@@ -16,18 +16,13 @@ use crate::error::Result;
 use crate::types::{Key, RawValue, Timestamp, TxnId};
 use std::ops::Range;
 
-#[derive(Clone, Copy, Debug, PartialEq)]
+#[derive(Clone, Copy, Debug, Default, PartialEq)]
 pub enum IsolationLevel {
     ReadCommitted,
     RepeatableRead,
     Serializable,
+    #[default]
     SnapshotIsolation,
-}
-
-impl Default for IsolationLevel {
-    fn default() -> Self {
-        Self::SnapshotIsolation
-    }
 }
 
 /// Transaction interface

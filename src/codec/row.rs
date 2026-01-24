@@ -548,7 +548,7 @@ pub fn encode_row(col_ids: &[ColumnId], values: &[Value]) -> Vec<u8> {
 
 /// Decode a row from bytes.
 /// Returns a RowDecoder that can be used to access column values.
-pub fn decode_row(data: &[u8]) -> Result<RowDecoder> {
+pub fn decode_row(data: &[u8]) -> Result<RowDecoder<'_>> {
     RowDecoder::new(data)
 }
 
