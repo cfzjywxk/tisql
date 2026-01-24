@@ -127,10 +127,7 @@ impl FileClogService {
         }
 
         // Re-open for appending (seek to end)
-        let file = OpenOptions::new()
-            .read(true)
-            .write(true)
-            .open(&clog_path)?;
+        let file = OpenOptions::new().read(true).write(true).open(&clog_path)?;
 
         let mut file_for_write = file;
         file_for_write.seek(SeekFrom::End(0))?;
