@@ -2,12 +2,31 @@
 
 This file helps restore context for continuing development across sessions.
 
+**Project Structure:**
+```
+tisql/
+├── doc/                 # Documentation
+│   ├── ARCHITECTURE.md  # Design and architecture
+│   └── CLAUDE.md        # Development context (this file)
+├── src/                 # Source code
+│   ├── main.rs          # Entry point
+│   ├── lib.rs           # Library root
+│   ├── protocol/        # MySQL protocol
+│   ├── sql/             # SQL parsing, binding, planning
+│   ├── executor/        # Query execution
+│   ├── storage/         # Storage engine
+│   ├── catalog/         # Schema management
+│   └── util/            # Utilities (logging, timing)
+├── Cargo.toml
+└── Cargo.lock
+```
+
 ---
 
 ## Progress Log
 
-### Session 2026-02-08: Async Logging & Simplify Entry Point
-**Goal**: Add non-blocking logging utilities; simplify to server-only mode
+### Session 2026-02-08: Async Logging, Simplify Entry Point & Restructure
+**Goal**: Add non-blocking logging utilities; simplify to server-only mode; reorganize project
 
 **Completed**:
 - Created `src/util/` module with logging and timing utilities
@@ -21,10 +40,12 @@ This file helps restore context for continuing development across sessions.
 - Added `-L/--log-level` CLI option
 - Replaced tracing with custom logging in protocol layer
 - **Removed REPL mode** - `cargo run` now starts MySQL server directly on port 4000
+- **Reorganized project structure**: created `doc/` folder for documentation
 - All 26 tests passing
 
 **Files Changed**:
-- New: `src/util/mod.rs`, `src/util/log.rs`, `src/util/timing.rs`
+- New: `src/util/mod.rs`, `src/util/log.rs`, `src/util/timing.rs`, `doc/`
+- Moved: `CLAUDE.md` → `doc/CLAUDE.md`, `ARCHITECTURE.md` → `doc/ARCHITECTURE.md`
 - Modified: `src/lib.rs`, `src/main.rs`, `src/protocol/mod.rs`, `src/protocol/mysql.rs`, `Cargo.toml`
 
 ---
@@ -64,7 +85,7 @@ This file helps restore context for continuing development across sessions.
 - Persist data with WAL
 
 **Reference Materials:**
-- Architecture design: `../ARCHITECTURE.md`
+- Architecture design: `doc/ARCHITECTURE.md` (same folder)
 - TiDB RFC: https://github.com/TiDBHackers/rfc/blob/master/text/one_node_fits_all_tisql.md
 - OceanBase reference: `~/src/oceanbase`
 
@@ -93,7 +114,7 @@ This file helps restore context for continuing development across sessions.
 ### How to Run
 
 ```bash
-cd /home/ywxk/src/requirements/build_my_own/tisql
+cd tisql/    # Project root
 
 # Run tests
 cargo test
