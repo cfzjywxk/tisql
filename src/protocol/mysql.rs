@@ -11,18 +11,21 @@ use opensrv_mysql::{
 use tokio::io::AsyncWrite;
 
 use crate::types::DataType;
+use crate::worker::WorkerPool;
 use crate::{log_debug, log_info, Database, QueryResult};
 
 /// MySQL protocol backend that wraps our Database
 pub struct MySqlBackend {
     db: Arc<Database>,
+    worker_pool: Arc<WorkerPool>,
     current_db: String,
 }
 
 impl MySqlBackend {
-    pub fn new(db: Arc<Database>) -> Self {
+    pub fn new(db: Arc<Database>, worker_pool: Arc<WorkerPool>) -> Self {
         Self {
             db,
+            worker_pool,
             current_db: "test".to_string(),
         }
     }
@@ -81,8 +84,13 @@ impl<W: AsyncWrite + Send + Unpin> AsyncMysqlShim<W> for MySqlBackend {
             return self.handle_system_variable(query, results).await;
         }
 
-        // Execute the query through our database
-        match self.db.execute(query) {
+        // Execute the query through the worker pool (off the network IO thread)
+        let db = Arc::clone(&self.db);
+        match self
+            .worker_pool
+            .execute_query(db, query.to_string())
+            .await
+        {
             Ok(result) => self.write_result(result, results).await,
             Err(e) => {
                 results

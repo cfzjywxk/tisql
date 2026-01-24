@@ -35,6 +35,10 @@ async-trait = "0.1"
 # Command line parsing
 clap = { version = "4", features = ["derive"] }
 
+# Thread pool for database work
+yatp = { git = "https://github.com/tikv/yatp.git" }
+num_cpus = "1"
+
 [dev-dependencies]
 criterion = "0.5"
 

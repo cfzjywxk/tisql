@@ -10,6 +10,7 @@ pub mod storage;
 pub mod transaction;
 pub mod types;
 pub mod util;
+pub mod worker;
 
 pub use catalog::{Catalog, MemoryCatalog};
 use error::Result;
@@ -19,6 +20,7 @@ use sql::{Binder, Parser};
 use storage::MemTableEngine;
 use types::Value;
 use util::Timer;
+pub use worker::{WorkerPool, WorkerPoolConfig};
 
 /// TiSQL Database instance
 pub struct Database {
