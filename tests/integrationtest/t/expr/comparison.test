@@ -1,0 +1,37 @@
+# Comparison expression tests
+
+# Create test table
+CREATE TABLE t_cmp (id INT, val INT, name VARCHAR(50));
+
+# Insert test data
+INSERT INTO t_cmp VALUES (1, 10, 'a'), (2, 20, 'b'), (3, 20, 'c'), (4, 30, 'd');
+
+# Equality
+SELECT id, val FROM t_cmp WHERE val = 20 ORDER BY id;
+
+# Not equal
+SELECT id, val FROM t_cmp WHERE val != 20 ORDER BY id;
+
+# Less than
+SELECT id, val FROM t_cmp WHERE val < 20 ORDER BY id;
+
+# Less than or equal
+SELECT id, val FROM t_cmp WHERE val <= 20 ORDER BY id;
+
+# Greater than
+SELECT id, val FROM t_cmp WHERE val > 20 ORDER BY id;
+
+# Greater than or equal
+SELECT id, val FROM t_cmp WHERE val >= 20 ORDER BY id;
+
+# AND
+SELECT id, val FROM t_cmp WHERE val >= 10 AND val <= 20 ORDER BY id;
+
+# OR
+SELECT id, val FROM t_cmp WHERE val = 10 OR val = 30 ORDER BY id;
+
+# String comparison
+SELECT id, name FROM t_cmp WHERE name = 'b';
+
+# Clean up
+DROP TABLE t_cmp;

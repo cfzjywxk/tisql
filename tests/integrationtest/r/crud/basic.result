@@ -1,0 +1,18 @@
+CREATE TABLE users (id INT, name VARCHAR(100), age INT)
+INSERT INTO users (id, name, age) VALUES (1, 'Alice', 25)
+INSERT INTO users VALUES (2, 'Bob', 30), (3, 'Charlie', 35)
+SELECT id, name, age FROM users ORDER BY id
+id	name	age
+1	Alice	25
+2	Bob	30
+3	Charlie	35
+UPDATE users SET age = 26 WHERE id = 1
+SELECT id, name, age FROM users WHERE id = 1
+id	name	age
+1	Alice	26
+DELETE FROM users WHERE id = 2
+SELECT id, name, age FROM users ORDER BY id
+id	name	age
+1	Alice	26
+3	Charlie	35
+DROP TABLE users

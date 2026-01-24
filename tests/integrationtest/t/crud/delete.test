@@ -1,0 +1,25 @@
+# Delete operation tests
+
+# Create test table
+CREATE TABLE t_delete (id INT, val INT);
+
+# Insert test data
+INSERT INTO t_delete VALUES (1, 10), (2, 20), (3, 30), (4, 40), (5, 50);
+
+# Verify initial data
+SELECT id, val FROM t_delete ORDER BY id;
+
+# Delete single row
+DELETE FROM t_delete WHERE id = 3;
+SELECT id, val FROM t_delete ORDER BY id;
+
+# Delete with range condition
+DELETE FROM t_delete WHERE id > 3;
+SELECT id, val FROM t_delete ORDER BY id;
+
+# Delete remaining rows
+DELETE FROM t_delete WHERE id > 0;
+SELECT id, val FROM t_delete;
+
+# Clean up
+DROP TABLE t_delete;

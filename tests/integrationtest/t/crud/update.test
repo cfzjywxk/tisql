@@ -1,0 +1,29 @@
+# Update operation tests
+
+# Create test table
+CREATE TABLE t_update (id INT, val INT, name VARCHAR(50));
+
+# Insert test data
+INSERT INTO t_update VALUES (1, 100, 'first'), (2, 200, 'second'), (3, 300, 'third');
+
+# Verify initial data
+SELECT id, val, name FROM t_update ORDER BY id;
+
+# Update single column
+UPDATE t_update SET val = 150 WHERE id = 1;
+SELECT id, val, name FROM t_update WHERE id = 1;
+
+# Update multiple columns
+UPDATE t_update SET val = 250, name = 'updated' WHERE id = 2;
+SELECT id, val, name FROM t_update WHERE id = 2;
+
+# Update multiple rows
+UPDATE t_update SET val = 999 WHERE id > 1;
+SELECT id, val, name FROM t_update ORDER BY id;
+
+# Update with expression
+UPDATE t_update SET val = val + 1 WHERE id = 1;
+SELECT id, val, name FROM t_update WHERE id = 1;
+
+# Clean up
+DROP TABLE t_update;

@@ -1,0 +1,21 @@
+# Arithmetic expression tests
+
+# Basic arithmetic
+SELECT 1 + 1;
+SELECT 10 - 3;
+SELECT 4 * 5;
+SELECT 20 / 4;
+SELECT 17 % 5;
+
+# Negative numbers
+SELECT -5;
+SELECT 0 - 10;
+
+# Order of operations
+SELECT 2 + 3 * 4;
+SELECT (2 + 3) * 4;
+SELECT 10 - 2 * 3;
+
+# Mixed operations
+SELECT 100 / 10 + 5;
+SELECT 100 / (10 + 10);

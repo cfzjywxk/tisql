@@ -1,0 +1,36 @@
+SELECT 1 + 1
+?column?
+2
+SELECT 10 - 3
+?column?
+7
+SELECT 4 * 5
+?column?
+20
+SELECT 20 / 4
+?column?
+5
+SELECT 17 % 5
+?column?
+2
+SELECT -5
+?column?
+-5
+SELECT 0 - 10
+?column?
+-10
+SELECT 2 + 3 * 4
+?column?
+14
+SELECT (2 + 3) * 4
+?column?
+20
+SELECT 10 - 2 * 3
+?column?
+4
+SELECT 100 / 10 + 5
+?column?
+15
+SELECT 100 / (10 + 10)
+?column?
+5

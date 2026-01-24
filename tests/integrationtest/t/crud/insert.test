@@ -1,0 +1,29 @@
+# Insert operation tests
+
+# Create test table
+CREATE TABLE t_insert (
+    id INT,
+    name VARCHAR(100),
+    value INT
+);
+
+# Insert with column list
+INSERT INTO t_insert (id, name, value) VALUES (1, 'first', 100);
+
+# Insert without column list
+INSERT INTO t_insert VALUES (2, 'second', 200);
+
+# Insert multiple rows
+INSERT INTO t_insert VALUES (3, 'third', 300), (4, 'fourth', 400);
+
+# Insert with NULL
+INSERT INTO t_insert (id, name) VALUES (5, 'fifth');
+
+# Verify all inserts
+SELECT id, name, value FROM t_insert ORDER BY id;
+
+# Verify NULL handling
+SELECT id, name, value FROM t_insert WHERE id = 5;
+
+# Clean up
+DROP TABLE t_insert;

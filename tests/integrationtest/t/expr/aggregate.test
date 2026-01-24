@@ -1,0 +1,31 @@
+# Aggregate function tests
+
+# Create test table
+CREATE TABLE t_agg (id INT, val INT, category VARCHAR(10));
+
+# Insert test data
+INSERT INTO t_agg VALUES (1, 10, 'A'), (2, 20, 'A'), (3, 30, 'B'), (4, 40, 'B'), (5, 50, 'B');
+
+# COUNT
+SELECT COUNT(id) FROM t_agg;
+
+# SUM
+SELECT SUM(val) FROM t_agg;
+
+# AVG
+SELECT AVG(val) FROM t_agg;
+
+# MIN
+SELECT MIN(val) FROM t_agg;
+
+# MAX
+SELECT MAX(val) FROM t_agg;
+
+# Multiple aggregates
+SELECT COUNT(id), SUM(val), AVG(val), MIN(val), MAX(val) FROM t_agg;
+
+# Aggregate with WHERE
+SELECT COUNT(id), SUM(val) FROM t_agg WHERE category = 'B';
+
+# Clean up
+DROP TABLE t_agg;

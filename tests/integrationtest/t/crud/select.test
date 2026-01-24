@@ -1,0 +1,39 @@
+# Select operation tests
+
+# Create test table
+CREATE TABLE t_select (a INT, b INT, c VARCHAR(50));
+
+# Insert test data
+INSERT INTO t_select VALUES (1, 10, 'one'), (2, 20, 'two'), (3, 30, 'three'), (4, 40, 'four'), (5, 50, 'five');
+
+# Select all columns
+SELECT a, b, c FROM t_select ORDER BY a;
+
+# Select specific columns
+SELECT a, c FROM t_select ORDER BY a;
+
+# Select with WHERE
+SELECT a, b, c FROM t_select WHERE a > 2 ORDER BY a;
+
+# Select with multiple conditions
+SELECT a, b, c FROM t_select WHERE a > 1 AND b < 40 ORDER BY a;
+
+# Select with OR
+SELECT a, b, c FROM t_select WHERE a = 1 OR a = 5 ORDER BY a;
+
+# Select with ORDER BY DESC
+SELECT a, b, c FROM t_select ORDER BY a DESC;
+
+# Select with LIMIT
+SELECT a, b, c FROM t_select ORDER BY a LIMIT 3;
+
+# Select with LIMIT and OFFSET
+SELECT a, b, c FROM t_select ORDER BY a LIMIT 2 OFFSET 2;
+
+# Select literal expressions
+SELECT 1 + 2;
+SELECT 10 - 3;
+SELECT 5 * 4;
+
+# Clean up
+DROP TABLE t_select;

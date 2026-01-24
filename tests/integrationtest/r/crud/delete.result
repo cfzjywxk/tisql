@@ -1,0 +1,25 @@
+CREATE TABLE t_delete (id INT, val INT)
+INSERT INTO t_delete VALUES (1, 10), (2, 20), (3, 30), (4, 40), (5, 50)
+SELECT id, val FROM t_delete ORDER BY id
+id	val
+1	10
+2	20
+3	30
+4	40
+5	50
+DELETE FROM t_delete WHERE id = 3
+SELECT id, val FROM t_delete ORDER BY id
+id	val
+1	10
+2	20
+4	40
+5	50
+DELETE FROM t_delete WHERE id > 3
+SELECT id, val FROM t_delete ORDER BY id
+id	val
+1	10
+2	20
+DELETE FROM t_delete WHERE id > 0
+SELECT id, val FROM t_delete
+id	val
+DROP TABLE t_delete

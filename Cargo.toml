@@ -46,3 +46,11 @@ criterion = "0.5"
 # [[bench]]
 # name = "storage"
 # harness = false
+
+[[bin]]
+name = "mysqltest-runner"
+path = "tests/integrationtest/runner.rs"
+
+[[test]]
+name = "store_test"
+path = "tests/store_test.rs"
