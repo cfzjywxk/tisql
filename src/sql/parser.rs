@@ -18,8 +18,7 @@ impl Parser {
 
     /// Parse SQL string into AST statements
     pub fn parse(&self, sql: &str) -> Result<Vec<SqlStatement>> {
-        SqlParser::parse_sql(&self.dialect, sql)
-            .map_err(|e| TiSqlError::Parse(e.to_string()))
+        SqlParser::parse_sql(&self.dialect, sql).map_err(|e| TiSqlError::Parse(e.to_string()))
     }
 
     /// Parse a single statement
@@ -29,7 +28,9 @@ impl Parser {
             return Err(TiSqlError::Parse("Empty SQL statement".into()));
         }
         if stmts.len() > 1 {
-            return Err(TiSqlError::Parse("Multiple statements not supported".into()));
+            return Err(TiSqlError::Parse(
+                "Multiple statements not supported".into(),
+            ));
         }
         Ok(stmts.remove(0))
     }

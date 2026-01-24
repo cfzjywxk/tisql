@@ -1,7 +1,9 @@
 use crate::catalog::Catalog;
 use crate::error::{Result, TiSqlError};
 use crate::sql::{AggFunc, BinaryOp, Expr, LogicalPlan, UnaryOp};
-use crate::storage::{decode_row_to_values, encode_key, encode_pk, encode_row, StorageEngine, WriteBatch};
+use crate::storage::{
+    decode_row_to_values, encode_key, encode_pk, encode_row, StorageEngine, WriteBatch,
+};
 use crate::types::{ColumnId, ColumnInfo, DataType, Row, Schema, Value};
 
 use super::{ExecutionResult, Executor};
@@ -54,11 +56,9 @@ impl Executor for SimpleExecutor {
                         let schema = Schema::new(
                             exprs
                                 .iter()
-                                .map(|(expr, alias)| ColumnInfo::new(
-                                    alias.clone(),
-                                    expr.data_type(),
-                                    true,
-                                ))
+                                .map(|(expr, alias)| {
+                                    ColumnInfo::new(alias.clone(), expr.data_type(), true)
+                                })
                                 .collect(),
                         );
 
@@ -82,7 +82,11 @@ impl Executor for SimpleExecutor {
                 }
             }
 
-            LogicalPlan::Scan { table, filter, projection } => {
+            LogicalPlan::Scan {
+                table,
+                filter,
+                projection,
+            } => {
                 // Build key range for this table
                 let table_id = table.id();
                 let start_key = encode_key(table_id, &[]);
@@ -90,7 +94,11 @@ impl Executor for SimpleExecutor {
 
                 // Extract column IDs and data types for decoding
                 let col_ids: Vec<ColumnId> = table.columns().iter().map(|c| c.id()).collect();
-                let data_types: Vec<DataType> = table.columns().iter().map(|c| c.data_type().clone()).collect();
+                let data_types: Vec<DataType> = table
+                    .columns()
+                    .iter()
+                    .map(|c| c.data_type().clone())
+                    .collect();
 
                 let iter = storage.scan(start_key..end_key)?;
 
@@ -125,11 +133,13 @@ impl Executor for SimpleExecutor {
                     table
                         .columns()
                         .iter()
-                        .map(|c| ColumnInfo::new(
-                            c.name().to_string(),
-                            c.data_type().clone(),
-                            c.nullable(),
-                        ))
+                        .map(|c| {
+                            ColumnInfo::new(
+                                c.name().to_string(),
+                                c.data_type().clone(),
+                                c.nullable(),
+                            )
+                        })
                         .collect(),
                 );
 
@@ -159,7 +169,11 @@ impl Executor for SimpleExecutor {
                 }
             }
 
-            LogicalPlan::Limit { input, limit, offset } => {
+            LogicalPlan::Limit {
+                input,
+                limit,
+                offset,
+            } => {
                 let input_result = self.execute(*input, storage, catalog)?;
 
                 match input_result {
@@ -203,7 +217,11 @@ impl Executor for SimpleExecutor {
                 }
             }
 
-            LogicalPlan::Aggregate { input, group_by, agg_exprs } => {
+            LogicalPlan::Aggregate {
+                input,
+                group_by,
+                agg_exprs,
+            } => {
                 let input_result = self.execute(*input, storage, catalog)?;
 
                 match input_result {
@@ -226,11 +244,9 @@ impl Executor for SimpleExecutor {
                             let schema = Schema::new(
                                 agg_exprs
                                     .iter()
-                                    .map(|(_, _, alias)| ColumnInfo::new(
-                                        alias.clone(),
-                                        DataType::Double,
-                                        true,
-                                    ))
+                                    .map(|(_, _, alias)| {
+                                        ColumnInfo::new(alias.clone(), DataType::Double, true)
+                                    })
                                     .collect(),
                             );
 
@@ -248,7 +264,11 @@ impl Executor for SimpleExecutor {
                 }
             }
 
-            LogicalPlan::Insert { table, columns, values } => {
+            LogicalPlan::Insert {
+                table,
+                columns,
+                values,
+            } => {
                 let pk_indices = table.pk_column_indices();
                 let mut batch = WriteBatch::new();
                 let mut count = 0u64;
@@ -266,7 +286,9 @@ impl Executor for SimpleExecutor {
                             .columns()
                             .iter()
                             .position(|c| c.id() == col_id)
-                            .ok_or_else(|| TiSqlError::ColumnNotFound(format!("id={}", col_id)))?;
+                            .ok_or_else(|| {
+                            TiSqlError::ColumnNotFound(format!("id={col_id}"))
+                        })?;
 
                         let value = self.eval_expr(&row_exprs[col_idx], &Row::new(vec![]))?;
                         row_values[table_col_idx] = value;
@@ -288,10 +310,7 @@ impl Executor for SimpleExecutor {
                         row_counter += 1;
                         vals
                     } else {
-                        pk_indices
-                            .iter()
-                            .map(|&i| row_values[i].clone())
-                            .collect()
+                        pk_indices.iter().map(|&i| row_values[i].clone()).collect()
                     };
                     let pk_bytes = encode_pk(&pk_values);
                     let key = encode_key(table.id(), &pk_bytes);
@@ -308,7 +327,10 @@ impl Executor for SimpleExecutor {
                 Ok(ExecutionResult::Affected { count })
             }
 
-            LogicalPlan::CreateTable { table, if_not_exists } => {
+            LogicalPlan::CreateTable {
+                table,
+                if_not_exists,
+            } => {
                 // Check if table exists
                 if catalog.get_table(table.schema(), table.name())?.is_some() {
                     if if_not_exists {
@@ -324,12 +346,16 @@ impl Executor for SimpleExecutor {
                 Ok(ExecutionResult::Ok)
             }
 
-            LogicalPlan::DropTable { schema, table, if_exists } => {
+            LogicalPlan::DropTable {
+                schema,
+                table,
+                if_exists,
+            } => {
                 if catalog.get_table(&schema, &table)?.is_none() {
                     if if_exists {
                         return Ok(ExecutionResult::Ok);
                     }
-                    return Err(TiSqlError::TableNotFound(format!("{}.{}", schema, table)));
+                    return Err(TiSqlError::TableNotFound(format!("{schema}.{table}")));
                 }
 
                 catalog.drop_table(&schema, &table)?;
@@ -343,7 +369,11 @@ impl Executor for SimpleExecutor {
 
                 // Extract column IDs and data types for decoding
                 let col_ids: Vec<ColumnId> = table.columns().iter().map(|c| c.id()).collect();
-                let data_types: Vec<DataType> = table.columns().iter().map(|c| c.data_type().clone()).collect();
+                let data_types: Vec<DataType> = table
+                    .columns()
+                    .iter()
+                    .map(|c| c.data_type().clone())
+                    .collect();
 
                 let mut batch = WriteBatch::new();
                 let mut count = 0u64;
@@ -370,7 +400,11 @@ impl Executor for SimpleExecutor {
                 Ok(ExecutionResult::Affected { count })
             }
 
-            LogicalPlan::Update { table, assignments, filter } => {
+            LogicalPlan::Update {
+                table,
+                assignments,
+                filter,
+            } => {
                 let table_id = table.id();
                 let pk_indices = table.pk_column_indices();
                 let start_key = encode_key(table_id, &[]);
@@ -378,7 +412,11 @@ impl Executor for SimpleExecutor {
 
                 // Extract column IDs and data types for encoding/decoding
                 let col_ids: Vec<ColumnId> = table.columns().iter().map(|c| c.id()).collect();
-                let data_types: Vec<DataType> = table.columns().iter().map(|c| c.data_type().clone()).collect();
+                let data_types: Vec<DataType> = table
+                    .columns()
+                    .iter()
+                    .map(|c| c.data_type().clone())
+                    .collect();
 
                 let mut batch = WriteBatch::new();
                 let mut count = 0u64;
@@ -402,7 +440,7 @@ impl Executor for SimpleExecutor {
                             .columns()
                             .iter()
                             .position(|c| c.id() == *col_id)
-                            .ok_or_else(|| TiSqlError::ColumnNotFound(format!("id={}", col_id)))?;
+                            .ok_or_else(|| TiSqlError::ColumnNotFound(format!("id={col_id}")))?;
 
                         let new_value = self.eval_expr(expr, &row)?;
                         row.set(col_idx, new_value);
@@ -514,15 +552,29 @@ impl SimpleExecutor {
             BinaryOp::Add => self.numeric_op(left, right, |a, b| a + b),
             BinaryOp::Sub => self.numeric_op(left, right, |a, b| a - b),
             BinaryOp::Mul => self.numeric_op(left, right, |a, b| a * b),
-            BinaryOp::Div => self.numeric_op(left, right, |a, b| if b != 0.0 { a / b } else { f64::NAN }),
+            BinaryOp::Div => {
+                self.numeric_op(left, right, |a, b| if b != 0.0 { a / b } else { f64::NAN })
+            }
             BinaryOp::Mod => self.numeric_op(left, right, |a, b| a % b),
 
-            BinaryOp::Eq => Ok(Value::Boolean(self.compare_values(left, right) == std::cmp::Ordering::Equal)),
-            BinaryOp::Ne => Ok(Value::Boolean(self.compare_values(left, right) != std::cmp::Ordering::Equal)),
-            BinaryOp::Lt => Ok(Value::Boolean(self.compare_values(left, right) == std::cmp::Ordering::Less)),
-            BinaryOp::Le => Ok(Value::Boolean(self.compare_values(left, right) != std::cmp::Ordering::Greater)),
-            BinaryOp::Gt => Ok(Value::Boolean(self.compare_values(left, right) == std::cmp::Ordering::Greater)),
-            BinaryOp::Ge => Ok(Value::Boolean(self.compare_values(left, right) != std::cmp::Ordering::Less)),
+            BinaryOp::Eq => Ok(Value::Boolean(
+                self.compare_values(left, right) == std::cmp::Ordering::Equal,
+            )),
+            BinaryOp::Ne => Ok(Value::Boolean(
+                self.compare_values(left, right) != std::cmp::Ordering::Equal,
+            )),
+            BinaryOp::Lt => Ok(Value::Boolean(
+                self.compare_values(left, right) == std::cmp::Ordering::Less,
+            )),
+            BinaryOp::Le => Ok(Value::Boolean(
+                self.compare_values(left, right) != std::cmp::Ordering::Greater,
+            )),
+            BinaryOp::Gt => Ok(Value::Boolean(
+                self.compare_values(left, right) == std::cmp::Ordering::Greater,
+            )),
+            BinaryOp::Ge => Ok(Value::Boolean(
+                self.compare_values(left, right) != std::cmp::Ordering::Less,
+            )),
 
             BinaryOp::And => {
                 let l = self.value_to_bool(left)?;
@@ -538,7 +590,7 @@ impl SimpleExecutor {
             BinaryOp::Concat => {
                 let l = self.value_to_string(left);
                 let r = self.value_to_string(right);
-                Ok(Value::String(format!("{}{}", l, r)))
+                Ok(Value::String(format!("{l}{r}")))
             }
 
             BinaryOp::Like => {
@@ -559,17 +611,17 @@ impl SimpleExecutor {
                 let b = self.value_to_bool(val)?;
                 Ok(Value::Boolean(!b))
             }
-            UnaryOp::Neg => {
-                match val {
-                    Value::TinyInt(v) => Ok(Value::TinyInt(-v)),
-                    Value::SmallInt(v) => Ok(Value::SmallInt(-v)),
-                    Value::Int(v) => Ok(Value::Int(-v)),
-                    Value::BigInt(v) => Ok(Value::BigInt(-v)),
-                    Value::Float(v) => Ok(Value::Float(-v)),
-                    Value::Double(v) => Ok(Value::Double(-v)),
-                    _ => Err(TiSqlError::Execution("Cannot negate non-numeric value".into())),
-                }
-            }
+            UnaryOp::Neg => match val {
+                Value::TinyInt(v) => Ok(Value::TinyInt(-v)),
+                Value::SmallInt(v) => Ok(Value::SmallInt(-v)),
+                Value::Int(v) => Ok(Value::Int(-v)),
+                Value::BigInt(v) => Ok(Value::BigInt(-v)),
+                Value::Float(v) => Ok(Value::Float(-v)),
+                Value::Double(v) => Ok(Value::Double(-v)),
+                _ => Err(TiSqlError::Execution(
+                    "Cannot negate non-numeric value".into(),
+                )),
+            },
             UnaryOp::Plus => Ok(val.clone()),
         }
     }
@@ -602,9 +654,9 @@ impl SimpleExecutor {
             Value::BigInt(v) => Ok(*v as f64),
             Value::Float(v) => Ok(*v as f64),
             Value::Double(v) => Ok(*v),
-            Value::String(s) => s.parse().map_err(|_| {
-                TiSqlError::Execution(format!("Cannot convert '{}' to number", s))
-            }),
+            Value::String(s) => s
+                .parse()
+                .map_err(|_| TiSqlError::Execution(format!("Cannot convert '{s}' to number"))),
             _ => Err(TiSqlError::Execution("Cannot convert to number".into())),
         }
     }
@@ -632,7 +684,7 @@ impl SimpleExecutor {
             Value::Double(v) => v.to_string(),
             Value::Boolean(b) => b.to_string(),
             Value::Null => "NULL".to_string(),
-            _ => format!("{:?}", val),
+            _ => format!("{val:?}"),
         }
     }
 
@@ -658,10 +710,8 @@ impl SimpleExecutor {
 
     fn like_match(&self, text: &str, pattern: &str) -> bool {
         // Simple LIKE implementation (% and _ wildcards)
-        let regex_pattern = pattern
-            .replace('%', ".*")
-            .replace('_', ".");
-        regex::Regex::new(&format!("^{}$", regex_pattern))
+        let regex_pattern = pattern.replace('%', ".*").replace('_', ".");
+        regex::Regex::new(&format!("^{regex_pattern}$"))
             .map(|re| re.is_match(text))
             .unwrap_or(false)
     }
@@ -684,15 +734,10 @@ impl SimpleExecutor {
                 let n = self.value_to_f64(val)?;
                 Ok(Value::Double(n))
             }
-            DataType::Varchar(_) | DataType::Text => {
-                Ok(Value::String(self.value_to_string(val)))
-            }
-            DataType::Boolean => {
-                Ok(Value::Boolean(self.value_to_bool(val)?))
-            }
+            DataType::Varchar(_) | DataType::Text => Ok(Value::String(self.value_to_string(val))),
+            DataType::Boolean => Ok(Value::Boolean(self.value_to_bool(val)?)),
             _ => Err(TiSqlError::Execution(format!(
-                "Cast to {:?} not implemented",
-                target
+                "Cast to {target:?} not implemented"
             ))),
         }
     }
@@ -709,7 +754,12 @@ impl SimpleExecutor {
             AggFunc::Count => {
                 let count = rows
                     .iter()
-                    .filter(|row| !self.eval_expr(arg, row).map(|v| v.is_null()).unwrap_or(true))
+                    .filter(|row| {
+                        !self
+                            .eval_expr(arg, row)
+                            .map(|v| v.is_null())
+                            .unwrap_or(true)
+                    })
                     .count();
                 Ok(Value::BigInt(count as i64))
             }

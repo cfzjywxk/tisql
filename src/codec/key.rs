@@ -98,9 +98,7 @@ pub fn decode_record_key(key: &[u8]) -> Result<(TableId, Handle)> {
 
     // Check record prefix separator
     if rest.len() < 2 || &rest[..2] != RECORD_PREFIX_SEP {
-        return Err(TiSqlError::Codec(
-            "invalid record prefix separator".into(),
-        ));
+        return Err(TiSqlError::Codec("invalid record prefix separator".into()));
     }
 
     let handle_bytes = &rest[2..];
@@ -112,10 +110,7 @@ pub fn decode_record_key(key: &[u8]) -> Result<(TableId, Handle)> {
         Ok((table_id as TableId, Handle::Int(handle)))
     } else {
         // Common handle (composite key)
-        Ok((
-            table_id as TableId,
-            Handle::Common(handle_bytes.to_vec()),
-        ))
+        Ok((table_id as TableId, Handle::Common(handle_bytes.to_vec())))
     }
 }
 
@@ -408,11 +403,7 @@ mod tests {
         ];
 
         for i in 0..keys.len() - 1 {
-            assert!(
-                keys[i] < keys[i + 1],
-                "Key ordering failed at index {}",
-                i
-            );
+            assert!(keys[i] < keys[i + 1], "Key ordering failed at index {i}");
         }
     }
 
@@ -425,7 +416,7 @@ mod tests {
         ];
 
         for i in 0..keys.len() - 1 {
-            assert!(keys[i] < keys[i + 1], "Table ordering failed at index {}", i);
+            assert!(keys[i] < keys[i + 1], "Table ordering failed at index {i}");
         }
     }
 
@@ -473,7 +464,10 @@ mod tests {
             Value::Int(100),
         ];
 
-        let encoded: Vec<Vec<u8>> = values.iter().map(|v| encode_values_for_key(&[v.clone()])).collect();
+        let encoded: Vec<Vec<u8>> = values
+            .iter()
+            .map(|v| encode_values_for_key(&[v.clone()]))
+            .collect();
 
         for i in 0..encoded.len() - 1 {
             assert!(
@@ -494,7 +488,10 @@ mod tests {
             Value::String("b".into()),
         ];
 
-        let encoded: Vec<Vec<u8>> = values.iter().map(|v| encode_values_for_key(&[v.clone()])).collect();
+        let encoded: Vec<Vec<u8>> = values
+            .iter()
+            .map(|v| encode_values_for_key(&[v.clone()]))
+            .collect();
 
         for i in 0..encoded.len() - 1 {
             assert!(

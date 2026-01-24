@@ -30,9 +30,9 @@ pub use key::{
     TablePrefix, INDEX_PREFIX_SEP, RECORD_PREFIX_SEP, TABLE_PREFIX,
 };
 pub use number::{
-    decode_comparable_i64, decode_comparable_u64, decode_compact_i64, decode_compact_u64,
-    decode_varint, decode_varuint, encode_comparable_i64, encode_comparable_u64,
-    encode_compact_i64, encode_compact_u64, encode_varint, encode_varuint,
+    decode_compact_i64, decode_compact_u64, decode_comparable_i64, decode_comparable_u64,
+    decode_varint, decode_varuint, encode_compact_i64, encode_compact_u64, encode_comparable_i64,
+    encode_comparable_u64, encode_varint, encode_varuint,
 };
 pub use row::{
     decode_row, decode_row_to_values, decode_value_compact, encode_row, encode_value_compact,

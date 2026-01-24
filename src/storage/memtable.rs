@@ -66,9 +66,7 @@ impl StorageEngine for MemTableEngine {
 
     fn snapshot(&self) -> Result<Box<dyn Snapshot>> {
         let data = self.data.read().unwrap();
-        Ok(Box::new(MemTableSnapshot {
-            data: data.clone(),
-        }))
+        Ok(Box::new(MemTableSnapshot { data: data.clone() }))
     }
 
     fn scan(&self, range: Range<Key>) -> Result<Box<dyn Iterator<Item = (Key, RawValue)> + '_>> {
@@ -148,10 +146,7 @@ mod tests {
         engine.put(b"c", b"3").unwrap();
         engine.put(b"d", b"4").unwrap();
 
-        let results: Vec<_> = engine
-            .scan(b"b".to_vec()..b"d".to_vec())
-            .unwrap()
-            .collect();
+        let results: Vec<_> = engine.scan(b"b".to_vec()..b"d".to_vec()).unwrap().collect();
 
         assert_eq!(results.len(), 2);
         assert_eq!(results[0], (b"b".to_vec(), b"2".to_vec()));

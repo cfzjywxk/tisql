@@ -1,7 +1,7 @@
-mod parser;
 mod binder;
+mod parser;
 mod plan;
 
-pub use parser::Parser;
 pub use binder::Binder;
-pub use plan::{LogicalPlan, Expr, BinaryOp, UnaryOp, AggFunc, JoinType, OrderByExpr};
+pub use parser::Parser;
+pub use plan::{AggFunc, BinaryOp, Expr, JoinType, LogicalPlan, OrderByExpr, UnaryOp};

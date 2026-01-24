@@ -52,19 +52,22 @@ fn main() {
 
     println!("TiSQL v0.1.0 - MySQL Protocol Server");
     println!("Listening on {}:{}", args.host, args.port);
-    println!("Connect with: mysql -h{} -P{} -uroot test", args.host, args.port);
+    println!(
+        "Connect with: mysql -h{} -P{} -uroot test",
+        args.host, args.port
+    );
 
     let rt = tokio::runtime::Runtime::new().expect("Failed to create Tokio runtime");
     rt.block_on(async {
         // Initialize async logger within tokio runtime
-        let log_level = LogLevel::from_str(&args.log_level).unwrap_or(LogLevel::Info);
+        let log_level = LogLevel::parse(&args.log_level).unwrap_or(LogLevel::Info);
         tisql::util::init_logger(log_level);
 
         log_info!("TiSQL server starting on {}", addr);
 
         if let Err(e) = server.run().await {
             log_error!("Server error: {}", e);
-            eprintln!("Server error: {}", e);
+            eprintln!("Server error: {e}");
         }
     });
 }

@@ -163,8 +163,7 @@ pub fn decode_compact_i64(buf: &[u8]) -> Result<i64> {
         4 => Ok(i32::from_le_bytes(buf[..4].try_into().unwrap()) as i64),
         8 => Ok(i64::from_le_bytes(buf[..8].try_into().unwrap())),
         n => Err(TiSqlError::Codec(format!(
-            "invalid compact i64 length: {}",
-            n
+            "invalid compact i64 length: {n}"
         ))),
     }
 }
@@ -206,8 +205,7 @@ pub fn decode_compact_u64(buf: &[u8]) -> Result<u64> {
         4 => Ok(u32::from_le_bytes(buf[..4].try_into().unwrap()) as u64),
         8 => Ok(u64::from_le_bytes(buf[..8].try_into().unwrap())),
         n => Err(TiSqlError::Codec(format!(
-            "invalid compact u64 length: {}",
-            n
+            "invalid compact u64 length: {n}"
         ))),
     }
 }
@@ -350,7 +348,7 @@ mod tests {
         for (v, expected_len) in test_cases {
             let mut buf = Vec::new();
             encode_compact_i64(&mut buf, v);
-            assert_eq!(buf.len(), expected_len, "Length mismatch for {}", v);
+            assert_eq!(buf.len(), expected_len, "Length mismatch for {v}");
             assert_eq!(compact_i64_len(v), expected_len);
             let decoded = decode_compact_i64(&buf).unwrap();
             assert_eq!(decoded, v);
@@ -373,7 +371,7 @@ mod tests {
         for (v, expected_len) in test_cases {
             let mut buf = Vec::new();
             encode_compact_u64(&mut buf, v);
-            assert_eq!(buf.len(), expected_len, "Length mismatch for {}", v);
+            assert_eq!(buf.len(), expected_len, "Length mismatch for {v}");
             assert_eq!(compact_u64_len(v), expected_len);
             let decoded = decode_compact_u64(&buf).unwrap();
             assert_eq!(decoded, v);

@@ -68,9 +68,7 @@ impl Catalog for MemoryCatalog {
             }
             Ok(())
         } else {
-            Err(TiSqlError::Catalog(format!(
-                "Schema '{name}' not found"
-            )))
+            Err(TiSqlError::Catalog(format!("Schema '{name}' not found")))
         }
     }
 
@@ -95,7 +93,8 @@ impl Catalog for MemoryCatalog {
         if schema_tables.contains_key(table.name()) {
             return Err(TiSqlError::Catalog(format!(
                 "Table '{}' already exists in schema '{}'",
-                table.name(), table.schema()
+                table.name(),
+                table.schema()
             )));
         }
 
@@ -195,7 +194,8 @@ impl Catalog for MemoryCatalog {
             .and_then(|tables| tables.get_mut(&table_name))
             .ok_or_else(|| TiSqlError::Catalog("Table not found".into()))?;
 
-        table.remove_index(index_name)
+        table
+            .remove_index(index_name)
             .ok_or_else(|| TiSqlError::Catalog(format!("Index '{index_name}' not found")))?;
 
         Ok(())
@@ -240,14 +240,7 @@ mod tests {
             name.to_string(),
             "default".to_string(),
             vec![
-                ColumnDef::new(
-                    0,
-                    "id".to_string(),
-                    DataType::Int,
-                    false,
-                    None,
-                    true,
-                ),
+                ColumnDef::new(0, "id".to_string(), DataType::Int, false, None, true),
                 ColumnDef::new(
                     1,
                     "name".to_string(),

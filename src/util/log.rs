@@ -36,13 +36,13 @@ impl fmt::Display for LogLevel {
             LogLevel::Warn => "WARN ",
             LogLevel::Error => "ERROR",
         };
-        write!(f, "{}", s)
+        write!(f, "{s}")
     }
 }
 
 impl LogLevel {
     /// Parse log level from string (case insensitive)
-    pub fn from_str(s: &str) -> Option<LogLevel> {
+    pub fn parse(s: &str) -> Option<LogLevel> {
         match s.to_lowercase().as_str() {
             "trace" => Some(LogLevel::Trace),
             "debug" => Some(LogLevel::Debug),
@@ -51,6 +51,14 @@ impl LogLevel {
             "error" => Some(LogLevel::Error),
             _ => None,
         }
+    }
+}
+
+impl std::str::FromStr for LogLevel {
+    type Err = String;
+
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        LogLevel::parse(s).ok_or_else(|| format!("invalid log level: {s}"))
     }
 }
 
@@ -102,7 +110,7 @@ pub fn init_logger(min_level: LogLevel) {
 pub fn init_logger_from_env(default_level: LogLevel) {
     let level = std::env::var("TISQL_LOG")
         .ok()
-        .and_then(|s| LogLevel::from_str(&s))
+        .and_then(|s| LogLevel::parse(&s))
         .unwrap_or(default_level);
     init_logger(level);
 }
@@ -114,11 +122,7 @@ async fn log_writer_task(mut receiver: mpsc::UnboundedReceiver<LogRecord>) {
     while let Some(record) = receiver.recv().await {
         let formatted = format!(
             "[{}] [{}] [{}:{}] {}\n",
-            record.timestamp,
-            record.level,
-            record.file,
-            record.line,
-            record.message
+            record.timestamp, record.level, record.file, record.line, record.message
         );
 
         // Write to stderr (non-blocking from caller's perspective)
@@ -153,7 +157,13 @@ fn get_timestamp() -> String {
 
     format!(
         "{:04}-{:02}-{:02} {:02}:{:02}:{:02}.{:03}",
-        years, month.min(12), day.min(31), hours, minutes, seconds, millis
+        years,
+        month.min(12),
+        day.min(31),
+        hours,
+        minutes,
+        seconds,
+        millis
     )
 }
 
@@ -191,10 +201,7 @@ pub fn __log_impl(level: LogLevel, file: &'static str, line: u32, message: Strin
 
 /// Check if a log level is enabled (useful for avoiding expensive formatting)
 pub fn is_level_enabled(level: LogLevel) -> bool {
-    LOGGER
-        .get()
-        .map(|l| level >= l.min_level)
-        .unwrap_or(true)
+    LOGGER.get().map(|l| level >= l.min_level).unwrap_or(true)
 }
 
 // ============================================================================
@@ -338,10 +345,10 @@ mod tests {
 
     #[test]
     fn test_log_level_from_str() {
-        assert_eq!(LogLevel::from_str("debug"), Some(LogLevel::Debug));
-        assert_eq!(LogLevel::from_str("DEBUG"), Some(LogLevel::Debug));
-        assert_eq!(LogLevel::from_str("Info"), Some(LogLevel::Info));
-        assert_eq!(LogLevel::from_str("invalid"), None);
+        assert_eq!(LogLevel::parse("debug"), Some(LogLevel::Debug));
+        assert_eq!(LogLevel::parse("DEBUG"), Some(LogLevel::Debug));
+        assert_eq!(LogLevel::parse("Info"), Some(LogLevel::Info));
+        assert_eq!(LogLevel::parse("invalid"), None);
     }
 
     #[test]

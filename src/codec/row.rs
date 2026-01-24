@@ -104,8 +104,7 @@ impl RowEncoder {
         let total_cols = col_ids.len();
         if self.is_large() {
             self.col_ids32.resize(total_cols, 0);
-            self.offsets32
-                .resize(self.num_not_null_cols as usize, 0);
+            self.offsets32.resize(self.num_not_null_cols as usize, 0);
         } else {
             self.col_ids.resize(total_cols, 0);
             self.offsets.resize(self.num_not_null_cols as usize, 0);
@@ -484,7 +483,7 @@ pub fn decode_value_compact(data: &[u8], data_type: &DataType) -> Result<Value> 
         }
         DataType::Varchar(_) | DataType::Text | DataType::Char(_) => {
             let s = String::from_utf8(data.to_vec())
-                .map_err(|e| TiSqlError::Codec(format!("invalid utf8: {}", e)))?;
+                .map_err(|e| TiSqlError::Codec(format!("invalid utf8: {e}")))?;
             Ok(Value::String(s))
         }
         DataType::Blob => Ok(Value::Bytes(data.to_vec())),
@@ -506,7 +505,7 @@ pub fn decode_value_compact(data: &[u8], data_type: &DataType) -> Result<Value> 
         }
         DataType::Decimal { .. } => {
             let s = String::from_utf8(data.to_vec())
-                .map_err(|e| TiSqlError::Codec(format!("invalid decimal utf8: {}", e)))?;
+                .map_err(|e| TiSqlError::Codec(format!("invalid decimal utf8: {e}")))?;
             Ok(Value::Decimal(s))
         }
     }
@@ -748,7 +747,7 @@ mod tests {
             Value::String("hello world".into()),
             Value::BigInt(123456789),
             Value::Boolean(true),
-            Value::Double(3.14159),
+            Value::Double(1.23456),
         ];
 
         let encoded = encode_row(&col_ids, &values);
@@ -761,7 +760,7 @@ mod tests {
         assert_eq!(decoded[3], Value::Boolean(true));
         // Float comparison with tolerance
         if let Value::Double(d) = decoded[4] {
-            assert!((d - 3.14159).abs() < 0.00001);
+            assert!((d - 1.23456).abs() < 0.00001);
         } else {
             panic!("Expected Double");
         }
@@ -773,11 +772,7 @@ mod tests {
 
         let col_ids = vec![1, 2, 3];
         let data_types = vec![DataType::Int, DataType::Varchar(100), DataType::BigInt];
-        let values = vec![
-            Value::Int(100),
-            Value::Null,
-            Value::BigInt(-500),
-        ];
+        let values = vec![Value::Int(100), Value::Null, Value::BigInt(-500)];
 
         let encoded = encode_row(&col_ids, &values);
         let decoded = decode_row_to_values(&encoded, &col_ids, &data_types).unwrap();

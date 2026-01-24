@@ -42,7 +42,14 @@ impl ColumnDef {
         default: Option<DefaultValue>,
         auto_increment: bool,
     ) -> Self {
-        Self { id, name, data_type, nullable, default, auto_increment }
+        Self {
+            id,
+            name,
+            data_type,
+            nullable,
+            default,
+            auto_increment,
+        }
     }
 
     /// Get the column ID.
@@ -109,7 +116,12 @@ pub struct IndexDef {
 impl IndexDef {
     /// Create a new index definition.
     pub fn new(id: IndexId, name: String, columns: Vec<ColumnId>, unique: bool) -> Self {
-        Self { id, name, columns, unique }
+        Self {
+            id,
+            name,
+            columns,
+            unique,
+        }
     }
 
     /// Get the index ID.

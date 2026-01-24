@@ -1,6 +1,6 @@
 use sqlparser::ast::{
-    self, Expr as SqlExpr, Query, Select, SelectItem, SetExpr, Statement as SqlStatement,
-    TableFactor, TableWithJoins, Value as SqlValue, GroupByExpr,
+    self, Expr as SqlExpr, GroupByExpr, Query, Select, SelectItem, SetExpr,
+    Statement as SqlStatement, TableFactor, TableWithJoins, Value as SqlValue,
 };
 
 use crate::catalog::{Catalog, ColumnDef, TableDef};
@@ -40,9 +40,7 @@ impl<'a> Binder<'a> {
                 ..
             } => self.bind_update(table, assignments, selection),
             SqlStatement::Delete {
-                from,
-                selection,
-                ..
+                from, selection, ..
             } => self.bind_delete(from, selection),
             SqlStatement::CreateTable {
                 name,
@@ -90,10 +88,7 @@ impl<'a> Binder<'a> {
 
         // LIMIT / OFFSET
         if query.limit.is_some() || query.offset.is_some() {
-            let limit = query
-                .limit
-                .map(|l| self.expr_to_usize(&l))
-                .transpose()?;
+            let limit = query.limit.map(|l| self.expr_to_usize(&l)).transpose()?;
             let offset = query
                 .offset
                 .map(|o| self.expr_to_usize(&o.value))
@@ -216,21 +211,25 @@ impl<'a> Binder<'a> {
 
         for join in &table.joins {
             let right = self.bind_table_factor(&join.relation)?;
-            let tables = vec![self.collect_tables(&plan), self.collect_tables(&right)].concat();
+            let tables = [self.collect_tables(&plan), self.collect_tables(&right)].concat();
 
             let (join_type, on) = match &join.join_operator {
-                ast::JoinOperator::Inner(constraint) => {
-                    (JoinType::Inner, self.bind_join_constraint(constraint, &tables)?)
-                }
-                ast::JoinOperator::LeftOuter(constraint) => {
-                    (JoinType::Left, self.bind_join_constraint(constraint, &tables)?)
-                }
-                ast::JoinOperator::RightOuter(constraint) => {
-                    (JoinType::Right, self.bind_join_constraint(constraint, &tables)?)
-                }
-                ast::JoinOperator::FullOuter(constraint) => {
-                    (JoinType::Full, self.bind_join_constraint(constraint, &tables)?)
-                }
+                ast::JoinOperator::Inner(constraint) => (
+                    JoinType::Inner,
+                    self.bind_join_constraint(constraint, &tables)?,
+                ),
+                ast::JoinOperator::LeftOuter(constraint) => (
+                    JoinType::Left,
+                    self.bind_join_constraint(constraint, &tables)?,
+                ),
+                ast::JoinOperator::RightOuter(constraint) => (
+                    JoinType::Right,
+                    self.bind_join_constraint(constraint, &tables)?,
+                ),
+                ast::JoinOperator::FullOuter(constraint) => (
+                    JoinType::Full,
+                    self.bind_join_constraint(constraint, &tables)?,
+                ),
                 ast::JoinOperator::CrossJoin => {
                     (JoinType::Cross, Expr::Literal(Value::Boolean(true)))
                 }
@@ -275,7 +274,7 @@ impl<'a> Binder<'a> {
                 let table_def = self
                     .catalog
                     .get_table(schema, table)?
-                    .ok_or_else(|| TiSqlError::TableNotFound(format!("{}.{}", schema, table)))?;
+                    .ok_or_else(|| TiSqlError::TableNotFound(format!("{schema}.{table}")))?;
 
                 Ok(LogicalPlan::Scan {
                     table: table_def,
@@ -397,8 +396,7 @@ impl<'a> Binder<'a> {
                     }
                 }
                 Err(TiSqlError::ColumnNotFound(format!(
-                    "{}.{}",
-                    table_name, col_name
+                    "{table_name}.{col_name}"
                 )))
             }
 
@@ -421,7 +419,7 @@ impl<'a> Binder<'a> {
                     ast::UnaryOperator::Not => UnaryOp::Not,
                     ast::UnaryOperator::Minus => UnaryOp::Neg,
                     ast::UnaryOperator::Plus => UnaryOp::Plus,
-                    _ => return Err(TiSqlError::Bind(format!("Unsupported unary op: {:?}", op))),
+                    _ => return Err(TiSqlError::Bind(format!("Unsupported unary op: {op:?}"))),
                 };
                 Ok(Expr::UnaryOp {
                     op: unary_op,
@@ -437,7 +435,8 @@ impl<'a> Binder<'a> {
                     .filter_map(|arg| {
                         if let ast::FunctionArg::Unnamed(ast::FunctionArgExpr::Expr(e)) = arg {
                             Some(self.bind_expr(e, tables))
-                        } else if let ast::FunctionArg::Unnamed(ast::FunctionArgExpr::Wildcard) = arg
+                        } else if let ast::FunctionArg::Unnamed(ast::FunctionArgExpr::Wildcard) =
+                            arg
                         {
                             Some(Ok(Expr::Literal(Value::Int(1)))) // COUNT(*)
                         } else {
@@ -501,11 +500,11 @@ impl<'a> Binder<'a> {
             SqlValue::Number(n, _) => {
                 if n.contains('.') {
                     Ok(Value::Double(n.parse().map_err(|_| {
-                        TiSqlError::Bind(format!("Invalid number: {}", n))
+                        TiSqlError::Bind(format!("Invalid number: {n}"))
                     })?))
                 } else {
                     Ok(Value::BigInt(n.parse().map_err(|_| {
-                        TiSqlError::Bind(format!("Invalid integer: {}", n))
+                        TiSqlError::Bind(format!("Invalid integer: {n}"))
                     })?))
                 }
             }
@@ -514,7 +513,7 @@ impl<'a> Binder<'a> {
             }
             SqlValue::Boolean(b) => Ok(Value::Boolean(*b)),
             SqlValue::Null => Ok(Value::Null),
-            _ => Err(TiSqlError::Bind(format!("Unsupported value: {:?}", value))),
+            _ => Err(TiSqlError::Bind(format!("Unsupported value: {value:?}"))),
         }
     }
 
@@ -533,7 +532,7 @@ impl<'a> Binder<'a> {
             ast::BinaryOperator::GtEq => Ok(BinaryOp::Ge),
             ast::BinaryOperator::And => Ok(BinaryOp::And),
             ast::BinaryOperator::Or => Ok(BinaryOp::Or),
-            _ => Err(TiSqlError::Bind(format!("Unsupported operator: {:?}", op))),
+            _ => Err(TiSqlError::Bind(format!("Unsupported operator: {op:?}"))),
         }
     }
 
@@ -602,10 +601,9 @@ impl<'a> Binder<'a> {
             .iter()
             .map(|a| {
                 // In sqlparser 0.40+, Assignment has `id` field (Vec<Ident>)
-                let col_name = a
-                    .id
-                    .first()
-                    .ok_or_else(|| TiSqlError::Bind("Invalid assignment target".into()))?;
+                let col_name =
+                    a.id.first()
+                        .ok_or_else(|| TiSqlError::Bind("Invalid assignment target".into()))?;
                 let col = table
                     .column_by_name(&col_name.value)
                     .ok_or_else(|| TiSqlError::ColumnNotFound(col_name.value.clone()))?;
@@ -614,9 +612,7 @@ impl<'a> Binder<'a> {
             })
             .collect::<Result<Vec<_>>>()?;
 
-        let filter = selection
-            .map(|s| self.bind_expr(&s, &tables))
-            .transpose()?;
+        let filter = selection.map(|s| self.bind_expr(&s, &tables)).transpose()?;
 
         Ok(LogicalPlan::Update {
             table,
@@ -642,9 +638,7 @@ impl<'a> Binder<'a> {
 
         let tables = vec![&table];
 
-        let filter = selection
-            .map(|s| self.bind_expr(&s, &tables))
-            .transpose()?;
+        let filter = selection.map(|s| self.bind_expr(&s, &tables)).transpose()?;
 
         Ok(LogicalPlan::Delete { table, filter })
     }
@@ -723,13 +717,7 @@ impl<'a> Binder<'a> {
             }
         }
 
-        let table_def = TableDef::new(
-            table_id,
-            table_name,
-            schema,
-            col_defs,
-            primary_key,
-        );
+        let table_def = TableDef::new(table_id, table_name, schema, col_defs, primary_key);
 
         Ok(LogicalPlan::CreateTable {
             table: table_def,
@@ -764,8 +752,7 @@ impl<'a> Binder<'a> {
                 })
             }
             _ => Err(TiSqlError::Bind(format!(
-                "DROP {:?} not supported",
-                object_type
+                "DROP {object_type:?} not supported"
             ))),
         }
     }
@@ -786,11 +773,7 @@ impl<'a> Binder<'a> {
             let columns = first_row
                 .iter()
                 .enumerate()
-                .map(|(i, expr)| ColumnInfo::new(
-                    format!("column{}", i),
-                    expr.data_type(),
-                    true,
-                ))
+                .map(|(i, expr)| ColumnInfo::new(format!("column{i}"), expr.data_type(), true))
                 .collect();
             Schema::new(columns)
         } else {
@@ -846,10 +829,11 @@ impl<'a> Binder<'a> {
             ast::DataType::Time(_, _) => Ok(DataType::Time),
             ast::DataType::Datetime(_) => Ok(DataType::DateTime),
             ast::DataType::Timestamp(_, _) => Ok(DataType::Timestamp),
-            _ => Err(TiSqlError::Bind(format!("Unsupported data type: {:?}", dt))),
+            _ => Err(TiSqlError::Bind(format!("Unsupported data type: {dt:?}"))),
         }
     }
 
+    #[allow(clippy::only_used_in_recursion)]
     fn collect_tables<'b>(&'b self, plan: &'b LogicalPlan) -> Vec<&'b TableDef> {
         match plan {
             LogicalPlan::Scan { table, .. } => vec![table],
@@ -867,6 +851,7 @@ impl<'a> Binder<'a> {
         }
     }
 
+    #[allow(clippy::only_used_in_recursion)]
     fn collect_tables_owned(&self, plan: &LogicalPlan) -> Vec<TableDef> {
         match plan {
             LogicalPlan::Scan { table, .. } => vec![table.clone()],
@@ -884,6 +869,7 @@ impl<'a> Binder<'a> {
         }
     }
 
+    #[allow(clippy::only_used_in_recursion)]
     fn contains_aggregate(&self, expr: &Expr) -> bool {
         match expr {
             Expr::Aggregate { .. } => true,

@@ -19,8 +19,10 @@ mod crud {
         tk.must_exec("CREATE TABLE users (id INT, name VARCHAR(100), email VARCHAR(100))");
 
         // Single insert
-        tk.must_exec("INSERT INTO users (id, name, email) VALUES (1, 'Alice', 'alice@example.com')")
-            .check_affected(1);
+        tk.must_exec(
+            "INSERT INTO users (id, name, email) VALUES (1, 'Alice', 'alice@example.com')",
+        )
+        .check_affected(1);
 
         // Multiple insert
         tk.must_exec("INSERT INTO users VALUES (2, 'Bob', 'bob@example.com'), (3, 'Charlie', 'charlie@example.com')")
@@ -43,8 +45,10 @@ mod crud {
         tk.must_exec("INSERT INTO t VALUES (1, 100)");
 
         // Update single row
-        tk.must_exec("UPDATE t SET val = 150 WHERE id = 1").check_affected(1);
-        tk.must_query("SELECT val FROM t WHERE id = 1").check(rows![["150"]]);
+        tk.must_exec("UPDATE t SET val = 150 WHERE id = 1")
+            .check_affected(1);
+        tk.must_query("SELECT val FROM t WHERE id = 1")
+            .check(rows![["150"]]);
     }
 
     #[test]
@@ -78,8 +82,11 @@ mod select {
         tk.must_exec("INSERT INTO t VALUES (3, 'c'), (1, 'a'), (2, 'b')");
 
         // ORDER BY ASC
-        tk.must_query("SELECT a, b FROM t ORDER BY a")
-            .check(rows![["1", "a"], ["2", "b"], ["3", "c"]]);
+        tk.must_query("SELECT a, b FROM t ORDER BY a").check(rows![
+            ["1", "a"],
+            ["2", "b"],
+            ["3", "c"]
+        ]);
 
         // ORDER BY DESC
         tk.must_query("SELECT a, b FROM t ORDER BY a DESC")
@@ -111,7 +118,8 @@ mod select {
 
         tk.must_query("SELECT a FROM t").check(rows![["1"]]);
         tk.must_query("SELECT b, a FROM t").check(rows![["2", "1"]]);
-        tk.must_query("SELECT c, b, a FROM t").check(rows![["3", "2", "1"]]);
+        tk.must_query("SELECT c, b, a FROM t")
+            .check(rows![["3", "2", "1"]]);
     }
 
     #[test]
@@ -136,7 +144,8 @@ mod filter {
         tk.must_exec("INSERT INTO t VALUES (1, 10), (2, 20), (3, 30), (4, 40)");
 
         // Equality
-        tk.must_query("SELECT id FROM t WHERE val = 20").check(rows![["2"]]);
+        tk.must_query("SELECT id FROM t WHERE val = 20")
+            .check(rows![["2"]]);
 
         // Not equal
         tk.must_query("SELECT id FROM t WHERE val != 20 ORDER BY id")
@@ -186,7 +195,8 @@ mod filter {
         tk.must_exec("CREATE TABLE t (id INT, name VARCHAR(50))");
         tk.must_exec("INSERT INTO t VALUES (1, 'Alice'), (2, 'Bob'), (3, 'Charlie')");
 
-        tk.must_query("SELECT id FROM t WHERE name = 'Bob'").check(rows![["2"]]);
+        tk.must_query("SELECT id FROM t WHERE name = 'Bob'")
+            .check(rows![["2"]]);
     }
 }
 
@@ -199,7 +209,8 @@ mod ddl {
         let tk = TestKit::new();
 
         tk.must_exec("CREATE TABLE t1 (id INT)").check_ok();
-        tk.must_exec("CREATE TABLE t2 (id INT, name VARCHAR(100))").check_ok();
+        tk.must_exec("CREATE TABLE t2 (id INT, name VARCHAR(100))")
+            .check_ok();
 
         // Insert and verify
         tk.must_exec("INSERT INTO t1 VALUES (1)");
@@ -214,7 +225,8 @@ mod ddl {
         let tk = TestKit::new();
 
         tk.must_exec("CREATE TABLE t (id INT)").check_ok();
-        tk.must_exec("CREATE TABLE IF NOT EXISTS t (id INT)").check_ok();
+        tk.must_exec("CREATE TABLE IF NOT EXISTS t (id INT)")
+            .check_ok();
 
         tk.must_exec("DROP TABLE t");
     }
@@ -255,8 +267,11 @@ mod data_types {
         tk.must_exec("CREATE TABLE t (c CHAR(10), vc VARCHAR(100), txt TEXT)");
         tk.must_exec("INSERT INTO t VALUES ('hello', 'world', 'long text content')");
 
-        tk.must_query("SELECT c, vc, txt FROM t")
-            .check(rows![["hello", "world", "long text content"]]);
+        tk.must_query("SELECT c, vc, txt FROM t").check(rows![[
+            "hello",
+            "world",
+            "long text content"
+        ]]);
     }
 
     #[test]
@@ -316,7 +331,10 @@ mod errors {
     fn test_table_not_found() {
         let tk = TestKit::new();
         let err = tk.must_exec_err("SELECT * FROM non_existent");
-        assert!(err.contains("not found") || err.contains("Table"), "Error: {}", err);
+        assert!(
+            err.contains("not found") || err.contains("Table"),
+            "Error: {err}"
+        );
     }
 
     #[test]
@@ -324,7 +342,10 @@ mod errors {
         let tk = TestKit::new();
         tk.must_exec("CREATE TABLE t (id INT)");
         let err = tk.must_exec_err("CREATE TABLE t (id INT)");
-        assert!(err.contains("exists") || err.contains("already"), "Error: {}", err);
+        assert!(
+            err.contains("exists") || err.contains("already"),
+            "Error: {err}"
+        );
     }
 }
 

@@ -61,7 +61,7 @@ pub fn encode_bytes(buf: &mut Vec<u8>, data: &[u8]) {
                 buf.extend_from_slice(&data[idx..]);
             }
             pad_count = ENC_GROUP_SIZE - remain;
-            buf.extend(std::iter::repeat(ENC_PAD).take(pad_count));
+            buf.extend(std::iter::repeat_n(ENC_PAD, pad_count));
         }
 
         // Marker byte
@@ -116,16 +116,11 @@ fn decode_bytes_internal(mut buf: &[u8], reverse: bool) -> Result<(&[u8], Vec<u8
         let group = &buf[..ENC_GROUP_SIZE];
         let marker = buf[ENC_GROUP_SIZE];
 
-        let pad_count = if reverse {
-            marker
-        } else {
-            ENC_MARKER - marker
-        };
+        let pad_count = if reverse { marker } else { ENC_MARKER - marker };
 
         if pad_count > ENC_GROUP_SIZE as u8 {
             return Err(TiSqlError::Codec(format!(
-                "invalid marker byte: {:02x}",
-                marker
+                "invalid marker byte: {marker:02x}"
             )));
         }
 
@@ -139,8 +134,7 @@ fn decode_bytes_internal(mut buf: &[u8], reverse: bool) -> Result<(&[u8], Vec<u8
             for &b in &group[real_group_size..] {
                 if b != pad_byte {
                     return Err(TiSqlError::Codec(format!(
-                        "invalid padding byte: {:02x}, expected {:02x}",
-                        b, pad_byte
+                        "invalid padding byte: {b:02x}, expected {pad_byte:02x}"
                     )));
                 }
             }
@@ -339,7 +333,11 @@ mod tests {
 
     #[test]
     fn test_compact_bytes_roundtrip() {
-        let test_cases = [vec![], vec![1, 2, 3], (0..1000u16).map(|x| x as u8).collect()];
+        let test_cases = [
+            vec![],
+            vec![1, 2, 3],
+            (0..1000u16).map(|x| x as u8).collect(),
+        ];
 
         for data in test_cases {
             let mut buf = Vec::new();

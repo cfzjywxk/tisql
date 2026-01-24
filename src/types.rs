@@ -82,10 +82,10 @@ pub enum Value {
     Decimal(String), // Use string for exact decimal representation
     String(String),
     Bytes(Vec<u8>),
-    Date(i32),       // Days since epoch
-    Time(i64),       // Microseconds since midnight
-    DateTime(i64),   // Microseconds since epoch
-    Timestamp(i64),  // Microseconds since epoch
+    Date(i32),      // Days since epoch
+    Time(i64),      // Microseconds since midnight
+    DateTime(i64),  // Microseconds since epoch
+    Timestamp(i64), // Microseconds since epoch
 }
 
 impl Value {
@@ -100,7 +100,10 @@ impl Value {
             Value::BigInt(_) => DataType::BigInt,
             Value::Float(_) => DataType::Float,
             Value::Double(_) => DataType::Double,
-            Value::Decimal(_) => DataType::Decimal { precision: 38, scale: 10 },
+            Value::Decimal(_) => DataType::Decimal {
+                precision: 38,
+                scale: 10,
+            },
             Value::String(_) => DataType::Text,
             Value::Bytes(_) => DataType::Blob,
             Value::Date(_) => DataType::Date,
@@ -199,7 +202,11 @@ pub struct ColumnInfo {
 impl ColumnInfo {
     /// Create a new column info.
     pub fn new(name: String, data_type: DataType, nullable: bool) -> Self {
-        Self { name, data_type, nullable }
+        Self {
+            name,
+            data_type,
+            nullable,
+        }
     }
 
     /// Get the column name.

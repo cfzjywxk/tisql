@@ -91,9 +91,7 @@ pub enum LogicalPlan {
     },
 
     /// Empty result (for internal use)
-    Empty {
-        schema: Schema,
-    },
+    Empty { schema: Schema },
 }
 
 /// Expression tree
@@ -118,16 +116,10 @@ pub enum Expr {
     },
 
     /// Unary operation
-    UnaryOp {
-        op: UnaryOp,
-        expr: Box<Expr>,
-    },
+    UnaryOp { op: UnaryOp, expr: Box<Expr> },
 
     /// Function call
-    Function {
-        name: String,
-        args: Vec<Expr>,
-    },
+    Function { name: String, args: Vec<Expr> },
 
     /// Aggregate function
     Aggregate {
@@ -144,10 +136,7 @@ pub enum Expr {
     },
 
     /// IS NULL / IS NOT NULL
-    IsNull {
-        expr: Box<Expr>,
-        negated: bool,
-    },
+    IsNull { expr: Box<Expr>, negated: bool },
 
     /// IN list
     InList {
@@ -184,9 +173,7 @@ pub enum Expr {
     Wildcard,
 
     /// Qualified wildcard (table.*) - only valid in certain contexts
-    QualifiedWildcard {
-        table: String,
-    },
+    QualifiedWildcard { table: String },
 
     /// Cast expression
     Cast {
@@ -201,20 +188,22 @@ impl Expr {
         match self {
             Expr::Column { data_type, .. } => data_type.clone(),
             Expr::Literal(v) => v.data_type(),
-            Expr::BinaryOp { left, op, .. } => {
-                match op {
-                    BinaryOp::Eq | BinaryOp::Ne | BinaryOp::Lt | BinaryOp::Le
-                    | BinaryOp::Gt | BinaryOp::Ge | BinaryOp::And | BinaryOp::Or
-                    | BinaryOp::Like => DataType::Boolean,
-                    _ => left.data_type(),
-                }
-            }
-            Expr::UnaryOp { op, expr } => {
-                match op {
-                    UnaryOp::Not => DataType::Boolean,
-                    UnaryOp::Neg | UnaryOp::Plus => expr.data_type(),
-                }
-            }
+            Expr::BinaryOp { left, op, .. } => match op {
+                BinaryOp::Eq
+                | BinaryOp::Ne
+                | BinaryOp::Lt
+                | BinaryOp::Le
+                | BinaryOp::Gt
+                | BinaryOp::Ge
+                | BinaryOp::And
+                | BinaryOp::Or
+                | BinaryOp::Like => DataType::Boolean,
+                _ => left.data_type(),
+            },
+            Expr::UnaryOp { op, expr } => match op {
+                UnaryOp::Not => DataType::Boolean,
+                UnaryOp::Neg | UnaryOp::Plus => expr.data_type(),
+            },
             Expr::Aggregate { func, .. } => {
                 match func {
                     AggFunc::Count => DataType::BigInt,

@@ -103,7 +103,7 @@ fn main() {
     }
 
     println!("----------------------------------------");
-    println!("Passed: {}, Failed: {}", passed, failed);
+    println!("Passed: {passed}, Failed: {failed}");
 
     if failed > 0 {
         std::process::exit(1);
@@ -111,11 +111,11 @@ fn main() {
 }
 
 fn find_test_case(config: &Config, name: &str) -> TestCase {
-    let test_file = config.test_dir.join(format!("{}.test", name));
-    let result_file = config.result_dir.join(format!("{}.result", name));
+    let test_file = config.test_dir.join(format!("{name}.test"));
+    let result_file = config.result_dir.join(format!("{name}.result"));
 
     if !test_file.exists() {
-        eprintln!("Test file not found: {:?}", test_file);
+        eprintln!("Test file not found: {test_file:?}");
         std::process::exit(1);
     }
 
@@ -128,7 +128,12 @@ fn find_test_case(config: &Config, name: &str) -> TestCase {
 
 fn find_all_test_cases(config: &Config) -> Vec<TestCase> {
     let mut cases = Vec::new();
-    find_tests_recursive(&config.test_dir, &config.test_dir, &config.result_dir, &mut cases);
+    find_tests_recursive(
+        &config.test_dir,
+        &config.test_dir,
+        &config.result_dir,
+        &mut cases,
+    );
     cases.sort_by(|a, b| a.name.cmp(&b.name));
     cases
 }
@@ -146,7 +151,7 @@ fn find_tests_recursive(
                 let subdir_name = path.file_name().unwrap().to_str().unwrap();
                 let result_subdir = result_base.join(subdir_name);
                 find_tests_recursive(base, &path, &result_subdir, cases);
-            } else if path.extension().map_or(false, |e| e == "test") {
+            } else if path.extension().is_some_and(|e| e == "test") {
                 let relative = path.strip_prefix(base).unwrap();
                 let name = relative
                     .with_extension("")
@@ -178,7 +183,7 @@ fn run_test(config: &Config, test_case: &TestCase) -> TestResult {
             return TestResult {
                 name: test_case.name.clone(),
                 passed: false,
-                message: format!("Failed to parse test file: {}", e),
+                message: format!("Failed to parse test file: {e}"),
             };
         }
     };
@@ -232,7 +237,7 @@ fn run_test(config: &Config, test_case: &TestCase) -> TestResult {
             Err(e) => {
                 if let Some(expected_code) = stmt.expected_error {
                     // Error was expected
-                    output.push_str(&format!("ERROR {}: {}\n", expected_code, e));
+                    output.push_str(&format!("ERROR {expected_code}: {e}\n"));
                 } else {
                     return TestResult {
                         name: test_case.name.clone(),
@@ -266,7 +271,7 @@ fn run_test(config: &Config, test_case: &TestCase) -> TestResult {
                 return TestResult {
                     name: test_case.name.clone(),
                     passed: false,
-                    message: format!("Failed to write result: {}", e),
+                    message: format!("Failed to write result: {e}"),
                 };
             }
         }
@@ -287,7 +292,7 @@ fn run_test(config: &Config, test_case: &TestCase) -> TestResult {
             return TestResult {
                 name: test_case.name.clone(),
                 passed: false,
-                message: format!("Failed to read result file: {}", e),
+                message: format!("Failed to read result file: {e}"),
             };
         }
     };

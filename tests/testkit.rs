@@ -28,14 +28,14 @@ impl TestKit {
     pub fn must_exec(&self, sql: &str) -> ExecResult {
         match self.db.execute(sql) {
             Ok(result) => ExecResult { result },
-            Err(e) => panic!("SQL execution failed: {}\nSQL: {}", e, sql),
+            Err(e) => panic!("SQL execution failed: {e}\nSQL: {sql}"),
         }
     }
 
     /// Execute SQL and expect an error
     pub fn must_exec_err(&self, sql: &str) -> String {
         match self.db.execute(sql) {
-            Ok(_) => panic!("Expected error but got success\nSQL: {}", sql),
+            Ok(_) => panic!("Expected error but got success\nSQL: {sql}"),
             Err(e) => e.to_string(),
         }
     }
@@ -44,17 +44,19 @@ impl TestKit {
     pub fn must_query(&self, sql: &str) -> QueryChecker {
         match self.db.execute(sql) {
             Ok(QueryResult::Rows { columns, data }) => QueryChecker { columns, data },
-            Ok(other) => panic!("Expected rows but got: {:?}\nSQL: {}", other, sql),
-            Err(e) => panic!("Query failed: {}\nSQL: {}", e, sql),
+            Ok(other) => panic!("Expected rows but got: {other:?}\nSQL: {sql}"),
+            Err(e) => panic!("Query failed: {e}\nSQL: {sql}"),
         }
     }
 
     /// Execute SQL without checking result
+    #[allow(dead_code)]
     pub fn exec(&self, sql: &str) -> Result<QueryResult, String> {
         self.db.execute(sql).map_err(|e| e.to_string())
     }
 
     /// Get the underlying database
+    #[allow(dead_code)]
     pub fn db(&self) -> Arc<Database> {
         Arc::clone(&self.db)
     }
@@ -76,9 +78,12 @@ impl ExecResult {
     pub fn check_affected(&self, expected: u64) {
         match &self.result {
             QueryResult::Affected(count) => {
-                assert_eq!(*count, expected, "Expected {} affected rows, got {}", expected, count);
+                assert_eq!(
+                    *count, expected,
+                    "Expected {expected} affected rows, got {count}"
+                );
             }
-            other => panic!("Expected affected count but got: {:?}", other),
+            other => panic!("Expected affected count but got: {other:?}"),
         }
     }
 
@@ -86,7 +91,7 @@ impl ExecResult {
     pub fn check_ok(&self) {
         match &self.result {
             QueryResult::Ok => {}
-            other => panic!("Expected OK but got: {:?}", other),
+            other => panic!("Expected OK but got: {other:?}"),
         }
     }
 }
@@ -121,8 +126,7 @@ impl QueryChecker {
             for (j, (actual, expected)) in actual_row.iter().zip(expected_row.iter()).enumerate() {
                 assert_eq!(
                     actual, *expected,
-                    "Value mismatch at row {}, column {}: expected '{}', got '{}'",
-                    i, j, expected, actual
+                    "Value mismatch at row {i}, column {j}: expected '{expected}', got '{actual}'"
                 );
             }
         }
@@ -150,11 +154,13 @@ impl QueryChecker {
     }
 
     /// Get the data for further inspection
+    #[allow(dead_code)]
     pub fn rows(&self) -> &Vec<Vec<String>> {
         &self.data
     }
 
     /// Get the columns for further inspection
+    #[allow(dead_code)]
     pub fn columns(&self) -> &Vec<String> {
         &self.columns
     }
@@ -177,8 +183,10 @@ mod tests {
     fn test_testkit_basic() {
         let tk = TestKit::new();
 
-        tk.must_exec("CREATE TABLE t (id INT, name VARCHAR(100))").check_ok();
-        tk.must_exec("INSERT INTO t VALUES (1, 'Alice'), (2, 'Bob')").check_affected(2);
+        tk.must_exec("CREATE TABLE t (id INT, name VARCHAR(100))")
+            .check_ok();
+        tk.must_exec("INSERT INTO t VALUES (1, 'Alice'), (2, 'Bob')")
+            .check_affected(2);
 
         tk.must_query("SELECT id, name FROM t ORDER BY id")
             .check(rows![["1", "Alice"], ["2", "Bob"]]);
