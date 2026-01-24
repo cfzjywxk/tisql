@@ -45,4 +45,7 @@ pub enum TiSqlError {
 
     #[error("Internal error: {0}")]
     Internal(String),
+
+    #[error("Codec error: {0}")]
+    Codec(String),
 }

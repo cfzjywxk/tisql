@@ -1,4 +1,5 @@
 pub mod catalog;
+pub mod codec;
 pub mod error;
 pub mod executor;
 pub mod log;

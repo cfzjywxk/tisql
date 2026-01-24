@@ -1,12 +1,48 @@
 mod memtable;
-mod encoding;
 
 pub use memtable::MemTableEngine;
-pub use encoding::{encode_key, decode_key, encode_pk, encode_row, decode_row};
 
-use crate::error::Result;
-use crate::types::{Key, RawValue, Timestamp};
+// Re-export codec functions
+pub use crate::codec::key::{
+    decode_record_key, encode_record_key, encode_record_key_with_handle,
+    encode_values_for_key as encode_pk, Handle,
+};
+
+use crate::error::{Result, TiSqlError};
+use crate::types::{Key, RawValue, Row, TableId, Timestamp};
 use std::ops::Range;
+
+/// Encode a table key (TiDB-compatible format).
+/// Format: 't' + tableID + "_r" + user_key
+///
+/// This uses the new codec for proper ordering.
+pub fn encode_key(table_id: TableId, user_key: &[u8]) -> Vec<u8> {
+    encode_record_key(table_id, user_key)
+}
+
+/// Decode a table key back to (table_id, user_key).
+pub fn decode_key(key: &[u8]) -> Result<(TableId, Vec<u8>)> {
+    let (table_id, handle) = decode_record_key(key)?;
+    let user_key = match handle {
+        Handle::Int(_) => handle.encoded(),
+        Handle::Common(bytes) => bytes,
+    };
+    Ok((table_id, user_key))
+}
+
+/// Encode a row using bincode.
+///
+/// Note: For now, we continue using bincode for row values since it preserves
+/// all type information. The codec::row module provides the TiDB-compatible
+/// compact row format for future use when schema info is available during decode.
+pub fn encode_row(row: &Row) -> Result<Vec<u8>> {
+    bincode::serialize(row).map_err(|e| TiSqlError::Storage(e.to_string()))
+}
+
+/// Decode a row from bincode.
+pub fn decode_row(data: &[u8]) -> Result<Row> {
+    bincode::deserialize(data).map_err(|e| TiSqlError::Storage(e.to_string()))
+}
 
 /// Core KV storage interface - all engines implement this
 pub trait StorageEngine: Send + Sync + 'static {

@@ -11,6 +11,7 @@ tisql/
 ├── src/                 # Source code
 │   ├── main.rs          # Entry point
 │   ├── lib.rs           # Library root
+│   ├── codec/           # Key/value encoding (TiDB-compatible)
 │   ├── protocol/        # MySQL protocol
 │   ├── sql/             # SQL parsing, binding, planning
 │   ├── executor/        # Query execution
@@ -24,6 +25,54 @@ tisql/
 ---
 
 ## Progress Log
+
+### Session 2026-01-24: TiDB-Compatible Codec Module
+**Goal**: Create standalone key/value encoding utilities following TiDB patterns
+
+**Completed**:
+- Created new `src/codec/` module with TiDB-compatible encoding:
+  - `mod.rs` - Module root with codec version constant (128) and type flags
+  - `number.rs` - Number encoding:
+    - Comparable encoding (memcomparable for keys, big-endian with sign bit XOR)
+    - Compact encoding (for row values, minimal bytes needed, little-endian)
+    - Varint encoding (for lengths and small values)
+  - `bytes.rs` - Bytes encoding:
+    - Memcomparable format (8-byte groups with markers, preserves ordering)
+    - Compact format (varint length prefix)
+    - Ascending and descending order support
+  - `row.rs` - Compact row format (TiDB rowcodec style):
+    - Header: version, flags, column counts
+    - Sorted column IDs (1 or 4 bytes)
+    - End offsets for non-null column data
+    - Concatenated column values
+    - Small row (colID=1B, offset=2B) vs Large row (colID=4B, offset=4B)
+  - `key.rs` - Table key encoding (TiDB tablecodec style):
+    - Record key: `'t' + tableID + "_r" + handle`
+    - Index key: `'t' + tableID + "_i" + indexID + values`
+    - Handle type (Int or Common/composite)
+    - Value encoding for keys (memcomparable)
+- Removed old `src/storage/encoding.rs`
+- Updated `src/storage/mod.rs` to use new codec
+- Added `Codec` error variant to error types
+- All 61 tests passing (35 new codec tests)
+
+**Key Design Decisions**:
+- Keys use memcomparable encoding for correct BTreeMap ordering
+- Row values currently use bincode (codec::row for future schema-aware decode)
+- Followed TiDB's exact key format for compatibility
+
+**Files Changed**:
+- New: `src/codec/mod.rs`, `src/codec/number.rs`, `src/codec/bytes.rs`,
+       `src/codec/row.rs`, `src/codec/key.rs`
+- Removed: `src/storage/encoding.rs`
+- Modified: `src/lib.rs`, `src/storage/mod.rs`, `src/error.rs`
+
+**Reference**:
+- TiDB tablecodec: `~/src/tidb/pkg/tablecodec/tablecodec.go`
+- TiDB rowcodec: `~/src/tidb/pkg/util/rowcodec/`
+- TiDB codec: `~/src/tidb/pkg/util/codec/`
+
+---
 
 ### Session 2026-02-08: Async Logging, Simplify Entry Point & Restructure
 **Goal**: Add non-blocking logging utilities; simplify to server-only mode; reorganize project
@@ -180,9 +229,15 @@ SHOW DATABASES;
 └─────────────────────────┬───────────────────────────────────┘
                           │
 ┌─────────────────────────▼───────────────────────────────────┐
+│                   Codec Layer                               │
+│         (TiDB-compatible Key/Value Encoding)                │
+│    src/codec/number.rs, bytes.rs, key.rs, row.rs            │
+└─────────────────────────┬───────────────────────────────────┘
+                          │
+┌─────────────────────────▼───────────────────────────────────┐
 │                  Storage Layer                              │
-│         (MemTable with BTreeMap + Encoding)                 │
-│    src/storage/memtable.rs, encoding.rs                     │
+│              (MemTable with BTreeMap)                       │
+│              src/storage/memtable.rs                        │
 └─────────────────────────┬───────────────────────────────────┘
                           │
 ┌─────────────────────────▼───────────────────────────────────┐
@@ -196,7 +251,7 @@ SHOW DATABASES;
 
 | File | Purpose |
 |------|---------|
-| `src/main.rs` | CLI entry point (REPL or server mode) |
+| `src/main.rs` | CLI entry point (server mode) |
 | `src/lib.rs` | Database struct, QueryResult, public API |
 | `src/protocol/mysql.rs` | MySQL protocol backend (AsyncMysqlShim) |
 | `src/protocol/mod.rs` | MySqlServer TCP listener |
@@ -204,8 +259,11 @@ SHOW DATABASES;
 | `src/sql/binder.rs` | Name resolution, type checking |
 | `src/sql/plan.rs` | LogicalPlan, Expr definitions |
 | `src/executor/simple.rs` | Query execution engine |
+| `src/codec/number.rs` | Number encoding (comparable, compact, varint) |
+| `src/codec/bytes.rs` | Bytes encoding (memcomparable, compact) |
+| `src/codec/key.rs` | Table key encoding (record, index keys) |
+| `src/codec/row.rs` | Compact row format (TiDB rowcodec style) |
 | `src/storage/memtable.rs` | In-memory KV storage |
-| `src/storage/encoding.rs` | Key/value encoding for ordered storage |
 | `src/catalog/memory.rs` | In-memory schema catalog |
 | `src/types.rs` | DataType, Value, Row, Schema |
 | `src/error.rs` | Error types |
