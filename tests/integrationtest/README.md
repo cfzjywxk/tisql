@@ -59,3 +59,7 @@ SELECT * FROM non_existent_table;
 2. Run with `-r` flag to record expected results
 3. Verify the `.result` file is correct
 4. Commit both files
+
+## License
+
+This project is licensed under the Apache License, Version 2.0. See [LICENSE](../../LICENSE) for details.

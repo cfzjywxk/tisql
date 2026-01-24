@@ -215,3 +215,7 @@ See `.github/workflows/ci.yml` for details.
 3. **Clarity**: Use descriptive test names and comments
 4. **Coverage**: Test both success and error cases
 5. **Regression**: When fixing bugs, add tests that reproduce the issue first
+
+## License
+
+This project is licensed under the Apache License, Version 2.0. See [LICENSE](LICENSE) for details.
