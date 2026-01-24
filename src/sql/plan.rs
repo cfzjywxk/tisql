@@ -108,6 +108,28 @@ pub enum LogicalPlan {
     Empty { schema: Schema },
 }
 
+impl LogicalPlan {
+    /// Check if this plan is a write operation (INSERT, UPDATE, DELETE, DDL)
+    pub fn is_write(&self) -> bool {
+        matches!(
+            self,
+            LogicalPlan::Insert { .. }
+                | LogicalPlan::Update { .. }
+                | LogicalPlan::Delete { .. }
+                | LogicalPlan::CreateTable { .. }
+                | LogicalPlan::DropTable { .. }
+        )
+    }
+
+    /// Check if this plan is a DDL operation
+    pub fn is_ddl(&self) -> bool {
+        matches!(
+            self,
+            LogicalPlan::CreateTable { .. } | LogicalPlan::DropTable { .. }
+        )
+    }
+}
+
 /// Expression tree
 #[derive(Debug, Clone)]
 pub enum Expr {

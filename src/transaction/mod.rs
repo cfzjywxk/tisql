@@ -12,6 +12,16 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+//! Transaction layer for TiSQL.
+//!
+//! This module provides transaction management with durability guarantees.
+//! Current implementation uses autocommit mode where each statement is
+//! a complete transaction.
+
+mod service;
+
+pub use service::TransactionService;
+
 use crate::error::Result;
 use crate::types::{Key, RawValue, Timestamp, TxnId};
 use std::ops::Range;
@@ -62,5 +72,3 @@ pub trait TransactionManager: Send + Sync {
     /// Get current global timestamp
     fn current_ts(&self) -> Timestamp;
 }
-
-// Simple implementation will be added in M2 milestone

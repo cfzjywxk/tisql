@@ -9,3 +9,6 @@
 *.swp
 /target/
 target/
+
+# Development design documents (keep local only)
+docs/

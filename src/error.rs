@@ -21,6 +21,9 @@ pub enum TiSqlError {
     #[error("Storage error: {0}")]
     Storage(String),
 
+    #[error("Log error: {0}")]
+    Log(String),
+
     #[error("Catalog error: {0}")]
     Catalog(String),
 
