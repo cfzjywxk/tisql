@@ -1,0 +1,44 @@
+[package]
+name = "tisql"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+# SQL parsing
+sqlparser = "0.40"
+
+# Async runtime
+tokio = { version = "1", features = ["full"] }
+
+# Serialization
+bincode = "1.3"
+serde = { version = "1", features = ["derive"] }
+
+# Error handling
+thiserror = "1"
+anyhow = "1"
+
+# Logging
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+
+# Bytes handling
+bytes = "1"
+
+# Regex for LIKE matching
+regex = "1"
+
+# MySQL protocol server
+opensrv-mysql = "0.7"
+async-trait = "0.1"
+
+# Command line parsing
+clap = { version = "4", features = ["derive"] }
+
+[dev-dependencies]
+criterion = "0.5"
+
+# Benchmarks will be added later
+# [[bench]]
+# name = "storage"
+# harness = false
