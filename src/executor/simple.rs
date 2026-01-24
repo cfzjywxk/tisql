@@ -1,8 +1,8 @@
 use crate::catalog::Catalog;
 use crate::error::{Result, TiSqlError};
 use crate::sql::{AggFunc, BinaryOp, Expr, LogicalPlan, UnaryOp};
-use crate::storage::{encode_key, encode_pk, encode_row, decode_row, StorageEngine, WriteBatch};
-use crate::types::{ColumnInfo, DataType, Row, Schema, Value};
+use crate::storage::{decode_row_to_values, encode_key, encode_pk, encode_row, StorageEngine, WriteBatch};
+use crate::types::{ColumnId, ColumnInfo, DataType, Row, Schema, Value};
 
 use super::{ExecutionResult, Executor};
 
@@ -88,11 +88,16 @@ impl Executor for SimpleExecutor {
                 let start_key = encode_key(table_id, &[]);
                 let end_key = encode_key(table_id + 1, &[]);
 
+                // Extract column IDs and data types for decoding
+                let col_ids: Vec<ColumnId> = table.columns.iter().map(|c| c.id).collect();
+                let data_types: Vec<DataType> = table.columns.iter().map(|c| c.data_type.clone()).collect();
+
                 let iter = storage.scan(start_key..end_key)?;
 
                 let mut rows = Vec::new();
                 for (_, value) in iter {
-                    let row = decode_row(&value)?;
+                    let values = decode_row_to_values(&value, &col_ids, &data_types)?;
+                    let row = Row::new(values);
 
                     // Apply filter
                     if let Some(ref filter_expr) = filter {
@@ -249,6 +254,9 @@ impl Executor for SimpleExecutor {
                 let mut count = 0u64;
                 let mut row_counter = 0u64;
 
+                // Get column IDs for encoding
+                let col_ids: Vec<ColumnId> = table.columns.iter().map(|c| c.id).collect();
+
                 for row_exprs in values {
                     // Build row values
                     let mut row_values = vec![Value::Null; table.columns.len()];
@@ -272,26 +280,24 @@ impl Executor for SimpleExecutor {
                         }
                     }
 
-                    let row = Row::new(row_values);
-
                     // Build primary key - use all columns if no PK defined
                     let pk_values: Vec<_> = if pk_indices.is_empty() {
                         // No explicit primary key - use all values plus a row counter for uniqueness
-                        let mut vals = row.values.clone();
+                        let mut vals = row_values.clone();
                         vals.push(Value::BigInt(row_counter as i64));
                         row_counter += 1;
                         vals
                     } else {
                         pk_indices
                             .iter()
-                            .map(|&i| row.values[i].clone())
+                            .map(|&i| row_values[i].clone())
                             .collect()
                     };
                     let pk_bytes = encode_pk(&pk_values);
                     let key = encode_key(table.id, &pk_bytes);
 
-                    // Encode row
-                    let value = encode_row(&row)?;
+                    // Encode row using TiDB codec format
+                    let value = encode_row(&col_ids, &row_values);
 
                     batch.put(key, value);
                     count += 1;
@@ -335,12 +341,17 @@ impl Executor for SimpleExecutor {
                 let start_key = encode_key(table_id, &[]);
                 let end_key = encode_key(table_id + 1, &[]);
 
+                // Extract column IDs and data types for decoding
+                let col_ids: Vec<ColumnId> = table.columns.iter().map(|c| c.id).collect();
+                let data_types: Vec<DataType> = table.columns.iter().map(|c| c.data_type.clone()).collect();
+
                 let mut batch = WriteBatch::new();
                 let mut count = 0u64;
 
                 let iter = storage.scan(start_key..end_key)?;
                 for (key, value) in iter {
-                    let row = decode_row(&value)?;
+                    let values = decode_row_to_values(&value, &col_ids, &data_types)?;
+                    let row = Row::new(values);
 
                     // Apply filter
                     if let Some(ref filter_expr) = filter {
@@ -365,12 +376,17 @@ impl Executor for SimpleExecutor {
                 let start_key = encode_key(table_id, &[]);
                 let end_key = encode_key(table_id + 1, &[]);
 
+                // Extract column IDs and data types for encoding/decoding
+                let col_ids: Vec<ColumnId> = table.columns.iter().map(|c| c.id).collect();
+                let data_types: Vec<DataType> = table.columns.iter().map(|c| c.data_type.clone()).collect();
+
                 let mut batch = WriteBatch::new();
                 let mut count = 0u64;
 
                 let iter = storage.scan(start_key..end_key)?;
                 for (key, value) in iter {
-                    let mut row = decode_row(&value)?;
+                    let values = decode_row_to_values(&value, &col_ids, &data_types)?;
+                    let mut row = Row::new(values);
 
                     // Apply filter
                     if let Some(ref filter_expr) = filter {
@@ -405,8 +421,8 @@ impl Executor for SimpleExecutor {
                         batch.delete(key);
                     }
 
-                    // Write new row
-                    let new_value = encode_row(&row)?;
+                    // Write new row using TiDB codec format
+                    let new_value = encode_row(&col_ids, &row.values);
                     batch.put(new_key, new_value);
                     count += 1;
                 }

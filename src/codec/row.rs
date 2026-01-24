@@ -20,10 +20,12 @@
 //! - Small row: colID = 1 byte, offset = 2 bytes (for common cases)
 //! - Large row: colID = 4 bytes, offset = 4 bytes (for > 255 columns or > 64KB data)
 
-use crate::codec::number::{encode_compact_i64, encode_compact_u64};
+use crate::codec::number::{
+    decode_compact_i64, decode_compact_u64, encode_compact_i64, encode_compact_u64,
+};
 use crate::codec::CODEC_VER;
 use crate::error::{Result, TiSqlError};
-use crate::types::{ColumnId, Value};
+use crate::types::{ColumnId, DataType, Value};
 
 /// Row format flags
 const ROW_FLAG_LARGE: u8 = 0x01;
@@ -109,51 +111,47 @@ impl RowEncoder {
             self.offsets.resize(self.num_not_null_cols as usize, 0);
         }
 
-        // Collect and sort columns
-        let mut not_null_cols: Vec<(ColumnId, &Value)> = Vec::new();
-        let mut null_cols: Vec<ColumnId> = Vec::new();
+        // Build sorted indices instead of copying data
+        let mut indices: Vec<usize> = (0..col_ids.len()).collect();
+        indices.sort_by_key(|&i| col_ids[i]);
 
-        for (col_id, value) in col_ids.iter().zip(values.iter()) {
+        // Encode columns in sorted order
+        let mut not_null_idx = 0usize;
+        let mut null_idx = self.num_not_null_cols as usize;
+
+        for &i in &indices {
+            let col_id = col_ids[i];
+            let value = &values[i];
+
             if value.is_null() {
-                null_cols.push(*col_id);
+                // Store null column ID
+                if self.is_large() {
+                    self.col_ids32[null_idx] = col_id;
+                } else {
+                    self.col_ids[null_idx] = col_id as u8;
+                }
+                null_idx += 1;
             } else {
-                not_null_cols.push((*col_id, value));
-            }
-        }
+                // Store non-null column ID and encode value
+                if self.is_large() {
+                    self.col_ids32[not_null_idx] = col_id;
+                } else {
+                    self.col_ids[not_null_idx] = col_id as u8;
+                }
 
-        // Sort by column ID
-        not_null_cols.sort_by_key(|(id, _)| *id);
-        null_cols.sort();
+                encode_value_compact(&mut self.data, value);
 
-        // Encode non-null columns
-        for (i, (col_id, value)) in not_null_cols.iter().enumerate() {
-            if self.is_large() {
-                self.col_ids32[i] = *col_id;
-            } else {
-                self.col_ids[i] = *col_id as u8;
-            }
+                // Check if we need to convert to large row
+                if self.data.len() > u16::MAX as usize && !self.is_large() {
+                    self.convert_to_large();
+                }
 
-            encode_value_compact(&mut self.data, value);
-
-            // Check if we need to convert to large row
-            if self.data.len() > u16::MAX as usize && !self.is_large() {
-                self.convert_to_large();
-            }
-
-            if self.is_large() {
-                self.offsets32[i] = self.data.len() as u32;
-            } else {
-                self.offsets[i] = self.data.len() as u16;
-            }
-        }
-
-        // Store null column IDs
-        for (i, col_id) in null_cols.iter().enumerate() {
-            let idx = self.num_not_null_cols as usize + i;
-            if self.is_large() {
-                self.col_ids32[idx] = *col_id;
-            } else {
-                self.col_ids[idx] = *col_id as u8;
+                if self.is_large() {
+                    self.offsets32[not_null_idx] = self.data.len() as u32;
+                } else {
+                    self.offsets[not_null_idx] = self.data.len() as u16;
+                }
+                not_null_idx += 1;
             }
         }
 
@@ -176,7 +174,17 @@ impl RowEncoder {
 
     /// Serialize the row to bytes.
     fn to_bytes(&self) -> Vec<u8> {
-        let mut buf = Vec::new();
+        // Pre-calculate buffer size
+        let total_cols = self.num_not_null_cols as usize + self.num_null_cols as usize;
+        let col_id_size = if self.is_large() { 4 } else { 1 };
+        let offset_size = if self.is_large() { 4 } else { 2 };
+
+        let size = SMALL_ROW_HEADER_SIZE
+            + total_cols * col_id_size
+            + self.num_not_null_cols as usize * offset_size
+            + self.data.len();
+
+        let mut buf = Vec::with_capacity(size);
 
         // Version
         buf.push(CODEC_VER);
@@ -422,6 +430,88 @@ pub fn encode_value_compact(buf: &mut Vec<u8>, value: &Value) {
     }
 }
 
+/// Decode a value from compact format given its data type.
+pub fn decode_value_compact(data: &[u8], data_type: &DataType) -> Result<Value> {
+    if data.is_empty() {
+        // For types that might have empty representation
+        match data_type {
+            DataType::Varchar(_) | DataType::Text | DataType::Char(_) => {
+                return Ok(Value::String(String::new()));
+            }
+            DataType::Blob => return Ok(Value::Bytes(Vec::new())),
+            _ => {}
+        }
+    }
+
+    match data_type {
+        DataType::Boolean => {
+            if data.is_empty() {
+                return Err(TiSqlError::Codec("boolean data too short".into()));
+            }
+            Ok(Value::Boolean(data[0] != 0))
+        }
+        DataType::TinyInt => {
+            let v = decode_compact_i64(data)?;
+            Ok(Value::TinyInt(v as i8))
+        }
+        DataType::SmallInt => {
+            let v = decode_compact_i64(data)?;
+            Ok(Value::SmallInt(v as i16))
+        }
+        DataType::Int => {
+            let v = decode_compact_i64(data)?;
+            Ok(Value::Int(v as i32))
+        }
+        DataType::BigInt => {
+            let v = decode_compact_i64(data)?;
+            Ok(Value::BigInt(v))
+        }
+        DataType::Float => {
+            if data.len() < 4 {
+                return Err(TiSqlError::Codec("float data too short".into()));
+            }
+            let v = f32::from_le_bytes([data[0], data[1], data[2], data[3]]);
+            Ok(Value::Float(v))
+        }
+        DataType::Double => {
+            if data.len() < 8 {
+                return Err(TiSqlError::Codec("double data too short".into()));
+            }
+            let v = f64::from_le_bytes([
+                data[0], data[1], data[2], data[3], data[4], data[5], data[6], data[7],
+            ]);
+            Ok(Value::Double(v))
+        }
+        DataType::Varchar(_) | DataType::Text | DataType::Char(_) => {
+            let s = String::from_utf8(data.to_vec())
+                .map_err(|e| TiSqlError::Codec(format!("invalid utf8: {}", e)))?;
+            Ok(Value::String(s))
+        }
+        DataType::Blob => Ok(Value::Bytes(data.to_vec())),
+        DataType::Date => {
+            let v = decode_compact_i64(data)?;
+            Ok(Value::Date(v as i32))
+        }
+        DataType::Time => {
+            let v = decode_compact_i64(data)?;
+            Ok(Value::Time(v))
+        }
+        DataType::DateTime => {
+            let v = decode_compact_u64(data)?;
+            Ok(Value::DateTime(v as i64))
+        }
+        DataType::Timestamp => {
+            let v = decode_compact_u64(data)?;
+            Ok(Value::Timestamp(v as i64))
+        }
+        DataType::Decimal { .. } => {
+            let s = String::from_utf8(data.to_vec())
+                .map_err(|e| TiSqlError::Codec(format!("invalid decimal utf8: {}", e)))?;
+            Ok(Value::Decimal(s))
+        }
+    }
+}
+
 // ============================================================================
 // Convenience Functions
 // ============================================================================
@@ -447,6 +537,42 @@ pub fn encode_row(col_ids: &[ColumnId], values: &[Value]) -> Vec<u8> {
 /// Returns a RowDecoder that can be used to access column values.
 pub fn decode_row(data: &[u8]) -> Result<RowDecoder> {
     RowDecoder::new(data)
+}
+
+/// Decode a row to a Vec<Value> given column IDs and their data types.
+/// The returned Vec will have the same order as the col_ids/data_types slices.
+pub fn decode_row_to_values(
+    data: &[u8],
+    col_ids: &[ColumnId],
+    data_types: &[DataType],
+) -> Result<Vec<Value>> {
+    if col_ids.len() != data_types.len() {
+        return Err(TiSqlError::Codec(
+            "col_ids and data_types length mismatch".into(),
+        ));
+    }
+
+    let decoder = RowDecoder::new(data)?;
+    let mut values = Vec::with_capacity(col_ids.len());
+
+    for (col_id, data_type) in col_ids.iter().zip(data_types.iter()) {
+        match decoder.find_col(*col_id) {
+            Some(Some(col_data)) => {
+                let value = decode_value_compact(col_data, data_type)?;
+                values.push(value);
+            }
+            Some(None) => {
+                // Column is null
+                values.push(Value::Null);
+            }
+            None => {
+                // Column not found in row, treat as null
+                values.push(Value::Null);
+            }
+        }
+    }
+
+    Ok(values)
 }
 
 #[cfg(test)]
@@ -603,5 +729,62 @@ mod tests {
         assert_eq!(decoder.find_col(1), Some(None));
         assert_eq!(decoder.find_col(2), Some(None));
         assert_eq!(decoder.find_col(3), Some(None));
+    }
+
+    #[test]
+    fn test_decode_row_to_values_roundtrip() {
+        use crate::types::DataType;
+
+        let col_ids = vec![1, 2, 3, 4, 5];
+        let data_types = vec![
+            DataType::Int,
+            DataType::Varchar(255),
+            DataType::BigInt,
+            DataType::Boolean,
+            DataType::Double,
+        ];
+        let values = vec![
+            Value::Int(42),
+            Value::String("hello world".into()),
+            Value::BigInt(123456789),
+            Value::Boolean(true),
+            Value::Double(3.14159),
+        ];
+
+        let encoded = encode_row(&col_ids, &values);
+        let decoded = decode_row_to_values(&encoded, &col_ids, &data_types).unwrap();
+
+        assert_eq!(decoded.len(), values.len());
+        assert_eq!(decoded[0], Value::Int(42));
+        assert_eq!(decoded[1], Value::String("hello world".into()));
+        assert_eq!(decoded[2], Value::BigInt(123456789));
+        assert_eq!(decoded[3], Value::Boolean(true));
+        // Float comparison with tolerance
+        if let Value::Double(d) = decoded[4] {
+            assert!((d - 3.14159).abs() < 0.00001);
+        } else {
+            panic!("Expected Double");
+        }
+    }
+
+    #[test]
+    fn test_decode_row_to_values_with_nulls() {
+        use crate::types::DataType;
+
+        let col_ids = vec![1, 2, 3];
+        let data_types = vec![DataType::Int, DataType::Varchar(100), DataType::BigInt];
+        let values = vec![
+            Value::Int(100),
+            Value::Null,
+            Value::BigInt(-500),
+        ];
+
+        let encoded = encode_row(&col_ids, &values);
+        let decoded = decode_row_to_values(&encoded, &col_ids, &data_types).unwrap();
+
+        assert_eq!(decoded.len(), 3);
+        assert_eq!(decoded[0], Value::Int(100));
+        assert_eq!(decoded[1], Value::Null);
+        assert_eq!(decoded[2], Value::BigInt(-500));
     }
 }

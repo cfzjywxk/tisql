@@ -34,7 +34,10 @@ pub use number::{
     decode_varint, decode_varuint, encode_comparable_i64, encode_comparable_u64,
     encode_compact_i64, encode_compact_u64, encode_varint, encode_varuint,
 };
-pub use row::{decode_row, encode_row, RowCodec, RowDecoder, RowEncoder};
+pub use row::{
+    decode_row, decode_row_to_values, decode_value_compact, encode_row, encode_value_compact,
+    RowCodec, RowDecoder, RowEncoder,
+};
 
 /// Codec version constant (matches TiDB's CodecVer = 128)
 pub const CODEC_VER: u8 = 128;

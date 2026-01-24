@@ -26,6 +26,36 @@ tisql/
 
 ## Progress Log
 
+### Session 2026-01-24 (Update): Switch Row Encoding to TiDB Codec
+**Goal**: Use TiDB-compatible codec for row value encoding (replacing bincode)
+
+**Completed**:
+- **Switched row encoding from bincode to TiDB codec format**:
+  - Row values now use `codec::row::encode_row(col_ids, values)` instead of bincode
+  - Added `decode_row_to_values(data, col_ids, data_types)` for decoding with schema info
+  - Added `decode_value_compact(data, data_type)` for individual value decoding
+- **Updated executor** to use new encoding/decoding functions:
+  - Scan, Insert, Update, Delete operations now pass column IDs and data types
+  - Keys still use memcomparable encoding for BTreeMap ordering
+- **Optimized RowEncoder**:
+  - Use sorted indices instead of copying data for sorting
+  - Pre-allocate buffer size in `to_bytes()`
+- **Removed bincode dependency from storage layer**
+- All 63 tests passing (2 new codec tests added)
+
+**Key Design Decisions**:
+- Keys: memcomparable encoding (preserves ordering)
+- Row values: TiDB compact row format with column IDs and type-aware encoding
+- Decoding requires schema info (column IDs and data types)
+
+**Files Changed**:
+- Modified: `src/codec/row.rs` (added decode functions, optimized encoder)
+- Modified: `src/codec/mod.rs` (new exports)
+- Modified: `src/storage/mod.rs` (removed bincode, use codec re-exports)
+- Modified: `src/executor/simple.rs` (pass column IDs/types for encoding)
+
+---
+
 ### Session 2026-01-24: TiDB-Compatible Codec Module
 **Goal**: Create standalone key/value encoding utilities following TiDB patterns
 
@@ -58,7 +88,6 @@ tisql/
 
 **Key Design Decisions**:
 - Keys use memcomparable encoding for correct BTreeMap ordering
-- Row values currently use bincode (codec::row for future schema-aware decode)
 - Followed TiDB's exact key format for compatibility
 
 **Files Changed**:
