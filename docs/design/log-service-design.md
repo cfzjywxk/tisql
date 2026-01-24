@@ -2,65 +2,62 @@
 
 ## Overview
 
-This document describes the design of the LogService component for TiSQL, providing persistence capabilities through a Write-Ahead Log (WAL). The design is informed by research on OceanBase's PALF (Parallel Architecture Log Framework) and TiKV's Raft-Engine.
+This document describes the design of the LogService component for TiSQL, providing persistence capabilities through a Write-Ahead Log (WAL). The design is based on TiKV's Raft-Engine patterns for local persistence, with raft-rs for future distributed replication.
 
-## Research Summary
+## Design Principles
 
-### OceanBase PALF
+1. **Simple sequential log** - No complex sliding window or out-of-order commit
+2. **Raft-Engine inspired persistence** - BitCask-style append-only log files
+3. **Raft-rs for replication** - Standard Raft consensus when distributed
+4. **Parallel apply ready** - Leave hooks for future parallel apply optimization
 
-PALF (Parallel Architecture Log Framework) is OceanBase's replicated WAL system designed for distributed databases. Key insights from the source code analysis:
-
-**Architecture Components:**
-- **LogHandler**: Primary interface between transaction layer and log service
-- **LogSlidingWindow**: In-memory window managing uncommitted logs with Paxos consensus
-- **LogEngine**: Central coordinator for storage, network, and I/O
-- **LogStorage**: Physical disk storage with block management
-- **ApplyService**: Bridges log replication and transaction execution
-
-**Key Design Patterns:**
-- Paxos-based replication with proposal IDs
-- Dual mode: APPEND (primary) and RAW_WRITE (standby)
-- Log grouping for batched I/O efficiency
-- Async I/O with callback chains
-- Accumulated checksums for batch validation
-
-**Entry Format:**
-```
-LogGroupEntryHeader (batch):
-  - Magic ("GR"), Version, Group Size
-  - Proposal ID, Committed End LSN
-  - Max SCN, Accumulated Checksum
-  - Log ID, Flags, Header Checksum
-
-LogEntryHeader (individual):
-  - Magic ("LH"), Version, Log Size
-  - SCN, Data Checksum, Flags
-```
+## Reference Implementations
 
 ### TiKV Raft-Engine
 
-Raft-Engine is a log-structured embedded storage engine inspired by BitCask. Key insights:
+[Raft-Engine](https://github.com/tikv/raft-engine) is a log-structured embedded storage engine inspired by BitCask.
 
-**Architecture Components:**
+**Key Components:**
 - **Engine**: Central coordinator exposing public API
 - **LogBatch**: Atomic batch write container
-- **MemTables**: Per-Raft-Group in-memory indexing
+- **MemTables**: Per-Raft-Group in-memory indexing (entry locations)
 - **FilePipeLog**: Dual-queue storage (Append + Rewrite queues)
-- **PurgeManager**: Collaborative garbage collection
+- **PurgeManager**: Lazy two-phase garbage collection
 
 **Key Design Patterns:**
 - Sequential append-only writes (no random I/O)
-- Partitioned memtables with router for concurrency
 - Write batching with queue leader pattern
-- Lazy two-phase garbage collection
+- Shared log stream across multiple Raft Groups
+- Feedback-driven compaction (engine reports blocking entries)
 - LZ4 compression support
 
-**Performance Benefits:**
-- 25-40% less write I/O than RocksDB
+**Why Raft-Engine over RocksDB:**
+- 25-40% less write I/O (no LSM compaction)
 - 20% lower tail latency
 - Minimal write amplification
+- No unnecessary key-sorting overhead
 
-## Proposed Architecture
+### TiKV Raft-rs
+
+[Raft-rs](https://github.com/tikv/raft-rs) is the Raft consensus implementation used by TiKV.
+
+**Integration Pattern:**
+- `RawNode<S>` with Storage trait for log persistence
+- `Unstable` for entries not yet persisted
+- `Storage` trait for persisted entries
+
+### Parallel Apply (Future)
+
+Reference: [TiDB Hackathon 2022 - Parallel Apply](https://tanxinyu.work/2022-tidb-hackathon/)
+
+**Key Insight:** Non-conflicting logs can be applied in parallel without dependency detection on the Leader side, because their key ranges must not overlap due to transaction semantics.
+
+**Design Hooks for Future:**
+- `region_id`/`partition_id` in log entries for routing
+- Apply callback interface for parallel execution
+- Term-based routing for consistency during leadership transitions
+
+## Architecture
 
 ### Component Hierarchy
 
@@ -72,73 +69,85 @@ Raft-Engine is a log-structured embedded storage engine inspired by BitCask. Key
                             │
 ┌───────────────────────────▼─────────────────────────────────────┐
 │                     PartitionService                             │
-│  (Logical partition management, key routing)                     │
-│  • Map keys to partitions                                        │
+│  • Key-to-partition routing                                      │
 │  • Future: distributed partition placement                       │
 └───────────────────────────┬─────────────────────────────────────┘
                             │
 ┌───────────────────────────▼─────────────────────────────────────┐
 │                   TransactionService                             │
-│  (MVCC, isolation levels, commit/rollback)                       │
-│  • Transaction lifecycle management                              │
-│  • Conflict detection                                            │
-│  • Visibility control                                            │
+│  • MVCC, isolation levels                                        │
+│  • Conflict detection, visibility control                        │
 └───────────────────────────┬─────────────────────────────────────┘
                             │
 ┌───────────────────────────▼─────────────────────────────────────┐
 │                      LogService                                  │
-│  (Write-Ahead Log for durability)                                │
-│  • Append log entries                                            │
-│  • Sync to disk                                                  │
+│  • Append log entries (LogBatch)                                 │
+│  • Sync to disk (fsync)                                          │
 │  • Recovery replay                                               │
-│  • Log compaction/GC                                             │
+│  • Garbage collection                                            │
+│  [Future: raft-rs integration for replication]                   │
 └───────────────────────────┬─────────────────────────────────────┘
                             │
 ┌───────────────────────────▼─────────────────────────────────────┐
 │                     StateEngine                                  │
-│  (Materialized state storage)                                    │
 │  • Current: MemTableEngine (in-memory)                           │
 │  • Future: LSM-based persistent storage                          │
+│  [Future: parallel apply from LogService]                        │
 └─────────────────────────────────────────────────────────────────┘
 ```
 
 ### Data Flow
 
 ```
-Write Path:
+Write Path (Single Node):
   Client → SQLEngine → PartitionService → TransactionService
-       → LogService.append() → LogService.sync()
+       → LogService.append_batch() → LogService.sync()
+       → StateEngine.apply() → Return to Client
+
+Write Path (Future Distributed):
+  Client → SQLEngine → PartitionService → TransactionService
+       → LogService.propose() → Raft consensus (raft-rs)
+       → LogService.append() on majority → Commit
        → StateEngine.apply() → Return to Client
 
 Read Path:
   Client → SQLEngine → PartitionService → TransactionService
-       → StateEngine.get() (with MVCC visibility check)
+       → StateEngine.get() (with MVCC visibility)
        → Return to Client
 
 Recovery Path:
   Startup → LogService.recover()
-       → Replay entries to StateEngine
+       → Replay committed entries to StateEngine
        → Ready for queries
 ```
 
 ## LogService Design
 
-### Core Traits
+### Core Types
 
 ```rust
-// src/log/mod.rs (enhanced)
+// src/log/mod.rs
 
 /// Log Sequence Number - monotonically increasing position
 pub type Lsn = u64;
 
+/// Index within a Raft log (for future raft-rs integration)
+pub type RaftIndex = u64;
+
 /// Log entry for WAL
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct LogEntry {
+    /// Log sequence number (file position)
     pub lsn: Lsn,
+
+    /// Transaction that made this change
     pub txn_id: TxnId,
-    pub partition_id: PartitionId,  // NEW: partition affinity
+
+    /// Partition/Region for routing (enables parallel apply)
+    pub region_id: u64,
+
+    /// The operation
     pub op: LogOp,
-    pub checksum: u32,              // NEW: CRC32 for integrity
 }
 
 /// Log operation types
@@ -148,481 +157,521 @@ pub enum LogOp {
     Delete { key: Key },
     Commit { commit_ts: Timestamp },
     Rollback,
-    // Future: schema changes, partition operations
 }
 
-/// Batch of log entries for atomic append
+/// Batch of log entries for atomic append (like raft-engine's LogBatch)
 pub struct LogBatch {
     entries: Vec<LogEntry>,
-    sync_required: bool,
+    compression: CompressionType,
 }
 
-/// Callback for async append completion
-pub trait AppendCallback: Send + 'static {
-    fn on_success(&self, lsn: Lsn);
-    fn on_failure(&self, error: TiSqlError);
-}
+impl LogBatch {
+    pub fn new() -> Self { ... }
 
-/// Write-ahead log interface
-pub trait WriteAheadLog: Send + Sync {
-    /// Append single entry, returns LSN
-    fn append(&self, entry: LogEntry) -> Result<Lsn>;
+    pub fn add_entry(&mut self, region_id: u64, txn_id: TxnId, op: LogOp) { ... }
 
-    /// Append batch atomically, returns last LSN
-    fn append_batch(&self, batch: LogBatch) -> Result<Lsn>;
+    pub fn add_put(&mut self, region_id: u64, txn_id: TxnId, key: Key, value: RawValue) {
+        self.add_entry(region_id, txn_id, LogOp::Put { key, value });
+    }
 
-    /// Async append with callback (for high throughput)
-    fn append_async(&self, batch: LogBatch, callback: Box<dyn AppendCallback>);
+    pub fn add_delete(&mut self, region_id: u64, txn_id: TxnId, key: Key) {
+        self.add_entry(region_id, txn_id, LogOp::Delete { key });
+    }
 
-    /// Sync to disk up to LSN (durability guarantee)
-    fn sync(&self, lsn: Lsn) -> Result<()>;
-
-    /// Read entries from LSN (for recovery)
-    fn read_from(&self, lsn: Lsn) -> Result<LogIterator>;
-
-    /// Get current append position
-    fn current_lsn(&self) -> Lsn;
-
-    /// Get last synced position
-    fn synced_lsn(&self) -> Lsn;
-
-    /// Truncate log before LSN (after checkpoint)
-    fn truncate_before(&self, lsn: Lsn) -> Result<()>;
-
-    /// Close and flush all pending writes
-    fn close(&self) -> Result<()>;
+    pub fn add_commit(&mut self, region_id: u64, txn_id: TxnId, commit_ts: Timestamp) {
+        self.add_entry(region_id, txn_id, LogOp::Commit { commit_ts });
+    }
 }
 ```
 
-### Implementation: FileLogService
+### LogService Trait
+
+```rust
+/// Write-ahead log interface
+pub trait LogService: Send + Sync {
+    /// Append batch atomically, returns last LSN
+    /// Similar to raft-engine's Engine::write()
+    fn write(&self, batch: &mut LogBatch, sync: bool) -> Result<Lsn>;
+
+    /// Read entries for a region starting from index
+    /// Similar to raft-engine's fetch_entries_to()
+    fn fetch_entries(&self, region_id: u64, from_lsn: Lsn) -> Result<Vec<LogEntry>>;
+
+    /// Get first LSN for a region
+    fn first_lsn(&self, region_id: u64) -> Option<Lsn>;
+
+    /// Get last LSN for a region
+    fn last_lsn(&self, region_id: u64) -> Option<Lsn>;
+
+    /// Compact entries before LSN for a region
+    /// Similar to raft-engine's compact_to()
+    fn compact_to(&self, region_id: u64, lsn: Lsn) -> Result<()>;
+
+    /// Purge old log files, returns regions with blocking entries
+    /// Similar to raft-engine's purge_expired_files()
+    fn purge_expired_files(&self) -> Result<Vec<u64>>;
+
+    /// Sync all pending writes to disk
+    fn sync(&self) -> Result<()>;
+}
+```
+
+### FileLogService Implementation
+
+Following raft-engine's design patterns:
 
 ```rust
 // src/log/file.rs
 
-/// Configuration for file-based log service
 pub struct FileLogConfig {
     /// Directory for log files
     pub log_dir: PathBuf,
 
-    /// Maximum size per log segment (default: 64MB)
-    pub segment_size: usize,
+    /// Target size per log file (default: 128MB)
+    pub target_file_size: usize,
 
-    /// Sync mode
-    pub sync_mode: SyncMode,
+    /// Compression type
+    pub compression: CompressionType,
 
-    /// Write buffer size (default: 4MB)
-    pub buffer_size: usize,
-
-    /// Enable compression (LZ4)
-    pub compression: bool,
+    /// Purge threshold - trigger GC when this much space is reclaimable
+    pub purge_threshold: usize,
 }
 
-pub enum SyncMode {
-    /// Sync after every commit
-    EveryCommit,
-    /// Sync at interval (e.g., every 100ms)
-    Periodic(Duration),
-    /// Sync when buffer full
-    OnBufferFull,
-    /// No sync (fastest, least durable)
-    None,
-}
-
-/// File-based WAL implementation
+/// File-based log service (raft-engine inspired)
 pub struct FileLogService {
     config: FileLogConfig,
 
-    // Current state
-    current_lsn: AtomicU64,
-    synced_lsn: AtomicU64,
+    /// Per-region memtables indexing entry locations
+    memtables: RwLock<HashMap<u64, MemTable>>,
 
-    // Active segment
-    active_segment: Mutex<LogSegment>,
+    /// Active log file for appends
+    pipe_log: Mutex<PipeLog>,
 
-    // Write buffer for batching
-    write_buffer: Mutex<WriteBuffer>,
-
-    // Background sync worker
-    sync_worker: Option<JoinHandle<()>>,
-    sync_notify: Condvar,
-
-    // Segment management
-    segments: RwLock<Vec<SegmentMeta>>,
+    /// Global stats
+    stats: LogStats,
 }
 
-/// Individual log segment file
-struct LogSegment {
+/// In-memory index for a region's entries
+struct MemTable {
+    /// Entry LSN -> file location
+    entries: BTreeMap<Lsn, FileLocation>,
+
+    /// First and last LSN
+    first_lsn: Lsn,
+    last_lsn: Lsn,
+}
+
+/// Location of an entry in log files
+#[derive(Clone, Copy)]
+struct FileLocation {
+    file_id: u64,
+    offset: u64,
+    len: u32,
+}
+
+/// Manages append-only log files
+struct PipeLog {
+    /// Active file for writing
+    active_file: LogFile,
+
+    /// All log files (id -> metadata)
+    files: BTreeMap<u64, LogFileMeta>,
+
+    /// Next file ID
+    next_file_id: u64,
+}
+
+struct LogFile {
     id: u64,
     file: File,
-    size: usize,
-    start_lsn: Lsn,
-    end_lsn: Lsn,
+    written: usize,
 }
 
-/// Metadata for segment discovery
-#[derive(Serialize, Deserialize)]
-struct SegmentMeta {
+struct LogFileMeta {
     id: u64,
-    filename: String,
-    start_lsn: Lsn,
-    end_lsn: Lsn,
-    checksum: u32,
+    path: PathBuf,
+    first_lsn: Lsn,
+    last_lsn: Lsn,
+    size: usize,
+}
+```
+
+### Write Path
+
+```rust
+impl LogService for FileLogService {
+    fn write(&self, batch: &mut LogBatch, sync: bool) -> Result<Lsn> {
+        // 1. Serialize batch (optionally compress)
+        let data = batch.serialize(self.config.compression)?;
+
+        // 2. Write to pipe log (may rotate file)
+        let locations = {
+            let mut pipe = self.pipe_log.lock();
+            pipe.append(&data, &batch.entries)?
+        };
+
+        // 3. Update memtables
+        {
+            let mut memtables = self.memtables.write();
+            for (entry, location) in batch.entries.iter().zip(locations) {
+                let table = memtables
+                    .entry(entry.region_id)
+                    .or_insert_with(MemTable::new);
+                table.insert(entry.lsn, location);
+            }
+        }
+
+        // 4. Sync if requested
+        if sync {
+            self.sync()?;
+        }
+
+        Ok(batch.entries.last().map(|e| e.lsn).unwrap_or(0))
+    }
 }
 ```
 
 ### On-Disk Format
 
+Similar to raft-engine's format:
+
 ```
-Log Directory Structure:
+Log Directory:
   data/log/
-  ├── manifest.json       # Segment metadata
-  ├── segment_000001.log  # Log segments
-  ├── segment_000002.log
+  ├── 000001.raftlog    # Log files with sequential IDs
+  ├── 000002.raftlog
+  ├── 000003.raftlog
   └── ...
 
-Segment File Format:
+Log File Format:
   ┌─────────────────────────────────────────┐
-  │ Segment Header (64 bytes)               │
-  │  - Magic: "TSQL" (4 bytes)              │
+  │ File Header (32 bytes)                  │
+  │  - Magic: "TLOG" (4 bytes)              │
   │  - Version: u32                         │
-  │  - Segment ID: u64                      │
-  │  - Start LSN: u64                       │
-  │  - Created At: u64 (timestamp)          │
-  │  - Reserved: 32 bytes                   │
+  │  - File ID: u64                         │
+  │  - Created: u64 (timestamp)             │
+  │  - Reserved: 8 bytes                    │
   └─────────────────────────────────────────┘
   ┌─────────────────────────────────────────┐
-  │ Entry Block (variable size)             │
+  │ Record 1                                │
   │  ┌───────────────────────────────────┐  │
-  │  │ Block Header (16 bytes)           │  │
-  │  │  - Entry Count: u32               │  │
-  │  │  - Block Size: u32                │  │
+  │  │ Record Header (12 bytes)          │  │
+  │  │  - Type: u8 (Entries/Compact/etc) │  │
   │  │  - Compression: u8                │  │
-  │  │  - Checksum: u32                  │  │
-  │  │  - Reserved: 3 bytes              │  │
+  │  │  - Reserved: u16                  │  │
+  │  │  - Length: u32                    │  │
+  │  │  - Checksum: u32 (CRC32)          │  │
   │  └───────────────────────────────────┘  │
   │  ┌───────────────────────────────────┐  │
-  │  │ Entry 1                           │  │
-  │  │  - LSN: u64                       │  │
-  │  │  - TxnId: u64                     │  │
-  │  │  - PartitionId: u64               │  │
-  │  │  - OpType: u8                     │  │
-  │  │  - KeyLen: u32, Key: bytes        │  │
-  │  │  - ValueLen: u32, Value: bytes    │  │
-  │  │  - Checksum: u32                  │  │
+  │  │ Record Data (variable)            │  │
+  │  │  [Serialized LogBatch entries]    │  │
   │  └───────────────────────────────────┘  │
-  │  │ Entry 2...N                       │  │
   └─────────────────────────────────────────┘
-  │ More Entry Blocks...                    │
+  │ Record 2...N                            │
   └─────────────────────────────────────────┘
 ```
 
-### Write Path Implementation
-
-```rust
-impl WriteAheadLog for FileLogService {
-    fn append_batch(&self, mut batch: LogBatch) -> Result<Lsn> {
-        // 1. Assign LSNs
-        let start_lsn = self.current_lsn.fetch_add(
-            batch.entries.len() as u64,
-            Ordering::SeqCst
-        );
-
-        for (i, entry) in batch.entries.iter_mut().enumerate() {
-            entry.lsn = start_lsn + i as u64;
-            entry.checksum = crc32(&entry);
-        }
-
-        let end_lsn = start_lsn + batch.entries.len() as u64 - 1;
-
-        // 2. Serialize and optionally compress
-        let data = if self.config.compression {
-            lz4_compress(&serialize(&batch.entries)?)
-        } else {
-            serialize(&batch.entries)?
-        };
-
-        // 3. Write to buffer
-        {
-            let mut buffer = self.write_buffer.lock();
-            buffer.append(&data, end_lsn)?;
-
-            // Flush if buffer full or sync required
-            if buffer.should_flush() || batch.sync_required {
-                self.flush_buffer(&mut buffer)?;
-            }
-        }
-
-        // 4. Sync if required
-        if batch.sync_required {
-            self.sync(end_lsn)?;
-        }
-
-        Ok(end_lsn)
-    }
-
-    fn sync(&self, lsn: Lsn) -> Result<()> {
-        // Ensure buffer is flushed
-        {
-            let mut buffer = self.write_buffer.lock();
-            if buffer.max_lsn() >= lsn {
-                self.flush_buffer(&mut buffer)?;
-            }
-        }
-
-        // fsync the segment file
-        {
-            let segment = self.active_segment.lock();
-            segment.file.sync_data()?;
-        }
-
-        // Update synced LSN
-        self.synced_lsn.store(lsn, Ordering::SeqCst);
-
-        Ok(())
-    }
-}
-```
-
-### Recovery Implementation
+### Recovery
 
 ```rust
 impl FileLogService {
-    /// Recover from log directory
-    pub fn recover(config: FileLogConfig) -> Result<(Self, Vec<LogEntry>)> {
+    pub fn open(config: FileLogConfig) -> Result<Self> {
         let log_dir = &config.log_dir;
+        std::fs::create_dir_all(log_dir)?;
 
-        // 1. Load manifest
-        let manifest_path = log_dir.join("manifest.json");
-        let segments: Vec<SegmentMeta> = if manifest_path.exists() {
-            serde_json::from_reader(File::open(&manifest_path)?)?
-        } else {
-            vec![]
-        };
+        // 1. Discover log files
+        let mut files: Vec<_> = std::fs::read_dir(log_dir)?
+            .filter_map(|e| e.ok())
+            .filter(|e| e.path().extension() == Some("raftlog".as_ref()))
+            .collect();
+        files.sort_by_key(|e| e.path());
 
-        // 2. Scan and validate segments
-        let mut entries = Vec::new();
-        let mut max_lsn = 0;
+        // 2. Replay each file to rebuild memtables
+        let mut memtables = HashMap::new();
+        let mut file_metas = BTreeMap::new();
 
-        for segment_meta in &segments {
-            let segment_path = log_dir.join(&segment_meta.filename);
-            let segment_entries = Self::read_segment(&segment_path)?;
+        for entry in files {
+            let path = entry.path();
+            let (file_id, entries, meta) = Self::replay_file(&path)?;
 
-            for entry in segment_entries {
-                // Validate checksum
-                if crc32(&entry) != entry.checksum {
-                    return Err(TiSqlError::CorruptedLog(entry.lsn));
-                }
-                max_lsn = max_lsn.max(entry.lsn);
-                entries.push(entry);
+            for (lsn, region_id, location) in entries {
+                let table = memtables
+                    .entry(region_id)
+                    .or_insert_with(MemTable::new);
+                table.insert(lsn, location);
             }
+
+            file_metas.insert(file_id, meta);
         }
 
-        // 3. Initialize service at recovered position
-        let service = Self::new_at(config, max_lsn + 1, segments)?;
+        // 3. Open or create active file
+        let next_file_id = file_metas.keys().last().map(|id| id + 1).unwrap_or(1);
+        let active_file = LogFile::create(log_dir.join(format!("{:06}.raftlog", next_file_id)))?;
 
-        Ok((service, entries))
+        Ok(Self {
+            config,
+            memtables: RwLock::new(memtables),
+            pipe_log: Mutex::new(PipeLog {
+                active_file,
+                files: file_metas,
+                next_file_id: next_file_id + 1,
+            }),
+            stats: LogStats::default(),
+        })
     }
 
-    fn read_segment(path: &Path) -> Result<Vec<LogEntry>> {
-        let file = File::open(path)?;
-        let mut reader = BufReader::new(file);
+    fn replay_file(path: &Path) -> Result<(u64, Vec<(Lsn, u64, FileLocation)>, LogFileMeta)> {
+        let mut file = File::open(path)?;
+        let header = FileHeader::read_from(&mut file)?;
 
-        // Read and validate header
-        let header = SegmentHeader::read_from(&mut reader)?;
-        if header.magic != SEGMENT_MAGIC {
-            return Err(TiSqlError::InvalidSegment);
-        }
-
-        // Read entry blocks until EOF
         let mut entries = Vec::new();
-        loop {
-            match BlockHeader::read_from(&mut reader) {
-                Ok(block_header) => {
-                    let block_data = read_bytes(&mut reader, block_header.size)?;
+        let mut offset = FILE_HEADER_SIZE as u64;
 
-                    // Validate block checksum
-                    if crc32(&block_data) != block_header.checksum {
-                        break; // Truncated write, stop here
+        loop {
+            match RecordHeader::read_from(&mut file) {
+                Ok(record_header) => {
+                    // Validate checksum
+                    let data = read_bytes(&mut file, record_header.length as usize)?;
+                    if crc32(&data) != record_header.checksum {
+                        break; // Corrupted, stop here
                     }
 
-                    // Decompress if needed
-                    let data = if block_header.compression > 0 {
-                        lz4_decompress(&block_data)?
-                    } else {
-                        block_data
-                    };
+                    // Decompress and parse
+                    let batch_entries = LogBatch::deserialize(&data, record_header.compression)?;
 
-                    // Deserialize entries
-                    let block_entries: Vec<LogEntry> = deserialize(&data)?;
-                    entries.extend(block_entries);
+                    for (i, entry) in batch_entries.iter().enumerate() {
+                        let location = FileLocation {
+                            file_id: header.file_id,
+                            offset: offset + RECORD_HEADER_SIZE as u64,
+                            len: record_header.length,
+                        };
+                        entries.push((entry.lsn, entry.region_id, location));
+                    }
+
+                    offset += RECORD_HEADER_SIZE as u64 + record_header.length as u64;
                 }
                 Err(_) => break, // EOF
             }
         }
 
-        Ok(entries)
+        let meta = LogFileMeta {
+            id: header.file_id,
+            path: path.to_path_buf(),
+            first_lsn: entries.first().map(|(lsn, _, _)| *lsn).unwrap_or(0),
+            last_lsn: entries.last().map(|(lsn, _, _)| *lsn).unwrap_or(0),
+            size: offset as usize,
+        };
+
+        Ok((header.file_id, entries, meta))
     }
 }
 ```
 
-## Integration with TransactionService
+### Garbage Collection
 
-### Transaction Commit Flow
+Following raft-engine's lazy two-phase approach:
 
 ```rust
-impl TransactionService {
-    pub fn commit(&self, txn: &mut Transaction) -> Result<Timestamp> {
-        // 1. Get commit timestamp
-        let commit_ts = self.timestamp_oracle.get_ts();
-
-        // 2. Build log batch from transaction writes
-        let mut batch = LogBatch::new();
-        for write in txn.writes() {
-            batch.add(LogEntry {
-                lsn: 0, // Assigned by LogService
-                txn_id: txn.id(),
-                partition_id: self.partition_service.get_partition(&write.key),
-                op: write.op.clone(),
-                checksum: 0,
-            });
+impl LogService for FileLogService {
+    fn compact_to(&self, region_id: u64, lsn: Lsn) -> Result<()> {
+        // Logical compaction: remove entries from memtable
+        let mut memtables = self.memtables.write();
+        if let Some(table) = memtables.get_mut(&region_id) {
+            table.entries.retain(|&entry_lsn, _| entry_lsn >= lsn);
+            if let Some((&first, _)) = table.entries.first_key_value() {
+                table.first_lsn = first;
+            }
         }
+        Ok(())
+    }
 
-        // 3. Add commit record
-        batch.add(LogEntry {
-            lsn: 0,
-            txn_id: txn.id(),
-            partition_id: 0, // Global
-            op: LogOp::Commit { commit_ts },
-            checksum: 0,
-        });
-        batch.set_sync_required(true);
+    fn purge_expired_files(&self) -> Result<Vec<u64>> {
+        // Find files where all entries have been compacted
+        let memtables = self.memtables.read();
+        let mut pipe = self.pipe_log.lock();
 
-        // 4. Append to log (durability)
-        let commit_lsn = self.log_service.append_batch(batch)?;
-
-        // 5. Apply to state engine
-        for write in txn.writes() {
-            match &write.op {
-                LogOp::Put { key, value } => {
-                    self.state_engine.put_versioned(key, value, commit_ts)?;
-                }
-                LogOp::Delete { key } => {
-                    self.state_engine.delete_versioned(key, commit_ts)?;
-                }
-                _ => {}
+        // Find minimum LSN per file still referenced
+        let mut file_min_lsn: HashMap<u64, Lsn> = HashMap::new();
+        for table in memtables.values() {
+            for location in table.entries.values() {
+                let min = file_min_lsn.entry(location.file_id).or_insert(Lsn::MAX);
+                // Track that this file still has live entries
+                *min = (*min).min(location.file_id);
             }
         }
 
-        // 6. Mark transaction committed
-        txn.set_committed(commit_ts, commit_lsn);
-
-        Ok(commit_ts)
-    }
-}
-```
-
-### Startup and Recovery
-
-```rust
-impl Database {
-    pub fn open(config: DatabaseConfig) -> Result<Self> {
-        // 1. Recover LogService and get entries
-        let (log_service, entries) = FileLogService::recover(config.log)?;
-
-        // 2. Create state engine
-        let state_engine = MemTableEngine::new();
-
-        // 3. Replay log entries
-        let mut committed_txns = HashSet::new();
-        let mut pending_writes: HashMap<TxnId, Vec<LogEntry>> = HashMap::new();
-
-        // First pass: identify committed transactions
-        for entry in &entries {
-            if let LogOp::Commit { .. } = entry.op {
-                committed_txns.insert(entry.txn_id);
-            }
-        }
-
-        // Second pass: apply committed writes
-        for entry in entries {
-            if committed_txns.contains(&entry.txn_id) {
-                match entry.op {
-                    LogOp::Put { key, value } => {
-                        state_engine.put(&key, &value)?;
-                    }
-                    LogOp::Delete { key } => {
-                        state_engine.delete(&key)?;
-                    }
-                    _ => {}
-                }
-            }
-            // Uncommitted transactions are automatically rolled back
-        }
-
-        // 4. Build catalog from state
-        let catalog = Self::rebuild_catalog(&state_engine)?;
-
-        // 5. Create services
-        let partition_service = PartitionService::new();
-        let transaction_service = TransactionService::new(
-            Arc::new(log_service),
-            Arc::new(state_engine),
-        );
-
-        Ok(Self {
-            catalog,
-            partition_service,
-            transaction_service,
-            parser: Parser::new(),
-            executor: SimpleExecutor::new(),
-        })
-    }
-}
-```
-
-## Garbage Collection and Compaction
-
-### Checkpoint and Truncation
-
-```rust
-impl LogService {
-    /// Create checkpoint - safe truncation point
-    pub fn checkpoint(&self) -> Result<Lsn> {
-        // 1. Get current state snapshot LSN
-        let snapshot_lsn = self.synced_lsn();
-
-        // 2. Ensure all pending transactions are resolved
-        // (committed or rolled back)
-
-        // 3. Record checkpoint in manifest
-        self.record_checkpoint(snapshot_lsn)?;
-
-        Ok(snapshot_lsn)
-    }
-
-    /// Truncate log entries before checkpoint
-    pub fn truncate_before(&self, lsn: Lsn) -> Result<()> {
-        let mut segments = self.segments.write();
-
-        // Find segments fully before LSN
-        let to_remove: Vec<_> = segments
+        // Delete files with no live entries (except active file)
+        let active_id = pipe.active_file.id;
+        let to_delete: Vec<_> = pipe.files
             .iter()
-            .filter(|s| s.end_lsn < lsn)
-            .map(|s| s.filename.clone())
+            .filter(|(id, _)| **id != active_id && !file_min_lsn.contains_key(id))
+            .map(|(id, meta)| (*id, meta.path.clone()))
             .collect();
 
-        // Remove segment files
-        for filename in &to_remove {
-            let path = self.config.log_dir.join(filename);
-            std::fs::remove_file(path)?;
+        for (id, path) in to_delete {
+            std::fs::remove_file(&path)?;
+            pipe.files.remove(&id);
         }
 
-        // Update manifest
-        segments.retain(|s| s.end_lsn >= lsn);
-        self.save_manifest(&segments)?;
+        // Return regions that are blocking GC (have old entries)
+        let blocking_regions: Vec<u64> = memtables
+            .iter()
+            .filter(|(_, table)| {
+                table.entries.values().any(|loc| {
+                    pipe.files.get(&loc.file_id)
+                        .map(|f| f.size > self.config.purge_threshold)
+                        .unwrap_or(false)
+                })
+            })
+            .map(|(region_id, _)| *region_id)
+            .collect();
+
+        Ok(blocking_regions)
+    }
+}
+```
+
+## Future: Raft-rs Integration
+
+When distributed replication is needed, integrate with raft-rs:
+
+```rust
+// Future: src/log/raft.rs
+
+use raft::{RawNode, Storage, Config};
+use raft::eraftpb::{Entry, Snapshot, HardState, ConfState};
+
+/// Raft storage backed by FileLogService
+pub struct RaftLogStorage {
+    region_id: u64,
+    log_service: Arc<FileLogService>,
+
+    /// Raft hard state (term, vote, commit)
+    hard_state: HardState,
+
+    /// Raft conf state (voters, learners)
+    conf_state: ConfState,
+}
+
+impl Storage for RaftLogStorage {
+    fn initial_state(&self) -> raft::Result<RaftState> {
+        Ok(RaftState {
+            hard_state: self.hard_state.clone(),
+            conf_state: self.conf_state.clone(),
+        })
+    }
+
+    fn entries(&self, low: u64, high: u64, max_size: impl Into<Option<u64>>) -> raft::Result<Vec<Entry>> {
+        // Fetch from log service
+        let entries = self.log_service.fetch_entries(self.region_id, low)?;
+        // Convert LogEntry to raft Entry
+        ...
+    }
+
+    fn term(&self, idx: u64) -> raft::Result<u64> { ... }
+    fn first_index(&self) -> raft::Result<u64> { ... }
+    fn last_index(&self) -> raft::Result<u64> { ... }
+    fn snapshot(&self, request_index: u64, to: u64) -> raft::Result<Snapshot> { ... }
+}
+
+/// Raft node for a partition/region
+pub struct RaftNode {
+    raw_node: RawNode<RaftLogStorage>,
+    log_service: Arc<FileLogService>,
+    apply_sender: Sender<ApplyTask>,  // For parallel apply
+}
+
+impl RaftNode {
+    /// Propose a write to the Raft group
+    pub fn propose(&mut self, data: Vec<u8>) -> Result<()> {
+        self.raw_node.propose(vec![], data)?;
+        Ok(())
+    }
+
+    /// Drive Raft state machine
+    pub fn tick(&mut self) {
+        self.raw_node.tick();
+    }
+
+    /// Process ready state
+    pub fn handle_ready(&mut self) -> Result<()> {
+        if !self.raw_node.has_ready() {
+            return Ok(());
+        }
+
+        let mut ready = self.raw_node.ready();
+
+        // 1. Persist entries and hard state
+        if !ready.entries().is_empty() {
+            let mut batch = LogBatch::new();
+            for entry in ready.entries() {
+                // Convert raft Entry to LogEntry
+                batch.add_raft_entry(self.region_id, entry);
+            }
+            self.log_service.write(&mut batch, true)?;
+        }
+
+        // 2. Send messages to peers
+        for msg in ready.take_messages() {
+            self.send_message(msg)?;
+        }
+
+        // 3. Apply committed entries
+        for entry in ready.take_committed_entries() {
+            self.apply_sender.send(ApplyTask {
+                region_id: self.region_id,
+                entry,
+            })?;
+        }
+
+        // 4. Advance Raft
+        let mut light_rd = self.raw_node.advance(ready);
+        // Handle light ready...
 
         Ok(())
     }
+}
+```
+
+## Future: Parallel Apply
+
+Leave hooks for parallel apply optimization:
+
+```rust
+// Future: src/apply/mod.rs
+
+/// Apply task for a committed entry
+pub struct ApplyTask {
+    pub region_id: u64,
+    pub entry: LogEntry,
+    pub callback: Option<Box<dyn ApplyCallback>>,
+}
+
+/// Parallel apply pool
+pub struct ApplyPool {
+    /// Per-region apply workers
+    workers: HashMap<u64, ApplyWorker>,
+
+    /// State engine for applying changes
+    state_engine: Arc<dyn StateEngine>,
+}
+
+impl ApplyPool {
+    /// Submit task for parallel apply
+    /// Non-conflicting regions can be applied concurrently
+    pub fn submit(&self, task: ApplyTask) {
+        let worker = self.workers
+            .entry(task.region_id)
+            .or_insert_with(|| ApplyWorker::new(task.region_id));
+        worker.submit(task);
+    }
+}
+
+/// Worker for a specific region (maintains ordering within region)
+struct ApplyWorker {
+    region_id: u64,
+    pending: VecDeque<ApplyTask>,
+    applied_lsn: AtomicU64,
 }
 ```
 
@@ -631,47 +680,33 @@ impl LogService {
 ```
 src/
 ├── log/
-│   ├── mod.rs           # Traits and types
-│   ├── entry.rs         # LogEntry, LogOp, serialization
-│   ├── batch.rs         # LogBatch implementation
+│   ├── mod.rs           # LogService trait, LogEntry, LogBatch
 │   ├── file.rs          # FileLogService implementation
-│   ├── segment.rs       # Segment file management
-│   ├── buffer.rs        # Write buffer
-│   ├── recovery.rs      # Recovery logic
-│   └── checkpoint.rs    # Checkpoint and GC
+│   ├── memtable.rs      # In-memory entry index
+│   ├── pipe.rs          # PipeLog - file management
+│   └── format.rs        # On-disk format, serialization
 ├── partition/
 │   ├── mod.rs           # PartitionService trait
-│   └── simple.rs        # Single-partition impl
+│   └── single.rs        # Single-partition impl (initial)
 ├── transaction/
 │   ├── mod.rs           # Transaction trait (existing)
 │   ├── service.rs       # TransactionService
 │   └── mvcc.rs          # MVCC implementation
-└── ...
+└── apply/               # Future: parallel apply
+    ├── mod.rs
+    └── pool.rs
 ```
 
 ## Configuration
 
 ```rust
-/// Database configuration
-pub struct DatabaseConfig {
-    /// Data directory
-    pub data_dir: PathBuf,
-
-    /// Log service configuration
-    pub log: FileLogConfig,
-
-    /// State engine type
-    pub state_engine: StateEngineType,
-}
-
 impl Default for FileLogConfig {
     fn default() -> Self {
         Self {
             log_dir: PathBuf::from("data/log"),
-            segment_size: 64 * 1024 * 1024, // 64MB
-            sync_mode: SyncMode::EveryCommit,
-            buffer_size: 4 * 1024 * 1024,   // 4MB
-            compression: true,
+            target_file_size: 128 * 1024 * 1024, // 128MB
+            compression: CompressionType::Lz4,
+            purge_threshold: 256 * 1024 * 1024,  // 256MB
         }
     }
 }
@@ -679,41 +714,45 @@ impl Default for FileLogConfig {
 
 ## Implementation Phases
 
-### Phase 1: Basic WAL
-- [ ] Implement `FileLogService` with single segment
-- [ ] Entry serialization with checksums
-- [ ] Sync to disk
-- [ ] Basic recovery (replay all entries)
+### Phase 1: Basic LogService
+- [ ] LogEntry, LogBatch types
+- [ ] FileLogService with single file
+- [ ] Write path with fsync
+- [ ] Recovery (replay on startup)
 
-### Phase 2: Segment Management
-- [ ] Multiple segment files
-- [ ] Segment rotation on size limit
-- [ ] Manifest for segment tracking
-- [ ] Recovery across segments
+### Phase 2: Multi-File Management
+- [ ] File rotation on size limit
+- [ ] MemTable per region
+- [ ] Basic GC (purge_expired_files)
 
-### Phase 3: Performance Optimization
-- [ ] Write buffering
+### Phase 3: Performance
 - [ ] LZ4 compression
-- [ ] Async append with callbacks
-- [ ] Batch group commit
+- [ ] Write buffering
+- [ ] Group commit
 
-### Phase 4: Integration
+### Phase 4: Transaction Integration
 - [ ] Integrate with TransactionService
-- [ ] MVCC visibility with log LSNs
-- [ ] Checkpoint and truncation
-- [ ] Graceful shutdown
+- [ ] Commit/rollback logging
+- [ ] Recovery with uncommitted txn handling
 
-### Phase 5: Advanced Features
-- [ ] PartitionService for key routing
-- [ ] Per-partition log streams (future)
-- [ ] Distributed replication (future)
+### Phase 5: Raft Integration (Future)
+- [ ] Add raft-rs dependency
+- [ ] RaftLogStorage impl
+- [ ] RaftNode for consensus
+- [ ] Message transport
+
+### Phase 6: Parallel Apply (Future)
+- [ ] ApplyPool with per-region workers
+- [ ] Term-based routing
+- [ ] Apply index tracking
 
 ## References
 
-1. **OceanBase PALF**: VLDB 2024 paper "PALF: Replicated Write-Ahead Logging for Distributed Databases"
-2. **TiKV Raft-Engine**: https://github.com/tikv/raft-engine
-3. **BitCask**: https://riak.com/assets/bitcask-intro.pdf
-4. **TiDB Transaction Model**: https://docs.pingcap.com/tidb/stable/transaction-overview
+1. **TiKV Raft-Engine**: https://github.com/tikv/raft-engine
+2. **TiKV Raft-rs**: https://github.com/tikv/raft-rs
+3. **Raft-Engine Blog**: https://www.pingcap.com/blog/raft-engine-a-log-structured-embedded-storage-engine-for-multi-raft-logs-in-tikv/
+4. **Parallel Apply**: https://tanxinyu.work/2022-tidb-hackathon/
+5. **BitCask Paper**: https://riak.com/assets/bitcask-intro.pdf
 
 ## License
 
