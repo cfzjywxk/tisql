@@ -480,7 +480,7 @@ mod tests {
 
         let encoded: Vec<Vec<u8>> = values
             .iter()
-            .map(|v| encode_values_for_key(&[v.clone()]))
+            .map(|v| encode_values_for_key(std::slice::from_ref(v)))
             .collect();
 
         for i in 0..encoded.len() - 1 {
@@ -504,7 +504,7 @@ mod tests {
 
         let encoded: Vec<Vec<u8>> = values
             .iter()
-            .map(|v| encode_values_for_key(&[v.clone()]))
+            .map(|v| encode_values_for_key(std::slice::from_ref(v)))
             .collect();
 
         for i in 0..encoded.len() - 1 {
