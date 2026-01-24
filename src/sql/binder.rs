@@ -314,15 +314,15 @@ impl<'a> Binder<'a> {
                 }
                 SelectItem::Wildcard(_) => {
                     for table in tables {
-                        for (idx, col) in table.columns.iter().enumerate() {
+                        for (idx, col) in table.columns().iter().enumerate() {
                             exprs.push((
                                 Expr::Column {
                                     table_idx: None,
                                     column_idx: idx,
-                                    name: col.name.clone(),
-                                    data_type: col.data_type.clone(),
+                                    name: col.name().to_string(),
+                                    data_type: col.data_type().clone(),
                                 },
-                                col.name.clone(),
+                                col.name().to_string(),
                             ));
                         }
                     }
@@ -337,18 +337,18 @@ impl<'a> Binder<'a> {
 
                     let table = tables
                         .iter()
-                        .find(|t| t.name == table_name)
+                        .find(|t| t.name() == table_name)
                         .ok_or_else(|| TiSqlError::TableNotFound(table_name.into()))?;
 
-                    for (idx, col) in table.columns.iter().enumerate() {
+                    for (idx, col) in table.columns().iter().enumerate() {
                         exprs.push((
                             Expr::Column {
                                 table_idx: None,
                                 column_idx: idx,
-                                name: col.name.clone(),
-                                data_type: col.data_type.clone(),
+                                name: col.name().to_string(),
+                                data_type: col.data_type().clone(),
                             },
-                            col.name.clone(),
+                            col.name().to_string(),
                         ));
                     }
                 }
@@ -364,12 +364,12 @@ impl<'a> Binder<'a> {
                 // Look for column in tables
                 for (table_idx, table) in tables.iter().enumerate() {
                     if let Some(col_idx) = table.column_index(&ident.value) {
-                        let col = &table.columns[col_idx];
+                        let col = &table.columns()[col_idx];
                         return Ok(Expr::Column {
                             table_idx: Some(table_idx),
                             column_idx: col_idx,
-                            name: col.name.clone(),
-                            data_type: col.data_type.clone(),
+                            name: col.name().to_string(),
+                            data_type: col.data_type().clone(),
                         });
                     }
                 }
@@ -384,14 +384,14 @@ impl<'a> Binder<'a> {
                 let col_name = &idents[1].value;
 
                 for (table_idx, table) in tables.iter().enumerate() {
-                    if table.name == *table_name {
+                    if table.name() == table_name {
                         if let Some(col_idx) = table.column_index(col_name) {
-                            let col = &table.columns[col_idx];
+                            let col = &table.columns()[col_idx];
                             return Ok(Expr::Column {
                                 table_idx: Some(table_idx),
                                 column_idx: col_idx,
-                                name: col.name.clone(),
-                                data_type: col.data_type.clone(),
+                                name: col.name().to_string(),
+                                data_type: col.data_type().clone(),
                             });
                         }
                     }
@@ -551,14 +551,14 @@ impl<'a> Binder<'a> {
 
         let col_ids: Vec<u32> = if columns.is_empty() {
             // All columns
-            table.columns.iter().map(|c| c.id).collect()
+            table.columns().iter().map(|c| c.id()).collect()
         } else {
             columns
                 .iter()
                 .map(|ident| {
                     table
                         .column_by_name(&ident.value)
-                        .map(|c| c.id)
+                        .map(|c| c.id())
                         .ok_or_else(|| TiSqlError::ColumnNotFound(ident.value.clone()))
                 })
                 .collect::<Result<Vec<_>>>()?
@@ -610,7 +610,7 @@ impl<'a> Binder<'a> {
                     .column_by_name(&col_name.value)
                     .ok_or_else(|| TiSqlError::ColumnNotFound(col_name.value.clone()))?;
                 let value = self.bind_expr(&a.value, &tables)?;
-                Ok((col.id, value))
+                Ok((col.id(), value))
             })
             .collect::<Result<Vec<_>>>()?;
 
@@ -695,14 +695,14 @@ impl<'a> Binder<'a> {
                 }
             }
 
-            col_defs.push(ColumnDef {
-                id: col_id,
-                name: col.name.value.clone(),
+            col_defs.push(ColumnDef::new(
+                col_id,
+                col.name.value.clone(),
                 data_type,
                 nullable,
-                default: None,
+                None,
                 auto_increment,
-            });
+            ));
         }
 
         // Check table constraints for PRIMARY KEY
@@ -714,24 +714,22 @@ impl<'a> Binder<'a> {
             } = constraint
             {
                 for pk_col in pk_cols {
-                    if let Some(col) = col_defs.iter().find(|c| c.name == pk_col.value) {
-                        if !primary_key.contains(&col.id) {
-                            primary_key.push(col.id);
+                    if let Some(col) = col_defs.iter().find(|c| c.name() == pk_col.value) {
+                        if !primary_key.contains(&col.id()) {
+                            primary_key.push(col.id());
                         }
                     }
                 }
             }
         }
 
-        let table_def = TableDef {
-            id: table_id,
-            name: table_name,
+        let table_def = TableDef::new(
+            table_id,
+            table_name,
             schema,
-            columns: col_defs,
+            col_defs,
             primary_key,
-            indexes: vec![],
-            auto_increment_id: 0,
-        };
+        );
 
         Ok(LogicalPlan::CreateTable {
             table: table_def,
@@ -788,11 +786,11 @@ impl<'a> Binder<'a> {
             let columns = first_row
                 .iter()
                 .enumerate()
-                .map(|(i, expr)| ColumnInfo {
-                    name: format!("column{}", i),
-                    data_type: expr.data_type(),
-                    nullable: true,
-                })
+                .map(|(i, expr)| ColumnInfo::new(
+                    format!("column{}", i),
+                    expr.data_type(),
+                    true,
+                ))
                 .collect();
             Schema::new(columns)
         } else {

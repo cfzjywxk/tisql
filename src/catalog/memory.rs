@@ -1,3 +1,5 @@
+//! In-memory catalog implementation.
+
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::RwLock;
@@ -7,7 +9,10 @@ use crate::types::{IndexId, TableId};
 
 use super::{Catalog, IndexDef, TableDef};
 
-/// In-memory catalog implementation
+/// In-memory catalog implementation.
+///
+/// This implementation stores all metadata in memory and is suitable for
+/// testing and development. Data is lost when the process exits.
 pub struct MemoryCatalog {
     /// Schema name -> set of table names
     schemas: RwLock<HashMap<String, HashMap<String, TableDef>>>,
@@ -45,8 +50,7 @@ impl Catalog for MemoryCatalog {
         let mut schemas = self.schemas.write().unwrap();
         if schemas.contains_key(name) {
             return Err(TiSqlError::Catalog(format!(
-                "Schema '{}' already exists",
-                name
+                "Schema '{name}' already exists"
             )));
         }
         schemas.insert(name.to_string(), HashMap::new());
@@ -60,13 +64,12 @@ impl Catalog for MemoryCatalog {
         if let Some(tables) = schemas.remove(name) {
             // Remove all tables from tables_by_id
             for table in tables.values() {
-                tables_by_id.remove(&table.id);
+                tables_by_id.remove(&table.id());
             }
             Ok(())
         } else {
             Err(TiSqlError::Catalog(format!(
-                "Schema '{}' not found",
-                name
+                "Schema '{name}' not found"
             )))
         }
     }
@@ -86,19 +89,19 @@ impl Catalog for MemoryCatalog {
         let mut tables_by_id = self.tables_by_id.write().unwrap();
 
         let schema_tables = schemas
-            .get_mut(&table.schema)
-            .ok_or_else(|| TiSqlError::Catalog(format!("Schema '{}' not found", table.schema)))?;
+            .get_mut(table.schema())
+            .ok_or_else(|| TiSqlError::Catalog(format!("Schema '{}' not found", table.schema())))?;
 
-        if schema_tables.contains_key(&table.name) {
+        if schema_tables.contains_key(table.name()) {
             return Err(TiSqlError::Catalog(format!(
                 "Table '{}' already exists in schema '{}'",
-                table.name, table.schema
+                table.name(), table.schema()
             )));
         }
 
-        let table_id = table.id;
-        let schema_name = table.schema.clone();
-        let table_name = table.name.clone();
+        let table_id = table.id();
+        let schema_name = table.schema().to_string();
+        let table_name = table.name().to_string();
 
         schema_tables.insert(table_name.clone(), table);
         tables_by_id.insert(table_id, (schema_name, table_name));
@@ -112,13 +115,13 @@ impl Catalog for MemoryCatalog {
 
         let schema_tables = schemas
             .get_mut(schema)
-            .ok_or_else(|| TiSqlError::Catalog(format!("Schema '{}' not found", schema)))?;
+            .ok_or_else(|| TiSqlError::Catalog(format!("Schema '{schema}' not found")))?;
 
         if let Some(table_def) = schema_tables.remove(table) {
-            tables_by_id.remove(&table_def.id);
+            tables_by_id.remove(&table_def.id());
             Ok(())
         } else {
-            Err(TiSqlError::TableNotFound(format!("{}.{}", schema, table)))
+            Err(TiSqlError::TableNotFound(format!("{schema}.{table}")))
         }
     }
 
@@ -156,7 +159,7 @@ impl Catalog for MemoryCatalog {
 
         let (schema, table_name) = tables_by_id
             .get(&table_id)
-            .ok_or_else(|| TiSqlError::Catalog(format!("Table with ID {} not found", table_id)))?
+            .ok_or_else(|| TiSqlError::Catalog(format!("Table with ID {table_id} not found")))?
             .clone();
 
         let table = schemas
@@ -165,15 +168,15 @@ impl Catalog for MemoryCatalog {
             .ok_or_else(|| TiSqlError::Catalog("Table not found".into()))?;
 
         // Check for duplicate index name
-        if table.indexes.iter().any(|i| i.name == index.name) {
+        if table.indexes().iter().any(|i| i.name() == index.name()) {
             return Err(TiSqlError::Catalog(format!(
                 "Index '{}' already exists",
-                index.name
+                index.name()
             )));
         }
 
-        let index_id = index.id;
-        table.indexes.push(index);
+        let index_id = index.id();
+        table.add_index(index);
 
         Ok(index_id)
     }
@@ -184,7 +187,7 @@ impl Catalog for MemoryCatalog {
 
         let (schema, table_name) = tables_by_id
             .get(&table_id)
-            .ok_or_else(|| TiSqlError::Catalog(format!("Table with ID {} not found", table_id)))?
+            .ok_or_else(|| TiSqlError::Catalog(format!("Table with ID {table_id} not found")))?
             .clone();
 
         let table = schemas
@@ -192,13 +195,9 @@ impl Catalog for MemoryCatalog {
             .and_then(|tables| tables.get_mut(&table_name))
             .ok_or_else(|| TiSqlError::Catalog("Table not found".into()))?;
 
-        let idx = table
-            .indexes
-            .iter()
-            .position(|i| i.name == index_name)
-            .ok_or_else(|| TiSqlError::Catalog(format!("Index '{}' not found", index_name)))?;
+        table.remove_index(index_name)
+            .ok_or_else(|| TiSqlError::Catalog(format!("Index '{index_name}' not found")))?;
 
-        table.indexes.remove(idx);
         Ok(())
     }
 
@@ -208,7 +207,7 @@ impl Catalog for MemoryCatalog {
 
         let (schema, table_name) = tables_by_id
             .get(&table_id)
-            .ok_or_else(|| TiSqlError::Catalog(format!("Table with ID {} not found", table_id)))?
+            .ok_or_else(|| TiSqlError::Catalog(format!("Table with ID {table_id} not found")))?
             .clone();
 
         let table = schemas
@@ -216,8 +215,7 @@ impl Catalog for MemoryCatalog {
             .and_then(|tables| tables.get_mut(&table_name))
             .ok_or_else(|| TiSqlError::Catalog("Table not found".into()))?;
 
-        table.auto_increment_id += 1;
-        Ok(table.auto_increment_id)
+        Ok(table.increment_auto_id())
     }
 
     fn next_table_id(&self) -> Result<TableId> {
@@ -237,48 +235,46 @@ mod tests {
 
     fn make_test_table(catalog: &MemoryCatalog, name: &str) -> TableDef {
         let table_id = catalog.next_table_id().unwrap();
-        TableDef {
-            id: table_id,
-            name: name.to_string(),
-            schema: "default".to_string(),
-            columns: vec![
-                ColumnDef {
-                    id: 0,
-                    name: "id".to_string(),
-                    data_type: DataType::Int,
-                    nullable: false,
-                    default: None,
-                    auto_increment: true,
-                },
-                ColumnDef {
-                    id: 1,
-                    name: "name".to_string(),
-                    data_type: DataType::Varchar(255),
-                    nullable: true,
-                    default: None,
-                    auto_increment: false,
-                },
+        TableDef::new(
+            table_id,
+            name.to_string(),
+            "default".to_string(),
+            vec![
+                ColumnDef::new(
+                    0,
+                    "id".to_string(),
+                    DataType::Int,
+                    false,
+                    None,
+                    true,
+                ),
+                ColumnDef::new(
+                    1,
+                    "name".to_string(),
+                    DataType::Varchar(255),
+                    true,
+                    None,
+                    false,
+                ),
             ],
-            primary_key: vec![0],
-            indexes: vec![],
-            auto_increment_id: 0,
-        }
+            vec![0],
+        )
     }
 
     #[test]
     fn test_create_get_table() {
         let catalog = MemoryCatalog::new();
         let table = make_test_table(&catalog, "users");
-        let table_id = table.id;
+        let table_id = table.id();
 
         catalog.create_table(table).unwrap();
 
         let retrieved = catalog.get_table("default", "users").unwrap().unwrap();
-        assert_eq!(retrieved.id, table_id);
-        assert_eq!(retrieved.name, "users");
+        assert_eq!(retrieved.id(), table_id);
+        assert_eq!(retrieved.name(), "users");
 
         let by_id = catalog.get_table_by_id(table_id).unwrap().unwrap();
-        assert_eq!(by_id.name, "users");
+        assert_eq!(by_id.name(), "users");
     }
 
     #[test]
@@ -297,7 +293,7 @@ mod tests {
     fn test_auto_increment() {
         let catalog = MemoryCatalog::new();
         let table = make_test_table(&catalog, "users");
-        let table_id = table.id;
+        let table_id = table.id();
 
         catalog.create_table(table).unwrap();
 

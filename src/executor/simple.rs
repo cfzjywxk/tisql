@@ -54,11 +54,11 @@ impl Executor for SimpleExecutor {
                         let schema = Schema::new(
                             exprs
                                 .iter()
-                                .map(|(expr, alias)| ColumnInfo {
-                                    name: alias.clone(),
-                                    data_type: expr.data_type(),
-                                    nullable: true,
-                                })
+                                .map(|(expr, alias)| ColumnInfo::new(
+                                    alias.clone(),
+                                    expr.data_type(),
+                                    true,
+                                ))
                                 .collect(),
                         );
 
@@ -84,13 +84,13 @@ impl Executor for SimpleExecutor {
 
             LogicalPlan::Scan { table, filter, projection } => {
                 // Build key range for this table
-                let table_id = table.id;
+                let table_id = table.id();
                 let start_key = encode_key(table_id, &[]);
                 let end_key = encode_key(table_id + 1, &[]);
 
                 // Extract column IDs and data types for decoding
-                let col_ids: Vec<ColumnId> = table.columns.iter().map(|c| c.id).collect();
-                let data_types: Vec<DataType> = table.columns.iter().map(|c| c.data_type.clone()).collect();
+                let col_ids: Vec<ColumnId> = table.columns().iter().map(|c| c.id()).collect();
+                let data_types: Vec<DataType> = table.columns().iter().map(|c| c.data_type().clone()).collect();
 
                 let iter = storage.scan(start_key..end_key)?;
 
@@ -111,7 +111,7 @@ impl Executor for SimpleExecutor {
                     let projected_row = if let Some(ref indices) = projection {
                         let values = indices
                             .iter()
-                            .map(|&i| row.values.get(i).cloned().unwrap_or(Value::Null))
+                            .map(|&i| row.get(i).cloned().unwrap_or(Value::Null))
                             .collect();
                         Row::new(values)
                     } else {
@@ -123,13 +123,13 @@ impl Executor for SimpleExecutor {
 
                 let schema = Schema::new(
                     table
-                        .columns
+                        .columns()
                         .iter()
-                        .map(|c| ColumnInfo {
-                            name: c.name.clone(),
-                            data_type: c.data_type.clone(),
-                            nullable: c.nullable,
-                        })
+                        .map(|c| ColumnInfo::new(
+                            c.name().to_string(),
+                            c.data_type().clone(),
+                            c.nullable(),
+                        ))
                         .collect(),
                 );
 
@@ -226,11 +226,11 @@ impl Executor for SimpleExecutor {
                             let schema = Schema::new(
                                 agg_exprs
                                     .iter()
-                                    .map(|(_, _, alias)| ColumnInfo {
-                                        name: alias.clone(),
-                                        data_type: DataType::Double,
-                                        nullable: true,
-                                    })
+                                    .map(|(_, _, alias)| ColumnInfo::new(
+                                        alias.clone(),
+                                        DataType::Double,
+                                        true,
+                                    ))
                                     .collect(),
                             );
 
@@ -255,17 +255,17 @@ impl Executor for SimpleExecutor {
                 let mut row_counter = 0u64;
 
                 // Get column IDs for encoding
-                let col_ids: Vec<ColumnId> = table.columns.iter().map(|c| c.id).collect();
+                let col_ids: Vec<ColumnId> = table.columns().iter().map(|c| c.id()).collect();
 
                 for row_exprs in values {
                     // Build row values
-                    let mut row_values = vec![Value::Null; table.columns.len()];
+                    let mut row_values = vec![Value::Null; table.columns().len()];
 
                     for (col_idx, &col_id) in columns.iter().enumerate() {
                         let table_col_idx = table
-                            .columns
+                            .columns()
                             .iter()
-                            .position(|c| c.id == col_id)
+                            .position(|c| c.id() == col_id)
                             .ok_or_else(|| TiSqlError::ColumnNotFound(format!("id={}", col_id)))?;
 
                         let value = self.eval_expr(&row_exprs[col_idx], &Row::new(vec![]))?;
@@ -273,9 +273,9 @@ impl Executor for SimpleExecutor {
                     }
 
                     // Handle auto-increment
-                    for (idx, col) in table.columns.iter().enumerate() {
-                        if col.auto_increment && row_values[idx].is_null() {
-                            let next_id = catalog.next_auto_increment(table.id)?;
+                    for (idx, col) in table.columns().iter().enumerate() {
+                        if col.auto_increment() && row_values[idx].is_null() {
+                            let next_id = catalog.next_auto_increment(table.id())?;
                             row_values[idx] = Value::BigInt(next_id as i64);
                         }
                     }
@@ -294,7 +294,7 @@ impl Executor for SimpleExecutor {
                             .collect()
                     };
                     let pk_bytes = encode_pk(&pk_values);
-                    let key = encode_key(table.id, &pk_bytes);
+                    let key = encode_key(table.id(), &pk_bytes);
 
                     // Encode row using TiDB codec format
                     let value = encode_row(&col_ids, &row_values);
@@ -310,13 +310,13 @@ impl Executor for SimpleExecutor {
 
             LogicalPlan::CreateTable { table, if_not_exists } => {
                 // Check if table exists
-                if catalog.get_table(&table.schema, &table.name)?.is_some() {
+                if catalog.get_table(table.schema(), table.name())?.is_some() {
                     if if_not_exists {
                         return Ok(ExecutionResult::Ok);
                     }
                     return Err(TiSqlError::Catalog(format!(
                         "Table '{}' already exists",
-                        table.name
+                        table.name()
                     )));
                 }
 
@@ -337,13 +337,13 @@ impl Executor for SimpleExecutor {
             }
 
             LogicalPlan::Delete { table, filter } => {
-                let table_id = table.id;
+                let table_id = table.id();
                 let start_key = encode_key(table_id, &[]);
                 let end_key = encode_key(table_id + 1, &[]);
 
                 // Extract column IDs and data types for decoding
-                let col_ids: Vec<ColumnId> = table.columns.iter().map(|c| c.id).collect();
-                let data_types: Vec<DataType> = table.columns.iter().map(|c| c.data_type.clone()).collect();
+                let col_ids: Vec<ColumnId> = table.columns().iter().map(|c| c.id()).collect();
+                let data_types: Vec<DataType> = table.columns().iter().map(|c| c.data_type().clone()).collect();
 
                 let mut batch = WriteBatch::new();
                 let mut count = 0u64;
@@ -371,14 +371,14 @@ impl Executor for SimpleExecutor {
             }
 
             LogicalPlan::Update { table, assignments, filter } => {
-                let table_id = table.id;
+                let table_id = table.id();
                 let pk_indices = table.pk_column_indices();
                 let start_key = encode_key(table_id, &[]);
                 let end_key = encode_key(table_id + 1, &[]);
 
                 // Extract column IDs and data types for encoding/decoding
-                let col_ids: Vec<ColumnId> = table.columns.iter().map(|c| c.id).collect();
-                let data_types: Vec<DataType> = table.columns.iter().map(|c| c.data_type.clone()).collect();
+                let col_ids: Vec<ColumnId> = table.columns().iter().map(|c| c.id()).collect();
+                let data_types: Vec<DataType> = table.columns().iter().map(|c| c.data_type().clone()).collect();
 
                 let mut batch = WriteBatch::new();
                 let mut count = 0u64;
@@ -399,19 +399,19 @@ impl Executor for SimpleExecutor {
                     // Apply assignments
                     for (col_id, expr) in &assignments {
                         let col_idx = table
-                            .columns
+                            .columns()
                             .iter()
-                            .position(|c| c.id == *col_id)
+                            .position(|c| c.id() == *col_id)
                             .ok_or_else(|| TiSqlError::ColumnNotFound(format!("id={}", col_id)))?;
 
                         let new_value = self.eval_expr(expr, &row)?;
-                        row.values[col_idx] = new_value;
+                        row.set(col_idx, new_value);
                     }
 
                     // Check if PK changed
                     let pk_values: Vec<_> = pk_indices
                         .iter()
-                        .map(|&i| row.values[i].clone())
+                        .map(|&i| row.get(i).cloned().unwrap_or(Value::Null))
                         .collect();
                     let pk_bytes = encode_pk(&pk_values);
                     let new_key = encode_key(table_id, &pk_bytes);
@@ -422,7 +422,7 @@ impl Executor for SimpleExecutor {
                     }
 
                     // Write new row using TiDB codec format
-                    let new_value = encode_row(&col_ids, &row.values);
+                    let new_value = encode_row(&col_ids, row.values());
                     batch.put(new_key, new_value);
                     count += 1;
                 }
@@ -446,7 +446,7 @@ impl SimpleExecutor {
             Expr::Literal(v) => Ok(v.clone()),
 
             Expr::Column { column_idx, .. } => {
-                Ok(row.values.get(*column_idx).cloned().unwrap_or(Value::Null))
+                Ok(row.get(*column_idx).cloned().unwrap_or(Value::Null))
             }
 
             Expr::BinaryOp { left, op, right } => {

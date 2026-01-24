@@ -63,10 +63,10 @@ impl Database {
         let query_result = match result {
             ExecutionResult::Rows { schema, rows } => {
                 let row_count = rows.len();
-                let columns: Vec<String> = schema.columns.iter().map(|c| c.name.clone()).collect();
+                let columns: Vec<String> = schema.columns().iter().map(|c| c.name().to_string()).collect();
                 let data: Vec<Vec<String>> = rows
                     .iter()
-                    .map(|row| row.values.iter().map(value_to_string).collect())
+                    .map(|row| row.iter().map(value_to_string).collect())
                     .collect();
 
                 log_trace!(
@@ -112,7 +112,7 @@ impl Database {
     /// List tables in default schema
     pub fn list_tables(&self) -> Result<Vec<String>> {
         let tables = self.catalog.list_tables("default")?;
-        Ok(tables.into_iter().map(|t| t.name).collect())
+        Ok(tables.into_iter().map(|t| t.name().to_string()).collect())
     }
 }
 

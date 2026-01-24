@@ -51,7 +51,7 @@ impl StorageEngine for MemTableEngine {
 
     fn write_batch(&self, batch: WriteBatch) -> Result<()> {
         let mut data = self.data.write().unwrap();
-        for op in batch.ops {
+        for op in batch.into_ops() {
             match op {
                 WriteOp::Put { key, value } => {
                     data.insert(key, value);

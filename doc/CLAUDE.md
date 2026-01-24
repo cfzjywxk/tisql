@@ -26,6 +26,49 @@ tisql/
 
 ## Progress Log
 
+### Session 2026-01-24 (Refactoring): Encapsulate Module Interfaces
+**Goal**: Reduce public fields, improve encapsulation, program to interfaces
+
+**Completed**:
+- **Encapsulated struct fields** - All struct fields are now private with accessor methods:
+  - `types.rs`: `Row`, `Schema`, `ColumnInfo` - added getters like `row.get()`, `row.values()`, `row.iter()`
+  - `catalog/mod.rs`: `TableDef`, `ColumnDef`, `IndexDef` - added getters and constructors
+  - `storage/mod.rs`: `WriteBatch` - `ops` field now private, added `into_ops()` for internal use
+- **Updated all consumers** to use accessor methods:
+  - `executor/simple.rs` - 25 changes from field access to method calls
+  - `sql/binder.rs` - 12 changes
+  - `lib.rs` - 3 changes
+- **Visibility refinement**:
+  - `pub(crate)` for internal helpers (e.g., `WriteBatch::into_ops()`, `TableDef::increment_auto_id()`)
+  - Private fields with public accessors
+- All 63 tests passing
+
+**Key Design Principles Applied**:
+1. **Program to interfaces** - Traits define behavior, not implementations
+2. **Encapsulation** - Struct fields are private, access via methods
+3. **Dependency injection** - Executor takes generic `StorageEngine` and `Catalog`
+
+**Module Interface Summary**:
+| Trait | Purpose | Implementations |
+|-------|---------|-----------------|
+| `StorageEngine` | KV storage | `MemTableEngine` |
+| `Snapshot` | Consistent reads | `MemTableSnapshot` |
+| `Catalog` | Schema metadata | `MemoryCatalog` |
+| `Executor` | Query execution | `SimpleExecutor` |
+| `Transaction` | MVCC (planned) | - |
+
+**Files Changed**:
+- Modified: `src/types.rs` (Row, Schema, ColumnInfo encapsulation)
+- Modified: `src/catalog/mod.rs` (TableDef, ColumnDef, IndexDef encapsulation)
+- Modified: `src/catalog/memory.rs` (use new accessor methods)
+- Modified: `src/storage/mod.rs` (WriteBatch encapsulation)
+- Modified: `src/storage/memtable.rs` (use into_ops())
+- Modified: `src/executor/simple.rs` (use accessor methods)
+- Modified: `src/sql/binder.rs` (use accessor methods)
+- Modified: `src/lib.rs` (use accessor methods)
+
+---
+
 ### Session 2026-01-24 (Update): Switch Row Encoding to TiDB Codec
 **Goal**: Use TiDB-compatible codec for row value encoding (replacing bincode)
 
