@@ -1,11 +1,11 @@
+
+*~
+.DS_Store
 # IDE
 .idea/
-*.swp
-*.swo
-*~
-
 # OS
-.DS_Store
-
 # Rust build artifacts (in subdirectories)
+*.swo
+*.swp
+/target/
 target/
