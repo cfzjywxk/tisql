@@ -271,9 +271,12 @@ impl Database {
 
     /// Handle MySQL protocol query text with a QueryCtx.
     ///
-    /// This is the internal implementation that takes a pre-created QueryCtx.
-    /// All SQL processing (parse, bind, execute) is delegated to SQLEngine.
-    fn handle_mp_query_with_ctx(
+    /// This method takes a pre-created QueryCtx that contains session context
+    /// (current_db, isolation_level, etc.). All SQL processing (parse, bind,
+    /// execute) is delegated to SQLEngine.
+    ///
+    /// This is the primary method used by the protocol layer via WorkerPool.
+    pub fn handle_mp_query_with_ctx(
         &self,
         sql: &str,
         query_ctx: &session::QueryCtx,

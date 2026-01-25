@@ -26,6 +26,7 @@ use yatp::pool::Remote;
 use yatp::task::future::TaskCell;
 
 use crate::error::{Result, TiSqlError};
+use crate::session::QueryCtx;
 use crate::{Database, QueryResult};
 
 /// Configuration for the worker thread pool
@@ -72,17 +73,25 @@ impl WorkerPool {
         }
     }
 
-    /// Handle MySQL protocol query text on a worker thread.
+    /// Handle MySQL protocol query text on a worker thread with session context.
     ///
     /// This method:
     /// 1. Creates a oneshot channel for the result
     /// 2. Spawns the database work onto the yatp pool
     /// 3. Awaits the result asynchronously (doesn't block tokio)
-    pub async fn handle_mp_query(&self, db: Arc<Database>, query: String) -> Result<QueryResult> {
+    ///
+    /// The QueryCtx provides session context (current_db, isolation_level, etc.)
+    /// for the query execution.
+    pub async fn handle_mp_query_with_ctx(
+        &self,
+        db: Arc<Database>,
+        query: String,
+        query_ctx: QueryCtx,
+    ) -> Result<QueryResult> {
         let (tx, rx) = oneshot::channel();
 
         self.remote.spawn(async move {
-            let result = db.handle_mp_query(&query);
+            let result = db.handle_mp_query_with_ctx(&query, &query_ctx);
             // Ignore send error - receiver may have been dropped if connection closed
             let _ = tx.send(result);
         });
@@ -90,5 +99,14 @@ impl WorkerPool {
         // Await the result from the worker thread
         rx.await
             .map_err(|_| TiSqlError::Internal("Worker task dropped".into()))?
+    }
+
+    /// Handle MySQL protocol query text on a worker thread (legacy method).
+    ///
+    /// This method creates a default QueryCtx. Prefer `handle_mp_query_with_ctx`
+    /// when session context is available.
+    pub async fn handle_mp_query(&self, db: Arc<Database>, query: String) -> Result<QueryResult> {
+        let query_ctx = QueryCtx::new();
+        self.handle_mp_query_with_ctx(db, query, query_ctx).await
     }
 }

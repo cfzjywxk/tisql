@@ -60,12 +60,24 @@ impl MySqlServer {
 
             tokio::spawn(async move {
                 let backend = MySqlBackend::new(db, worker_pool);
+                let session_id = backend.session_id();
+                log_info!(
+                    "Session {} established for connection from {}",
+                    session_id,
+                    peer_addr
+                );
+
                 // Split TCP stream into read and write halves
                 let (r, w) = stream.into_split();
                 if let Err(e) = AsyncMysqlIntermediary::run_on(backend, r, w).await {
-                    log_error!("Connection error from {}: {}", peer_addr, e);
+                    log_error!(
+                        "Session {} connection error from {}: {}",
+                        session_id,
+                        peer_addr,
+                        e
+                    );
                 }
-                log_debug!("Connection closed: {}", peer_addr);
+                log_info!("Session {} closed ({})", session_id, peer_addr);
             });
         }
     }

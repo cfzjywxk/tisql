@@ -24,24 +24,48 @@ use opensrv_mysql::{
 };
 use tokio::io::AsyncWrite;
 
+use crate::session::Session;
 use crate::types::DataType;
 use crate::worker::WorkerPool;
 use crate::{log_debug, log_info, Database, QueryResult};
 
-/// MySQL protocol backend that wraps our Database
+/// MySQL protocol backend that wraps our Database.
+///
+/// Each MySqlBackend represents a single client connection and holds:
+/// - Reference to the shared Database
+/// - Reference to the worker pool
+/// - A Session for this connection (created on connection establishment)
+///
+/// The Session persists for the lifetime of the connection and is used
+/// to create QueryCtx for each SQL statement execution.
 pub struct MySqlBackend {
     db: Arc<Database>,
     worker_pool: Arc<WorkerPool>,
-    current_db: String,
+    /// Session for this connection - created when connection is established
+    session: Session,
 }
 
 impl MySqlBackend {
+    /// Create a new MySqlBackend for a client connection.
+    ///
+    /// This is called after successful MySQL protocol handshake,
+    /// which means the connection phase is complete and we're entering
+    /// the command phase. A new Session is created for this connection.
     pub fn new(db: Arc<Database>, worker_pool: Arc<WorkerPool>) -> Self {
+        // Create a new session for this connection
+        let session = Session::new();
+        log_info!("Created session {} for new connection", session.id());
+
         Self {
             db,
             worker_pool,
-            current_db: "test".to_string(),
+            session,
         }
+    }
+
+    /// Get the session ID for this connection.
+    pub fn session_id(&self) -> u64 {
+        self.session.id()
     }
 
     fn make_ok_response(affected_rows: u64, last_insert_id: u64) -> OkResponse {
@@ -61,24 +85,34 @@ impl MySqlBackend {
 impl<W: AsyncWrite + Send + Unpin> AsyncMysqlShim<W> for MySqlBackend {
     type Error = io::Error;
 
-    /// Called when client connects and sends COM_INIT_DB
+    /// Called when client connects and sends COM_INIT_DB.
+    ///
+    /// Updates the session's current database. This is also called
+    /// when client sends USE database_name command.
     async fn on_init<'a>(
         &'a mut self,
         database: &'a str,
         writer: InitWriter<'a, W>,
     ) -> io::Result<()> {
-        log_info!("Client selected database: {}", database);
-        self.current_db = database.to_string();
+        log_info!(
+            "Session {} selected database: {}",
+            self.session.id(),
+            database
+        );
+        self.session.set_current_db(database);
         writer.ok().await
     }
 
-    /// Called on COM_QUERY - direct SQL query
+    /// Called on COM_QUERY - direct SQL query.
+    ///
+    /// Creates a QueryCtx from the session before executing the query.
+    /// The QueryCtx inherits session settings (current_db, isolation_level, etc.).
     async fn on_query<'a>(
         &'a mut self,
         query: &'a str,
         results: QueryResultWriter<'a, W>,
     ) -> io::Result<()> {
-        log_debug!("Query: {}", query);
+        log_debug!("Session {} query: {}", self.session.id(), query);
 
         // Handle some special MySQL client queries
         let query_lower = query.trim().to_lowercase();
@@ -98,9 +132,16 @@ impl<W: AsyncWrite + Send + Unpin> AsyncMysqlShim<W> for MySqlBackend {
             return self.handle_system_variable(query, results).await;
         }
 
+        // Create QueryCtx from session for this statement
+        let query_ctx = self.session.new_query_ctx();
+
         // Execute the query through the worker pool (off the network IO thread)
         let db = Arc::clone(&self.db);
-        match self.worker_pool.handle_mp_query(db, query.to_string()).await {
+        match self
+            .worker_pool
+            .handle_mp_query_with_ctx(db, query.to_string(), query_ctx)
+            .await
+        {
             Ok(result) => self.write_result(result, results).await,
             Err(e) => {
                 results
@@ -209,7 +250,7 @@ impl MySqlBackend {
             // Show tables in current database
             let cols = vec![Column {
                 table: String::new(),
-                column: format!("Tables_in_{}", self.current_db),
+                column: format!("Tables_in_{}", self.session.current_db()),
                 coltype: ColumnType::MYSQL_TYPE_VAR_STRING,
                 colflags: ColumnFlags::empty(),
             }];
