@@ -28,7 +28,7 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use tisql::error::TiSqlError;
-use tisql::{Database, QueryResult};
+use tisql::{Database, DatabaseConfig, QueryResult};
 
 /// Test runner configuration
 struct Config {
@@ -221,8 +221,19 @@ fn run_test(config: &Config, test_case: &TestCase) -> TestResult {
         }
     };
 
-    // Create database
-    let db = Arc::new(Database::new());
+    // Create database with temp directory
+    let temp_dir = std::env::temp_dir().join(format!("tisql-test-{}", std::process::id()));
+    std::fs::create_dir_all(&temp_dir).expect("Failed to create temp directory");
+    let db_config = DatabaseConfig::with_data_dir(&temp_dir);
+    let db = Arc::new(Database::open(db_config).expect("Failed to open database"));
+    // Clean up temp dir at the end using a guard
+    struct TempDirGuard(std::path::PathBuf);
+    impl Drop for TempDirGuard {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.0);
+        }
+    }
+    let _temp_guard = TempDirGuard(temp_dir);
 
     // Execute statements and collect output
     let mut output = String::new();
@@ -233,7 +244,7 @@ fn run_test(config: &Config, test_case: &TestCase) -> TestResult {
         output.push('\n');
 
         // Execute
-        match db.execute(&stmt.sql) {
+        match db.handle_mp_query(&stmt.sql) {
             Ok(result) => {
                 if stmt.expectations.expected_error.is_some() {
                     return TestResult {

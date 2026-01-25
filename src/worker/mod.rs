@@ -82,7 +82,7 @@ impl WorkerPool {
         let (tx, rx) = oneshot::channel();
 
         self.remote.spawn(async move {
-            let result = db.execute(&query);
+            let result = db.handle_mp_query(&query);
             // Ignore send error - receiver may have been dropped if connection closed
             let _ = tx.send(result);
         });

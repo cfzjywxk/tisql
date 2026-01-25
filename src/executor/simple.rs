@@ -43,11 +43,11 @@ impl Default for SimpleExecutor {
 }
 
 impl Executor for SimpleExecutor {
-    fn execute(
+    fn execute<T: TxnService, C: Catalog>(
         &self,
         plan: LogicalPlan,
-        txn_service: &dyn TxnService,
-        catalog: &dyn Catalog,
+        txn_service: &T,
+        catalog: &C,
     ) -> Result<ExecutionResult> {
         // Determine if this is a read or write operation
         if plan.is_write() {
@@ -63,11 +63,11 @@ impl SimpleExecutor {
     ///
     /// Creates a snapshot with start_ts from TSO, then executes all reads
     /// at that consistent timestamp.
-    fn execute_read(
+    fn execute_read<T: TxnService, C: Catalog>(
         &self,
         plan: LogicalPlan,
-        txn_service: &dyn TxnService,
-        catalog: &dyn Catalog,
+        txn_service: &T,
+        catalog: &C,
     ) -> Result<ExecutionResult> {
         // Allocate start_ts and create snapshot
         let snapshot = txn_service.snapshot()?;
@@ -79,11 +79,11 @@ impl SimpleExecutor {
     /// Execute a write plan using a transaction.
     ///
     /// Creates a transaction, executes writes (buffered), then commits.
-    fn execute_write(
+    fn execute_write<T: TxnService, C: Catalog>(
         &self,
         plan: LogicalPlan,
-        txn_service: &dyn TxnService,
-        catalog: &dyn Catalog,
+        txn_service: &T,
+        catalog: &C,
     ) -> Result<ExecutionResult> {
         // DDL operations don't need transaction (catalog operations)
         match &plan {
@@ -101,7 +101,7 @@ impl SimpleExecutor {
     }
 
     /// Execute DDL operations (no transaction needed).
-    fn execute_ddl(&self, plan: LogicalPlan, catalog: &dyn Catalog) -> Result<ExecutionResult> {
+    fn execute_ddl<C: Catalog>(&self, plan: LogicalPlan, catalog: &C) -> Result<ExecutionResult> {
         match plan {
             LogicalPlan::CreateTable {
                 table,
@@ -142,11 +142,11 @@ impl SimpleExecutor {
     }
 
     /// Execute read operations using a snapshot.
-    fn execute_with_snapshot(
+    fn execute_with_snapshot<C: Catalog>(
         &self,
         plan: LogicalPlan,
         snapshot: &dyn ReadSnapshot,
-        catalog: &dyn Catalog,
+        catalog: &C,
     ) -> Result<ExecutionResult> {
         match plan {
             LogicalPlan::Values { rows, schema } => {
@@ -387,11 +387,11 @@ impl SimpleExecutor {
     }
 
     /// Execute write operations using a transaction.
-    fn execute_with_txn(
+    fn execute_with_txn<C: Catalog>(
         &self,
         plan: LogicalPlan,
         mut txn: Box<dyn Txn>,
-        catalog: &dyn Catalog,
+        catalog: &C,
     ) -> Result<ExecutionResult> {
         let result = match plan {
             LogicalPlan::Insert {

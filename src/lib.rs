@@ -28,7 +28,7 @@ pub mod util;
 pub mod worker;
 
 pub use catalog::{Catalog, MemoryCatalog};
-pub use clog::{ClogService, FileClogConfig, FileClogService, NopClogService};
+pub use clog::{ClogService, FileClogConfig, FileClogService};
 pub use concurrency::ConcurrencyManager;
 use error::Result;
 use executor::{ExecutionResult, Executor, SimpleExecutor};
@@ -43,20 +43,21 @@ pub use worker::{WorkerPool, WorkerPoolConfig};
 use std::path::PathBuf;
 use std::sync::Arc;
 
+// ============================================================================
+// Database Configuration
+// ============================================================================
+
 /// Database configuration
 #[derive(Clone, Debug)]
 pub struct DatabaseConfig {
     /// Data directory for persistence
     pub data_dir: PathBuf,
-    /// Enable durability (WAL)
-    pub durability: bool,
 }
 
 impl Default for DatabaseConfig {
     fn default() -> Self {
         Self {
             data_dir: PathBuf::from("data"),
-            durability: true,
         }
     }
 }
@@ -66,72 +67,94 @@ impl DatabaseConfig {
     pub fn with_data_dir(dir: impl Into<PathBuf>) -> Self {
         Self {
             data_dir: dir.into(),
-            durability: true,
-        }
-    }
-
-    /// Create in-memory only config (no durability)
-    pub fn in_memory() -> Self {
-        Self {
-            data_dir: PathBuf::from("data"),
-            durability: false,
         }
     }
 }
 
-/// TiSQL Database instance with durability support
-pub struct Database {
-    storage: Arc<MvccMemTableEngine>,
-    catalog: MemoryCatalog,
+// ============================================================================
+// SQL Engine - Parser, Binder, Executor
+// ============================================================================
+
+/// SQL Engine handles SQL text processing: parsing, binding, and execution.
+///
+/// This is the core SQL processing pipeline that transforms SQL strings
+/// into query results through the transaction service.
+pub struct SQLEngine {
     parser: Parser,
     executor: SimpleExecutor,
-    /// ConcurrencyManager for TSO and lock table
-    concurrency_manager: Arc<ConcurrencyManager>,
-    /// Commit log service for durability (None if durability disabled)
-    clog_service: Option<Arc<FileClogService>>,
-    /// Transaction service for all SQL execution (always present)
-    txn_service: Box<dyn TxnService>,
+}
+
+impl SQLEngine {
+    /// Create a new SQL engine.
+    pub fn new() -> Self {
+        Self {
+            parser: Parser::new(),
+            executor: SimpleExecutor::new(),
+        }
+    }
+
+    /// Execute a SQL statement through the transaction service.
+    ///
+    /// Flow: SQL text -> parse -> bind -> execute through TxnService
+    pub fn execute<T: TxnService, C: Catalog>(
+        &self,
+        sql: &str,
+        txn_service: &T,
+        catalog: &C,
+    ) -> Result<ExecutionResult> {
+        // Parse
+        let stmt = self.parser.parse_one(sql)?;
+
+        // Bind (semantic analysis, name resolution)
+        let binder = Binder::new(catalog, "default");
+        let plan = binder.bind(stmt)?;
+
+        // Execute through TxnService
+        self.executor.execute(plan, txn_service, catalog)
+    }
+}
+
+impl Default for SQLEngine {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+// ============================================================================
+// Database - Main Entry Point
+// ============================================================================
+
+/// Concrete transaction service type used by Database
+pub type DbTxnService = TransactionService<MvccMemTableEngine, FileClogService>;
+
+/// TiSQL Database instance.
+///
+/// Database is the main entry point that coordinates:
+/// - SQL processing via SQLEngine
+/// - Transaction management via TxnService
+/// - Schema metadata via Catalog
+///
+/// Internal components (storage, clog, concurrency manager) are hidden
+/// and managed by the transaction service.
+pub struct Database {
+    /// SQL engine for parsing, binding, execution
+    sql_engine: SQLEngine,
+    /// Transaction service (owns storage, clog, concurrency manager)
+    txn_service: Arc<DbTxnService>,
+    /// Schema metadata catalog
+    catalog: MemoryCatalog,
 }
 
 impl Database {
-    /// Create a new in-memory database (no durability)
-    pub fn new() -> Self {
-        log_info!("Initializing TiSQL database (in-memory mode, MVCC enabled)");
-        let concurrency_manager = Arc::new(ConcurrencyManager::new(1));
-        let storage = Arc::new(MvccMemTableEngine::new(Arc::clone(&concurrency_manager)));
-        let clog_service = Arc::new(NopClogService::new());
-        let txn_service: Box<dyn TxnService> = Box::new(TransactionService::new(
-            Arc::clone(&storage),
-            clog_service,
-            Arc::clone(&concurrency_manager),
-        ));
-
-        Self {
-            storage,
-            catalog: MemoryCatalog::new(),
-            parser: Parser::new(),
-            executor: SimpleExecutor::new(),
-            concurrency_manager,
-            clog_service: None,
-            txn_service,
-        }
-    }
-
-    /// Open database with persistence and recovery
+    /// Open database with persistence and recovery.
+    ///
+    /// This is the only way to create a Database instance.
+    /// All databases use file-based persistence.
     pub fn open(config: DatabaseConfig) -> Result<Self> {
-        log_info!(
-            "Opening TiSQL database at {:?} (MVCC enabled)",
-            config.data_dir
-        );
+        log_info!("Opening TiSQL database at {:?}", config.data_dir);
 
-        if !config.durability {
-            return Ok(Self::new());
-        }
-
-        // Create commit log config
+        // Create commit log config and recover
         let clog_config = FileClogConfig::with_dir(&config.data_dir);
-
-        // Recover commit log entries
         let (clog_service, entries) = FileClogService::recover(clog_config)?;
         let clog_service = Arc::new(clog_service);
 
@@ -140,7 +163,7 @@ impl Database {
         let storage = Arc::new(MvccMemTableEngine::new(Arc::clone(&concurrency_manager)));
 
         // Create transaction service
-        let concrete_txn_service = Arc::new(TransactionService::new(
+        let txn_service = Arc::new(TransactionService::new(
             Arc::clone(&storage),
             Arc::clone(&clog_service),
             Arc::clone(&concurrency_manager),
@@ -148,7 +171,7 @@ impl Database {
 
         // Recover state by replaying commit log
         if !entries.is_empty() {
-            let stats = concrete_txn_service.recover(&entries)?;
+            let stats = txn_service.recover(&entries)?;
             log_info!(
                 "Recovery complete: {} txns, {} puts, {} deletes applied, {} entries rolled back",
                 stats.committed_txns,
@@ -158,35 +181,26 @@ impl Database {
             );
         }
 
-        // Recover catalog from storage
+        // Create catalog (TODO: persist and recover catalog metadata)
         let catalog = MemoryCatalog::new();
-        // TODO: Persist and recover catalog metadata
-
-        // Create boxed trait object for the txn_service
-        let txn_service: Box<dyn TxnService> = Box::new(TransactionService::new(
-            Arc::clone(&storage),
-            Arc::clone(&clog_service),
-            Arc::clone(&concurrency_manager),
-        ));
 
         Ok(Self {
-            storage,
-            catalog,
-            parser: Parser::new(),
-            executor: SimpleExecutor::new(),
-            concurrency_manager,
-            clog_service: Some(clog_service),
+            sql_engine: SQLEngine::new(),
             txn_service,
+            catalog,
         })
     }
 
-    /// Execute a SQL statement with durability
-    pub fn execute(&self, sql: &str) -> Result<QueryResult> {
+    /// Handle MySQL protocol query text (COM_QUERY).
+    ///
+    /// This is the main entry point for SQL execution from the MySQL protocol.
+    /// For prepared statements, use `handle_mp_prepare` and `handle_mp_execute` (TODO).
+    pub fn handle_mp_query(&self, sql: &str) -> Result<QueryResult> {
         let total_timer = Timer::new("total");
 
         // Parse
         let parse_timer = Timer::new("parse");
-        let stmt = self.parser.parse_one(sql)?;
+        let stmt = self.sql_engine.parser.parse_one(sql)?;
         let parse_ms = parse_timer.elapsed_ms();
 
         // Bind
@@ -196,11 +210,9 @@ impl Database {
         let bind_ms = bind_timer.elapsed_ms();
 
         // Execute through TxnService
-        // All operations (read and write) go through the transaction service:
-        // - Reads: snapshot with start_ts allocation
-        // - Writes: transaction with commit
         let exec_timer = Timer::new("execute");
         let result = self
+            .sql_engine
             .executor
             .execute(plan, self.txn_service.as_ref(), &self.catalog)?;
         let exec_ms = exec_timer.elapsed_ms();
@@ -259,45 +271,29 @@ impl Database {
         Ok(query_result)
     }
 
-    /// List tables in default schema
+    /// List tables in default schema.
     pub fn list_tables(&self) -> Result<Vec<String>> {
         let tables = self.catalog.list_tables("default")?;
         Ok(tables.into_iter().map(|t| t.name().to_string()).collect())
     }
 
-    /// Close the database (flush commit log)
+    /// Close the database (flush commit log).
     pub fn close(&self) -> Result<()> {
-        if let Some(ref clog_service) = self.clog_service {
-            clog_service.close()?;
-        }
+        self.txn_service.clog_service().close()?;
         log_info!("Database closed");
         Ok(())
-    }
-
-    /// Get reference to storage engine (for testing)
-    pub fn storage(&self) -> &MvccMemTableEngine {
-        &self.storage
-    }
-
-    /// Get reference to concurrency manager
-    pub fn concurrency_manager(&self) -> &ConcurrencyManager {
-        &self.concurrency_manager
-    }
-}
-
-impl Default for Database {
-    fn default() -> Self {
-        Self::new()
     }
 }
 
 impl Drop for Database {
     fn drop(&mut self) {
-        if let Some(ref clog_service) = self.clog_service {
-            let _ = clog_service.close();
-        }
+        let _ = self.txn_service.clog_service().close();
     }
 }
+
+// ============================================================================
+// Query Result
+// ============================================================================
 
 /// Query result for user-facing output
 #[derive(Debug)]
@@ -372,6 +368,10 @@ impl QueryResult {
     }
 }
 
+// ============================================================================
+// Helper Functions
+// ============================================================================
+
 /// Truncate SQL for logging (avoid huge queries in logs)
 fn truncate_sql(sql: &str, max_len: usize) -> String {
     let sql = sql.trim().replace('\n', " ");
@@ -402,15 +402,26 @@ fn value_to_string(val: &Value) -> String {
     }
 }
 
+// ============================================================================
+// Tests
+// ============================================================================
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use tempfile::tempdir;
 
+    fn create_test_db() -> (Database, tempfile::TempDir) {
+        let dir = tempdir().unwrap();
+        let config = DatabaseConfig::with_data_dir(dir.path());
+        let db = Database::open(config).unwrap();
+        (db, dir)
+    }
+
     #[test]
     fn test_select_literal() {
-        let db = Database::new();
-        let result = db.execute("SELECT 1 + 1").unwrap();
+        let (db, _dir) = create_test_db();
+        let result = db.handle_mp_query("SELECT 1 + 1").unwrap();
         match result {
             QueryResult::Rows { data, .. } => {
                 assert_eq!(data.len(), 1);
@@ -422,20 +433,20 @@ mod tests {
 
     #[test]
     fn test_create_and_insert() {
-        let db = Database::new();
+        let (db, _dir) = create_test_db();
 
-        db.execute("CREATE TABLE users (id INT, name VARCHAR(255))")
+        db.handle_mp_query("CREATE TABLE users (id INT, name VARCHAR(255))")
             .unwrap();
 
         let result = db
-            .execute("INSERT INTO users (id, name) VALUES (1, 'Alice')")
+            .handle_mp_query("INSERT INTO users (id, name) VALUES (1, 'Alice')")
             .unwrap();
         match result {
             QueryResult::Affected(count) => assert_eq!(count, 1),
             _ => panic!("Expected affected count"),
         }
 
-        let result = db.execute("SELECT id, name FROM users").unwrap();
+        let result = db.handle_mp_query("SELECT id, name FROM users").unwrap();
         match result {
             QueryResult::Rows { data, columns } => {
                 assert_eq!(columns, vec!["id", "name"]);
@@ -455,32 +466,33 @@ mod tests {
         // Create database and insert data
         {
             let db = Database::open(config.clone()).unwrap();
-            db.execute("CREATE TABLE t (id INT, val VARCHAR(100))")
+            db.handle_mp_query("CREATE TABLE t (id INT, val VARCHAR(100))")
                 .unwrap();
-            db.execute("INSERT INTO t VALUES (1, 'hello')").unwrap();
-            db.execute("INSERT INTO t VALUES (2, 'world')").unwrap();
+            db.handle_mp_query("INSERT INTO t VALUES (1, 'hello')")
+                .unwrap();
+            db.handle_mp_query("INSERT INTO t VALUES (2, 'world')")
+                .unwrap();
             db.close().unwrap();
         }
 
         // Reopen - data should be in storage but catalog needs recovery
         // For now, this tests that the commit log file is created and can be recovered
         {
-            let db = Database::open(config).unwrap();
+            let _db = Database::open(config).unwrap();
             // Note: Catalog is not persisted yet, so CREATE TABLE won't survive
             // But commit log entries are persisted
-            assert!(db.clog_service.is_some());
         }
     }
 
     #[test]
     fn test_where_clause() {
-        let db = Database::new();
+        let (db, _dir) = create_test_db();
 
-        db.execute("CREATE TABLE t (a INT, b INT)").unwrap();
-        db.execute("INSERT INTO t VALUES (1, 10), (2, 20), (3, 30)")
+        db.handle_mp_query("CREATE TABLE t (a INT, b INT)").unwrap();
+        db.handle_mp_query("INSERT INTO t VALUES (1, 10), (2, 20), (3, 30)")
             .unwrap();
 
-        let result = db.execute("SELECT a, b FROM t WHERE a > 1").unwrap();
+        let result = db.handle_mp_query("SELECT a, b FROM t WHERE a > 1").unwrap();
         match result {
             QueryResult::Rows { data, .. } => {
                 assert_eq!(data.len(), 2);
@@ -491,12 +503,13 @@ mod tests {
 
     #[test]
     fn test_order_by() {
-        let db = Database::new();
+        let (db, _dir) = create_test_db();
 
-        db.execute("CREATE TABLE t (a INT)").unwrap();
-        db.execute("INSERT INTO t VALUES (3), (1), (2)").unwrap();
+        db.handle_mp_query("CREATE TABLE t (a INT)").unwrap();
+        db.handle_mp_query("INSERT INTO t VALUES (3), (1), (2)")
+            .unwrap();
 
-        let result = db.execute("SELECT a FROM t ORDER BY a").unwrap();
+        let result = db.handle_mp_query("SELECT a FROM t ORDER BY a").unwrap();
         match result {
             QueryResult::Rows { data, .. } => {
                 assert_eq!(data[0][0], "1");
@@ -509,13 +522,13 @@ mod tests {
 
     #[test]
     fn test_limit() {
-        let db = Database::new();
+        let (db, _dir) = create_test_db();
 
-        db.execute("CREATE TABLE t (a INT)").unwrap();
-        db.execute("INSERT INTO t VALUES (1), (2), (3), (4), (5)")
+        db.handle_mp_query("CREATE TABLE t (a INT)").unwrap();
+        db.handle_mp_query("INSERT INTO t VALUES (1), (2), (3), (4), (5)")
             .unwrap();
 
-        let result = db.execute("SELECT a FROM t LIMIT 3").unwrap();
+        let result = db.handle_mp_query("SELECT a FROM t LIMIT 3").unwrap();
         match result {
             QueryResult::Rows { data, .. } => {
                 assert_eq!(data.len(), 3);
@@ -526,15 +539,19 @@ mod tests {
 
     #[test]
     fn test_update() {
-        let db = Database::new();
+        let (db, _dir) = create_test_db();
 
-        db.execute("CREATE TABLE t (id INT, val INT)").unwrap();
-        db.execute("INSERT INTO t VALUES (1, 100), (2, 200)")
+        db.handle_mp_query("CREATE TABLE t (id INT, val INT)")
+            .unwrap();
+        db.handle_mp_query("INSERT INTO t VALUES (1, 100), (2, 200)")
             .unwrap();
 
-        db.execute("UPDATE t SET val = 999 WHERE id = 1").unwrap();
+        db.handle_mp_query("UPDATE t SET val = 999 WHERE id = 1")
+            .unwrap();
 
-        let result = db.execute("SELECT id, val FROM t WHERE id = 1").unwrap();
+        let result = db
+            .handle_mp_query("SELECT id, val FROM t WHERE id = 1")
+            .unwrap();
         match result {
             QueryResult::Rows { data, .. } => {
                 assert_eq!(data[0][1], "999");
@@ -545,14 +562,15 @@ mod tests {
 
     #[test]
     fn test_delete() {
-        let db = Database::new();
+        let (db, _dir) = create_test_db();
 
-        db.execute("CREATE TABLE t (a INT)").unwrap();
-        db.execute("INSERT INTO t VALUES (1), (2), (3)").unwrap();
+        db.handle_mp_query("CREATE TABLE t (a INT)").unwrap();
+        db.handle_mp_query("INSERT INTO t VALUES (1), (2), (3)")
+            .unwrap();
 
-        db.execute("DELETE FROM t WHERE a = 2").unwrap();
+        db.handle_mp_query("DELETE FROM t WHERE a = 2").unwrap();
 
-        let result = db.execute("SELECT a FROM t").unwrap();
+        let result = db.handle_mp_query("SELECT a FROM t").unwrap();
         match result {
             QueryResult::Rows { data, .. } => {
                 assert_eq!(data.len(), 2);

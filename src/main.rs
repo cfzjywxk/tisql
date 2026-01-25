@@ -18,7 +18,7 @@ use std::sync::Arc;
 use clap::Parser as ClapParser;
 use tisql::util::LogLevel;
 use tisql::{log_error, log_info};
-use tisql::{Database, MySqlServer, WorkerPool, WorkerPoolConfig, MYSQL_DEFAULT_PORT};
+use tisql::{Database, DatabaseConfig, MySqlServer, WorkerPool, WorkerPoolConfig, MYSQL_DEFAULT_PORT};
 
 #[derive(ClapParser, Debug)]
 #[command(name = "tisql")]
@@ -32,6 +32,10 @@ struct Args {
     /// Port to listen on
     #[arg(short = 'P', long, default_value_t = MYSQL_DEFAULT_PORT)]
     port: u16,
+
+    /// Data directory for persistence
+    #[arg(short = 'D', long, default_value = "data")]
+    data_dir: String,
 
     /// Log level (trace, debug, info, warn, error)
     #[arg(short = 'L', long, default_value = "info")]
@@ -61,10 +65,19 @@ fn main() {
     };
     let worker_pool = Arc::new(WorkerPool::new(worker_config));
 
-    let db = Arc::new(Database::new());
+    // Open database with persistence
+    let db_config = DatabaseConfig::with_data_dir(&args.data_dir);
+    let db = match Database::open(db_config) {
+        Ok(db) => Arc::new(db),
+        Err(e) => {
+            eprintln!("Failed to open database: {e}");
+            std::process::exit(1);
+        }
+    };
     let server = MySqlServer::new(db, addr, worker_pool);
 
     println!("TiSQL v0.1.0 - MySQL Protocol Server");
+    println!("Data directory: {}", args.data_dir);
     println!("Listening on {}:{}", args.host, args.port);
     println!(
         "Connect with: mysql -h{} -P{} -uroot test",

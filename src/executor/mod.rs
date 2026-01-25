@@ -48,10 +48,10 @@ pub trait Executor {
     /// 1. Creates a transaction via txn_service.begin()
     /// 2. Writes are buffered in transaction
     /// 3. Transaction is committed with durability
-    fn execute(
+    fn execute<T: TxnService, C: Catalog>(
         &self,
         plan: LogicalPlan,
-        txn_service: &dyn TxnService,
-        catalog: &dyn Catalog,
+        txn_service: &T,
+        catalog: &C,
     ) -> Result<ExecutionResult>;
 }
