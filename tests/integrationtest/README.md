@@ -8,9 +8,11 @@ This directory contains MySQL-test style integration tests for TiSQL.
 integrationtest/
 ├── t/              # Test case files (.test)
 │   ├── crud/       # Basic CRUD operation tests
+│   ├── error/      # Error expectation tests
 │   └── expr/       # Expression and operator tests
 ├── r/              # Expected result files (.result)
 │   ├── crud/
+│   ├── error/
 │   └── expr/
 ├── run-tests.sh    # Test runner script
 └── README.md       # This file
@@ -20,6 +22,10 @@ integrationtest/
 
 Test files (`.test`) contain SQL statements that are executed sequentially.
 Each statement is separated by a semicolon.
+
+The runner records:
+- Query results (`SELECT ...`) as tab-separated output (header + rows)
+- DML affected rows (`INSERT/UPDATE/DELETE`) as `AFFECTED <n>`
 
 ### Basic Format
 
@@ -38,6 +44,16 @@ Use `--error` directive to expect an error:
 ```sql
 --error 1146
 SELECT * FROM non_existent_table;
+```
+
+You can also assert additional properties:
+
+```sql
+CREATE TABLE t (id INT);
+--error 1050
+--error_kind Catalog
+--error_contains already exists
+CREATE TABLE t (id INT);
 ```
 
 ## Running Tests

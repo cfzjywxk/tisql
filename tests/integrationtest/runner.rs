@@ -27,6 +27,7 @@ use std::io::{BufRead, BufReader};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
+use tisql::error::TiSqlError;
 use tisql::{Database, QueryResult};
 
 /// Test runner configuration
@@ -46,7 +47,7 @@ struct TestCase {
 /// SQL statement with optional error expectation
 struct Statement {
     sql: String,
-    expected_error: Option<i32>,
+    expectations: Expectations,
     line_number: usize,
 }
 
@@ -122,6 +123,24 @@ fn main() {
     if failed > 0 {
         std::process::exit(1);
     }
+}
+
+/// Expected behavior for a statement.
+#[derive(Debug, Clone, Default)]
+struct Expectations {
+    expected_error: Option<ExpectedError>,
+    expected_affected_rows: Option<u64>,
+    expected_rows: Option<usize>,
+}
+
+#[derive(Debug, Clone, Default)]
+struct ExpectedError {
+    /// MySQL-style error code (e.g. 1146). If omitted, any error is accepted.
+    code: Option<u32>,
+    /// TiSqlError variant name to match (e.g. "TableNotFound").
+    kind: Option<String>,
+    /// Substring that must appear in the error message.
+    contains: Option<String>,
 }
 
 fn find_test_case(config: &Config, name: &str) -> TestCase {
@@ -216,7 +235,7 @@ fn run_test(config: &Config, test_case: &TestCase) -> TestResult {
         // Execute
         match db.execute(&stmt.sql) {
             Ok(result) => {
-                if stmt.expected_error.is_some() {
+                if stmt.expectations.expected_error.is_some() {
                     return TestResult {
                         name: test_case.name.clone(),
                         passed: false,
@@ -230,6 +249,22 @@ fn run_test(config: &Config, test_case: &TestCase) -> TestResult {
                 // Format result
                 match result {
                     QueryResult::Rows { columns, data } => {
+                        if let Some(expected_rows) = stmt.expectations.expected_rows {
+                            if data.len() != expected_rows {
+                                return TestResult {
+                                    name: test_case.name.clone(),
+                                    passed: false,
+                                    message: format!(
+                                        "Line {}: Expected {} rows but got {} for: {}",
+                                        stmt.line_number,
+                                        expected_rows,
+                                        data.len(),
+                                        stmt.sql
+                                    ),
+                                };
+                            }
+                        }
+
                         // Header
                         output.push_str(&columns.join("\t"));
                         output.push('\n');
@@ -240,8 +275,22 @@ fn run_test(config: &Config, test_case: &TestCase) -> TestResult {
                             output.push('\n');
                         }
                     }
-                    QueryResult::Affected(_count) => {
-                        // Don't output for DML, just like mysql-test
+                    QueryResult::Affected(count) => {
+                        if let Some(expected) = stmt.expectations.expected_affected_rows {
+                            if count != expected {
+                                return TestResult {
+                                    name: test_case.name.clone(),
+                                    passed: false,
+                                    message: format!(
+                                        "Line {}: Expected {} affected rows but got {} for: {}",
+                                        stmt.line_number, expected, count, stmt.sql
+                                    ),
+                                };
+                            }
+                        }
+
+                        // Output affected count so result files can validate DML semantics.
+                        output.push_str(&format!("AFFECTED {count}\n"));
                     }
                     QueryResult::Ok => {
                         // Don't output for DDL
@@ -249,9 +298,57 @@ fn run_test(config: &Config, test_case: &TestCase) -> TestResult {
                 }
             }
             Err(e) => {
-                if let Some(expected_code) = stmt.expected_error {
-                    // Error was expected
-                    output.push_str(&format!("ERROR {expected_code}: {e}\n"));
+                if let Some(expected) = &stmt.expectations.expected_error {
+                    // Error was expected; validate it and record a stable representation.
+                    let actual_code = mysql_error_code(&e);
+                    let actual_kind = tisql_error_kind(&e);
+
+                    if let Some(expected_code) = expected.code {
+                        if actual_code != expected_code {
+                            return TestResult {
+                                name: test_case.name.clone(),
+                                passed: false,
+                                message: format!(
+                                    "Line {}: Expected error code {} but got {} ({}) for: {}",
+                                    stmt.line_number,
+                                    expected_code,
+                                    actual_code,
+                                    actual_kind,
+                                    stmt.sql
+                                ),
+                            };
+                        }
+                    }
+
+                    if let Some(expected_kind) = &expected.kind {
+                        if &actual_kind != expected_kind {
+                            return TestResult {
+                                name: test_case.name.clone(),
+                                passed: false,
+                                message: format!(
+                                    "Line {}: Expected error kind {} but got {} for: {}",
+                                    stmt.line_number, expected_kind, actual_kind, stmt.sql
+                                ),
+                            };
+                        }
+                    }
+
+                    if let Some(needle) = &expected.contains {
+                        let msg = e.to_string();
+                        if !msg.contains(needle) {
+                            return TestResult {
+                                name: test_case.name.clone(),
+                                passed: false,
+                                message: format!(
+                                    "Line {}: Expected error message to contain {:?} but got {:?} for: {}",
+                                    stmt.line_number, needle, msg, stmt.sql
+                                ),
+                            };
+                        }
+                    }
+
+                    // Keep output stable (avoid encoding full messages that may change).
+                    output.push_str(&format!("ERROR {actual_code}: {actual_kind}\n"));
                 } else {
                     return TestResult {
                         name: test_case.name.clone(),
@@ -269,7 +366,13 @@ fn run_test(config: &Config, test_case: &TestCase) -> TestResult {
     // Handle record mode
     if config.record_mode {
         if let Some(parent) = test_case.result_file.parent() {
-            fs::create_dir_all(parent).ok();
+            if let Err(e) = fs::create_dir_all(parent) {
+                return TestResult {
+                    name: test_case.name.clone(),
+                    passed: false,
+                    message: format!("Failed to create result directory {parent:?}: {e}"),
+                };
+            }
         }
 
         match fs::write(&test_case.result_file, &output) {
@@ -322,31 +425,11 @@ fn run_test(config: &Config, test_case: &TestCase) -> TestResult {
             message: "OK".to_string(),
         }
     } else {
-        // Find first difference
-        let output_lines: Vec<&str> = output.lines().collect();
-        let expected_lines: Vec<&str> = expected.lines().collect();
-
-        let mut diff_line = 0;
-        for (i, (out, exp)) in output_lines.iter().zip(expected_lines.iter()).enumerate() {
-            if out != exp {
-                diff_line = i + 1;
-                break;
-            }
-        }
-
-        if diff_line == 0 && output_lines.len() != expected_lines.len() {
-            diff_line = output_lines.len().min(expected_lines.len()) + 1;
-        }
-
+        let message = format_output_mismatch(&expected, &output);
         TestResult {
             name: test_case.name.clone(),
             passed: false,
-            message: format!(
-                "Output mismatch at line {}. Expected {} lines, got {} lines",
-                diff_line,
-                expected_lines.len(),
-                output_lines.len()
-            ),
+            message,
         }
     }
 }
@@ -357,12 +440,17 @@ fn parse_test_file(path: &Path) -> Result<Vec<Statement>, String> {
 
     let mut statements = Vec::new();
     let mut current_sql = String::new();
-    let mut expected_error = None;
-    let mut start_line = 0;
-    let mut line_number = 0;
+    let mut expectations = Expectations::default();
+    let mut start_line: usize = 0;
 
-    for line in reader.lines() {
-        line_number += 1;
+    // Simple SQL lexer state for splitting on semicolons.
+    let mut in_single_quote = false;
+    let mut in_double_quote = false;
+    let mut in_backtick = false;
+    let mut in_block_comment = false;
+
+    for (idx, line) in reader.lines().enumerate() {
+        let line_number = idx + 1;
         let line = line.map_err(|e| e.to_string())?;
         let trimmed = line.trim();
 
@@ -371,49 +459,334 @@ fn parse_test_file(path: &Path) -> Result<Vec<Statement>, String> {
             continue;
         }
 
-        // Handle --error directive
+        // mysql-test style directives.
         if trimmed.starts_with("--error") {
+            // --error [<mysql_code>]
             let parts: Vec<&str> = trimmed.split_whitespace().collect();
-            if parts.len() >= 2 {
-                expected_error = parts[1].parse().ok();
+            let mut expected = expectations.expected_error.take().unwrap_or_default();
+            expected.code = parts.get(1).and_then(|s| s.parse::<u32>().ok());
+            expectations.expected_error = Some(expected);
+            continue;
+        }
+        if trimmed.starts_with("--error_kind") {
+            // --error_kind <TiSqlErrorVariant>
+            let parts: Vec<&str> = trimmed.split_whitespace().collect();
+            if let Some(kind) = parts.get(1) {
+                let mut expected = expectations.expected_error.take().unwrap_or_default();
+                expected.kind = Some(kind.to_string());
+                expectations.expected_error = Some(expected);
             }
             continue;
         }
+        if trimmed.starts_with("--error_contains") {
+            // --error_contains <substring...>
+            // Use the remainder of the line after the directive as the needle.
+            let needle = trimmed
+                .strip_prefix("--error_contains")
+                .unwrap()
+                .trim()
+                .trim_matches('"');
+            if !needle.is_empty() {
+                let mut expected = expectations.expected_error.take().unwrap_or_default();
+                expected.contains = Some(needle.to_string());
+                expectations.expected_error = Some(expected);
+            }
+            continue;
+        }
+        if trimmed.starts_with("--affected_rows") {
+            // --affected_rows <n>
+            let parts: Vec<&str> = trimmed.split_whitespace().collect();
+            expectations.expected_affected_rows = parts.get(1).and_then(|s| s.parse::<u64>().ok());
+            continue;
+        }
+        if trimmed.starts_with("--rows") {
+            // --rows <n>
+            let parts: Vec<&str> = trimmed.split_whitespace().collect();
+            expectations.expected_rows = parts.get(1).and_then(|s| s.parse::<usize>().ok());
+            continue;
+        }
 
-        // Track start line
-        if current_sql.is_empty() {
+        // Track start line for the next statement chunk.
+        if current_sql.trim().is_empty() {
             start_line = line_number;
         }
 
-        // Accumulate SQL
-        current_sql.push_str(trimmed);
+        // Accumulate and split statements on semicolons outside quotes/comments.
+        let mut chars = trimmed.chars().peekable();
+        let mut prev_is_whitespace = true; // trimmed => start-of-line behaves like whitespace
+        while let Some(ch) = chars.next() {
+            if in_block_comment {
+                if ch == '*' && chars.peek() == Some(&'/') {
+                    chars.next(); // consume '/'
+                    in_block_comment = false;
+                }
+                continue;
+            }
 
-        // Check if statement is complete (ends with ;)
-        if trimmed.ends_with(';') {
-            // Remove trailing semicolon for execution
-            let sql = current_sql.trim_end_matches(';').to_string();
+            // Start of block comment
+            if !in_single_quote
+                && !in_double_quote
+                && !in_backtick
+                && ch == '/'
+                && chars.peek() == Some(&'*')
+            {
+                chars.next(); // consume '*'
+                in_block_comment = true;
+                continue;
+            }
 
-            statements.push(Statement {
-                sql,
-                expected_error,
-                line_number: start_line,
-            });
+            // Start of line comment (# or -- )
+            if !in_single_quote && !in_double_quote && !in_backtick {
+                if ch == '#' {
+                    break;
+                }
+                if ch == '-' && chars.peek() == Some(&'-') {
+                    // mysql requires whitespace or end after `--`
+                    let mut lookahead = chars.clone();
+                    lookahead.next(); // second '-'
+                    if prev_is_whitespace
+                        && (lookahead.peek().is_none()
+                            || lookahead.peek().is_some_and(|c| c.is_whitespace()))
+                    {
+                        // consume second '-'
+                        chars.next();
+                        break;
+                    }
+                }
+            }
 
-            current_sql.clear();
-            expected_error = None;
-        } else {
+            // Quote tracking (handles doubled quotes/backticks and backslash escapes).
+            match ch {
+                '\'' if !in_double_quote && !in_backtick => {
+                    if in_single_quote {
+                        if chars.peek() == Some(&'\'') {
+                            // Escaped quote via doubling: ''.
+                            current_sql.push('\'');
+                            chars.next();
+                        } else {
+                            in_single_quote = false;
+                            current_sql.push('\'');
+                        }
+                    } else {
+                        in_single_quote = true;
+                        current_sql.push('\'');
+                    }
+                    continue;
+                }
+                '"' if !in_single_quote && !in_backtick => {
+                    if in_double_quote {
+                        if chars.peek() == Some(&'"') {
+                            current_sql.push('"');
+                            chars.next();
+                        } else {
+                            in_double_quote = false;
+                            current_sql.push('"');
+                        }
+                    } else {
+                        in_double_quote = true;
+                        current_sql.push('"');
+                    }
+                    continue;
+                }
+                '`' if !in_single_quote && !in_double_quote => {
+                    if in_backtick {
+                        if chars.peek() == Some(&'`') {
+                            current_sql.push('`');
+                            chars.next();
+                        } else {
+                            in_backtick = false;
+                            current_sql.push('`');
+                        }
+                    } else {
+                        in_backtick = true;
+                        current_sql.push('`');
+                    }
+                    continue;
+                }
+                '\\' if in_single_quote || in_double_quote => {
+                    // Preserve escapes; don't interpret semicolons after a backslash specially.
+                    current_sql.push('\\');
+                    if let Some(next) = chars.next() {
+                        current_sql.push(next);
+                    }
+                    continue;
+                }
+                ';' if !in_single_quote && !in_double_quote && !in_backtick => {
+                    let sql = current_sql.trim().to_string();
+                    if !sql.is_empty() {
+                        statements.push(Statement {
+                            sql,
+                            expectations: expectations.clone(),
+                            line_number: start_line,
+                        });
+                    }
+                    current_sql.clear();
+                    expectations = Expectations::default();
+                    // Next statement (if any) starts on the same line.
+                    start_line = line_number;
+                    continue;
+                }
+                _ => {}
+            }
+
+            current_sql.push(ch);
+            prev_is_whitespace = ch.is_whitespace();
+        }
+
+        // Ensure tokens across lines don't get concatenated.
+        if !current_sql.is_empty() {
             current_sql.push(' ');
         }
     }
 
-    // Handle any remaining SQL without semicolon
-    if !current_sql.trim().is_empty() {
+    // Handle any remaining SQL without semicolon.
+    let tail = current_sql.trim();
+    if !tail.is_empty() {
         statements.push(Statement {
-            sql: current_sql.trim().to_string(),
-            expected_error,
+            sql: tail.to_string(),
+            expectations,
             line_number: start_line,
         });
     }
 
     Ok(statements)
+}
+
+fn tisql_error_kind(err: &TiSqlError) -> String {
+    match err {
+        TiSqlError::Storage(_) => "Storage".into(),
+        TiSqlError::Log(_) => "Log".into(),
+        TiSqlError::Catalog(_) => "Catalog".into(),
+        TiSqlError::Transaction(_) => "Transaction".into(),
+        TiSqlError::Parse(_) => "Parse".into(),
+        TiSqlError::Bind(_) => "Bind".into(),
+        TiSqlError::Execution(_) => "Execution".into(),
+        TiSqlError::TableNotFound(_) => "TableNotFound".into(),
+        TiSqlError::ColumnNotFound(_) => "ColumnNotFound".into(),
+        TiSqlError::TypeMismatch { .. } => "TypeMismatch".into(),
+        TiSqlError::DuplicateKey(_) => "DuplicateKey".into(),
+        TiSqlError::TransactionConflict => "TransactionConflict".into(),
+        TiSqlError::TransactionAborted => "TransactionAborted".into(),
+        TiSqlError::Io(_) => "Io".into(),
+        TiSqlError::Internal(_) => "Internal".into(),
+        TiSqlError::Codec(_) => "Codec".into(),
+    }
+}
+
+/// Best-effort mapping from TiSqlError to MySQL-style error codes for mysql-test cases.
+fn mysql_error_code(err: &TiSqlError) -> u32 {
+    match err {
+        TiSqlError::TableNotFound(_) => 1146,    // ER_NO_SUCH_TABLE
+        TiSqlError::ColumnNotFound(_) => 1054,   // ER_BAD_FIELD_ERROR
+        TiSqlError::DuplicateKey(_) => 1062,     // ER_DUP_ENTRY
+        TiSqlError::Parse(_) => 1064,            // ER_PARSE_ERROR
+        TiSqlError::TypeMismatch { .. } => 1366, // ER_TRUNCATED_WRONG_VALUE_FOR_FIELD (approx)
+
+        // Heuristics for Catalog/Execution errors.
+        TiSqlError::Catalog(msg) => {
+            if msg.to_lowercase().contains("already exists") {
+                1050 // ER_TABLE_EXISTS_ERROR
+            } else {
+                1105 // ER_UNKNOWN_ERROR
+            }
+        }
+        TiSqlError::Execution(_) | TiSqlError::Bind(_) => 1105, // ER_UNKNOWN_ERROR
+
+        // Default fallback.
+        _ => 1105, // ER_UNKNOWN_ERROR
+    }
+}
+
+fn format_output_mismatch(expected: &str, output: &str) -> String {
+    let output_lines: Vec<&str> = output.lines().collect();
+    let expected_lines: Vec<&str> = expected.lines().collect();
+
+    let mut diff_line = 0usize;
+    for (i, (out, exp)) in output_lines.iter().zip(expected_lines.iter()).enumerate() {
+        if out != exp {
+            diff_line = i + 1;
+            break;
+        }
+    }
+
+    if diff_line == 0 && output_lines.len() != expected_lines.len() {
+        diff_line = output_lines.len().min(expected_lines.len()) + 1;
+    }
+
+    let exp_line = expected_lines
+        .get(diff_line.saturating_sub(1))
+        .copied()
+        .unwrap_or("<EOF>");
+    let out_line = output_lines
+        .get(diff_line.saturating_sub(1))
+        .copied()
+        .unwrap_or("<EOF>");
+
+    format!(
+        "Output mismatch at line {}. Expected {} lines, got {} lines.\nexpected: {}\nactual  : {}",
+        diff_line,
+        expected_lines.len(),
+        output_lines.len(),
+        exp_line,
+        out_line
+    )
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn parse_supports_multiple_statements_per_line() {
+        let tmp = tempfile::NamedTempFile::new().unwrap();
+        fs::write(
+            tmp.path(),
+            "CREATE TABLE t (id INT); INSERT INTO t VALUES (1); SELECT id FROM t;",
+        )
+        .unwrap();
+
+        let stmts = parse_test_file(tmp.path()).unwrap();
+        assert_eq!(stmts.len(), 3);
+        assert_eq!(stmts[0].sql, "CREATE TABLE t (id INT)");
+        assert_eq!(stmts[1].sql, "INSERT INTO t VALUES (1)");
+        assert_eq!(stmts[2].sql, "SELECT id FROM t");
+    }
+
+    #[test]
+    fn parse_does_not_split_on_semicolon_in_string() {
+        let tmp = tempfile::NamedTempFile::new().unwrap();
+        fs::write(
+            tmp.path(),
+            "CREATE TABLE t (v VARCHAR(10)); INSERT INTO t VALUES ('a;b'); SELECT v FROM t;",
+        )
+        .unwrap();
+
+        let stmts = parse_test_file(tmp.path()).unwrap();
+        assert_eq!(stmts.len(), 3);
+        assert_eq!(stmts[1].sql, "INSERT INTO t VALUES ('a;b')");
+    }
+
+    #[test]
+    fn directives_apply_to_next_statement_only() {
+        let tmp = tempfile::NamedTempFile::new().unwrap();
+        fs::write(tmp.path(), "--rows 1\nSELECT 1;\nSELECT 2;").unwrap();
+
+        let stmts = parse_test_file(tmp.path()).unwrap();
+        assert_eq!(stmts.len(), 2);
+        assert_eq!(stmts[0].expectations.expected_rows, Some(1));
+        assert_eq!(stmts[1].expectations.expected_rows, None);
+    }
+
+    #[test]
+    fn error_code_mapping_covers_common_cases() {
+        assert_eq!(
+            mysql_error_code(&TiSqlError::TableNotFound("t".into())),
+            1146
+        );
+        assert_eq!(
+            mysql_error_code(&TiSqlError::ColumnNotFound("c".into())),
+            1054
+        );
+        assert_eq!(mysql_error_code(&TiSqlError::Parse("x".into())), 1064);
+    }
 }

@@ -1,5 +1,6 @@
 CREATE TABLE t_agg (id INT, val INT, category VARCHAR(10))
 INSERT INTO t_agg VALUES (1, 10, 'A'), (2, 20, 'A'), (3, 30, 'B'), (4, 40, 'B'), (5, 50, 'B')
+AFFECTED 5
 SELECT COUNT(id) FROM t_agg
 COUNT
 1

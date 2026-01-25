@@ -1,5 +1,6 @@
 CREATE TABLE t_select (a INT, b INT, c VARCHAR(50))
 INSERT INTO t_select VALUES (1, 10, 'one'), (2, 20, 'two'), (3, 30, 'three'), (4, 40, 'four'), (5, 50, 'five')
+AFFECTED 5
 SELECT a, b, c FROM t_select ORDER BY a
 a	b	c
 1	10	one

@@ -188,8 +188,7 @@ impl FileClogService {
         reader.read_exact(&mut magic)?;
         if &magic != FILE_MAGIC {
             return Err(TiSqlError::Internal(format!(
-                "Invalid commit log file magic: {:?}",
-                magic
+                "Invalid commit log file magic: {magic:?}"
             )));
         }
 
@@ -198,8 +197,7 @@ impl FileClogService {
         let version = u32::from_le_bytes(version_bytes);
         if version != FILE_VERSION {
             return Err(TiSqlError::Internal(format!(
-                "Unsupported commit log file version: {}",
-                version
+                "Unsupported commit log file version: {version}"
             )));
         }
 
@@ -254,8 +252,7 @@ impl FileClogService {
         // Only support entry records (type 1)
         if record_type != 1 {
             return Err(TiSqlError::Internal(format!(
-                "Unknown record type: {}",
-                record_type
+                "Unknown record type: {record_type}"
             )));
         }
 
@@ -267,14 +264,13 @@ impl FileClogService {
         let computed_checksum = crc32(&data);
         if computed_checksum != checksum {
             return Err(TiSqlError::Internal(format!(
-                "Checksum mismatch: expected {}, got {}",
-                checksum, computed_checksum
+                "Checksum mismatch: expected {checksum}, got {computed_checksum}"
             )));
         }
 
         // Deserialize entries
         let entries: Vec<ClogEntry> = bincode::deserialize(&data).map_err(|e| {
-            TiSqlError::Internal(format!("Failed to deserialize commit log entries: {}", e))
+            TiSqlError::Internal(format!("Failed to deserialize commit log entries: {e}"))
         })?;
 
         Ok(Some(entries))
@@ -284,7 +280,7 @@ impl FileClogService {
     fn write_record<W: Write>(writer: &mut W, entries: &[ClogEntry]) -> Result<()> {
         // Serialize entries
         let data = bincode::serialize(entries).map_err(|e| {
-            TiSqlError::Internal(format!("Failed to serialize commit log entries: {}", e))
+            TiSqlError::Internal(format!("Failed to serialize commit log entries: {e}"))
         })?;
 
         // Compute checksum

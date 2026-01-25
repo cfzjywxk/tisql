@@ -1,23 +1,28 @@
 CREATE TABLE t_update (id INT, val INT, name VARCHAR(50))
 INSERT INTO t_update VALUES (1, 100, 'first'), (2, 200, 'second'), (3, 300, 'third')
+AFFECTED 3
 SELECT id, val, name FROM t_update ORDER BY id
 id	val	name
 1	100	first
 2	200	second
 3	300	third
 UPDATE t_update SET val = 150 WHERE id = 1
+AFFECTED 1
 SELECT id, val, name FROM t_update WHERE id = 1
 id	val	name
 1	150	first
 UPDATE t_update SET val = 250, name = 'updated' WHERE id = 2
+AFFECTED 1
 SELECT id, val, name FROM t_update WHERE id = 2
 id	val	name
 2	250	updated
 UPDATE t_update SET val = 999 WHERE id > 1
+AFFECTED 2
 SELECT id, val, name FROM t_update ORDER BY id
 id	val	name
 3	999	third
 UPDATE t_update SET val = val + 1 WHERE id = 1
+AFFECTED 0
 SELECT id, val, name FROM t_update WHERE id = 1
 id	val	name
 DROP TABLE t_update

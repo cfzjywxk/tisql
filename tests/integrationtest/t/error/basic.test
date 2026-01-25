@@ -1,0 +1,17 @@
+# Error expectation tests
+
+# Missing table
+--error 1146
+--error_kind TableNotFound
+SELECT * FROM non_existent_table;
+
+# Parse error
+--error 1064
+--error_kind Parse
+SELCT 1;
+
+# Regular statements still work after errors
+CREATE TABLE t (id INT);
+INSERT INTO t VALUES (1);
+SELECT id FROM t;
+DROP TABLE t;

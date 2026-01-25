@@ -1,8 +1,12 @@
 CREATE TABLE t_insert ( id INT, name VARCHAR(100), value INT )
 INSERT INTO t_insert (id, name, value) VALUES (1, 'first', 100)
+AFFECTED 1
 INSERT INTO t_insert VALUES (2, 'second', 200)
+AFFECTED 1
 INSERT INTO t_insert VALUES (3, 'third', 300), (4, 'fourth', 400)
+AFFECTED 2
 INSERT INTO t_insert (id, name) VALUES (5, 'fifth')
+AFFECTED 1
 SELECT id, name, value FROM t_insert ORDER BY id
 id	name	value
 1	first	100

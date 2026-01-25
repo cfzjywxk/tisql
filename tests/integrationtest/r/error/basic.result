@@ -1,0 +1,11 @@
+SELECT * FROM non_existent_table
+ERROR 1146: TableNotFound
+SELCT 1
+ERROR 1064: Parse
+CREATE TABLE t (id INT)
+INSERT INTO t VALUES (1)
+AFFECTED 1
+SELECT id FROM t
+id
+1
+DROP TABLE t
