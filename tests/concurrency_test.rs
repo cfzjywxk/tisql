@@ -234,7 +234,10 @@ fn test_concurrent_writes_different_keys() {
             for j in 0..writes_per_thread {
                 let key = format!("key_{i}_{j}");
                 let value = format!("value_{i}_{j}");
-                if txn_service.autocommit_put(key.as_bytes(), value.as_bytes()).is_ok() {
+                if txn_service
+                    .autocommit_put(key.as_bytes(), value.as_bytes())
+                    .is_ok()
+                {
                     success_count.fetch_add(1, Ordering::Relaxed);
                 }
             }
