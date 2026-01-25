@@ -158,35 +158,15 @@ impl SQLEngine {
         // Parse SQL text into AST
         let stmt = self.parser.parse_one(sql)?;
 
-        // For DDL statements, use the latest schema (no snapshot_ts).
-        // For DML/DQL statements, use current_ts for MVCC schema visibility.
-        let binder = if Self::is_ddl(&stmt) {
-            Binder::new(catalog, &query_ctx.current_db)
-        } else {
-            Binder::with_snapshot_ts(catalog, &query_ctx.current_db, txn_service.current_ts())
-        };
+        // Use latest schema for binding (Timestamp::MAX).
+        // For proper MVCC schema versioning within a transaction, the executor
+        // would need to use a start_ts from the transaction context.
+        let binder = Binder::new(catalog, &query_ctx.current_db);
         let plan = binder.bind(stmt)?;
 
         // Execute through TxnService
         // TODO: Use query_ctx for execution options (priority, isolation level, etc.)
         self.executor.execute(plan, txn_service, catalog)
-    }
-
-    /// Check if a statement is DDL (schema-modifying).
-    fn is_ddl(stmt: &sqlparser::ast::Statement) -> bool {
-        use sqlparser::ast::Statement;
-        matches!(
-            stmt,
-            Statement::CreateTable { .. }
-                | Statement::CreateIndex { .. }
-                | Statement::CreateDatabase { .. }
-                | Statement::CreateSchema { .. }
-                | Statement::CreateView { .. }
-                | Statement::AlterTable { .. }
-                | Statement::AlterIndex { .. }
-                | Statement::Drop { .. }
-                | Statement::Truncate { .. }
-        )
     }
 }
 

@@ -104,8 +104,11 @@ impl<S: StorageEngine, L: ClogService, T: TsoService> TransactionService<S, L, T
             return Ok((0, ts, 0));
         }
 
-        // Get commit_ts from TSO (also serves as txn_id for simplicity)
-        let commit_ts = self.get_ts();
+        // Get commit_ts ensuring it's greater than max observed timestamp.
+        // This maintains MVCC invariant: commit_ts > all reader's start_ts
+        let max_ts = self.concurrency_manager.max_ts();
+        let tso_ts = self.get_ts();
+        let commit_ts = std::cmp::max(max_ts + 1, tso_ts);
         let txn_id = commit_ts;
 
         // Collect keys for locking
@@ -277,10 +280,6 @@ impl<S: StorageEngine + 'static, L: ClogService + 'static, T: TsoService> TxnSer
         Ok(TxnCtx::new(txn_id, start_ts, read_only))
     }
 
-    fn current_ts(&self) -> Timestamp {
-        self.tso.current_ts()
-    }
-
     fn get(&self, ctx: &TxnCtx, key: &[u8]) -> Result<Option<RawValue>> {
         // First check write buffer for uncommitted writes (read-your-writes)
         // Iterate in reverse order to get the most recent operation
@@ -308,17 +307,51 @@ impl<S: StorageEngine + 'static, L: ClogService + 'static, T: TsoService> TxnSer
         ctx: &TxnCtx,
         range: Range<Key>,
     ) -> Result<Box<dyn Iterator<Item = (Key, RawValue)> + '_>> {
-        // Note: This simplified scan doesn't merge with write buffer
-        // A full implementation would need to merge buffered writes with storage scan
-
         // Check for locks in range
         if !range.is_empty() {
             self.concurrency_manager
                 .check_range(&range.start, &range.end, ctx.start_ts)?;
         }
 
-        // Use scan_at with transaction's start_ts for MVCC visibility
-        self.storage.scan_at(range, ctx.start_ts)
+        // Get storage scan results
+        let storage_iter = self.storage.scan_at(range.clone(), ctx.start_ts)?;
+
+        // Collect buffered writes in range for read-your-writes semantics
+        // Use a map to track the latest operation per key
+        let mut buffer_ops: std::collections::BTreeMap<Key, Option<RawValue>> =
+            std::collections::BTreeMap::new();
+
+        for op in ctx.write_buffer.iter() {
+            match op {
+                WriteOp::Put { key, value } => {
+                    if key >= &range.start && key < &range.end {
+                        buffer_ops.insert(key.clone(), Some(value.clone()));
+                    }
+                }
+                WriteOp::Delete { key } => {
+                    if key >= &range.start && key < &range.end {
+                        buffer_ops.insert(key.clone(), None); // None = deleted
+                    }
+                }
+            }
+        }
+
+        // Merge storage results with buffered writes
+        // Buffered writes override storage values
+        let mut results: std::collections::BTreeMap<Key, RawValue> = storage_iter.collect();
+
+        for (key, value_opt) in buffer_ops {
+            match value_opt {
+                Some(value) => {
+                    results.insert(key, value);
+                }
+                None => {
+                    results.remove(&key); // Buffered delete removes the key
+                }
+            }
+        }
+
+        Ok(Box::new(results.into_iter()))
     }
 
     fn put(&self, ctx: &mut TxnCtx, key: Key, value: RawValue) -> Result<()> {
@@ -356,8 +389,11 @@ impl<S: StorageEngine + 'static, L: ClogService + 'static, T: TsoService> TxnSer
             });
         }
 
-        // Get commit_ts from TSO
-        let commit_ts = self.get_ts();
+        // Get commit_ts ensuring it's greater than max observed timestamp.
+        // This maintains MVCC invariant: commit_ts > all reader's start_ts
+        let max_ts = self.concurrency_manager.max_ts();
+        let tso_ts = self.get_ts();
+        let commit_ts = std::cmp::max(max_ts + 1, tso_ts);
 
         // Collect keys for locking
         let keys: Vec<Key> = ctx.write_buffer.keys().cloned().collect();
@@ -535,8 +571,8 @@ mod tests {
         assert!(storage.get(b"k1").unwrap().is_none()); // Was deleted
         assert_eq!(storage.get(b"k2").unwrap().unwrap(), b"v2");
 
-        // Verify TSO advanced
-        assert!(txn_service.current_ts() > 3);
+        // Verify TSO advanced (use tso().last_ts() to check state)
+        assert!(txn_service.tso().last_ts() > 3);
     }
 
     #[test]
@@ -751,19 +787,63 @@ mod tests {
     }
 
     #[test]
-    fn test_txn_current_ts_advances() {
+    fn test_txn_service_scan_read_your_writes() {
         let (_storage, txn_service, _dir) = create_test_service();
 
-        let ts1 = txn_service.current_ts();
+        // Write some data via autocommit first
+        txn_service.autocommit_put(b"a", b"1").unwrap();
+        txn_service.autocommit_put(b"b", b"2").unwrap();
 
-        // Each begin advances the timestamp
+        // Begin a read-write transaction
+        let mut ctx = txn_service.begin(false).unwrap();
+
+        // Buffer some writes
+        txn_service
+            .put(&mut ctx, b"c".to_vec(), b"3".to_vec())
+            .unwrap();
+        txn_service
+            .put(&mut ctx, b"b".to_vec(), b"modified".to_vec())
+            .unwrap(); // Override existing
+        txn_service.delete(&mut ctx, b"a".to_vec()).unwrap(); // Delete existing
+
+        // Scan should merge buffered writes with storage (read-your-writes)
+        let results: Vec<_> = txn_service
+            .scan(&ctx, b"a".to_vec()..b"d".to_vec())
+            .unwrap()
+            .collect();
+
+        // Should see:
+        // - 'a' deleted (removed from results)
+        // - 'b' modified (buffered write overrides storage)
+        // - 'c' added (buffered write)
+        assert_eq!(results.len(), 2, "scan should see 2 keys (a deleted)");
+
+        let result_map: std::collections::HashMap<_, _> = results.into_iter().collect();
+        assert_eq!(
+            result_map.get(b"b".as_slice()),
+            Some(&b"modified".to_vec())
+        );
+        assert_eq!(result_map.get(b"c".as_slice()), Some(&b"3".to_vec()));
+        assert!(
+            !result_map.contains_key(b"a".as_slice()),
+            "a should be deleted"
+        );
+    }
+
+    #[test]
+    fn test_tso_advances_on_begin() {
+        let (_storage, txn_service, _dir) = create_test_service();
+
+        let ts1 = txn_service.tso().last_ts();
+
+        // Each begin advances the timestamp (allocates txn_id and start_ts)
         let _ctx = txn_service.begin(false).unwrap();
-        let ts2 = txn_service.current_ts();
+        let ts2 = txn_service.tso().last_ts();
         assert!(ts2 > ts1);
 
         // Each begin also advances the timestamp
         let _ctx2 = txn_service.begin(true).unwrap();
-        let ts3 = txn_service.current_ts();
+        let ts3 = txn_service.tso().last_ts();
         assert!(ts3 > ts2);
     }
 }

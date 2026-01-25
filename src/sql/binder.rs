@@ -45,6 +45,7 @@ impl<'a> Binder<'a> {
     ///
     /// This enables MVCC schema visibility - the Binder will see the schema
     /// as it existed at the specified timestamp.
+    #[allow(dead_code)]
     pub fn with_snapshot_ts(catalog: &'a dyn Catalog, current_schema: &str, ts: Timestamp) -> Self {
         Self {
             catalog,

@@ -22,7 +22,7 @@
 //! **DO NOT use `StorageEngine` methods directly for reading data.**
 //!
 //! All reads should go through [`TxnService`](crate::transaction::TxnService) to ensure
-//! proper MVCC semantics and transaction isolation:
+//! proper MVCC semantics, transaction isolation, and read-your-writes consistency:
 //!
 //! ```ignore
 //! // CORRECT: Use TxnService for reads
@@ -30,19 +30,18 @@
 //! let value = txn_service.get(&ctx, key)?;
 //! let iter = txn_service.scan(&ctx, range)?;
 //!
-//! // WRONG: Direct storage access bypasses MVCC
+//! // WRONG: Direct storage access bypasses MVCC and buffered writes
 //! let value = storage.get(key)?;  // DON'T DO THIS
 //! ```
 //!
-//! The non-MVCC methods (`get`, `scan`, `snapshot`) exist only for:
+//! The non-MVCC methods (`get`, `scan`) exist only for:
 //! - Internal recovery operations
 //! - Testing and debugging
 //! - Low-level infrastructure code
 //!
 //! ## Module Structure
 //! - `StorageEngine` trait - Core KV storage interface (use via TxnService)
-//! - `Snapshot` trait - Consistent read snapshot (deprecated, use TxnService)
-//! - `WriteBatch` - Atomic batch writes (used internally by TxnService)
+//! - `WriteBatch` - Atomic batch writes with explicit `commit_ts`
 //! - `MvccMemTableEngine` - MVCC in-memory implementation
 //!
 //! ## Key Encoding

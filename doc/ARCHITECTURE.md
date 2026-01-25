@@ -199,11 +199,8 @@ pub trait Transaction: Send {
 pub trait TransactionManager: Send + Sync {
     type Txn: Transaction;
 
-    /// Begin a new transaction
+    /// Begin a new transaction (allocates start_ts)
     fn begin(&self, isolation: IsolationLevel) -> Result<Self::Txn>;
-
-    /// Get current global timestamp (for MVCC)
-    fn current_ts(&self) -> Timestamp;
 }
 ```
 

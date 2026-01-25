@@ -79,11 +79,14 @@ pub trait TsoService: Send + Sync + 'static {
         first
     }
 
-    /// Get current timestamp without incrementing.
+    /// Get last allocated timestamp without incrementing.
     ///
-    /// Returns the last allocated timestamp (or initial value if none allocated).
-    /// This is useful for checking the current TSO state.
-    fn current_ts(&self) -> Timestamp;
+    /// Returns the next timestamp that would be allocated (or initial value if
+    /// none allocated yet). This is useful for recovery and testing.
+    ///
+    /// Note: This is NOT `start_ts` or `commit_ts` - those are transaction-specific.
+    /// This returns the TSO's internal counter state.
+    fn last_ts(&self) -> Timestamp;
 
     /// Set the timestamp counter (used during recovery).
     ///
@@ -93,9 +96,9 @@ pub trait TsoService: Send + Sync + 'static {
 
     /// Check if the given timestamp is valid (not in the future).
     ///
-    /// Returns true if `ts <= current_ts()`.
+    /// Returns true if `ts <= last_ts()`.
     fn is_valid_ts(&self, ts: Timestamp) -> bool {
-        ts <= self.current_ts()
+        ts <= self.last_ts()
     }
 }
 

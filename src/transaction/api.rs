@@ -170,12 +170,9 @@ pub trait TxnService: Send + Sync {
 
     /// Begin a new transaction.
     ///
+    /// Allocates a `start_ts` from TSO and returns a transaction context.
     /// If `read_only` is true, write operations will error.
-    /// Returns a transaction context to pass to subsequent operations.
     fn begin(&self, read_only: bool) -> Result<TxnCtx>;
-
-    /// Get current timestamp from TSO.
-    fn current_ts(&self) -> Timestamp;
 
     // === Data Operations ===
 
@@ -188,6 +185,9 @@ pub trait TxnService: Send + Sync {
     fn get(&self, ctx: &TxnCtx, key: &[u8]) -> Result<Option<RawValue>>;
 
     /// Scan a range of keys within the transaction.
+    ///
+    /// For read-write transactions, this merges buffered writes with storage,
+    /// implementing read-your-writes semantics.
     ///
     /// Returns an iterator over key-value pairs visible at `start_ts`.
     fn scan(

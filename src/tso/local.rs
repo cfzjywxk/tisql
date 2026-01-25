@@ -58,7 +58,7 @@ impl TsoService for LocalTso {
         self.counter.fetch_add(1, Ordering::SeqCst)
     }
 
-    fn current_ts(&self) -> Timestamp {
+    fn last_ts(&self) -> Timestamp {
         self.counter.load(Ordering::SeqCst)
     }
 
@@ -86,7 +86,7 @@ mod tests {
         assert_eq!(tso.get_ts(), 1);
         assert_eq!(tso.get_ts(), 2);
         assert_eq!(tso.get_ts(), 3);
-        assert_eq!(tso.current_ts(), 4);
+        assert_eq!(tso.last_ts(), 4);
     }
 
     #[test]
@@ -97,7 +97,7 @@ mod tests {
         tso.get_ts(); // 2
 
         tso.set_ts(100);
-        assert_eq!(tso.current_ts(), 100);
+        assert_eq!(tso.last_ts(), 100);
         assert_eq!(tso.get_ts(), 100);
         assert_eq!(tso.get_ts(), 101);
     }
@@ -145,7 +145,7 @@ mod tests {
 
         assert!(tso.is_valid_ts(1));
         assert!(tso.is_valid_ts(2));
-        assert!(tso.is_valid_ts(3)); // current_ts
+        assert!(tso.is_valid_ts(3)); // last_ts
         assert!(!tso.is_valid_ts(4)); // future
         assert!(!tso.is_valid_ts(100)); // future
     }
