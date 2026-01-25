@@ -15,14 +15,18 @@
 //! Concurrency control for MVCC transactions.
 //!
 //! This module provides:
-//! - TSO (Timestamp Oracle) for monotonic timestamp allocation
 //! - In-memory lock table for 1PC transaction atomicity
+//! - max_ts tracking for MVCC read visibility
+//!
+//! Note: Timestamp allocation (TSO) is handled by the separate `tso` module.
 //!
 //! ## Design
 //!
 //! The ConcurrencyManager follows TiKV's pattern for 1PC (one-phase commit)
 //! transaction atomicity. The key insight is that readers must be blocked
 //! by in-memory locks BEFORE they even get a storage snapshot.
+//!
+//! Reference: TiKV's `components/concurrency_manager/src/lib.rs`
 //!
 //! ```text
 //! 1PC Write Flow:
@@ -76,22 +80,25 @@ impl std::fmt::Debug for KeyGuard {
     }
 }
 
-/// ConcurrencyManager provides TSO and in-memory lock table.
+/// ConcurrencyManager provides in-memory lock table and max_ts tracking.
 ///
-/// This is the central component for MVCC concurrency control:
-/// 1. **TSO** - Monotonic timestamp allocation for start_ts and commit_ts
-/// 2. **Lock Table** - In-memory locks that block readers during writes
+/// This is a component for MVCC concurrency control:
+/// 1. **Lock Table** - In-memory locks that block readers during writes
+/// 2. **max_ts** - Maximum timestamp seen, for MVCC visibility checks
+///
+/// Note: Timestamp allocation is handled by the separate `TsoService`.
 ///
 /// ## Thread Safety
 ///
 /// ConcurrencyManager is designed to be shared across threads via `Arc`.
 /// All operations are lock-free using atomic operations and crossbeam-skiplist.
+///
+/// ## Reference
+///
+/// TiKV's ConcurrencyManager: `components/concurrency_manager/src/lib.rs`
 pub struct ConcurrencyManager {
-    /// Monotonic timestamp counter (serves as TSO)
-    current_ts: AtomicU64,
-
     /// Maximum timestamp seen by any transaction.
-    /// Used for safe timestamp allocation in distributed scenarios.
+    /// Used for MVCC read visibility checks.
     max_ts: AtomicU64,
 
     /// In-memory lock table: key -> Lock
@@ -100,36 +107,20 @@ pub struct ConcurrencyManager {
 }
 
 impl ConcurrencyManager {
-    /// Create a new ConcurrencyManager with initial timestamp.
+    /// Create a new ConcurrencyManager.
     ///
-    /// The initial_ts should be set based on recovered state (max commit_ts + 1).
-    pub fn new(initial_ts: Timestamp) -> Self {
+    /// The initial_max_ts should be set based on recovered state (max commit_ts).
+    pub fn new(initial_max_ts: Timestamp) -> Self {
         Self {
-            current_ts: AtomicU64::new(initial_ts),
-            max_ts: AtomicU64::new(initial_ts),
+            max_ts: AtomicU64::new(initial_max_ts),
             lock_table: Arc::new(SkipMap::new()),
         }
     }
 
-    /// Allocate next timestamp (TSO).
-    ///
-    /// Returns a monotonically increasing timestamp.
-    /// This is used for both start_ts and commit_ts.
-    pub fn get_ts(&self) -> Timestamp {
-        let ts = self.current_ts.fetch_add(1, Ordering::SeqCst);
-        // Also update max_ts
-        self.update_max_ts(ts);
-        ts
-    }
-
-    /// Get current timestamp without incrementing.
-    pub fn current_ts(&self) -> Timestamp {
-        self.current_ts.load(Ordering::SeqCst)
-    }
-
     /// Update max_ts if the given ts is greater.
     ///
-    /// This is called by readers to ensure timestamp monotonicity.
+    /// This is called when transactions allocate timestamps to ensure
+    /// proper MVCC visibility tracking.
     pub fn update_max_ts(&self, ts: Timestamp) {
         let mut current = self.max_ts.load(Ordering::Relaxed);
         while ts > current {
@@ -148,12 +139,6 @@ impl ConcurrencyManager {
     /// Get the maximum timestamp seen.
     pub fn max_ts(&self) -> Timestamp {
         self.max_ts.load(Ordering::SeqCst)
-    }
-
-    /// Set timestamp counter (used during recovery).
-    pub fn set_ts(&self, ts: Timestamp) {
-        self.current_ts.store(ts, Ordering::SeqCst);
-        self.update_max_ts(ts);
     }
 
     /// Acquire locks for keys (called BEFORE write).
@@ -256,7 +241,7 @@ impl ConcurrencyManager {
 
 impl Default for ConcurrencyManager {
     fn default() -> Self {
-        Self::new(1)
+        Self::new(0)
     }
 }
 
@@ -265,23 +250,8 @@ mod tests {
     use super::*;
 
     #[test]
-    fn test_tso_monotonic() {
-        let cm = ConcurrencyManager::new(1);
-
-        let ts1 = cm.get_ts();
-        let ts2 = cm.get_ts();
-        let ts3 = cm.get_ts();
-
-        assert_eq!(ts1, 1);
-        assert_eq!(ts2, 2);
-        assert_eq!(ts3, 3);
-        assert!(ts1 < ts2);
-        assert!(ts2 < ts3);
-    }
-
-    #[test]
     fn test_max_ts_update() {
-        let cm = ConcurrencyManager::new(1);
+        let cm = ConcurrencyManager::new(0);
 
         cm.update_max_ts(10);
         assert_eq!(cm.max_ts(), 10);
@@ -297,7 +267,7 @@ mod tests {
 
     #[test]
     fn test_lock_keys_success() {
-        let cm = ConcurrencyManager::new(1);
+        let cm = ConcurrencyManager::new(0);
 
         let keys = vec![b"key1".to_vec(), b"key2".to_vec()];
         let lock = Lock {
@@ -319,7 +289,7 @@ mod tests {
 
     #[test]
     fn test_lock_release_on_drop() {
-        let cm = ConcurrencyManager::new(1);
+        let cm = ConcurrencyManager::new(0);
 
         let keys = vec![b"key1".to_vec()];
         let lock = Lock {
@@ -340,7 +310,7 @@ mod tests {
 
     #[test]
     fn test_lock_conflict() {
-        let cm = ConcurrencyManager::new(1);
+        let cm = ConcurrencyManager::new(0);
 
         let keys = vec![b"key1".to_vec()];
         let lock1 = Lock {
@@ -362,7 +332,7 @@ mod tests {
 
     #[test]
     fn test_check_range() {
-        let cm = ConcurrencyManager::new(1);
+        let cm = ConcurrencyManager::new(0);
 
         let keys = vec![b"key2".to_vec()];
         let lock = Lock {
@@ -380,32 +350,26 @@ mod tests {
     }
 
     #[test]
-    fn test_concurrent_tso() {
+    fn test_concurrent_max_ts() {
         use std::thread;
 
-        let cm = Arc::new(ConcurrencyManager::new(1));
+        let cm = Arc::new(ConcurrencyManager::new(0));
         let mut handles = vec![];
 
-        for _ in 0..10 {
+        for i in 0..10 {
             let cm = Arc::clone(&cm);
             handles.push(thread::spawn(move || {
-                let mut timestamps = vec![];
-                for _ in 0..100 {
-                    timestamps.push(cm.get_ts());
+                for j in 0..100 {
+                    cm.update_max_ts((i * 100 + j) as u64);
                 }
-                timestamps
             }));
         }
 
-        let mut all_timestamps = vec![];
         for handle in handles {
-            all_timestamps.extend(handle.join().unwrap());
+            handle.join().unwrap();
         }
 
-        // All timestamps should be unique
-        all_timestamps.sort();
-        for i in 1..all_timestamps.len() {
-            assert!(all_timestamps[i] > all_timestamps[i - 1]);
-        }
+        // max_ts should be at least 999 (10 threads * 100 iterations - 1)
+        assert!(cm.max_ts() >= 999);
     }
 }

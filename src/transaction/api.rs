@@ -14,129 +14,187 @@
 
 //! Transaction service API definitions.
 //!
-//! This module defines the core transaction service interfaces following the
-//! design patterns from TiKV/OceanBase:
-//!
-//! - `TxnService`: The main entry point for creating transactions
-//! - `ReadSnapshot`: Read-only transaction handle for SELECT statements
-//! - `Txn`: Read-write transaction handle for DML statements
+//! This module defines the unified transaction service interface following
+//! OceanBase's design pattern where all transaction operations go through
+//! a single service trait.
 //!
 //! ## Key Design Principles
 //!
-//! 1. **Opaque handles**: Internal state (start_ts, commit_ts) is hidden from consumers
-//! 2. **Interface separation**: Read-only vs read-write transactions have different interfaces
-//! 3. **Trait-based abstraction**: SQL engine depends on traits, not implementations
+//! 1. **Unified interface**: All transaction operations in one trait (`TxnService`)
+//! 2. **Context-based**: Transaction state is held in `TxnCtx`, passed to operations
+//! 3. **No read-only distinction**: Even "reads" may write in distributed txn (lock resolution)
 //!
 //! ## Usage
 //!
 //! ```ignore
-//! // Read-only query
-//! let snapshot = txn_service.snapshot()?;
-//! let value = snapshot.get(key)?;
+//! // Begin a transaction
+//! let mut ctx = txn_service.begin(false)?;  // read_only = false
 //!
-//! // Read-write transaction
-//! let mut txn = txn_service.begin()?;
-//! txn.put(key, value);
-//! let info = txn.commit()?;
+//! // Read operations
+//! let value = txn_service.get(&ctx, key)?;
+//!
+//! // Write operations
+//! txn_service.put(&mut ctx, key, value);
+//!
+//! // Commit
+//! let info = txn_service.commit(ctx)?;
 //! ```
 
 use std::ops::Range;
 
 use crate::error::Result;
+use crate::storage::WriteBatch;
 use crate::types::{Key, Lsn, RawValue, Timestamp, TxnId};
 
-/// Transaction service trait - the main entry point for transactions.
+/// Transaction state machine.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TxnState {
+    /// Transaction is active and can perform operations.
+    Active,
+    /// Transaction has been committed.
+    Committed,
+    /// Transaction has been aborted/rolled back.
+    Aborted,
+}
+
+/// Transaction context - holds transaction state.
 ///
-/// This is the "thin waist" that all transaction operations go through.
-/// Implementations hide internal details like TSO, lock tables, and 2PC.
+/// Similar to OceanBase's `ObTxDesc`. This struct is passed to all
+/// transaction operations on `TxnService`.
+///
+/// The context is created by `TxnService::begin()` and consumed by
+/// `commit()` or `rollback()`.
+#[derive(Debug)]
+pub struct TxnCtx {
+    /// Unique transaction ID.
+    pub(crate) txn_id: TxnId,
+    /// Start timestamp for MVCC reads.
+    pub(crate) start_ts: Timestamp,
+    /// Current transaction state.
+    pub(crate) state: TxnState,
+    /// Whether this is a read-only transaction.
+    pub(crate) read_only: bool,
+    /// Buffered writes (for read-write transactions).
+    pub(crate) write_buffer: WriteBatch,
+}
+
+impl TxnCtx {
+    /// Create a new transaction context.
+    pub(crate) fn new(txn_id: TxnId, start_ts: Timestamp, read_only: bool) -> Self {
+        Self {
+            txn_id,
+            start_ts,
+            state: TxnState::Active,
+            read_only,
+            write_buffer: WriteBatch::new(),
+        }
+    }
+
+    /// Get the transaction ID.
+    #[inline]
+    pub fn txn_id(&self) -> TxnId {
+        self.txn_id
+    }
+
+    /// Get the start timestamp.
+    #[inline]
+    pub fn start_ts(&self) -> Timestamp {
+        self.start_ts
+    }
+
+    /// Check if this is a read-only transaction.
+    #[inline]
+    pub fn is_read_only(&self) -> bool {
+        self.read_only
+    }
+
+    /// Check if the transaction is still valid (active).
+    #[inline]
+    pub fn is_valid(&self) -> bool {
+        self.state == TxnState::Active
+    }
+
+    /// Get the current state.
+    #[inline]
+    pub fn state(&self) -> TxnState {
+        self.state
+    }
+}
+
+/// Transaction Service - the unified interface for all transaction operations.
+///
+/// This follows OceanBase's `ObTransService` pattern where all transaction
+/// operations go through a single service interface. Transaction state is
+/// held in `TxnCtx` and passed to each operation.
+///
+/// ## Design Rationale
+///
+/// In distributed transactions (2PC), even "read" operations may need to:
+/// - Push forward `min_commit_ts` of concurrent writes
+/// - Resolve stale locks
+///
+/// Therefore, there's no fundamental distinction between read-only and
+/// read-write transactions at the API level. The `read_only` flag is
+/// a hint for optimization, not a hard constraint.
 pub trait TxnService: Send + Sync {
-    /// Begin a new read-write transaction.
-    ///
-    /// The transaction is in "active" state after this call.
-    /// All writes are buffered until commit.
-    fn begin(&self) -> Result<Box<dyn Txn>>;
+    // === Factory ===
 
-    /// Create a read-only snapshot for consistent reads.
+    /// Begin a new transaction.
     ///
-    /// The snapshot is assigned a start_ts from TSO and provides
-    /// a consistent view of the database at that timestamp.
-    fn snapshot(&self) -> Result<Box<dyn ReadSnapshot>>;
+    /// If `read_only` is true, write operations will error.
+    /// Returns a transaction context to pass to subsequent operations.
+    fn begin(&self, read_only: bool) -> Result<TxnCtx>;
 
-    /// Get the current timestamp from TSO (for debugging/testing only).
+    /// Get current timestamp from TSO.
     fn current_ts(&self) -> Timestamp;
-}
 
-/// Read-only snapshot handle for SELECT statements.
-///
-/// A snapshot provides a consistent read view at a specific timestamp.
-/// All reads see the same version of data regardless of concurrent writes.
-///
-/// ## MVCC Visibility
-///
-/// The snapshot can only see data with commit_ts <= start_ts.
-/// Concurrent writes with higher timestamps are invisible.
-pub trait ReadSnapshot: Send + Sync {
-    /// Get the snapshot's read timestamp.
+    // === Data Operations ===
+
+    /// Read a key within the transaction.
     ///
-    /// This is the timestamp at which all reads are performed.
-    /// Data with commit_ts > start_ts is invisible.
-    fn start_ts(&self) -> Timestamp;
-
-    /// Read a key at the snapshot timestamp.
+    /// For read-write transactions, this checks the write buffer first,
+    /// then reads from storage at `start_ts`.
     ///
-    /// Returns the value visible at start_ts, or None if the key
-    /// doesn't exist or was deleted before start_ts.
-    fn get(&self, key: &[u8]) -> Result<Option<RawValue>>;
+    /// For read-only transactions, this reads directly from storage.
+    fn get(&self, ctx: &TxnCtx, key: &[u8]) -> Result<Option<RawValue>>;
 
-    /// Scan a range of keys at the snapshot timestamp.
+    /// Scan a range of keys within the transaction.
     ///
-    /// Returns an iterator over key-value pairs visible at start_ts.
-    fn scan(&self, range: Range<Key>) -> Result<Box<dyn Iterator<Item = (Key, RawValue)> + '_>>;
-}
-
-/// Read-write transaction handle for DML statements.
-///
-/// A transaction buffers writes and applies them atomically on commit.
-/// The transaction follows 1PC (one-phase commit) pattern:
-///
-/// 1. Acquire in-memory locks (blocks concurrent readers)
-/// 2. Write to commit log
-/// 3. Apply to storage with commit_ts
-/// 4. Release locks
-///
-/// ## State Machine
-///
-/// ```text
-/// Active -> Committed
-///        -> Aborted
-/// ```
-pub trait Txn: ReadSnapshot {
-    /// Get the transaction ID (for logging/debugging).
-    fn txn_id(&self) -> TxnId;
-
-    /// Check if the transaction is still valid (not committed/aborted).
-    fn is_valid(&self) -> bool;
+    /// Returns an iterator over key-value pairs visible at `start_ts`.
+    fn scan(
+        &self,
+        ctx: &TxnCtx,
+        range: Range<Key>,
+    ) -> Result<Box<dyn Iterator<Item = (Key, RawValue)> + '_>>;
 
     /// Buffer a put operation.
     ///
     /// The write is not visible until commit.
-    fn put(&mut self, key: Key, value: RawValue);
+    /// Errors if the transaction is read-only.
+    fn put(&self, ctx: &mut TxnCtx, key: Key, value: RawValue);
 
     /// Buffer a delete operation.
     ///
     /// The delete is not visible until commit.
-    fn delete(&mut self, key: Key);
+    /// Errors if the transaction is read-only.
+    fn delete(&self, ctx: &mut TxnCtx, key: Key);
 
-    /// Commit the transaction and return commit info.
+    // === Finalization ===
+
+    /// Commit the transaction.
     ///
-    /// This is a consuming operation - the transaction cannot be used after.
-    /// All buffered writes are applied atomically.
-    fn commit(self: Box<Self>) -> Result<CommitInfo>;
+    /// For read-only transactions with no writes, returns immediately.
+    /// For read-write transactions:
+    /// 1. Acquire in-memory locks
+    /// 2. Write to commit log
+    /// 3. Apply to storage with commit_ts
+    /// 4. Release locks
+    fn commit(&self, ctx: TxnCtx) -> Result<CommitInfo>;
 
     /// Rollback the transaction.
     ///
     /// All buffered writes are discarded.
-    fn rollback(self: Box<Self>) -> Result<()>;
+    fn rollback(&self, ctx: TxnCtx) -> Result<()>;
 }
 
 /// Information returned after a successful commit.
@@ -148,27 +206,6 @@ pub struct CommitInfo {
     pub commit_ts: Timestamp,
     /// Log sequence number (for durability tracking)
     pub lsn: Lsn,
-}
-
-/// Options for beginning a transaction (for future explicit transaction support).
-#[allow(dead_code)]
-#[derive(Debug, Clone, Default)]
-pub struct BeginOptions {
-    /// Whether this is a read-only transaction.
-    /// Read-only transactions don't acquire locks.
-    pub read_only: bool,
-
-    /// Isolation level (for future use).
-    pub isolation: IsolationLevel,
-}
-
-/// Options for creating a snapshot (for future stale read support).
-#[allow(dead_code)]
-#[derive(Debug, Clone, Default)]
-pub struct SnapshotOptions {
-    /// Use a specific timestamp instead of getting from TSO.
-    /// This is for stale reads.
-    pub ts: Option<Timestamp>,
 }
 
 /// Transaction isolation levels.
@@ -198,9 +235,19 @@ mod tests {
     }
 
     #[test]
-    fn test_begin_options_default() {
-        let opts = BeginOptions::default();
-        assert!(!opts.read_only);
-        assert_eq!(opts.isolation, IsolationLevel::SnapshotIsolation);
+    fn test_txn_ctx_new() {
+        let ctx = TxnCtx::new(1, 100, false);
+        assert_eq!(ctx.txn_id(), 1);
+        assert_eq!(ctx.start_ts(), 100);
+        assert!(!ctx.is_read_only());
+        assert!(ctx.is_valid());
+        assert_eq!(ctx.state(), TxnState::Active);
+    }
+
+    #[test]
+    fn test_txn_ctx_read_only() {
+        let ctx = TxnCtx::new(2, 200, true);
+        assert!(ctx.is_read_only());
+        assert!(ctx.is_valid());
     }
 }

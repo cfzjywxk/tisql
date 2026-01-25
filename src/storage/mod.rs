@@ -141,7 +141,7 @@ pub enum WriteOp {
 ///
 /// Use `WriteBatch` to group multiple writes that should be applied
 /// as a single atomic operation.
-#[derive(Default, Clone)]
+#[derive(Default, Clone, Debug)]
 pub struct WriteBatch {
     ops: Vec<WriteOp>,
     /// Commit timestamp for MVCC (set by TransactionService)

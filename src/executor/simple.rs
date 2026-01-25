@@ -15,14 +15,14 @@
 //! Simple volcano-style executor using TxnService for all operations.
 //!
 //! All statement execution goes through the transaction service:
-//! - Read statements: Use snapshot with allocated start_ts
-//! - Write statements: Use transaction with commit
+//! - Read statements: Use begin(read_only=true) for snapshot reads
+//! - Write statements: Use begin(read_only=false) with commit
 
 use crate::catalog::Catalog;
 use crate::error::{Result, TiSqlError};
 use crate::sql::{AggFunc, BinaryOp, Expr, LogicalPlan, UnaryOp};
 use crate::storage::{decode_row_to_values, encode_int_key, encode_key, encode_pk, encode_row};
-use crate::transaction::{ReadSnapshot, Txn, TxnService};
+use crate::transaction::{TxnCtx, TxnService};
 use crate::types::{ColumnId, ColumnInfo, DataType, Row, Schema, Value};
 
 use super::{ExecutionResult, Executor};
@@ -59,24 +59,24 @@ impl Executor for SimpleExecutor {
 }
 
 impl SimpleExecutor {
-    /// Execute a read-only plan using a snapshot.
+    /// Execute a read-only plan using a read-only transaction.
     ///
-    /// Creates a snapshot with start_ts from TSO, then executes all reads
-    /// at that consistent timestamp.
+    /// Creates a transaction with read_only=true, which allocates start_ts
+    /// from TSO for consistent reads.
     fn execute_read<T: TxnService, C: Catalog>(
         &self,
         plan: LogicalPlan,
         txn_service: &T,
         catalog: &C,
     ) -> Result<ExecutionResult> {
-        // Allocate start_ts and create snapshot
-        let snapshot = txn_service.snapshot()?;
+        // Begin a read-only transaction (allocates start_ts)
+        let ctx = txn_service.begin(true)?;
 
-        // Execute the read plan using the snapshot
-        self.execute_with_snapshot(plan, snapshot.as_ref(), catalog)
+        // Execute the read plan using the transaction context
+        self.execute_with_ctx(plan, &ctx, txn_service, catalog)
     }
 
-    /// Execute a write plan using a transaction.
+    /// Execute a write plan using a read-write transaction.
     ///
     /// Creates a transaction, executes writes (buffered), then commits.
     fn execute_write<T: TxnService, C: Catalog>(
@@ -93,11 +93,16 @@ impl SimpleExecutor {
             _ => {}
         }
 
-        // Create transaction with start_ts
-        let txn = txn_service.begin()?;
+        // Begin a read-write transaction (allocates txn_id and start_ts)
+        let mut ctx = txn_service.begin(false)?;
 
-        // Execute the write plan using the transaction
-        self.execute_with_txn(plan, txn, catalog)
+        // Execute the write plan and get the result
+        let result = self.execute_write_with_ctx(plan, &mut ctx, txn_service, catalog)?;
+
+        // Commit the transaction
+        txn_service.commit(ctx)?;
+
+        Ok(result)
     }
 
     /// Execute DDL operations (no transaction needed).
@@ -141,12 +146,13 @@ impl SimpleExecutor {
         }
     }
 
-    /// Execute read operations using a snapshot.
+    /// Execute read operations using a transaction context.
     #[allow(clippy::only_used_in_recursion)]
-    fn execute_with_snapshot<C: Catalog>(
+    fn execute_with_ctx<T: TxnService, C: Catalog>(
         &self,
         plan: LogicalPlan,
-        snapshot: &dyn ReadSnapshot,
+        ctx: &TxnCtx,
+        txn_service: &T,
         catalog: &C,
     ) -> Result<ExecutionResult> {
         match plan {
@@ -168,7 +174,7 @@ impl SimpleExecutor {
             }
 
             LogicalPlan::Project { input, exprs } => {
-                let input_result = self.execute_with_snapshot(*input, snapshot, catalog)?;
+                let input_result = self.execute_with_ctx(*input, ctx, txn_service, catalog)?;
 
                 match input_result {
                     ExecutionResult::Rows { rows, .. } => {
@@ -219,8 +225,8 @@ impl SimpleExecutor {
                     .map(|c| c.data_type().clone())
                     .collect();
 
-                // Scan using snapshot (reads at start_ts)
-                let iter = snapshot.scan(start_key..end_key)?;
+                // Scan using transaction service (reads at start_ts)
+                let iter = txn_service.scan(ctx, start_key..end_key)?;
 
                 let mut rows = Vec::new();
                 for (_, value) in iter {
@@ -267,7 +273,7 @@ impl SimpleExecutor {
             }
 
             LogicalPlan::Filter { input, predicate } => {
-                let input_result = self.execute_with_snapshot(*input, snapshot, catalog)?;
+                let input_result = self.execute_with_ctx(*input, ctx, txn_service, catalog)?;
 
                 match input_result {
                     ExecutionResult::Rows { schema, rows } => {
@@ -294,7 +300,7 @@ impl SimpleExecutor {
                 limit,
                 offset,
             } => {
-                let input_result = self.execute_with_snapshot(*input, snapshot, catalog)?;
+                let input_result = self.execute_with_ctx(*input, ctx, txn_service, catalog)?;
 
                 match input_result {
                     ExecutionResult::Rows { schema, rows } => {
@@ -314,7 +320,7 @@ impl SimpleExecutor {
             }
 
             LogicalPlan::Sort { input, order_by } => {
-                let input_result = self.execute_with_snapshot(*input, snapshot, catalog)?;
+                let input_result = self.execute_with_ctx(*input, ctx, txn_service, catalog)?;
 
                 match input_result {
                     ExecutionResult::Rows { schema, mut rows } => {
@@ -342,7 +348,7 @@ impl SimpleExecutor {
                 group_by,
                 agg_exprs,
             } => {
-                let input_result = self.execute_with_snapshot(*input, snapshot, catalog)?;
+                let input_result = self.execute_with_ctx(*input, ctx, txn_service, catalog)?;
 
                 match input_result {
                     ExecutionResult::Rows { rows, .. } => {
@@ -387,14 +393,15 @@ impl SimpleExecutor {
         }
     }
 
-    /// Execute write operations using a transaction.
-    fn execute_with_txn<C: Catalog>(
+    /// Execute write operations using a transaction context.
+    fn execute_write_with_ctx<T: TxnService, C: Catalog>(
         &self,
         plan: LogicalPlan,
-        mut txn: Box<dyn Txn>,
+        ctx: &mut TxnCtx,
+        txn_service: &T,
         catalog: &C,
     ) -> Result<ExecutionResult> {
-        let result = match plan {
+        match plan {
             LogicalPlan::Insert {
                 table,
                 columns,
@@ -454,11 +461,11 @@ impl SimpleExecutor {
                     let value = encode_row(&col_ids, &row_values);
 
                     // Buffer write in transaction
-                    txn.put(key, value);
+                    txn_service.put(ctx, key, value);
                     count += 1;
                 }
 
-                ExecutionResult::Affected { count }
+                Ok(ExecutionResult::Affected { count })
             }
 
             LogicalPlan::Delete { table, filter } => {
@@ -476,7 +483,7 @@ impl SimpleExecutor {
                 let mut count = 0u64;
 
                 // Scan using transaction's snapshot (reads at start_ts)
-                let iter = txn.scan(start_key..end_key)?;
+                let iter = txn_service.scan(ctx, start_key..end_key)?;
                 let entries: Vec<_> = iter.collect();
 
                 for (key, value) in entries {
@@ -492,11 +499,11 @@ impl SimpleExecutor {
                     }
 
                     // Buffer delete in transaction
-                    txn.delete(key);
+                    txn_service.delete(ctx, key);
                     count += 1;
                 }
 
-                ExecutionResult::Affected { count }
+                Ok(ExecutionResult::Affected { count })
             }
 
             LogicalPlan::Update {
@@ -519,7 +526,7 @@ impl SimpleExecutor {
                 let mut count = 0u64;
 
                 // Scan using transaction's snapshot
-                let iter = txn.scan(start_key..end_key)?;
+                let iter = txn_service.scan(ctx, start_key..end_key)?;
                 let entries: Vec<_> = iter.collect();
 
                 for (key, value) in entries {
@@ -560,30 +567,23 @@ impl SimpleExecutor {
 
                     // Delete old key if PK changed
                     if !pk_indices.is_empty() && new_key != key {
-                        txn.delete(key);
+                        txn_service.delete(ctx, key);
                     }
 
                     // Write new row
                     let new_value = encode_row(&col_ids, row.values());
-                    txn.put(new_key, new_value);
+                    txn_service.put(ctx, new_key, new_value);
                     count += 1;
                 }
 
-                ExecutionResult::Affected { count }
+                Ok(ExecutionResult::Affected { count })
             }
 
-            _ => {
-                return Err(TiSqlError::Execution(format!(
-                    "Unsupported write plan: {:?}",
-                    std::mem::discriminant(&plan)
-                )));
-            }
-        };
-
-        // Commit the transaction
-        txn.commit()?;
-
-        Ok(result)
+            _ => Err(TiSqlError::Execution(format!(
+                "Unsupported write plan: {:?}",
+                std::mem::discriminant(&plan)
+            ))),
+        }
     }
 
     fn eval_expr(&self, expr: &Expr, row: &Row) -> Result<Value> {

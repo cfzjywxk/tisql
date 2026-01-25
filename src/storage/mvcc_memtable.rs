@@ -34,6 +34,7 @@ use crossbeam_skiplist::SkipMap;
 
 use crate::error::Result;
 use crate::transaction::ConcurrencyManager;
+use crate::tso::TsoService;
 use crate::types::{Key, RawValue, Timestamp};
 
 use super::{Snapshot, StorageEngine, WriteBatch, WriteOp};
@@ -71,10 +72,12 @@ fn is_tombstone(value: &[u8]) -> bool {
 }
 
 /// Inner storage that can be shared via Arc.
-struct MvccMemTableInner {
-    /// Concurrent skipmap storing MVCC-encoded keys.
-    data: SkipMap<Key, RawValue>,
-    /// ConcurrencyManager for lock checking and TSO.
+struct MvccMemTableInner<T: TsoService> {
+    /// Concurrent skipmap storing MVCC-encoded keys (shared with snapshots).
+    data: Arc<SkipMap<Key, RawValue>>,
+    /// TSO service for timestamp allocation.
+    tso: Arc<T>,
+    /// ConcurrencyManager for lock checking.
     concurrency_manager: Arc<ConcurrencyManager>,
 }
 
@@ -82,16 +85,17 @@ struct MvccMemTableInner {
 ///
 /// This engine stores multiple versions of each key, keyed by `user_key || !commit_ts`.
 /// Reads automatically find the latest visible version.
-pub struct MvccMemTableEngine {
-    inner: Arc<MvccMemTableInner>,
+pub struct MvccMemTableEngine<T: TsoService = crate::tso::LocalTso> {
+    inner: Arc<MvccMemTableInner<T>>,
 }
 
-impl MvccMemTableEngine {
+impl<T: TsoService> MvccMemTableEngine<T> {
     /// Create a new MVCC memtable engine.
-    pub fn new(concurrency_manager: Arc<ConcurrencyManager>) -> Self {
+    pub fn new(tso: Arc<T>, concurrency_manager: Arc<ConcurrencyManager>) -> Self {
         Self {
             inner: Arc::new(MvccMemTableInner {
-                data: SkipMap::new(),
+                data: Arc::new(SkipMap::new()),
+                tso,
                 concurrency_manager,
             }),
         }
@@ -173,7 +177,7 @@ fn increment_bytes(bytes: &mut Vec<u8>) {
     bytes.insert(0, 1);
 }
 
-impl StorageEngine for MvccMemTableEngine {
+impl<T: TsoService> StorageEngine for MvccMemTableEngine<T> {
     fn get(&self, key: &[u8]) -> Result<Option<RawValue>> {
         // Get at latest timestamp (Timestamp::MAX means get the latest version)
         self.get_at(key, Timestamp::MAX)
@@ -188,24 +192,22 @@ impl StorageEngine for MvccMemTableEngine {
     }
 
     fn put(&self, key: &[u8], value: &[u8]) -> Result<()> {
-        // For simple put without transaction context, use current ts
-        let ts = self.inner.concurrency_manager.get_ts();
+        // For simple put without transaction context, use current ts from TSO
+        let ts = self.inner.tso.get_ts();
         self.put_at(key, value, ts);
         Ok(())
     }
 
     fn delete(&self, key: &[u8]) -> Result<()> {
-        // For simple delete without transaction context, use current ts
-        let ts = self.inner.concurrency_manager.get_ts();
+        // For simple delete without transaction context, use current ts from TSO
+        let ts = self.inner.tso.get_ts();
         self.delete_at(key, ts);
         Ok(())
     }
 
     fn write_batch(&self, batch: WriteBatch) -> Result<()> {
-        // Get commit_ts from batch, or allocate new one
-        let commit_ts = batch
-            .commit_ts()
-            .unwrap_or_else(|| self.inner.concurrency_manager.get_ts());
+        // Get commit_ts from batch, or allocate new one from TSO
+        let commit_ts = batch.commit_ts().unwrap_or_else(|| self.inner.tso.get_ts());
 
         for op in batch.into_ops() {
             match op {
@@ -222,11 +224,12 @@ impl StorageEngine for MvccMemTableEngine {
     }
 
     fn snapshot(&self) -> Result<Box<dyn Snapshot>> {
-        // For MVCC, snapshot is just a timestamp
-        let ts = self.inner.concurrency_manager.get_ts();
+        // For MVCC, snapshot is at the current TSO timestamp
+        let ts = self.inner.tso.get_ts();
         Ok(Box::new(MvccSnapshot {
             ts,
-            inner: Arc::clone(&self.inner),
+            data: Arc::clone(&self.inner.data),
+            concurrency_manager: Arc::clone(&self.inner.concurrency_manager),
         }))
     }
 
@@ -278,22 +281,22 @@ impl StorageEngine for MvccMemTableEngine {
 /// MVCC snapshot at a specific timestamp.
 pub struct MvccSnapshot {
     ts: Timestamp,
-    inner: Arc<MvccMemTableInner>,
+    data: Arc<SkipMap<Key, RawValue>>,
+    concurrency_manager: Arc<ConcurrencyManager>,
 }
 
 impl Snapshot for MvccSnapshot {
     fn get(&self, key: &[u8]) -> Result<Option<RawValue>> {
         // Check lock
-        self.inner.concurrency_manager.check_lock(key, self.ts)?;
+        self.concurrency_manager.check_lock(key, self.ts)?;
 
         // Get at snapshot timestamp
-        get_at_internal(&self.inner.data, key, self.ts)
+        get_at_internal(&self.data, key, self.ts)
     }
 
     fn scan(&self, range: Range<Key>) -> Result<Box<dyn Iterator<Item = (Key, RawValue)> + '_>> {
         // Check range for locks
-        self.inner
-            .concurrency_manager
+        self.concurrency_manager
             .check_range(&range.start, &range.end, self.ts)?;
 
         let start_mvcc = encode_mvcc_key(&range.start, self.ts);
@@ -302,7 +305,7 @@ impl Snapshot for MvccSnapshot {
         let mut results = Vec::new();
         let mut last_user_key: Option<Key> = None;
 
-        for entry in self.inner.data.range(start_mvcc..end_mvcc) {
+        for entry in self.data.range(start_mvcc..end_mvcc) {
             if let Some((user_key, entry_ts)) = decode_mvcc_key(entry.key()) {
                 if user_key < range.start || user_key >= range.end {
                     continue;
@@ -331,10 +334,12 @@ impl Snapshot for MvccSnapshot {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::tso::LocalTso;
 
-    fn new_engine() -> MvccMemTableEngine {
-        let cm = Arc::new(ConcurrencyManager::new(1));
-        MvccMemTableEngine::new(cm)
+    fn new_engine() -> MvccMemTableEngine<LocalTso> {
+        let tso = Arc::new(LocalTso::new(1));
+        let cm = Arc::new(ConcurrencyManager::new(0));
+        MvccMemTableEngine::new(tso, cm)
     }
 
     #[test]
@@ -392,19 +397,20 @@ mod tests {
 
     #[test]
     fn test_mvcc_versions() {
-        let cm = Arc::new(ConcurrencyManager::new(1));
-        let engine = MvccMemTableEngine::new(Arc::clone(&cm));
+        let tso = Arc::new(LocalTso::new(1));
+        let cm = Arc::new(ConcurrencyManager::new(0));
+        let engine = MvccMemTableEngine::new(Arc::clone(&tso), Arc::clone(&cm));
 
         // Write version 1
-        let ts1 = cm.get_ts();
+        let ts1 = tso.get_ts();
         engine.put_at(b"key", b"v1", ts1);
 
         // Write version 2
-        let ts2 = cm.get_ts();
+        let ts2 = tso.get_ts();
         engine.put_at(b"key", b"v2", ts2);
 
         // Write version 3
-        let ts3 = cm.get_ts();
+        let ts3 = tso.get_ts();
         engine.put_at(b"key", b"v3", ts3);
 
         // Read at ts1 should see v1
@@ -430,15 +436,16 @@ mod tests {
 
     #[test]
     fn test_mvcc_delete_version() {
-        let cm = Arc::new(ConcurrencyManager::new(1));
-        let engine = MvccMemTableEngine::new(Arc::clone(&cm));
+        let tso = Arc::new(LocalTso::new(1));
+        let cm = Arc::new(ConcurrencyManager::new(0));
+        let engine = MvccMemTableEngine::new(Arc::clone(&tso), Arc::clone(&cm));
 
         // Write value
-        let ts1 = cm.get_ts();
+        let ts1 = tso.get_ts();
         engine.put_at(b"key", b"value", ts1);
 
         // Delete at later timestamp
-        let ts2 = cm.get_ts();
+        let ts2 = tso.get_ts();
         engine.delete_at(b"key", ts2);
 
         // Read at ts1 should see value
@@ -472,8 +479,9 @@ mod tests {
 
     #[test]
     fn test_write_batch_with_commit_ts() {
-        let cm = Arc::new(ConcurrencyManager::new(1));
-        let engine = MvccMemTableEngine::new(Arc::clone(&cm));
+        let tso = Arc::new(LocalTso::new(1));
+        let cm = Arc::new(ConcurrencyManager::new(0));
+        let engine = MvccMemTableEngine::new(Arc::clone(&tso), Arc::clone(&cm));
 
         let commit_ts = 100;
         let mut batch = WriteBatch::new();
@@ -496,8 +504,9 @@ mod tests {
         use crate::error::TiSqlError;
         use crate::transaction::Lock;
 
-        let cm = Arc::new(ConcurrencyManager::new(1));
-        let engine = MvccMemTableEngine::new(Arc::clone(&cm));
+        let tso = Arc::new(LocalTso::new(1));
+        let cm = Arc::new(ConcurrencyManager::new(0));
+        let engine = MvccMemTableEngine::new(Arc::clone(&tso), Arc::clone(&cm));
 
         // Put some data
         engine.put(b"key", b"value").unwrap();
@@ -520,8 +529,9 @@ mod tests {
 
     #[test]
     fn test_snapshot() {
-        let cm = Arc::new(ConcurrencyManager::new(1));
-        let engine = MvccMemTableEngine::new(Arc::clone(&cm));
+        let tso = Arc::new(LocalTso::new(1));
+        let cm = Arc::new(ConcurrencyManager::new(0));
+        let engine = MvccMemTableEngine::new(Arc::clone(&tso), Arc::clone(&cm));
 
         // Write v1
         engine.put(b"key", b"v1").unwrap();

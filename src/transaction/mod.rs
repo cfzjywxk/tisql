@@ -14,49 +14,57 @@
 
 //! Transaction layer for TiSQL.
 //!
-//! This module provides transaction management with durability guarantees,
-//! including concurrency control (TSO and lock table).
+//! This module provides transaction management with durability guarantees.
+//! Concurrency control is handled by:
+//! - `TsoService` (separate module) - timestamp allocation
+//! - `ConcurrencyManager` - in-memory lock table and max_ts tracking
+//!
+//! ## Design Pattern
+//!
+//! Following OceanBase's `ObTransService` pattern, all transaction operations
+//! go through a single [`TxnService`] trait. Transaction state is held in
+//! [`TxnCtx`] and passed to each operation.
 //!
 //! ## Key Abstractions
 //!
-//! - [`TxnService`]: The main entry point for creating transactions
-//! - [`ReadSnapshot`]: Read-only transaction for SELECT statements
-//! - [`Txn`]: Read-write transaction for DML statements
+//! - [`TxnService`]: Unified interface for all transaction operations
+//! - [`TxnCtx`]: Transaction context holding state (passed to operations)
+//! - [`CommitInfo`]: Information returned after successful commit
+//! - `TsoService` (in `tso` module): Timestamp allocation (start_ts, commit_ts)
+//! - `ConcurrencyManager`: In-memory lock table for 1PC atomicity
 //!
 //! ## Design Principles
 //!
-//! 1. **Interface-based**: SQL engine depends on traits, not implementations
-//! 2. **Opaque handles**: Internal state (start_ts, commit_ts) is hidden
-//! 3. **Read transactions get timestamps**: Even read-only queries allocate start_ts
-//! 4. **Concurrency control**: TSO and lock table are internal to transaction layer
+//! 1. **Unified interface**: All operations go through `TxnService`
+//! 2. **Context-based**: Transaction state is in `TxnCtx`, passed to operations
+//! 3. **No read-only distinction at API level**: Even "reads" may write in
+//!    distributed transactions (lock resolution, min_commit_ts push)
+//! 4. **Separated concerns**: TSO is a standalone service, ConcurrencyManager only tracks locks
 //!
 //! ## Example
 //!
 //! ```ignore
-//! // Read-only query - allocates start_ts for MVCC snapshot
-//! let snapshot = txn_service.snapshot()?;
-//! let value = snapshot.get(key)?;
+//! // Begin a transaction
+//! let mut ctx = txn_service.begin(false)?;  // read_only = false
 //!
-//! // Read-write transaction
-//! let mut txn = txn_service.begin()?;
-//! txn.put(key, value);
-//! let info = txn.commit()?;
+//! // Read operations
+//! let value = txn_service.get(&ctx, key)?;
+//!
+//! // Write operations
+//! txn_service.put(&mut ctx, key, value);
+//!
+//! // Commit
+//! let info = txn_service.commit(ctx)?;
 //! ```
 
 mod api;
 mod concurrency;
-mod handle;
 mod service;
-mod snapshot;
 
 // Public API - only expose traits and types needed by consumers
-pub use api::{IsolationLevel, ReadSnapshot, Txn, TxnService};
+pub use api::{CommitInfo, IsolationLevel, TxnCtx, TxnService, TxnState};
 
 // Implementation types - not re-exported from lib.rs main API
 // Available via testkit for integration tests
 pub use concurrency::{ConcurrencyManager, Lock};
 pub use service::TransactionService;
-
-// KeyGuard is used internally by handle.rs
-#[allow(unused_imports)]
-pub(crate) use concurrency::KeyGuard;

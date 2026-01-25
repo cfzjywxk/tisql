@@ -12,15 +12,12 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-//! Transaction service with autocommit semantics and durability.
+//! Transaction service implementation following OceanBase's unified pattern.
 //!
-//! This implementation treats each statement as an autocommit transaction.
-//! For write operations:
-//! 1. Acquire in-memory locks (visible to readers immediately)
-//! 2. Write to commit log and sync
-//! 3. Apply to storage with commit_ts
-//! 4. Release locks (on guard drop)
+//! All transaction operations go through this service, with transaction
+//! state held in `TxnCtx` and passed to each operation.
 
+use std::ops::Range;
 use std::sync::Arc;
 
 #[cfg(feature = "failpoints")]
@@ -28,16 +25,18 @@ use fail::fail_point;
 
 use crate::clog::{ClogBatch, ClogEntry, ClogOp, ClogService};
 use crate::error::Result;
+use crate::tso::TsoService;
 
+use super::api::{CommitInfo, TxnCtx, TxnService, TxnState};
 use super::concurrency::{ConcurrencyManager, Lock};
 use crate::storage::{StorageEngine, WriteBatch, WriteOp};
-use crate::types::{Key, Lsn, Timestamp, TxnId};
+use crate::types::{Key, Lsn, RawValue, Timestamp, TxnId};
 
-use super::api::{ReadSnapshot, Txn, TxnService};
-use super::handle::TxnHandle;
-use super::snapshot::StorageSnapshot;
-
-/// Transaction service manages autocommit transactions with durability and MVCC.
+/// Transaction service manages transactions with durability and MVCC.
+///
+/// This is the unified interface for all transaction operations, following
+/// OceanBase's `ObTransService` pattern. Transaction state is held in `TxnCtx`
+/// and passed to each operation.
 ///
 /// All write operations follow the 1PC pattern:
 /// 1. Acquire in-memory locks (blocks concurrent readers)
@@ -45,32 +44,39 @@ use super::snapshot::StorageSnapshot;
 /// 3. Sync commit log to disk (durability)
 /// 4. Apply to storage with commit_ts
 /// 5. Release locks (on guard drop)
-pub struct TransactionService<S: StorageEngine, L: ClogService> {
+pub struct TransactionService<S: StorageEngine, L: ClogService, T: TsoService> {
     /// Storage engine for state
     storage: Arc<S>,
     /// Commit log service for durability
     clog_service: Arc<L>,
-    /// ConcurrencyManager for TSO and lock table
+    /// TSO service for timestamp allocation
+    tso: Arc<T>,
+    /// ConcurrencyManager for lock table and max_ts tracking
     concurrency_manager: Arc<ConcurrencyManager>,
 }
 
-impl<S: StorageEngine, L: ClogService> TransactionService<S, L> {
+impl<S: StorageEngine, L: ClogService, T: TsoService> TransactionService<S, L, T> {
     /// Create a new transaction service
     pub fn new(
         storage: Arc<S>,
         clog_service: Arc<L>,
+        tso: Arc<T>,
         concurrency_manager: Arc<ConcurrencyManager>,
     ) -> Self {
         Self {
             storage,
             clog_service,
+            tso,
             concurrency_manager,
         }
     }
 
     /// Get the next timestamp from TSO
     fn get_ts(&self) -> Timestamp {
-        self.concurrency_manager.get_ts()
+        let ts = self.tso.get_ts();
+        // Update max_ts in concurrency manager for MVCC visibility
+        self.concurrency_manager.update_max_ts(ts);
+        ts
     }
 
     /// Get reference to storage engine
@@ -78,7 +84,12 @@ impl<S: StorageEngine, L: ClogService> TransactionService<S, L> {
         &self.storage
     }
 
-    /// Execute a write batch with durability guarantees.
+    /// Get reference to TSO service
+    pub fn tso(&self) -> &T {
+        &self.tso
+    }
+
+    /// Execute a write batch with durability guarantees (for direct/autocommit writes).
     ///
     /// This is the core method for autocommit transactions with 1PC:
     /// 1. Allocate commit_ts from TSO
@@ -151,15 +162,15 @@ impl<S: StorageEngine, L: ClogService> TransactionService<S, L> {
         Ok((txn_id, commit_ts, lsn))
     }
 
-    /// Execute a single put with durability.
-    pub fn put(&self, key: &[u8], value: &[u8]) -> Result<(TxnId, Timestamp, Lsn)> {
+    /// Execute a single put with autocommit (for testing and simple writes).
+    pub fn autocommit_put(&self, key: &[u8], value: &[u8]) -> Result<(TxnId, Timestamp, Lsn)> {
         let mut batch = WriteBatch::new();
         batch.put(key.to_vec(), value.to_vec());
         self.execute_write(batch)
     }
 
-    /// Execute a single delete with durability.
-    pub fn delete(&self, key: &[u8]) -> Result<(TxnId, Timestamp, Lsn)> {
+    /// Execute a single delete with autocommit (for testing and simple writes).
+    pub fn autocommit_delete(&self, key: &[u8]) -> Result<(TxnId, Timestamp, Lsn)> {
         let mut batch = WriteBatch::new();
         batch.delete(key.to_vec());
         self.execute_write(batch)
@@ -224,14 +235,10 @@ impl<S: StorageEngine, L: ClogService> TransactionService<S, L> {
         }
 
         // Update TSO to continue from recovered state
-        self.concurrency_manager.set_ts(max_ts + 1);
+        self.tso.set_ts(max_ts + 1);
+        self.concurrency_manager.update_max_ts(max_ts);
 
         Ok(stats)
-    }
-
-    /// Get current timestamp from TSO
-    pub fn current_ts(&self) -> Timestamp {
-        self.concurrency_manager.current_ts()
     }
 
     /// Get commit log service reference
@@ -244,50 +251,154 @@ impl<S: StorageEngine, L: ClogService> TransactionService<S, L> {
         &self.concurrency_manager
     }
 
-    /// Get Arc references to internal components (for creating TxnHandle)
-    fn storage_arc(&self) -> Arc<S> {
-        Arc::clone(&self.storage)
-    }
-
-    fn clog_service_arc(&self) -> Arc<L> {
-        Arc::clone(&self.clog_service)
-    }
-
-    fn concurrency_manager_arc(&self) -> Arc<ConcurrencyManager> {
-        Arc::clone(&self.concurrency_manager)
+    /// Check if transaction is in active state
+    fn check_active(ctx: &TxnCtx) -> Result<()> {
+        match ctx.state {
+            TxnState::Active => Ok(()),
+            TxnState::Committed => Err(crate::error::TiSqlError::Internal(
+                "Transaction already committed".into(),
+            )),
+            TxnState::Aborted => Err(crate::error::TiSqlError::Internal(
+                "Transaction already aborted".into(),
+            )),
+        }
     }
 }
 
 /// Implement TxnService trait for TransactionService
-impl<S: StorageEngine + 'static, L: ClogService + 'static> TxnService for TransactionService<S, L> {
-    fn begin(&self) -> Result<Box<dyn Txn>> {
+impl<S: StorageEngine + 'static, L: ClogService + 'static, T: TsoService> TxnService
+    for TransactionService<S, L, T>
+{
+    fn begin(&self, read_only: bool) -> Result<TxnCtx> {
         // Allocate txn_id and start_ts from TSO
         let txn_id = self.get_ts();
         let start_ts = self.get_ts();
 
-        let handle = TxnHandle::new(
-            txn_id,
-            start_ts,
-            self.storage_arc(),
-            self.clog_service_arc(),
-            self.concurrency_manager_arc(),
-        );
-
-        Ok(Box::new(handle))
-    }
-
-    fn snapshot(&self) -> Result<Box<dyn ReadSnapshot>> {
-        // Allocate start_ts from TSO for consistent read
-        let start_ts = self.get_ts();
-
-        let snapshot =
-            StorageSnapshot::new(start_ts, self.storage_arc(), self.concurrency_manager_arc());
-
-        Ok(Box::new(snapshot))
+        Ok(TxnCtx::new(txn_id, start_ts, read_only))
     }
 
     fn current_ts(&self) -> Timestamp {
-        self.concurrency_manager.current_ts()
+        self.tso.current_ts()
+    }
+
+    fn get(&self, ctx: &TxnCtx, key: &[u8]) -> Result<Option<RawValue>> {
+        // First check write buffer for uncommitted writes (read-your-writes)
+        // Iterate in reverse order to get the most recent operation
+        for op in ctx.write_buffer.iter().rev() {
+            match op {
+                WriteOp::Put { key: k, value } if k.as_slice() == key => {
+                    return Ok(Some(value.clone()));
+                }
+                WriteOp::Delete { key: k } if k.as_slice() == key => {
+                    return Ok(None);
+                }
+                _ => {}
+            }
+        }
+
+        // Check for locks from other transactions
+        self.concurrency_manager.check_lock(key, ctx.start_ts)?;
+
+        // Read from storage at snapshot timestamp
+        self.storage.get_at(key, ctx.start_ts)
+    }
+
+    fn scan(
+        &self,
+        ctx: &TxnCtx,
+        range: Range<Key>,
+    ) -> Result<Box<dyn Iterator<Item = (Key, RawValue)> + '_>> {
+        // Note: This simplified scan doesn't merge with write buffer
+        // A full implementation would need to merge buffered writes with storage scan
+
+        // Check for locks in range
+        if !range.is_empty() {
+            self.concurrency_manager
+                .check_range(&range.start, &range.end, ctx.start_ts)?;
+        }
+
+        self.storage.scan(range)
+    }
+
+    fn put(&self, ctx: &mut TxnCtx, key: Key, value: RawValue) {
+        if ctx.state == TxnState::Active && !ctx.read_only {
+            ctx.write_buffer.put(key, value);
+        }
+    }
+
+    fn delete(&self, ctx: &mut TxnCtx, key: Key) {
+        if ctx.state == TxnState::Active && !ctx.read_only {
+            ctx.write_buffer.delete(key);
+        }
+    }
+
+    fn commit(&self, mut ctx: TxnCtx) -> Result<CommitInfo> {
+        Self::check_active(&ctx)?;
+
+        if ctx.write_buffer.is_empty() {
+            // No writes - just mark as committed
+            ctx.state = TxnState::Committed;
+            return Ok(CommitInfo {
+                txn_id: ctx.txn_id,
+                commit_ts: ctx.start_ts,
+                lsn: 0,
+            });
+        }
+
+        // Get commit_ts from TSO
+        let commit_ts = self.get_ts();
+
+        // Collect keys for locking
+        let keys: Vec<Key> = ctx.write_buffer.keys().cloned().collect();
+
+        // Acquire in-memory locks BEFORE any writes
+        let lock = Lock {
+            ts: commit_ts,
+            primary: keys.first().cloned().unwrap_or_default(),
+        };
+        let _guards = self.concurrency_manager.lock_keys(&keys, lock)?;
+
+        // Build commit log batch
+        let mut clog_batch = ClogBatch::new();
+        for op in ctx.write_buffer.iter() {
+            match op {
+                WriteOp::Put { key, value } => {
+                    clog_batch.add_put(ctx.txn_id, key.clone(), value.clone());
+                }
+                WriteOp::Delete { key } => {
+                    clog_batch.add_delete(ctx.txn_id, key.clone());
+                }
+            }
+        }
+        clog_batch.add_commit(ctx.txn_id, commit_ts);
+
+        // Write to commit log with sync (durability guarantee)
+        let lsn = self.clog_service.write(&mut clog_batch, true)?;
+
+        // Apply to storage with commit_ts
+        ctx.write_buffer.set_commit_ts(commit_ts);
+        self.storage.write_batch(ctx.write_buffer.clone())?;
+
+        // Mark as committed (guards will be dropped, releasing locks)
+        ctx.state = TxnState::Committed;
+
+        Ok(CommitInfo {
+            txn_id: ctx.txn_id,
+            commit_ts,
+            lsn,
+        })
+    }
+
+    fn rollback(&self, mut ctx: TxnCtx) -> Result<()> {
+        Self::check_active(&ctx)?;
+
+        // Clear write buffer
+        ctx.write_buffer.clear();
+
+        // Mark as aborted
+        ctx.state = TxnState::Aborted;
+
+        Ok(())
     }
 }
 
@@ -316,19 +427,23 @@ mod tests {
     use super::*;
     use crate::clog::{FileClogConfig, FileClogService};
     use crate::storage::MvccMemTableEngine;
+    use crate::tso::LocalTso;
     use tempfile::tempdir;
 
+    type TestStorage = MvccMemTableEngine<LocalTso>;
+
     fn create_test_service() -> (
-        Arc<MvccMemTableEngine>,
-        TransactionService<MvccMemTableEngine, FileClogService>,
+        Arc<TestStorage>,
+        TransactionService<TestStorage, FileClogService, LocalTso>,
         tempfile::TempDir,
     ) {
         let dir = tempdir().unwrap();
         let config = FileClogConfig::with_dir(dir.path());
         let clog_service = Arc::new(FileClogService::open(config).unwrap());
-        let cm = Arc::new(ConcurrencyManager::new(1));
-        let storage = Arc::new(MvccMemTableEngine::new(Arc::clone(&cm)));
-        let txn_service = TransactionService::new(Arc::clone(&storage), clog_service, cm);
+        let tso = Arc::new(LocalTso::new(1));
+        let cm = Arc::new(ConcurrencyManager::new(0));
+        let storage = Arc::new(MvccMemTableEngine::new(Arc::clone(&tso), Arc::clone(&cm)));
+        let txn_service = TransactionService::new(Arc::clone(&storage), clog_service, tso, cm);
         (storage, txn_service, dir)
     }
 
@@ -362,7 +477,7 @@ mod tests {
         assert_eq!(cm.lock_count(), 0);
 
         // Execute write
-        txn_service.put(b"key1", b"value1").unwrap();
+        txn_service.autocommit_put(b"key1", b"value1").unwrap();
 
         // After write, locks should be released
         assert_eq!(cm.lock_count(), 0);
@@ -380,13 +495,14 @@ mod tests {
         // Write some data
         {
             let clog_service = Arc::new(FileClogService::open(config.clone()).unwrap());
-            let cm = Arc::new(ConcurrencyManager::new(1));
-            let storage = Arc::new(MvccMemTableEngine::new(Arc::clone(&cm)));
-            let txn_service = TransactionService::new(storage, clog_service.clone(), cm);
+            let tso = Arc::new(LocalTso::new(1));
+            let cm = Arc::new(ConcurrencyManager::new(0));
+            let storage = Arc::new(MvccMemTableEngine::new(Arc::clone(&tso), Arc::clone(&cm)));
+            let txn_service = TransactionService::new(storage, clog_service.clone(), tso, cm);
 
-            txn_service.put(b"k1", b"v1").unwrap();
-            txn_service.put(b"k2", b"v2").unwrap();
-            txn_service.delete(b"k1").unwrap();
+            txn_service.autocommit_put(b"k1", b"v1").unwrap();
+            txn_service.autocommit_put(b"k2", b"v2").unwrap();
+            txn_service.autocommit_delete(b"k1").unwrap();
 
             clog_service.close().unwrap();
         }
@@ -394,9 +510,10 @@ mod tests {
         // Recover
         let (clog_service, entries) = FileClogService::recover(config).unwrap();
         let clog_service = Arc::new(clog_service);
-        let cm = Arc::new(ConcurrencyManager::new(1));
-        let storage = Arc::new(MvccMemTableEngine::new(Arc::clone(&cm)));
-        let txn_service = TransactionService::new(Arc::clone(&storage), clog_service, cm);
+        let tso = Arc::new(LocalTso::new(1));
+        let cm = Arc::new(ConcurrencyManager::new(0));
+        let storage = Arc::new(MvccMemTableEngine::new(Arc::clone(&tso), Arc::clone(&cm)));
+        let txn_service = TransactionService::new(Arc::clone(&storage), clog_service, tso, cm);
 
         let stats = txn_service.recover(&entries).unwrap();
         assert_eq!(stats.committed_txns, 3);
@@ -416,10 +533,10 @@ mod tests {
         let (storage, txn_service, _dir) = create_test_service();
 
         // Write v1
-        let (_, ts1, _) = txn_service.put(b"key", b"v1").unwrap();
+        let (_, ts1, _) = txn_service.autocommit_put(b"key", b"v1").unwrap();
 
         // Write v2
-        let (_, _ts2, _) = txn_service.put(b"key", b"v2").unwrap();
+        let (_, _ts2, _) = txn_service.autocommit_put(b"key", b"v2").unwrap();
 
         // Reading at latest should see v2
         let v = storage.get(b"key").unwrap();
@@ -431,111 +548,143 @@ mod tests {
     }
 
     // ========================================================================
-    // TxnService trait tests
+    // TxnService trait tests (new unified API)
     // ========================================================================
-
-    #[test]
-    fn test_txn_service_snapshot() {
-        let (_storage, txn_service, _dir) = create_test_service();
-
-        // Create a snapshot - this allocates a start_ts
-        let snapshot = txn_service.snapshot().unwrap();
-
-        // Snapshot should have a valid timestamp
-        assert!(snapshot.start_ts() > 0);
-
-        // Creating another snapshot should get a higher timestamp
-        let snapshot2 = txn_service.snapshot().unwrap();
-        assert!(snapshot2.start_ts() > snapshot.start_ts());
-    }
-
-    #[test]
-    fn test_txn_service_snapshot_reads_at_start_ts() {
-        let (_storage, txn_service, _dir) = create_test_service();
-
-        // Write initial data
-        txn_service.put(b"key", b"v1").unwrap();
-
-        // Create snapshot before second write
-        let snapshot = txn_service.snapshot().unwrap();
-        let snapshot_ts = snapshot.start_ts();
-
-        // Write again (after snapshot)
-        let (_, write_ts, _) = txn_service.put(b"key", b"v2").unwrap();
-        assert!(
-            write_ts > snapshot_ts,
-            "Write should have higher ts than snapshot"
-        );
-
-        // Snapshot should still see v1 (the value at its start_ts)
-        // Note: This depends on MVCC implementation correctly respecting timestamps
-        let value = snapshot.get(b"key").unwrap();
-        assert_eq!(value, Some(b"v1".to_vec()));
-    }
 
     #[test]
     fn test_txn_service_begin() {
         let (_storage, txn_service, _dir) = create_test_service();
 
-        // Begin a transaction
-        let txn = txn_service.begin().unwrap();
+        // Begin a read-write transaction
+        let ctx = txn_service.begin(false).unwrap();
 
         // Transaction should have valid timestamp
-        assert!(txn.start_ts() > 0);
-        assert!(txn.is_valid());
+        assert!(ctx.start_ts() > 0);
+        assert!(ctx.is_valid());
+        assert!(!ctx.is_read_only());
     }
 
     #[test]
-    fn test_txn_service_begin_commit() {
+    fn test_txn_service_begin_read_only() {
+        let (_storage, txn_service, _dir) = create_test_service();
+
+        // Begin a read-only transaction
+        let ctx = txn_service.begin(true).unwrap();
+
+        assert!(ctx.start_ts() > 0);
+        assert!(ctx.is_valid());
+        assert!(ctx.is_read_only());
+    }
+
+    #[test]
+    fn test_txn_service_get_put() {
         let (storage, txn_service, _dir) = create_test_service();
 
-        // Begin and write
-        let mut txn = txn_service.begin().unwrap();
-        txn.put(b"key1".to_vec(), b"value1".to_vec());
+        let mut ctx = txn_service.begin(false).unwrap();
+
+        // Put via transaction
+        txn_service.put(&mut ctx, b"key1".to_vec(), b"value1".to_vec());
+
+        // Should see buffered write
+        let value = txn_service.get(&ctx, b"key1").unwrap();
+        assert_eq!(value, Some(b"value1".to_vec()));
+
+        // Not yet in storage
+        let storage_value = storage.get(b"key1").unwrap();
+        assert!(storage_value.is_none());
 
         // Commit
-        let info = txn.commit().unwrap();
+        let info = txn_service.commit(ctx).unwrap();
         assert!(info.commit_ts > 0);
         assert!(info.lsn > 0);
 
-        // Data should be visible in storage
-        let value = storage.get(b"key1").unwrap();
-        assert_eq!(value, Some(b"value1".to_vec()));
+        // Now visible in storage
+        let storage_value = storage.get(b"key1").unwrap();
+        assert_eq!(storage_value, Some(b"value1".to_vec()));
     }
 
     #[test]
-    fn test_txn_service_isolation() {
+    fn test_txn_service_delete() {
+        let (_storage, txn_service, _dir) = create_test_service();
+
+        let mut ctx = txn_service.begin(false).unwrap();
+
+        txn_service.put(&mut ctx, b"key1".to_vec(), b"value1".to_vec());
+        txn_service.delete(&mut ctx, b"key1".to_vec());
+
+        // Should see delete in buffer
+        let value = txn_service.get(&ctx, b"key1").unwrap();
+        assert!(value.is_none());
+    }
+
+    #[test]
+    fn test_txn_service_rollback() {
+        let (storage, txn_service, _dir) = create_test_service();
+
+        let mut ctx = txn_service.begin(false).unwrap();
+
+        txn_service.put(&mut ctx, b"key1".to_vec(), b"value1".to_vec());
+
+        // Rollback
+        txn_service.rollback(ctx).unwrap();
+
+        // Data should NOT be in storage
+        let value = storage.get(b"key1").unwrap();
+        assert!(value.is_none());
+    }
+
+    #[test]
+    fn test_txn_service_snapshot_isolation() {
         let (_storage, txn_service, _dir) = create_test_service();
 
         // Write initial data
-        txn_service.put(b"key", b"v1").unwrap();
+        txn_service.autocommit_put(b"key", b"v1").unwrap();
 
         // Begin transaction
-        let mut txn = txn_service.begin().unwrap();
+        let mut ctx = txn_service.begin(false).unwrap();
 
         // Transaction should see v1
-        let value = txn.get(b"key").unwrap();
+        let value = txn_service.get(&ctx, b"key").unwrap();
         assert_eq!(value, Some(b"v1".to_vec()));
 
-        // Write v2 via txn_service (outside the transaction)
-        txn_service.put(b"key", b"v2").unwrap();
+        // Write v2 via autocommit (outside the transaction)
+        txn_service.autocommit_put(b"key", b"v2").unwrap();
 
         // Transaction should still see v1 (snapshot isolation)
-        // unless the new write is to its own buffer
-        let value = txn.get(b"key").unwrap();
+        let value = txn_service.get(&ctx, b"key").unwrap();
         assert_eq!(value, Some(b"v1".to_vec()));
 
         // But reading via storage should see v2
-        let storage = txn_service.storage();
-        let latest = storage.get(b"key").unwrap();
+        let latest = txn_service.storage().get(b"key").unwrap();
         assert_eq!(latest, Some(b"v2".to_vec()));
 
         // Transaction write
-        txn.put(b"key".to_vec(), b"v3".to_vec());
+        txn_service.put(&mut ctx, b"key".to_vec(), b"v3".to_vec());
 
         // Transaction should see its own write
-        let value = txn.get(b"key").unwrap();
+        let value = txn_service.get(&ctx, b"key").unwrap();
         assert_eq!(value, Some(b"v3".to_vec()));
+    }
+
+    #[test]
+    fn test_txn_service_read_only_ignores_writes() {
+        let (storage, txn_service, _dir) = create_test_service();
+
+        let mut ctx = txn_service.begin(true).unwrap();
+
+        // Put should be ignored for read-only transaction
+        txn_service.put(&mut ctx, b"key1".to_vec(), b"value1".to_vec());
+
+        // Buffer should be empty
+        assert!(ctx.write_buffer.is_empty());
+
+        // Commit should succeed (no-op)
+        let info = txn_service.commit(ctx).unwrap();
+        assert_eq!(info.lsn, 0); // No log written
+
+        // Nothing in storage
+        let value = storage.get(b"key1").unwrap();
+        assert!(value.is_none());
     }
 
     #[test]
@@ -544,13 +693,13 @@ mod tests {
 
         let ts1 = txn_service.current_ts();
 
-        // Each snapshot allocation advances the timestamp
-        let _snapshot = txn_service.snapshot().unwrap();
+        // Each begin advances the timestamp
+        let _ctx = txn_service.begin(false).unwrap();
         let ts2 = txn_service.current_ts();
         assert!(ts2 > ts1);
 
         // Each begin also advances the timestamp
-        let _txn = txn_service.begin().unwrap();
+        let _ctx2 = txn_service.begin(true).unwrap();
         let ts3 = txn_service.current_ts();
         assert!(ts3 > ts2);
     }

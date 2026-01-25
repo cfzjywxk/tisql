@@ -46,6 +46,7 @@ mod executor;
 mod sql;
 mod storage;
 mod transaction;
+mod tso;
 
 // Re-export public interfaces (traits only) and commonly used types
 pub use catalog::Catalog;
@@ -53,7 +54,8 @@ pub use clog::ClogService;
 pub use protocol::{MySqlServer, MYSQL_DEFAULT_PORT};
 pub use session::{Priority, QueryCtx, Session, SessionVars};
 pub use storage::StorageEngine;
-pub use transaction::{ReadSnapshot, Txn, TxnService};
+pub use transaction::{CommitInfo, TxnCtx, TxnService, TxnState};
+pub use tso::TsoService;
 pub use worker::{WorkerPool, WorkerPoolConfig};
 
 // ============================================================================
@@ -69,6 +71,7 @@ pub mod testkit {
     pub use crate::clog::{FileClogConfig, FileClogService};
     pub use crate::storage::MvccMemTableEngine;
     pub use crate::transaction::{ConcurrencyManager, Lock, TransactionService};
+    pub use crate::tso::LocalTso;
 }
 
 // Internal imports (not re-exported)
@@ -79,6 +82,7 @@ use executor::{ExecutionResult, Executor, SimpleExecutor};
 use sql::{Binder, Parser};
 use storage::MvccMemTableEngine;
 use transaction::{ConcurrencyManager, TransactionService};
+use tso::LocalTso;
 use types::Value;
 use util::Timer;
 
@@ -168,9 +172,12 @@ impl SQLEngine {
 // Database - Main Entry Point
 // ============================================================================
 
+/// Internal type alias for concrete storage engine.
+type DbStorage = MvccMemTableEngine<LocalTso>;
+
 /// Internal type alias for concrete transaction service.
 /// Not exposed publicly - callers only see TxnService trait.
-type DbTxnService = TransactionService<MvccMemTableEngine, FileClogService>;
+type DbTxnService = TransactionService<DbStorage, FileClogService, LocalTso>;
 
 /// TiSQL Database instance.
 ///
@@ -210,14 +217,21 @@ impl Database {
         let (clog_service, entries) = FileClogService::recover(clog_config)?;
         let clog_service = Arc::new(clog_service);
 
-        // Create concurrency manager and storage
-        let concurrency_manager = Arc::new(ConcurrencyManager::new(1));
-        let storage = Arc::new(MvccMemTableEngine::new(Arc::clone(&concurrency_manager)));
+        // Create TSO service for timestamp allocation
+        let tso = Arc::new(LocalTso::new(1));
+
+        // Create concurrency manager (for locks and max_ts) and storage
+        let concurrency_manager = Arc::new(ConcurrencyManager::new(0));
+        let storage = Arc::new(MvccMemTableEngine::new(
+            Arc::clone(&tso),
+            Arc::clone(&concurrency_manager),
+        ));
 
         // Create transaction service
         let txn_service = Arc::new(TransactionService::new(
             Arc::clone(&storage),
             Arc::clone(&clog_service),
+            Arc::clone(&tso),
             Arc::clone(&concurrency_manager),
         ));
 

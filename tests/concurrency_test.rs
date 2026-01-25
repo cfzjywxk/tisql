@@ -31,18 +31,22 @@ use std::time::Duration;
 
 use tisql::error::TiSqlError;
 use tisql::testkit::{
-    ConcurrencyManager, FileClogConfig, FileClogService, Lock, MvccMemTableEngine,
+    ConcurrencyManager, FileClogConfig, FileClogService, LocalTso, Lock, MvccMemTableEngine,
     TransactionService,
 };
 use tisql::StorageEngine;
 
+/// Type alias for the test storage engine
+type TestStorage = MvccMemTableEngine<LocalTso>;
+
 /// Type alias for the test transaction service
-type TestTxnService = TransactionService<MvccMemTableEngine, FileClogService>;
+type TestTxnService = TransactionService<TestStorage, FileClogService, LocalTso>;
 
 /// Type alias for the create_test_service return type
 type TestServiceTuple = (
-    Arc<MvccMemTableEngine>,
+    Arc<TestStorage>,
     Arc<TestTxnService>,
+    Arc<LocalTso>,
     Arc<ConcurrencyManager>,
     tempfile::TempDir,
 );
@@ -51,14 +55,16 @@ fn create_test_service() -> TestServiceTuple {
     let dir = tempfile::tempdir().unwrap();
     let config = FileClogConfig::with_dir(dir.path());
     let clog_service = Arc::new(FileClogService::open(config).unwrap());
-    let cm = Arc::new(ConcurrencyManager::new(1));
-    let storage = Arc::new(MvccMemTableEngine::new(Arc::clone(&cm)));
+    let tso = Arc::new(LocalTso::new(1));
+    let cm = Arc::new(ConcurrencyManager::new(0));
+    let storage = Arc::new(MvccMemTableEngine::new(Arc::clone(&tso), Arc::clone(&cm)));
     let txn_service = Arc::new(TransactionService::new(
         Arc::clone(&storage),
         clog_service,
+        Arc::clone(&tso),
         Arc::clone(&cm),
     ));
-    (storage, txn_service, cm, dir)
+    (storage, txn_service, tso, cm, dir)
 }
 
 // ============================================================================
@@ -68,18 +74,20 @@ fn create_test_service() -> TestServiceTuple {
 /// Verify TSO produces strictly monotonic timestamps under concurrent load.
 #[test]
 fn test_tso_strict_ordering_concurrent() {
-    let cm = Arc::new(ConcurrencyManager::new(1));
+    use tisql::TsoService;
+
+    let tso = Arc::new(LocalTso::new(1));
     let num_threads = 8;
     let timestamps_per_thread = 1000;
 
     let mut handles = vec![];
 
     for _ in 0..num_threads {
-        let cm = Arc::clone(&cm);
+        let tso = Arc::clone(&tso);
         handles.push(thread::spawn(move || {
             let mut timestamps = Vec::with_capacity(timestamps_per_thread);
             for _ in 0..timestamps_per_thread {
-                timestamps.push(cm.get_ts());
+                timestamps.push(tso.get_ts());
             }
             timestamps
         }));
@@ -110,18 +118,20 @@ fn test_tso_strict_ordering_concurrent() {
 /// Verify per-thread timestamps are locally monotonic.
 #[test]
 fn test_tso_per_thread_monotonic() {
-    let cm = Arc::new(ConcurrencyManager::new(1));
+    use tisql::TsoService;
+
+    let tso = Arc::new(LocalTso::new(1));
     let num_threads = 4;
     let timestamps_per_thread = 500;
 
     let mut handles = vec![];
 
     for _ in 0..num_threads {
-        let cm = Arc::clone(&cm);
+        let tso = Arc::clone(&tso);
         handles.push(thread::spawn(move || {
             let mut prev = 0u64;
             for _ in 0..timestamps_per_thread {
-                let ts = cm.get_ts();
+                let ts = tso.get_ts();
                 assert!(
                     ts > prev,
                     "Timestamp must be strictly increasing: prev={prev}, ts={ts}"
@@ -139,7 +149,7 @@ fn test_tso_per_thread_monotonic() {
 /// Verify max_ts tracking under concurrent updates.
 #[test]
 fn test_max_ts_concurrent_updates() {
-    let cm = Arc::new(ConcurrencyManager::new(1));
+    let cm = Arc::new(ConcurrencyManager::new(0));
     let num_threads = 8;
     let updates_per_thread = 1000;
 
@@ -177,7 +187,7 @@ fn test_max_ts_concurrent_updates() {
 /// Verify that readers see locks immediately after acquisition.
 #[test]
 fn test_reader_sees_lock_immediately() {
-    let cm = Arc::new(ConcurrencyManager::new(1));
+    let cm = Arc::new(ConcurrencyManager::new(0));
     let key = b"test_key".to_vec();
 
     // Initially no lock
@@ -188,7 +198,7 @@ fn test_reader_sees_lock_immediately() {
         ts: 100,
         primary: key.clone(),
     };
-    let guards = cm.lock_keys(&[key.clone()], lock).unwrap();
+    let guards = cm.lock_keys(std::slice::from_ref(&key), lock).unwrap();
 
     // Immediately visible to reader
     let result = cm.check_lock(&key, 1);
@@ -210,7 +220,7 @@ fn test_reader_sees_lock_immediately() {
 /// Test concurrent writers to different keys succeed.
 #[test]
 fn test_concurrent_writes_different_keys() {
-    let (_storage, txn_service, cm, _dir) = create_test_service();
+    let (_storage, txn_service, _tso, cm, _dir) = create_test_service();
     let num_threads = 4;
     let writes_per_thread = 100;
 
@@ -224,7 +234,7 @@ fn test_concurrent_writes_different_keys() {
             for j in 0..writes_per_thread {
                 let key = format!("key_{i}_{j}");
                 let value = format!("value_{i}_{j}");
-                if txn_service.put(key.as_bytes(), value.as_bytes()).is_ok() {
+                if txn_service.autocommit_put(key.as_bytes(), value.as_bytes()).is_ok() {
                     success_count.fetch_add(1, Ordering::Relaxed);
                 }
             }
@@ -244,7 +254,7 @@ fn test_concurrent_writes_different_keys() {
 /// Test concurrent writers to same key - one should get lock conflict.
 #[test]
 fn test_concurrent_writes_same_key() {
-    let (_storage, txn_service, cm, _dir) = create_test_service();
+    let (_storage, txn_service, _tso, cm, _dir) = create_test_service();
     let num_threads = 10;
     let key = b"shared_key";
 
@@ -263,7 +273,7 @@ fn test_concurrent_writes_same_key() {
             barrier.wait();
 
             let value = format!("value_{i}");
-            match txn_service.put(key, value.as_bytes()) {
+            match txn_service.autocommit_put(key, value.as_bytes()) {
                 Ok(_) => {
                     success_count.fetch_add(1, Ordering::Relaxed);
                 }
@@ -300,7 +310,7 @@ fn test_concurrent_writes_same_key() {
 /// Verify range lock check blocks correctly.
 #[test]
 fn test_range_lock_check() {
-    let cm = Arc::new(ConcurrencyManager::new(1));
+    let cm = Arc::new(ConcurrencyManager::new(0));
 
     // Lock a key in the middle of a range
     let lock = Lock {
@@ -331,7 +341,7 @@ fn test_range_lock_check() {
 /// 3. Reader should get KeyIsLocked error
 #[test]
 fn test_concurrent_read_during_write() {
-    let (storage, _txn_service, cm, _dir) = create_test_service();
+    let (storage, _txn_service, _tso, cm, _dir) = create_test_service();
 
     let key = b"test_key".to_vec();
     let writer_started = Arc::new(AtomicBool::new(false));
@@ -401,18 +411,18 @@ fn test_concurrent_read_during_write() {
 /// Test that MVCC read at specific timestamp works correctly.
 #[test]
 fn test_mvcc_read_at_timestamp() {
-    let (storage, txn_service, _cm, _dir) = create_test_service();
+    let (storage, txn_service, _tso, _cm, _dir) = create_test_service();
 
     let key = b"version_key";
 
     // Write version 1
-    let (_, ts1, _) = txn_service.put(key, b"v1").unwrap();
+    let (_, ts1, _) = txn_service.autocommit_put(key, b"v1").unwrap();
 
     // Write version 2
-    let (_, ts2, _) = txn_service.put(key, b"v2").unwrap();
+    let (_, ts2, _) = txn_service.autocommit_put(key, b"v2").unwrap();
 
     // Write version 3
-    let (_, ts3, _) = txn_service.put(key, b"v3").unwrap();
+    let (_, ts3, _) = txn_service.autocommit_put(key, b"v3").unwrap();
 
     assert!(ts1 < ts2);
     assert!(ts2 < ts3);
@@ -441,11 +451,11 @@ fn test_mvcc_read_at_timestamp() {
 /// Test multiple readers don't interfere with each other.
 #[test]
 fn test_concurrent_readers_no_interference() {
-    let (storage, txn_service, _cm, _dir) = create_test_service();
+    let (storage, txn_service, _tso, _cm, _dir) = create_test_service();
     let key = b"shared_read_key";
 
     // Write initial value
-    txn_service.put(key, b"initial_value").unwrap();
+    txn_service.autocommit_put(key, b"initial_value").unwrap();
 
     let num_readers = 10;
     let reads_per_thread = 100;
@@ -484,17 +494,17 @@ fn test_concurrent_readers_no_interference() {
 /// Test delete creates proper tombstone and is visible to concurrent readers.
 #[test]
 fn test_concurrent_read_after_delete() {
-    let (storage, txn_service, _cm, _dir) = create_test_service();
+    let (storage, txn_service, _tso, _cm, _dir) = create_test_service();
     let key = b"delete_key";
 
     // Write initial value
-    let (_, ts1, _) = txn_service.put(key, b"value").unwrap();
+    let (_, ts1, _) = txn_service.autocommit_put(key, b"value").unwrap();
 
     // Verify value exists
     assert!(storage.get(key).unwrap().is_some());
 
     // Delete
-    let (_, ts2, _) = txn_service.delete(key).unwrap();
+    let (_, ts2, _) = txn_service.autocommit_delete(key).unwrap();
     assert!(ts2 > ts1);
 
     // Read at latest should see nothing (deleted)
@@ -520,7 +530,7 @@ mod failpoint_tests {
     fn test_reader_blocked_during_write_with_failpoint() {
         let scenario = fail::FailScenario::setup();
 
-        let (storage, txn_service, cm, _dir) = create_test_service();
+        let (storage, txn_service, _tso, cm, _dir) = create_test_service();
         let key = b"fp_test_key";
 
         // Configure failpoint to pause after lock acquisition
@@ -560,7 +570,7 @@ mod failpoint_tests {
     fn test_lock_during_clog_write_with_failpoint() {
         let scenario = fail::FailScenario::setup();
 
-        let (_storage, txn_service, cm, _dir) = create_test_service();
+        let (_storage, txn_service, _tso, cm, _dir) = create_test_service();
         let key = b"fp_clog_key";
 
         // Pause after clog write, before storage apply
@@ -590,11 +600,11 @@ mod failpoint_tests {
     fn test_read_write_race_with_failpoint() {
         let scenario = fail::FailScenario::setup();
 
-        let (storage, txn_service, cm, _dir) = create_test_service();
+        let (storage, txn_service, _tso, cm, _dir) = create_test_service();
         let key = b"race_key";
 
         // Write initial value
-        txn_service.put(key, b"v1").unwrap();
+        txn_service.autocommit_put(key, b"v1").unwrap();
 
         // Pause after storage apply but before lock release
         fail::cfg("txn_after_storage_apply", "pause").unwrap();
@@ -625,7 +635,7 @@ mod failpoint_tests {
     fn test_serialized_writes_with_failpoint() {
         let scenario = fail::FailScenario::setup();
 
-        let (storage, txn_service, _cm, _dir) = create_test_service();
+        let (storage, txn_service, _tso, _cm, _dir) = create_test_service();
         let key = b"serial_key";
 
         let results = Arc::new(std::sync::Mutex::new(vec![]));
@@ -636,7 +646,7 @@ mod failpoint_tests {
             let value = format!("v{i}");
 
             // Each write will succeed in order since they wait for previous
-            let (_, ts, _) = txn_service.put(key, value.as_bytes()).unwrap();
+            let (_, ts, _) = txn_service.autocommit_put(key, value.as_bytes()).unwrap();
             results.lock().unwrap().push((i, ts));
         }
 
