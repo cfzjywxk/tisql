@@ -26,7 +26,9 @@
 
 mod memory;
 
-pub use memory::MemoryCatalog;
+// Crate-internal implementation - not exposed publicly
+// External users only see the Catalog trait
+pub(crate) use memory::MemoryCatalog;
 
 use crate::error::Result;
 use crate::types::{ColumnId, DataType, IndexId, TableId};

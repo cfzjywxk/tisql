@@ -14,7 +14,8 @@
 
 //! Transaction layer for TiSQL.
 //!
-//! This module provides transaction management with durability guarantees.
+//! This module provides transaction management with durability guarantees,
+//! including concurrency control (TSO and lock table).
 //!
 //! ## Key Abstractions
 //!
@@ -27,6 +28,7 @@
 //! 1. **Interface-based**: SQL engine depends on traits, not implementations
 //! 2. **Opaque handles**: Internal state (start_ts, commit_ts) is hidden
 //! 3. **Read transactions get timestamps**: Even read-only queries allocate start_ts
+//! 4. **Concurrency control**: TSO and lock table are internal to transaction layer
 //!
 //! ## Example
 //!
@@ -42,16 +44,19 @@
 //! ```
 
 mod api;
+mod concurrency;
 mod handle;
 mod service;
 mod snapshot;
 
-// Re-export the main types
-pub use api::{
-    BeginOptions, CommitInfo, IsolationLevel, ReadSnapshot, SnapshotOptions, Txn, TxnService,
-};
-pub use service::{RecoveryStats, TransactionService};
+// Public API - only expose traits and types needed by consumers
+pub use api::{IsolationLevel, ReadSnapshot, Txn, TxnService};
 
-// Re-export handle and snapshot for testing/internal use
-pub use handle::TxnHandle;
-pub use snapshot::StorageSnapshot;
+// Implementation types - not re-exported from lib.rs main API
+// Available via testkit for integration tests
+pub use concurrency::{ConcurrencyManager, Lock};
+pub use service::TransactionService;
+
+// KeyGuard is used internally by handle.rs
+#[allow(unused_imports)]
+pub(crate) use concurrency::KeyGuard;

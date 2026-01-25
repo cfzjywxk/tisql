@@ -12,34 +12,75 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-pub mod catalog;
-pub mod clog;
+// ============================================================================
+// Module Structure
+// ============================================================================
+//
+// Layer separation: upper layers only access lower layers via traits (interfaces)
+//
+// Public modules (expose interfaces/traits):
+//   - error, types, util, codec - common types
+//   - session - Session/QueryCtx (needed by protocol layer)
+//   - protocol, worker - server infrastructure
+//
+// Internal modules (implementations hidden):
+//   - catalog - Catalog trait public, MemoryCatalog internal
+//   - clog - ClogService trait public, FileClogService internal
+//   - storage - StorageEngine trait public, implementations internal
+//   - transaction - TxnService trait public, TransactionService/ConcurrencyManager internal
+//   - sql, executor - encapsulated in SQLEngine
+
+// Public modules - common types and server infrastructure
 pub mod codec;
-pub mod concurrency;
 pub mod error;
-pub mod executor;
 pub mod protocol;
 pub mod session;
-pub mod sql;
-pub mod storage;
-pub mod transaction;
 pub mod types;
 pub mod util;
 pub mod worker;
 
-pub use catalog::{Catalog, MemoryCatalog};
-pub use clog::{ClogService, FileClogConfig, FileClogService};
-pub use concurrency::ConcurrencyManager;
-use error::Result;
-use executor::{ExecutionResult, Executor, SimpleExecutor};
+// Internal modules - only traits are re-exported, not implementations
+mod catalog;
+mod clog;
+mod executor;
+mod sql;
+mod storage;
+mod transaction;
+
+// Re-export public interfaces (traits only) and commonly used types
+pub use catalog::Catalog;
+pub use clog::ClogService;
 pub use protocol::{MySqlServer, MYSQL_DEFAULT_PORT};
 pub use session::{Priority, QueryCtx, Session, SessionVars};
+pub use storage::StorageEngine;
+pub use transaction::{ReadSnapshot, Txn, TxnService};
+pub use worker::{WorkerPool, WorkerPoolConfig};
+
+// ============================================================================
+// Test-only exports - implementation details for integration tests
+// ============================================================================
+// These are exposed for testing purposes only. They are NOT part of the public API.
+#[doc(hidden)]
+pub mod testkit {
+    //! Test utilities and implementation re-exports.
+    //!
+    //! This module exposes internal implementation details for integration tests.
+    //! These are NOT part of the public API and may change without notice.
+    pub use crate::clog::{FileClogConfig, FileClogService};
+    pub use crate::storage::MvccMemTableEngine;
+    pub use crate::transaction::{ConcurrencyManager, Lock, TransactionService};
+}
+
+// Internal imports (not re-exported)
+use catalog::MemoryCatalog;
+use clog::{FileClogConfig, FileClogService};
+use error::Result;
+use executor::{ExecutionResult, Executor, SimpleExecutor};
 use sql::{Binder, Parser};
 use storage::MvccMemTableEngine;
-pub use transaction::{ReadSnapshot, TransactionService, Txn, TxnService};
+use transaction::{ConcurrencyManager, TransactionService};
 use types::Value;
 use util::Timer;
-pub use worker::{WorkerPool, WorkerPoolConfig};
 
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -80,14 +121,17 @@ impl DatabaseConfig {
 ///
 /// This is the core SQL processing pipeline that transforms SQL strings
 /// into query results through the transaction service.
-pub struct SQLEngine {
+///
+/// All internal components (Parser, Binder, Executor) are encapsulated.
+/// External callers only see the `handle_mp_query` interface.
+struct SQLEngine {
     parser: Parser,
     executor: SimpleExecutor,
 }
 
 impl SQLEngine {
     /// Create a new SQL engine.
-    pub fn new() -> Self {
+    fn new() -> Self {
         Self {
             parser: Parser::new(),
             executor: SimpleExecutor::new(),
@@ -97,14 +141,17 @@ impl SQLEngine {
     /// Handle MySQL protocol query text.
     ///
     /// Flow: SQL text -> parse -> bind -> execute through TxnService
-    pub fn handle_mp_query<T: TxnService, C: Catalog>(
+    ///
+    /// All SQL execution goes through this method. Internal components
+    /// (Parser, Binder, Executor) are not exposed to callers.
+    fn handle_mp_query<T: TxnService, C: Catalog>(
         &self,
         sql: &str,
         query_ctx: &session::QueryCtx,
         txn_service: &T,
         catalog: &C,
     ) -> Result<ExecutionResult> {
-        // Parse
+        // Parse SQL text into AST
         let stmt = self.parser.parse_one(sql)?;
 
         // Bind (semantic analysis, name resolution)
@@ -112,26 +159,8 @@ impl SQLEngine {
         let plan = binder.bind(stmt)?;
 
         // Execute through TxnService
-        self.executor.execute(plan, txn_service, catalog)
-    }
-
-    /// Internal method for handling a pre-parsed plan with QueryCtx.
-    fn handle_mp_query_internal<T: TxnService, C: Catalog>(
-        &self,
-        plan: sql::LogicalPlan,
-        _query_ctx: &session::QueryCtx,
-        txn_service: &T,
-        catalog: &C,
-    ) -> Result<ExecutionResult> {
-        // Execute through TxnService
         // TODO: Use query_ctx for execution options (priority, isolation level, etc.)
         self.executor.execute(plan, txn_service, catalog)
-    }
-}
-
-impl Default for SQLEngine {
-    fn default() -> Self {
-        Self::new()
     }
 }
 
@@ -139,8 +168,9 @@ impl Default for SQLEngine {
 // Database - Main Entry Point
 // ============================================================================
 
-/// Concrete transaction service type used by Database
-pub type DbTxnService = TransactionService<MvccMemTableEngine, FileClogService>;
+/// Internal type alias for concrete transaction service.
+/// Not exposed publicly - callers only see TxnService trait.
+type DbTxnService = TransactionService<MvccMemTableEngine, FileClogService>;
 
 /// TiSQL Database instance.
 ///
@@ -149,12 +179,19 @@ pub type DbTxnService = TransactionService<MvccMemTableEngine, FileClogService>;
 /// - Transaction management via TxnService
 /// - Schema metadata via Catalog
 ///
-/// Internal components (storage, clog, concurrency manager) are hidden
-/// and managed by the transaction service.
+/// ## Layer Separation
+///
+/// All internal components are encapsulated:
+/// - SQLEngine (Parser, Binder, Executor) - not exposed
+/// - TransactionService implementation - not exposed
+/// - Storage engine implementation - not exposed
+/// - Clog implementation - not exposed
+///
+/// External callers interact only through public methods like `handle_mp_query`.
 pub struct Database {
-    /// SQL engine for parsing, binding, execution
+    /// SQL engine for parsing, binding, execution (encapsulated)
     sql_engine: SQLEngine,
-    /// Transaction service (owns storage, clog, concurrency manager)
+    /// Transaction service - internal implementation hidden
     txn_service: Arc<DbTxnService>,
     /// Schema metadata catalog
     catalog: MemoryCatalog,
@@ -235,36 +272,24 @@ impl Database {
     /// Handle MySQL protocol query text with a QueryCtx.
     ///
     /// This is the internal implementation that takes a pre-created QueryCtx.
+    /// All SQL processing (parse, bind, execute) is delegated to SQLEngine.
     fn handle_mp_query_with_ctx(
         &self,
         sql: &str,
         query_ctx: &session::QueryCtx,
     ) -> Result<QueryResult> {
-        let total_timer = Timer::new("total");
+        let timer = Timer::new("query");
 
-        // Parse
-        let parse_timer = Timer::new("parse");
-        let stmt = self.sql_engine.parser.parse_one(sql)?;
-        let parse_ms = parse_timer.elapsed_ms();
-
-        // Bind
-        let bind_timer = Timer::new("bind");
-        // Use current_db from QueryCtx
-        let binder = Binder::new(&self.catalog, &query_ctx.current_db);
-        let plan = binder.bind(stmt)?;
-        let bind_ms = bind_timer.elapsed_ms();
-
-        // Execute through TxnService via SQLEngine
-        let exec_timer = Timer::new("execute");
-        let result = self.sql_engine.handle_mp_query_internal(
-            plan,
+        // Delegate all SQL processing to SQLEngine
+        // SQLEngine handles: parse -> bind -> execute through TxnService
+        let result = self.sql_engine.handle_mp_query(
+            sql,
             query_ctx,
             self.txn_service.as_ref(),
             &self.catalog,
         )?;
-        let exec_ms = exec_timer.elapsed_ms();
 
-        // Convert to QueryResult
+        // Convert ExecutionResult to QueryResult
         let query_result = match result {
             ExecutionResult::Rows { schema, rows } => {
                 let row_count = rows.len();
@@ -279,12 +304,9 @@ impl Database {
                     .collect();
 
                 log_trace!(
-                    "SQL: {} | parse={:.3}ms bind={:.3}ms exec={:.3}ms total={:.3}ms rows={}",
+                    "SQL: {} | elapsed={:.3}ms rows={}",
                     truncate_sql(sql, 50),
-                    parse_ms,
-                    bind_ms,
-                    exec_ms,
-                    total_timer.elapsed_ms(),
+                    timer.elapsed_ms(),
                     row_count
                 );
 
@@ -292,24 +314,18 @@ impl Database {
             }
             ExecutionResult::Affected { count } => {
                 log_trace!(
-                    "SQL: {} | parse={:.3}ms bind={:.3}ms exec={:.3}ms total={:.3}ms affected={}",
+                    "SQL: {} | elapsed={:.3}ms affected={}",
                     truncate_sql(sql, 50),
-                    parse_ms,
-                    bind_ms,
-                    exec_ms,
-                    total_timer.elapsed_ms(),
+                    timer.elapsed_ms(),
                     count
                 );
                 QueryResult::Affected(count)
             }
             ExecutionResult::Ok => {
                 log_trace!(
-                    "SQL: {} | parse={:.3}ms bind={:.3}ms exec={:.3}ms total={:.3}ms",
+                    "SQL: {} | elapsed={:.3}ms",
                     truncate_sql(sql, 50),
-                    parse_ms,
-                    bind_ms,
-                    exec_ms,
-                    total_timer.elapsed_ms()
+                    timer.elapsed_ms()
                 );
                 QueryResult::Ok
             }

@@ -17,7 +17,7 @@
 use std::ops::Range;
 use std::sync::Arc;
 
-use crate::concurrency::ConcurrencyManager;
+use super::concurrency::ConcurrencyManager;
 use crate::error::Result;
 use crate::storage::StorageEngine;
 use crate::types::{Key, RawValue, Timestamp};

@@ -32,7 +32,7 @@ use std::sync::Arc;
 
 use crossbeam_skiplist::SkipMap;
 
-use crate::concurrency::ConcurrencyManager;
+use crate::transaction::ConcurrencyManager;
 use crate::error::Result;
 use crate::types::{Key, RawValue, Timestamp};
 
@@ -493,8 +493,8 @@ mod tests {
 
     #[test]
     fn test_lock_blocks_read() {
-        use crate::concurrency::Lock;
         use crate::error::TiSqlError;
+        use crate::transaction::Lock;
 
         let cm = Arc::new(ConcurrencyManager::new(1));
         let engine = MvccMemTableEngine::new(Arc::clone(&cm));

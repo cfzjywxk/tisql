@@ -30,6 +30,9 @@
 mod memtable;
 mod mvcc_memtable;
 
+// Implementation types - not re-exported from main API
+// These are available via testkit for integration tests
+#[allow(unused_imports)]
 pub use memtable::MemTableEngine;
 pub use mvcc_memtable::MvccMemTableEngine;
 

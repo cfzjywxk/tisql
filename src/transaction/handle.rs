@@ -18,7 +18,7 @@ use std::ops::Range;
 use std::sync::Arc;
 
 use crate::clog::{ClogBatch, ClogService};
-use crate::concurrency::{ConcurrencyManager, KeyGuard, Lock};
+use super::concurrency::{ConcurrencyManager, KeyGuard, Lock};
 use crate::error::Result;
 use crate::storage::{StorageEngine, WriteBatch, WriteOp};
 use crate::types::{Key, RawValue, Timestamp, TxnId};

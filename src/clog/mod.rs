@@ -26,6 +26,8 @@
 
 mod file;
 
+// Implementation types - not re-exported from main API
+// Available via testkit for integration tests
 pub use file::{FileClogConfig, FileClogService};
 
 use crate::error::Result;

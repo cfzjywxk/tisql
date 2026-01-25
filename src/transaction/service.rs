@@ -27,8 +27,9 @@ use std::sync::Arc;
 use fail::fail_point;
 
 use crate::clog::{ClogBatch, ClogEntry, ClogOp, ClogService};
-use crate::concurrency::{ConcurrencyManager, Lock};
 use crate::error::Result;
+
+use super::concurrency::{ConcurrencyManager, Lock};
 use crate::storage::{StorageEngine, WriteBatch, WriteOp};
 use crate::types::{Key, Lsn, Timestamp, TxnId};
 

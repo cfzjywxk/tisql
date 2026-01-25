@@ -14,7 +14,8 @@
 
 mod simple;
 
-pub use simple::SimpleExecutor;
+// Crate-internal implementation
+pub(crate) use simple::SimpleExecutor;
 
 use crate::catalog::Catalog;
 use crate::error::Result;

@@ -29,11 +29,9 @@ use std::sync::Arc;
 use std::thread;
 use std::time::Duration;
 
-use tisql::clog::{FileClogConfig, FileClogService};
-use tisql::concurrency::{ConcurrencyManager, Lock};
 use tisql::error::TiSqlError;
-use tisql::storage::{MvccMemTableEngine, StorageEngine};
-use tisql::TransactionService;
+use tisql::StorageEngine;
+use tisql::testkit::{ConcurrencyManager, FileClogConfig, FileClogService, Lock, MvccMemTableEngine, TransactionService};
 
 fn create_test_service() -> (
     Arc<MvccMemTableEngine>,
