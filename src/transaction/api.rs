@@ -34,7 +34,7 @@
 //! let value = txn_service.get(&ctx, key)?;
 //!
 //! // Write operations
-//! txn_service.put(&mut ctx, key, value);
+//! txn_service.put(&mut ctx, key, value)?;
 //!
 //! // Commit
 //! let info = txn_service.commit(ctx)?;
@@ -199,14 +199,22 @@ pub trait TxnService: Send + Sync {
     /// Buffer a put operation.
     ///
     /// The write is not visible until commit.
-    /// Errors if the transaction is read-only.
-    fn put(&self, ctx: &mut TxnCtx, key: Key, value: RawValue);
+    ///
+    /// # Errors
+    ///
+    /// - `ReadOnlyTransaction` if the transaction was started with `read_only = true`
+    /// - `TransactionNotActive` if the transaction is not in `Active` state
+    fn put(&self, ctx: &mut TxnCtx, key: Key, value: RawValue) -> Result<()>;
 
     /// Buffer a delete operation.
     ///
     /// The delete is not visible until commit.
-    /// Errors if the transaction is read-only.
-    fn delete(&self, ctx: &mut TxnCtx, key: Key);
+    ///
+    /// # Errors
+    ///
+    /// - `ReadOnlyTransaction` if the transaction was started with `read_only = true`
+    /// - `TransactionNotActive` if the transaction is not in `Active` state
+    fn delete(&self, ctx: &mut TxnCtx, key: Key) -> Result<()>;
 
     // === Finalization ===
 

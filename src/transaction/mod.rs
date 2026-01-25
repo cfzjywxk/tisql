@@ -51,7 +51,7 @@
 //! let value = txn_service.get(&ctx, key)?;
 //!
 //! // Write operations
-//! txn_service.put(&mut ctx, key, value);
+//! txn_service.put(&mut ctx, key, value)?;
 //!
 //! // Commit
 //! let info = txn_service.commit(ctx)?;

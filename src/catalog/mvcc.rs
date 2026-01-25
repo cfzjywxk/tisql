@@ -91,17 +91,17 @@ impl<T: TxnService> MvccCatalog<T> {
         let mut ctx = self.txn_service.begin(false)?;
         let key = encode_global_key("schema_version");
         self.txn_service
-            .put(&mut ctx, key, 1u64.to_be_bytes().to_vec());
+            .put(&mut ctx, key, 1u64.to_be_bytes().to_vec())?;
 
         // Initialize next_table_id counter to 1
         let key = encode_global_key("next_table_id");
         self.txn_service
-            .put(&mut ctx, key, 1u64.to_be_bytes().to_vec());
+            .put(&mut ctx, key, 1u64.to_be_bytes().to_vec())?;
 
         // Initialize next_index_id counter to 1
         let key = encode_global_key("next_index_id");
         self.txn_service
-            .put(&mut ctx, key, 1u64.to_be_bytes().to_vec());
+            .put(&mut ctx, key, 1u64.to_be_bytes().to_vec())?;
 
         self.txn_service.commit(ctx)?;
 
@@ -179,25 +179,25 @@ impl<T: TxnService> MvccCatalog<T> {
 
     /// Increment schema version in storage and memory.
     /// Must be called while holding write lock on schema_state.
-    fn increment_schema_version(&self, ctx: &mut TxnCtx, state: &mut SchemaState) {
+    fn increment_schema_version(&self, ctx: &mut TxnCtx, state: &mut SchemaState) -> Result<()> {
         state.version += 1;
         let key = encode_global_key("schema_version");
         self.txn_service
-            .put(ctx, key, state.version.to_be_bytes().to_vec());
+            .put(ctx, key, state.version.to_be_bytes().to_vec())
     }
 
     /// Persist the current table ID counter to storage.
     /// Called as part of DDL transaction to ensure durability.
-    fn persist_table_id_counter(&self, ctx: &mut TxnCtx, value: u64) {
+    fn persist_table_id_counter(&self, ctx: &mut TxnCtx, value: u64) -> Result<()> {
         let key = encode_global_key("next_table_id");
-        self.txn_service.put(ctx, key, value.to_be_bytes().to_vec());
+        self.txn_service.put(ctx, key, value.to_be_bytes().to_vec())
     }
 
     /// Persist the current index ID counter to storage.
     /// Called as part of DDL transaction to ensure durability.
-    fn persist_index_id_counter(&self, ctx: &mut TxnCtx, value: u64) {
+    fn persist_index_id_counter(&self, ctx: &mut TxnCtx, value: u64) -> Result<()> {
         let key = encode_global_key("next_index_id");
-        self.txn_service.put(ctx, key, value.to_be_bytes().to_vec());
+        self.txn_service.put(ctx, key, value.to_be_bytes().to_vec())
     }
 
     /// Begin an internal transaction for DDL operations.
@@ -234,10 +234,10 @@ impl<T: TxnService> Catalog for MvccCatalog<T> {
         }
 
         // Write schema marker (just a flag, empty value is fine)
-        self.txn_service.put(&mut ctx, key, vec![1]);
+        self.txn_service.put(&mut ctx, key, vec![1])?;
 
         // Increment schema version as part of this transaction
-        self.increment_schema_version(&mut ctx, &mut state);
+        self.increment_schema_version(&mut ctx, &mut state)?;
 
         self.commit_internal(ctx)?;
         // Write lock released here - DML can now see new version
@@ -274,10 +274,10 @@ impl<T: TxnService> Catalog for MvccCatalog<T> {
         state = self.schema_state.write().unwrap();
 
         // Delete schema marker
-        self.txn_service.delete(&mut ctx, key);
+        self.txn_service.delete(&mut ctx, key)?;
 
         // Increment schema version as part of this transaction
-        self.increment_schema_version(&mut ctx, &mut state);
+        self.increment_schema_version(&mut ctx, &mut state)?;
 
         self.commit_internal(ctx)?;
         Ok(())
@@ -338,20 +338,20 @@ impl<T: TxnService> Catalog for MvccCatalog<T> {
         // Serialize and write table definition
         let table_id = table.id();
         let value = bincode::serialize(&table).map_err(|e| TiSqlError::Catalog(e.to_string()))?;
-        self.txn_service.put(&mut ctx, key, value);
+        self.txn_service.put(&mut ctx, key, value)?;
 
         // Write table ID mapping
         let id_key = encode_table_id_key(table_id);
         let id_value = format!("{}:{}", table.schema(), table.name());
         self.txn_service
-            .put(&mut ctx, id_key, id_value.into_bytes());
+            .put(&mut ctx, id_key, id_value.into_bytes())?;
 
         // Persist the current table ID counter for durability
         let current_next_id = self.next_table_id.load(Ordering::SeqCst);
-        self.persist_table_id_counter(&mut ctx, current_next_id);
+        self.persist_table_id_counter(&mut ctx, current_next_id)?;
 
         // Increment schema version as part of this transaction
-        self.increment_schema_version(&mut ctx, &mut state);
+        self.increment_schema_version(&mut ctx, &mut state)?;
 
         self.commit_internal(ctx)?;
         Ok(table_id)
@@ -374,14 +374,14 @@ impl<T: TxnService> Catalog for MvccCatalog<T> {
         };
 
         // Delete table definition
-        self.txn_service.delete(&mut ctx, key);
+        self.txn_service.delete(&mut ctx, key)?;
 
         // Delete table ID mapping
         let id_key = encode_table_id_key(table_def.id());
-        self.txn_service.delete(&mut ctx, id_key);
+        self.txn_service.delete(&mut ctx, id_key)?;
 
         // Increment schema version as part of this transaction
-        self.increment_schema_version(&mut ctx, &mut state);
+        self.increment_schema_version(&mut ctx, &mut state)?;
 
         self.commit_internal(ctx)?;
         Ok(())
@@ -518,14 +518,14 @@ impl<T: TxnService> Catalog for MvccCatalog<T> {
         // Write updated table definition
         let value =
             bincode::serialize(&table_def).map_err(|e| TiSqlError::Catalog(e.to_string()))?;
-        self.txn_service.put(&mut ctx, table_key, value);
+        self.txn_service.put(&mut ctx, table_key, value)?;
 
         // Persist the current index ID counter for durability
         let current_next_id = self.next_index_id.load(Ordering::SeqCst);
-        self.persist_index_id_counter(&mut ctx, current_next_id);
+        self.persist_index_id_counter(&mut ctx, current_next_id)?;
 
         // Increment schema version as part of this transaction
-        self.increment_schema_version(&mut ctx, &mut state);
+        self.increment_schema_version(&mut ctx, &mut state)?;
 
         self.commit_internal(ctx)?;
         Ok(index_id)
@@ -578,10 +578,10 @@ impl<T: TxnService> Catalog for MvccCatalog<T> {
         // Write updated table definition
         let value =
             bincode::serialize(&table_def).map_err(|e| TiSqlError::Catalog(e.to_string()))?;
-        self.txn_service.put(&mut ctx, table_key, value);
+        self.txn_service.put(&mut ctx, table_key, value)?;
 
         // Increment schema version as part of this transaction
-        self.increment_schema_version(&mut ctx, &mut state);
+        self.increment_schema_version(&mut ctx, &mut state)?;
 
         self.commit_internal(ctx)?;
         Ok(())
@@ -629,7 +629,7 @@ impl<T: TxnService> Catalog for MvccCatalog<T> {
         // Write updated table definition
         let value =
             bincode::serialize(&table_def).map_err(|e| TiSqlError::Catalog(e.to_string()))?;
-        self.txn_service.put(&mut ctx, table_key, value);
+        self.txn_service.put(&mut ctx, table_key, value)?;
 
         self.commit_internal(ctx)?;
         Ok(new_id)
@@ -738,8 +738,7 @@ mod tests {
     use std::sync::Arc;
     use tempfile::tempdir;
 
-    type TestTxnService =
-        TransactionService<MvccMemTableEngine<LocalTso>, FileClogService, LocalTso>;
+    type TestTxnService = TransactionService<MvccMemTableEngine, FileClogService, LocalTso>;
 
     fn create_test_catalog() -> (MvccCatalog<TestTxnService>, tempfile::TempDir) {
         let dir = tempdir().unwrap();
@@ -749,10 +748,7 @@ mod tests {
 
         let tso = Arc::new(LocalTso::new(1));
         let concurrency_manager = Arc::new(ConcurrencyManager::new(0));
-        let storage = Arc::new(MvccMemTableEngine::new(
-            Arc::clone(&tso),
-            Arc::clone(&concurrency_manager),
-        ));
+        let storage = Arc::new(MvccMemTableEngine::new());
 
         let txn_service = Arc::new(TransactionService::new(
             Arc::clone(&storage),
@@ -946,10 +942,7 @@ mod tests {
 
             let tso = Arc::new(LocalTso::new(1));
             let concurrency_manager = Arc::new(ConcurrencyManager::new(0));
-            let storage = Arc::new(MvccMemTableEngine::new(
-                Arc::clone(&tso),
-                Arc::clone(&concurrency_manager),
-            ));
+            let storage = Arc::new(MvccMemTableEngine::new());
 
             let txn_service = Arc::new(TransactionService::new(
                 Arc::clone(&storage),
@@ -982,10 +975,7 @@ mod tests {
 
             let tso = Arc::new(LocalTso::new(1));
             let concurrency_manager = Arc::new(ConcurrencyManager::new(0));
-            let storage = Arc::new(MvccMemTableEngine::new(
-                Arc::clone(&tso),
-                Arc::clone(&concurrency_manager),
-            ));
+            let storage = Arc::new(MvccMemTableEngine::new());
 
             let txn_service = Arc::new(TransactionService::new(
                 Arc::clone(&storage),

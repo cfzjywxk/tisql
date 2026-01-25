@@ -195,7 +195,7 @@ impl SQLEngine {
 // ============================================================================
 
 /// Internal type alias for concrete storage engine.
-type DbStorage = MvccMemTableEngine<LocalTso>;
+type DbStorage = MvccMemTableEngine;
 
 /// Internal type alias for concrete transaction service.
 /// Not exposed publicly - callers only see TxnService trait.
@@ -245,12 +245,11 @@ impl Database {
         // Create TSO service for timestamp allocation
         let tso = Arc::new(LocalTso::new(1));
 
-        // Create concurrency manager (for locks and max_ts) and storage
+        // Create concurrency manager (for locks and max_ts)
         let concurrency_manager = Arc::new(ConcurrencyManager::new(0));
-        let storage = Arc::new(MvccMemTableEngine::new(
-            Arc::clone(&tso),
-            Arc::clone(&concurrency_manager),
-        ));
+
+        // Create storage engine (pure key-value store, no transaction logic)
+        let storage = Arc::new(MvccMemTableEngine::new());
 
         // Create transaction service
         let txn_service = Arc::new(TransactionService::new(

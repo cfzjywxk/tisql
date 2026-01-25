@@ -678,6 +678,8 @@ fn tisql_error_kind(err: &TiSqlError) -> String {
         TiSqlError::DuplicateKey(_) => "DuplicateKey".into(),
         TiSqlError::TransactionConflict => "TransactionConflict".into(),
         TiSqlError::TransactionAborted => "TransactionAborted".into(),
+        TiSqlError::ReadOnlyTransaction => "ReadOnlyTransaction".into(),
+        TiSqlError::TransactionNotActive(_) => "TransactionNotActive".into(),
         TiSqlError::KeyIsLocked { .. } => "KeyIsLocked".into(),
         TiSqlError::SchemaChanged => "SchemaChanged".into(),
         TiSqlError::Io(_) => "Io".into(),

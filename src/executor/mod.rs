@@ -36,17 +36,17 @@ pub enum ExecutionResult {
 /// Executor trait - executes plans through TxnService
 ///
 /// All statement execution goes through the transaction service:
-/// - Read statements: TxnService.snapshot() allocates start_ts
-/// - Write statements: TxnService.begin() + commit() with durability
+/// - Read statements: TxnService.begin(true) creates read-only transaction
+/// - Write statements: TxnService.begin(false) + commit() with durability
 pub trait Executor {
     /// Execute a logical plan through the transaction service.
     ///
     /// For read operations (SELECT):
-    /// 1. Creates a snapshot via txn_service.snapshot()
-    /// 2. Reads are performed at snapshot's start_ts
+    /// 1. Creates a read-only transaction via txn_service.begin(true)
+    /// 2. Reads are performed at transaction's start_ts
     ///
     /// For write operations (INSERT/UPDATE/DELETE):
-    /// 1. Creates a transaction via txn_service.begin()
+    /// 1. Creates a transaction via txn_service.begin(false)
     /// 2. Writes are buffered in transaction
     /// 3. Transaction is committed with durability
     fn execute<T: TxnService, C: Catalog>(

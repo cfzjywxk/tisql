@@ -24,7 +24,7 @@ use std::sync::Arc;
 use fail::fail_point;
 
 use crate::clog::{ClogBatch, ClogEntry, ClogOp, ClogService};
-use crate::error::Result;
+use crate::error::{Result, TiSqlError};
 use crate::tso::TsoService;
 
 use super::api::{CommitInfo, TxnCtx, TxnService, TxnState};
@@ -321,16 +321,26 @@ impl<S: StorageEngine + 'static, L: ClogService + 'static, T: TsoService> TxnSer
         self.storage.scan_at(range, ctx.start_ts)
     }
 
-    fn put(&self, ctx: &mut TxnCtx, key: Key, value: RawValue) {
-        if ctx.state == TxnState::Active && !ctx.read_only {
-            ctx.write_buffer.put(key, value);
+    fn put(&self, ctx: &mut TxnCtx, key: Key, value: RawValue) -> Result<()> {
+        if ctx.state != TxnState::Active {
+            return Err(TiSqlError::TransactionNotActive(format!("{:?}", ctx.state)));
         }
+        if ctx.read_only {
+            return Err(TiSqlError::ReadOnlyTransaction);
+        }
+        ctx.write_buffer.put(key, value);
+        Ok(())
     }
 
-    fn delete(&self, ctx: &mut TxnCtx, key: Key) {
-        if ctx.state == TxnState::Active && !ctx.read_only {
-            ctx.write_buffer.delete(key);
+    fn delete(&self, ctx: &mut TxnCtx, key: Key) -> Result<()> {
+        if ctx.state != TxnState::Active {
+            return Err(TiSqlError::TransactionNotActive(format!("{:?}", ctx.state)));
         }
+        if ctx.read_only {
+            return Err(TiSqlError::ReadOnlyTransaction);
+        }
+        ctx.write_buffer.delete(key);
+        Ok(())
     }
 
     fn commit(&self, mut ctx: TxnCtx) -> Result<CommitInfo> {
@@ -431,7 +441,7 @@ mod tests {
     use crate::tso::LocalTso;
     use tempfile::tempdir;
 
-    type TestStorage = MvccMemTableEngine<LocalTso>;
+    type TestStorage = MvccMemTableEngine;
 
     fn create_test_service() -> (
         Arc<TestStorage>,
@@ -443,7 +453,7 @@ mod tests {
         let clog_service = Arc::new(FileClogService::open(config).unwrap());
         let tso = Arc::new(LocalTso::new(1));
         let cm = Arc::new(ConcurrencyManager::new(0));
-        let storage = Arc::new(MvccMemTableEngine::new(Arc::clone(&tso), Arc::clone(&cm)));
+        let storage = Arc::new(MvccMemTableEngine::new());
         let txn_service = TransactionService::new(Arc::clone(&storage), clog_service, tso, cm);
         (storage, txn_service, dir)
     }
@@ -498,7 +508,7 @@ mod tests {
             let clog_service = Arc::new(FileClogService::open(config.clone()).unwrap());
             let tso = Arc::new(LocalTso::new(1));
             let cm = Arc::new(ConcurrencyManager::new(0));
-            let storage = Arc::new(MvccMemTableEngine::new(Arc::clone(&tso), Arc::clone(&cm)));
+            let storage = Arc::new(MvccMemTableEngine::new());
             let txn_service = TransactionService::new(storage, clog_service.clone(), tso, cm);
 
             txn_service.autocommit_put(b"k1", b"v1").unwrap();
@@ -513,7 +523,7 @@ mod tests {
         let clog_service = Arc::new(clog_service);
         let tso = Arc::new(LocalTso::new(1));
         let cm = Arc::new(ConcurrencyManager::new(0));
-        let storage = Arc::new(MvccMemTableEngine::new(Arc::clone(&tso), Arc::clone(&cm)));
+        let storage = Arc::new(MvccMemTableEngine::new());
         let txn_service = TransactionService::new(Arc::clone(&storage), clog_service, tso, cm);
 
         let stats = txn_service.recover(&entries).unwrap();
@@ -537,15 +547,19 @@ mod tests {
         let (_, ts1, _) = txn_service.autocommit_put(b"key", b"v1").unwrap();
 
         // Write v2
-        let (_, _ts2, _) = txn_service.autocommit_put(b"key", b"v2").unwrap();
+        let (_, ts2, _) = txn_service.autocommit_put(b"key", b"v2").unwrap();
 
         // Reading at latest should see v2
         let v = storage.get(b"key").unwrap();
         assert_eq!(v, Some(b"v2".to_vec()));
 
-        // Reading at ts1 should see v1 (using internal method)
-        let v = storage.concurrency_manager().check_lock(b"key", ts1);
-        assert!(v.is_ok()); // No lock
+        // Reading at ts1 should see v1 (MVCC visibility)
+        let v = storage.get_at(b"key", ts1).unwrap();
+        assert_eq!(v, Some(b"v1".to_vec()));
+
+        // Reading at ts2 should see v2
+        let v = storage.get_at(b"key", ts2).unwrap();
+        assert_eq!(v, Some(b"v2".to_vec()));
     }
 
     // ========================================================================
@@ -584,7 +598,9 @@ mod tests {
         let mut ctx = txn_service.begin(false).unwrap();
 
         // Put via transaction
-        txn_service.put(&mut ctx, b"key1".to_vec(), b"value1".to_vec());
+        txn_service
+            .put(&mut ctx, b"key1".to_vec(), b"value1".to_vec())
+            .unwrap();
 
         // Should see buffered write
         let value = txn_service.get(&ctx, b"key1").unwrap();
@@ -610,8 +626,10 @@ mod tests {
 
         let mut ctx = txn_service.begin(false).unwrap();
 
-        txn_service.put(&mut ctx, b"key1".to_vec(), b"value1".to_vec());
-        txn_service.delete(&mut ctx, b"key1".to_vec());
+        txn_service
+            .put(&mut ctx, b"key1".to_vec(), b"value1".to_vec())
+            .unwrap();
+        txn_service.delete(&mut ctx, b"key1".to_vec()).unwrap();
 
         // Should see delete in buffer
         let value = txn_service.get(&ctx, b"key1").unwrap();
@@ -624,7 +642,9 @@ mod tests {
 
         let mut ctx = txn_service.begin(false).unwrap();
 
-        txn_service.put(&mut ctx, b"key1".to_vec(), b"value1".to_vec());
+        txn_service
+            .put(&mut ctx, b"key1".to_vec(), b"value1".to_vec())
+            .unwrap();
 
         // Rollback
         txn_service.rollback(ctx).unwrap();
@@ -660,7 +680,9 @@ mod tests {
         assert_eq!(latest, Some(b"v2".to_vec()));
 
         // Transaction write
-        txn_service.put(&mut ctx, b"key".to_vec(), b"v3".to_vec());
+        txn_service
+            .put(&mut ctx, b"key".to_vec(), b"v3".to_vec())
+            .unwrap();
 
         // Transaction should see its own write
         let value = txn_service.get(&ctx, b"key").unwrap();
@@ -668,18 +690,31 @@ mod tests {
     }
 
     #[test]
-    fn test_txn_service_read_only_ignores_writes() {
+    fn test_txn_service_read_only_rejects_writes() {
         let (storage, txn_service, _dir) = create_test_service();
 
         let mut ctx = txn_service.begin(true).unwrap();
 
-        // Put should be ignored for read-only transaction
-        txn_service.put(&mut ctx, b"key1".to_vec(), b"value1".to_vec());
+        // Put should error for read-only transaction
+        let result = txn_service.put(&mut ctx, b"key1".to_vec(), b"value1".to_vec());
+        assert!(result.is_err());
+        assert!(matches!(
+            result.unwrap_err(),
+            TiSqlError::ReadOnlyTransaction
+        ));
+
+        // Delete should also error
+        let result = txn_service.delete(&mut ctx, b"key1".to_vec());
+        assert!(result.is_err());
+        assert!(matches!(
+            result.unwrap_err(),
+            TiSqlError::ReadOnlyTransaction
+        ));
 
         // Buffer should be empty
         assert!(ctx.write_buffer.is_empty());
 
-        // Commit should succeed (no-op)
+        // Commit should succeed (no-op for read-only)
         let info = txn_service.commit(ctx).unwrap();
         assert_eq!(info.lsn, 0); // No log written
 

@@ -100,45 +100,48 @@ pub use crate::codec::row::{decode_row_to_values, encode_row};
 // Storage Engine Trait
 // ============================================================================
 
-/// Core KV storage interface - all engines implement this.
+/// Core KV storage interface with MVCC versioning.
 ///
-/// This trait defines the fundamental operations for key-value storage.
-/// Implementations should be thread-safe (Send + Sync).
+/// This trait defines a pure key-value storage layer. Implementations should be
+/// thread-safe (Send + Sync) and provide MVCC versioning through timestamped writes.
 ///
-/// # IMPORTANT: Use TxnService Instead
+/// # Layer Separation
 ///
-/// **For application-level reads, always use [`TxnService`](crate::transaction::TxnService)
-/// instead of calling these methods directly.** Direct storage access bypasses MVCC
-/// visibility rules and transaction isolation.
+/// The storage layer is responsible ONLY for:
+/// - Storing and retrieving versioned key-value pairs
+/// - Atomic batch writes with explicit timestamps
 ///
-/// The storage layer methods are intended for:
-/// - Internal use by `TxnService` and `TransactionService`
-/// - Recovery and bootstrap operations
+/// The storage layer does NOT handle:
+/// - Lock management (handled by ConcurrencyManager in transaction layer)
+/// - Timestamp allocation (handled by TsoService in transaction layer)
+/// - Transaction coordination (handled by TransactionService)
+///
+/// # Usage
+///
+/// **For application code, always use [`TxnService`](crate::transaction::TxnService)
+/// instead of calling these methods directly.**
+///
+/// Storage methods are intended for:
+/// - Internal use by `TransactionService`
+/// - Recovery operations
 /// - Testing infrastructure
 ///
-/// # MVCC vs Non-MVCC Methods
+/// # Methods
 ///
-/// | Method | MVCC-aware | Use Case |
-/// |--------|------------|----------|
-/// | `get` | ❌ No | **Avoid** - reads latest version, ignores visibility |
-/// | `get_at` | ✅ Yes | Internal - reads at specific timestamp |
-/// | `scan` | ❌ No | **Avoid** - scans latest versions, ignores visibility |
-/// | `scan_at` | ✅ Yes | Internal - scans at specific timestamp |
-/// | `snapshot` | ⚠️ Partial | **Deprecated** - use TxnService instead |
+/// | Method | Description |
+/// |--------|-------------|
+/// | `get` | Read latest version (for recovery/testing) |
+/// | `get_at` | Read at specific timestamp (MVCC) |
+/// | `scan` | Scan latest versions (for recovery/testing) |
+/// | `scan_at` | Scan at specific timestamp (MVCC) |
+/// | `write_batch` | Atomic writes with commit_ts (requires timestamp) |
 pub trait StorageEngine: Send + Sync + 'static {
     /// Point lookup - returns the latest version of a key.
     ///
-    /// # Warning: Non-MVCC Read
+    /// Returns the most recently committed version regardless of timestamp.
+    /// Primarily used for recovery operations and testing.
     ///
-    /// **DO NOT USE for application reads.** This method returns the latest
-    /// committed version regardless of transaction visibility rules.
-    ///
-    /// Use [`TxnService::get`](crate::transaction::TxnService::get) instead,
-    /// which respects MVCC visibility based on the transaction's start_ts.
-    ///
-    /// This method exists for:
-    /// - Recovery operations that need to see all committed data
-    /// - Testing and debugging
+    /// For MVCC-aware reads, use `get_at()` or `TxnService::get()`.
     fn get(&self, key: &[u8]) -> Result<Option<RawValue>>;
 
     /// Point lookup at specific timestamp (MVCC-aware).
@@ -146,59 +149,27 @@ pub trait StorageEngine: Send + Sync + 'static {
     /// Returns the value visible at the given timestamp, i.e., the latest
     /// version with `commit_ts <= ts`.
     ///
-    /// # Internal Use
-    ///
-    /// This is called internally by `TxnService::get`. Application code should
-    /// use `TxnService::get` which automatically uses the transaction's start_ts.
+    /// This is called internally by `TxnService::get()`.
     fn get_at(&self, key: &[u8], ts: Timestamp) -> Result<Option<RawValue>>;
-
-    /// Write a single key-value pair.
-    ///
-    /// # Warning: Non-Transactional Write
-    ///
-    /// **DO NOT USE for application writes.** This bypasses transaction
-    /// management, commit logging, and MVCC timestamp assignment.
-    ///
-    /// Use [`TxnService::put`](crate::transaction::TxnService::put) and
-    /// [`TxnService::commit`](crate::transaction::TxnService::commit) instead.
-    fn put(&self, key: &[u8], value: &[u8]) -> Result<()>;
-
-    /// Delete a key.
-    ///
-    /// # Warning: Non-Transactional Write
-    ///
-    /// **DO NOT USE for application writes.** See `put` for details.
-    fn delete(&self, key: &[u8]) -> Result<()>;
 
     /// Apply a batch of writes atomically.
     ///
-    /// # Internal Use
+    /// # Requirements
     ///
-    /// This is called internally by `TxnService::commit` after logging to clog.
-    /// The batch should have `commit_ts` set for proper MVCC versioning.
+    /// The batch MUST have `commit_ts` set via `batch.set_commit_ts()`.
+    /// This ensures proper MVCC versioning.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if `commit_ts` is not set.
     fn write_batch(&self, batch: WriteBatch) -> Result<()>;
-
-    /// Create a consistent snapshot for reads.
-    ///
-    /// # Deprecated
-    ///
-    /// **Use `TxnService::begin(true)` instead** to create a read-only transaction
-    /// with proper MVCC semantics.
-    ///
-    /// This method creates a snapshot at the current TSO timestamp, but the
-    /// returned `Snapshot` trait doesn't carry timestamp information for callers,
-    /// making it error-prone.
-    fn snapshot(&self) -> Result<Box<dyn Snapshot>>;
 
     /// Range scan - returns latest versions of all keys in range.
     ///
-    /// # Warning: Non-MVCC Read
+    /// Returns the most recently committed version of each key.
+    /// Primarily used for recovery operations and testing.
     ///
-    /// **DO NOT USE for application reads.** This method returns the latest
-    /// committed version of each key, ignoring transaction visibility rules.
-    ///
-    /// Use [`TxnService::scan`](crate::transaction::TxnService::scan) instead,
-    /// which respects MVCC visibility based on the transaction's start_ts.
+    /// For MVCC-aware scans, use `scan_at()` or `TxnService::scan()`.
     fn scan(&self, range: Range<Key>) -> Result<Box<dyn Iterator<Item = (Key, RawValue)> + '_>>;
 
     /// Range scan at specific timestamp (MVCC-aware).
@@ -206,65 +177,12 @@ pub trait StorageEngine: Send + Sync + 'static {
     /// Returns key-value pairs visible at the given timestamp. For each key,
     /// returns the latest version with `commit_ts <= ts`.
     ///
-    /// # Internal Use
-    ///
-    /// This is called internally by `TxnService::scan`. Application code should
-    /// use `TxnService::scan` which automatically uses the transaction's start_ts.
+    /// This is called internally by `TxnService::scan()`.
     fn scan_at(
         &self,
         range: Range<Key>,
         ts: Timestamp,
     ) -> Result<Box<dyn Iterator<Item = (Key, RawValue)> + '_>>;
-}
-
-// ============================================================================
-// Snapshot Trait (Deprecated - Use TxnService)
-// ============================================================================
-
-/// Immutable snapshot for consistent reads.
-///
-/// # Deprecated
-///
-/// **This trait is deprecated. Use [`TxnService`](crate::transaction::TxnService) instead.**
-///
-/// The `Snapshot` trait has several issues:
-/// 1. Callers don't know the snapshot timestamp, making debugging difficult
-/// 2. No integration with transaction context (TxnCtx)
-/// 3. No support for read-your-writes semantics
-///
-/// ## Migration Guide
-///
-/// Instead of:
-/// ```ignore
-/// let snapshot = storage.snapshot()?;
-/// let value = snapshot.get(key)?;
-/// let iter = snapshot.scan(range)?;
-/// ```
-///
-/// Use:
-/// ```ignore
-/// let ctx = txn_service.begin(true)?;  // read-only transaction
-/// let value = txn_service.get(&ctx, key)?;
-/// let iter = txn_service.scan(&ctx, range)?;
-/// // ctx is automatically cleaned up when dropped
-/// ```
-///
-/// The `TxnService` approach provides:
-/// - Explicit timestamp in `TxnCtx` for debugging
-/// - Consistent MVCC semantics across all operations
-/// - Proper lock checking for write conflicts
-pub trait Snapshot: Send + Sync {
-    /// Point lookup within the snapshot.
-    ///
-    /// # Deprecated
-    /// Use `TxnService::get` instead.
-    fn get(&self, key: &[u8]) -> Result<Option<RawValue>>;
-
-    /// Range scan within the snapshot.
-    ///
-    /// # Deprecated
-    /// Use `TxnService::scan` instead.
-    fn scan(&self, range: Range<Key>) -> Result<Box<dyn Iterator<Item = (Key, RawValue)> + '_>>;
 }
 
 // ============================================================================

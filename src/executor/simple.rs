@@ -473,7 +473,7 @@ impl SimpleExecutor {
                     let value = encode_row(&col_ids, &row_values);
 
                     // Buffer write in transaction
-                    txn_service.put(ctx, key, value);
+                    txn_service.put(ctx, key, value)?;
                     count += 1;
                 }
 
@@ -511,7 +511,7 @@ impl SimpleExecutor {
                     }
 
                     // Buffer delete in transaction
-                    txn_service.delete(ctx, key);
+                    txn_service.delete(ctx, key)?;
                     count += 1;
                 }
 
@@ -579,12 +579,12 @@ impl SimpleExecutor {
 
                     // Delete old key if PK changed
                     if !pk_indices.is_empty() && new_key != key {
-                        txn_service.delete(ctx, key);
+                        txn_service.delete(ctx, key)?;
                     }
 
                     // Write new row
                     let new_value = encode_row(&col_ids, row.values());
-                    txn_service.put(ctx, new_key, new_value);
+                    txn_service.put(ctx, new_key, new_value)?;
                     count += 1;
                 }
 

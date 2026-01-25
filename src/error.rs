@@ -57,6 +57,12 @@ pub enum TiSqlError {
     #[error("Transaction aborted")]
     TransactionAborted,
 
+    #[error("Cannot write in read-only transaction")]
+    ReadOnlyTransaction,
+
+    #[error("Transaction is not active (state: {0})")]
+    TransactionNotActive(String),
+
     #[error("Key is locked: key={key:?}, lock_ts={lock_ts}")]
     KeyIsLocked {
         key: Vec<u8>,
