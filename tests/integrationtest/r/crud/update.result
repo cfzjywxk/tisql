@@ -20,9 +20,12 @@ UPDATE t_update SET val = 999 WHERE id > 1
 AFFECTED 2
 SELECT id, val, name FROM t_update ORDER BY id
 id	val	name
+1	150	first
+2	999	updated
 3	999	third
 UPDATE t_update SET val = val + 1 WHERE id = 1
-AFFECTED 0
+AFFECTED 1
 SELECT id, val, name FROM t_update WHERE id = 1
 id	val	name
+1	0	first
 DROP TABLE t_update

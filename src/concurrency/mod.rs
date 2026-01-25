@@ -169,21 +169,34 @@ impl ConcurrencyManager {
     /// * `Ok(guards)` - Locks acquired successfully
     /// * `Err(KeyIsLocked)` - A key is already locked by another transaction
     pub fn lock_keys(&self, keys: &[Key], lock: Lock) -> Result<Vec<KeyGuard>> {
+        if keys.is_empty() {
+            return Ok(vec![]);
+        }
+
+        // Sort and de-duplicate keys to avoid self-conflicts and to provide a stable
+        // acquisition order.
+        let mut keys = keys.to_vec();
+        keys.sort();
+        keys.dedup();
+
         let mut guards = Vec::with_capacity(keys.len());
 
-        for key in keys {
-            // Check if key is already locked
-            if let Some(entry) = self.lock_table.get(key) {
-                let existing_lock = entry.value();
+        for key in &keys {
+            // Use compare_insert to avoid a check-then-insert race. SkipMap::insert will
+            // remove an existing entry, which can break mutual exclusion if two writers
+            // race on the same key.
+            let entry = self
+                .lock_table
+                .compare_insert(key.clone(), lock.clone(), |_| false);
+
+            let existing_lock = entry.value();
+            if existing_lock.ts != lock.ts || existing_lock.primary != lock.primary {
                 return Err(TiSqlError::KeyIsLocked {
                     key: key.clone(),
                     lock_ts: existing_lock.ts,
                     primary: existing_lock.primary.clone(),
                 });
             }
-
-            // Insert lock
-            self.lock_table.insert(key.clone(), lock.clone());
 
             guards.push(KeyGuard {
                 key: key.clone(),

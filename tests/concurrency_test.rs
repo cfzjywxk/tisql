@@ -162,7 +162,7 @@ fn test_max_ts_concurrent_updates() {
 
     // max_ts should reflect the highest value seen
     let expected_max = (num_threads as u64) * updates_per_thread * 1000;
-    assert!(cm.max_ts() >= expected_max - 1000); // Allow for race condition in final update
+    assert_eq!(cm.max_ts(), expected_max);
 }
 
 // ============================================================================
@@ -383,7 +383,10 @@ fn test_concurrent_read_during_write() {
     reader.join().unwrap();
 
     // After writer thread exits, lock should be released
-    assert!(cm.check_lock(&key, 1).is_ok(), "Lock should be released after writer exits");
+    assert!(
+        cm.check_lock(&key, 1).is_ok(),
+        "Lock should be released after writer exits"
+    );
 
     // Can read (would return None since nothing written to storage)
     let value = storage.get(&key).unwrap();
@@ -559,19 +562,14 @@ mod failpoint_tests {
         fail::cfg("txn_after_clog_write", "pause").unwrap();
 
         let txn_service_clone = Arc::clone(&txn_service);
-        let writer = thread::spawn(move || {
-            txn_service_clone.put(key, b"value").unwrap()
-        });
+        let writer = thread::spawn(move || txn_service_clone.put(key, b"value").unwrap());
 
         // Give writer time to reach failpoint
         thread::sleep(Duration::from_millis(50));
 
         // Lock should still be held
         let result = cm.check_lock(key, 1);
-        assert!(
-            result.is_err(),
-            "Lock should persist through clog write"
-        );
+        assert!(result.is_err(), "Lock should persist through clog write");
 
         // Resume
         fail::cfg("txn_after_clog_write", "off").unwrap();
@@ -597,9 +595,7 @@ mod failpoint_tests {
         fail::cfg("txn_after_storage_apply", "pause").unwrap();
 
         let txn_service_clone = Arc::clone(&txn_service);
-        let writer = thread::spawn(move || {
-            txn_service_clone.put(key, b"v2").unwrap()
-        });
+        let writer = thread::spawn(move || txn_service_clone.put(key, b"v2").unwrap());
 
         // Give writer time to reach failpoint
         thread::sleep(Duration::from_millis(50));

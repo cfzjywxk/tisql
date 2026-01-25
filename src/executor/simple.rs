@@ -16,7 +16,8 @@ use crate::catalog::Catalog;
 use crate::error::{Result, TiSqlError};
 use crate::sql::{AggFunc, BinaryOp, Expr, LogicalPlan, UnaryOp};
 use crate::storage::{
-    decode_row_to_values, encode_key, encode_pk, encode_row, StorageEngine, WriteBatch,
+    decode_row_to_values, encode_int_key, encode_key, encode_pk, encode_row, StorageEngine,
+    WriteBatch,
 };
 use crate::types::{ColumnId, ColumnInfo, DataType, Row, Schema, Value};
 
@@ -286,7 +287,6 @@ impl Executor for SimpleExecutor {
                 let pk_indices = table.pk_column_indices();
                 let mut batch = WriteBatch::new();
                 let mut count = 0u64;
-                let mut row_counter = 0u64;
 
                 // Get column IDs for encoding
                 let col_ids: Vec<ColumnId> = table.columns().iter().map(|c| c.id()).collect();
@@ -308,26 +308,34 @@ impl Executor for SimpleExecutor {
                         row_values[table_col_idx] = value;
                     }
 
+                    // For tables without an explicit PK, allocate a stable hidden row-id and use it
+                    // as the record handle.
+                    let row_id_for_key = if pk_indices.is_empty() {
+                        Some(catalog.next_auto_increment(table.id())?)
+                    } else {
+                        None
+                    };
+
                     // Handle auto-increment
                     for (idx, col) in table.columns().iter().enumerate() {
                         if col.auto_increment() && row_values[idx].is_null() {
-                            let next_id = catalog.next_auto_increment(table.id())?;
+                            let next_id = match row_id_for_key {
+                                Some(v) => v,
+                                None => catalog.next_auto_increment(table.id())?,
+                            };
                             row_values[idx] = Value::BigInt(next_id as i64);
                         }
                     }
 
-                    // Build primary key - use all columns if no PK defined
-                    let pk_values: Vec<_> = if pk_indices.is_empty() {
-                        // No explicit primary key - use all values plus a row counter for uniqueness
-                        let mut vals = row_values.clone();
-                        vals.push(Value::BigInt(row_counter as i64));
-                        row_counter += 1;
-                        vals
+                    let key = if let Some(handle) = row_id_for_key {
+                        encode_int_key(table.id(), handle as i64)
                     } else {
-                        pk_indices.iter().map(|&i| row_values[i].clone()).collect()
+                        // Build PK bytes for common handle keys.
+                        let pk_values: Vec<_> =
+                            pk_indices.iter().map(|&i| row_values[i].clone()).collect();
+                        let pk_bytes = encode_pk(&pk_values);
+                        encode_key(table.id(), &pk_bytes)
                     };
-                    let pk_bytes = encode_pk(&pk_values);
-                    let key = encode_key(table.id(), &pk_bytes);
 
                     // Encode row using TiDB codec format
                     let value = encode_row(&col_ids, &row_values);
@@ -460,16 +468,21 @@ impl Executor for SimpleExecutor {
                         row.set(col_idx, new_value);
                     }
 
-                    // Check if PK changed
-                    let pk_values: Vec<_> = pk_indices
-                        .iter()
-                        .map(|&i| row.get(i).cloned().unwrap_or(Value::Null))
-                        .collect();
-                    let pk_bytes = encode_pk(&pk_values);
-                    let new_key = encode_key(table_id, &pk_bytes);
+                    // If the table doesn't have an explicit PK, keep the existing key (hidden
+                    // handle). Otherwise recompute the key and handle PK changes.
+                    let new_key = if pk_indices.is_empty() {
+                        key.clone()
+                    } else {
+                        let pk_values: Vec<_> = pk_indices
+                            .iter()
+                            .map(|&i| row.get(i).cloned().unwrap_or(Value::Null))
+                            .collect();
+                        let pk_bytes = encode_pk(&pk_values);
+                        encode_key(table_id, &pk_bytes)
+                    };
 
-                    // Delete old key if PK changed
-                    if new_key != key {
+                    // Delete old key if PK changed (explicit PK tables only).
+                    if !pk_indices.is_empty() && new_key != key {
                         batch.delete(key);
                     }
 

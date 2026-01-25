@@ -124,7 +124,11 @@ impl MvccMemTableEngine {
 }
 
 /// Shared get_at_internal logic for both engine and snapshot.
-fn get_at_internal(data: &SkipMap<Key, RawValue>, user_key: &[u8], ts: Timestamp) -> Result<Option<RawValue>> {
+fn get_at_internal(
+    data: &SkipMap<Key, RawValue>,
+    user_key: &[u8],
+    ts: Timestamp,
+) -> Result<Option<RawValue>> {
     // Build scan bounds
     // Start: user_key || !ts (will find versions <= ts)
     let start = encode_mvcc_key(user_key, ts);
@@ -199,7 +203,9 @@ impl StorageEngine for MvccMemTableEngine {
 
     fn write_batch(&self, batch: WriteBatch) -> Result<()> {
         // Get commit_ts from batch, or allocate new one
-        let commit_ts = batch.commit_ts().unwrap_or_else(|| self.inner.concurrency_manager.get_ts());
+        let commit_ts = batch
+            .commit_ts()
+            .unwrap_or_else(|| self.inner.concurrency_manager.get_ts());
 
         for op in batch.into_ops() {
             match op {
@@ -229,7 +235,8 @@ impl StorageEngine for MvccMemTableEngine {
         let ts = Timestamp::MAX;
 
         // Check range for locks
-        self.inner.concurrency_manager
+        self.inner
+            .concurrency_manager
             .check_range(&range.start, &range.end, ts)?;
 
         // Scan MVCC keys and deduplicate by user_key
@@ -285,7 +292,8 @@ impl Snapshot for MvccSnapshot {
 
     fn scan(&self, range: Range<Key>) -> Result<Box<dyn Iterator<Item = (Key, RawValue)> + '_>> {
         // Check range for locks
-        self.inner.concurrency_manager
+        self.inner
+            .concurrency_manager
             .check_range(&range.start, &range.end, self.ts)?;
 
         let start_mvcc = encode_mvcc_key(&range.start, self.ts);

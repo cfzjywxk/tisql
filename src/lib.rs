@@ -111,7 +111,10 @@ impl Database {
 
     /// Open database with persistence and recovery
     pub fn open(config: DatabaseConfig) -> Result<Self> {
-        log_info!("Opening TiSQL database at {:?} (MVCC enabled)", config.data_dir);
+        log_info!(
+            "Opening TiSQL database at {:?} (MVCC enabled)",
+            config.data_dir
+        );
 
         if !config.durability {
             return Ok(Self::new());

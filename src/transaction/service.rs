@@ -277,11 +277,7 @@ mod tests {
         let clog_service = Arc::new(FileClogService::open(config).unwrap());
         let cm = Arc::new(ConcurrencyManager::new(1));
         let storage = Arc::new(MvccMemTableEngine::new(Arc::clone(&cm)));
-        let txn_service = TransactionService::new(
-            Arc::clone(&storage),
-            clog_service,
-            cm,
-        );
+        let txn_service = TransactionService::new(Arc::clone(&storage), clog_service, cm);
         (storage, txn_service, dir)
     }
 

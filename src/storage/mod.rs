@@ -41,12 +41,22 @@ use std::ops::Range;
 // Key Encoding (re-exports from codec for convenience)
 // ============================================================================
 
-use crate::codec::key::{decode_record_key, encode_record_key, Handle};
+use crate::codec::key::{
+    decode_record_key, encode_record_key, encode_record_key_with_handle, Handle,
+};
 
 /// Encode a table key (TiDB-compatible format).
 /// Format: 't' + tableID + "_r" + user_key
 pub fn encode_key(table_id: TableId, user_key: &[u8]) -> Vec<u8> {
     encode_record_key(table_id, user_key)
+}
+
+/// Encode a table key with an integer handle.
+///
+/// This is used for tables without an explicit primary key, where we fall back to
+/// a hidden row-id (similar to TiDB's `_tidb_rowid`).
+pub fn encode_int_key(table_id: TableId, handle: i64) -> Vec<u8> {
+    encode_record_key_with_handle(table_id, handle)
 }
 
 /// Decode a table key back to (table_id, user_key).
