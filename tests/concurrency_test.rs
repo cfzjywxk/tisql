@@ -30,15 +30,24 @@ use std::thread;
 use std::time::Duration;
 
 use tisql::error::TiSqlError;
+use tisql::testkit::{
+    ConcurrencyManager, FileClogConfig, FileClogService, Lock, MvccMemTableEngine,
+    TransactionService,
+};
 use tisql::StorageEngine;
-use tisql::testkit::{ConcurrencyManager, FileClogConfig, FileClogService, Lock, MvccMemTableEngine, TransactionService};
 
-fn create_test_service() -> (
+/// Type alias for the test transaction service
+type TestTxnService = TransactionService<MvccMemTableEngine, FileClogService>;
+
+/// Type alias for the create_test_service return type
+type TestServiceTuple = (
     Arc<MvccMemTableEngine>,
-    Arc<TransactionService<MvccMemTableEngine, FileClogService>>,
+    Arc<TestTxnService>,
     Arc<ConcurrencyManager>,
     tempfile::TempDir,
-) {
+);
+
+fn create_test_service() -> TestServiceTuple {
     let dir = tempfile::tempdir().unwrap();
     let config = FileClogConfig::with_dir(dir.path());
     let clog_service = Arc::new(FileClogService::open(config).unwrap());
@@ -115,9 +124,7 @@ fn test_tso_per_thread_monotonic() {
                 let ts = cm.get_ts();
                 assert!(
                     ts > prev,
-                    "Timestamp must be strictly increasing: prev={}, ts={}",
-                    prev,
-                    ts
+                    "Timestamp must be strictly increasing: prev={prev}, ts={ts}"
                 );
                 prev = ts;
             }
@@ -215,8 +222,8 @@ fn test_concurrent_writes_different_keys() {
         let success_count = Arc::clone(&success_count);
         handles.push(thread::spawn(move || {
             for j in 0..writes_per_thread {
-                let key = format!("key_{}_{}", i, j);
-                let value = format!("value_{}_{}", i, j);
+                let key = format!("key_{i}_{j}");
+                let value = format!("value_{i}_{j}");
                 if txn_service.put(key.as_bytes(), value.as_bytes()).is_ok() {
                     success_count.fetch_add(1, Ordering::Relaxed);
                 }
@@ -255,7 +262,7 @@ fn test_concurrent_writes_same_key() {
             // Synchronize all threads to maximize contention
             barrier.wait();
 
-            let value = format!("value_{}", i);
+            let value = format!("value_{i}");
             match txn_service.put(key, value.as_bytes()) {
                 Ok(_) => {
                     success_count.fetch_add(1, Ordering::Relaxed);
@@ -264,7 +271,7 @@ fn test_concurrent_writes_same_key() {
                     conflict_count.fetch_add(1, Ordering::Relaxed);
                 }
                 Err(e) => {
-                    panic!("Unexpected error: {:?}", e);
+                    panic!("Unexpected error: {e:?}");
                 }
             }
         }));
@@ -454,9 +461,9 @@ fn test_concurrent_readers_no_interference() {
                     Ok(Some(v)) if v == b"initial_value" => {
                         success_count.fetch_add(1, Ordering::Relaxed);
                     }
-                    Ok(Some(v)) => panic!("Unexpected value: {:?}", v),
+                    Ok(Some(v)) => panic!("Unexpected value: {v:?}"),
                     Ok(None) => panic!("Key should exist"),
-                    Err(e) => panic!("Read error: {:?}", e),
+                    Err(e) => panic!("Read error: {e:?}"),
                 }
             }
         }));
@@ -626,7 +633,7 @@ mod failpoint_tests {
         for i in 0..3 {
             let txn_service = Arc::clone(&txn_service);
             let results = Arc::clone(&results);
-            let value = format!("v{}", i);
+            let value = format!("v{i}");
 
             // Each write will succeed in order since they wait for previous
             let (_, ts, _) = txn_service.put(key, value.as_bytes()).unwrap();

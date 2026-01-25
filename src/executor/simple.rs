@@ -142,6 +142,7 @@ impl SimpleExecutor {
     }
 
     /// Execute read operations using a snapshot.
+    #[allow(clippy::only_used_in_recursion)]
     fn execute_with_snapshot<C: Catalog>(
         &self,
         plan: LogicalPlan,
@@ -414,7 +415,9 @@ impl SimpleExecutor {
                             .columns()
                             .iter()
                             .position(|c| c.id() == col_id)
-                            .ok_or_else(|| TiSqlError::ColumnNotFound(format!("id={col_id}")))?;
+                            .ok_or_else(|| {
+                            TiSqlError::ColumnNotFound(format!("id={col_id}"))
+                        })?;
 
                         let value = self.eval_expr(&row_exprs[col_idx], &Row::new(vec![]))?;
                         row_values[table_col_idx] = value;

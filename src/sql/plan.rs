@@ -12,6 +12,14 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+//! Logical plan types for SQL execution.
+//!
+//! Many plan types and expression variants are defined for future features
+//! (e.g., JOIN, subqueries, aggregations) and are not yet implemented.
+
+// Allow dead code for future features that are defined but not yet implemented
+#![allow(dead_code)]
+
 use crate::catalog::TableDef;
 use crate::types::{ColumnId, DataType, Schema, Value};
 

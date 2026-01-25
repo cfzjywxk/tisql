@@ -82,7 +82,7 @@ impl WorkerPool {
     ///
     /// The QueryCtx provides session context (current_db, isolation_level, etc.)
     /// for the query execution.
-    pub async fn handle_mp_query_with_ctx(
+    pub async fn handle_mp_query(
         &self,
         db: Arc<Database>,
         query: String,
@@ -99,14 +99,5 @@ impl WorkerPool {
         // Await the result from the worker thread
         rx.await
             .map_err(|_| TiSqlError::Internal("Worker task dropped".into()))?
-    }
-
-    /// Handle MySQL protocol query text on a worker thread (legacy method).
-    ///
-    /// This method creates a default QueryCtx. Prefer `handle_mp_query_with_ctx`
-    /// when session context is available.
-    pub async fn handle_mp_query(&self, db: Arc<Database>, query: String) -> Result<QueryResult> {
-        let query_ctx = QueryCtx::new();
-        self.handle_mp_query_with_ctx(db, query, query_ctx).await
     }
 }

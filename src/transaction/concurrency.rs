@@ -236,7 +236,8 @@ impl ConcurrencyManager {
     /// * `end` - Range end (exclusive)
     /// * `start_ts` - Reader's start timestamp
     pub fn check_range(&self, start: &[u8], end: &[u8], _start_ts: Timestamp) -> Result<()> {
-        for entry in self.lock_table.range(start.to_vec()..end.to_vec()) {
+        // Check if any key in the range is locked
+        if let Some(entry) = self.lock_table.range(start.to_vec()..end.to_vec()).next() {
             let lock = entry.value();
             return Err(TiSqlError::KeyIsLocked {
                 key: entry.key().clone(),

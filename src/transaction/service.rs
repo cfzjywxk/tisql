@@ -280,11 +280,8 @@ impl<S: StorageEngine + 'static, L: ClogService + 'static> TxnService for Transa
         // Allocate start_ts from TSO for consistent read
         let start_ts = self.get_ts();
 
-        let snapshot = StorageSnapshot::new(
-            start_ts,
-            self.storage_arc(),
-            self.concurrency_manager_arc(),
-        );
+        let snapshot =
+            StorageSnapshot::new(start_ts, self.storage_arc(), self.concurrency_manager_arc());
 
         Ok(Box::new(snapshot))
     }
@@ -465,7 +462,10 @@ mod tests {
 
         // Write again (after snapshot)
         let (_, write_ts, _) = txn_service.put(b"key", b"v2").unwrap();
-        assert!(write_ts > snapshot_ts, "Write should have higher ts than snapshot");
+        assert!(
+            write_ts > snapshot_ts,
+            "Write should have higher ts than snapshot"
+        );
 
         // Snapshot should still see v1 (the value at its start_ts)
         // Note: This depends on MVCC implementation correctly respecting timestamps

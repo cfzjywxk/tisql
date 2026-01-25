@@ -18,7 +18,9 @@ use std::sync::Arc;
 use clap::Parser as ClapParser;
 use tisql::util::LogLevel;
 use tisql::{log_error, log_info};
-use tisql::{Database, DatabaseConfig, MySqlServer, WorkerPool, WorkerPoolConfig, MYSQL_DEFAULT_PORT};
+use tisql::{
+    Database, DatabaseConfig, MySqlServer, WorkerPool, WorkerPoolConfig, MYSQL_DEFAULT_PORT,
+};
 
 #[derive(ClapParser, Debug)]
 #[command(name = "tisql")]

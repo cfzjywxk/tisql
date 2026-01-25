@@ -63,6 +63,7 @@ pub fn encode_int_key(table_id: TableId, handle: i64) -> Vec<u8> {
 }
 
 /// Decode a table key back to (table_id, user_key).
+#[allow(dead_code)]
 pub fn decode_key(key: &[u8]) -> Result<(TableId, Vec<u8>)> {
     let (table_id, handle) = decode_record_key(key)?;
     let user_key = match handle {

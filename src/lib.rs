@@ -558,7 +558,9 @@ mod tests {
         db.handle_mp_query("INSERT INTO t VALUES (1, 10), (2, 20), (3, 30)")
             .unwrap();
 
-        let result = db.handle_mp_query("SELECT a, b FROM t WHERE a > 1").unwrap();
+        let result = db
+            .handle_mp_query("SELECT a, b FROM t WHERE a > 1")
+            .unwrap();
         match result {
             QueryResult::Rows { data, .. } => {
                 assert_eq!(data.len(), 2);

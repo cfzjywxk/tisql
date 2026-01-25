@@ -89,7 +89,6 @@ pub struct SessionVars {
 
     /// Connection collation (for future use)
     pub collation: String,
-
     // Future: Add more session variables
     // - timezone
     // - sql_mode
@@ -149,7 +148,6 @@ pub struct Session {
 
     /// Session-level variables
     vars: SessionVars,
-
     // Future: Add more session state
     // - prepared_stmts: HashMap<u32, PreparedStmt>
     // - txn_ctx: Option<TransactionContext>
@@ -269,7 +267,6 @@ pub struct QueryCtx {
 
     /// Last insert ID (for auto-increment)
     last_insert_id: u64,
-
     // Future: Add more statement context fields
     // - warnings: Vec<Warning>
     // - in_insert_stmt, in_update_stmt, etc.

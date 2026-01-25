@@ -23,7 +23,7 @@ use opensrv_mysql::AsyncMysqlIntermediary;
 use tokio::net::TcpListener;
 
 use crate::worker::WorkerPool;
-use crate::{log_debug, log_error, log_info, Database};
+use crate::{log_error, log_info, Database};
 use mysql::MySqlBackend;
 
 /// Default MySQL protocol port (TiDB style)

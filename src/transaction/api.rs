@@ -150,7 +150,8 @@ pub struct CommitInfo {
     pub lsn: Lsn,
 }
 
-/// Options for beginning a transaction.
+/// Options for beginning a transaction (for future explicit transaction support).
+#[allow(dead_code)]
 #[derive(Debug, Clone, Default)]
 pub struct BeginOptions {
     /// Whether this is a read-only transaction.
@@ -161,7 +162,8 @@ pub struct BeginOptions {
     pub isolation: IsolationLevel,
 }
 
-/// Options for creating a snapshot.
+/// Options for creating a snapshot (for future stale read support).
+#[allow(dead_code)]
 #[derive(Debug, Clone, Default)]
 pub struct SnapshotOptions {
     /// Use a specific timestamp instead of getting from TSO.

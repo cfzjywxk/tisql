@@ -32,8 +32,8 @@ use std::sync::Arc;
 
 use crossbeam_skiplist::SkipMap;
 
-use crate::transaction::ConcurrencyManager;
 use crate::error::Result;
+use crate::transaction::ConcurrencyManager;
 use crate::types::{Key, RawValue, Timestamp};
 
 use super::{Snapshot, StorageEngine, WriteBatch, WriteOp};

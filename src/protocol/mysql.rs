@@ -139,7 +139,7 @@ impl<W: AsyncWrite + Send + Unpin> AsyncMysqlShim<W> for MySqlBackend {
         let db = Arc::clone(&self.db);
         match self
             .worker_pool
-            .handle_mp_query_with_ctx(db, query.to_string(), query_ctx)
+            .handle_mp_query(db, query.to_string(), query_ctx)
             .await
         {
             Ok(result) => self.write_result(result, results).await,
