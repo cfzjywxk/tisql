@@ -72,13 +72,13 @@ impl WorkerPool {
         }
     }
 
-    /// Execute a query on a worker thread, returning the result via oneshot channel
+    /// Handle MySQL protocol query text on a worker thread.
     ///
     /// This method:
     /// 1. Creates a oneshot channel for the result
     /// 2. Spawns the database work onto the yatp pool
     /// 3. Awaits the result asynchronously (doesn't block tokio)
-    pub async fn execute_query(&self, db: Arc<Database>, query: String) -> Result<QueryResult> {
+    pub async fn handle_mp_query(&self, db: Arc<Database>, query: String) -> Result<QueryResult> {
         let (tx, rx) = oneshot::channel();
 
         self.remote.spawn(async move {

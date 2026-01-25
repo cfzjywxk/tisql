@@ -33,6 +33,7 @@ pub use concurrency::ConcurrencyManager;
 use error::Result;
 use executor::{ExecutionResult, Executor, SimpleExecutor};
 pub use protocol::{MySqlServer, MYSQL_DEFAULT_PORT};
+pub use session::{Priority, QueryCtx, Session, SessionVars};
 use sql::{Binder, Parser};
 use storage::MvccMemTableEngine;
 pub use transaction::{ReadSnapshot, TransactionService, Txn, TxnService};
@@ -93,12 +94,13 @@ impl SQLEngine {
         }
     }
 
-    /// Execute a SQL statement through the transaction service.
+    /// Handle MySQL protocol query text.
     ///
     /// Flow: SQL text -> parse -> bind -> execute through TxnService
-    pub fn execute<T: TxnService, C: Catalog>(
+    pub fn handle_mp_query<T: TxnService, C: Catalog>(
         &self,
         sql: &str,
+        query_ctx: &session::QueryCtx,
         txn_service: &T,
         catalog: &C,
     ) -> Result<ExecutionResult> {
@@ -106,10 +108,23 @@ impl SQLEngine {
         let stmt = self.parser.parse_one(sql)?;
 
         // Bind (semantic analysis, name resolution)
-        let binder = Binder::new(catalog, "default");
+        let binder = Binder::new(catalog, &query_ctx.current_db);
         let plan = binder.bind(stmt)?;
 
         // Execute through TxnService
+        self.executor.execute(plan, txn_service, catalog)
+    }
+
+    /// Internal method for handling a pre-parsed plan with QueryCtx.
+    fn handle_mp_query_internal<T: TxnService, C: Catalog>(
+        &self,
+        plan: sql::LogicalPlan,
+        _query_ctx: &session::QueryCtx,
+        txn_service: &T,
+        catalog: &C,
+    ) -> Result<ExecutionResult> {
+        // Execute through TxnService
+        // TODO: Use query_ctx for execution options (priority, isolation level, etc.)
         self.executor.execute(plan, txn_service, catalog)
     }
 }
@@ -195,7 +210,36 @@ impl Database {
     ///
     /// This is the main entry point for SQL execution from the MySQL protocol.
     /// For prepared statements, use `handle_mp_prepare` and `handle_mp_execute` (TODO).
+    ///
+    /// Note: This method creates a temporary QueryCtx for backward compatibility.
+    /// The proper way is to use `handle_mp_query_with_session` which takes a Session.
     pub fn handle_mp_query(&self, sql: &str) -> Result<QueryResult> {
+        // Create a temporary QueryCtx for backward compatibility
+        let query_ctx = session::QueryCtx::new();
+        self.handle_mp_query_with_ctx(sql, &query_ctx)
+    }
+
+    /// Handle MySQL protocol query text with a Session.
+    ///
+    /// This is the preferred method - it creates a QueryCtx from the Session
+    /// before executing the statement.
+    pub fn handle_mp_query_with_session(
+        &self,
+        sql: &str,
+        session: &session::Session,
+    ) -> Result<QueryResult> {
+        let query_ctx = session.new_query_ctx();
+        self.handle_mp_query_with_ctx(sql, &query_ctx)
+    }
+
+    /// Handle MySQL protocol query text with a QueryCtx.
+    ///
+    /// This is the internal implementation that takes a pre-created QueryCtx.
+    fn handle_mp_query_with_ctx(
+        &self,
+        sql: &str,
+        query_ctx: &session::QueryCtx,
+    ) -> Result<QueryResult> {
         let total_timer = Timer::new("total");
 
         // Parse
@@ -205,16 +249,19 @@ impl Database {
 
         // Bind
         let bind_timer = Timer::new("bind");
-        let binder = Binder::new(&self.catalog, "default");
+        // Use current_db from QueryCtx
+        let binder = Binder::new(&self.catalog, &query_ctx.current_db);
         let plan = binder.bind(stmt)?;
         let bind_ms = bind_timer.elapsed_ms();
 
-        // Execute through TxnService
+        // Execute through TxnService via SQLEngine
         let exec_timer = Timer::new("execute");
-        let result = self
-            .sql_engine
-            .executor
-            .execute(plan, self.txn_service.as_ref(), &self.catalog)?;
+        let result = self.sql_engine.handle_mp_query_internal(
+            plan,
+            query_ctx,
+            self.txn_service.as_ref(),
+            &self.catalog,
+        )?;
         let exec_ms = exec_timer.elapsed_ms();
 
         // Convert to QueryResult

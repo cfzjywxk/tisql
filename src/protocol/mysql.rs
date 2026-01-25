@@ -100,7 +100,7 @@ impl<W: AsyncWrite + Send + Unpin> AsyncMysqlShim<W> for MySqlBackend {
 
         // Execute the query through the worker pool (off the network IO thread)
         let db = Arc::clone(&self.db);
-        match self.worker_pool.execute_query(db, query.to_string()).await {
+        match self.worker_pool.handle_mp_query(db, query.to_string()).await {
             Ok(result) => self.write_result(result, results).await,
             Err(e) => {
                 results
