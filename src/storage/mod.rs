@@ -21,19 +21,16 @@
 //! - `StorageEngine` trait - Core KV storage interface
 //! - `Snapshot` trait - Consistent read snapshot
 //! - `WriteBatch` - Atomic batch writes
-//! - `MemTableEngine` - In-memory implementation for testing
+//! - `MvccMemTableEngine` - MVCC in-memory implementation
 //!
 //! ## Key Encoding
 //! Keys are encoded using TiDB-compatible format via the codec module.
 //! The storage layer is agnostic to key structure - it just stores bytes.
 
-mod memtable;
 mod mvcc_memtable;
 
 // Implementation types - not re-exported from main API
 // These are available via testkit for integration tests
-#[allow(unused_imports)]
-pub use memtable::MemTableEngine;
 pub use mvcc_memtable::MvccMemTableEngine;
 
 use crate::error::Result;
