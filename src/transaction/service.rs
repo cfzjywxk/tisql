@@ -32,6 +32,10 @@ use crate::error::Result;
 use crate::storage::{StorageEngine, WriteBatch, WriteOp};
 use crate::types::{Key, Lsn, Timestamp, TxnId};
 
+use super::api::{ReadSnapshot, Txn, TxnService};
+use super::handle::TxnHandle;
+use super::snapshot::StorageSnapshot;
+
 /// Transaction service manages autocommit transactions with durability and MVCC.
 ///
 /// All write operations follow the 1PC pattern:
@@ -238,6 +242,55 @@ impl<S: StorageEngine, L: ClogService> TransactionService<S, L> {
     pub fn concurrency_manager(&self) -> &ConcurrencyManager {
         &self.concurrency_manager
     }
+
+    /// Get Arc references to internal components (for creating TxnHandle)
+    fn storage_arc(&self) -> Arc<S> {
+        Arc::clone(&self.storage)
+    }
+
+    fn clog_service_arc(&self) -> Arc<L> {
+        Arc::clone(&self.clog_service)
+    }
+
+    fn concurrency_manager_arc(&self) -> Arc<ConcurrencyManager> {
+        Arc::clone(&self.concurrency_manager)
+    }
+}
+
+/// Implement TxnService trait for TransactionService
+impl<S: StorageEngine + 'static, L: ClogService + 'static> TxnService for TransactionService<S, L> {
+    fn begin(&self) -> Result<Box<dyn Txn>> {
+        // Allocate txn_id and start_ts from TSO
+        let txn_id = self.get_ts();
+        let start_ts = self.get_ts();
+
+        let handle = TxnHandle::new(
+            txn_id,
+            start_ts,
+            self.storage_arc(),
+            self.clog_service_arc(),
+            self.concurrency_manager_arc(),
+        );
+
+        Ok(Box::new(handle))
+    }
+
+    fn snapshot(&self) -> Result<Box<dyn ReadSnapshot>> {
+        // Allocate start_ts from TSO for consistent read
+        let start_ts = self.get_ts();
+
+        let snapshot = StorageSnapshot::new(
+            start_ts,
+            self.storage_arc(),
+            self.concurrency_manager_arc(),
+        );
+
+        Ok(Box::new(snapshot))
+    }
+
+    fn current_ts(&self) -> Timestamp {
+        self.concurrency_manager.current_ts()
+    }
 }
 
 /// Statistics from recovery
@@ -377,5 +430,127 @@ mod tests {
         // Reading at ts1 should see v1 (using internal method)
         let v = storage.concurrency_manager().check_lock(b"key", ts1);
         assert!(v.is_ok()); // No lock
+    }
+
+    // ========================================================================
+    // TxnService trait tests
+    // ========================================================================
+
+    #[test]
+    fn test_txn_service_snapshot() {
+        let (_storage, txn_service, _dir) = create_test_service();
+
+        // Create a snapshot - this allocates a start_ts
+        let snapshot = txn_service.snapshot().unwrap();
+
+        // Snapshot should have a valid timestamp
+        assert!(snapshot.start_ts() > 0);
+
+        // Creating another snapshot should get a higher timestamp
+        let snapshot2 = txn_service.snapshot().unwrap();
+        assert!(snapshot2.start_ts() > snapshot.start_ts());
+    }
+
+    #[test]
+    fn test_txn_service_snapshot_reads_at_start_ts() {
+        let (_storage, txn_service, _dir) = create_test_service();
+
+        // Write initial data
+        txn_service.put(b"key", b"v1").unwrap();
+
+        // Create snapshot before second write
+        let snapshot = txn_service.snapshot().unwrap();
+        let snapshot_ts = snapshot.start_ts();
+
+        // Write again (after snapshot)
+        let (_, write_ts, _) = txn_service.put(b"key", b"v2").unwrap();
+        assert!(write_ts > snapshot_ts, "Write should have higher ts than snapshot");
+
+        // Snapshot should still see v1 (the value at its start_ts)
+        // Note: This depends on MVCC implementation correctly respecting timestamps
+        let value = snapshot.get(b"key").unwrap();
+        assert_eq!(value, Some(b"v1".to_vec()));
+    }
+
+    #[test]
+    fn test_txn_service_begin() {
+        let (_storage, txn_service, _dir) = create_test_service();
+
+        // Begin a transaction
+        let txn = txn_service.begin().unwrap();
+
+        // Transaction should have valid timestamp
+        assert!(txn.start_ts() > 0);
+        assert!(txn.is_valid());
+    }
+
+    #[test]
+    fn test_txn_service_begin_commit() {
+        let (storage, txn_service, _dir) = create_test_service();
+
+        // Begin and write
+        let mut txn = txn_service.begin().unwrap();
+        txn.put(b"key1".to_vec(), b"value1".to_vec());
+
+        // Commit
+        let info = txn.commit().unwrap();
+        assert!(info.commit_ts > 0);
+        assert!(info.lsn > 0);
+
+        // Data should be visible in storage
+        let value = storage.get(b"key1").unwrap();
+        assert_eq!(value, Some(b"value1".to_vec()));
+    }
+
+    #[test]
+    fn test_txn_service_isolation() {
+        let (_storage, txn_service, _dir) = create_test_service();
+
+        // Write initial data
+        txn_service.put(b"key", b"v1").unwrap();
+
+        // Begin transaction
+        let mut txn = txn_service.begin().unwrap();
+
+        // Transaction should see v1
+        let value = txn.get(b"key").unwrap();
+        assert_eq!(value, Some(b"v1".to_vec()));
+
+        // Write v2 via txn_service (outside the transaction)
+        txn_service.put(b"key", b"v2").unwrap();
+
+        // Transaction should still see v1 (snapshot isolation)
+        // unless the new write is to its own buffer
+        let value = txn.get(b"key").unwrap();
+        assert_eq!(value, Some(b"v1".to_vec()));
+
+        // But reading via storage should see v2
+        let storage = txn_service.storage();
+        let latest = storage.get(b"key").unwrap();
+        assert_eq!(latest, Some(b"v2".to_vec()));
+
+        // Transaction write
+        txn.put(b"key".to_vec(), b"v3".to_vec());
+
+        // Transaction should see its own write
+        let value = txn.get(b"key").unwrap();
+        assert_eq!(value, Some(b"v3".to_vec()));
+    }
+
+    #[test]
+    fn test_txn_current_ts_advances() {
+        let (_storage, txn_service, _dir) = create_test_service();
+
+        let ts1 = txn_service.current_ts();
+
+        // Each snapshot allocation advances the timestamp
+        let _snapshot = txn_service.snapshot().unwrap();
+        let ts2 = txn_service.current_ts();
+        assert!(ts2 > ts1);
+
+        // Each begin also advances the timestamp
+        let _txn = txn_service.begin().unwrap();
+        let ts3 = txn_service.current_ts();
+        assert!(ts3 > ts2);
     }
 }

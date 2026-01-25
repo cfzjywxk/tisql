@@ -184,7 +184,7 @@ impl WriteBatch {
     }
 
     /// Iterate over the operations.
-    pub fn iter(&self) -> impl Iterator<Item = &WriteOp> {
+    pub fn iter(&self) -> std::slice::Iter<'_, WriteOp> {
         self.ops.iter()
     }
 

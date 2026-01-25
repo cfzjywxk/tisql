@@ -15,60 +15,43 @@
 //! Transaction layer for TiSQL.
 //!
 //! This module provides transaction management with durability guarantees.
-//! Current implementation uses autocommit mode where each statement is
-//! a complete transaction.
+//!
+//! ## Key Abstractions
+//!
+//! - [`TxnService`]: The main entry point for creating transactions
+//! - [`ReadSnapshot`]: Read-only transaction for SELECT statements
+//! - [`Txn`]: Read-write transaction for DML statements
+//!
+//! ## Design Principles
+//!
+//! 1. **Interface-based**: SQL engine depends on traits, not implementations
+//! 2. **Opaque handles**: Internal state (start_ts, commit_ts) is hidden
+//! 3. **Read transactions get timestamps**: Even read-only queries allocate start_ts
+//!
+//! ## Example
+//!
+//! ```ignore
+//! // Read-only query - allocates start_ts for MVCC snapshot
+//! let snapshot = txn_service.snapshot()?;
+//! let value = snapshot.get(key)?;
+//!
+//! // Read-write transaction
+//! let mut txn = txn_service.begin()?;
+//! txn.put(key, value);
+//! let info = txn.commit()?;
+//! ```
 
+mod api;
+mod handle;
 mod service;
+mod snapshot;
 
-pub use service::TransactionService;
+// Re-export the main types
+pub use api::{
+    BeginOptions, CommitInfo, IsolationLevel, ReadSnapshot, SnapshotOptions, Txn, TxnService,
+};
+pub use service::{RecoveryStats, TransactionService};
 
-use crate::error::Result;
-use crate::types::{Key, RawValue, Timestamp, TxnId};
-use std::ops::Range;
-
-#[derive(Clone, Copy, Debug, Default, PartialEq)]
-pub enum IsolationLevel {
-    ReadCommitted,
-    RepeatableRead,
-    Serializable,
-    #[default]
-    SnapshotIsolation,
-}
-
-/// Transaction interface
-pub trait Transaction: Send {
-    /// Get transaction ID
-    fn id(&self) -> TxnId;
-
-    /// Get start timestamp
-    fn start_ts(&self) -> Timestamp;
-
-    /// Read a key within transaction
-    fn get(&self, key: &[u8]) -> Result<Option<RawValue>>;
-
-    /// Write a key within transaction (buffered until commit)
-    fn put(&mut self, key: &[u8], value: &[u8]) -> Result<()>;
-
-    /// Delete a key within transaction
-    fn delete(&mut self, key: &[u8]) -> Result<()>;
-
-    /// Scan range within transaction
-    fn scan(&self, range: Range<Key>) -> Result<Vec<(Key, RawValue)>>;
-
-    /// Commit transaction - returns commit timestamp on success
-    fn commit(self) -> Result<Timestamp>;
-
-    /// Rollback transaction
-    fn rollback(self) -> Result<()>;
-}
-
-/// Transaction manager - creates and coordinates transactions
-pub trait TransactionManager: Send + Sync {
-    type Txn: Transaction;
-
-    /// Begin a new transaction
-    fn begin(&self, isolation: IsolationLevel) -> Result<Self::Txn>;
-
-    /// Get current global timestamp
-    fn current_ts(&self) -> Timestamp;
-}
+// Re-export handle and snapshot for testing/internal use
+pub use handle::TxnHandle;
+pub use snapshot::StorageSnapshot;

@@ -35,7 +35,7 @@ use executor::{ExecutionResult, Executor, SimpleExecutor};
 pub use protocol::{MySqlServer, MYSQL_DEFAULT_PORT};
 use sql::{Binder, Parser};
 use storage::MvccMemTableEngine;
-pub use transaction::TransactionService;
+pub use transaction::{ReadSnapshot, TransactionService, Txn, TxnService};
 use types::Value;
 use util::Timer;
 pub use worker::{WorkerPool, WorkerPoolConfig};
