@@ -525,4 +525,234 @@ mod persistence {
             db.close().unwrap();
         }
     }
+
+    /// Test crash recovery without graceful shutdown (simulates kill -9).
+    /// This test does NOT call db.close() to simulate an abrupt crash.
+    #[test]
+    fn test_crash_recovery_no_close() {
+        let dir = tempdir().unwrap();
+        let config = DatabaseConfig::with_data_dir(dir.path());
+
+        // First session: write data and "crash" (no close)
+        {
+            let db = Database::open(config.clone()).unwrap();
+            db.handle_mp_query("CREATE TABLE crash_test (id INT, data VARCHAR(100))")
+                .unwrap();
+            db.handle_mp_query("INSERT INTO crash_test VALUES (1, 'first')")
+                .unwrap();
+            db.handle_mp_query("INSERT INTO crash_test VALUES (2, 'second')")
+                .unwrap();
+            db.handle_mp_query("INSERT INTO crash_test VALUES (3, 'third')")
+                .unwrap();
+            // NO close() - simulate kill -9
+            // Database is dropped here, but close() is not called
+        }
+
+        // Second session: recover and verify all data
+        {
+            let db = Database::open(config.clone()).unwrap();
+
+            let result = db
+                .handle_mp_query("SELECT id, data FROM crash_test ORDER BY id")
+                .unwrap();
+            match result {
+                QueryResult::Rows { data, columns } => {
+                    assert_eq!(columns, vec!["id", "data"]);
+                    assert_eq!(data.len(), 3, "All 3 rows should be recovered");
+                    assert_eq!(data[0][0], "1");
+                    assert_eq!(data[0][1], "first");
+                    assert_eq!(data[1][0], "2");
+                    assert_eq!(data[1][1], "second");
+                    assert_eq!(data[2][0], "3");
+                    assert_eq!(data[2][1], "third");
+                }
+                other => panic!("Expected rows, got: {other:?}"),
+            }
+            db.close().unwrap();
+        }
+    }
+
+    /// Test crash recovery with updates and deletes.
+    #[test]
+    fn test_crash_recovery_with_updates_deletes() {
+        let dir = tempdir().unwrap();
+        let config = DatabaseConfig::with_data_dir(dir.path());
+
+        // First session: create, insert, update, delete, then crash
+        {
+            let db = Database::open(config.clone()).unwrap();
+            db.handle_mp_query("CREATE TABLE modify_test (id INT, value INT)")
+                .unwrap();
+            db.handle_mp_query("INSERT INTO modify_test VALUES (1, 100)")
+                .unwrap();
+            db.handle_mp_query("INSERT INTO modify_test VALUES (2, 200)")
+                .unwrap();
+            db.handle_mp_query("INSERT INTO modify_test VALUES (3, 300)")
+                .unwrap();
+
+            // Update id=2
+            db.handle_mp_query("UPDATE modify_test SET value = 999 WHERE id = 2")
+                .unwrap();
+
+            // Delete id=1
+            db.handle_mp_query("DELETE FROM modify_test WHERE id = 1")
+                .unwrap();
+
+            // NO close() - crash
+        }
+
+        // Second session: verify state
+        {
+            let db = Database::open(config.clone()).unwrap();
+
+            let result = db
+                .handle_mp_query("SELECT id, value FROM modify_test ORDER BY id")
+                .unwrap();
+            match result {
+                QueryResult::Rows { data, .. } => {
+                    // Should have id=2 (updated) and id=3 (unchanged)
+                    // id=1 was deleted
+                    assert_eq!(data.len(), 2, "Should have 2 rows after delete");
+                    assert_eq!(data[0][0], "2");
+                    assert_eq!(data[0][1], "999"); // Updated value
+                    assert_eq!(data[1][0], "3");
+                    assert_eq!(data[1][1], "300");
+                }
+                other => panic!("Expected rows, got: {other:?}"),
+            }
+            db.close().unwrap();
+        }
+    }
+
+    /// Test crash recovery with multiple crash/recover cycles.
+    #[test]
+    fn test_multiple_crash_recovery_cycles() {
+        let dir = tempdir().unwrap();
+        let config = DatabaseConfig::with_data_dir(dir.path());
+
+        // Cycle 1: create and insert
+        {
+            let db = Database::open(config.clone()).unwrap();
+            db.handle_mp_query("CREATE TABLE cycle_test (id INT)")
+                .unwrap();
+            db.handle_mp_query("INSERT INTO cycle_test VALUES (1)")
+                .unwrap();
+            // crash - no close()
+        }
+
+        // Cycle 2: recover, insert more, crash again
+        {
+            let db = Database::open(config.clone()).unwrap();
+
+            // Verify cycle 1 data
+            let result = db
+                .handle_mp_query("SELECT id FROM cycle_test ORDER BY id")
+                .unwrap();
+            match &result {
+                QueryResult::Rows { data, .. } => {
+                    assert_eq!(data.len(), 1, "Should have 1 row from cycle 1");
+                    assert_eq!(data[0][0], "1");
+                }
+                _ => panic!("Expected rows"),
+            }
+
+            db.handle_mp_query("INSERT INTO cycle_test VALUES (2)")
+                .unwrap();
+            db.handle_mp_query("INSERT INTO cycle_test VALUES (3)")
+                .unwrap();
+            // crash - no close()
+        }
+
+        // Cycle 3: recover, insert more, crash again
+        {
+            let db = Database::open(config.clone()).unwrap();
+
+            // Verify cycle 1+2 data
+            let result = db
+                .handle_mp_query("SELECT id FROM cycle_test ORDER BY id")
+                .unwrap();
+            match &result {
+                QueryResult::Rows { data, .. } => {
+                    assert_eq!(data.len(), 3, "Should have 3 rows from cycles 1+2");
+                    assert_eq!(data[0][0], "1");
+                    assert_eq!(data[1][0], "2");
+                    assert_eq!(data[2][0], "3");
+                }
+                _ => panic!("Expected rows"),
+            }
+
+            db.handle_mp_query("INSERT INTO cycle_test VALUES (4)")
+                .unwrap();
+            // crash - no close()
+        }
+
+        // Final: verify all data
+        {
+            let db = Database::open(config.clone()).unwrap();
+
+            let result = db
+                .handle_mp_query("SELECT id FROM cycle_test ORDER BY id")
+                .unwrap();
+            match result {
+                QueryResult::Rows { data, .. } => {
+                    assert_eq!(data.len(), 4, "Should have all 4 rows from 3 cycles");
+                    assert_eq!(data[0][0], "1");
+                    assert_eq!(data[1][0], "2");
+                    assert_eq!(data[2][0], "3");
+                    assert_eq!(data[3][0], "4");
+                }
+                other => panic!("Expected rows, got: {other:?}"),
+            }
+            db.close().unwrap();
+        }
+    }
+
+    /// Test crash during DDL (DROP TABLE) - verify atomicity.
+    #[test]
+    fn test_crash_recovery_ddl_drop_table() {
+        let dir = tempdir().unwrap();
+        let config = DatabaseConfig::with_data_dir(dir.path());
+
+        // Create two tables
+        {
+            let db = Database::open(config.clone()).unwrap();
+            db.handle_mp_query("CREATE TABLE keep_me (x INT)").unwrap();
+            db.handle_mp_query("INSERT INTO keep_me VALUES (42)")
+                .unwrap();
+            db.handle_mp_query("CREATE TABLE drop_me (y INT)").unwrap();
+            db.handle_mp_query("INSERT INTO drop_me VALUES (99)")
+                .unwrap();
+            db.close().unwrap();
+        }
+
+        // Drop one table and crash
+        {
+            let db = Database::open(config.clone()).unwrap();
+            db.handle_mp_query("DROP TABLE drop_me").unwrap();
+            // crash
+        }
+
+        // Verify state
+        {
+            let db = Database::open(config.clone()).unwrap();
+
+            // keep_me should exist
+            let result = db.handle_mp_query("SELECT x FROM keep_me").unwrap();
+            match result {
+                QueryResult::Rows { data, .. } => {
+                    assert_eq!(data[0][0], "42");
+                }
+                other => panic!("Expected rows for keep_me, got: {other:?}"),
+            }
+
+            // drop_me should not exist
+            let result = db.handle_mp_query("SELECT * FROM drop_me");
+            assert!(
+                result.is_err(),
+                "drop_me should not exist after crash recovery"
+            );
+
+            db.close().unwrap();
+        }
+    }
 }

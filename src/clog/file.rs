@@ -464,4 +464,280 @@ mod tests {
         // Known CRC32 value for "hello world"
         assert_eq!(checksum, 0x0D4A1185);
     }
+
+    // ========================================================================
+    // Crash Recovery Tests - simulate kill -9 scenarios
+    // ========================================================================
+
+    /// Test recovery with truncated record header (partial header write).
+    /// Simulates crash during the 12-byte header write.
+    #[test]
+    fn test_recover_truncated_header() {
+        let dir = tempdir().unwrap();
+        let config = FileClogConfig::with_dir(dir.path());
+        let clog_path = config.clog_path();
+
+        // Write one valid record
+        {
+            let service = FileClogService::open(config.clone()).unwrap();
+            let mut batch = ClogBatch::new();
+            batch.add_put(1, b"valid_key".to_vec(), b"valid_value".to_vec());
+            batch.add_commit(1, 100);
+            service.write(&mut batch, true).unwrap();
+            service.close().unwrap();
+        }
+
+        // Append partial header (6 bytes of a 12-byte header) to simulate crash
+        {
+            let mut file = OpenOptions::new().append(true).open(&clog_path).unwrap();
+            // Partial record header: only 6 of 12 bytes
+            file.write_all(&[1, 0, 0, 0, 50, 0]).unwrap();
+            file.sync_all().unwrap();
+        }
+
+        // Recovery should skip the truncated header and recover valid entries
+        let (service, entries) = FileClogService::recover(config).unwrap();
+
+        // Should recover the 2 valid entries (Put + Commit)
+        assert_eq!(
+            entries.len(),
+            2,
+            "Should recover valid entries before truncation"
+        );
+        assert_eq!(
+            service.current_lsn(),
+            3,
+            "LSN should continue from valid entries"
+        );
+    }
+
+    /// Test recovery with truncated record data (header complete, data partial).
+    /// Simulates crash during the data write after header was written.
+    #[test]
+    fn test_recover_truncated_data() {
+        let dir = tempdir().unwrap();
+        let config = FileClogConfig::with_dir(dir.path());
+        let clog_path = config.clog_path();
+
+        // Write one valid record
+        {
+            let service = FileClogService::open(config.clone()).unwrap();
+            let mut batch = ClogBatch::new();
+            batch.add_put(1, b"key1".to_vec(), b"value1".to_vec());
+            batch.add_commit(1, 100);
+            service.write(&mut batch, true).unwrap();
+            service.close().unwrap();
+        }
+
+        // Append a complete header but truncated data
+        {
+            let mut file = OpenOptions::new().append(true).open(&clog_path).unwrap();
+            // Record header: type=1, length=100 (but we won't write 100 bytes), checksum=0
+            let record_type: u32 = 1;
+            let length: u32 = 100; // Claims 100 bytes of data
+            let checksum: u32 = 0; // Wrong checksum
+            file.write_all(&record_type.to_le_bytes()).unwrap();
+            file.write_all(&length.to_le_bytes()).unwrap();
+            file.write_all(&checksum.to_le_bytes()).unwrap();
+            // Write only 10 bytes of the claimed 100
+            file.write_all(&[0u8; 10]).unwrap();
+            file.sync_all().unwrap();
+        }
+
+        // Recovery should skip the truncated record
+        let (service, entries) = FileClogService::recover(config).unwrap();
+
+        assert_eq!(entries.len(), 2, "Should recover entries before truncation");
+        assert_eq!(service.current_lsn(), 3);
+    }
+
+    /// Test recovery with corrupted checksum.
+    /// Simulates data corruption (bit flip) after write.
+    #[test]
+    fn test_recover_corrupted_checksum() {
+        let dir = tempdir().unwrap();
+        let config = FileClogConfig::with_dir(dir.path());
+        let clog_path = config.clog_path();
+
+        // Write two valid records
+        {
+            let service = FileClogService::open(config.clone()).unwrap();
+
+            // First batch
+            let mut batch1 = ClogBatch::new();
+            batch1.add_put(1, b"key1".to_vec(), b"value1".to_vec());
+            batch1.add_commit(1, 100);
+            service.write(&mut batch1, true).unwrap();
+
+            // Second batch
+            let mut batch2 = ClogBatch::new();
+            batch2.add_put(2, b"key2".to_vec(), b"value2".to_vec());
+            batch2.add_commit(2, 200);
+            service.write(&mut batch2, true).unwrap();
+
+            service.close().unwrap();
+        }
+
+        // Corrupt the checksum of the second record
+        {
+            let mut file = OpenOptions::new()
+                .read(true)
+                .write(true)
+                .open(&clog_path)
+                .unwrap();
+
+            // Skip to the checksum of the second record
+            // Header (16) + first record header (12) + first record data (variable)
+            // We need to find where the second record starts
+
+            // Read the file to find the structure
+            file.seek(SeekFrom::Start(16)).unwrap(); // Skip file header
+
+            // Read first record header
+            let mut header = [0u8; 12];
+            file.read_exact(&mut header).unwrap();
+            let first_data_len = u32::from_le_bytes(header[4..8].try_into().unwrap()) as u64;
+
+            // Skip first record data
+            file.seek(SeekFrom::Current(first_data_len as i64)).unwrap();
+
+            // Now at second record header - corrupt the checksum (offset 8-12 in header)
+            let second_record_start = file.stream_position().unwrap();
+            file.seek(SeekFrom::Start(second_record_start + 8)).unwrap();
+
+            // Write corrupted checksum
+            file.write_all(&[0xFF, 0xFF, 0xFF, 0xFF]).unwrap();
+            file.sync_all().unwrap();
+        }
+
+        // Recovery should stop at corrupted record
+        let (service, entries) = FileClogService::recover(config).unwrap();
+
+        // Should only recover the first batch (2 entries)
+        assert_eq!(entries.len(), 2, "Should stop at corrupted record");
+        assert_eq!(service.current_lsn(), 3);
+
+        // Verify we got the first batch
+        match &entries[0].op {
+            ClogOp::Put { key, value } => {
+                assert_eq!(key, b"key1");
+                assert_eq!(value, b"value1");
+            }
+            _ => panic!("Expected Put"),
+        }
+    }
+
+    /// Test recovery after simulated crash with multiple valid batches.
+    /// Verifies that all data before crash point is recovered.
+    #[test]
+    fn test_recover_multiple_batches_before_crash() {
+        let dir = tempdir().unwrap();
+        let config = FileClogConfig::with_dir(dir.path());
+        let clog_path = config.clog_path();
+
+        // Write multiple batches
+        {
+            let service = FileClogService::open(config.clone()).unwrap();
+
+            for i in 1..=5 {
+                let mut batch = ClogBatch::new();
+                batch.add_put(
+                    i,
+                    format!("key{i}").into_bytes(),
+                    format!("value{i}").into_bytes(),
+                );
+                batch.add_commit(i, i * 100);
+                service.write(&mut batch, true).unwrap();
+            }
+            service.close().unwrap();
+        }
+
+        // Append garbage to simulate partial write during crash
+        {
+            let mut file = OpenOptions::new().append(true).open(&clog_path).unwrap();
+            file.write_all(b"GARBAGE_DATA_FROM_CRASH").unwrap();
+            file.sync_all().unwrap();
+        }
+
+        // Recovery should get all 5 batches (10 entries)
+        let (service, entries) = FileClogService::recover(config).unwrap();
+
+        assert_eq!(entries.len(), 10, "Should recover all valid entries");
+        assert_eq!(service.current_lsn(), 11);
+
+        // Verify all 5 puts are there
+        let puts: Vec<_> = entries
+            .iter()
+            .filter(|e| matches!(e.op, ClogOp::Put { .. }))
+            .collect();
+        assert_eq!(puts.len(), 5);
+    }
+
+    /// Test that recovery can continue writing after crash.
+    /// Simulates: write -> crash -> recover -> write more -> verify all data.
+    #[test]
+    fn test_recover_and_continue_writing() {
+        let dir = tempdir().unwrap();
+        let config = FileClogConfig::with_dir(dir.path());
+
+        // First session: write some data
+        {
+            let service = FileClogService::open(config.clone()).unwrap();
+            let mut batch = ClogBatch::new();
+            batch.add_put(1, b"before_crash".to_vec(), b"v1".to_vec());
+            batch.add_commit(1, 100);
+            service.write(&mut batch, true).unwrap();
+            // Simulate crash - no close() call
+        }
+
+        // Second session: recover and write more
+        let (service, entries) = FileClogService::recover(config.clone()).unwrap();
+        assert_eq!(entries.len(), 2);
+
+        // Write more data after recovery
+        let mut batch = ClogBatch::new();
+        batch.add_put(2, b"after_crash".to_vec(), b"v2".to_vec());
+        batch.add_commit(2, 200);
+        service.write(&mut batch, true).unwrap();
+        service.close().unwrap();
+
+        // Third session: verify all data
+        let (_, all_entries) = FileClogService::recover(config).unwrap();
+        assert_eq!(
+            all_entries.len(),
+            4,
+            "Should have entries from both sessions"
+        );
+
+        // Verify both puts are there
+        let keys: Vec<_> = all_entries
+            .iter()
+            .filter_map(|e| match &e.op {
+                ClogOp::Put { key, .. } => Some(key.clone()),
+                _ => None,
+            })
+            .collect();
+        assert!(keys.contains(&b"before_crash".to_vec()));
+        assert!(keys.contains(&b"after_crash".to_vec()));
+    }
+
+    /// Test recovery with empty file (only header, no records).
+    /// Simulates crash immediately after file creation.
+    #[test]
+    fn test_recover_empty_clog() {
+        let dir = tempdir().unwrap();
+        let config = FileClogConfig::with_dir(dir.path());
+
+        // Create file but don't write any records
+        {
+            let service = FileClogService::open(config.clone()).unwrap();
+            // Simulate crash before any writes
+            service.close().unwrap();
+        }
+
+        // Recovery should succeed with empty entries
+        let (service, entries) = FileClogService::recover(config).unwrap();
+        assert_eq!(entries.len(), 0);
+        assert_eq!(service.current_lsn(), 1);
+    }
 }
