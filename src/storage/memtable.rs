@@ -12,6 +12,12 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+//! Legacy in-memory storage engine (non-MVCC).
+//!
+//! This module is kept for reference. Production code uses MvccMemTableEngine.
+
+#![allow(dead_code)]
+
 use std::collections::BTreeMap;
 use std::ops::Range;
 use std::sync::RwLock;
