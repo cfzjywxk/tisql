@@ -317,7 +317,8 @@ impl<S: StorageEngine + 'static, L: ClogService + 'static, T: TsoService> TxnSer
                 .check_range(&range.start, &range.end, ctx.start_ts)?;
         }
 
-        self.storage.scan(range)
+        // Use scan_at with transaction's start_ts for MVCC visibility
+        self.storage.scan_at(range, ctx.start_ts)
     }
 
     fn put(&self, ctx: &mut TxnCtx, key: Key, value: RawValue) {
@@ -685,6 +686,33 @@ mod tests {
         // Nothing in storage
         let value = storage.get(b"key1").unwrap();
         assert!(value.is_none());
+    }
+
+    #[test]
+    fn test_txn_service_scan_mvcc() {
+        let (_storage, txn_service, _dir) = create_test_service();
+
+        // Write some data via autocommit
+        txn_service.autocommit_put(b"a", b"1").unwrap();
+        txn_service.autocommit_put(b"b", b"2").unwrap();
+        txn_service.autocommit_put(b"c", b"3").unwrap();
+
+        // Begin a read-only transaction
+        let ctx = txn_service.begin(true).unwrap();
+
+        // Scan should see all data
+        let results: Vec<_> = txn_service
+            .scan(&ctx, b"a".to_vec()..b"d".to_vec())
+            .unwrap()
+            .collect();
+
+        assert_eq!(
+            results.len(),
+            3,
+            "scan should see 3 keys, start_ts={}, got {:?}",
+            ctx.start_ts(),
+            results
+        );
     }
 
     #[test]

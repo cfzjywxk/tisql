@@ -234,16 +234,31 @@ impl<T: TsoService> StorageEngine for MvccMemTableEngine<T> {
     }
 
     fn scan(&self, range: Range<Key>) -> Result<Box<dyn Iterator<Item = (Key, RawValue)> + '_>> {
-        // Get current timestamp for visibility
-        let ts = Timestamp::MAX;
+        // Default scan uses MAX timestamp (latest visible version)
+        self.scan_at(range, Timestamp::MAX)
+    }
 
+    fn scan_at(
+        &self,
+        range: Range<Key>,
+        ts: Timestamp,
+    ) -> Result<Box<dyn Iterator<Item = (Key, RawValue)> + '_>> {
         // Check range for locks
         self.inner
             .concurrency_manager
             .check_range(&range.start, &range.end, ts)?;
 
         // Scan MVCC keys and deduplicate by user_key
-        let start_mvcc = encode_mvcc_key(&range.start, ts);
+        //
+        // MVCC key encoding: user_key || !commit_ts
+        // Due to !commit_ts, higher timestamps produce SMALLER encoded keys.
+        //
+        // To find all versions within the user key range:
+        // - start: use Timestamp::MAX to get the SMALLEST mvcc key for range.start
+        // - end: use 0 to get the LARGEST mvcc key just before range.end
+        //
+        // Then filter by entry_ts <= ts during iteration for visibility.
+        let start_mvcc = encode_mvcc_key(&range.start, Timestamp::MAX);
         let end_mvcc = encode_mvcc_key(&range.end, 0); // 0 is the "oldest" version
 
         let mut results = Vec::new();
@@ -256,14 +271,14 @@ impl<T: TsoService> StorageEngine for MvccMemTableEngine<T> {
                     continue;
                 }
 
-                // Skip if we already have this key (we want the latest version)
+                // Skip if we already have this key (we want the latest visible version)
                 if let Some(ref last) = last_user_key {
                     if &user_key == last {
                         continue;
                     }
                 }
 
-                // Check if this version is visible
+                // Check if this version is visible at the given timestamp
                 if entry_ts <= ts {
                     let value = entry.value();
                     if !is_tombstone(value) {
@@ -583,5 +598,50 @@ mod tests {
         let mut v = vec![1u8, 255u8];
         increment_bytes(&mut v);
         assert_eq!(v, vec![2u8, 0u8]);
+    }
+
+    #[test]
+    fn test_scan_at_mvcc() {
+        let tso = Arc::new(LocalTso::new(1));
+        let cm = Arc::new(ConcurrencyManager::new(0));
+        let engine = MvccMemTableEngine::new(Arc::clone(&tso), Arc::clone(&cm));
+
+        // Write data at specific timestamps
+        let ts1 = tso.get_ts(); // ts1 = 1
+        engine.put_at(b"a", b"1", ts1);
+
+        let ts2 = tso.get_ts(); // ts2 = 2
+        engine.put_at(b"b", b"2", ts2);
+
+        let ts3 = tso.get_ts(); // ts3 = 3
+        engine.put_at(b"c", b"3", ts3);
+
+        // scan_at with ts=3 should see all data
+        let results: Vec<_> = engine
+            .scan_at(b"a".to_vec()..b"d".to_vec(), 3)
+            .unwrap()
+            .collect();
+        assert_eq!(results.len(), 3, "scan_at ts=3 should see 3 keys");
+
+        // scan_at with ts=2 should see a and b only
+        let results: Vec<_> = engine
+            .scan_at(b"a".to_vec()..b"d".to_vec(), 2)
+            .unwrap()
+            .collect();
+        assert_eq!(results.len(), 2, "scan_at ts=2 should see 2 keys");
+
+        // scan_at with ts=1 should see a only
+        let results: Vec<_> = engine
+            .scan_at(b"a".to_vec()..b"d".to_vec(), 1)
+            .unwrap()
+            .collect();
+        assert_eq!(results.len(), 1, "scan_at ts=1 should see 1 key");
+
+        // scan_at with ts=0 should see nothing
+        let results: Vec<_> = engine
+            .scan_at(b"a".to_vec()..b"d".to_vec(), 0)
+            .unwrap()
+            .collect();
+        assert_eq!(results.len(), 0, "scan_at ts=0 should see 0 keys");
     }
 }

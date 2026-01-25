@@ -108,6 +108,16 @@ pub trait StorageEngine: Send + Sync + 'static {
 
     /// Range scan - returns an iterator over key-value pairs.
     fn scan(&self, range: Range<Key>) -> Result<Box<dyn Iterator<Item = (Key, RawValue)> + '_>>;
+
+    /// Range scan at specific timestamp (for MVCC).
+    ///
+    /// Returns an iterator over key-value pairs visible at the given timestamp.
+    /// Only versions with commit_ts <= ts are visible.
+    fn scan_at(
+        &self,
+        range: Range<Key>,
+        ts: Timestamp,
+    ) -> Result<Box<dyn Iterator<Item = (Key, RawValue)> + '_>>;
 }
 
 // ============================================================================
