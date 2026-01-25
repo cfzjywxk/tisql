@@ -46,9 +46,19 @@ num_cpus = "1"
 crossbeam-skiplist = "0.1"
 crossbeam-epoch = "0.9"
 
+# Fail injection testing
+[dependencies.fail]
+version = "0.5"
+optional = true
+
 [dev-dependencies]
 criterion = "0.5"
 tempfile = "3"
+fail = "0.5"
+
+[features]
+default = []
+failpoints = ["fail/failpoints"]
 
 # Benchmarks will be added later
 # [[bench]]
@@ -62,3 +72,7 @@ path = "tests/integrationtest/runner.rs"
 [[test]]
 name = "store_test"
 path = "tests/store_test.rs"
+
+[[test]]
+name = "concurrency_test"
+path = "tests/concurrency_test.rs"

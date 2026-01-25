@@ -23,6 +23,9 @@
 
 use std::sync::Arc;
 
+#[cfg(feature = "failpoints")]
+use fail::fail_point;
+
 use crate::clog::{ClogBatch, ClogEntry, ClogOp, ClogService};
 use crate::concurrency::{ConcurrencyManager, Lock};
 use crate::error::Result;
@@ -100,6 +103,11 @@ impl<S: StorageEngine, L: ClogService> TransactionService<S, L> {
         };
         let _guards = self.concurrency_manager.lock_keys(&keys, lock)?;
 
+        // FAILPOINT: After locks acquired, before any writes
+        // Readers checking now will see the lock and be blocked
+        #[cfg(feature = "failpoints")]
+        fail_point!("txn_after_lock_acquired");
+
         // Build commit log batch from write batch
         let mut clog_batch = ClogBatch::new();
         for op in batch.iter() {
@@ -119,10 +127,20 @@ impl<S: StorageEngine, L: ClogService> TransactionService<S, L> {
         // Write to commit log with sync (durability guarantee)
         let lsn = self.clog_service.write(&mut clog_batch, true)?;
 
+        // FAILPOINT: After clog write, before storage apply
+        // Data is durable but not yet visible in storage
+        #[cfg(feature = "failpoints")]
+        fail_point!("txn_after_clog_write");
+
         // Apply to storage engine with commit_ts
         let mut batch = batch;
         batch.set_commit_ts(commit_ts);
         self.storage.write_batch(batch)?;
+
+        // FAILPOINT: After storage apply, before lock release
+        // Data is visible in storage but locks still held
+        #[cfg(feature = "failpoints")]
+        fail_point!("txn_after_storage_apply");
 
         // Guards dropped here -> locks released
         Ok((txn_id, commit_ts, lsn))
