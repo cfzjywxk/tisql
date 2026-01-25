@@ -28,7 +28,7 @@ pub mod util;
 pub mod worker;
 
 pub use catalog::{Catalog, MemoryCatalog};
-pub use clog::{ClogService, FileClogConfig, FileClogService};
+pub use clog::{ClogService, FileClogConfig, FileClogService, NopClogService};
 pub use concurrency::ConcurrencyManager;
 use error::Result;
 use executor::{ExecutionResult, Executor, SimpleExecutor};
@@ -89,8 +89,8 @@ pub struct Database {
     concurrency_manager: Arc<ConcurrencyManager>,
     /// Commit log service for durability (None if durability disabled)
     clog_service: Option<Arc<FileClogService>>,
-    /// Transaction service for durable writes
-    txn_service: Option<Arc<TransactionService<MvccMemTableEngine, FileClogService>>>,
+    /// Transaction service for all SQL execution (always present)
+    txn_service: Box<dyn TxnService>,
 }
 
 impl Database {
@@ -98,14 +98,22 @@ impl Database {
     pub fn new() -> Self {
         log_info!("Initializing TiSQL database (in-memory mode, MVCC enabled)");
         let concurrency_manager = Arc::new(ConcurrencyManager::new(1));
+        let storage = Arc::new(MvccMemTableEngine::new(Arc::clone(&concurrency_manager)));
+        let clog_service = Arc::new(NopClogService::new());
+        let txn_service: Box<dyn TxnService> = Box::new(TransactionService::new(
+            Arc::clone(&storage),
+            clog_service,
+            Arc::clone(&concurrency_manager),
+        ));
+
         Self {
-            storage: Arc::new(MvccMemTableEngine::new(Arc::clone(&concurrency_manager))),
+            storage,
             catalog: MemoryCatalog::new(),
             parser: Parser::new(),
             executor: SimpleExecutor::new(),
             concurrency_manager,
             clog_service: None,
-            txn_service: None,
+            txn_service,
         }
     }
 
@@ -132,7 +140,7 @@ impl Database {
         let storage = Arc::new(MvccMemTableEngine::new(Arc::clone(&concurrency_manager)));
 
         // Create transaction service
-        let txn_service = Arc::new(TransactionService::new(
+        let concrete_txn_service = Arc::new(TransactionService::new(
             Arc::clone(&storage),
             Arc::clone(&clog_service),
             Arc::clone(&concurrency_manager),
@@ -140,7 +148,7 @@ impl Database {
 
         // Recover state by replaying commit log
         if !entries.is_empty() {
-            let stats = txn_service.recover(&entries)?;
+            let stats = concrete_txn_service.recover(&entries)?;
             log_info!(
                 "Recovery complete: {} txns, {} puts, {} deletes applied, {} entries rolled back",
                 stats.committed_txns,
@@ -154,6 +162,13 @@ impl Database {
         let catalog = MemoryCatalog::new();
         // TODO: Persist and recover catalog metadata
 
+        // Create boxed trait object for the txn_service
+        let txn_service: Box<dyn TxnService> = Box::new(TransactionService::new(
+            Arc::clone(&storage),
+            Arc::clone(&clog_service),
+            Arc::clone(&concurrency_manager),
+        ));
+
         Ok(Self {
             storage,
             catalog,
@@ -161,7 +176,7 @@ impl Database {
             executor: SimpleExecutor::new(),
             concurrency_manager,
             clog_service: Some(clog_service),
-            txn_service: Some(txn_service),
+            txn_service,
         })
     }
 
@@ -180,24 +195,14 @@ impl Database {
         let plan = binder.bind(stmt)?;
         let bind_ms = bind_timer.elapsed_ms();
 
-        // Check if this is a write operation that needs logging
-        let is_write = plan.is_write();
-
-        // Execute
+        // Execute through TxnService
+        // All operations (read and write) go through the transaction service:
+        // - Reads: snapshot with start_ts allocation
+        // - Writes: transaction with commit
         let exec_timer = Timer::new("execute");
-        let result = if is_write && self.txn_service.is_some() {
-            // For write operations with durability enabled, we need to:
-            // 1. Execute to get the write batch
-            // 2. Log the batch
-            // 3. Apply to storage
-            // But current executor applies directly, so for now we use the
-            // logging storage wrapper approach (see execute_with_logging)
-            self.execute_with_logging(plan)?
-        } else {
-            // Read operations or no durability - execute directly
-            self.executor
-                .execute(plan, self.storage.as_ref(), &self.catalog)?
-        };
+        let result = self
+            .executor
+            .execute(plan, self.txn_service.as_ref(), &self.catalog)?;
         let exec_ms = exec_timer.elapsed_ms();
 
         // Convert to QueryResult
@@ -252,41 +257,6 @@ impl Database {
         };
 
         Ok(query_result)
-    }
-
-    /// Execute a write operation with commit logging for durability
-    fn execute_with_logging(&self, plan: sql::LogicalPlan) -> Result<ExecutionResult> {
-        use crate::clog::ClogBatch;
-
-        let txn_service = self.txn_service.as_ref().unwrap();
-        let clog_service = self.clog_service.as_ref().unwrap();
-
-        // Execute the plan
-        // TODO: Implement true write-ahead logging by:
-        // 1. Modifying executor to return WriteBatch without applying
-        // 2. Logging the batch to clog
-        // 3. Syncing to disk
-        // 4. Then applying to storage
-        //
-        // For now, we execute and then log a commit marker
-        let result = self
-            .executor
-            .execute(plan, self.storage.as_ref(), &self.catalog)?;
-
-        // Log after execution for durability
-        // This ensures the operation is persisted, but if we crash between
-        // storage write and clog write, we may lose data. A proper implementation
-        // would log before the storage write.
-        if let ExecutionResult::Affected { count } = &result {
-            if *count > 0 {
-                let txn_id = txn_service.current_ts();
-                let mut batch = ClogBatch::new();
-                batch.add_commit(txn_id, txn_id);
-                clog_service.write(&mut batch, true)?;
-            }
-        }
-
-        Ok(result)
     }
 
     /// List tables in default schema

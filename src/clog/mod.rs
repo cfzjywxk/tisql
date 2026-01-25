@@ -27,6 +27,7 @@
 mod file;
 
 pub use file::{FileClogConfig, FileClogService};
+// NopClogService is defined at the end of this file
 
 use crate::error::Result;
 use crate::types::{Key, Lsn, RawValue, Timestamp, TxnId};
@@ -144,4 +145,64 @@ pub trait ClogService: Send + Sync {
 
     /// Close the commit log service
     fn close(&self) -> Result<()>;
+}
+
+// ============================================================================
+// No-op Commit Log Service (for in-memory mode)
+// ============================================================================
+
+use std::sync::atomic::{AtomicU64, Ordering};
+
+/// No-op commit log service for in-memory mode (no durability).
+///
+/// This implementation doesn't persist anything - it just tracks LSNs.
+/// Useful for testing and in-memory-only databases.
+pub struct NopClogService {
+    current_lsn: AtomicU64,
+}
+
+impl NopClogService {
+    /// Create a new no-op commit log service.
+    pub fn new() -> Self {
+        Self {
+            current_lsn: AtomicU64::new(0),
+        }
+    }
+}
+
+impl Default for NopClogService {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl ClogService for NopClogService {
+    fn write(&self, batch: &mut ClogBatch, _sync: bool) -> Result<Lsn> {
+        let entries_count = batch.len() as u64;
+        if entries_count == 0 {
+            return Ok(self.current_lsn.load(Ordering::SeqCst));
+        }
+        // Just increment LSN without actually writing anything
+        let new_lsn = self.current_lsn.fetch_add(entries_count, Ordering::SeqCst) + entries_count;
+        Ok(new_lsn)
+    }
+
+    fn sync(&self) -> Result<()> {
+        // No-op
+        Ok(())
+    }
+
+    fn read_all(&self) -> Result<Vec<ClogEntry>> {
+        // Nothing to read - no persistence
+        Ok(vec![])
+    }
+
+    fn current_lsn(&self) -> Lsn {
+        self.current_lsn.load(Ordering::SeqCst)
+    }
+
+    fn close(&self) -> Result<()> {
+        // No-op
+        Ok(())
+    }
 }

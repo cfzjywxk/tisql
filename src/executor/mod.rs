@@ -19,7 +19,7 @@ pub use simple::SimpleExecutor;
 use crate::catalog::Catalog;
 use crate::error::Result;
 use crate::sql::LogicalPlan;
-use crate::storage::StorageEngine;
+use crate::transaction::TxnService;
 use crate::types::{Row, Schema};
 
 /// Query execution result
@@ -32,12 +32,26 @@ pub enum ExecutionResult {
     Ok,
 }
 
-/// Executor trait
+/// Executor trait - executes plans through TxnService
+///
+/// All statement execution goes through the transaction service:
+/// - Read statements: TxnService.snapshot() allocates start_ts
+/// - Write statements: TxnService.begin() + commit() with durability
 pub trait Executor {
-    fn execute<S: StorageEngine, C: Catalog>(
+    /// Execute a logical plan through the transaction service.
+    ///
+    /// For read operations (SELECT):
+    /// 1. Creates a snapshot via txn_service.snapshot()
+    /// 2. Reads are performed at snapshot's start_ts
+    ///
+    /// For write operations (INSERT/UPDATE/DELETE):
+    /// 1. Creates a transaction via txn_service.begin()
+    /// 2. Writes are buffered in transaction
+    /// 3. Transaction is committed with durability
+    fn execute(
         &self,
         plan: LogicalPlan,
-        storage: &S,
-        catalog: &C,
+        txn_service: &dyn TxnService,
+        catalog: &dyn Catalog,
     ) -> Result<ExecutionResult>;
 }

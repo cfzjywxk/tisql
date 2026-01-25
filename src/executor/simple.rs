@@ -12,13 +12,17 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+//! Simple volcano-style executor using TxnService for all operations.
+//!
+//! All statement execution goes through the transaction service:
+//! - Read statements: Use snapshot with allocated start_ts
+//! - Write statements: Use transaction with commit
+
 use crate::catalog::Catalog;
 use crate::error::{Result, TiSqlError};
 use crate::sql::{AggFunc, BinaryOp, Expr, LogicalPlan, UnaryOp};
-use crate::storage::{
-    decode_row_to_values, encode_int_key, encode_key, encode_pk, encode_row, StorageEngine,
-    WriteBatch,
-};
+use crate::storage::{decode_row_to_values, encode_int_key, encode_key, encode_pk, encode_row};
+use crate::transaction::{ReadSnapshot, Txn, TxnService};
 use crate::types::{ColumnId, ColumnInfo, DataType, Row, Schema, Value};
 
 use super::{ExecutionResult, Executor};
@@ -39,11 +43,110 @@ impl Default for SimpleExecutor {
 }
 
 impl Executor for SimpleExecutor {
-    fn execute<S: StorageEngine, C: Catalog>(
+    fn execute(
         &self,
         plan: LogicalPlan,
-        storage: &S,
-        catalog: &C,
+        txn_service: &dyn TxnService,
+        catalog: &dyn Catalog,
+    ) -> Result<ExecutionResult> {
+        // Determine if this is a read or write operation
+        if plan.is_write() {
+            self.execute_write(plan, txn_service, catalog)
+        } else {
+            self.execute_read(plan, txn_service, catalog)
+        }
+    }
+}
+
+impl SimpleExecutor {
+    /// Execute a read-only plan using a snapshot.
+    ///
+    /// Creates a snapshot with start_ts from TSO, then executes all reads
+    /// at that consistent timestamp.
+    fn execute_read(
+        &self,
+        plan: LogicalPlan,
+        txn_service: &dyn TxnService,
+        catalog: &dyn Catalog,
+    ) -> Result<ExecutionResult> {
+        // Allocate start_ts and create snapshot
+        let snapshot = txn_service.snapshot()?;
+
+        // Execute the read plan using the snapshot
+        self.execute_with_snapshot(plan, snapshot.as_ref(), catalog)
+    }
+
+    /// Execute a write plan using a transaction.
+    ///
+    /// Creates a transaction, executes writes (buffered), then commits.
+    fn execute_write(
+        &self,
+        plan: LogicalPlan,
+        txn_service: &dyn TxnService,
+        catalog: &dyn Catalog,
+    ) -> Result<ExecutionResult> {
+        // DDL operations don't need transaction (catalog operations)
+        match &plan {
+            LogicalPlan::CreateTable { .. } | LogicalPlan::DropTable { .. } => {
+                return self.execute_ddl(plan, catalog);
+            }
+            _ => {}
+        }
+
+        // Create transaction with start_ts
+        let txn = txn_service.begin()?;
+
+        // Execute the write plan using the transaction
+        self.execute_with_txn(plan, txn, catalog)
+    }
+
+    /// Execute DDL operations (no transaction needed).
+    fn execute_ddl(&self, plan: LogicalPlan, catalog: &dyn Catalog) -> Result<ExecutionResult> {
+        match plan {
+            LogicalPlan::CreateTable {
+                table,
+                if_not_exists,
+            } => {
+                if catalog.get_table(table.schema(), table.name())?.is_some() {
+                    if if_not_exists {
+                        return Ok(ExecutionResult::Ok);
+                    }
+                    return Err(TiSqlError::Catalog(format!(
+                        "Table '{}' already exists",
+                        table.name()
+                    )));
+                }
+
+                catalog.create_table(table)?;
+                Ok(ExecutionResult::Ok)
+            }
+
+            LogicalPlan::DropTable {
+                schema,
+                table,
+                if_exists,
+            } => {
+                if catalog.get_table(&schema, &table)?.is_none() {
+                    if if_exists {
+                        return Ok(ExecutionResult::Ok);
+                    }
+                    return Err(TiSqlError::TableNotFound(format!("{schema}.{table}")));
+                }
+
+                catalog.drop_table(&schema, &table)?;
+                Ok(ExecutionResult::Ok)
+            }
+
+            _ => Err(TiSqlError::Execution("Not a DDL operation".into())),
+        }
+    }
+
+    /// Execute read operations using a snapshot.
+    fn execute_with_snapshot(
+        &self,
+        plan: LogicalPlan,
+        snapshot: &dyn ReadSnapshot,
+        catalog: &dyn Catalog,
     ) -> Result<ExecutionResult> {
         match plan {
             LogicalPlan::Values { rows, schema } => {
@@ -64,7 +167,7 @@ impl Executor for SimpleExecutor {
             }
 
             LogicalPlan::Project { input, exprs } => {
-                let input_result = self.execute(*input, storage, catalog)?;
+                let input_result = self.execute_with_snapshot(*input, snapshot, catalog)?;
 
                 match input_result {
                     ExecutionResult::Rows { rows, .. } => {
@@ -115,7 +218,8 @@ impl Executor for SimpleExecutor {
                     .map(|c| c.data_type().clone())
                     .collect();
 
-                let iter = storage.scan(start_key..end_key)?;
+                // Scan using snapshot (reads at start_ts)
+                let iter = snapshot.scan(start_key..end_key)?;
 
                 let mut rows = Vec::new();
                 for (_, value) in iter {
@@ -162,7 +266,7 @@ impl Executor for SimpleExecutor {
             }
 
             LogicalPlan::Filter { input, predicate } => {
-                let input_result = self.execute(*input, storage, catalog)?;
+                let input_result = self.execute_with_snapshot(*input, snapshot, catalog)?;
 
                 match input_result {
                     ExecutionResult::Rows { schema, rows } => {
@@ -189,7 +293,7 @@ impl Executor for SimpleExecutor {
                 limit,
                 offset,
             } => {
-                let input_result = self.execute(*input, storage, catalog)?;
+                let input_result = self.execute_with_snapshot(*input, snapshot, catalog)?;
 
                 match input_result {
                     ExecutionResult::Rows { schema, rows } => {
@@ -209,7 +313,7 @@ impl Executor for SimpleExecutor {
             }
 
             LogicalPlan::Sort { input, order_by } => {
-                let input_result = self.execute(*input, storage, catalog)?;
+                let input_result = self.execute_with_snapshot(*input, snapshot, catalog)?;
 
                 match input_result {
                     ExecutionResult::Rows { schema, mut rows } => {
@@ -237,19 +341,17 @@ impl Executor for SimpleExecutor {
                 group_by,
                 agg_exprs,
             } => {
-                let input_result = self.execute(*input, storage, catalog)?;
+                let input_result = self.execute_with_snapshot(*input, snapshot, catalog)?;
 
                 match input_result {
                     ExecutionResult::Rows { rows, .. } => {
                         if group_by.is_empty() && agg_exprs.is_empty() {
-                            // No aggregation, just return input
                             return Ok(ExecutionResult::Rows {
                                 schema: Schema::new(vec![]),
                                 rows,
                             });
                         }
 
-                        // Simple aggregation without GROUP BY
                         if group_by.is_empty() {
                             let agg_values = agg_exprs
                                 .iter()
@@ -271,21 +373,33 @@ impl Executor for SimpleExecutor {
                             });
                         }
 
-                        // GROUP BY aggregation - simplified implementation
-                        // TODO: Implement proper grouping
                         Err(TiSqlError::Execution("GROUP BY not yet implemented".into()))
                     }
                     other => Ok(other),
                 }
             }
 
+            _ => Err(TiSqlError::Execution(format!(
+                "Unsupported read plan: {:?}",
+                std::mem::discriminant(&plan)
+            ))),
+        }
+    }
+
+    /// Execute write operations using a transaction.
+    fn execute_with_txn(
+        &self,
+        plan: LogicalPlan,
+        mut txn: Box<dyn Txn>,
+        catalog: &dyn Catalog,
+    ) -> Result<ExecutionResult> {
+        let result = match plan {
             LogicalPlan::Insert {
                 table,
                 columns,
                 values,
             } => {
                 let pk_indices = table.pk_column_indices();
-                let mut batch = WriteBatch::new();
                 let mut count = 0u64;
 
                 // Get column IDs for encoding
@@ -300,16 +414,13 @@ impl Executor for SimpleExecutor {
                             .columns()
                             .iter()
                             .position(|c| c.id() == col_id)
-                            .ok_or_else(|| {
-                            TiSqlError::ColumnNotFound(format!("id={col_id}"))
-                        })?;
+                            .ok_or_else(|| TiSqlError::ColumnNotFound(format!("id={col_id}")))?;
 
                         let value = self.eval_expr(&row_exprs[col_idx], &Row::new(vec![]))?;
                         row_values[table_col_idx] = value;
                     }
 
-                    // For tables without an explicit PK, allocate a stable hidden row-id and use it
-                    // as the record handle.
+                    // For tables without explicit PK, allocate hidden row-id
                     let row_id_for_key = if pk_indices.is_empty() {
                         Some(catalog.next_auto_increment(table.id())?)
                     } else {
@@ -330,7 +441,6 @@ impl Executor for SimpleExecutor {
                     let key = if let Some(handle) = row_id_for_key {
                         encode_int_key(table.id(), handle as i64)
                     } else {
-                        // Build PK bytes for common handle keys.
                         let pk_values: Vec<_> =
                             pk_indices.iter().map(|&i| row_values[i].clone()).collect();
                         let pk_bytes = encode_pk(&pk_values);
@@ -340,48 +450,12 @@ impl Executor for SimpleExecutor {
                     // Encode row using TiDB codec format
                     let value = encode_row(&col_ids, &row_values);
 
-                    batch.put(key, value);
+                    // Buffer write in transaction
+                    txn.put(key, value);
                     count += 1;
                 }
 
-                storage.write_batch(batch)?;
-
-                Ok(ExecutionResult::Affected { count })
-            }
-
-            LogicalPlan::CreateTable {
-                table,
-                if_not_exists,
-            } => {
-                // Check if table exists
-                if catalog.get_table(table.schema(), table.name())?.is_some() {
-                    if if_not_exists {
-                        return Ok(ExecutionResult::Ok);
-                    }
-                    return Err(TiSqlError::Catalog(format!(
-                        "Table '{}' already exists",
-                        table.name()
-                    )));
-                }
-
-                catalog.create_table(table)?;
-                Ok(ExecutionResult::Ok)
-            }
-
-            LogicalPlan::DropTable {
-                schema,
-                table,
-                if_exists,
-            } => {
-                if catalog.get_table(&schema, &table)?.is_none() {
-                    if if_exists {
-                        return Ok(ExecutionResult::Ok);
-                    }
-                    return Err(TiSqlError::TableNotFound(format!("{schema}.{table}")));
-                }
-
-                catalog.drop_table(&schema, &table)?;
-                Ok(ExecutionResult::Ok)
+                ExecutionResult::Affected { count }
             }
 
             LogicalPlan::Delete { table, filter } => {
@@ -389,7 +463,6 @@ impl Executor for SimpleExecutor {
                 let start_key = encode_key(table_id, &[]);
                 let end_key = encode_key(table_id + 1, &[]);
 
-                // Extract column IDs and data types for decoding
                 let col_ids: Vec<ColumnId> = table.columns().iter().map(|c| c.id()).collect();
                 let data_types: Vec<DataType> = table
                     .columns()
@@ -397,11 +470,13 @@ impl Executor for SimpleExecutor {
                     .map(|c| c.data_type().clone())
                     .collect();
 
-                let mut batch = WriteBatch::new();
                 let mut count = 0u64;
 
-                let iter = storage.scan(start_key..end_key)?;
-                for (key, value) in iter {
+                // Scan using transaction's snapshot (reads at start_ts)
+                let iter = txn.scan(start_key..end_key)?;
+                let entries: Vec<_> = iter.collect();
+
+                for (key, value) in entries {
                     let values = decode_row_to_values(&value, &col_ids, &data_types)?;
                     let row = Row::new(values);
 
@@ -413,13 +488,12 @@ impl Executor for SimpleExecutor {
                         }
                     }
 
-                    batch.delete(key);
+                    // Buffer delete in transaction
+                    txn.delete(key);
                     count += 1;
                 }
 
-                storage.write_batch(batch)?;
-
-                Ok(ExecutionResult::Affected { count })
+                ExecutionResult::Affected { count }
             }
 
             LogicalPlan::Update {
@@ -432,7 +506,6 @@ impl Executor for SimpleExecutor {
                 let start_key = encode_key(table_id, &[]);
                 let end_key = encode_key(table_id + 1, &[]);
 
-                // Extract column IDs and data types for encoding/decoding
                 let col_ids: Vec<ColumnId> = table.columns().iter().map(|c| c.id()).collect();
                 let data_types: Vec<DataType> = table
                     .columns()
@@ -440,11 +513,13 @@ impl Executor for SimpleExecutor {
                     .map(|c| c.data_type().clone())
                     .collect();
 
-                let mut batch = WriteBatch::new();
                 let mut count = 0u64;
 
-                let iter = storage.scan(start_key..end_key)?;
-                for (key, value) in iter {
+                // Scan using transaction's snapshot
+                let iter = txn.scan(start_key..end_key)?;
+                let entries: Vec<_> = iter.collect();
+
+                for (key, value) in entries {
                     let values = decode_row_to_values(&value, &col_ids, &data_types)?;
                     let mut row = Row::new(values);
 
@@ -468,8 +543,7 @@ impl Executor for SimpleExecutor {
                         row.set(col_idx, new_value);
                     }
 
-                    // If the table doesn't have an explicit PK, keep the existing key (hidden
-                    // handle). Otherwise recompute the key and handle PK changes.
+                    // Compute new key if PK changed
                     let new_key = if pk_indices.is_empty() {
                         key.clone()
                     } else {
@@ -481,31 +555,34 @@ impl Executor for SimpleExecutor {
                         encode_key(table_id, &pk_bytes)
                     };
 
-                    // Delete old key if PK changed (explicit PK tables only).
+                    // Delete old key if PK changed
                     if !pk_indices.is_empty() && new_key != key {
-                        batch.delete(key);
+                        txn.delete(key);
                     }
 
-                    // Write new row using TiDB codec format
+                    // Write new row
                     let new_value = encode_row(&col_ids, row.values());
-                    batch.put(new_key, new_value);
+                    txn.put(new_key, new_value);
                     count += 1;
                 }
 
-                storage.write_batch(batch)?;
-
-                Ok(ExecutionResult::Affected { count })
+                ExecutionResult::Affected { count }
             }
 
-            _ => Err(TiSqlError::Execution(format!(
-                "Unsupported plan: {:?}",
-                std::mem::discriminant(&plan)
-            ))),
-        }
-    }
-}
+            _ => {
+                return Err(TiSqlError::Execution(format!(
+                    "Unsupported write plan: {:?}",
+                    std::mem::discriminant(&plan)
+                )));
+            }
+        };
 
-impl SimpleExecutor {
+        // Commit the transaction
+        txn.commit()?;
+
+        Ok(result)
+    }
+
     fn eval_expr(&self, expr: &Expr, row: &Row) -> Result<Value> {
         match expr {
             Expr::Literal(v) => Ok(v.clone()),
@@ -531,11 +608,7 @@ impl SimpleExecutor {
                 Ok(Value::Boolean(if *negated { !is_null } else { is_null }))
             }
 
-            Expr::Aggregate { func: _, arg, .. } => {
-                // During row evaluation, aggregates should already be computed
-                // This is a fallback for non-aggregated context
-                self.eval_expr(arg, row)
-            }
+            Expr::Aggregate { func: _, arg, .. } => self.eval_expr(arg, row),
 
             Expr::Cast { expr, data_type } => {
                 let val = self.eval_expr(expr, row)?;
@@ -661,7 +734,6 @@ impl SimpleExecutor {
         let r = self.value_to_f64(right)?;
         let result = op(l, r);
 
-        // Try to preserve integer type if both operands were integers
         match (left, right) {
             (Value::BigInt(_), Value::BigInt(_)) if result.fract() == 0.0 => {
                 Ok(Value::BigInt(result as i64))
@@ -727,7 +799,6 @@ impl SimpleExecutor {
             (Value::String(a), Value::String(b)) => a.cmp(b),
 
             _ => {
-                // Numeric comparison
                 let l = self.value_to_f64(left).unwrap_or(f64::NAN);
                 let r = self.value_to_f64(right).unwrap_or(f64::NAN);
                 l.partial_cmp(&r).unwrap_or(Ordering::Equal)
@@ -736,7 +807,6 @@ impl SimpleExecutor {
     }
 
     fn like_match(&self, text: &str, pattern: &str) -> bool {
-        // Simple LIKE implementation (% and _ wildcards)
         let regex_pattern = pattern.replace('%', ".*").replace('_', ".");
         regex::Regex::new(&format!("^{regex_pattern}$"))
             .map(|re| re.is_match(text))
