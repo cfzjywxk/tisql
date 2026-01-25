@@ -57,6 +57,13 @@ pub enum TiSqlError {
     #[error("Transaction aborted")]
     TransactionAborted,
 
+    #[error("Key is locked: key={key:?}, lock_ts={lock_ts}")]
+    KeyIsLocked {
+        key: Vec<u8>,
+        lock_ts: u64,
+        primary: Vec<u8>,
+    },
+
     #[error("IO error: {0}")]
     Io(#[from] std::io::Error),
 

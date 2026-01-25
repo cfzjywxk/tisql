@@ -15,6 +15,7 @@
 pub mod catalog;
 pub mod clog;
 pub mod codec;
+pub mod concurrency;
 pub mod error;
 pub mod executor;
 pub mod protocol;
@@ -28,11 +29,12 @@ pub mod worker;
 
 pub use catalog::{Catalog, MemoryCatalog};
 pub use clog::{ClogService, FileClogConfig, FileClogService};
+pub use concurrency::ConcurrencyManager;
 use error::Result;
 use executor::{ExecutionResult, Executor, SimpleExecutor};
 pub use protocol::{MySqlServer, MYSQL_DEFAULT_PORT};
 use sql::{Binder, Parser};
-use storage::MemTableEngine;
+use storage::MvccMemTableEngine;
 pub use transaction::TransactionService;
 use types::Value;
 use util::Timer;
@@ -79,25 +81,29 @@ impl DatabaseConfig {
 
 /// TiSQL Database instance with durability support
 pub struct Database {
-    storage: Arc<MemTableEngine>,
+    storage: Arc<MvccMemTableEngine>,
     catalog: MemoryCatalog,
     parser: Parser,
     executor: SimpleExecutor,
+    /// ConcurrencyManager for TSO and lock table
+    concurrency_manager: Arc<ConcurrencyManager>,
     /// Commit log service for durability (None if durability disabled)
     clog_service: Option<Arc<FileClogService>>,
     /// Transaction service for durable writes
-    txn_service: Option<Arc<TransactionService<MemTableEngine, FileClogService>>>,
+    txn_service: Option<Arc<TransactionService<MvccMemTableEngine, FileClogService>>>,
 }
 
 impl Database {
     /// Create a new in-memory database (no durability)
     pub fn new() -> Self {
-        log_info!("Initializing TiSQL database (in-memory mode)");
+        log_info!("Initializing TiSQL database (in-memory mode, MVCC enabled)");
+        let concurrency_manager = Arc::new(ConcurrencyManager::new(1));
         Self {
-            storage: Arc::new(MemTableEngine::new()),
+            storage: Arc::new(MvccMemTableEngine::new(Arc::clone(&concurrency_manager))),
             catalog: MemoryCatalog::new(),
             parser: Parser::new(),
             executor: SimpleExecutor::new(),
+            concurrency_manager,
             clog_service: None,
             txn_service: None,
         }
@@ -105,7 +111,7 @@ impl Database {
 
     /// Open database with persistence and recovery
     pub fn open(config: DatabaseConfig) -> Result<Self> {
-        log_info!("Opening TiSQL database at {:?}", config.data_dir);
+        log_info!("Opening TiSQL database at {:?} (MVCC enabled)", config.data_dir);
 
         if !config.durability {
             return Ok(Self::new());
@@ -118,11 +124,15 @@ impl Database {
         let (clog_service, entries) = FileClogService::recover(clog_config)?;
         let clog_service = Arc::new(clog_service);
 
-        // Create storage and transaction service
-        let storage = Arc::new(MemTableEngine::new());
+        // Create concurrency manager and storage
+        let concurrency_manager = Arc::new(ConcurrencyManager::new(1));
+        let storage = Arc::new(MvccMemTableEngine::new(Arc::clone(&concurrency_manager)));
+
+        // Create transaction service
         let txn_service = Arc::new(TransactionService::new(
             Arc::clone(&storage),
             Arc::clone(&clog_service),
+            Arc::clone(&concurrency_manager),
         ));
 
         // Recover state by replaying commit log
@@ -146,6 +156,7 @@ impl Database {
             catalog,
             parser: Parser::new(),
             executor: SimpleExecutor::new(),
+            concurrency_manager,
             clog_service: Some(clog_service),
             txn_service: Some(txn_service),
         })
@@ -291,8 +302,13 @@ impl Database {
     }
 
     /// Get reference to storage engine (for testing)
-    pub fn storage(&self) -> &MemTableEngine {
+    pub fn storage(&self) -> &MvccMemTableEngine {
         &self.storage
+    }
+
+    /// Get reference to concurrency manager
+    pub fn concurrency_manager(&self) -> &ConcurrencyManager {
+        &self.concurrency_manager
     }
 }
 

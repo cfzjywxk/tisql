@@ -42,6 +42,10 @@ clap = { version = "4", features = ["derive"] }
 yatp = { git = "https://github.com/tikv/yatp.git" }
 num_cpus = "1"
 
+# Concurrent data structures for MVCC
+crossbeam-skiplist = "0.1"
+crossbeam-epoch = "0.9"
+
 [dev-dependencies]
 criterion = "0.5"
 tempfile = "3"

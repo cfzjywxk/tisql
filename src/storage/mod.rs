@@ -28,8 +28,10 @@
 //! The storage layer is agnostic to key structure - it just stores bytes.
 
 mod memtable;
+mod mvcc_memtable;
 
 pub use memtable::MemTableEngine;
+pub use mvcc_memtable::MvccMemTableEngine;
 
 use crate::error::Result;
 use crate::types::{Key, RawValue, TableId, Timestamp};
@@ -131,6 +133,8 @@ pub enum WriteOp {
 #[derive(Default, Clone)]
 pub struct WriteBatch {
     ops: Vec<WriteOp>,
+    /// Commit timestamp for MVCC (set by TransactionService)
+    commit_ts: Option<Timestamp>,
 }
 
 impl WriteBatch {
@@ -177,5 +181,23 @@ impl WriteBatch {
     /// Consume the batch and return the operations.
     pub(crate) fn into_ops(self) -> Vec<WriteOp> {
         self.ops
+    }
+
+    /// Set the commit timestamp for MVCC.
+    pub fn set_commit_ts(&mut self, ts: Timestamp) {
+        self.commit_ts = Some(ts);
+    }
+
+    /// Get the commit timestamp.
+    pub fn commit_ts(&self) -> Option<Timestamp> {
+        self.commit_ts
+    }
+
+    /// Get all keys in this batch.
+    pub fn keys(&self) -> impl Iterator<Item = &Key> {
+        self.ops.iter().map(|op| match op {
+            WriteOp::Put { key, .. } => key,
+            WriteOp::Delete { key } => key,
+        })
     }
 }

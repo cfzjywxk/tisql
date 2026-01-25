@@ -667,6 +667,7 @@ fn tisql_error_kind(err: &TiSqlError) -> String {
         TiSqlError::DuplicateKey(_) => "DuplicateKey".into(),
         TiSqlError::TransactionConflict => "TransactionConflict".into(),
         TiSqlError::TransactionAborted => "TransactionAborted".into(),
+        TiSqlError::KeyIsLocked { .. } => "KeyIsLocked".into(),
         TiSqlError::Io(_) => "Io".into(),
         TiSqlError::Internal(_) => "Internal".into(),
         TiSqlError::Codec(_) => "Codec".into(),
