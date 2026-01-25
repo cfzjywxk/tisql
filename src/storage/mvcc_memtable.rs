@@ -85,6 +85,23 @@ struct MvccMemTableInner<T: TsoService> {
 ///
 /// This engine stores multiple versions of each key, keyed by `user_key || !commit_ts`.
 /// Reads automatically find the latest visible version.
+///
+/// # IMPORTANT: Use TxnService for All Reads
+///
+/// **Do not use this engine's read methods directly.** All reads should go through
+/// [`TxnService`](crate::transaction::TxnService) to ensure proper MVCC semantics:
+///
+/// ```ignore
+/// // WRONG - bypasses MVCC visibility
+/// let value = engine.get(key)?;
+///
+/// // CORRECT - respects transaction isolation
+/// let ctx = txn_service.begin(true)?;
+/// let value = txn_service.get(&ctx, key)?;
+/// ```
+///
+/// The `StorageEngine` trait methods are implemented for internal use by
+/// `TransactionService` only.
 pub struct MvccMemTableEngine<T: TsoService = crate::tso::LocalTso> {
     inner: Arc<MvccMemTableInner<T>>,
 }

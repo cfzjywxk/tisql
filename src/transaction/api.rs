@@ -121,11 +121,40 @@ impl TxnCtx {
     }
 }
 
-/// Transaction Service - the unified interface for all transaction operations.
+/// Transaction Service - **THE** interface for all data access operations.
 ///
 /// This follows OceanBase's `ObTransService` pattern where all transaction
 /// operations go through a single service interface. Transaction state is
 /// held in `TxnCtx` and passed to each operation.
+///
+/// # IMPORTANT: Always Use TxnService for Reads
+///
+/// **All reads MUST go through `TxnService`** to ensure proper MVCC semantics.
+/// Do not access `StorageEngine` directly for reading data.
+///
+/// ```ignore
+/// // CORRECT: MVCC-aware read with transaction semantics
+/// let ctx = txn_service.begin(true)?;  // read-only transaction
+/// let value = txn_service.get(&ctx, key)?;
+/// let iter = txn_service.scan(&ctx, range)?;
+///
+/// // WRONG: Bypasses MVCC visibility rules
+/// let value = storage.get(key)?;  // DON'T DO THIS
+/// ```
+///
+/// ## Why TxnService for Reads?
+///
+/// 1. **MVCC Visibility**: Reads see data at `ctx.start_ts`, ignoring uncommitted
+///    writes and later commits for snapshot isolation.
+///
+/// 2. **Lock Checking**: Reads check for conflicting locks from concurrent
+///    transactions, returning `KeyIsLocked` error when blocked.
+///
+/// 3. **Read-Your-Writes**: Within a transaction, reads see buffered writes
+///    that haven't been committed yet.
+///
+/// 4. **Consistent Timestamps**: The `TxnCtx` carries `start_ts` for debugging
+///    and ensures all operations in a transaction use the same snapshot.
 ///
 /// ## Design Rationale
 ///
