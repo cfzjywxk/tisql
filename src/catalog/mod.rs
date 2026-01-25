@@ -25,20 +25,25 @@
 //! - `TableDef`, `ColumnDef`, `IndexDef` - Schema definitions
 
 mod memory;
+mod mvcc;
 
 // Crate-internal implementation - not exposed publicly
 // External users only see the Catalog trait
+#[allow(unused_imports)]
 pub(crate) use memory::MemoryCatalog;
+pub(crate) use mvcc::MvccCatalog;
+
+use serde::{Deserialize, Serialize};
 
 use crate::error::Result;
-use crate::types::{ColumnId, DataType, IndexId, TableId};
+use crate::types::{ColumnId, DataType, IndexId, TableId, Timestamp};
 
 // ============================================================================
 // Column Definition
 // ============================================================================
 
 /// Definition of a table column.
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct ColumnDef {
     id: ColumnId,
     name: String,
@@ -106,7 +111,7 @@ impl ColumnDef {
 }
 
 /// Default value for a column.
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, Serialize, Deserialize)]
 pub enum DefaultValue {
     Null,
     Int(i64),
@@ -121,7 +126,7 @@ pub enum DefaultValue {
 // ============================================================================
 
 /// Definition of an index.
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct IndexDef {
     id: IndexId,
     name: String,
@@ -170,7 +175,7 @@ impl IndexDef {
 // ============================================================================
 
 /// Definition of a table.
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct TableDef {
     id: TableId,
     name: String,
@@ -345,4 +350,50 @@ pub trait Catalog: Send + Sync {
 
     /// Generate a new unique index ID.
     fn next_index_id(&self) -> Result<IndexId>;
+
+    // MVCC-aware reads (for schema versioning)
+
+    /// Get a table at a specific timestamp.
+    ///
+    /// This enables MVCC schema versioning - transactions see the schema
+    /// as it existed at their start timestamp.
+    fn get_table_at(&self, schema: &str, table: &str, ts: Timestamp) -> Result<Option<TableDef>> {
+        // Default implementation ignores timestamp (backward compatibility)
+        let _ = ts;
+        self.get_table(schema, table)
+    }
+
+    /// Get a table by ID at a specific timestamp.
+    fn get_table_by_id_at(&self, id: TableId, ts: Timestamp) -> Result<Option<TableDef>> {
+        // Default implementation ignores timestamp (backward compatibility)
+        let _ = ts;
+        self.get_table_by_id(id)
+    }
+
+    /// List all tables in a schema at a specific timestamp.
+    fn list_tables_at(&self, schema: &str, ts: Timestamp) -> Result<Vec<TableDef>> {
+        // Default implementation ignores timestamp (backward compatibility)
+        let _ = ts;
+        self.list_tables(schema)
+    }
+
+    /// Check if a schema exists at a specific timestamp.
+    fn schema_exists_at(&self, name: &str, ts: Timestamp) -> Result<bool> {
+        // Default implementation ignores timestamp (backward compatibility)
+        let _ = ts;
+        self.schema_exists(name)
+    }
+
+    // Schema version for DDL/DML concurrency control
+
+    /// Get the current schema version.
+    ///
+    /// This is used for DDL/DML concurrency control. DML transactions
+    /// capture the schema version at start and check it at commit time.
+    /// If the version changed, the transaction is aborted.
+    ///
+    /// Default implementation returns 0 (no versioning).
+    fn current_schema_version(&self) -> u64 {
+        0
+    }
 }

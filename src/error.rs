@@ -64,6 +64,9 @@ pub enum TiSqlError {
         primary: Vec<u8>,
     },
 
+    #[error("Schema changed during transaction, please retry")]
+    SchemaChanged,
+
     #[error("IO error: {0}")]
     Io(#[from] std::io::Error),
 

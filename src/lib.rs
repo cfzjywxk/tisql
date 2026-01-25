@@ -75,7 +75,7 @@ pub mod testkit {
 }
 
 // Internal imports (not re-exported)
-use catalog::MemoryCatalog;
+use catalog::MvccCatalog;
 use clog::{FileClogConfig, FileClogService};
 use error::Result;
 use executor::{ExecutionResult, Executor, SimpleExecutor};
@@ -158,13 +158,35 @@ impl SQLEngine {
         // Parse SQL text into AST
         let stmt = self.parser.parse_one(sql)?;
 
-        // Bind (semantic analysis, name resolution)
-        let binder = Binder::new(catalog, &query_ctx.current_db);
+        // For DDL statements, use the latest schema (no snapshot_ts).
+        // For DML/DQL statements, use current_ts for MVCC schema visibility.
+        let binder = if Self::is_ddl(&stmt) {
+            Binder::new(catalog, &query_ctx.current_db)
+        } else {
+            Binder::with_snapshot_ts(catalog, &query_ctx.current_db, txn_service.current_ts())
+        };
         let plan = binder.bind(stmt)?;
 
         // Execute through TxnService
         // TODO: Use query_ctx for execution options (priority, isolation level, etc.)
         self.executor.execute(plan, txn_service, catalog)
+    }
+
+    /// Check if a statement is DDL (schema-modifying).
+    fn is_ddl(stmt: &sqlparser::ast::Statement) -> bool {
+        use sqlparser::ast::Statement;
+        matches!(
+            stmt,
+            Statement::CreateTable { .. }
+                | Statement::CreateIndex { .. }
+                | Statement::CreateDatabase { .. }
+                | Statement::CreateSchema { .. }
+                | Statement::CreateView { .. }
+                | Statement::AlterTable { .. }
+                | Statement::AlterIndex { .. }
+                | Statement::Drop { .. }
+                | Statement::Truncate { .. }
+        )
     }
 }
 
@@ -195,13 +217,16 @@ type DbTxnService = TransactionService<DbStorage, FileClogService, LocalTso>;
 /// - Clog implementation - not exposed
 ///
 /// External callers interact only through public methods like `handle_mp_query`.
+/// Internal type alias for concrete catalog.
+type DbCatalog = MvccCatalog<DbTxnService>;
+
 pub struct Database {
     /// SQL engine for parsing, binding, execution (encapsulated)
     sql_engine: SQLEngine,
     /// Transaction service - internal implementation hidden
     txn_service: Arc<DbTxnService>,
-    /// Schema metadata catalog
-    catalog: MemoryCatalog,
+    /// Schema metadata catalog (MVCC-based, persistent)
+    catalog: DbCatalog,
 }
 
 impl Database {
@@ -236,6 +261,7 @@ impl Database {
         ));
 
         // Recover state by replaying commit log
+        // This also recovers catalog metadata (stored with 'm' prefix keys)
         if !entries.is_empty() {
             let stats = txn_service.recover(&entries)?;
             log_info!(
@@ -247,8 +273,17 @@ impl Database {
             );
         }
 
-        // Create catalog (TODO: persist and recover catalog metadata)
-        let catalog = MemoryCatalog::new();
+        // Create MVCC catalog using same txn_service
+        let catalog = MvccCatalog::new(Arc::clone(&txn_service));
+
+        // Bootstrap if fresh database (no default schema exists)
+        if !catalog.is_bootstrapped()? {
+            log_info!("Fresh database - bootstrapping catalog");
+            catalog.bootstrap()?;
+        } else {
+            // Load schema version from storage for existing database
+            catalog.load_schema_version()?;
+        }
 
         Ok(Self {
             sql_engine: SQLEngine::new(),

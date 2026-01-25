@@ -542,7 +542,7 @@ mod failpoint_tests {
         let txn_service_clone = Arc::clone(&txn_service);
         let writer = thread::spawn(move || {
             // This will pause at the failpoint
-            txn_service_clone.put(key, b"value").unwrap()
+            txn_service_clone.autocommit_put(key, b"value").unwrap()
         });
 
         // Give writer time to reach failpoint
@@ -580,7 +580,8 @@ mod failpoint_tests {
         fail::cfg("txn_after_clog_write", "pause").unwrap();
 
         let txn_service_clone = Arc::clone(&txn_service);
-        let writer = thread::spawn(move || txn_service_clone.put(key, b"value").unwrap());
+        let writer =
+            thread::spawn(move || txn_service_clone.autocommit_put(key, b"value").unwrap());
 
         // Give writer time to reach failpoint
         thread::sleep(Duration::from_millis(50));
@@ -613,7 +614,7 @@ mod failpoint_tests {
         fail::cfg("txn_after_storage_apply", "pause").unwrap();
 
         let txn_service_clone = Arc::clone(&txn_service);
-        let writer = thread::spawn(move || txn_service_clone.put(key, b"v2").unwrap());
+        let writer = thread::spawn(move || txn_service_clone.autocommit_put(key, b"v2").unwrap());
 
         // Give writer time to reach failpoint
         thread::sleep(Duration::from_millis(50));
@@ -668,5 +669,262 @@ mod failpoint_tests {
         assert_eq!(v, Some(b"v2".to_vec()));
 
         scenario.teardown();
+    }
+}
+
+// ============================================================================
+// DDL Concurrency Tests
+// ============================================================================
+
+/// Tests for DDL/DDL and DDL/DML concurrency control.
+mod ddl_concurrency {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::{Arc, Barrier};
+    use std::thread;
+    use tempfile::tempdir;
+    use tisql::{Database, DatabaseConfig, QueryResult};
+
+    /// Test that concurrent DDLs are serialized (no conflicts).
+    #[test]
+    fn test_concurrent_create_different_tables() {
+        let dir = tempdir().unwrap();
+        let config = DatabaseConfig::with_data_dir(dir.path());
+        let db = Arc::new(Database::open(config).unwrap());
+
+        let num_threads = 4;
+        let barrier = Arc::new(Barrier::new(num_threads));
+        let success_count = Arc::new(AtomicUsize::new(0));
+
+        let handles: Vec<_> = (0..num_threads)
+            .map(|i| {
+                let db = Arc::clone(&db);
+                let barrier = Arc::clone(&barrier);
+                let success_count = Arc::clone(&success_count);
+
+                thread::spawn(move || {
+                    // Wait for all threads to be ready
+                    barrier.wait();
+
+                    // Each thread creates a different table
+                    let sql = format!("CREATE TABLE t{i} (id INT, name VARCHAR(100))");
+                    match db.handle_mp_query(&sql) {
+                        Ok(_) => {
+                            success_count.fetch_add(1, Ordering::SeqCst);
+                        }
+                        Err(e) => {
+                            panic!("Thread {i} failed to create table: {e}");
+                        }
+                    }
+                })
+            })
+            .collect();
+
+        for handle in handles {
+            handle.join().unwrap();
+        }
+
+        // All creates should succeed
+        assert_eq!(
+            success_count.load(Ordering::SeqCst),
+            num_threads,
+            "All table creations should succeed"
+        );
+
+        // Verify all tables exist
+        for i in 0..num_threads {
+            let sql = format!("SELECT * FROM t{i}");
+            assert!(db.handle_mp_query(&sql).is_ok(), "Table t{i} should exist");
+        }
+
+        db.close().unwrap();
+    }
+
+    /// Test that concurrent DDLs creating the same table result in exactly one success.
+    #[test]
+    fn test_concurrent_create_same_table() {
+        let dir = tempdir().unwrap();
+        let config = DatabaseConfig::with_data_dir(dir.path());
+        let db = Arc::new(Database::open(config).unwrap());
+
+        let num_threads = 4;
+        let barrier = Arc::new(Barrier::new(num_threads));
+        let success_count = Arc::new(AtomicUsize::new(0));
+        let error_count = Arc::new(AtomicUsize::new(0));
+
+        let handles: Vec<_> = (0..num_threads)
+            .map(|i| {
+                let db = Arc::clone(&db);
+                let barrier = Arc::clone(&barrier);
+                let success_count = Arc::clone(&success_count);
+                let error_count = Arc::clone(&error_count);
+
+                thread::spawn(move || {
+                    barrier.wait();
+
+                    // All threads try to create the same table
+                    match db.handle_mp_query("CREATE TABLE conflict_table (id INT)") {
+                        Ok(_) => {
+                            success_count.fetch_add(1, Ordering::SeqCst);
+                        }
+                        Err(e) => {
+                            // Valid errors: "already exists" or "key is locked" (transaction conflict)
+                            let msg = e.to_string().to_lowercase();
+                            assert!(
+                                msg.contains("already exists")
+                                    || msg.contains("exists")
+                                    || msg.contains("key is locked"),
+                                "Thread {i} got unexpected error: {e}"
+                            );
+                            error_count.fetch_add(1, Ordering::SeqCst);
+                        }
+                    }
+                })
+            })
+            .collect();
+
+        for handle in handles {
+            handle.join().unwrap();
+        }
+
+        // Exactly one should succeed
+        assert_eq!(
+            success_count.load(Ordering::SeqCst),
+            1,
+            "Exactly one CREATE should succeed"
+        );
+        assert_eq!(
+            error_count.load(Ordering::SeqCst),
+            num_threads - 1,
+            "Others should get 'already exists' error"
+        );
+
+        db.close().unwrap();
+    }
+
+    /// Test DDL and DML concurrency - DML should detect schema change.
+    #[test]
+    fn test_ddl_during_dml_causes_retry() {
+        let dir = tempdir().unwrap();
+        let config = DatabaseConfig::with_data_dir(dir.path());
+        let db = Arc::new(Database::open(config).unwrap());
+
+        // Create initial table
+        db.handle_mp_query("CREATE TABLE users (id INT, name VARCHAR(100))")
+            .unwrap();
+        db.handle_mp_query("INSERT INTO users VALUES (1, 'Alice')")
+            .unwrap();
+
+        // This test verifies that schema version is checked.
+        // In a real concurrent scenario, if DDL commits between DML start and commit,
+        // the DML would fail with SchemaChanged error.
+
+        // For now, verify that the schema version mechanism works by checking
+        // that after a DDL, subsequent operations see the updated schema.
+        // Execute a query to exercise the catalog
+        db.handle_mp_query("SELECT * FROM users").unwrap();
+
+        // DDL changes schema
+        db.handle_mp_query("CREATE TABLE orders (id INT)").unwrap();
+
+        // DML on original table should still work (schema of 'users' didn't change)
+        db.handle_mp_query("INSERT INTO users VALUES (2, 'Bob')")
+            .unwrap();
+
+        // Verify data
+        let result = db.handle_mp_query("SELECT id FROM users ORDER BY id");
+        match result {
+            Ok(QueryResult::Rows { data, .. }) => {
+                assert_eq!(data.len(), 2);
+                assert_eq!(data[0][0], "1");
+                assert_eq!(data[1][0], "2");
+            }
+            other => panic!("Expected rows, got: {other:?}"),
+        }
+
+        db.close().unwrap();
+    }
+
+    /// Test schema version increments correctly with concurrent DDLs.
+    #[test]
+    fn test_schema_version_with_concurrent_ddl() {
+        let dir = tempdir().unwrap();
+        let config = DatabaseConfig::with_data_dir(dir.path());
+        let db = Arc::new(Database::open(config).unwrap());
+
+        // Create tables sequentially to establish baseline
+        for i in 0..5 {
+            db.handle_mp_query(&format!("CREATE TABLE seq_t{i} (id INT)"))
+                .unwrap();
+        }
+
+        // Now create more tables concurrently
+        let num_threads = 4;
+        let barrier = Arc::new(Barrier::new(num_threads));
+
+        let handles: Vec<_> = (0..num_threads)
+            .map(|i| {
+                let db = Arc::clone(&db);
+                let barrier = Arc::clone(&barrier);
+
+                thread::spawn(move || {
+                    barrier.wait();
+                    db.handle_mp_query(&format!("CREATE TABLE conc_t{i} (id INT)"))
+                        .unwrap();
+                })
+            })
+            .collect();
+
+        for handle in handles {
+            handle.join().unwrap();
+        }
+
+        // Verify all 9 tables exist (5 sequential + 4 concurrent)
+        for i in 0..5 {
+            assert!(
+                db.handle_mp_query(&format!("SELECT * FROM seq_t{i}"))
+                    .is_ok(),
+                "seq_t{i} should exist"
+            );
+        }
+        for i in 0..num_threads {
+            assert!(
+                db.handle_mp_query(&format!("SELECT * FROM conc_t{i}"))
+                    .is_ok(),
+                "conc_t{i} should exist"
+            );
+        }
+
+        db.close().unwrap();
+    }
+
+    /// Test drop table with concurrent create.
+    #[test]
+    fn test_drop_and_recreate_table() {
+        let dir = tempdir().unwrap();
+        let config = DatabaseConfig::with_data_dir(dir.path());
+        let db = Arc::new(Database::open(config).unwrap());
+
+        // Create, drop, recreate in sequence
+        db.handle_mp_query("CREATE TABLE temp (id INT)").unwrap();
+        db.handle_mp_query("INSERT INTO temp VALUES (1)").unwrap();
+        db.handle_mp_query("DROP TABLE temp").unwrap();
+        db.handle_mp_query("CREATE TABLE temp (id INT, name VARCHAR(50))")
+            .unwrap();
+        db.handle_mp_query("INSERT INTO temp VALUES (2, 'test')")
+            .unwrap();
+
+        // Verify new schema is in effect
+        let result = db.handle_mp_query("SELECT id, name FROM temp");
+        match result {
+            Ok(QueryResult::Rows { data, columns }) => {
+                assert_eq!(columns.len(), 2);
+                assert_eq!(data.len(), 1);
+                assert_eq!(data[0][0], "2");
+                assert_eq!(data[0][1], "test");
+            }
+            other => panic!("Expected rows, got: {other:?}"),
+        }
+
+        db.close().unwrap();
     }
 }

@@ -367,3 +367,162 @@ mod errors {
 // 1. Aggregate functions (COUNT, SUM, AVG, MIN, MAX) do not properly collapse rows
 // 2. UPDATE with expression (val = val + 1) has issues with row key generation
 // These behaviors are captured by E2E tests in tests/integrationtest/ for regression detection.
+
+/// Persistence tests - verify data and catalog survive restart
+mod persistence {
+    use tempfile::tempdir;
+    use tisql::{Database, DatabaseConfig, QueryResult};
+
+    #[test]
+    fn test_catalog_survives_restart() {
+        let dir = tempdir().unwrap();
+        let config = DatabaseConfig::with_data_dir(dir.path());
+
+        // First session: create table and insert data
+        {
+            let db = Database::open(config.clone()).unwrap();
+            db.handle_mp_query("CREATE TABLE users (id INT, name VARCHAR(100))")
+                .unwrap();
+            db.handle_mp_query("INSERT INTO users VALUES (1, 'Alice')")
+                .unwrap();
+            db.handle_mp_query("INSERT INTO users VALUES (2, 'Bob')")
+                .unwrap();
+            db.close().unwrap();
+        }
+
+        // Second session: verify table and data exist
+        {
+            let db = Database::open(config.clone()).unwrap();
+
+            // Table should exist
+            let result = db.handle_mp_query("SELECT id, name FROM users ORDER BY id");
+            match result {
+                Ok(QueryResult::Rows { data, columns }) => {
+                    assert_eq!(columns, vec!["id", "name"]);
+                    assert_eq!(data.len(), 2);
+                    assert_eq!(data[0][0], "1");
+                    assert_eq!(data[0][1], "Alice");
+                    assert_eq!(data[1][0], "2");
+                    assert_eq!(data[1][1], "Bob");
+                }
+                other => panic!("Expected rows, got: {other:?}"),
+            }
+            db.close().unwrap();
+        }
+    }
+
+    #[test]
+    fn test_multiple_tables_survive_restart() {
+        let dir = tempdir().unwrap();
+        let config = DatabaseConfig::with_data_dir(dir.path());
+
+        // First session: create multiple tables
+        {
+            let db = Database::open(config.clone()).unwrap();
+            db.handle_mp_query("CREATE TABLE t1 (a INT)").unwrap();
+            db.handle_mp_query("CREATE TABLE t2 (b INT, c INT)")
+                .unwrap();
+            db.handle_mp_query("INSERT INTO t1 VALUES (100)").unwrap();
+            db.handle_mp_query("INSERT INTO t2 VALUES (200, 300)")
+                .unwrap();
+            db.close().unwrap();
+        }
+
+        // Second session: verify both tables exist
+        {
+            let db = Database::open(config.clone()).unwrap();
+
+            // Check t1
+            let result = db.handle_mp_query("SELECT a FROM t1").unwrap();
+            match result {
+                QueryResult::Rows { data, .. } => {
+                    assert_eq!(data.len(), 1);
+                    assert_eq!(data[0][0], "100");
+                }
+                other => panic!("Expected rows for t1, got: {other:?}"),
+            }
+
+            // Check t2
+            let result = db.handle_mp_query("SELECT b, c FROM t2").unwrap();
+            match result {
+                QueryResult::Rows { data, .. } => {
+                    assert_eq!(data.len(), 1);
+                    assert_eq!(data[0][0], "200");
+                    assert_eq!(data[0][1], "300");
+                }
+                other => panic!("Expected rows for t2, got: {other:?}"),
+            }
+            db.close().unwrap();
+        }
+    }
+
+    #[test]
+    fn test_drop_table_persists() {
+        let dir = tempdir().unwrap();
+        let config = DatabaseConfig::with_data_dir(dir.path());
+
+        // First session: create and drop a table
+        {
+            let db = Database::open(config.clone()).unwrap();
+            db.handle_mp_query("CREATE TABLE temp (x INT)").unwrap();
+            db.handle_mp_query("INSERT INTO temp VALUES (1)").unwrap();
+            db.handle_mp_query("DROP TABLE temp").unwrap();
+            // Create another table to verify we can still create tables
+            db.handle_mp_query("CREATE TABLE perm (y INT)").unwrap();
+            db.handle_mp_query("INSERT INTO perm VALUES (2)").unwrap();
+            db.close().unwrap();
+        }
+
+        // Second session: verify temp is gone but perm exists
+        {
+            let db = Database::open(config.clone()).unwrap();
+
+            // temp should not exist
+            let result = db.handle_mp_query("SELECT * FROM temp");
+            assert!(result.is_err(), "temp table should not exist after restart");
+
+            // perm should exist
+            let result = db.handle_mp_query("SELECT y FROM perm").unwrap();
+            match result {
+                QueryResult::Rows { data, .. } => {
+                    assert_eq!(data.len(), 1);
+                    assert_eq!(data[0][0], "2");
+                }
+                other => panic!("Expected rows for perm, got: {other:?}"),
+            }
+            db.close().unwrap();
+        }
+    }
+
+    #[test]
+    fn test_table_id_persists() {
+        let dir = tempdir().unwrap();
+        let config = DatabaseConfig::with_data_dir(dir.path());
+
+        // First session: create tables
+        {
+            let db = Database::open(config.clone()).unwrap();
+            db.handle_mp_query("CREATE TABLE t1 (a INT)").unwrap();
+            db.handle_mp_query("CREATE TABLE t2 (b INT)").unwrap();
+            db.close().unwrap();
+        }
+
+        // Second session: create more tables - IDs should continue from where we left off
+        {
+            let db = Database::open(config.clone()).unwrap();
+            // This should succeed without ID conflict
+            db.handle_mp_query("CREATE TABLE t3 (c INT)").unwrap();
+            db.handle_mp_query("INSERT INTO t3 VALUES (333)").unwrap();
+
+            let result = db.handle_mp_query("SELECT c FROM t3").unwrap();
+            match result {
+                QueryResult::Rows { data, .. } => {
+                    assert_eq!(data.len(), 1);
+                    assert_eq!(data[0][0], "333");
+                }
+                other => panic!("Expected rows, got: {other:?}"),
+            }
+            db.close().unwrap();
+        }
+    }
+}

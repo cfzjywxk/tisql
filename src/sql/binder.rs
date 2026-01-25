@@ -19,7 +19,7 @@ use sqlparser::ast::{
 
 use crate::catalog::{Catalog, ColumnDef, TableDef};
 use crate::error::{Result, TiSqlError};
-use crate::types::{ColumnInfo, DataType, Schema, Value};
+use crate::types::{ColumnInfo, DataType, Schema, Timestamp, Value};
 
 use super::plan::{AggFunc, BinaryOp, Expr, JoinType, LogicalPlan, OrderByExpr, UnaryOp};
 
@@ -27,13 +27,29 @@ use super::plan::{AggFunc, BinaryOp, Expr, JoinType, LogicalPlan, OrderByExpr, U
 pub struct Binder<'a> {
     catalog: &'a dyn Catalog,
     current_schema: String,
+    /// Timestamp for MVCC schema reads. If None, uses latest schema.
+    snapshot_ts: Option<Timestamp>,
 }
 
 impl<'a> Binder<'a> {
+    /// Create a new Binder that reads the latest schema (for DDL).
     pub fn new(catalog: &'a dyn Catalog, current_schema: &str) -> Self {
         Self {
             catalog,
             current_schema: current_schema.to_string(),
+            snapshot_ts: None,
+        }
+    }
+
+    /// Create a new Binder with a specific snapshot timestamp (for DML/DQL).
+    ///
+    /// This enables MVCC schema visibility - the Binder will see the schema
+    /// as it existed at the specified timestamp.
+    pub fn with_snapshot_ts(catalog: &'a dyn Catalog, current_schema: &str, ts: Timestamp) -> Self {
+        Self {
+            catalog,
+            current_schema: current_schema.to_string(),
+            snapshot_ts: Some(ts),
         }
     }
 
@@ -285,10 +301,12 @@ impl<'a> Binder<'a> {
                     return Err(TiSqlError::Bind("Invalid table name".into()));
                 };
 
-                let table_def = self
-                    .catalog
-                    .get_table(schema, table)?
-                    .ok_or_else(|| TiSqlError::TableNotFound(format!("{schema}.{table}")))?;
+                // Use MVCC-aware schema lookup if snapshot_ts is set
+                let table_def = match self.snapshot_ts {
+                    Some(ts) => self.catalog.get_table_at(schema, table, ts)?,
+                    None => self.catalog.get_table(schema, table)?,
+                }
+                .ok_or_else(|| TiSqlError::TableNotFound(format!("{schema}.{table}")))?;
 
                 Ok(LogicalPlan::Scan {
                     table: table_def,
@@ -557,10 +575,12 @@ impl<'a> Binder<'a> {
         source: Option<Box<Query>>,
     ) -> Result<LogicalPlan> {
         let name = table_name.to_string();
-        let table = self
-            .catalog
-            .get_table(&self.current_schema, &name)?
-            .ok_or_else(|| TiSqlError::TableNotFound(name.clone()))?;
+        // Use MVCC-aware schema lookup if snapshot_ts is set
+        let table = match self.snapshot_ts {
+            Some(ts) => self.catalog.get_table_at(&self.current_schema, &name, ts)?,
+            None => self.catalog.get_table(&self.current_schema, &name)?,
+        }
+        .ok_or_else(|| TiSqlError::TableNotFound(name.clone()))?;
 
         let col_ids: Vec<u32> = if columns.is_empty() {
             // All columns

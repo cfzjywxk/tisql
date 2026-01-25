@@ -79,6 +79,7 @@ impl SimpleExecutor {
     /// Execute a write plan using a read-write transaction.
     ///
     /// Creates a transaction, executes writes (buffered), then commits.
+    /// Checks schema version at commit to detect concurrent DDL changes.
     fn execute_write<T: TxnService, C: Catalog>(
         &self,
         plan: LogicalPlan,
@@ -93,11 +94,22 @@ impl SimpleExecutor {
             _ => {}
         }
 
+        // Capture schema version at start (no IO - just atomic read)
+        let schema_version_at_start = catalog.current_schema_version();
+
         // Begin a read-write transaction (allocates txn_id and start_ts)
         let mut ctx = txn_service.begin(false)?;
 
         // Execute the write plan and get the result
         let result = self.execute_write_with_ctx(plan, &mut ctx, txn_service, catalog)?;
+
+        // Check schema version before commit (no IO - just atomic read)
+        // This read lock will block if DDL is in the middle of committing
+        let schema_version_now = catalog.current_schema_version();
+        if schema_version_now != schema_version_at_start {
+            txn_service.rollback(ctx)?;
+            return Err(TiSqlError::SchemaChanged);
+        }
 
         // Commit the transaction
         txn_service.commit(ctx)?;
