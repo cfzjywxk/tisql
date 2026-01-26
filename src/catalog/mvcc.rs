@@ -731,14 +731,14 @@ mod tests {
     use super::*;
     use crate::catalog::ColumnDef;
     use crate::clog::{FileClogConfig, FileClogService};
-    use crate::storage::ArenaMemTableEngine;
+    use crate::storage::MemTableEngine;
     use crate::transaction::{ConcurrencyManager, TransactionService};
     use crate::tso::LocalTso;
     use crate::types::DataType;
     use std::sync::Arc;
     use tempfile::tempdir;
 
-    type TestTxnService = TransactionService<ArenaMemTableEngine, FileClogService, LocalTso>;
+    type TestTxnService = TransactionService<MemTableEngine, FileClogService, LocalTso>;
 
     fn create_test_catalog() -> (MvccCatalog<TestTxnService>, tempfile::TempDir) {
         let dir = tempdir().unwrap();
@@ -748,7 +748,7 @@ mod tests {
 
         let tso = Arc::new(LocalTso::new(1));
         let concurrency_manager = Arc::new(ConcurrencyManager::new(0));
-        let storage = Arc::new(ArenaMemTableEngine::new());
+        let storage = Arc::new(MemTableEngine::new());
 
         let txn_service = Arc::new(TransactionService::new(
             Arc::clone(&storage),
@@ -942,7 +942,7 @@ mod tests {
 
             let tso = Arc::new(LocalTso::new(1));
             let concurrency_manager = Arc::new(ConcurrencyManager::new(0));
-            let storage = Arc::new(ArenaMemTableEngine::new());
+            let storage = Arc::new(MemTableEngine::new());
 
             let txn_service = Arc::new(TransactionService::new(
                 Arc::clone(&storage),
@@ -975,7 +975,7 @@ mod tests {
 
             let tso = Arc::new(LocalTso::new(1));
             let concurrency_manager = Arc::new(ConcurrencyManager::new(0));
-            let storage = Arc::new(ArenaMemTableEngine::new());
+            let storage = Arc::new(MemTableEngine::new());
 
             let txn_service = Arc::new(TransactionService::new(
                 Arc::clone(&storage),

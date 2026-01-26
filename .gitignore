@@ -12,6 +12,7 @@ target/
 
 # Development design documents (keep local only)
 docs/
+doc/
 
 # Claude Code project instructions (local only)
 CLAUDE.md

@@ -503,11 +503,11 @@ impl RecoveryStats {
 mod tests {
     use super::*;
     use crate::clog::{FileClogConfig, FileClogService};
-    use crate::storage::ArenaMemTableEngine;
+    use crate::storage::MemTableEngine;
     use crate::tso::LocalTso;
     use tempfile::tempdir;
 
-    type TestStorage = ArenaMemTableEngine;
+    type TestStorage = MemTableEngine;
 
     fn create_test_service() -> (
         Arc<TestStorage>,
@@ -519,7 +519,7 @@ mod tests {
         let clog_service = Arc::new(FileClogService::open(config).unwrap());
         let tso = Arc::new(LocalTso::new(1));
         let cm = Arc::new(ConcurrencyManager::new(0));
-        let storage = Arc::new(ArenaMemTableEngine::new());
+        let storage = Arc::new(MemTableEngine::new());
         let txn_service = TransactionService::new(Arc::clone(&storage), clog_service, tso, cm);
         (storage, txn_service, dir)
     }
@@ -574,7 +574,7 @@ mod tests {
             let clog_service = Arc::new(FileClogService::open(config.clone()).unwrap());
             let tso = Arc::new(LocalTso::new(1));
             let cm = Arc::new(ConcurrencyManager::new(0));
-            let storage = Arc::new(ArenaMemTableEngine::new());
+            let storage = Arc::new(MemTableEngine::new());
             let txn_service = TransactionService::new(storage, clog_service.clone(), tso, cm);
 
             txn_service.autocommit_put(b"k1", b"v1").unwrap();
@@ -589,7 +589,7 @@ mod tests {
         let clog_service = Arc::new(clog_service);
         let tso = Arc::new(LocalTso::new(1));
         let cm = Arc::new(ConcurrencyManager::new(0));
-        let storage = Arc::new(ArenaMemTableEngine::new());
+        let storage = Arc::new(MemTableEngine::new());
         let txn_service = TransactionService::new(Arc::clone(&storage), clog_service, tso, cm);
 
         let stats = txn_service.recover(&entries).unwrap();

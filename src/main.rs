@@ -12,6 +12,12 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+// Use jemalloc as the global allocator on Unix (like TiKV)
+// This provides better performance for concurrent workloads
+#[cfg(all(unix, feature = "jemalloc"))]
+#[global_allocator]
+static GLOBAL: tikv_jemallocator::Jemalloc = tikv_jemallocator::Jemalloc;
+
 use std::net::SocketAddr;
 use std::sync::Arc;
 

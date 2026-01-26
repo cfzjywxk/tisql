@@ -27,9 +27,7 @@
 //! | Crossbeam      | Epoch-based GC    | Lock-free CAS     | Medium (epoch)  |
 //! | BTreeMap+Lock  | Standard heap     | RwLock            | Low             |
 
-use criterion::{
-    black_box, criterion_group, criterion_main, BenchmarkId, Criterion, Throughput,
-};
+use criterion::{black_box, criterion_group, criterion_main, BenchmarkId, Criterion, Throughput};
 use crossbeam_skiplist::SkipMap;
 use parking_lot::RwLock;
 use std::collections::BTreeMap;
@@ -318,11 +316,11 @@ fn bench_concurrent_mixed(c: &mut Criterion) {
         let total_ops = num_threads * OPS_PER_THREAD;
         group.throughput(Throughput::Elements(total_ops as u64));
 
-        let label = format!("r{}w{}", read_pct, write_pct);
+        let label = format!("r{read_pct}w{write_pct}");
 
         // ArenaSkipList
         group.bench_with_input(
-            BenchmarkId::new(format!("arena_skiplist/{}", label), num_threads),
+            BenchmarkId::new(format!("arena_skiplist/{label}"), num_threads),
             &(read_pct, write_pct),
             |b, &(read_pct, _)| {
                 b.iter(|| {
@@ -343,7 +341,7 @@ fn bench_concurrent_mixed(c: &mut Criterion) {
 
         // Crossbeam SkipMap
         group.bench_with_input(
-            BenchmarkId::new(format!("crossbeam_skipmap/{}", label), num_threads),
+            BenchmarkId::new(format!("crossbeam_skipmap/{label}"), num_threads),
             &(read_pct, write_pct),
             |b, &(read_pct, _)| {
                 b.iter(|| {
@@ -362,7 +360,7 @@ fn bench_concurrent_mixed(c: &mut Criterion) {
 
         // BTreeMap + RwLock
         group.bench_with_input(
-            BenchmarkId::new(format!("btreemap_rwlock/{}", label), num_threads),
+            BenchmarkId::new(format!("btreemap_rwlock/{label}"), num_threads),
             &(read_pct, write_pct),
             |b, &(read_pct, _)| {
                 b.iter(|| {
@@ -546,12 +544,21 @@ fn bench_access_pattern(c: &mut Criterion) {
 
     // Sequential access pattern
     for (name, wrapper) in [
-        ("arena_skiplist", arena_wrapper.clone() as Arc<dyn ConcurrentMap>),
-        ("crossbeam_skipmap", crossbeam_wrapper.clone() as Arc<dyn ConcurrentMap>),
-        ("btreemap_rwlock", btree_wrapper.clone() as Arc<dyn ConcurrentMap>),
+        (
+            "arena_skiplist",
+            arena_wrapper.clone() as Arc<dyn ConcurrentMap>,
+        ),
+        (
+            "crossbeam_skipmap",
+            crossbeam_wrapper.clone() as Arc<dyn ConcurrentMap>,
+        ),
+        (
+            "btreemap_rwlock",
+            btree_wrapper.clone() as Arc<dyn ConcurrentMap>,
+        ),
     ] {
         group.bench_with_input(
-            BenchmarkId::new(format!("{}/sequential", name), num_threads),
+            BenchmarkId::new(format!("{name}/sequential"), num_threads),
             &num_threads,
             |b, &num_threads| {
                 let wrapper = Arc::clone(&wrapper);
@@ -564,12 +571,21 @@ fn bench_access_pattern(c: &mut Criterion) {
 
     // Random access pattern
     for (name, wrapper) in [
-        ("arena_skiplist", arena_wrapper.clone() as Arc<dyn ConcurrentMap>),
-        ("crossbeam_skipmap", crossbeam_wrapper.clone() as Arc<dyn ConcurrentMap>),
-        ("btreemap_rwlock", btree_wrapper.clone() as Arc<dyn ConcurrentMap>),
+        (
+            "arena_skiplist",
+            arena_wrapper.clone() as Arc<dyn ConcurrentMap>,
+        ),
+        (
+            "crossbeam_skipmap",
+            crossbeam_wrapper.clone() as Arc<dyn ConcurrentMap>,
+        ),
+        (
+            "btreemap_rwlock",
+            btree_wrapper.clone() as Arc<dyn ConcurrentMap>,
+        ),
     ] {
         group.bench_with_input(
-            BenchmarkId::new(format!("{}/random", name), num_threads),
+            BenchmarkId::new(format!("{name}/random"), num_threads),
             &num_threads,
             |b, &num_threads| {
                 let wrapper = Arc::clone(&wrapper);

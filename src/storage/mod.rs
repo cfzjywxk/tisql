@@ -39,10 +39,17 @@
 //! - Testing and debugging
 //! - Low-level infrastructure code
 //!
-//! ## Storage Implementation
+//! ## Storage Implementations
 //!
-//! [`ArenaMemTableEngine`] is the production storage engine. It uses MVCC-encoded keys
-//! with a custom arena-based skip list for predictable memory management.
+//! Two storage engines are available:
+//!
+//! - [`CrossbeamMemTableEngine`] (default, aliased as `MemTableEngine`): Uses crossbeam's
+//!   lock-free skip list with epoch-based memory reclamation. Better write throughput due
+//!   to smaller node size (~40 bytes vs 192 bytes).
+//!
+//! - [`ArenaMemTableEngine`]: Uses a custom arena-based skip list for predictable memory
+//!   management and bulk deallocation. Useful for scenarios where memory release timing
+//!   is critical.
 //!
 //! ## Key Encoding
 //!
@@ -50,14 +57,28 @@
 //! The storage layer is agnostic to key structure - it just stores bytes.
 
 pub mod arena_memtable;
+pub mod btree_memtable;
+pub mod crossbeam_memtable;
 pub mod skiplist;
 
 // ============================================================================
 // Storage Implementation
 // ============================================================================
 
-// Production default: Arena-based memtable with MVCC key encoding
-pub use arena_memtable::{ArenaMemTableEngine, MemoryStats};
+// Production default: Crossbeam-based memtable with MVCC key encoding
+// (better write throughput due to smaller node size and epoch-based GC)
+pub use crossbeam_memtable::CrossbeamMemTableEngine as MemTableEngine;
+pub use crossbeam_memtable::MemoryStats;
+
+// Re-export arena-based memtable for comparison/benchmarking
+pub use arena_memtable::ArenaMemTableEngine;
+pub use arena_memtable::MemoryStats as ArenaMemoryStats;
+
+// Re-export BTreeMap-based memtable for comparison/benchmarking
+pub use btree_memtable::BTreeMemTableEngine;
+
+// Re-export CrossbeamMemTableEngine for comparison/benchmarking
+pub use crossbeam_memtable::CrossbeamMemTableEngine;
 
 use std::collections::HashMap;
 use std::ops::Range;

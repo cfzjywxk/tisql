@@ -46,6 +46,10 @@ num_cpus = "1"
 crossbeam-skiplist = "0.1"
 crossbeam-epoch = "0.9"
 
+# Memory allocator (jemalloc for production, like TiKV)
+[target.'cfg(unix)'.dependencies]
+tikv-jemallocator = { version = "0.5", optional = true }
+
 # Fail injection testing
 [dependencies.fail]
 version = "0.5"
@@ -58,7 +62,8 @@ fail = "0.5"
 parking_lot = "0.12"
 
 [features]
-default = []
+default = ["jemalloc"]
+jemalloc = ["tikv-jemallocator"]
 failpoints = ["fail/failpoints"]
 
 [[bench]]
@@ -68,6 +73,18 @@ harness = false
 [[bench]]
 name = "memtable_comparison"
 harness = false
+
+[[bench]]
+name = "memtable_impl_comparison"
+harness = false
+
+[[bench]]
+name = "e2e_oltp_bench"
+harness = false
+
+[[bin]]
+name = "sysbench-sim"
+path = "tools/sysbench_sim.rs"
 
 [[bin]]
 name = "mysqltest-runner"
