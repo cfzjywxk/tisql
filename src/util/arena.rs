@@ -273,6 +273,10 @@ impl PageArena {
                         // Success! Update statistics and return pointer
                         self.allocated_bytes
                             .fetch_add(size as u64, Ordering::Relaxed);
+                        // SAFETY: `aligned_offset` is within `page_size` bounds (checked above:
+                        // new_offset <= page_size), and `page_ptr` points to a valid allocation
+                        // of exactly `page_size` bytes. The CAS success guarantees exclusive
+                        // ownership of the byte range [aligned_offset, aligned_offset + size).
                         let ptr = unsafe { page_ptr.add(aligned_offset) };
                         return NonNull::new(ptr);
                     }
@@ -443,6 +447,9 @@ impl PageArena {
         let layout = Layout::from_size_align(self.config.page_size, self.config.page_size)
             .expect("Invalid page layout");
 
+        // SAFETY: The layout is valid (page_size is checked to be a power of two and > 0
+        // in `new()`). The layout's size and alignment are both `page_size`, which is
+        // validated to be a valid power-of-two value.
         let ptr = unsafe { alloc::alloc(layout) };
         if ptr.is_null() {
             None
@@ -455,6 +462,9 @@ impl PageArena {
     fn deallocate_page_memory(&self, ptr: *mut u8) {
         let layout = Layout::from_size_align(self.config.page_size, self.config.page_size)
             .expect("Invalid page layout");
+        // SAFETY: `ptr` was allocated by `allocate_page_memory` with the same layout
+        // (same page_size for both size and alignment). This is only called from Drop
+        // or when a CAS race causes us to discard a duplicate page allocation.
         unsafe { alloc::dealloc(ptr, layout) };
     }
 
@@ -584,6 +594,8 @@ mod tests {
         assert_eq!(ptr.as_ptr() as usize % mem::align_of::<TestStruct>(), 0);
 
         // Write and read back
+        // SAFETY: `ptr` is freshly allocated with correct size/alignment for TestStruct.
+        // We have exclusive access and the pointer is valid for the arena's lifetime.
         unsafe {
             ptr.as_ptr().write(TestStruct {
                 a: 42,
@@ -609,6 +621,9 @@ mod tests {
         let data = b"Hello, World!";
         let ptr: NonNull<Header> = arena.alloc_with_data(data.len()).unwrap();
 
+        // SAFETY: `ptr` was allocated with `alloc_with_data(data.len())`, so the allocation
+        // includes space for Header + data.len() bytes. We write the header first, then
+        // copy data immediately after. The pointer arithmetic stays within bounds.
         unsafe {
             // Write header
             ptr.as_ptr().write(Header {
@@ -779,6 +794,8 @@ mod tests {
                             assert_eq!(ptr.as_ptr() as usize % align, 0, "Misaligned allocation");
 
                             // Write a pattern to detect corruption
+                            // SAFETY: `ptr` was just allocated with the given `size`.
+                            // We only write to the first min(size, 8) bytes.
                             unsafe {
                                 let pattern = ((tid as u8) << 4) | ((i & 0xF) as u8);
                                 std::ptr::write_bytes(ptr.as_ptr(), pattern, size.min(8));
@@ -882,6 +899,8 @@ mod tests {
 
                         if let Some(ptr) = arena.alloc(size, 8) {
                             // Write size at the beginning for verification
+                            // SAFETY: `ptr` was allocated with at least `size` bytes,
+                            // and size >= sizeof(usize) for all allocations in this test.
                             unsafe {
                                 *(ptr.as_ptr() as *mut usize) = size;
                             }
@@ -891,6 +910,8 @@ mod tests {
 
                     // Verify written values
                     for (ptr_addr, expected_size) in &ptrs {
+                        // SAFETY: We just wrote to these addresses above. The arena
+                        // is still alive, so the pointers remain valid.
                         unsafe {
                             let actual_size = *(*ptr_addr as *const usize);
                             assert_eq!(actual_size, *expected_size, "Memory corruption detected");
@@ -933,6 +954,7 @@ mod tests {
                         let ptr = arena.alloc(8, 8).expect("allocation failed");
                         let value = ((tid as u64) << 32) | (i as u64);
 
+                        // SAFETY: `ptr` was allocated with 8 bytes, sufficient for u64.
                         unsafe {
                             *(ptr.as_ptr() as *mut u64) = value;
                         }
@@ -956,6 +978,7 @@ mod tests {
         assert_eq!(final_results.len(), num_threads * allocs_per_thread);
 
         for (ptr_addr, expected) in final_results.iter() {
+            // SAFETY: These addresses were written above and the arena is still alive.
             unsafe {
                 let actual = *(*ptr_addr as *const u64);
                 assert_eq!(
@@ -1075,6 +1098,7 @@ mod tests {
                         assert_eq!(ptr.as_ptr() as usize % 64, 0);
 
                         // Initialize
+                        // SAFETY: `ptr` was allocated with correct size/alignment for CacheAligned.
                         unsafe {
                             (*ptr.as_ptr())
                                 .value
@@ -1086,6 +1110,7 @@ mod tests {
 
                     // Verify values
                     for (i, ptr_addr) in ptrs.iter().enumerate() {
+                        // SAFETY: These addresses point to valid CacheAligned structs we wrote above.
                         unsafe {
                             let expected = ((tid as u64) << 32) | (i as u64);
                             let actual = (*(*ptr_addr as *const CacheAligned))

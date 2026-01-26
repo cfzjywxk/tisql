@@ -185,6 +185,11 @@ where
             .expect("Failed to allocate skip list head")
             .as_ptr() as *mut SkipNode<K, V>;
 
+        // SAFETY: `ptr` is freshly allocated from the arena with correct size and alignment
+        // for `SkipNode<K, V>`. We have exclusive access to this memory. We use `ptr::write`
+        // for the AtomicPtr fields because the memory is uninitialized. The `key` and `value`
+        // fields are `MaybeUninit` so they don't need initialization. This is the head node
+        // (sentinel), so `key` and `value` will never be read.
         unsafe {
             (*ptr).height = MAX_HEIGHT as u8;
             (*ptr).is_head = true;
@@ -211,6 +216,12 @@ where
             .expect("Failed to allocate skip list node")
             .as_ptr() as *mut SkipNode<K, V>;
 
+        // SAFETY: `ptr` is freshly allocated from the arena with correct size and alignment
+        // for `SkipNode<K, V>`. We have exclusive access to this memory until we publish it
+        // via the CAS on `all_nodes_head`. We use `ptr::write` to initialize all fields
+        // because the memory is uninitialized. The key and value are moved into the node.
+        // After the CAS succeeds, other threads may access this node, but only after seeing
+        // the Release barrier from the CAS.
         unsafe {
             ptr::write((*ptr).key.as_mut_ptr(), key);
             ptr::write((*ptr).value.as_mut_ptr(), value);
@@ -295,6 +306,9 @@ where
             while level > 0 {
                 level -= 1;
 
+                // SAFETY: `pred` is either `self.head` (valid for arena lifetime) or a node
+                // we traversed to via atomic loads with Acquire ordering. Nodes are never
+                // deallocated until the arena is dropped, so the pointer remains valid.
                 let mut curr = unsafe { (*pred).tower[level].load(Ordering::Acquire) };
 
                 loop {
@@ -314,6 +328,8 @@ where
                         break;
                     }
 
+                    // SAFETY: `curr_clean` is a valid, unmarked pointer to a node. We checked
+                    // it's non-null above. Nodes are never deallocated until arena Drop.
                     let next = unsafe { (*curr_clean).tower[level].load(Ordering::Acquire) };
 
                     // If next is marked, curr_clean is being deleted.
@@ -321,6 +337,9 @@ where
                     if SkipNode::is_ptr_marked(next) {
                         let next_clean = SkipNode::unmark(next);
                         // CAS pred->curr to pred->next (unmarked)
+                        // SAFETY: `pred` is valid (same reasoning as above). We perform a CAS
+                        // to atomically unlink `curr_clean` from this level. This is the
+                        // "helping" mechanism of lock-free deletion.
                         let result = unsafe {
                             (*pred).tower[level].compare_exchange(
                                 curr_clean, // expect unmarked pointer to curr
@@ -344,6 +363,8 @@ where
                     }
 
                     // Compare keys
+                    // SAFETY: `curr_clean` is valid and non-head (head nodes don't appear
+                    // in the middle of the list). The key was initialized in `alloc_node`.
                     let cmp = unsafe { (*curr_clean).key_ref().borrow().cmp(key) };
 
                     match cmp {
@@ -377,6 +398,9 @@ where
     pub fn insert(&self, key: K, value: V) -> Option<&V> {
         // First, check if the key already exists (without allocating)
         let (found, _, _) = self.search(&key);
+        // SAFETY: If `found` is non-null, it points to a valid node returned by `search`.
+        // Nodes are never deallocated, so the pointer remains valid. `is_deleted` and
+        // `value_ref` both access fields that were properly initialized in `alloc_node`.
         if !found.is_null() && !unsafe { (*found).is_deleted() } {
             // Key exists, return existing value without allocating a new node
             return Some(unsafe { (*found).value_ref() });
@@ -387,8 +411,10 @@ where
         let new_node = self.alloc_node(key, value, height);
 
         loop {
+            // SAFETY: `new_node` was just allocated by us and its key was initialized.
             let (found, preds, succs) = self.search(unsafe { (*new_node).key_ref() });
 
+            // SAFETY: Same as above - if found is non-null, it's a valid node.
             if !found.is_null() && !unsafe { (*found).is_deleted() } {
                 // Key was inserted by another thread while we were allocating
                 // The node is already in all_nodes chain, it will be dropped properly
@@ -398,6 +424,8 @@ where
 
             // Set up new node's tower pointers
             for level in 0..height {
+                // SAFETY: `new_node` is our exclusively-owned node (not yet published).
+                // We're setting up its tower pointers before linking it into the list.
                 unsafe {
                     (*new_node).tower[level].store(succs[level], Ordering::Relaxed);
                 }
@@ -407,6 +435,8 @@ where
             let pred = preds[0];
             let succ = succs[0];
 
+            // SAFETY: `pred` is a valid node from `search`. The CAS atomically publishes
+            // `new_node` into the list. After success, other threads may access it.
             let result = unsafe {
                 (*pred).tower[0].compare_exchange(
                     succ,
@@ -422,9 +452,12 @@ where
                     // Now link at higher levels
                     for level in 1..height {
                         loop {
+                            // SAFETY: `new_node` is now in the list (linked at level 0).
+                            // Its key is valid and initialized.
                             let (_, preds, succs) = self.search(unsafe { (*new_node).key_ref() });
 
                             // Check if node was removed concurrently
+                            // SAFETY: `new_node` is valid for arena lifetime.
                             if unsafe { (*new_node).is_deleted() } {
                                 break;
                             }
@@ -433,10 +466,12 @@ where
                             let succ = succs[level];
 
                             // Update new_node's next pointer at this level
+                            // SAFETY: `new_node` is valid; tower was initialized in `alloc_node`.
                             let current_next =
                                 unsafe { (*new_node).tower[level].load(Ordering::Relaxed) };
 
                             if current_next != succ && !SkipNode::is_ptr_marked(current_next) {
+                                // SAFETY: Updating our own node's tower pointer.
                                 let cas_result = unsafe {
                                     (*new_node).tower[level].compare_exchange(
                                         current_next,
@@ -446,6 +481,7 @@ where
                                     )
                                 };
                                 if cas_result.is_err() {
+                                    // SAFETY: Same as above.
                                     if unsafe { (*new_node).is_deleted() } {
                                         break;
                                     }
@@ -454,6 +490,7 @@ where
                             }
 
                             // Try to link pred -> new_node at this level
+                            // SAFETY: `pred` is a valid node from `search`.
                             let link_result = unsafe {
                                 (*pred).tower[level].compare_exchange(
                                     succ,
@@ -504,6 +541,9 @@ where
             return None;
         }
 
+        // SAFETY: `found` is a valid, non-null node returned by `search`. The node was
+        // properly initialized in `alloc_node` and is never deallocated until arena Drop.
+        // `is_deleted` checks the mark bit; `value_ref` returns the initialized value.
         if unsafe { (*found).is_deleted() } {
             return None;
         }
@@ -534,15 +574,19 @@ where
             return false;
         }
 
+        // SAFETY: `found` is a valid, non-null node returned by `search`. The node's
+        // fields were initialized in `alloc_node` and remain valid until arena Drop.
         if unsafe { (*found).is_deleted() } {
             return false;
         }
 
+        // SAFETY: `found` is valid and `height` was set in `alloc_node`.
         let height = unsafe { (*found).height } as usize;
 
         // Mark from top to bottom
         for level in (1..height).rev() {
             loop {
+                // SAFETY: `found` is valid; tower was initialized in `alloc_node`.
                 let next = unsafe { (*found).tower[level].load(Ordering::Acquire) };
 
                 if SkipNode::is_ptr_marked(next) {
@@ -550,6 +594,7 @@ where
                 }
 
                 let marked = SkipNode::mark(next);
+                // SAFETY: Marking our own tower pointer to indicate logical deletion.
                 let result = unsafe {
                     (*found).tower[level].compare_exchange(
                         next,
@@ -567,6 +612,7 @@ where
 
         // Mark level 0 (linearization point)
         loop {
+            // SAFETY: `found` is valid; this is the linearization point for deletion.
             let next = unsafe { (*found).tower[0].load(Ordering::Acquire) };
 
             if SkipNode::is_ptr_marked(next) {
@@ -574,6 +620,8 @@ where
             }
 
             let marked = SkipNode::mark(next);
+            // SAFETY: CAS on level 0 is the linearization point. Success means we
+            // logically deleted the node. The node remains in memory until arena Drop.
             let result = unsafe {
                 (*found).tower[0].compare_exchange(
                     next,
@@ -650,6 +698,7 @@ where
         loop {
             if !self.started {
                 // Start from head's first successor
+                // SAFETY: `self.list.head` is valid for the arena's lifetime.
                 let first = unsafe { (*self.list.head).tower[0].load(Ordering::Acquire) };
                 self.current = SkipNode::unmark(first);
                 self.started = true;
@@ -662,6 +711,9 @@ where
             let node = self.current;
 
             // Move to next
+            // SAFETY: `node` is valid (checked non-null above). Nodes are never
+            // deallocated until arena Drop. The iterator's lifetime is tied to
+            // the skip list's lifetime, which is tied to the arena.
             let next = unsafe { (*node).tower[0].load(Ordering::Acquire) };
             self.current = if next.is_null() {
                 ptr::null()
@@ -670,10 +722,13 @@ where
             };
 
             // Skip marked (deleted) nodes
+            // SAFETY: `node` is valid; `is_deleted` checks the mark bit.
             if unsafe { (*node).is_deleted() } {
                 continue;
             }
 
+            // SAFETY: `node` is a valid, non-head, non-deleted node. Its key and
+            // value were initialized in `alloc_node` and remain valid.
             return Some(unsafe { ((*node).key_ref(), (*node).value_ref()) });
         }
     }
@@ -696,10 +751,16 @@ where
 
         while !current.is_null() {
             let node = current;
-            // Use Acquire to ensure we see the fully initialized next_allocated pointer
+            // SAFETY: `node` is valid - it was allocated from the arena and added to
+            // the all_nodes chain in `alloc_node`. We use Acquire ordering to ensure
+            // we see the fully initialized `next_allocated` pointer (synchronizes with
+            // the Release in the CAS that published the node).
             let next = unsafe { (*node).next_allocated.load(Ordering::Acquire) };
 
             // Drop key and value (non-head nodes only)
+            // SAFETY: For non-head nodes, key and value were initialized in `alloc_node`
+            // using `ptr::write`. We're in Drop, so we have exclusive access. We drop
+            // each node exactly once by traversing the all_nodes chain.
             if !unsafe { (*node).is_head } {
                 unsafe {
                     ptr::drop_in_place((*node).key.as_mut_ptr());

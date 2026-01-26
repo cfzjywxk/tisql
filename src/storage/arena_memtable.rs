@@ -163,9 +163,12 @@ impl ArenaMemTableEngine {
         let arena_ptr: *const PageArena = &*arena;
 
         // 3. Create skip list with 'static lifetime
-        // Safety: We guarantee the arena outlives the skip list by:
-        // - arena is heap-allocated (stable address)
-        // - Custom Drop impl drops skip list before arena
+        // SAFETY: We guarantee the arena outlives the skip list by:
+        // - `arena` is Box-allocated (stable heap address that won't move)
+        // - `arena` is owned by `Self`, not borrowed
+        // - Custom `Drop` impl drops skip list before arena (via ManuallyDrop)
+        // - The 'static lifetime is a lie, but safe because the skip list cannot
+        //   outlive Self, which owns the arena
         let arena_ref: &'static PageArena = unsafe { &*arena_ptr };
         let list = ArenaSkipList::new(arena_ref);
 
@@ -192,6 +195,10 @@ impl ArenaMemTableEngine {
         let arena = Box::new(PageArena::new(config));
 
         let arena_ptr: *const PageArena = &*arena;
+        // SAFETY: Same guarantees as in `new()`:
+        // - `arena` is Box-allocated (stable heap address)
+        // - Custom `Drop` impl drops skip list before arena
+        // - The skip list cannot outlive Self, which owns the arena
         let arena_ref: &'static PageArena = unsafe { &*arena_ptr };
         let list = ArenaSkipList::new(arena_ref);
 
@@ -286,12 +293,17 @@ impl Default for ArenaMemTableEngine {
 
 impl Drop for ArenaMemTableEngine {
     fn drop(&mut self) {
-        // Safety: We must drop the skip list before the arena.
+        // SAFETY: We must drop the skip list before the arena.
         // The skip list holds a reference to the arena, so if we let the
         // default drop order run (arena might be dropped first), we'd have
         // a dangling reference.
         //
-        // ManuallyDrop::drop takes &mut self, so this is safe.
+        // This is safe because:
+        // 1. `ManuallyDrop::drop` requires `&mut self`, which we have
+        // 2. We only call this once (in Drop), and ManuallyDrop prevents double-drop
+        // 3. After this call, `self.list` is in an uninitialized state, but that's
+        //    fine because we're in Drop and won't access it again
+        // 4. The arena is still valid at this point and will be dropped after
         unsafe {
             ManuallyDrop::drop(&mut self.list);
         }
