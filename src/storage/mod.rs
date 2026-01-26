@@ -39,20 +39,26 @@
 //! - Testing and debugging
 //! - Low-level infrastructure code
 //!
-//! ## Module Structure
-//! - `StorageEngine` trait - Core KV storage interface (use via TxnService)
-//! - `WriteBatch` - Atomic batch writes with explicit `commit_ts`
-//! - `MvccMemTableEngine` - MVCC in-memory implementation
+//! ## Storage Implementation
+//!
+//! [`ArenaMemTableEngine`] is the production storage engine. It uses MVCC-encoded keys
+//! with a custom arena-based skip list for predictable memory management.
 //!
 //! ## Key Encoding
+//!
 //! Keys are encoded using TiDB-compatible format via the codec module.
 //! The storage layer is agnostic to key structure - it just stores bytes.
 
-mod mvcc_memtable;
+mod arena_memtable;
+// Skiplist is pub(crate) so it can be accessed by testkit, but not part of public API
+pub(crate) mod skiplist;
 
-// Implementation types - not re-exported from main API
-// These are available via testkit for integration tests
-pub use mvcc_memtable::MvccMemTableEngine;
+// ============================================================================
+// Storage Implementation
+// ============================================================================
+
+// Production default: Arena-based memtable with MVCC key encoding
+pub use arena_memtable::{ArenaMemTableEngine, MemoryStats};
 
 use crate::error::Result;
 use crate::types::{Key, RawValue, TableId, Timestamp};
@@ -169,7 +175,7 @@ pub trait StorageEngine: Send + Sync + 'static {
     /// Primarily used for recovery operations and testing.
     ///
     /// For MVCC-aware scans, use `scan_at()` or `TxnService::scan()`.
-    fn scan(&self, range: Range<Key>) -> Result<Box<dyn Iterator<Item = (Key, RawValue)> + '_>>;
+    fn scan(&self, range: &Range<Key>) -> Result<Box<dyn Iterator<Item = (Key, RawValue)> + '_>>;
 
     /// Range scan at specific timestamp (MVCC-aware).
     ///
@@ -179,7 +185,7 @@ pub trait StorageEngine: Send + Sync + 'static {
     /// This is called internally by `TxnService::scan()`.
     fn scan_at(
         &self,
-        range: Range<Key>,
+        range: &Range<Key>,
         ts: Timestamp,
     ) -> Result<Box<dyn Iterator<Item = (Key, RawValue)> + '_>>;
 }

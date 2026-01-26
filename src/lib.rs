@@ -69,7 +69,16 @@ pub mod testkit {
     //! This module exposes internal implementation details for integration tests.
     //! These are NOT part of the public API and may change without notice.
     pub use crate::clog::{FileClogConfig, FileClogService};
-    pub use crate::storage::MvccMemTableEngine;
+
+    // Arena (from util - it's a general-purpose allocator)
+    pub use crate::util::{ArenaConfig, PageArena, DEFAULT_PAGE_SIZE};
+
+    // Storage implementation
+    pub use crate::storage::{ArenaMemTableEngine, MemoryStats};
+
+    // ArenaSkipList (exposed for testing low-level skiplist behavior)
+    pub use crate::storage::skiplist::ArenaSkipList;
+
     pub use crate::transaction::{ConcurrencyManager, Lock, TransactionService};
     pub use crate::tso::LocalTso;
 }
@@ -80,7 +89,7 @@ use clog::{FileClogConfig, FileClogService};
 use error::Result;
 use executor::{ExecutionResult, Executor, SimpleExecutor};
 use sql::{Binder, Parser};
-use storage::MvccMemTableEngine;
+use storage::ArenaMemTableEngine;
 use transaction::{ConcurrencyManager, TransactionService};
 use tso::LocalTso;
 use types::Value;
@@ -175,7 +184,7 @@ impl SQLEngine {
 // ============================================================================
 
 /// Internal type alias for concrete storage engine.
-type DbStorage = MvccMemTableEngine;
+type DbStorage = ArenaMemTableEngine;
 
 /// Internal type alias for concrete transaction service.
 /// Not exposed publicly - callers only see TxnService trait.
@@ -229,7 +238,7 @@ impl Database {
         let concurrency_manager = Arc::new(ConcurrencyManager::new(0));
 
         // Create storage engine (pure key-value store, no transaction logic)
-        let storage = Arc::new(MvccMemTableEngine::new());
+        let storage = Arc::new(ArenaMemTableEngine::new());
 
         // Create transaction service
         let txn_service = Arc::new(TransactionService::new(

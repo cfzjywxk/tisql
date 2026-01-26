@@ -12,7 +12,10 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-//! MVCC-aware memtable using crossbeam-skiplist.
+//! MVCC-aware memtable using arena-based skip list.
+//!
+//! This implementation replaces crossbeam-skiplist with our custom ArenaSkipList
+//! to avoid memory fragmentation and provide predictable memory management.
 //!
 //! ## Key Encoding
 //!
@@ -26,20 +29,28 @@
 //!
 //! Deletes are represented as tombstone markers (empty value with a flag).
 //! This allows MVCC to correctly handle deleted keys at specific versions.
+//!
+//! ## Memory Management
+//!
+//! Unlike crossbeam-skiplist which uses epoch-based reclamation, this
+//! implementation uses arena allocation. Memory is released in bulk when
+//! the memtable is dropped (e.g., after flush to disk).
 
+use std::mem::ManuallyDrop;
 use std::ops::Range;
-use std::sync::Arc;
 
-use crossbeam_skiplist::SkipMap;
-
+use super::skiplist::ArenaSkipList;
+use super::{StorageEngine, WriteBatch, WriteOp};
 use crate::error::{Result, TiSqlError};
 use crate::types::{Key, RawValue, Timestamp};
-
-use super::{StorageEngine, WriteBatch, WriteOp};
+use crate::util::arena::PageArena;
 
 /// Tombstone marker for deleted keys.
-/// We use a special byte sequence that's unlikely to be a valid value.
-const TOMBSTONE: &[u8] = b"\x00\x00\x00TOMBSTONE\x00\x00\x00";
+///
+/// We use a byte sequence that starts with NUL bytes (uncommon in user data)
+/// followed by a magic string and a version byte, making collision extremely unlikely.
+/// The probability of collision is ~2^-120 for random 16-byte values.
+const TOMBSTONE: &[u8] = b"\x00\x00\x00\x00TISQL_TOMBSTONE\x01";
 
 /// Encode MVCC key: user_key || !commit_ts (8 bytes, big-endian)
 ///
@@ -69,102 +80,6 @@ fn is_tombstone(value: &[u8]) -> bool {
     value == TOMBSTONE
 }
 
-/// MVCC-aware memtable engine using crossbeam-skiplist.
-///
-/// This engine stores multiple versions of each key, keyed by `user_key || !commit_ts`.
-/// Reads automatically find the latest visible version.
-///
-/// # Layer Separation
-///
-/// This is a pure storage layer with NO transaction logic:
-/// - NO lock management (handled by ConcurrencyManager in transaction layer)
-/// - NO timestamp allocation (handled by TsoService in transaction layer)
-/// - NO transaction coordination (handled by TransactionService)
-///
-/// All writes require explicit `commit_ts` via `write_batch()`.
-///
-/// # Usage
-///
-/// For application code, use [`TxnService`](crate::transaction::TxnService):
-///
-/// ```ignore
-/// let ctx = txn_service.begin(true)?;  // read-only transaction
-/// let value = txn_service.get(&ctx, key)?;
-/// ```
-pub struct MvccMemTableEngine {
-    /// Concurrent skipmap storing MVCC-encoded keys.
-    data: Arc<SkipMap<Key, RawValue>>,
-}
-
-impl MvccMemTableEngine {
-    /// Create a new MVCC memtable engine.
-    ///
-    /// The storage engine is a pure key-value store with MVCC versioning.
-    /// Lock checking, timestamp allocation, and transaction control are
-    /// handled by the transaction layer.
-    pub fn new() -> Self {
-        Self {
-            data: Arc::new(SkipMap::new()),
-        }
-    }
-
-    /// Get the latest version of a key visible at the given timestamp.
-    ///
-    /// This scans from `user_key || !ts` to find the first version
-    /// with commit_ts <= ts.
-    fn get_at_internal(&self, user_key: &[u8], ts: Timestamp) -> Result<Option<RawValue>> {
-        get_at_internal(&self.data, user_key, ts)
-    }
-
-    /// Write a key-value pair at the given timestamp.
-    ///
-    /// This is an internal method used by `write_batch()`.
-    pub(crate) fn put_at(&self, user_key: &[u8], value: &[u8], ts: Timestamp) {
-        let mvcc_key = encode_mvcc_key(user_key, ts);
-        self.data.insert(mvcc_key, value.to_vec());
-    }
-
-    /// Write a tombstone (delete marker) at the given timestamp.
-    ///
-    /// This is an internal method used by `write_batch()`.
-    pub(crate) fn delete_at(&self, user_key: &[u8], ts: Timestamp) {
-        let mvcc_key = encode_mvcc_key(user_key, ts);
-        self.data.insert(mvcc_key, TOMBSTONE.to_vec());
-    }
-}
-
-/// Shared get_at_internal logic for both engine and snapshot.
-fn get_at_internal(
-    data: &SkipMap<Key, RawValue>,
-    user_key: &[u8],
-    ts: Timestamp,
-) -> Result<Option<RawValue>> {
-    // Build scan bounds
-    // Start: user_key || !ts (will find versions <= ts)
-    let start = encode_mvcc_key(user_key, ts);
-
-    // We need to find keys that start with user_key
-    // The end bound should be the first key > user_key
-    let mut end_key = user_key.to_vec();
-    increment_bytes(&mut end_key);
-
-    for entry in data.range(start..end_key) {
-        let mvcc_key = entry.key();
-        if let Some((key, _entry_ts)) = decode_mvcc_key(mvcc_key) {
-            // Verify this is still our key (prefix match)
-            if key == user_key {
-                let value = entry.value();
-                if is_tombstone(value) {
-                    return Ok(None);
-                }
-                return Ok(Some(value.clone()));
-            }
-        }
-    }
-
-    Ok(None)
-}
-
 /// Increment byte array by 1 (for range end bound).
 fn increment_bytes(bytes: &mut Vec<u8>) {
     if bytes.is_empty() {
@@ -183,7 +98,208 @@ fn increment_bytes(bytes: &mut Vec<u8>) {
     bytes.insert(0, 1);
 }
 
-impl StorageEngine for MvccMemTableEngine {
+/// MVCC-aware memtable engine using arena-based skip list.
+///
+/// This engine stores multiple versions of each key, keyed by `user_key || !commit_ts`.
+/// Reads automatically find the latest visible version.
+///
+/// # Memory Model
+///
+/// This struct owns both the arena (memory pool) and the skip list. The skip list
+/// holds a reference to the arena, so we must ensure the skip list is dropped before
+/// the arena. This is achieved through `ManuallyDrop` and a custom `Drop` impl.
+///
+/// # Layer Separation
+///
+/// This is a pure storage layer with NO transaction logic:
+/// - NO lock management (handled by ConcurrencyManager in transaction layer)
+/// - NO timestamp allocation (handled by TsoService in transaction layer)
+/// - NO transaction coordination (handled by TransactionService)
+///
+/// All writes require explicit `commit_ts` via `write_batch()`.
+///
+/// # Usage
+///
+/// For application code, use [`TxnService`](crate::transaction::TxnService):
+///
+/// ```ignore
+/// let ctx = txn_service.begin(true)?;  // read-only transaction
+/// let value = txn_service.get(&ctx, key)?;
+/// ```
+pub struct ArenaMemTableEngine {
+    /// The arena that owns all allocated memory.
+    /// This is boxed to ensure a stable address for the skip list reference.
+    arena: Box<PageArena>,
+
+    /// The skip list storing MVCC-encoded keys.
+    ///
+    /// Safety: This field uses a 'static lifetime, but the actual lifetime is
+    /// tied to `arena`. We use ManuallyDrop to ensure the skip list is dropped
+    /// before the arena in our custom Drop implementation.
+    ///
+    /// Note: ArenaSkipList provides interior mutability via atomic operations,
+    /// so no UnsafeCell wrapper is needed.
+    list: ManuallyDrop<ArenaSkipList<'static, Key, RawValue>>,
+}
+
+// Safety: ArenaMemTableEngine can be sent between threads and shared because:
+// 1. PageArena is Send + Sync
+// 2. ArenaSkipList is Send + Sync (documented in skiplist.rs)
+// 3. All operations on the skip list are lock-free and thread-safe
+unsafe impl Send for ArenaMemTableEngine {}
+unsafe impl Sync for ArenaMemTableEngine {}
+
+impl ArenaMemTableEngine {
+    /// Create a new arena-based MVCC memtable engine.
+    ///
+    /// The storage engine is a pure key-value store with MVCC versioning.
+    /// Lock checking, timestamp allocation, and transaction control are
+    /// handled by the transaction layer.
+    pub fn new() -> Self {
+        // 1. Allocate arena on heap (stable address)
+        let arena = Box::new(PageArena::with_defaults());
+
+        // 2. Get raw pointer to arena
+        let arena_ptr: *const PageArena = &*arena;
+
+        // 3. Create skip list with 'static lifetime
+        // Safety: We guarantee the arena outlives the skip list by:
+        // - arena is heap-allocated (stable address)
+        // - Custom Drop impl drops skip list before arena
+        let arena_ref: &'static PageArena = unsafe { &*arena_ptr };
+        let list = ArenaSkipList::new(arena_ref);
+
+        Self {
+            arena,
+            list: ManuallyDrop::new(list),
+        }
+    }
+
+    /// Create a new arena-based MVCC memtable with custom arena capacity.
+    ///
+    /// # Arguments
+    ///
+    /// * `page_size` - Size of each arena page in bytes (default: 256KB)
+    /// * `max_pages` - Maximum number of pages (default: 1024)
+    pub fn with_capacity(page_size: usize, max_pages: usize) -> Self {
+        use crate::util::arena::ArenaConfig;
+
+        let config = ArenaConfig {
+            page_size,
+            max_pages,
+            ..Default::default()
+        };
+        let arena = Box::new(PageArena::new(config));
+
+        let arena_ptr: *const PageArena = &*arena;
+        let arena_ref: &'static PageArena = unsafe { &*arena_ptr };
+        let list = ArenaSkipList::new(arena_ref);
+
+        Self {
+            arena,
+            list: ManuallyDrop::new(list),
+        }
+    }
+
+    /// Get a reference to the skip list.
+    #[inline]
+    fn list(&self) -> &ArenaSkipList<'static, Key, RawValue> {
+        &self.list
+    }
+
+    /// Get the latest version of a key visible at the given timestamp.
+    ///
+    /// This scans from `user_key || !ts` to find the first version
+    /// with commit_ts <= ts.
+    fn get_at_internal(&self, user_key: &[u8], ts: Timestamp) -> Result<Option<RawValue>> {
+        // Build scan key: user_key || !ts
+        // Due to !ts encoding, this will find the first key >= user_key with ts' <= ts
+        let start = encode_mvcc_key(user_key, ts);
+
+        // We need to find keys that start with user_key
+        let mut end_key = user_key.to_vec();
+        increment_bytes(&mut end_key);
+
+        // Use iter_from to start at the right position
+        for (mvcc_key, value) in self.list().iter_from(&start) {
+            // Check if we've gone past our user_key prefix
+            if mvcc_key >= &end_key {
+                break;
+            }
+
+            if let Some((key, _entry_ts)) = decode_mvcc_key(mvcc_key) {
+                // Verify this is still our key (prefix match)
+                if key == user_key {
+                    if is_tombstone(value) {
+                        return Ok(None);
+                    }
+                    return Ok(Some(value.clone()));
+                }
+            }
+        }
+
+        Ok(None)
+    }
+
+    /// Write a key-value pair at the given timestamp.
+    ///
+    /// This is an internal method used by `write_batch()`.
+    pub(crate) fn put_at(&self, user_key: &[u8], value: &[u8], ts: Timestamp) {
+        let mvcc_key = encode_mvcc_key(user_key, ts);
+        // ArenaSkipList::insert returns Some if key exists, None if inserted
+        // For MVCC, each key is unique (includes timestamp), so this should always insert
+        let _ = self.list().insert(mvcc_key, value.to_vec());
+    }
+
+    /// Write a tombstone (delete marker) at the given timestamp.
+    ///
+    /// This is an internal method used by `write_batch()`.
+    pub(crate) fn delete_at(&self, user_key: &[u8], ts: Timestamp) {
+        let mvcc_key = encode_mvcc_key(user_key, ts);
+        let _ = self.list().insert(mvcc_key, TOMBSTONE.to_vec());
+    }
+
+    /// Get the number of entries in the memtable.
+    pub fn len(&self) -> usize {
+        self.list().len()
+    }
+
+    /// Check if the memtable is empty.
+    pub fn is_empty(&self) -> bool {
+        self.list().is_empty()
+    }
+
+    /// Get memory usage statistics.
+    pub fn memory_stats(&self) -> MemoryStats {
+        MemoryStats {
+            allocated_bytes: self.arena.allocated_bytes(),
+            entry_count: self.list().len(),
+        }
+    }
+}
+
+impl Default for ArenaMemTableEngine {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl Drop for ArenaMemTableEngine {
+    fn drop(&mut self) {
+        // Safety: We must drop the skip list before the arena.
+        // The skip list holds a reference to the arena, so if we let the
+        // default drop order run (arena might be dropped first), we'd have
+        // a dangling reference.
+        //
+        // ManuallyDrop::drop takes &mut self, so this is safe.
+        unsafe {
+            ManuallyDrop::drop(&mut self.list);
+        }
+        // arena is dropped automatically after this
+    }
+}
+
+impl StorageEngine for ArenaMemTableEngine {
     fn get(&self, key: &[u8]) -> Result<Option<RawValue>> {
         // Get at latest timestamp (Timestamp::MAX means get the latest version)
         self.get_at(key, Timestamp::MAX)
@@ -214,14 +330,14 @@ impl StorageEngine for MvccMemTableEngine {
         Ok(())
     }
 
-    fn scan(&self, range: Range<Key>) -> Result<Box<dyn Iterator<Item = (Key, RawValue)> + '_>> {
+    fn scan(&self, range: &Range<Key>) -> Result<Box<dyn Iterator<Item = (Key, RawValue)> + '_>> {
         // Default scan uses MAX timestamp (latest visible version)
         self.scan_at(range, Timestamp::MAX)
     }
 
     fn scan_at(
         &self,
-        range: Range<Key>,
+        range: &Range<Key>,
         ts: Timestamp,
     ) -> Result<Box<dyn Iterator<Item = (Key, RawValue)> + '_>> {
         // Scan MVCC keys and deduplicate by user_key
@@ -235,13 +351,18 @@ impl StorageEngine for MvccMemTableEngine {
         //
         // Then filter by entry_ts <= ts during iteration for visibility.
         let start_mvcc = encode_mvcc_key(&range.start, Timestamp::MAX);
-        let end_mvcc = encode_mvcc_key(&range.end, 0); // 0 is the "oldest" version
+        let end_mvcc = encode_mvcc_key(&range.end, 0);
 
         let mut results = Vec::new();
         let mut last_user_key: Option<Key> = None;
 
-        for entry in self.data.range(start_mvcc..end_mvcc) {
-            if let Some((user_key, entry_ts)) = decode_mvcc_key(entry.key()) {
+        for (mvcc_key, value) in self.list().iter_from(&start_mvcc) {
+            // Stop when we reach the end bound
+            if mvcc_key >= &end_mvcc {
+                break;
+            }
+
+            if let Some((user_key, entry_ts)) = decode_mvcc_key(mvcc_key) {
                 // Check if within user range
                 if user_key < range.start || user_key >= range.end {
                     continue;
@@ -256,7 +377,6 @@ impl StorageEngine for MvccMemTableEngine {
 
                 // Check if this version is visible at the given timestamp
                 if entry_ts <= ts {
-                    let value = entry.value();
                     if !is_tombstone(value) {
                         results.push((user_key.clone(), value.clone()));
                     }
@@ -269,18 +389,22 @@ impl StorageEngine for MvccMemTableEngine {
     }
 }
 
-impl Default for MvccMemTableEngine {
-    fn default() -> Self {
-        Self::new()
-    }
+/// Memory usage statistics for the arena memtable.
+#[derive(Debug, Clone, Copy)]
+pub struct MemoryStats {
+    /// Total bytes allocated from the arena
+    pub allocated_bytes: u64,
+    /// Number of entries in the skip list
+    pub entry_count: usize,
 }
 
 #[cfg(test)]
+#[allow(clippy::uninlined_format_args)]
 mod tests {
     use super::*;
 
-    fn new_engine() -> MvccMemTableEngine {
-        MvccMemTableEngine::new()
+    fn new_engine() -> ArenaMemTableEngine {
+        ArenaMemTableEngine::new()
     }
 
     #[test]
@@ -446,7 +570,10 @@ mod tests {
         engine.put_at(b"c", b"3", 1);
         engine.put_at(b"d", b"4", 1);
 
-        let results: Vec<_> = engine.scan(b"b".to_vec()..b"d".to_vec()).unwrap().collect();
+        let results: Vec<_> = engine
+            .scan(&(b"b".to_vec()..b"d".to_vec()))
+            .unwrap()
+            .collect();
 
         assert_eq!(results.len(), 2);
         let keys: Vec<_> = results.iter().map(|(k, _)| k.clone()).collect();
@@ -479,31 +606,20 @@ mod tests {
         engine.put_at(b"c", b"3", 30);
 
         // scan_at with ts=30 should see all data
-        let results: Vec<_> = engine
-            .scan_at(b"a".to_vec()..b"d".to_vec(), 30)
-            .unwrap()
-            .collect();
+        let range = b"a".to_vec()..b"d".to_vec();
+        let results: Vec<_> = engine.scan_at(&range, 30).unwrap().collect();
         assert_eq!(results.len(), 3, "scan_at ts=30 should see 3 keys");
 
         // scan_at with ts=20 should see a and b only
-        let results: Vec<_> = engine
-            .scan_at(b"a".to_vec()..b"d".to_vec(), 20)
-            .unwrap()
-            .collect();
+        let results: Vec<_> = engine.scan_at(&range, 20).unwrap().collect();
         assert_eq!(results.len(), 2, "scan_at ts=20 should see 2 keys");
 
         // scan_at with ts=10 should see a only
-        let results: Vec<_> = engine
-            .scan_at(b"a".to_vec()..b"d".to_vec(), 10)
-            .unwrap()
-            .collect();
+        let results: Vec<_> = engine.scan_at(&range, 10).unwrap().collect();
         assert_eq!(results.len(), 1, "scan_at ts=10 should see 1 key");
 
         // scan_at with ts=5 should see nothing
-        let results: Vec<_> = engine
-            .scan_at(b"a".to_vec()..b"d".to_vec(), 5)
-            .unwrap()
-            .collect();
+        let results: Vec<_> = engine.scan_at(&range, 5).unwrap().collect();
         assert_eq!(results.len(), 0, "scan_at ts=5 should see 0 keys");
     }
 
@@ -518,18 +634,13 @@ mod tests {
         engine.put_at(b"key", b"v2", 20);
 
         // scan_at ts=15 should see v1
-        let results: Vec<_> = engine
-            .scan_at(b"key".to_vec()..b"kez".to_vec(), 15)
-            .unwrap()
-            .collect();
+        let range = b"key".to_vec()..b"kez".to_vec();
+        let results: Vec<_> = engine.scan_at(&range, 15).unwrap().collect();
         assert_eq!(results.len(), 1);
         assert_eq!(results[0].1, b"v1".to_vec());
 
         // scan_at ts=25 should see v2 (latest)
-        let results: Vec<_> = engine
-            .scan_at(b"key".to_vec()..b"kez".to_vec(), 25)
-            .unwrap()
-            .collect();
+        let results: Vec<_> = engine.scan_at(&range, 25).unwrap().collect();
         assert_eq!(results.len(), 1);
         assert_eq!(results[0].1, b"v2".to_vec());
     }
@@ -547,17 +658,12 @@ mod tests {
         engine.delete_at(b"b", 20);
 
         // scan_at ts=15 should see all 3 keys
-        let results: Vec<_> = engine
-            .scan_at(b"a".to_vec()..b"d".to_vec(), 15)
-            .unwrap()
-            .collect();
+        let range = b"a".to_vec()..b"d".to_vec();
+        let results: Vec<_> = engine.scan_at(&range, 15).unwrap().collect();
         assert_eq!(results.len(), 3, "ts=15 should see 3 keys (before delete)");
 
         // scan_at ts=25 should see only a and c
-        let results: Vec<_> = engine
-            .scan_at(b"a".to_vec()..b"d".to_vec(), 25)
-            .unwrap()
-            .collect();
+        let results: Vec<_> = engine.scan_at(&range, 25).unwrap().collect();
         assert_eq!(results.len(), 2, "ts=25 should see 2 keys (b deleted)");
         let keys: Vec<_> = results.iter().map(|(k, _)| k.clone()).collect();
         assert!(keys.contains(&b"a".to_vec()));
@@ -603,5 +709,191 @@ mod tests {
         assert_eq!(engine.get_at(b"key", 40).unwrap(), None); // deleted
         assert_eq!(engine.get_at(b"key", 45).unwrap(), None); // still deleted
         assert_eq!(engine.get_at(b"key", 50).unwrap(), Some(b"v4".to_vec())); // rewritten
+    }
+
+    #[test]
+    fn test_memory_stats() {
+        let engine = new_engine();
+
+        let stats_before = engine.memory_stats();
+        assert_eq!(stats_before.entry_count, 0);
+
+        for i in 0..100 {
+            engine.put_at(format!("key{:03}", i).as_bytes(), b"value", 1);
+        }
+
+        let stats_after = engine.memory_stats();
+        assert_eq!(stats_after.entry_count, 100);
+        assert!(stats_after.allocated_bytes > stats_before.allocated_bytes);
+    }
+
+    // ==================== Concurrent Tests ====================
+
+    use std::sync::Barrier;
+    use std::thread;
+
+    #[test]
+    fn test_concurrent_writes() {
+        let engine = ArenaMemTableEngine::new();
+        let num_threads = 8;
+        let writes_per_thread = 1000;
+        let barrier = Barrier::new(num_threads);
+
+        thread::scope(|s| {
+            for tid in 0..num_threads {
+                let engine = &engine;
+                let barrier = &barrier;
+
+                s.spawn(move || {
+                    barrier.wait();
+
+                    for i in 0..writes_per_thread {
+                        let key = format!("key_{}_{}", tid, i);
+                        let ts = (tid * writes_per_thread + i + 1) as u64;
+                        engine.put_at(key.as_bytes(), b"value", ts);
+                    }
+                });
+            }
+        });
+
+        // Verify all writes are visible
+        for tid in 0..num_threads {
+            for i in 0..writes_per_thread {
+                let key = format!("key_{}_{}", tid, i);
+                assert!(
+                    engine.get(key.as_bytes()).unwrap().is_some(),
+                    "Missing key {}",
+                    key
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn test_concurrent_reads_and_writes() {
+        let engine = ArenaMemTableEngine::new();
+
+        // Pre-populate some data
+        for i in 0..1000 {
+            engine.put_at(format!("key{:04}", i).as_bytes(), b"initial", 1);
+        }
+
+        let num_writers = 4;
+        let num_readers = 4;
+        let ops_per_thread = 1000;
+        let barrier = Barrier::new(num_writers + num_readers);
+
+        thread::scope(|s| {
+            // Writer threads - write new versions
+            for tid in 0..num_writers {
+                let engine = &engine;
+                let barrier = &barrier;
+
+                s.spawn(move || {
+                    barrier.wait();
+
+                    for i in 0..ops_per_thread {
+                        let key = format!("key{:04}", i % 1000);
+                        let ts = (100 + tid * ops_per_thread + i) as u64;
+                        let value = format!("value_{}_{}", tid, i);
+                        engine.put_at(key.as_bytes(), value.as_bytes(), ts);
+                    }
+                });
+            }
+
+            // Reader threads - read at various timestamps
+            for _ in 0..num_readers {
+                let engine = &engine;
+                let barrier = &barrier;
+
+                s.spawn(move || {
+                    barrier.wait();
+
+                    for i in 0..ops_per_thread {
+                        let key = format!("key{:04}", i % 1000);
+                        // Read at timestamp 1 should always see "initial"
+                        let value = engine.get_at(key.as_bytes(), 1).unwrap();
+                        assert_eq!(value, Some(b"initial".to_vec()));
+                    }
+                });
+            }
+        });
+    }
+
+    #[test]
+    fn test_concurrent_scans() {
+        let engine = ArenaMemTableEngine::new();
+
+        // Pre-populate data
+        for i in 0..100 {
+            engine.put_at(format!("key{:03}", i).as_bytes(), b"value", 1);
+        }
+
+        let num_threads = 8;
+        let scans_per_thread = 100;
+        let barrier = Barrier::new(num_threads);
+
+        thread::scope(|s| {
+            for _ in 0..num_threads {
+                let engine = &engine;
+                let barrier = &barrier;
+
+                s.spawn(move || {
+                    barrier.wait();
+
+                    let range = b"key000".to_vec()..b"key100".to_vec();
+                    for _ in 0..scans_per_thread {
+                        let results: Vec<_> = engine.scan(&range).unwrap().collect();
+                        assert_eq!(results.len(), 100);
+                    }
+                });
+            }
+        });
+    }
+
+    #[test]
+    fn test_stress_mixed_operations() {
+        let engine = ArenaMemTableEngine::new();
+        let num_threads = 16;
+        let ops_per_thread = 5000;
+        let barrier = Barrier::new(num_threads);
+
+        thread::scope(|s| {
+            for tid in 0..num_threads {
+                let engine = &engine;
+                let barrier = &barrier;
+
+                s.spawn(move || {
+                    barrier.wait();
+
+                    for i in 0..ops_per_thread {
+                        let key = format!("stress_{}_{}", tid, i % 100);
+                        let ts = (tid * ops_per_thread + i + 1) as u64;
+
+                        match i % 4 {
+                            0 | 1 => {
+                                // Write
+                                engine.put_at(key.as_bytes(), b"value", ts);
+                            }
+                            2 => {
+                                // Read
+                                let _ = engine.get(key.as_bytes());
+                            }
+                            _ => {
+                                // Delete
+                                engine.delete_at(key.as_bytes(), ts);
+                            }
+                        }
+                    }
+                });
+            }
+        });
+
+        // Verify the engine is in a valid state by scanning
+        let results: Vec<_> = engine
+            .scan(&(b"stress".to_vec()..b"strest".to_vec()))
+            .unwrap()
+            .collect();
+        println!("Stress test: {} entries remaining", results.len());
     }
 }

@@ -111,7 +111,7 @@ impl<S: StorageEngine, L: ClogService, T: TsoService> TransactionService<S, L, T
         let commit_ts = std::cmp::max(max_ts + 1, tso_ts);
         let txn_id = commit_ts;
 
-        // Collect keys for locking
+        // Collect keys for locking (need owned Keys for lock_keys API)
         let keys: Vec<Key> = batch.keys().cloned().collect();
 
         // Acquire in-memory locks BEFORE any writes
@@ -127,15 +127,21 @@ impl<S: StorageEngine, L: ClogService, T: TsoService> TransactionService<S, L, T
         #[cfg(feature = "failpoints")]
         fail_point!("txn_after_lock_acquired");
 
-        // Build commit log batch from write batch
+        // Build commit log batch and storage batch from write ops
+        // Take ownership of ops to avoid extra clones
         let mut clog_batch = ClogBatch::new();
-        for op in batch.iter() {
+        let mut storage_batch = WriteBatch::new();
+
+        for op in batch.into_ops() {
             match op {
                 WriteOp::Put { key, value } => {
+                    // Clone for clog, use owned for storage
                     clog_batch.add_put(txn_id, key.clone(), value.clone());
+                    storage_batch.put(key, value);
                 }
                 WriteOp::Delete { key } => {
                     clog_batch.add_delete(txn_id, key.clone());
+                    storage_batch.delete(key);
                 }
             }
         }
@@ -152,9 +158,8 @@ impl<S: StorageEngine, L: ClogService, T: TsoService> TransactionService<S, L, T
         fail_point!("txn_after_clog_write");
 
         // Apply to storage engine with commit_ts
-        let mut batch = batch;
-        batch.set_commit_ts(commit_ts);
-        self.storage.write_batch(batch)?;
+        storage_batch.set_commit_ts(commit_ts);
+        self.storage.write_batch(storage_batch)?;
 
         // FAILPOINT: After storage apply, before lock release
         // Data is visible in storage but locks still held
@@ -313,8 +318,8 @@ impl<S: StorageEngine + 'static, L: ClogService + 'static, T: TsoService> TxnSer
                 .check_range(&range.start, &range.end, ctx.start_ts)?;
         }
 
-        // Get storage scan results
-        let storage_iter = self.storage.scan_at(range.clone(), ctx.start_ts)?;
+        // Get storage scan results (pass reference to avoid cloning)
+        let storage_iter = self.storage.scan_at(&range, ctx.start_ts)?;
 
         // Collect buffered writes in range for read-your-writes semantics
         // Use a map to track the latest operation per key
@@ -395,7 +400,7 @@ impl<S: StorageEngine + 'static, L: ClogService + 'static, T: TsoService> TxnSer
         let tso_ts = self.get_ts();
         let commit_ts = std::cmp::max(max_ts + 1, tso_ts);
 
-        // Collect keys for locking
+        // Collect keys for locking (need owned Keys for lock_keys API)
         let keys: Vec<Key> = ctx.write_buffer.keys().cloned().collect();
 
         // Acquire in-memory locks BEFORE any writes
@@ -405,32 +410,41 @@ impl<S: StorageEngine + 'static, L: ClogService + 'static, T: TsoService> TxnSer
         };
         let _guards = self.concurrency_manager.lock_keys(&keys, lock)?;
 
-        // Build commit log batch
+        // Build commit log batch from write buffer ops
+        // Use into_ops() to take ownership and avoid cloning
         let mut clog_batch = ClogBatch::new();
-        for op in ctx.write_buffer.iter() {
+        let txn_id = ctx.txn_id;
+        let ops = ctx.write_buffer.into_ops();
+        let mut storage_batch = WriteBatch::new();
+
+        for op in ops {
             match op {
                 WriteOp::Put { key, value } => {
-                    clog_batch.add_put(ctx.txn_id, key.clone(), value.clone());
+                    // Add to clog (takes ownership)
+                    clog_batch.add_put(txn_id, key.clone(), value.clone());
+                    // Add to storage batch
+                    storage_batch.put(key, value);
                 }
                 WriteOp::Delete { key } => {
-                    clog_batch.add_delete(ctx.txn_id, key.clone());
+                    clog_batch.add_delete(txn_id, key.clone());
+                    storage_batch.delete(key);
                 }
             }
         }
-        clog_batch.add_commit(ctx.txn_id, commit_ts);
+        clog_batch.add_commit(txn_id, commit_ts);
 
         // Write to commit log with sync (durability guarantee)
         let lsn = self.clog_service.write(&mut clog_batch, true)?;
 
         // Apply to storage with commit_ts
-        ctx.write_buffer.set_commit_ts(commit_ts);
-        self.storage.write_batch(ctx.write_buffer.clone())?;
+        storage_batch.set_commit_ts(commit_ts);
+        self.storage.write_batch(storage_batch)?;
 
         // Mark as committed (guards will be dropped, releasing locks)
         ctx.state = TxnState::Committed;
 
         Ok(CommitInfo {
-            txn_id: ctx.txn_id,
+            txn_id,
             commit_ts,
             lsn,
         })
@@ -473,11 +487,11 @@ impl RecoveryStats {
 mod tests {
     use super::*;
     use crate::clog::{FileClogConfig, FileClogService};
-    use crate::storage::MvccMemTableEngine;
+    use crate::storage::ArenaMemTableEngine;
     use crate::tso::LocalTso;
     use tempfile::tempdir;
 
-    type TestStorage = MvccMemTableEngine;
+    type TestStorage = ArenaMemTableEngine;
 
     fn create_test_service() -> (
         Arc<TestStorage>,
@@ -489,7 +503,7 @@ mod tests {
         let clog_service = Arc::new(FileClogService::open(config).unwrap());
         let tso = Arc::new(LocalTso::new(1));
         let cm = Arc::new(ConcurrencyManager::new(0));
-        let storage = Arc::new(MvccMemTableEngine::new());
+        let storage = Arc::new(ArenaMemTableEngine::new());
         let txn_service = TransactionService::new(Arc::clone(&storage), clog_service, tso, cm);
         (storage, txn_service, dir)
     }
@@ -544,7 +558,7 @@ mod tests {
             let clog_service = Arc::new(FileClogService::open(config.clone()).unwrap());
             let tso = Arc::new(LocalTso::new(1));
             let cm = Arc::new(ConcurrencyManager::new(0));
-            let storage = Arc::new(MvccMemTableEngine::new());
+            let storage = Arc::new(ArenaMemTableEngine::new());
             let txn_service = TransactionService::new(storage, clog_service.clone(), tso, cm);
 
             txn_service.autocommit_put(b"k1", b"v1").unwrap();
@@ -559,7 +573,7 @@ mod tests {
         let clog_service = Arc::new(clog_service);
         let tso = Arc::new(LocalTso::new(1));
         let cm = Arc::new(ConcurrencyManager::new(0));
-        let storage = Arc::new(MvccMemTableEngine::new());
+        let storage = Arc::new(ArenaMemTableEngine::new());
         let txn_service = TransactionService::new(Arc::clone(&storage), clog_service, tso, cm);
 
         let stats = txn_service.recover(&entries).unwrap();
@@ -819,10 +833,7 @@ mod tests {
         assert_eq!(results.len(), 2, "scan should see 2 keys (a deleted)");
 
         let result_map: std::collections::HashMap<_, _> = results.into_iter().collect();
-        assert_eq!(
-            result_map.get(b"b".as_slice()),
-            Some(&b"modified".to_vec())
-        );
+        assert_eq!(result_map.get(b"b".as_slice()), Some(&b"modified".to_vec()));
         assert_eq!(result_map.get(b"c".as_slice()), Some(&b"3".to_vec()));
         assert!(
             !result_map.contains_key(b"a".as_slice()),

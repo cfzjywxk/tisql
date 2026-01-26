@@ -31,13 +31,13 @@ use std::time::Duration;
 
 use tisql::error::TiSqlError;
 use tisql::testkit::{
-    ConcurrencyManager, FileClogConfig, FileClogService, LocalTso, Lock, MvccMemTableEngine,
+    ArenaMemTableEngine, ConcurrencyManager, FileClogConfig, FileClogService, LocalTso, Lock,
     TransactionService,
 };
 use tisql::StorageEngine;
 
 /// Type alias for the test storage engine
-type TestStorage = MvccMemTableEngine;
+type TestStorage = ArenaMemTableEngine;
 
 /// Type alias for the test transaction service
 type TestTxnService = TransactionService<TestStorage, FileClogService, LocalTso>;
@@ -57,7 +57,7 @@ fn create_test_service() -> TestServiceTuple {
     let clog_service = Arc::new(FileClogService::open(config).unwrap());
     let tso = Arc::new(LocalTso::new(1));
     let cm = Arc::new(ConcurrencyManager::new(0));
-    let storage = Arc::new(MvccMemTableEngine::new());
+    let storage = Arc::new(ArenaMemTableEngine::new());
     let txn_service = Arc::new(TransactionService::new(
         Arc::clone(&storage),
         clog_service,

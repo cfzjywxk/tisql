@@ -350,6 +350,52 @@ mod tests {
     }
 
     #[test]
+    fn test_lock_partial_failure_releases_acquired() {
+        // Test that when locking k1, k2, k3 and k2 fails,
+        // k1's lock is properly released (atomic behavior)
+        let cm = ConcurrencyManager::new(0);
+
+        // First, lock k2 with a different transaction
+        let lock_other = Lock {
+            ts: 50,
+            primary: b"other".to_vec(),
+        };
+        let _guard_k2 = cm.lock_keys(&[b"k2".to_vec()], lock_other).unwrap();
+        assert_eq!(cm.lock_count(), 1);
+
+        // Now try to lock k1, k2, k3 - k2 should fail
+        let lock_ours = Lock {
+            ts: 100,
+            primary: b"k1".to_vec(),
+        };
+        let keys = vec![b"k1".to_vec(), b"k2".to_vec(), b"k3".to_vec()];
+        let result = cm.lock_keys(&keys, lock_ours);
+
+        // Should fail because k2 is already locked
+        assert!(result.is_err());
+
+        // IMPORTANT: k1's lock should be released (not left dangling)
+        // Only the original k2 lock should remain
+        assert_eq!(
+            cm.lock_count(),
+            1,
+            "k1 should be released on partial failure"
+        );
+
+        // Verify k1 is NOT locked (was released)
+        assert!(cm.check_lock(b"k1", 1).is_ok(), "k1 should not be locked");
+
+        // Verify k2 is still locked (by the other transaction)
+        assert!(
+            cm.check_lock(b"k2", 1).is_err(),
+            "k2 should still be locked"
+        );
+
+        // Verify k3 was never locked
+        assert!(cm.check_lock(b"k3", 1).is_ok(), "k3 should not be locked");
+    }
+
+    #[test]
     fn test_concurrent_max_ts() {
         use std::thread;
 
