@@ -55,6 +55,7 @@ optional = true
 criterion = "0.5"
 tempfile = "3"
 fail = "0.5"
+parking_lot = "0.12"
 
 [features]
 default = []
@@ -62,6 +63,10 @@ failpoints = ["fail/failpoints"]
 
 [[bench]]
 name = "memtable_bench"
+harness = false
+
+[[bench]]
+name = "memtable_comparison"
 harness = false
 
 [[bin]]
