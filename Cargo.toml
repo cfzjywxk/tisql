@@ -60,10 +60,9 @@ fail = "0.5"
 default = []
 failpoints = ["fail/failpoints"]
 
-# Benchmarks will be added later
-# [[bench]]
-# name = "storage"
-# harness = false
+[[bench]]
+name = "memtable_bench"
+harness = false
 
 [[bin]]
 name = "mysqltest-runner"

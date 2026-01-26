@@ -49,9 +49,8 @@
 //! Keys are encoded using TiDB-compatible format via the codec module.
 //! The storage layer is agnostic to key structure - it just stores bytes.
 
-mod arena_memtable;
-// Skiplist is pub(crate) so it can be accessed by testkit, but not part of public API
-pub(crate) mod skiplist;
+pub mod arena_memtable;
+pub mod skiplist;
 
 // ============================================================================
 // Storage Implementation

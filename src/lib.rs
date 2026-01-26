@@ -44,7 +44,7 @@ mod catalog;
 mod clog;
 mod executor;
 mod sql;
-mod storage;
+pub mod storage;
 mod transaction;
 mod tso;
 

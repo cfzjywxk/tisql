@@ -250,8 +250,9 @@ impl ArenaMemTableEngine {
 
     /// Write a key-value pair at the given timestamp.
     ///
-    /// This is an internal method used by `write_batch()`.
-    pub(crate) fn put_at(&self, user_key: &[u8], value: &[u8], ts: Timestamp) {
+    /// This method is exposed for benchmarking and testing. Production code
+    /// should use `write_batch()` instead.
+    pub fn put_at(&self, user_key: &[u8], value: &[u8], ts: Timestamp) {
         let mvcc_key = encode_mvcc_key(user_key, ts);
         // ArenaSkipList::insert returns Some if key exists, None if inserted
         // For MVCC, each key is unique (includes timestamp), so this should always insert
@@ -260,8 +261,9 @@ impl ArenaMemTableEngine {
 
     /// Write a tombstone (delete marker) at the given timestamp.
     ///
-    /// This is an internal method used by `write_batch()`.
-    pub(crate) fn delete_at(&self, user_key: &[u8], ts: Timestamp) {
+    /// This method is exposed for benchmarking and testing. Production code
+    /// should use `write_batch()` instead.
+    pub fn delete_at(&self, user_key: &[u8], ts: Timestamp) {
         let mvcc_key = encode_mvcc_key(user_key, ts);
         let _ = self.list().insert(mvcc_key, TOMBSTONE.to_vec());
     }
