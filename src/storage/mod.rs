@@ -60,9 +60,11 @@ pub(crate) mod skiplist;
 // Production default: Arena-based memtable with MVCC key encoding
 pub use arena_memtable::{ArenaMemTableEngine, MemoryStats};
 
+use std::collections::HashMap;
+use std::ops::Range;
+
 use crate::error::Result;
 use crate::types::{Key, RawValue, TableId, Timestamp};
-use std::ops::Range;
 
 // ============================================================================
 // Key Encoding (re-exports from codec for convenience)
@@ -205,9 +207,17 @@ pub enum WriteOp {
 ///
 /// Use `WriteBatch` to group multiple writes that should be applied
 /// as a single atomic operation.
+///
+/// # Key Deduplication
+///
+/// WriteBatch maintains at most one operation per key. If you call `put(k, v1)`
+/// followed by `put(k, v2)`, only `v2` will be committed. Similarly, `put(k, v)`
+/// followed by `delete(k)` results in only the delete. This is "last write wins"
+/// semantics required for correct MVCC behavior.
 #[derive(Default, Clone, Debug)]
 pub struct WriteBatch {
-    ops: Vec<WriteOp>,
+    /// Operations indexed by key - ensures at most one op per key (last write wins)
+    ops: HashMap<Key, WriteOp>,
     /// Commit timestamp for MVCC (set by TransactionService)
     commit_ts: Option<Timestamp>,
 }
@@ -219,16 +229,27 @@ impl WriteBatch {
     }
 
     /// Add a put operation to the batch.
+    ///
+    /// If the key already exists in the batch (from a previous put or delete),
+    /// the old operation is replaced. This ensures "last write wins" semantics.
     pub fn put(&mut self, key: impl Into<Key>, value: impl Into<RawValue>) {
-        self.ops.push(WriteOp::Put {
-            key: key.into(),
-            value: value.into(),
-        });
+        let key = key.into();
+        self.ops.insert(
+            key.clone(),
+            WriteOp::Put {
+                key,
+                value: value.into(),
+            },
+        );
     }
 
     /// Add a delete operation to the batch.
+    ///
+    /// If the key already exists in the batch (from a previous put or delete),
+    /// the old operation is replaced. This ensures "last write wins" semantics.
     pub fn delete(&mut self, key: impl Into<Key>) {
-        self.ops.push(WriteOp::Delete { key: key.into() });
+        let key = key.into();
+        self.ops.insert(key.clone(), WriteOp::Delete { key });
     }
 
     /// Clear all operations from the batch.
@@ -249,13 +270,18 @@ impl WriteBatch {
     }
 
     /// Iterate over the operations.
-    pub fn iter(&self) -> std::slice::Iter<'_, WriteOp> {
-        self.ops.iter()
+    pub fn iter(&self) -> impl Iterator<Item = &WriteOp> {
+        self.ops.values()
+    }
+
+    /// Get the operation for a specific key, if any.
+    pub fn get(&self, key: &[u8]) -> Option<&WriteOp> {
+        self.ops.get(key)
     }
 
     /// Consume the batch and return the operations.
     pub(crate) fn into_ops(self) -> Vec<WriteOp> {
-        self.ops
+        self.ops.into_values().collect()
     }
 
     /// Set the commit timestamp for MVCC.
@@ -270,9 +296,6 @@ impl WriteBatch {
 
     /// Get all keys in this batch.
     pub fn keys(&self) -> impl Iterator<Item = &Key> {
-        self.ops.iter().map(|op| match op {
-            WriteOp::Put { key, .. } => key,
-            WriteOp::Delete { key } => key,
-        })
+        self.ops.keys()
     }
 }

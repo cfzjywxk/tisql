@@ -303,17 +303,12 @@ impl<S: StorageEngine + 'static, L: ClogService + 'static, T: TsoService> TxnSer
 
     fn get(&self, ctx: &TxnCtx, key: &[u8]) -> Result<Option<RawValue>> {
         // First check write buffer for uncommitted writes (read-your-writes)
-        // Iterate in reverse order to get the most recent operation
-        for op in ctx.write_buffer.iter().rev() {
-            match op {
-                WriteOp::Put { key: k, value } if k.as_slice() == key => {
-                    return Ok(Some(value.clone()));
-                }
-                WriteOp::Delete { key: k } if k.as_slice() == key => {
-                    return Ok(None);
-                }
-                _ => {}
-            }
+        // WriteBatch has at most one op per key (last write wins)
+        if let Some(op) = ctx.write_buffer.get(key) {
+            return match op {
+                WriteOp::Put { value, .. } => Ok(Some(value.clone())),
+                WriteOp::Delete { .. } => Ok(None),
+            };
         }
 
         // Check for locks from other transactions

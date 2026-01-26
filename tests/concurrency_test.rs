@@ -519,6 +519,178 @@ fn test_concurrent_read_after_delete() {
 }
 
 // ============================================================================
+// Write Buffer Deduplication Tests
+// ============================================================================
+
+/// Test that multiple puts to the same key in one transaction keeps only the last value.
+///
+/// Regression test for: "Multiple ops on the same key in one commit are silently mishandled"
+/// Previously, put(k,v1); put(k,v2) would commit v1 instead of v2.
+#[test]
+fn test_write_buffer_last_put_wins() {
+    use tisql::TxnService;
+
+    let (_storage, txn_service, _tso, _cm, _dir) = create_test_service();
+
+    let key = b"dedup_key";
+    let value1 = b"first_value";
+    let value2 = b"second_value";
+    let value3 = b"third_value";
+
+    // Start a transaction and put the same key multiple times
+    let mut ctx = txn_service.begin(false).unwrap();
+    txn_service
+        .put(&mut ctx, key.to_vec(), value1.to_vec())
+        .unwrap();
+    txn_service
+        .put(&mut ctx, key.to_vec(), value2.to_vec())
+        .unwrap();
+    txn_service
+        .put(&mut ctx, key.to_vec(), value3.to_vec())
+        .unwrap();
+
+    // Read-your-writes should see the last value
+    let result = txn_service.get(&ctx, key).unwrap();
+    assert_eq!(
+        result,
+        Some(value3.to_vec()),
+        "Read-your-writes should see last put value"
+    );
+
+    // Commit the transaction
+    txn_service.commit(ctx).unwrap();
+
+    // Read after commit should see the last value
+    let read_ctx = txn_service.begin(true).unwrap();
+    let result = txn_service.get(&read_ctx, key).unwrap();
+    assert_eq!(
+        result,
+        Some(value3.to_vec()),
+        "Committed value should be the last put"
+    );
+}
+
+/// Test that put followed by delete in the same transaction results in delete.
+///
+/// Regression test for: "Multiple ops on the same key in one commit are silently mishandled"
+/// Previously, put(k,v); delete(k) would commit the put instead of the delete.
+#[test]
+fn test_write_buffer_put_then_delete() {
+    use tisql::TxnService;
+
+    let (_storage, txn_service, _tso, _cm, _dir) = create_test_service();
+
+    let key = b"put_delete_key";
+    let value = b"some_value";
+
+    // Start a transaction, put then delete
+    let mut ctx = txn_service.begin(false).unwrap();
+    txn_service
+        .put(&mut ctx, key.to_vec(), value.to_vec())
+        .unwrap();
+    txn_service.delete(&mut ctx, key.to_vec()).unwrap();
+
+    // Read-your-writes should see None (deleted)
+    let result = txn_service.get(&ctx, key).unwrap();
+    assert_eq!(result, None, "Read-your-writes should see deletion (None)");
+
+    // Commit the transaction
+    txn_service.commit(ctx).unwrap();
+
+    // Read after commit should see None
+    let read_ctx = txn_service.begin(true).unwrap();
+    let result = txn_service.get(&read_ctx, key).unwrap();
+    assert_eq!(result, None, "Committed result should be delete (None)");
+}
+
+/// Test that delete followed by put in the same transaction results in put.
+#[test]
+fn test_write_buffer_delete_then_put() {
+    use tisql::TxnService;
+
+    let (_storage, txn_service, _tso, _cm, _dir) = create_test_service();
+
+    let key = b"delete_put_key";
+    let value = b"final_value";
+
+    // First, insert an initial value
+    let mut setup_ctx = txn_service.begin(false).unwrap();
+    txn_service
+        .put(&mut setup_ctx, key.to_vec(), b"initial".to_vec())
+        .unwrap();
+    txn_service.commit(setup_ctx).unwrap();
+
+    // Start a new transaction, delete then put
+    let mut ctx = txn_service.begin(false).unwrap();
+    txn_service.delete(&mut ctx, key.to_vec()).unwrap();
+    txn_service
+        .put(&mut ctx, key.to_vec(), value.to_vec())
+        .unwrap();
+
+    // Read-your-writes should see the new value
+    let result = txn_service.get(&ctx, key).unwrap();
+    assert_eq!(
+        result,
+        Some(value.to_vec()),
+        "Read-your-writes should see put after delete"
+    );
+
+    // Commit the transaction
+    txn_service.commit(ctx).unwrap();
+
+    // Read after commit should see the new value
+    let read_ctx = txn_service.begin(true).unwrap();
+    let result = txn_service.get(&read_ctx, key).unwrap();
+    assert_eq!(
+        result,
+        Some(value.to_vec()),
+        "Committed result should be the put value"
+    );
+}
+
+/// Test write buffer deduplication with scan (read-your-writes in range).
+#[test]
+fn test_write_buffer_dedup_with_scan() {
+    use tisql::TxnService;
+
+    let (_storage, txn_service, _tso, _cm, _dir) = create_test_service();
+
+    // Start a transaction and put multiple values, some with duplicates
+    let mut ctx = txn_service.begin(false).unwrap();
+
+    // Key "a" - multiple puts, last should win
+    txn_service
+        .put(&mut ctx, b"a".to_vec(), b"a1".to_vec())
+        .unwrap();
+    txn_service
+        .put(&mut ctx, b"a".to_vec(), b"a2".to_vec())
+        .unwrap();
+
+    // Key "b" - put then delete, should be absent
+    txn_service
+        .put(&mut ctx, b"b".to_vec(), b"b1".to_vec())
+        .unwrap();
+    txn_service.delete(&mut ctx, b"b".to_vec()).unwrap();
+
+    // Key "c" - single put
+    txn_service
+        .put(&mut ctx, b"c".to_vec(), b"c1".to_vec())
+        .unwrap();
+
+    // Scan should show: a=a2, c=c1 (b is deleted)
+    let range = b"a".to_vec()..b"d".to_vec();
+    let results: Vec<_> = txn_service.scan(&ctx, range).unwrap().collect();
+
+    assert_eq!(results.len(), 2, "Should have 2 keys (a and c, not b)");
+
+    // Verify results (BTreeMap ordering)
+    let results_map: std::collections::HashMap<_, _> = results.into_iter().collect();
+    assert_eq!(results_map.get(&b"a".to_vec()), Some(&b"a2".to_vec()));
+    assert_eq!(results_map.get(&b"b".to_vec()), None); // deleted
+    assert_eq!(results_map.get(&b"c".to_vec()), Some(&b"c1".to_vec()));
+}
+
+// ============================================================================
 // Failpoint-based Tests (require --features failpoints)
 // ============================================================================
 
