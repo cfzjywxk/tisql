@@ -347,11 +347,12 @@ impl StorageEngine for ArenaMemTableEngine {
         //
         // To find all versions within the user key range:
         // - start: use Timestamp::MAX to get the SMALLEST mvcc key for range.start
-        // - end: use 0 to get the LARGEST mvcc key just before range.end
+        // - end: use Timestamp::MAX to get the SMALLEST mvcc key for range.end
+        //   (since range.end is exclusive, we stop right at the first version of range.end)
         //
         // Then filter by entry_ts <= ts during iteration for visibility.
         let start_mvcc = encode_mvcc_key(&range.start, Timestamp::MAX);
-        let end_mvcc = encode_mvcc_key(&range.end, 0);
+        let end_mvcc = encode_mvcc_key(&range.end, Timestamp::MAX);
 
         let mut results = Vec::new();
         let mut last_user_key: Option<Key> = None;

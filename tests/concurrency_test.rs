@@ -537,7 +537,7 @@ mod failpoint_tests {
         let key = b"fp_test_key";
 
         // Configure failpoint to pause after lock acquisition
-        fail::cfg("txn_after_lock_acquired", "pause").unwrap();
+        fail::cfg("txn_after_lock_before_commit_ts", "pause").unwrap();
 
         let txn_service_clone = Arc::clone(&txn_service);
         let writer = thread::spawn(move || {
@@ -556,7 +556,7 @@ mod failpoint_tests {
         );
 
         // Resume writer
-        fail::cfg("txn_after_lock_acquired", "off").unwrap();
+        fail::cfg("txn_after_lock_before_commit_ts", "off").unwrap();
 
         writer.join().unwrap();
 
@@ -667,6 +667,148 @@ mod failpoint_tests {
         // Final value should be v2
         let v = storage.get(key).unwrap();
         assert_eq!(v, Some(b"v2".to_vec()));
+
+        scenario.teardown();
+    }
+
+    /// Regression test for "commit in the past" anomaly (time-travel bug).
+    ///
+    /// This test verifies the fix for the snapshot isolation violation where:
+    /// BEFORE FIX: Writer picks commit_ts -> Reader starts with start_ts > commit_ts
+    ///             -> Writer acquires lock -> Writer commits
+    ///             -> Reader misses committed data because start_ts > commit_ts
+    ///
+    /// AFTER FIX: Writer acquires lock -> updates max_ts -> Reader starts
+    ///            -> Reader's start_ts is recorded in max_ts
+    ///            -> Writer picks commit_ts = max(max_ts + 1, tso_ts) > start_ts
+    ///            -> Reader correctly sees the committed data OR is blocked by lock
+    ///
+    /// The key insight is that by acquiring locks BEFORE getting commit_ts,
+    /// we ensure commit_ts > any concurrent reader's start_ts.
+    #[test]
+    fn test_no_commit_in_the_past_anomaly() {
+        use tisql::TxnService;
+
+        let scenario = fail::FailScenario::setup();
+
+        let (_storage, txn_service, _tso, cm, _dir) = create_test_service();
+        let key = b"time_travel_key";
+
+        // Phase 1: Writer acquires lock and pauses
+        fail::cfg("txn_after_lock_before_commit_ts", "pause").unwrap();
+
+        let txn_service_clone = Arc::clone(&txn_service);
+        let writer = thread::spawn(move || {
+            // This will pause right after acquiring locks but BEFORE setting commit_ts
+            // At the failpoint, locks are held but commit_ts = max(max_ts+1, tso_ts)
+            // hasn't been computed yet
+            txn_service_clone.autocommit_put(key, b"value").unwrap()
+        });
+
+        // Give writer time to reach failpoint (locks acquired)
+        thread::sleep(Duration::from_millis(50));
+
+        // Verify writer has the lock
+        assert!(
+            cm.check_lock(key, 1).is_err(),
+            "Writer should have acquired lock"
+        );
+
+        // Phase 2: Reader starts a transaction - this updates max_ts
+        // In a buggy implementation, if commit_ts was picked before locks,
+        // this reader's start_ts could be > commit_ts, causing it to miss data.
+        let reader_ctx = txn_service.begin(true).unwrap();
+        let reader_start_ts = reader_ctx.start_ts();
+
+        // Reader's start_ts should have updated max_ts
+        let max_ts_after_reader = cm.max_ts();
+        assert!(
+            max_ts_after_reader >= reader_start_ts,
+            "max_ts should include reader's start_ts"
+        );
+
+        // Phase 3: Resume writer
+        fail::cfg("txn_after_lock_before_commit_ts", "off").unwrap();
+
+        let (_, writer_commit_ts, _) = writer.join().unwrap();
+
+        // THE KEY ASSERTION: commit_ts must be > reader's start_ts
+        // This is the fix for the "commit in the past" anomaly.
+        // Because we get commit_ts = max(max_ts + 1, tso_ts) AFTER locks,
+        // and max_ts includes reader_start_ts, commit_ts > reader_start_ts.
+        assert!(
+            writer_commit_ts > reader_start_ts,
+            "commit_ts ({writer_commit_ts}) must be > reader_start_ts ({reader_start_ts}) to prevent time-travel anomaly"
+        );
+
+        // Now verify snapshot isolation works correctly:
+        // Reader with start_ts < commit_ts should NOT see the committed data
+        // (correct behavior - reader started before the logical commit point)
+        let value = txn_service.get(&reader_ctx, key).unwrap();
+        assert!(
+            value.is_none(),
+            "Reader with start_ts < commit_ts should not see the data"
+        );
+
+        // A new reader starting now should see the data
+        let new_reader_ctx = txn_service.begin(true).unwrap();
+        let value = txn_service.get(&new_reader_ctx, key).unwrap();
+        assert_eq!(
+            value,
+            Some(b"value".to_vec()),
+            "New reader should see committed data"
+        );
+
+        scenario.teardown();
+    }
+
+    /// Test that concurrent readers during commit don't create anomalies.
+    ///
+    /// Multiple readers starting while a writer holds locks should all
+    /// have start_ts < commit_ts (when the writer eventually commits).
+    #[test]
+    fn test_multiple_readers_during_write_no_anomaly() {
+        use tisql::TxnService;
+
+        let scenario = fail::FailScenario::setup();
+
+        let (_storage, txn_service, _tso, _cm, _dir) = create_test_service();
+        let key = b"multi_reader_key";
+
+        fail::cfg("txn_after_lock_before_commit_ts", "pause").unwrap();
+
+        let txn_service_clone = Arc::clone(&txn_service);
+        let writer =
+            thread::spawn(move || txn_service_clone.autocommit_put(key, b"value").unwrap());
+
+        thread::sleep(Duration::from_millis(50));
+
+        // Start multiple readers while writer holds lock
+        let mut reader_contexts = vec![];
+        for _ in 0..5 {
+            let ctx = txn_service.begin(true).unwrap();
+            reader_contexts.push(ctx);
+        }
+
+        // Resume writer
+        fail::cfg("txn_after_lock_before_commit_ts", "off").unwrap();
+        let (_, writer_commit_ts, _) = writer.join().unwrap();
+
+        // ALL readers should have start_ts < commit_ts
+        for (i, ctx) in reader_contexts.iter().enumerate() {
+            let start_ts = ctx.start_ts();
+            assert!(
+                writer_commit_ts > start_ts,
+                "Reader {i} start_ts ({start_ts}) should be < commit_ts ({writer_commit_ts})"
+            );
+
+            // None of them should see the data
+            let value = txn_service.get(ctx, key).unwrap();
+            assert!(
+                value.is_none(),
+                "Reader {i} should not see data committed after its start_ts"
+            );
+        }
 
         scenario.teardown();
     }

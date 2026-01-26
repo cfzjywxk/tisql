@@ -45,6 +45,9 @@ const FILE_HEADER_SIZE: usize = 16;
 /// Record header size in bytes (type + length + checksum)
 const RECORD_HEADER_SIZE: usize = 12;
 
+/// Maximum record size (256 MB) to prevent OOM from corrupted length fields
+const MAX_RECORD_SIZE: usize = 256 * 1024 * 1024;
+
 /// Configuration for file-based commit log service
 #[derive(Clone, Debug)]
 pub struct FileClogConfig {
@@ -256,6 +259,14 @@ impl FileClogService {
             )));
         }
 
+        // Guard against corrupted length field causing OOM
+        if length > MAX_RECORD_SIZE {
+            let max_size = MAX_RECORD_SIZE;
+            return Err(TiSqlError::Internal(format!(
+                "Record size {length} exceeds maximum {max_size} (possibly corrupted)"
+            )));
+        }
+
         // Read data
         let mut data = vec![0u8; length];
         reader.read_exact(&mut data)?;
@@ -283,6 +294,24 @@ impl FileClogService {
             TiSqlError::Internal(format!("Failed to serialize commit log entries: {e}"))
         })?;
 
+        // Guard against records larger than u32::MAX (length field is u32)
+        if data.len() > u32::MAX as usize {
+            return Err(TiSqlError::Internal(format!(
+                "Record size {} exceeds maximum {} (u32::MAX)",
+                data.len(),
+                u32::MAX
+            )));
+        }
+
+        // Also enforce our practical limit
+        if data.len() > MAX_RECORD_SIZE {
+            return Err(TiSqlError::Internal(format!(
+                "Record size {} exceeds maximum {}",
+                data.len(),
+                MAX_RECORD_SIZE
+            )));
+        }
+
         // Compute checksum
         let checksum = crc32(&data);
 
@@ -305,26 +334,26 @@ impl ClogService for FileClogService {
             return Ok(self.current_lsn.load(Ordering::SeqCst));
         }
 
-        // Assign LSNs
-        let start_lsn = self
-            .current_lsn
-            .fetch_add(batch.len() as u64, Ordering::SeqCst);
+        // Acquire lock BEFORE assigning LSNs to ensure writes are ordered
+        // This prevents concurrent writers from producing out-of-order LSNs in the file
+        let mut writer = self.writer.lock().unwrap();
 
+        // Assign LSNs inside the lock
+        let start_lsn = self.current_lsn.load(Ordering::SeqCst);
         for (i, entry) in batch.entries.iter_mut().enumerate() {
             entry.lsn = start_lsn + i as u64;
         }
-
         let end_lsn = start_lsn + batch.len() as u64 - 1;
 
         // Write to file
-        {
-            let mut writer = self.writer.lock().unwrap();
-            Self::write_record(&mut *writer, batch.entries())?;
-            writer.flush()?;
+        Self::write_record(&mut *writer, batch.entries())?;
+        writer.flush()?;
 
-            if sync {
-                writer.get_ref().sync_data()?;
-            }
+        // Update current_lsn AFTER successful write
+        self.current_lsn.store(end_lsn + 1, Ordering::SeqCst);
+
+        if sync {
+            writer.get_ref().sync_data()?;
         }
 
         log_trace!(
@@ -338,7 +367,9 @@ impl ClogService for FileClogService {
     }
 
     fn sync(&self) -> Result<()> {
-        let writer = self.writer.lock().unwrap();
+        let mut writer = self.writer.lock().unwrap();
+        // Flush buffered data before fsync to ensure all writes are persisted
+        writer.flush()?;
         writer.get_ref().sync_data()?;
         Ok(())
     }
@@ -739,5 +770,80 @@ mod tests {
         let (service, entries) = FileClogService::recover(config).unwrap();
         assert_eq!(entries.len(), 0);
         assert_eq!(service.current_lsn(), 1);
+    }
+
+    /// Test concurrent clog writes produce monotonic LSNs in file order.
+    /// This verifies the fix for the LSN out-of-order issue where concurrent
+    /// writers could produce entries with non-monotonic LSNs in the file.
+    #[test]
+    fn test_concurrent_writes_lsn_ordering() {
+        use std::sync::{Arc, Barrier};
+        use std::thread;
+
+        let dir = tempdir().unwrap();
+        let config = FileClogConfig::with_dir(dir.path());
+        let service = Arc::new(FileClogService::open(config.clone()).unwrap());
+
+        let num_threads = 8;
+        let writes_per_thread = 100;
+        let barrier = Arc::new(Barrier::new(num_threads));
+
+        let mut handles = Vec::new();
+        for tid in 0..num_threads {
+            let service = Arc::clone(&service);
+            let barrier = Arc::clone(&barrier);
+
+            handles.push(thread::spawn(move || {
+                barrier.wait();
+
+                for i in 0..writes_per_thread {
+                    let mut batch = ClogBatch::new();
+                    batch.add_put(
+                        tid as u64,
+                        format!("key_{tid}_{i}").into_bytes(),
+                        format!("value_{tid}_{i}").into_bytes(),
+                    );
+                    service.write(&mut batch, false).unwrap();
+                }
+            }));
+        }
+
+        for h in handles {
+            h.join().unwrap();
+        }
+
+        service.close().unwrap();
+
+        // Recover and verify LSN ordering
+        let (recovered_service, entries) = FileClogService::recover(config).unwrap();
+
+        // Verify all entries were written
+        let expected_count = num_threads * writes_per_thread;
+        assert_eq!(
+            entries.len(),
+            expected_count,
+            "Expected {} entries, got {}",
+            expected_count,
+            entries.len()
+        );
+
+        // Verify LSNs are monotonically increasing in file order
+        for i in 1..entries.len() {
+            assert!(
+                entries[i].lsn > entries[i - 1].lsn,
+                "LSNs not monotonic at index {}: {} <= {}",
+                i,
+                entries[i].lsn,
+                entries[i - 1].lsn
+            );
+        }
+
+        // Verify current_lsn is max(lsn) + 1
+        let max_lsn = entries.iter().map(|e| e.lsn).max().unwrap();
+        assert_eq!(
+            recovered_service.current_lsn(),
+            max_lsn + 1,
+            "current_lsn should be max(lsn) + 1"
+        );
     }
 }

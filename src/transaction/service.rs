@@ -104,25 +104,41 @@ impl<S: StorageEngine, L: ClogService, T: TsoService> TransactionService<S, L, T
             return Ok((0, ts, 0));
         }
 
-        // Get commit_ts ensuring it's greater than max observed timestamp.
-        // This maintains MVCC invariant: commit_ts > all reader's start_ts
+        // Collect keys for locking (need owned Keys for lock_keys API)
+        let keys: Vec<Key> = batch.keys().cloned().collect();
+
+        // Acquire in-memory locks BEFORE getting commit_ts
+        // This prevents the "time-travel" anomaly where a reader with start_ts > commit_ts
+        // could miss data that commits after they started reading.
+        //
+        // By acquiring locks first:
+        // 1. Any concurrent reader will see the lock and be blocked
+        // 2. We then get commit_ts which is guaranteed > any concurrent reader's start_ts
+        //    because: start_ts = max(TSO, max_ts), and we update max_ts via lock_keys
+        //
+        // Get a preliminary timestamp for the lock (will be updated to commit_ts)
+        let preliminary_ts = self.get_ts();
+        let lock = Lock {
+            ts: preliminary_ts,
+            primary: keys.first().cloned().unwrap_or_default(),
+        };
+        let _guards = self.concurrency_manager.lock_keys(&keys, lock)?;
+
+        // FAILPOINT: After locks acquired, before commit_ts computation.
+        // This is used to test the "commit in the past" fix - any reader
+        // starting now will have its start_ts recorded in max_ts, ensuring
+        // the writer's commit_ts > reader's start_ts.
+        #[cfg(feature = "failpoints")]
+        fail_point!("txn_after_lock_before_commit_ts");
+
+        // Now get commit_ts AFTER acquiring locks
+        // This ensures commit_ts > any concurrent reader's start_ts
         let max_ts = self.concurrency_manager.max_ts();
         let tso_ts = self.get_ts();
         let commit_ts = std::cmp::max(max_ts + 1, tso_ts);
         let txn_id = commit_ts;
 
-        // Collect keys for locking (need owned Keys for lock_keys API)
-        let keys: Vec<Key> = batch.keys().cloned().collect();
-
-        // Acquire in-memory locks BEFORE any writes
-        // This makes locks visible to concurrent readers immediately
-        let lock = Lock {
-            ts: commit_ts,
-            primary: keys.first().cloned().unwrap_or_default(),
-        };
-        let _guards = self.concurrency_manager.lock_keys(&keys, lock)?;
-
-        // FAILPOINT: After locks acquired, before any writes
+        // FAILPOINT: After commit_ts set, before any writes
         // Readers checking now will see the lock and be blocked
         #[cfg(feature = "failpoints")]
         fail_point!("txn_after_lock_acquired");
@@ -394,21 +410,26 @@ impl<S: StorageEngine + 'static, L: ClogService + 'static, T: TsoService> TxnSer
             });
         }
 
-        // Get commit_ts ensuring it's greater than max observed timestamp.
-        // This maintains MVCC invariant: commit_ts > all reader's start_ts
-        let max_ts = self.concurrency_manager.max_ts();
-        let tso_ts = self.get_ts();
-        let commit_ts = std::cmp::max(max_ts + 1, tso_ts);
-
         // Collect keys for locking (need owned Keys for lock_keys API)
         let keys: Vec<Key> = ctx.write_buffer.keys().cloned().collect();
 
-        // Acquire in-memory locks BEFORE any writes
+        // Acquire in-memory locks BEFORE getting commit_ts
+        // This prevents the "time-travel" anomaly (see execute_write for details)
+        let preliminary_ts = self.get_ts();
         let lock = Lock {
-            ts: commit_ts,
+            ts: preliminary_ts,
             primary: keys.first().cloned().unwrap_or_default(),
         };
         let _guards = self.concurrency_manager.lock_keys(&keys, lock)?;
+
+        // FAILPOINT: After locks acquired, before commit_ts computation
+        #[cfg(feature = "failpoints")]
+        fail_point!("txn_after_lock_before_commit_ts");
+
+        // Get commit_ts AFTER acquiring locks to ensure commit_ts > concurrent reader's start_ts
+        let max_ts = self.concurrency_manager.max_ts();
+        let tso_ts = self.get_ts();
+        let commit_ts = std::cmp::max(max_ts + 1, tso_ts);
 
         // Build commit log batch from write buffer ops
         // Use into_ops() to take ownership and avoid cloning
