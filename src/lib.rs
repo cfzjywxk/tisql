@@ -79,7 +79,7 @@ pub mod testkit {
     };
 
     // ArenaSkipList (exposed for testing low-level skiplist behavior)
-    pub use crate::storage::skiplist::ArenaSkipList;
+    pub use crate::storage::memtable::arena_skiplist::ArenaSkipList;
 
     pub use crate::transaction::{ConcurrencyManager, Lock, TransactionService};
     pub use crate::tso::LocalTso;

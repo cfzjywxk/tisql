@@ -33,7 +33,7 @@ use parking_lot::RwLock;
 use std::collections::BTreeMap;
 use std::sync::{Arc, Barrier};
 use std::thread;
-use tisql::storage::skiplist::ArenaSkipList;
+use tisql::storage::memtable::arena_skiplist::ArenaSkipList;
 use tisql::util::arena::PageArena;
 
 // =============================================================================

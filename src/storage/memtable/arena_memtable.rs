@@ -39,9 +39,9 @@
 use std::mem::ManuallyDrop;
 use std::ops::Range;
 
-use super::skiplist::ArenaSkipList;
-use super::{StorageEngine, WriteBatch, WriteOp};
+use super::arena_skiplist::ArenaSkipList;
 use crate::error::{Result, TiSqlError};
+use crate::storage::{StorageEngine, WriteBatch, WriteOp};
 use crate::types::{Key, RawValue, Timestamp};
 use crate::util::arena::PageArena;
 

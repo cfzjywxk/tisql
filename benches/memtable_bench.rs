@@ -10,8 +10,8 @@ use criterion::{
 };
 use std::sync::{Arc, Barrier};
 use std::thread;
-use tisql::storage::arena_memtable::ArenaMemTableEngine;
-use tisql::storage::skiplist::ArenaSkipList;
+use tisql::storage::memtable::arena_memtable::ArenaMemTableEngine;
+use tisql::storage::memtable::arena_skiplist::ArenaSkipList;
 use tisql::storage::{StorageEngine, WriteBatch};
 use tisql::util::arena::PageArena;
 

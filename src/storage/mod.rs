@@ -56,10 +56,8 @@
 //! Keys are encoded using TiDB-compatible format via the codec module.
 //! The storage layer is agnostic to key structure - it just stores bytes.
 
-pub mod arena_memtable;
-pub mod btree_memtable;
-pub mod crossbeam_memtable;
-pub mod skiplist;
+pub mod memtable;
+pub mod sstable;
 
 // ============================================================================
 // Storage Implementation
@@ -67,18 +65,44 @@ pub mod skiplist;
 
 // Production default: Crossbeam-based memtable with MVCC key encoding
 // (better write throughput due to smaller node size and epoch-based GC)
-pub use crossbeam_memtable::CrossbeamMemTableEngine as MemTableEngine;
-pub use crossbeam_memtable::MemoryStats;
+pub use memtable::MemTableEngine;
+pub use memtable::MemoryStats;
 
 // Re-export arena-based memtable for comparison/benchmarking
-pub use arena_memtable::ArenaMemTableEngine;
-pub use arena_memtable::MemoryStats as ArenaMemoryStats;
+pub use memtable::ArenaMemTableEngine;
+pub use memtable::ArenaMemoryStats;
 
 // Re-export BTreeMap-based memtable for comparison/benchmarking
-pub use btree_memtable::BTreeMemTableEngine;
+pub use memtable::BTreeMemTableEngine;
 
 // Re-export CrossbeamMemTableEngine for comparison/benchmarking
-pub use crossbeam_memtable::CrossbeamMemTableEngine;
+pub use memtable::CrossbeamMemTableEngine;
+
+// Re-export SST types for persistent storage
+pub use sstable::{
+    // Builder types
+    CompressionType,
+    // Iterator types
+    ConcatIterator,
+    // Block types
+    DataBlock,
+    DataBlockBuilder,
+    Footer,
+    IndexBlock,
+    IndexBlockBuilder,
+    IndexEntry,
+    SstBuilder,
+    SstBuilderOptions,
+    SstIterator,
+    SstMeta,
+    // Reader types
+    SstReader,
+    SstReaderRef,
+    DEFAULT_BLOCK_SIZE,
+    FOOTER_SIZE,
+    SST_MAGIC,
+    SST_VERSION,
+};
 
 use std::collections::HashMap;
 use std::ops::Range;

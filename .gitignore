@@ -17,3 +17,4 @@ doc/
 # Claude Code project instructions (local only)
 CLAUDE.md
 AGENTS.md
+storage_engine_thought.md

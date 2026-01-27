@@ -45,8 +45,8 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 
 use crossbeam_skiplist::SkipMap;
 
-use super::{StorageEngine, WriteBatch, WriteOp};
 use crate::error::{Result, TiSqlError};
+use crate::storage::{StorageEngine, WriteBatch, WriteOp};
 use crate::types::{Key, RawValue, Timestamp};
 
 /// Tombstone marker for deleted keys.
