@@ -54,8 +54,10 @@ use crate::types::{Key, RawValue, Timestamp};
 use super::config::LsmConfig;
 use super::ilog::IlogService;
 use super::memtable::MemTable;
-use super::sstable::{SstBuilder, SstBuilderOptions, SstMeta, SstReader};
-use super::version::{ManifestDelta, Version};
+use super::sstable::{
+    SstBuilder, SstBuilderOptions, SstIterator, SstMeta, SstReader, SstReaderRef,
+};
+use super::version::{ManifestDelta, Version, MAX_LEVELS};
 
 /// Inner state of the LSM engine, protected by RwLock for atomic updates.
 struct LsmState {
@@ -310,7 +312,7 @@ impl LsmEngine {
         }
 
         // Phase 2: Build SST file
-        let sst_path = self.config.sst_dir().join(format!("{:08}.sst", sst_id));
+        let sst_path = self.config.sst_dir().join(format!("{sst_id:08}.sst"));
         let options = SstBuilderOptions {
             block_size: self.config.block_size,
             compression: self.config.compression,
@@ -318,11 +320,11 @@ impl LsmEngine {
 
         let mut builder = SstBuilder::new(&sst_path, options)?;
 
-        // Iterate memtable and add all entries
-        // Use scan with full range to get all MVCC versions
+        // Iterate memtable and add all entries INCLUDING tombstones
+        // Tombstones must be written to SST to mask older values in previous SSTs
         let inner = memtable.inner();
         let range = vec![]..vec![0xFF; 32]; // Full range
-        let entries: Vec<_> = inner.scan(&range)?.collect();
+        let entries: Vec<_> = inner.scan_all(&range)?.collect();
 
         for (key, value) in entries {
             builder.add(&key, &value)?;
@@ -528,35 +530,115 @@ impl StorageEngine for LsmEngine {
     fn scan_at(
         &self,
         range: &Range<Key>,
-        ts: Timestamp,
+        _ts: Timestamp,
     ) -> Result<Box<dyn Iterator<Item = (Key, RawValue)> + '_>> {
-        // For now, collect from memtables only
-        // TODO: Merge with SST iterators
-        let (active, frozen) = {
+        // Use HashMap to track the latest value for each user key
+        // This automatically handles MVCC deduplication
+        // Value of None means the key was deleted (tombstone)
+        use std::collections::HashMap;
+
+        // Tombstone marker (must match crossbeam_memtable.rs)
+        const TOMBSTONE: &[u8] = b"\x00\x00\x00\x00TISQL_TOMBSTONE\x01";
+
+        let (active, frozen, version) = {
             let state = self.state.read().unwrap();
-            (Arc::clone(&state.active), state.frozen.clone())
+            (
+                Arc::clone(&state.active),
+                state.frozen.clone(),
+                Arc::clone(&state.version),
+            )
         };
 
-        // Collect from active memtable
-        let mut results: Vec<(Key, RawValue)> = active.scan_at(range, ts)?.collect();
+        // Results map: user_key -> Option<value>
+        // None means deleted (tombstone), Some means value exists
+        let mut results: HashMap<Key, Option<RawValue>> = HashMap::new();
 
-        // Collect from frozen memtables
-        for memtable in &frozen {
-            let memtable_results: Vec<_> = memtable.scan_at(range, ts)?.collect();
-            // Merge: memtable results should override earlier results for same key
-            for (k, v) in memtable_results {
-                if !results.iter().any(|(rk, _)| rk == &k) {
-                    results.push((k, v));
+        // 1. Scan SST files (oldest data first, will be overwritten by newer)
+        // Note: SSTs contain user keys (not MVCC-encoded keys) because memtable.scan_all()
+        // decodes MVCC keys before writing to SST. Each SST has the latest version
+        // of each key at the time of flush, including tombstones.
+        //
+        // Process levels from highest to L0 (older data first)
+        for level in (0..MAX_LEVELS).rev() {
+            let ssts = version.ssts_at_level(level as u32);
+            // For L0, process in order of increasing ID (older first)
+            // For other levels, they're already sorted
+            let mut sorted_ssts: Vec<_> = ssts.iter().collect();
+            if level == 0 {
+                sorted_ssts.sort_by_key(|s| s.id);
+            }
+
+            for sst_meta in sorted_ssts {
+                let sst_path = self
+                    .config
+                    .sst_dir()
+                    .join(format!("{:08}.sst", sst_meta.id));
+
+                if !sst_path.exists() {
+                    continue;
+                }
+
+                if let Ok(reader) = SstReaderRef::open(&sst_path) {
+                    // Use iterator to scan the SST
+                    if let Ok(mut iter) = SstIterator::new(reader) {
+                        while iter.valid() {
+                            let key = iter.key();
+                            let value = iter.value();
+
+                            // SST contains user keys, so compare directly with range
+                            if key >= range.start.as_slice() && key < range.end.as_slice() {
+                                // Check for tombstone
+                                if value == TOMBSTONE {
+                                    // Mark as deleted
+                                    results.insert(key.to_vec(), None);
+                                } else {
+                                    // Newer SSTs will overwrite older values for same key
+                                    results.insert(key.to_vec(), Some(value.to_vec()));
+                                }
+                            }
+
+                            // Move to next entry
+                            if iter.next().is_err() {
+                                break;
+                            }
+                        }
+                    }
                 }
             }
         }
 
-        // TODO: Merge with SST results
+        // 2. Scan frozen memtables (newest frozen last, so newer overwrites older)
+        // Use scan_all to include tombstones so deletions mask older SST values
+        for memtable in frozen.iter().rev() {
+            let memtable_results: Vec<_> = memtable.inner().scan_all(range)?.collect();
+            for (k, v) in memtable_results {
+                if v == TOMBSTONE {
+                    results.insert(k, None);
+                } else {
+                    results.insert(k, Some(v));
+                }
+            }
+        }
 
-        // Sort by key
-        results.sort_by(|a, b| a.0.cmp(&b.0));
+        // 3. Scan active memtable (newest data)
+        // Use scan_all to include tombstones
+        let active_results: Vec<_> = active.inner().scan_all(range)?.collect();
+        for (k, v) in active_results {
+            if v == TOMBSTONE {
+                results.insert(k, None);
+            } else {
+                results.insert(k, Some(v));
+            }
+        }
 
-        Ok(Box::new(results.into_iter()))
+        // Convert to sorted vector, filtering out tombstones (None values)
+        let mut result_vec: Vec<(Key, RawValue)> = results
+            .into_iter()
+            .filter_map(|(k, v)| v.map(|val| (k, val)))
+            .collect();
+        result_vec.sort_by(|a, b| a.0.cmp(&b.0));
+
+        Ok(Box::new(result_vec.into_iter()))
     }
 }
 
@@ -713,7 +795,7 @@ mod tests {
         }
 
         // Force flush
-        let flushed = engine.flush_all().unwrap();
+        let _flushed = engine.flush_all().unwrap();
 
         // Should have flushed some SSTs
         if engine.frozen_count() > 0 {

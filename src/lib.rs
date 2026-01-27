@@ -89,11 +89,11 @@ pub mod testkit {
 
 // Internal imports (not re-exported)
 use catalog::MvccCatalog;
-use clog::{FileClogConfig, FileClogService};
+use clog::FileClogService;
 use error::Result;
 use executor::{ExecutionResult, Executor, SimpleExecutor};
 use sql::{Binder, Parser};
-use storage::MemTableEngine;
+use storage::{IlogService, LsmEngine, LsmRecovery};
 use transaction::{ConcurrencyManager, TransactionService};
 use tso::LocalTso;
 use types::Value;
@@ -188,7 +188,7 @@ impl SQLEngine {
 // ============================================================================
 
 /// Internal type alias for concrete storage engine.
-type DbStorage = MemTableEngine;
+type DbStorage = LsmEngine;
 
 /// Internal type alias for concrete transaction service.
 /// Not exposed publicly - callers only see TxnService trait.
@@ -220,50 +220,50 @@ pub struct Database {
     txn_service: Arc<DbTxnService>,
     /// Schema metadata catalog (MVCC-based, persistent)
     catalog: DbCatalog,
+    /// Ilog service for SST metadata persistence (kept for proper shutdown)
+    #[allow(dead_code)]
+    ilog: Arc<IlogService>,
+    /// LSM storage engine (kept for flush on shutdown)
+    storage: Arc<LsmEngine>,
 }
 
 impl Database {
     /// Open database with persistence and recovery.
     ///
     /// This is the only way to create a Database instance.
-    /// All databases use file-based persistence.
+    /// All databases use file-based persistence with LSM storage engine.
     pub fn open(config: DatabaseConfig) -> Result<Self> {
         log_info!("Opening TiSQL database at {:?}", config.data_dir);
 
-        // Create commit log config and recover
-        let clog_config = FileClogConfig::with_dir(&config.data_dir);
-        let (clog_service, entries) = FileClogService::recover(clog_config)?;
-        let clog_service = Arc::new(clog_service);
+        // Use LsmRecovery for coordinated recovery of storage and logs
+        let recovery = LsmRecovery::new(&config.data_dir);
+        let recovery_result = recovery.recover()?;
 
-        // Create TSO service for timestamp allocation
-        let tso = Arc::new(LocalTso::new(1));
+        log_info!(
+            "LSM recovery complete: {} clog entries replayed, {} txns, flushed_lsn={}, max_commit_ts={}",
+            recovery_result.stats.clog_entries,
+            recovery_result.stats.txn_count,
+            recovery_result.stats.flushed_lsn,
+            recovery_result.stats.max_commit_ts
+        );
 
-        // Create concurrency manager (for locks and max_ts)
-        let concurrency_manager = Arc::new(ConcurrencyManager::new(0));
+        // Wrap storage in Arc
+        let storage = Arc::new(recovery_result.engine);
 
-        // Create storage engine (pure key-value store, no transaction logic)
-        let storage = Arc::new(MemTableEngine::new());
+        // Create TSO service, starting from recovered max_commit_ts + 1
+        let tso = Arc::new(LocalTso::new(recovery_result.stats.max_commit_ts + 1));
 
-        // Create transaction service
+        // Create concurrency manager with recovered max_ts
+        let concurrency_manager =
+            Arc::new(ConcurrencyManager::new(recovery_result.stats.max_commit_ts));
+
+        // Create transaction service with recovered components
         let txn_service = Arc::new(TransactionService::new(
             Arc::clone(&storage),
-            Arc::clone(&clog_service),
+            recovery_result.clog,
             Arc::clone(&tso),
             Arc::clone(&concurrency_manager),
         ));
-
-        // Recover state by replaying commit log
-        // This also recovers catalog metadata (stored with 'm' prefix keys)
-        if !entries.is_empty() {
-            let stats = txn_service.recover(&entries)?;
-            log_info!(
-                "Recovery complete: {} txns, {} puts, {} deletes applied, {} entries rolled back",
-                stats.committed_txns,
-                stats.applied_puts,
-                stats.applied_deletes,
-                stats.rolled_back_entries
-            );
-        }
 
         // Create MVCC catalog using same txn_service
         let catalog = MvccCatalog::new(Arc::clone(&txn_service));
@@ -281,6 +281,8 @@ impl Database {
             sql_engine: SQLEngine::new(),
             txn_service,
             catalog,
+            ilog: recovery_result.ilog,
+            storage,
         })
     }
 
@@ -384,9 +386,19 @@ impl Database {
         Ok(tables.into_iter().map(|t| t.name().to_string()).collect())
     }
 
-    /// Close the database (flush commit log).
+    /// Close the database (flush memtables and sync logs).
     pub fn close(&self) -> Result<()> {
+        // Flush any pending memtable data to SSTs
+        if let Err(e) = self.storage.flush_all_with_active() {
+            log_warn!("Error flushing memtables on close: {}", e);
+        }
+
+        // Close commit log
         self.txn_service.clog_service().close()?;
+
+        // Close ilog
+        self.ilog.close()?;
+
         log_info!("Database closed");
         Ok(())
     }
@@ -394,7 +406,10 @@ impl Database {
 
 impl Drop for Database {
     fn drop(&mut self) {
+        // Best-effort flush on drop
+        let _ = self.storage.flush_all_with_active();
         let _ = self.txn_service.clog_service().close();
+        let _ = self.ilog.close();
     }
 }
 

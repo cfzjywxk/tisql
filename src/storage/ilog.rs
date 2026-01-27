@@ -445,7 +445,7 @@ impl IlogService {
         let mut cleaned = 0;
 
         for sst_id in orphan_ids {
-            let sst_path = self.config.sst_dir.join(format!("{:08}.sst", sst_id));
+            let sst_path = self.config.sst_dir.join(format!("{sst_id:08}.sst"));
             if sst_path.exists() {
                 log_warn!("Removing orphan SST file: {:?}", sst_path);
                 fs::remove_file(&sst_path)?;
@@ -477,6 +477,14 @@ impl IlogService {
         }
 
         Ok(cleaned)
+    }
+
+    /// Close the ilog service, flushing any pending writes.
+    pub fn close(&self) -> Result<()> {
+        let mut writer = self.writer.lock().unwrap();
+        writer.flush()?;
+        writer.get_ref().sync_data()?;
+        Ok(())
     }
 
     // ========== Private methods ==========

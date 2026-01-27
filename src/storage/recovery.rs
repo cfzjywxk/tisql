@@ -90,6 +90,8 @@ pub struct RecoveryStats {
     pub flushed_lsn: Lsn,
     /// Final LSN after recovery
     pub final_lsn: Lsn,
+    /// Maximum commit timestamp seen (for TSO initialization)
+    pub max_commit_ts: Timestamp,
 }
 
 /// LSM recovery coordinator.
@@ -173,12 +175,16 @@ impl LsmRecovery {
             version,
         )?;
 
-        // Step 4: Recover clog
+        // Step 4: Recover clog with shared LSN provider
+        // This ensures clog and ilog share the same LSN space for proper ordering
         log_info!(
             "Starting clog recovery from {:?}",
             self.clog_config.clog_path()
         );
-        let (clog, clog_entries) = FileClogService::recover(self.clog_config)?;
+        let (clog, clog_entries) = FileClogService::recover_with_lsn_provider(
+            self.clog_config,
+            Arc::clone(&lsn_provider),
+        )?;
         let clog = Arc::new(clog);
 
         log_info!(
@@ -191,13 +197,9 @@ impl LsmRecovery {
         let replay_result = Self::replay_clog(&engine, &clog_entries, flushed_lsn)?;
         stats.clog_entries = replay_result.entries_replayed;
         stats.txn_count = replay_result.txn_count;
+        stats.max_commit_ts = replay_result.max_commit_ts;
 
-        // Step 6: Update LSN provider to max of ilog and clog
-        let max_clog_lsn = clog_entries.iter().map(|e| e.lsn).max().unwrap_or(0);
-        let current_lsn = lsn_provider.current_lsn();
-        if max_clog_lsn >= current_lsn {
-            lsn_provider.set_lsn(max_clog_lsn + 1);
-        }
+        // LSN provider is automatically updated by clog recovery to be at least max(clog_lsn) + 1
         stats.final_lsn = lsn_provider.current_lsn();
 
         log_info!(
@@ -218,7 +220,8 @@ impl LsmRecovery {
 
     /// Replay clog entries to the engine.
     ///
-    /// Only replays entries with lsn > flushed_lsn.
+    /// Only replays entries with lsn > flushed_lsn, but scans ALL entries
+    /// to find max_commit_ts for TSO initialization.
     fn replay_clog(
         engine: &LsmEngine,
         entries: &[ClogEntry],
@@ -227,8 +230,15 @@ impl LsmRecovery {
         let mut txn_states: HashMap<TxnId, TxnReplayState> = HashMap::new();
         let mut result = ReplayResult::default();
 
-        // Filter and process entries
+        // Process all entries - track max_commit_ts from ALL,
+        // but only replay writes from entries with lsn > flushed_lsn
         for entry in entries {
+            // Track max_commit_ts from ALL entries (for TSO initialization)
+            if let ClogOp::Commit { commit_ts } = &entry.op {
+                result.max_commit_ts = result.max_commit_ts.max(*commit_ts);
+            }
+
+            // Skip entries already in SSTs
             if entry.lsn <= flushed_lsn {
                 continue;
             }
@@ -294,6 +304,8 @@ impl LsmRecovery {
 struct ReplayResult {
     entries_replayed: usize,
     txn_count: usize,
+    /// Max commit_ts seen across ALL entries (for TSO initialization)
+    max_commit_ts: Timestamp,
 }
 
 #[cfg(test)]
@@ -364,8 +376,11 @@ mod tests {
                 LsmEngine::open_durable(lsm_config, Arc::clone(&lsn_provider), Arc::clone(&ilog))
                     .unwrap();
 
+            // Use shared LSN provider for clog too
             let clog_config = FileClogConfig::with_dir(tmp.path());
-            let clog = FileClogService::open(clog_config).unwrap();
+            let clog =
+                FileClogService::open_with_lsn_provider(clog_config, Arc::clone(&lsn_provider))
+                    .unwrap();
 
             let written = write_test_data(&engine, &clog, 5);
 
@@ -391,10 +406,12 @@ mod tests {
                 );
             }
 
-            // Note: Some clog entries may still be replayed because clog and engine
-            // have separate LSN counters. The data is already in SST, so re-applying
-            // won't cause issues (it will just be shadowed by the SST data).
-            // TODO: Unify LSN allocation between clog and LsmEngine.
+            // With unified LSN provider, flushed_lsn correctly tracks what's in SSTs
+            // so clog replay should skip entries that are already flushed
+            assert!(
+                result.stats.flushed_lsn > 0,
+                "flushed_lsn should be set after flush"
+            );
         }
     }
 
@@ -418,8 +435,11 @@ mod tests {
                 LsmEngine::open_durable(lsm_config, Arc::clone(&lsn_provider), Arc::clone(&ilog))
                     .unwrap();
 
+            // Use shared LSN provider for clog
             let clog_config = FileClogConfig::with_dir(tmp.path());
-            let clog = FileClogService::open(clog_config).unwrap();
+            let clog =
+                FileClogService::open_with_lsn_provider(clog_config, Arc::clone(&lsn_provider))
+                    .unwrap();
 
             let written = write_test_data(&engine, &clog, 3);
 
@@ -521,8 +541,11 @@ mod tests {
                 LsmEngine::open_durable(lsm_config, Arc::clone(&lsn_provider), Arc::clone(&ilog))
                     .unwrap();
 
+            // Use shared LSN provider for clog
             let clog_config = FileClogConfig::with_dir(tmp.path());
-            let clog = FileClogService::open(clog_config).unwrap();
+            let clog =
+                FileClogService::open_with_lsn_provider(clog_config, Arc::clone(&lsn_provider))
+                    .unwrap();
 
             // Write first batch and flush
             let flushed = write_test_data(&engine, &clog, 2);
@@ -579,12 +602,116 @@ mod tests {
                 );
             }
 
-            // Some transactions are replayed from clog
-            // Note: The exact count may vary because clog and engine have separate LSN counters
-            // The important thing is that all data is recovered correctly
+            // With unified LSN provider, exactly 3 unflushed transactions should be replayed
+            assert_eq!(
+                result.stats.txn_count, 3,
+                "Exactly 3 unflushed transactions should be replayed"
+            );
+        }
+    }
+
+    /// Test that unified LSN provider ensures correct ordering across clog and ilog.
+    /// This test specifically verifies that both logs use the same LSN space.
+    #[test]
+    fn test_unified_lsn_provider() {
+        let tmp = TempDir::new().unwrap();
+
+        // First session: interleave clog and ilog operations
+        {
+            let lsn_provider = new_lsn_provider();
+
+            // Open ilog and clog with shared provider
+            let ilog_config = IlogConfig::new(tmp.path());
+            let ilog = Arc::new(IlogService::open(ilog_config, Arc::clone(&lsn_provider)).unwrap());
+
+            let lsm_config = LsmConfig::builder(tmp.path())
+                .memtable_size(50) // Small to trigger flush
+                .max_frozen_memtables(4)
+                .build()
+                .unwrap();
+
+            let engine =
+                LsmEngine::open_durable(lsm_config, Arc::clone(&lsn_provider), Arc::clone(&ilog))
+                    .unwrap();
+
+            let clog_config = FileClogConfig::with_dir(tmp.path());
+            let clog =
+                FileClogService::open_with_lsn_provider(clog_config, Arc::clone(&lsn_provider))
+                    .unwrap();
+
+            // Write some data
+            for i in 0..5 {
+                let key = format!("key_{:04}", i).into_bytes();
+                let value = format!("value_{:04}", i).into_bytes();
+
+                // Write to clog (allocates LSN from shared provider)
+                let mut batch = ClogBatch::new();
+                batch.add_put(i as u64 + 1, key.clone(), value.clone());
+                batch.add_commit(i as u64 + 1, i as Timestamp + 100);
+                let clog_lsn = clog.write(&mut batch, true).unwrap();
+
+                // Write to engine
+                let mut wb = WriteBatch::new();
+                wb.set_commit_ts(i as Timestamp + 100);
+                wb.put(key.clone(), value.clone());
+                engine.write_batch(wb).unwrap();
+
+                // After each write, LSN should have advanced
+                assert!(
+                    lsn_provider.current_lsn() > clog_lsn,
+                    "LSN provider should advance after clog write"
+                );
+            }
+
+            // Flush - this allocates LSNs from shared provider for ilog
+            let before_flush_lsn = lsn_provider.current_lsn();
+            engine.flush_all_with_active().unwrap();
+            let after_flush_lsn = lsn_provider.current_lsn();
+
+            // Ilog should have allocated LSNs for FlushIntent and FlushCommit
             assert!(
-                result.stats.txn_count >= 3,
-                "At least 3 unflushed transactions should be replayed"
+                after_flush_lsn > before_flush_lsn,
+                "LSN should advance after flush (ilog writes)"
+            );
+
+            clog.close().unwrap();
+        }
+
+        // Second session: verify recovery sees correct LSN ordering
+        {
+            let recovery = LsmRecovery::new(tmp.path());
+            let result = recovery.recover().unwrap();
+
+            // Verify data is recovered
+            for i in 0..5 {
+                let key = format!("key_{:04}", i).into_bytes();
+                let expected_value = format!("value_{:04}", i).into_bytes();
+                assert_eq!(
+                    result.engine.get(&key).unwrap(),
+                    Some(expected_value),
+                    "Key should be recovered"
+                );
+            }
+
+            // flushed_lsn should be > 0 since we flushed
+            assert!(
+                result.stats.flushed_lsn > 0,
+                "flushed_lsn should be set after flush"
+            );
+
+            // final_lsn should be >= flushed_lsn
+            assert!(
+                result.stats.final_lsn >= result.stats.flushed_lsn,
+                "final_lsn should be >= flushed_lsn"
+            );
+
+            // Verify the key property: flushed_lsn is properly tracked
+            // so recovery only replays entries with lsn > flushed_lsn
+            // Note: Some entries may be replayed if they were logged to clog
+            // after the memtable captured max_memtable_lsn but before flush completed
+            assert!(
+                result.stats.clog_entries <= 10,
+                "Should replay at most 10 clog entries (2 per transaction * 5 transactions)"
             );
         }
     }

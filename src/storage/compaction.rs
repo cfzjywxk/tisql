@@ -271,6 +271,7 @@ impl MergeIterator {
     }
 
     /// Advance to the next entry.
+    #[allow(clippy::should_implement_trait)]
     pub fn next(&mut self) -> Result<()> {
         if let Some(entry) = self.heap.pop() {
             let idx = entry.source_idx;
@@ -349,7 +350,7 @@ impl CompactionExecutor {
         // Collect input SST readers
         let mut readers = Vec::new();
         for (_level, sst_id) in &task.inputs {
-            let sst_path = sst_dir.join(format!("{:08}.sst", sst_id));
+            let sst_path = sst_dir.join(format!("{sst_id:08}.sst"));
             let reader = SstReaderRef::open(&sst_path)?;
             readers.push(reader);
         }
@@ -359,7 +360,7 @@ impl CompactionExecutor {
 
         // Create output SST builder
         let next_sst_id = version.next_sst_id();
-        let output_path = sst_dir.join(format!("{:08}.sst", next_sst_id));
+        let output_path = sst_dir.join(format!("{next_sst_id:08}.sst"));
         let options = SstBuilderOptions {
             block_size: self.config.block_size,
             compression: self.config.compression,
@@ -383,7 +384,7 @@ impl CompactionExecutor {
 
                     // Start new output file
                     let new_id = next_sst_id + output_ssts.len() as u64;
-                    let new_path = sst_dir.join(format!("{:08}.sst", new_id));
+                    let new_path = sst_dir.join(format!("{new_id:08}.sst"));
                     builder = SstBuilder::new(&new_path, options.clone())?;
                     current_size = 0;
                 }
@@ -419,7 +420,7 @@ impl CompactionExecutor {
             .iter()
             .find(|sst| sst.id == input_id)
             .ok_or_else(|| {
-                crate::error::TiSqlError::Storage(format!("SST {} not found", input_id))
+                crate::error::TiSqlError::Storage(format!("SST {input_id} not found"))
             })?;
 
         // Create new metadata with updated level

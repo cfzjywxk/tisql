@@ -23,10 +23,10 @@
 use std::fs::{File, OpenOptions};
 use std::io::{BufReader, BufWriter, Read, Seek, SeekFrom, Write};
 use std::path::PathBuf;
-use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Mutex;
 
 use crate::error::{Result, TiSqlError};
+use crate::lsn::{AtomicLsnProvider, LsnProvider, SharedLsnProvider};
 use crate::types::Lsn;
 use crate::{log_info, log_trace, log_warn};
 
@@ -81,18 +81,69 @@ impl FileClogConfig {
     }
 }
 
+/// Internal LSN provider - either shared or local
+enum LsnProviderKind {
+    /// Shared LSN provider (used when unified with ilog)
+    Shared(SharedLsnProvider),
+    /// Local LSN counter (standalone clog)
+    Local(AtomicLsnProvider),
+}
+
+impl LsnProviderKind {
+    fn alloc_lsn(&self) -> Lsn {
+        match self {
+            LsnProviderKind::Shared(p) => p.alloc_lsn(),
+            LsnProviderKind::Local(p) => p.alloc_lsn(),
+        }
+    }
+
+    fn current_lsn(&self) -> Lsn {
+        match self {
+            LsnProviderKind::Shared(p) => p.current_lsn(),
+            LsnProviderKind::Local(p) => p.current_lsn(),
+        }
+    }
+
+    #[allow(dead_code)]
+    fn set_lsn(&self, lsn: Lsn) {
+        match self {
+            LsnProviderKind::Shared(p) => p.set_lsn(lsn),
+            LsnProviderKind::Local(p) => p.set_lsn(lsn),
+        }
+    }
+}
+
 /// File-based commit log implementation
 pub struct FileClogService {
     config: FileClogConfig,
-    /// Current LSN (next to assign)
-    current_lsn: AtomicU64,
+    /// LSN provider (shared or local)
+    lsn_provider: LsnProviderKind,
     /// Commit log file writer (protected by mutex for thread safety)
     writer: Mutex<BufWriter<File>>,
 }
 
 impl FileClogService {
-    /// Open or create a new commit log file
+    /// Open or create a new commit log file (standalone mode with local LSN counter)
     pub fn open(config: FileClogConfig) -> Result<Self> {
+        Self::open_internal(config, None)
+    }
+
+    /// Open or create a new commit log file with a shared LSN provider.
+    ///
+    /// This is used when clog and ilog share a unified LSN space for
+    /// consistent recovery ordering.
+    pub fn open_with_lsn_provider(
+        config: FileClogConfig,
+        lsn_provider: SharedLsnProvider,
+    ) -> Result<Self> {
+        Self::open_internal(config, Some(lsn_provider))
+    }
+
+    /// Internal open implementation
+    fn open_internal(
+        config: FileClogConfig,
+        shared_provider: Option<SharedLsnProvider>,
+    ) -> Result<Self> {
         // Ensure directory exists
         std::fs::create_dir_all(&config.clog_dir)?;
 
@@ -107,7 +158,7 @@ impl FileClogService {
             .truncate(false)
             .open(&clog_path)?;
 
-        let mut current_lsn = 1;
+        let mut max_lsn = 0u64;
 
         if file_exists && file.metadata()?.len() > 0 {
             // Validate existing file header
@@ -117,7 +168,7 @@ impl FileClogService {
             // Find max LSN from existing entries
             let entries = Self::read_entries(&mut reader)?;
             if let Some(last) = entries.last() {
-                current_lsn = last.lsn + 1;
+                max_lsn = last.lsn;
             }
 
             // Seek to end for appending
@@ -135,26 +186,61 @@ impl FileClogService {
         let mut file_for_write = file;
         file_for_write.seek(SeekFrom::End(0))?;
 
+        // Create LSN provider
+        let lsn_provider = match shared_provider {
+            Some(p) => {
+                // Shared mode: ensure provider is at least at our max LSN + 1
+                let current = p.current_lsn();
+                if current <= max_lsn {
+                    p.set_lsn(max_lsn + 1);
+                }
+                LsnProviderKind::Shared(p)
+            }
+            None => {
+                // Standalone mode: use local counter
+                LsnProviderKind::Local(AtomicLsnProvider::with_start(max_lsn + 1))
+            }
+        };
+
         log_info!(
             "Opened commit log file: {:?}, current_lsn={}",
             clog_path,
-            current_lsn
+            lsn_provider.current_lsn()
         );
 
         Ok(Self {
             config,
-            current_lsn: AtomicU64::new(current_lsn),
+            lsn_provider,
             writer: Mutex::new(BufWriter::new(file_for_write)),
         })
     }
 
-    /// Recover entries from commit log file
+    /// Recover entries from commit log file (standalone mode)
     pub fn recover(config: FileClogConfig) -> Result<(Self, Vec<ClogEntry>)> {
+        Self::recover_internal(config, None)
+    }
+
+    /// Recover entries with a shared LSN provider.
+    ///
+    /// The shared provider's current LSN will be updated to be at least
+    /// max(clog LSN) + 1 after recovery.
+    pub fn recover_with_lsn_provider(
+        config: FileClogConfig,
+        lsn_provider: SharedLsnProvider,
+    ) -> Result<(Self, Vec<ClogEntry>)> {
+        Self::recover_internal(config, Some(lsn_provider))
+    }
+
+    /// Internal recover implementation
+    fn recover_internal(
+        config: FileClogConfig,
+        shared_provider: Option<SharedLsnProvider>,
+    ) -> Result<(Self, Vec<ClogEntry>)> {
         let clog_path = config.clog_path();
 
         if !clog_path.exists() {
             // No commit log file, start fresh
-            let service = Self::open(config)?;
+            let service = Self::open_internal(config, shared_provider)?;
             return Ok((service, vec![]));
         }
 
@@ -171,9 +257,25 @@ impl FileClogService {
         );
 
         // Open service at recovered position
-        let service = Self::open(config)?;
+        let service = Self::open_internal(config, shared_provider)?;
 
         Ok((service, entries))
+    }
+
+    /// Read entries from clog starting from a given LSN.
+    ///
+    /// This is used during recovery to replay only unflushed transactions.
+    pub fn read_from_lsn(&self, from_lsn: Lsn) -> Result<Vec<ClogEntry>> {
+        let entries = self.read_all()?;
+        Ok(entries.into_iter().filter(|e| e.lsn >= from_lsn).collect())
+    }
+
+    /// Get the maximum LSN in the clog file.
+    ///
+    /// Returns 0 if the clog is empty.
+    pub fn max_lsn(&self) -> Result<Lsn> {
+        let entries = self.read_all()?;
+        Ok(entries.last().map(|e| e.lsn).unwrap_or(0))
     }
 
     /// Write file header
@@ -331,26 +433,28 @@ impl FileClogService {
 impl ClogService for FileClogService {
     fn write(&self, batch: &mut ClogBatch, sync: bool) -> Result<Lsn> {
         if batch.is_empty() {
-            return Ok(self.current_lsn.load(Ordering::SeqCst));
+            return Ok(self.lsn_provider.current_lsn());
         }
 
         // Acquire lock BEFORE assigning LSNs to ensure writes are ordered
         // This prevents concurrent writers from producing out-of-order LSNs in the file
         let mut writer = self.writer.lock().unwrap();
 
-        // Assign LSNs inside the lock
-        let start_lsn = self.current_lsn.load(Ordering::SeqCst);
+        // Assign LSNs inside the lock using the provider
+        // Note: We allocate one LSN per entry from the shared provider
+        let mut start_lsn = 0;
         for (i, entry) in batch.entries.iter_mut().enumerate() {
-            entry.lsn = start_lsn + i as u64;
+            let lsn = self.lsn_provider.alloc_lsn();
+            if i == 0 {
+                start_lsn = lsn;
+            }
+            entry.lsn = lsn;
         }
-        let end_lsn = start_lsn + batch.len() as u64 - 1;
+        let end_lsn = batch.entries.last().unwrap().lsn;
 
         // Write to file
         Self::write_record(&mut *writer, batch.entries())?;
         writer.flush()?;
-
-        // Update current_lsn AFTER successful write
-        self.current_lsn.store(end_lsn + 1, Ordering::SeqCst);
 
         if sync {
             writer.get_ref().sync_data()?;
@@ -383,7 +487,7 @@ impl ClogService for FileClogService {
     }
 
     fn current_lsn(&self) -> Lsn {
-        self.current_lsn.load(Ordering::SeqCst)
+        self.lsn_provider.current_lsn()
     }
 
     fn close(&self) -> Result<()> {
@@ -845,5 +949,148 @@ mod tests {
             max_lsn + 1,
             "current_lsn should be max(lsn) + 1"
         );
+    }
+
+    // ========================================================================
+    // Shared LSN Provider Tests
+    // ========================================================================
+
+    /// Test clog with shared LSN provider.
+    /// Verifies that clog uses the shared provider for LSN allocation.
+    #[test]
+    fn test_shared_lsn_provider() {
+        use crate::lsn::new_lsn_provider;
+
+        let dir = tempdir().unwrap();
+        let config = FileClogConfig::with_dir(dir.path());
+        let provider = new_lsn_provider();
+
+        // Allocate some LSNs before opening clog
+        assert_eq!(provider.alloc_lsn(), 1);
+        assert_eq!(provider.alloc_lsn(), 2);
+
+        // Open clog with shared provider
+        let service =
+            FileClogService::open_with_lsn_provider(config.clone(), provider.clone()).unwrap();
+
+        // Current LSN should be from provider
+        assert_eq!(service.current_lsn(), 3);
+
+        // Write to clog - should allocate LSN 3
+        let mut batch = ClogBatch::new();
+        batch.add_put(1, b"key1".to_vec(), b"value1".to_vec());
+        let lsn = service.write(&mut batch, true).unwrap();
+        assert_eq!(lsn, 3);
+
+        // Provider should have advanced
+        assert_eq!(provider.current_lsn(), 4);
+
+        // Write more
+        let mut batch2 = ClogBatch::new();
+        batch2.add_put(2, b"key2".to_vec(), b"value2".to_vec());
+        let lsn2 = service.write(&mut batch2, true).unwrap();
+        assert_eq!(lsn2, 4);
+
+        service.close().unwrap();
+
+        // Recover with same provider
+        let (recovered, entries) =
+            FileClogService::recover_with_lsn_provider(config, provider.clone()).unwrap();
+        assert_eq!(entries.len(), 2);
+        assert_eq!(entries[0].lsn, 3);
+        assert_eq!(entries[1].lsn, 4);
+        assert_eq!(recovered.current_lsn(), 5);
+        assert_eq!(provider.current_lsn(), 5);
+    }
+
+    /// Test that shared provider is updated when clog has higher LSN.
+    #[test]
+    fn test_shared_provider_updated_from_clog() {
+        use crate::lsn::new_lsn_provider;
+
+        let dir = tempdir().unwrap();
+        let config = FileClogConfig::with_dir(dir.path());
+
+        // First: write to clog with standalone mode
+        {
+            let service = FileClogService::open(config.clone()).unwrap();
+            let mut batch = ClogBatch::new();
+            batch.add_put(1, b"k1".to_vec(), b"v1".to_vec());
+            batch.add_put(1, b"k2".to_vec(), b"v2".to_vec());
+            batch.add_put(1, b"k3".to_vec(), b"v3".to_vec());
+            service.write(&mut batch, true).unwrap();
+            // LSNs 1, 2, 3 are used
+            service.close().unwrap();
+        }
+
+        // Create fresh provider starting at 1
+        let provider = new_lsn_provider();
+        assert_eq!(provider.current_lsn(), 1);
+
+        // Recover with shared provider - it should be updated to 4
+        let (recovered, entries) =
+            FileClogService::recover_with_lsn_provider(config, provider.clone()).unwrap();
+        assert_eq!(entries.len(), 3);
+        assert_eq!(provider.current_lsn(), 4); // max(3) + 1
+        assert_eq!(recovered.current_lsn(), 4);
+    }
+
+    /// Test read_from_lsn for partial replay during recovery.
+    #[test]
+    fn test_read_from_lsn() {
+        let dir = tempdir().unwrap();
+        let config = FileClogConfig::with_dir(dir.path());
+
+        let service = FileClogService::open(config.clone()).unwrap();
+
+        // Write 5 entries with LSN 1-5
+        for i in 1..=5 {
+            let mut batch = ClogBatch::new();
+            batch.add_put(
+                i,
+                format!("key{i}").into_bytes(),
+                format!("val{i}").into_bytes(),
+            );
+            service.write(&mut batch, true).unwrap();
+        }
+
+        // Read from LSN 3
+        let entries = service.read_from_lsn(3).unwrap();
+        assert_eq!(entries.len(), 3);
+        assert_eq!(entries[0].lsn, 3);
+        assert_eq!(entries[1].lsn, 4);
+        assert_eq!(entries[2].lsn, 5);
+
+        // Read from LSN 1 (all entries)
+        let all = service.read_from_lsn(1).unwrap();
+        assert_eq!(all.len(), 5);
+
+        // Read from LSN 6 (nothing)
+        let none = service.read_from_lsn(6).unwrap();
+        assert!(none.is_empty());
+
+        service.close().unwrap();
+    }
+
+    /// Test max_lsn helper.
+    #[test]
+    fn test_max_lsn() {
+        let dir = tempdir().unwrap();
+        let config = FileClogConfig::with_dir(dir.path());
+
+        let service = FileClogService::open(config.clone()).unwrap();
+
+        // Empty clog
+        assert_eq!(service.max_lsn().unwrap(), 0);
+
+        // Write some entries
+        let mut batch = ClogBatch::new();
+        batch.add_put(1, b"k1".to_vec(), b"v1".to_vec());
+        batch.add_put(1, b"k2".to_vec(), b"v2".to_vec());
+        service.write(&mut batch, true).unwrap();
+
+        assert_eq!(service.max_lsn().unwrap(), 2);
+
+        service.close().unwrap();
     }
 }

@@ -321,6 +321,50 @@ impl StorageEngine for CrossbeamMemTableEngine {
     }
 }
 
+impl CrossbeamMemTableEngine {
+    /// Scan all entries in range, INCLUDING tombstones.
+    ///
+    /// This is used during SST flush to ensure tombstones are written to SST
+    /// so they can mask older values in previous SSTs.
+    ///
+    /// Returns (user_key, value) pairs where value may be a tombstone (empty).
+    pub fn scan_all(
+        &self,
+        range: &Range<Key>,
+    ) -> Result<Box<dyn Iterator<Item = (Key, RawValue)> + '_>> {
+        let start_mvcc = encode_mvcc_key(&range.start, Timestamp::MAX);
+        let end_mvcc = encode_mvcc_key(&range.end, Timestamp::MAX);
+
+        let mut results = Vec::new();
+        let mut last_user_key: Option<Key> = None;
+
+        for entry in self.list.range(start_mvcc..end_mvcc) {
+            let mvcc_key = entry.key();
+
+            if let Some((user_key, _entry_ts)) = decode_mvcc_key(mvcc_key) {
+                // Check if within user range
+                if user_key < range.start || user_key >= range.end {
+                    continue;
+                }
+
+                // Skip if we already have this key (we want the latest version only)
+                if let Some(ref last) = last_user_key {
+                    if &user_key == last {
+                        continue;
+                    }
+                }
+
+                // Include ALL values, including tombstones
+                let value = entry.value();
+                results.push((user_key.clone(), value.clone()));
+                last_user_key = Some(user_key);
+            }
+        }
+
+        Ok(Box::new(results.into_iter()))
+    }
+}
+
 /// Memory usage statistics for the crossbeam memtable.
 #[derive(Debug, Clone, Copy)]
 pub struct MemoryStats {
