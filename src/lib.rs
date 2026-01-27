@@ -70,7 +70,9 @@ pub mod testkit {
     //!
     //! This module exposes internal implementation details for integration tests.
     //! These are NOT part of the public API and may change without notice.
-    pub use crate::clog::{FileClogConfig, FileClogService};
+    pub use crate::clog::{
+        ClogBatch, ClogEntry, ClogOp, FileClogConfig, FileClogService, TruncateStats,
+    };
 
     // Arena (from util - it's a general-purpose allocator)
     pub use crate::util::{ArenaConfig, PageArena, DEFAULT_PAGE_SIZE};
@@ -78,6 +80,13 @@ pub mod testkit {
     // Storage implementations
     pub use crate::storage::{
         ArenaMemTableEngine, ArenaMemoryStats, BTreeMemTableEngine, MemTableEngine, MemoryStats,
+    };
+
+    // LSM storage engine for testing
+    pub use crate::storage::{
+        CompactionExecutor, CompactionPicker, CompactionTask, IlogConfig, IlogService, LsmConfig,
+        LsmConfigBuilder, LsmEngine, LsmRecovery, LsmStats, ManifestDelta, MemTable,
+        RecoveryResult, SstBuilder, SstBuilderOptions, SstMeta, SstReader, Version,
     };
 
     // ArenaSkipList (exposed for testing low-level skiplist behavior)

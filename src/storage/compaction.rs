@@ -44,6 +44,9 @@ use std::collections::BinaryHeap;
 use std::path::Path;
 use std::sync::Arc;
 
+#[cfg(feature = "failpoints")]
+use fail::fail_point;
+
 use crate::error::Result;
 use crate::types::{Key, RawValue};
 
@@ -356,6 +359,10 @@ impl CompactionExecutor {
         }
 
         // Create merge iterator
+        // Failpoint: crash before merge iterator creation
+        #[cfg(feature = "failpoints")]
+        fail_point!("compaction_before_merge");
+
         let mut merge_iter = MergeIterator::new(readers)?;
 
         // Create output SST builder
@@ -373,6 +380,10 @@ impl CompactionExecutor {
 
         while merge_iter.valid() {
             if let Some((key, value)) = merge_iter.current() {
+                // Failpoint: crash mid compaction write
+                #[cfg(feature = "failpoints")]
+                fail_point!("compaction_mid_write");
+
                 builder.add(&key, &value)?;
                 current_size += key.len() + value.len();
 
@@ -399,6 +410,10 @@ impl CompactionExecutor {
         } else {
             builder.abort()?;
         }
+
+        // Failpoint: crash after all SSTs written, before commit
+        #[cfg(feature = "failpoints")]
+        fail_point!("compaction_after_finish");
 
         // Build manifest delta
         let delta = ManifestDelta::compaction(output_ssts, task.inputs.clone());

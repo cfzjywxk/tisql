@@ -28,7 +28,7 @@ mod file;
 
 // Implementation types - not re-exported from main API
 // Available via testkit for integration tests
-pub use file::{FileClogConfig, FileClogService};
+pub use file::{FileClogConfig, FileClogService, TruncateStats};
 
 use crate::error::Result;
 use crate::types::{Key, Lsn, RawValue, Timestamp, TxnId};

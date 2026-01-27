@@ -46,6 +46,9 @@ use std::ops::Range;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, RwLock};
 
+#[cfg(feature = "failpoints")]
+use fail::fail_point;
+
 use crate::error::{Result, TiSqlError};
 use crate::lsn::SharedLsnProvider;
 use crate::storage::{StorageEngine, WriteBatch};
@@ -278,7 +281,16 @@ impl LsmEngine {
 
         // Freeze current active
         let old_active = Arc::clone(&state.active);
+
+        // Failpoint: crash before freezing memtable
+        #[cfg(feature = "failpoints")]
+        fail_point!("lsm_before_freeze");
+
         old_active.freeze();
+
+        // Failpoint: crash after freeze but before inserting to frozen list
+        #[cfg(feature = "failpoints")]
+        fail_point!("lsm_after_freeze_before_insert");
 
         // Create new active
         let new_id = self.alloc_memtable_id();
@@ -312,6 +324,10 @@ impl LsmEngine {
         }
 
         // Phase 2: Build SST file
+        // Failpoint: crash before SST build
+        #[cfg(feature = "failpoints")]
+        fail_point!("lsm_flush_before_sst_build");
+
         let sst_path = self.config.sst_dir().join(format!("{sst_id:08}.sst"));
         let options = SstBuilderOptions {
             block_size: self.config.block_size,
@@ -333,10 +349,18 @@ impl LsmEngine {
         // Finish building (writes to disk with fsync)
         let meta = builder.finish(sst_id, 0)?; // Level 0
 
+        // Failpoint: crash after SST write, before ilog commit
+        #[cfg(feature = "failpoints")]
+        fail_point!("lsm_flush_after_sst_write");
+
         // Phase 3: Write flush commit (if durable)
         if let Some(ref ilog) = self.ilog {
             ilog.write_flush_commit(meta.clone(), max_memtable_lsn)?;
         }
+
+        // Failpoint: crash after ilog commit, before version update
+        #[cfg(feature = "failpoints")]
+        fail_point!("lsm_flush_after_ilog_commit");
 
         // Phase 4: Update in-memory version
         let delta = ManifestDelta::flush(meta.clone(), max_memtable_lsn);
@@ -347,6 +371,10 @@ impl LsmEngine {
 
         // Remove flushed memtable from frozen list
         state.frozen.retain(|m| m.id() != memtable.id());
+
+        // Failpoint: crash after version update
+        #[cfg(feature = "failpoints")]
+        fail_point!("lsm_flush_after_version_update");
 
         // Check if checkpoint needed
         if let Some(ref ilog) = self.ilog {
@@ -362,6 +390,9 @@ impl LsmEngine {
     ///
     /// Searches L0 first (newest to oldest), then L1, L2, etc.
     fn get_from_sst(&self, key: &[u8], _ts: Timestamp) -> Result<Option<RawValue>> {
+        // Tombstone marker (must match crossbeam_memtable.rs)
+        const TOMBSTONE: &[u8] = b"\x00\x00\x00\x00TISQL_TOMBSTONE\x01";
+
         let version = self.current_version();
 
         // Find SSTs that may contain this key
@@ -382,6 +413,10 @@ impl LsmEngine {
 
             // Try to find the key in this SST
             if let Some(value) = reader.get(key)? {
+                // Check for tombstone - deleted keys should return None
+                if value == TOMBSTONE {
+                    return Ok(None);
+                }
                 // TODO: Check timestamp visibility for MVCC
                 // For now, return first found value
                 return Ok(Some(value));

@@ -47,6 +47,8 @@ use std::path::PathBuf;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 
+#[cfg(feature = "failpoints")]
+use fail::fail_point;
 use serde::{Deserialize, Serialize};
 
 use crate::error::{Result, TiSqlError};
@@ -348,6 +350,11 @@ impl IlogService {
             max_memtable_lsn,
         };
         self.write_record(&record)?;
+
+        // Failpoint: crash after flush intent write
+        #[cfg(feature = "failpoints")]
+        fail_point!("ilog_after_flush_intent");
+
         log_trace!("Wrote FlushIntent: lsn={}, sst_id={}", lsn, sst_id);
         Ok(lsn)
     }
@@ -414,6 +421,11 @@ impl IlogService {
             version: VersionSnapshot::from(version),
             checkpoint_seq,
         };
+
+        // Failpoint: crash mid checkpoint write (before actual write)
+        #[cfg(feature = "failpoints")]
+        fail_point!("ilog_checkpoint_mid_write");
+
         self.write_record(&record)?;
         self.records_since_checkpoint.store(0, Ordering::SeqCst);
         log_info!("Wrote Checkpoint: lsn={}, seq={}", lsn, checkpoint_seq);
@@ -505,6 +517,10 @@ impl IlogService {
         writer.write_all(&data)?;
         writer.flush()?;
         writer.get_ref().sync_data()?;
+
+        // Failpoint: crash after fsync
+        #[cfg(feature = "failpoints")]
+        fail_point!("ilog_after_fsync");
 
         self.records_since_checkpoint.fetch_add(1, Ordering::SeqCst);
 

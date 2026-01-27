@@ -25,6 +25,9 @@ use std::io::{BufReader, BufWriter, Read, Seek, SeekFrom, Write};
 use std::path::PathBuf;
 use std::sync::Mutex;
 
+#[cfg(feature = "failpoints")]
+use fail::fail_point;
+
 use crate::error::{Result, TiSqlError};
 use crate::lsn::{AtomicLsnProvider, LsnProvider, SharedLsnProvider};
 use crate::types::Lsn;
@@ -457,7 +460,15 @@ impl ClogService for FileClogService {
         writer.flush()?;
 
         if sync {
+            // Failpoint: crash before clog fsync
+            #[cfg(feature = "failpoints")]
+            fail_point!("clog_before_sync");
+
             writer.get_ref().sync_data()?;
+
+            // Failpoint: crash after clog fsync
+            #[cfg(feature = "failpoints")]
+            fail_point!("clog_after_sync");
         }
 
         log_trace!(
@@ -495,6 +506,128 @@ impl ClogService for FileClogService {
         writer.flush()?;
         writer.get_ref().sync_data()?;
         Ok(())
+    }
+}
+
+// ============================================================================
+// Clog Truncation / GC API
+// ============================================================================
+
+/// Statistics returned from clog truncation.
+#[derive(Debug, Default)]
+pub struct TruncateStats {
+    /// Number of entries removed
+    pub entries_removed: usize,
+    /// Number of entries kept
+    pub entries_kept: usize,
+    /// Bytes freed
+    pub bytes_freed: u64,
+    /// New file size
+    pub new_file_size: u64,
+}
+
+impl FileClogService {
+    /// Truncate clog entries with lsn <= safe_lsn.
+    ///
+    /// This rewrites the clog file keeping only entries with lsn > safe_lsn.
+    /// The safe_lsn is typically the flushed_lsn from the LSM engine's Version,
+    /// indicating all entries up to that LSN are persisted in SST files.
+    ///
+    /// # Safety
+    ///
+    /// Only call this when you're certain all entries with lsn <= safe_lsn
+    /// have been durably persisted elsewhere (e.g., in SST files).
+    pub fn truncate_to(&self, safe_lsn: Lsn) -> Result<TruncateStats> {
+        let clog_path = self.config.clog_path();
+        let old_size = std::fs::metadata(&clog_path).map(|m| m.len()).unwrap_or(0);
+
+        // Read all entries
+        let entries = self.read_all()?;
+
+        // Partition entries
+        let (to_keep, to_remove): (Vec<_>, Vec<_>) =
+            entries.into_iter().partition(|e| e.lsn > safe_lsn);
+
+        if to_remove.is_empty() {
+            // Nothing to truncate
+            return Ok(TruncateStats {
+                entries_removed: 0,
+                entries_kept: to_keep.len(),
+                bytes_freed: 0,
+                new_file_size: old_size,
+            });
+        }
+
+        // Write kept entries to a temporary file
+        let temp_path = clog_path.with_extension("clog.tmp");
+        {
+            let temp_file = std::fs::OpenOptions::new()
+                .write(true)
+                .create(true)
+                .truncate(true)
+                .open(&temp_path)?;
+            let mut temp_writer = BufWriter::new(temp_file);
+
+            // Write header
+            Self::write_header(&mut temp_writer)?;
+
+            // Write kept entries
+            if !to_keep.is_empty() {
+                Self::write_record(&mut temp_writer, &to_keep)?;
+            }
+
+            temp_writer.flush()?;
+            temp_writer.get_ref().sync_data()?;
+        }
+
+        // Atomically replace old file with new file
+        std::fs::rename(&temp_path, &clog_path)?;
+
+        // Reopen the writer
+        {
+            let file = std::fs::OpenOptions::new()
+                .read(true)
+                .write(true)
+                .open(&clog_path)?;
+
+            // Seek to end for appending
+            let mut file_for_write = file;
+            file_for_write.seek(SeekFrom::End(0))?;
+
+            let mut writer = self.writer.lock().unwrap();
+            *writer = BufWriter::new(file_for_write);
+        }
+
+        let new_size = std::fs::metadata(&clog_path).map(|m| m.len()).unwrap_or(0);
+
+        log_info!(
+            "Truncated clog to safe_lsn={}: removed {} entries, kept {}",
+            safe_lsn,
+            to_remove.len(),
+            to_keep.len()
+        );
+
+        Ok(TruncateStats {
+            entries_removed: to_remove.len(),
+            entries_kept: to_keep.len(),
+            bytes_freed: old_size.saturating_sub(new_size),
+            new_file_size: new_size,
+        })
+    }
+
+    /// Get the oldest LSN still in the clog.
+    ///
+    /// Returns 0 if the clog is empty.
+    pub fn oldest_lsn(&self) -> Result<Lsn> {
+        let entries = self.read_all()?;
+        Ok(entries.first().map(|e| e.lsn).unwrap_or(0))
+    }
+
+    /// Get the clog file size in bytes.
+    pub fn file_size(&self) -> Result<u64> {
+        let clog_path = self.config.clog_path();
+        let metadata = std::fs::metadata(&clog_path)?;
+        Ok(metadata.len())
     }
 }
 
