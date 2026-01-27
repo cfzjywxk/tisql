@@ -47,10 +47,12 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, RwLock};
 
 use crate::error::{Result, TiSqlError};
+use crate::lsn::SharedLsnProvider;
 use crate::storage::{StorageEngine, WriteBatch};
 use crate::types::{Key, RawValue, Timestamp};
 
 use super::config::LsmConfig;
+use super::ilog::IlogService;
 use super::memtable::MemTable;
 use super::sstable::{SstBuilder, SstBuilderOptions, SstMeta, SstReader};
 use super::version::{ManifestDelta, Version};
@@ -111,12 +113,21 @@ pub struct LsmEngine {
     /// Next memtable ID.
     next_memtable_id: AtomicU64,
 
-    /// Next LSN for ordering operations.
+    /// Next LSN for ordering operations (fallback if no lsn_provider).
     next_lsn: AtomicU64,
+
+    /// Optional shared LSN provider for unified LSN allocation.
+    lsn_provider: Option<SharedLsnProvider>,
+
+    /// Optional ilog service for durable SST metadata.
+    ilog: Option<Arc<IlogService>>,
 }
 
 impl LsmEngine {
     /// Open or create an LSM engine at the given path.
+    ///
+    /// This opens the engine without durability (no ilog).
+    /// Use `open_durable` for production with crash recovery.
     pub fn open(config: LsmConfig) -> Result<Self> {
         config.validate().map_err(TiSqlError::Storage)?;
 
@@ -126,14 +137,70 @@ impl LsmEngine {
             std::fs::create_dir_all(&sst_dir)?;
         }
 
-        // TODO: Recovery - load manifest, rebuild version, recover memtable from WAL
-        // For now, start fresh
+        Ok(Self {
+            config: Arc::new(config),
+            state: RwLock::new(LsmState::new(1)),
+            next_memtable_id: AtomicU64::new(2),
+            next_lsn: AtomicU64::new(1),
+            lsn_provider: None,
+            ilog: None,
+        })
+    }
+
+    /// Open an LSM engine with durable ilog for crash recovery.
+    ///
+    /// This version uses intent/commit protocol for SST operations.
+    pub fn open_durable(
+        config: LsmConfig,
+        lsn_provider: SharedLsnProvider,
+        ilog: Arc<IlogService>,
+    ) -> Result<Self> {
+        config.validate().map_err(TiSqlError::Storage)?;
+
+        // Create SST directory if needed
+        let sst_dir = config.sst_dir();
+        if !sst_dir.exists() {
+            std::fs::create_dir_all(&sst_dir)?;
+        }
 
         Ok(Self {
             config: Arc::new(config),
             state: RwLock::new(LsmState::new(1)),
             next_memtable_id: AtomicU64::new(2),
             next_lsn: AtomicU64::new(1),
+            lsn_provider: Some(lsn_provider),
+            ilog: Some(ilog),
+        })
+    }
+
+    /// Open with recovery from ilog.
+    ///
+    /// This replays the ilog to rebuild version state.
+    pub fn open_with_recovery(
+        config: LsmConfig,
+        lsn_provider: SharedLsnProvider,
+        ilog: Arc<IlogService>,
+        version: Version,
+    ) -> Result<Self> {
+        config.validate().map_err(TiSqlError::Storage)?;
+
+        // Create SST directory if needed
+        let sst_dir = config.sst_dir();
+        if !sst_dir.exists() {
+            std::fs::create_dir_all(&sst_dir)?;
+        }
+
+        // Start with recovered version
+        let mut state = LsmState::new(1);
+        state.version = Arc::new(version);
+
+        Ok(Self {
+            config: Arc::new(config),
+            state: RwLock::new(state),
+            next_memtable_id: AtomicU64::new(2),
+            next_lsn: AtomicU64::new(1),
+            lsn_provider: Some(lsn_provider),
+            ilog: Some(ilog),
         })
     }
 
@@ -142,9 +209,18 @@ impl LsmEngine {
         &self.config
     }
 
+    /// Check if this engine has durable ilog.
+    pub fn is_durable(&self) -> bool {
+        self.ilog.is_some()
+    }
+
     /// Get the next LSN and increment.
     fn alloc_lsn(&self) -> u64 {
-        self.next_lsn.fetch_add(1, Ordering::SeqCst)
+        if let Some(ref provider) = self.lsn_provider {
+            provider.alloc_lsn()
+        } else {
+            self.next_lsn.fetch_add(1, Ordering::SeqCst)
+        }
     }
 
     /// Get the next memtable ID and increment.
@@ -215,6 +291,7 @@ impl LsmEngine {
     /// Flush a frozen memtable to an SST file.
     ///
     /// This creates a new L0 SST and updates the version.
+    /// If ilog is configured, uses intent/commit protocol for crash safety.
     pub fn flush_memtable(&self, memtable: &MemTable) -> Result<SstMeta> {
         if !memtable.is_frozen() {
             return Err(TiSqlError::Storage(
@@ -225,8 +302,14 @@ impl LsmEngine {
         // Get next SST ID from current version
         let version = self.current_version();
         let sst_id = version.next_sst_id();
+        let max_memtable_lsn = memtable.max_lsn().unwrap_or(0);
 
-        // Build SST file
+        // Phase 1: Write flush intent (if durable)
+        if let Some(ref ilog) = self.ilog {
+            ilog.write_flush_intent(sst_id, memtable.id(), max_memtable_lsn)?;
+        }
+
+        // Phase 2: Build SST file
         let sst_path = self.config.sst_dir().join(format!("{:08}.sst", sst_id));
         let options = SstBuilderOptions {
             block_size: self.config.block_size,
@@ -245,20 +328,30 @@ impl LsmEngine {
             builder.add(&key, &value)?;
         }
 
-        // Finish building (writes to disk)
+        // Finish building (writes to disk with fsync)
         let meta = builder.finish(sst_id, 0)?; // Level 0
 
-        // Update version with new SST
-        let flushed_lsn = memtable.max_lsn().unwrap_or(0);
-        let delta = ManifestDelta::flush(meta.clone(), flushed_lsn);
+        // Phase 3: Write flush commit (if durable)
+        if let Some(ref ilog) = self.ilog {
+            ilog.write_flush_commit(meta.clone(), max_memtable_lsn)?;
+        }
 
-        // Apply delta to version
+        // Phase 4: Update in-memory version
+        let delta = ManifestDelta::flush(meta.clone(), max_memtable_lsn);
+
         let mut state = self.state.write().unwrap();
         let new_version = state.version.apply(&delta);
         state.version = Arc::new(new_version);
 
         // Remove flushed memtable from frozen list
         state.frozen.retain(|m| m.id() != memtable.id());
+
+        // Check if checkpoint needed
+        if let Some(ref ilog) = self.ilog {
+            if ilog.needs_checkpoint() {
+                ilog.write_checkpoint(&state.version)?;
+            }
+        }
 
         Ok(meta)
     }
@@ -296,6 +389,36 @@ impl LsmEngine {
         Ok(None)
     }
 
+    /// Force freeze the active memtable.
+    ///
+    /// Used for shutdown to ensure all data is flushed.
+    pub fn freeze_active(&self) -> Option<Arc<MemTable>> {
+        let mut state = self.state.write().unwrap();
+
+        // Only freeze if there's data
+        if state.active.approximate_size() == 0 {
+            return None;
+        }
+
+        // Check frozen limit
+        if state.frozen.len() >= self.config.max_frozen_memtables {
+            return None;
+        }
+
+        // Freeze current active
+        let old_active = Arc::clone(&state.active);
+        old_active.freeze();
+
+        // Create new active
+        let new_id = self.alloc_memtable_id();
+        state.active = Arc::new(MemTable::new(new_id));
+
+        // Add to frozen list (newest first)
+        state.frozen.insert(0, Arc::clone(&old_active));
+
+        Some(old_active)
+    }
+
     /// Force flush all frozen memtables.
     ///
     /// Used for shutdown and testing.
@@ -319,6 +442,17 @@ impl LsmEngine {
         }
 
         Ok(results)
+    }
+
+    /// Freeze active memtable and flush all.
+    ///
+    /// Used for clean shutdown to ensure all data is persisted.
+    pub fn flush_all_with_active(&self) -> Result<Vec<SstMeta>> {
+        // First freeze the active memtable
+        self.freeze_active();
+
+        // Then flush all frozen
+        self.flush_all()
     }
 
     /// Get statistics about the engine.
@@ -772,6 +906,120 @@ mod tests {
         for i in 0..100 {
             let key = format!("key{:03}", i);
             assert!(engine.get(key.as_bytes()).unwrap().is_some());
+        }
+    }
+
+    // ==================== Durable Engine Tests ====================
+
+    use crate::lsn::new_lsn_provider;
+    use crate::storage::ilog::{IlogConfig, IlogService};
+
+    #[test]
+    fn test_lsm_durable_flush() {
+        let tmp = TempDir::new().unwrap();
+        let config = LsmConfig::builder(tmp.path())
+            .memtable_size(100) // Very small
+            .max_frozen_memtables(4)
+            .build()
+            .unwrap();
+
+        let lsn_provider = new_lsn_provider();
+        let ilog_config = IlogConfig::new(tmp.path());
+        let ilog = Arc::new(IlogService::open(ilog_config, Arc::clone(&lsn_provider)).unwrap());
+
+        let engine =
+            LsmEngine::open_durable(config, Arc::clone(&lsn_provider), Arc::clone(&ilog)).unwrap();
+
+        assert!(engine.is_durable());
+
+        // Write enough to trigger rotation
+        for i in 0..5 {
+            let mut batch = new_batch(i as Timestamp + 1);
+            let key = format!("key_{:04}", i);
+            let value = format!("value_{:04}", i);
+            batch.put(key.as_bytes().to_vec(), value.as_bytes().to_vec());
+            engine.write_batch(batch).unwrap();
+        }
+
+        // Force flush
+        let _flushed = engine.flush_all().unwrap();
+
+        // Data should still be readable
+        for i in 0..5 {
+            let key = format!("key_{:04}", i);
+            let expected = format!("value_{:04}", i);
+            assert_eq!(
+                engine.get(key.as_bytes()).unwrap(),
+                Some(expected.as_bytes().to_vec()),
+                "Key {} should be readable after durable flush",
+                key
+            );
+        }
+    }
+
+    #[test]
+    fn test_lsm_durable_recovery() {
+        let tmp = TempDir::new().unwrap();
+
+        // First session: write and flush
+        {
+            let config = LsmConfig::builder(tmp.path())
+                .memtable_size(100)
+                .max_frozen_memtables(4)
+                .build()
+                .unwrap();
+
+            let lsn_provider = new_lsn_provider();
+            let ilog_config = IlogConfig::new(tmp.path());
+            let ilog = Arc::new(IlogService::open(ilog_config, Arc::clone(&lsn_provider)).unwrap());
+
+            let engine = LsmEngine::open_durable(config, lsn_provider, ilog).unwrap();
+
+            for i in 0..5 {
+                let mut batch = new_batch(i as Timestamp + 1);
+                let key = format!("key_{:04}", i);
+                let value = format!("value_{:04}", i);
+                batch.put(key.as_bytes().to_vec(), value.as_bytes().to_vec());
+                engine.write_batch(batch).unwrap();
+            }
+
+            // Flush all including active memtable
+            engine.flush_all_with_active().unwrap();
+        }
+
+        // Second session: recover and verify
+        {
+            let lsn_provider = new_lsn_provider();
+            let ilog_config = IlogConfig::new(tmp.path());
+            let (ilog, version, orphans) =
+                IlogService::recover(ilog_config, Arc::clone(&lsn_provider)).unwrap();
+
+            assert!(
+                orphans.is_empty(),
+                "Should have no orphans after clean shutdown"
+            );
+
+            let config = LsmConfig::builder(tmp.path())
+                .memtable_size(100)
+                .max_frozen_memtables(4)
+                .build()
+                .unwrap();
+
+            let engine =
+                LsmEngine::open_with_recovery(config, lsn_provider, Arc::new(ilog), version)
+                    .unwrap();
+
+            // Data should be readable from SST
+            for i in 0..5 {
+                let key = format!("key_{:04}", i);
+                let expected = format!("value_{:04}", i);
+                assert_eq!(
+                    engine.get(key.as_bytes()).unwrap(),
+                    Some(expected.as_bytes().to_vec()),
+                    "Key {} should be readable after recovery",
+                    key
+                );
+            }
         }
     }
 }

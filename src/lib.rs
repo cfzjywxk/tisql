@@ -33,6 +33,7 @@
 // Public modules - common types and server infrastructure
 pub mod codec;
 pub mod error;
+pub mod lsn;
 pub mod protocol;
 pub mod session;
 pub mod types;
@@ -51,6 +52,7 @@ mod tso;
 // Re-export public interfaces (traits only) and commonly used types
 pub use catalog::Catalog;
 pub use clog::ClogService;
+pub use lsn::{new_lsn_provider, LsnProvider, SharedLsnProvider};
 pub use protocol::{MySqlServer, MYSQL_DEFAULT_PORT};
 pub use session::{Priority, QueryCtx, Session, SessionVars};
 pub use storage::StorageEngine;

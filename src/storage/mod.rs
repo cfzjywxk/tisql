@@ -58,8 +58,10 @@
 
 pub mod compaction;
 pub mod config;
+pub mod ilog;
 pub mod lsm;
 pub mod memtable;
+pub mod recovery;
 pub mod sstable;
 pub mod version;
 
@@ -101,6 +103,12 @@ pub use lsm::{LsmEngine, LsmStats};
 
 // Re-export compaction types
 pub use compaction::{CompactionExecutor, CompactionPicker, CompactionTask, MergeIterator};
+
+// Re-export ilog types
+pub use ilog::{IlogConfig, IlogRecord, IlogService, VersionSnapshot};
+
+// Re-export recovery types
+pub use recovery::{LsmRecovery, RecoveryResult, RecoveryStats};
 
 // Re-export SST types for persistent storage
 pub use sstable::{

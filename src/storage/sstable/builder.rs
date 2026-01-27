@@ -49,6 +49,8 @@ use std::fs::File;
 use std::io::{BufWriter, Write};
 use std::path::{Path, PathBuf};
 
+use serde::{Deserialize, Serialize};
+
 use crate::error::{Result, TiSqlError};
 use crate::types::{Key, Timestamp};
 
@@ -90,7 +92,7 @@ impl CompressionType {
 // ============================================================================
 
 /// Metadata for a single SST file.
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct SstMeta {
     /// Unique SST file ID
     pub id: u64,

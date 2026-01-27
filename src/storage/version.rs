@@ -183,6 +183,21 @@ impl Version {
             .unwrap_or_default()
     }
 
+    /// Check if an SST with the given ID exists in any level.
+    pub fn has_sst(&self, sst_id: u64) -> bool {
+        self.levels
+            .iter()
+            .any(|level_ssts| level_ssts.iter().any(|sst| sst.id == sst_id))
+    }
+
+    /// Get SST files at a specific level (for serialization).
+    pub fn ssts_at_level(&self, level: u32) -> &[Arc<SstMeta>] {
+        self.levels
+            .get(level as usize)
+            .map(|v| v.as_slice())
+            .unwrap_or(&[])
+    }
+
     /// Apply a manifest delta to create a new version.
     ///
     /// This creates a new Version with the delta applied.
@@ -270,11 +285,20 @@ impl VersionBuilder {
         self
     }
 
-    /// Add an SST to a level.
+    /// Add an SST to a level (uses level from SstMeta).
     pub fn add_sst(mut self, sst: SstMeta) -> Self {
         let level = sst.level as usize;
         if level < MAX_LEVELS {
             self.version.levels[level].push(Arc::new(sst));
+        }
+        self
+    }
+
+    /// Add an SST to a specific level (overrides SstMeta level).
+    pub fn add_sst_at_level(mut self, level: u32, sst: Arc<SstMeta>) -> Self {
+        let level = level as usize;
+        if level < MAX_LEVELS {
+            self.version.levels[level].push(sst);
         }
         self
     }
