@@ -29,6 +29,7 @@ use crate::tso::TsoService;
 
 use super::api::{CommitInfo, TxnCtx, TxnService, TxnState};
 use super::concurrency::{ConcurrencyManager, Lock};
+use crate::storage::mvcc::{is_tombstone, MvccKey};
 use crate::storage::{StorageEngine, WriteBatch, WriteOp};
 use crate::types::{Key, Lsn, RawValue, Timestamp, TxnId};
 
@@ -318,8 +319,38 @@ impl<S: StorageEngine + 'static, L: ClogService + 'static, T: TsoService> TxnSer
         // Check for locks from other transactions
         self.concurrency_manager.check_lock(key, ctx.start_ts)?;
 
-        // Read from storage at snapshot timestamp
-        self.storage.get_at(key, ctx.start_ts)
+        // MVCC read: find the latest version with commit_ts <= start_ts
+        //
+        // MVCC key encoding: key || !commit_ts (8 bytes big-endian, bitwise NOT)
+        // This means higher timestamps produce SMALLER encoded keys.
+        //
+        // To find visible versions:
+        // - Start at MvccKey::encode(key, start_ts) - the smallest MVCC key we'd accept
+        // - End at next key in key space at MAX_TS
+        // - The first entry with decoded_key == key and entry_ts <= start_ts is our result
+        let seek_key = MvccKey::encode(key, ctx.start_ts);
+        let end_key = MvccKey::encode(key, 0)
+            .next_key()
+            .unwrap_or_else(MvccKey::unbounded);
+
+        // Build scan range for MVCC keys
+        let scan_range = seek_key..end_key;
+
+        let entries = self.storage.scan(scan_range)?;
+
+        // Find the first entry matching our key with ts <= start_ts
+        for (mvcc_key, value) in entries {
+            let (decoded_key, entry_ts) = mvcc_key.decode();
+            // Check exact key match and timestamp visibility
+            if decoded_key == key && entry_ts <= ctx.start_ts {
+                if is_tombstone(&value) {
+                    return Ok(None); // Key was deleted
+                }
+                return Ok(Some(value));
+            }
+        }
+
+        Ok(None)
     }
 
     fn scan(
@@ -333,8 +364,47 @@ impl<S: StorageEngine + 'static, L: ClogService + 'static, T: TsoService> TxnSer
                 .check_range(&range.start, &range.end, ctx.start_ts)?;
         }
 
-        // Get storage scan results (pass reference to avoid cloning)
-        let storage_iter = self.storage.scan_at(&range, ctx.start_ts)?;
+        // MVCC scan: find the latest version of each key with commit_ts <= start_ts
+        //
+        // Build MVCC key range:
+        // - Start: MvccKey::encode(range.start, MAX) - smallest MVCC key for range.start
+        // - End: MvccKey::encode(range.end, 0) - largest MVCC key for range.end (exclusive)
+        let start_mvcc = MvccKey::encode(&range.start, Timestamp::MAX);
+        let end_mvcc = if range.end.is_empty() {
+            MvccKey::unbounded()
+        } else {
+            // Use ts=0 to get the largest MVCC key for range.end (exclusive)
+            MvccKey::encode(&range.end, 0)
+        };
+
+        let entries = self.storage.scan(start_mvcc..end_mvcc)?;
+
+        // Deduplicate by key, keeping the latest version with ts <= start_ts
+        // Since MVCC keys are sorted (key, !ts), we see higher timestamps first for each key
+        use std::collections::HashMap;
+        let mut results: HashMap<Key, (Timestamp, Option<RawValue>)> = HashMap::new();
+
+        for (mvcc_key, value) in entries {
+            let (decoded_key, entry_ts) = mvcc_key.decode();
+            // Check if within key range and visible at start_ts
+            if decoded_key >= range.start
+                && (range.end.is_empty() || decoded_key < range.end)
+                && entry_ts <= ctx.start_ts
+            {
+                // Check if this version is newer than what we have
+                let dominated = results
+                    .get(&decoded_key)
+                    .is_some_and(|(best_ts, _)| entry_ts <= *best_ts);
+
+                if !dominated {
+                    if is_tombstone(&value) {
+                        results.insert(decoded_key, (entry_ts, None));
+                    } else {
+                        results.insert(decoded_key, (entry_ts, Some(value)));
+                    }
+                }
+            }
+        }
 
         // Collect buffered writes in range for read-your-writes semantics
         // Use a map to track the latest operation per key
@@ -344,12 +414,12 @@ impl<S: StorageEngine + 'static, L: ClogService + 'static, T: TsoService> TxnSer
         for op in ctx.write_buffer.iter() {
             match op {
                 WriteOp::Put { key, value } => {
-                    if key >= &range.start && key < &range.end {
+                    if key >= &range.start && (range.end.is_empty() || key < &range.end) {
                         buffer_ops.insert(key.clone(), Some(value.clone()));
                     }
                 }
                 WriteOp::Delete { key } => {
-                    if key >= &range.start && key < &range.end {
+                    if key >= &range.start && (range.end.is_empty() || key < &range.end) {
                         buffer_ops.insert(key.clone(), None); // None = deleted
                     }
                 }
@@ -357,21 +427,26 @@ impl<S: StorageEngine + 'static, L: ClogService + 'static, T: TsoService> TxnSer
         }
 
         // Merge storage results with buffered writes
-        // Buffered writes override storage values
-        let mut results: std::collections::BTreeMap<Key, RawValue> = storage_iter.collect();
-
+        // Buffered writes override storage values (use MAX ts to ensure they win)
         for (key, value_opt) in buffer_ops {
             match value_opt {
                 Some(value) => {
-                    results.insert(key, value);
+                    results.insert(key, (Timestamp::MAX, Some(value)));
                 }
                 None => {
-                    results.remove(&key); // Buffered delete removes the key
+                    results.insert(key, (Timestamp::MAX, None)); // Buffered delete
                 }
             }
         }
 
-        Ok(Box::new(results.into_iter()))
+        // Convert to sorted vector, filtering out tombstones (None values)
+        let mut result_vec: Vec<(Key, RawValue)> = results
+            .into_iter()
+            .filter_map(|(k, (_, v))| v.map(|val| (k, val)))
+            .collect();
+        result_vec.sort_by(|a, b| a.0.cmp(&b.0));
+
+        Ok(Box::new(result_vec.into_iter()))
     }
 
     fn put(&self, ctx: &mut TxnCtx, key: Key, value: RawValue) -> Result<()> {
@@ -529,6 +604,39 @@ mod tests {
         (storage, txn_service, dir)
     }
 
+    // ========================================================================
+    // Test Helpers Using MvccKey
+    // ========================================================================
+
+    fn get_at_for_test<S: StorageEngine>(
+        storage: &S,
+        key: &[u8],
+        ts: Timestamp,
+    ) -> Option<RawValue> {
+        let seek_key = MvccKey::encode(key, ts);
+        let end_key = MvccKey::encode(key, 0)
+            .next_key()
+            .unwrap_or_else(MvccKey::unbounded);
+        let range = seek_key..end_key;
+
+        let results = storage.scan(range).unwrap();
+
+        for (mvcc_key, value) in results {
+            let (decoded_key, entry_ts) = mvcc_key.decode();
+            if decoded_key == key && entry_ts <= ts {
+                if is_tombstone(&value) {
+                    return None;
+                }
+                return Some(value);
+            }
+        }
+        None
+    }
+
+    fn get_for_test<S: StorageEngine>(storage: &S, key: &[u8]) -> Option<RawValue> {
+        get_at_for_test(storage, key, Timestamp::MAX)
+    }
+
     #[test]
     fn test_execute_write() {
         let (storage, txn_service, _dir) = create_test_service();
@@ -544,10 +652,10 @@ mod tests {
         assert!(lsn > 0);
 
         // Verify storage
-        let v1 = storage.get(b"key1").unwrap().unwrap();
-        assert_eq!(v1, b"value1");
-        let v2 = storage.get(b"key2").unwrap().unwrap();
-        assert_eq!(v2, b"value2");
+        let v1 = get_for_test(&*storage, b"key1");
+        assert_eq!(v1, Some(b"value1".to_vec()));
+        let v2 = get_for_test(&*storage, b"key2");
+        assert_eq!(v2, Some(b"value2".to_vec()));
     }
 
     #[test]
@@ -565,7 +673,7 @@ mod tests {
         assert_eq!(cm.lock_count(), 0);
 
         // Data should be there
-        let v = storage.get(b"key1").unwrap();
+        let v = get_for_test(&*storage, b"key1");
         assert_eq!(v, Some(b"value1".to_vec()));
     }
 
@@ -603,8 +711,8 @@ mod tests {
         assert_eq!(stats.applied_deletes, 1);
 
         // Verify recovered state
-        assert!(storage.get(b"k1").unwrap().is_none()); // Was deleted
-        assert_eq!(storage.get(b"k2").unwrap().unwrap(), b"v2");
+        assert!(get_for_test(&*storage, b"k1").is_none()); // Was deleted
+        assert_eq!(get_for_test(&*storage, b"k2"), Some(b"v2".to_vec()));
 
         // Verify TSO advanced (use tso().last_ts() to check state)
         assert!(txn_service.tso().last_ts() > 3);
@@ -621,15 +729,15 @@ mod tests {
         let (_, ts2, _) = txn_service.autocommit_put(b"key", b"v2").unwrap();
 
         // Reading at latest should see v2
-        let v = storage.get(b"key").unwrap();
+        let v = get_for_test(&*storage, b"key");
         assert_eq!(v, Some(b"v2".to_vec()));
 
         // Reading at ts1 should see v1 (MVCC visibility)
-        let v = storage.get_at(b"key", ts1).unwrap();
+        let v = get_at_for_test(&*storage, b"key", ts1);
         assert_eq!(v, Some(b"v1".to_vec()));
 
         // Reading at ts2 should see v2
-        let v = storage.get_at(b"key", ts2).unwrap();
+        let v = get_at_for_test(&*storage, b"key", ts2);
         assert_eq!(v, Some(b"v2".to_vec()));
     }
 
@@ -678,7 +786,7 @@ mod tests {
         assert_eq!(value, Some(b"value1".to_vec()));
 
         // Not yet in storage
-        let storage_value = storage.get(b"key1").unwrap();
+        let storage_value = get_for_test(&*storage, b"key1");
         assert!(storage_value.is_none());
 
         // Commit
@@ -687,7 +795,7 @@ mod tests {
         assert!(info.lsn > 0);
 
         // Now visible in storage
-        let storage_value = storage.get(b"key1").unwrap();
+        let storage_value = get_for_test(&*storage, b"key1");
         assert_eq!(storage_value, Some(b"value1".to_vec()));
     }
 
@@ -721,7 +829,7 @@ mod tests {
         txn_service.rollback(ctx).unwrap();
 
         // Data should NOT be in storage
-        let value = storage.get(b"key1").unwrap();
+        let value = get_for_test(&*storage, b"key1");
         assert!(value.is_none());
     }
 
@@ -747,7 +855,7 @@ mod tests {
         assert_eq!(value, Some(b"v1".to_vec()));
 
         // But reading via storage should see v2
-        let latest = txn_service.storage().get(b"key").unwrap();
+        let latest = get_for_test(txn_service.storage(), b"key");
         assert_eq!(latest, Some(b"v2".to_vec()));
 
         // Transaction write
@@ -790,7 +898,7 @@ mod tests {
         assert_eq!(info.lsn, 0); // No log written
 
         // Nothing in storage
-        let value = storage.get(b"key1").unwrap();
+        let value = get_for_test(&*storage, b"key1");
         assert!(value.is_none());
     }
 

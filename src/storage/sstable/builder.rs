@@ -52,7 +52,8 @@ use std::path::{Path, PathBuf};
 use serde::{Deserialize, Serialize};
 
 use crate::error::{Result, TiSqlError};
-use crate::types::{Key, Timestamp};
+use crate::storage::mvcc::extract_key;
+use crate::types::Timestamp;
 
 use super::block::{DataBlockBuilder, IndexBlockBuilder, DEFAULT_BLOCK_SIZE};
 
@@ -92,16 +93,19 @@ impl CompressionType {
 // ============================================================================
 
 /// Metadata for a single SST file.
+///
+/// Note: `smallest_key` and `largest_key` are MVCC keys (key || !commit_ts),
+/// not plain keys. Use `extract_key()` to get the key portion without timestamp.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct SstMeta {
     /// Unique SST file ID
     pub id: u64,
     /// Level this SST belongs to
     pub level: u32,
-    /// Smallest key in this SST (inclusive)
-    pub smallest_key: Key,
-    /// Largest key in this SST (inclusive)
-    pub largest_key: Key,
+    /// Smallest MVCC key in this SST (inclusive, includes timestamp suffix)
+    pub smallest_key: Vec<u8>,
+    /// Largest MVCC key in this SST (inclusive, includes timestamp suffix)
+    pub largest_key: Vec<u8>,
     /// File size in bytes
     pub file_size: u64,
     /// Number of entries (key-value pairs)
@@ -117,42 +121,55 @@ pub struct SstMeta {
 }
 
 impl SstMeta {
-    /// Check if a user key might be in this SST based on key range.
+    /// Check if a key might be in this SST based on key range.
     ///
-    /// Since SSTs store MVCC keys (user_key || !commit_ts), we extract the
-    /// user key portion from smallest_key and largest_key for comparison.
-    pub fn may_contain_key(&self, user_key: &[u8]) -> bool {
-        // Extract user key portions from MVCC keys (remove last 8 bytes of timestamp)
-        let smallest_user_key = extract_user_key(&self.smallest_key);
-        let largest_user_key = extract_user_key(&self.largest_key);
+    /// Since SSTs store MVCC keys (key || !commit_ts), we extract the
+    /// key portion from smallest_key and largest_key for comparison.
+    ///
+    /// # Arguments
+    ///
+    /// * `key` - The key to check (without MVCC timestamp suffix)
+    pub fn may_contain_key(&self, key: &[u8]) -> bool {
+        // Extract key portions from MVCC keys (remove last 8 bytes of timestamp)
+        let smallest = extract_key(&self.smallest_key);
+        let largest = extract_key(&self.largest_key);
 
-        user_key >= smallest_user_key && user_key <= largest_user_key
+        key >= smallest && key <= largest
     }
 
-    /// Check if this SST overlaps with the given user key range.
+    /// Check if this SST overlaps with the given key range.
     ///
-    /// Since SSTs store MVCC keys, we extract user key portions for comparison.
+    /// Since SSTs store MVCC keys, we extract key portions for comparison.
+    ///
+    /// # Arguments
+    ///
+    /// * `start` - Start of key range (inclusive, without MVCC timestamp suffix)
+    /// * `end` - End of key range (exclusive, without MVCC timestamp suffix)
     pub fn overlaps(&self, start: &[u8], end: &[u8]) -> bool {
-        // Extract user key portions from MVCC keys
-        let smallest_user_key = extract_user_key(&self.smallest_key);
-        let largest_user_key = extract_user_key(&self.largest_key);
+        // Extract key portions from MVCC keys
+        let smallest = extract_key(&self.smallest_key);
+        let largest = extract_key(&self.largest_key);
 
-        // SST range: [smallest_user_key, largest_user_key]
+        // SST range: [smallest, largest]
         // Query range: [start, end)
-        // Overlaps if: smallest_user_key < end AND largest_user_key >= start
-        smallest_user_key < end && largest_user_key >= start
+        // Overlaps if: smallest < end AND largest >= start
+        smallest < end && largest >= start
     }
-}
 
-/// Extract user key from MVCC key by removing the timestamp suffix.
-///
-/// MVCC keys are encoded as: user_key || !commit_ts (8 bytes)
-/// Returns the original key if it's too short to be an MVCC key.
-fn extract_user_key(mvcc_key: &[u8]) -> &[u8] {
-    if mvcc_key.len() >= 8 {
-        &mvcc_key[..mvcc_key.len() - 8]
-    } else {
-        mvcc_key
+    /// Check if this SST's MVCC key range overlaps with another range.
+    ///
+    /// This compares MVCC keys directly without extracting the key portion.
+    /// Each MVCC key is treated as an independent key in the storage engine.
+    ///
+    /// # Arguments
+    ///
+    /// * `start` - Start of MVCC key range (inclusive)
+    /// * `end` - End of MVCC key range (inclusive)
+    pub fn overlaps_mvcc(&self, start: &[u8], end: &[u8]) -> bool {
+        // SST range: [smallest_key, largest_key]
+        // Query range: [start, end]
+        // Overlaps if: smallest_key <= end AND largest_key >= start
+        self.smallest_key.as_slice() <= end && self.largest_key.as_slice() >= start
     }
 }
 
@@ -358,9 +375,9 @@ pub struct SstBuilder {
     /// Number of data blocks written
     block_count: u32,
     /// First key in the entire SST
-    first_key: Option<Key>,
+    first_key: Option<Vec<u8>>,
     /// Last key in the entire SST
-    last_key: Option<Key>,
+    last_key: Option<Vec<u8>>,
     /// Minimum timestamp seen
     min_ts: Timestamp,
     /// Maximum timestamp seen
@@ -396,7 +413,7 @@ impl SstBuilder {
     /// Add a key-value entry.
     ///
     /// Keys must be added in sorted order. The key should include the MVCC
-    /// timestamp suffix (user_key || !commit_ts).
+    /// timestamp suffix (key || !commit_ts).
     pub fn add(&mut self, key: &[u8], value: &[u8]) -> Result<()> {
         if self.finished {
             return Err(TiSqlError::Storage("Builder already finished".into()));
@@ -411,7 +428,7 @@ impl SstBuilder {
         // Extract timestamp from MVCC key for min/max tracking
         if key.len() >= 8 {
             let ts_bytes: [u8; 8] = key[key.len() - 8..].try_into().unwrap();
-            // Key format: user_key || !commit_ts, so we need to invert
+            // Key format: key || !commit_ts, so we need to invert
             let ts = !u64::from_be_bytes(ts_bytes);
             self.min_ts = self.min_ts.min(ts);
             self.max_ts = self.max_ts.max(ts);
@@ -590,10 +607,10 @@ mod tests {
     use tempfile::tempdir;
 
     // Helper to create MVCC key
-    fn mvcc_key(user_key: &[u8], ts: u64) -> Vec<u8> {
-        let mut key = user_key.to_vec();
-        key.extend_from_slice(&(!ts).to_be_bytes());
-        key
+    fn mvcc_key(key_bytes: &[u8], ts: u64) -> Vec<u8> {
+        let mut result = key_bytes.to_vec();
+        result.extend_from_slice(&(!ts).to_be_bytes());
+        result
     }
 
     // ------------------------------------------------------------------------
@@ -730,7 +747,7 @@ mod tests {
 
         let mut builder = SstBuilder::new(&path, SstBuilderOptions::default()).unwrap();
 
-        let key = mvcc_key(b"user_key", 100);
+        let key = mvcc_key(b"test_key", 100);
         builder.add(&key, b"value").unwrap();
 
         let meta = builder.finish(1, 0).unwrap();

@@ -34,11 +34,40 @@ use std::time::Duration;
 use tempfile::TempDir;
 
 use tisql::new_lsn_provider;
+use tisql::storage::mvcc::{is_tombstone, MvccKey};
 use tisql::storage::WriteBatch;
 use tisql::testkit::{
     IlogConfig, IlogService, LsmConfigBuilder, LsmEngine, LsmRecovery, RecoveryResult,
 };
+use tisql::types::{RawValue, Timestamp};
 use tisql::StorageEngine;
+
+// ==================== Test Helpers Using MvccKey ====================
+
+fn get_at_for_test(engine: &LsmEngine, key: &[u8], ts: Timestamp) -> Option<RawValue> {
+    let start = MvccKey::encode(key, ts);
+    let end = MvccKey::encode(key, 0)
+        .next_key()
+        .unwrap_or_else(MvccKey::unbounded);
+    let range = start..end;
+
+    let results = engine.scan(range).unwrap();
+
+    for (mvcc_key, value) in results {
+        let (decoded_key, entry_ts) = mvcc_key.decode();
+        if decoded_key == key && entry_ts <= ts {
+            if is_tombstone(&value) {
+                return None;
+            }
+            return Some(value);
+        }
+    }
+    None
+}
+
+fn get_for_test(engine: &LsmEngine, key: &[u8]) -> Option<RawValue> {
+    get_at_for_test(engine, key, Timestamp::MAX)
+}
 
 /// Helper to create a test LSM engine with ilog for durability tests.
 fn create_test_lsm_engine(dir: &TempDir) -> (Arc<LsmEngine>, Arc<IlogService>) {
@@ -156,7 +185,7 @@ fn test_concurrent_write_during_flush() {
     // Verify all keys are readable
     let mut found_keys = 0;
     for key in &all_written_keys {
-        let value = engine.get(key.as_bytes()).unwrap();
+        let value = get_for_test(&engine, key.as_bytes());
         assert!(value.is_some(), "Key {} should exist", key);
         found_keys += 1;
     }
@@ -206,13 +235,12 @@ fn test_concurrent_read_during_flush() {
             for _ in 0..50 {
                 for i in 0..100 {
                     let key = format!("pre_key_{:05}", i);
-                    match engine.get(key.as_bytes()) {
-                        Ok(Some(_)) => reads += 1,
-                        Ok(None) => {
+                    match get_for_test(&engine, key.as_bytes()) {
+                        Some(_) => reads += 1,
+                        None => {
                             // Key should always exist - this would be an error
                             errors += 1;
                         }
-                        Err(_) => errors += 1,
                     }
                 }
             }
@@ -320,7 +348,7 @@ fn test_concurrent_write_during_compaction() {
     for writer_id in 0..num_writers {
         for i in 0..writes_per_writer {
             let key = format!("concurrent_{}_key_{:04}", writer_id, i);
-            let value = engine.get(key.as_bytes()).unwrap();
+            let value = get_for_test(&engine, key.as_bytes());
             assert!(value.is_some(), "Key {} should exist", key);
         }
     }
@@ -362,7 +390,7 @@ fn test_concurrent_read_during_compaction() {
                 for batch in 0..5 {
                     let idx = (reader_id * 7 + batch) % 50; // Varied access pattern
                     let key = format!("read_batch_{}_key_{:03}", batch, idx);
-                    if engine.get(key.as_bytes()).unwrap().is_some() {
+                    if get_for_test(&engine, key.as_bytes()).is_some() {
                         found += 1;
                     }
                 }
@@ -443,7 +471,7 @@ fn test_stress_mixed_operations() {
                 let writer_id = rng_seed % 8;
                 let key_id = (rng_seed / 8) % 10000;
                 let key = format!("stress_w{}_k{}", writer_id, key_id);
-                let _ = engine.get(key.as_bytes());
+                let _ = get_for_test(&engine, key.as_bytes());
                 local_reads += 1;
 
                 if local_reads % 1000 == 0 {
@@ -517,13 +545,13 @@ fn test_write_ordering() {
     }
 
     // Latest version should be ts=10
-    let value = engine.get(key).unwrap();
+    let value = get_for_test(&engine, key);
     assert_eq!(value, Some(b"value_at_10".to_vec()));
 
     // Read at specific timestamps
     for ts in 1..=10 {
         let expected = format!("value_at_{}", ts);
-        let value = engine.get_at(key, ts).unwrap();
+        let value = get_at_for_test(&engine, key, ts);
         assert_eq!(value, Some(expected.into_bytes()), "Value at ts={}", ts);
     }
 }
@@ -539,8 +567,8 @@ fn test_snapshot_isolation() {
     write_test_data(&engine, b"key2", b"v2_initial", 2);
 
     // Snapshot at ts=2 should see both
-    let v1_at_2 = engine.get_at(b"key1", 2).unwrap();
-    let v2_at_2 = engine.get_at(b"key2", 2).unwrap();
+    let v1_at_2 = get_at_for_test(&engine, b"key1", 2);
+    let v2_at_2 = get_at_for_test(&engine, b"key2", 2);
     assert_eq!(v1_at_2, Some(b"v1_initial".to_vec()));
     assert_eq!(v2_at_2, Some(b"v2_initial".to_vec()));
 
@@ -549,14 +577,14 @@ fn test_snapshot_isolation() {
     write_test_data(&engine, b"key2", b"v2_updated", 6);
 
     // Snapshot at ts=2 should still see initial values
-    let v1_at_2_after = engine.get_at(b"key1", 2).unwrap();
-    let v2_at_2_after = engine.get_at(b"key2", 2).unwrap();
+    let v1_at_2_after = get_at_for_test(&engine, b"key1", 2);
+    let v2_at_2_after = get_at_for_test(&engine, b"key2", 2);
     assert_eq!(v1_at_2_after, Some(b"v1_initial".to_vec()));
     assert_eq!(v2_at_2_after, Some(b"v2_initial".to_vec()));
 
     // Snapshot at ts=10 should see updated values
-    let v1_at_10 = engine.get_at(b"key1", 10).unwrap();
-    let v2_at_10 = engine.get_at(b"key2", 10).unwrap();
+    let v1_at_10 = get_at_for_test(&engine, b"key1", 10);
+    let v2_at_10 = get_at_for_test(&engine, b"key2", 10);
     assert_eq!(v1_at_10, Some(b"v1_updated".to_vec()));
     assert_eq!(v2_at_10, Some(b"v2_updated".to_vec()));
 }
@@ -580,15 +608,15 @@ fn test_tombstone_visibility() {
     engine.write_batch(batch).unwrap();
 
     // Get should not find the key
-    let value = engine.get(b"to_delete").unwrap();
+    let value = get_for_test(&engine, b"to_delete");
     assert!(value.is_none(), "Deleted key should not be visible");
 
     // Get at ts=1 should find it
-    let value_at_1 = engine.get_at(b"to_delete", 1).unwrap();
+    let value_at_1 = get_at_for_test(&engine, b"to_delete", 1);
     assert_eq!(value_at_1, Some(b"exists".to_vec()));
 
     // Get at ts=2+ should not find it
-    let value_at_2 = engine.get_at(b"to_delete", 2).unwrap();
+    let value_at_2 = get_at_for_test(&engine, b"to_delete", 2);
     assert!(value_at_2.is_none());
 }
 
@@ -615,17 +643,17 @@ fn test_tombstone_across_sst() {
     }
 
     // Key should be deleted
-    let value = engine.get(b"cross_sst_key").unwrap();
+    let value = get_for_test(&engine, b"cross_sst_key");
     assert!(
         value.is_none(),
         "Tombstone should mask value in earlier SST"
     );
 
     // Verify via MVCC read
-    let value_at_1 = engine.get_at(b"cross_sst_key", 1).unwrap();
+    let value_at_1 = get_at_for_test(&engine, b"cross_sst_key", 1);
     assert_eq!(value_at_1, Some(b"initial_value".to_vec()));
 
-    let value_at_2 = engine.get_at(b"cross_sst_key", 2).unwrap();
+    let value_at_2 = get_at_for_test(&engine, b"cross_sst_key", 2);
     assert!(value_at_2.is_none());
 }
 
@@ -802,7 +830,7 @@ fn test_recovery_preserves_concurrent_writes() {
             // There are SSTs, so we should have some data
             let mut found_count = 0;
             for key in &expected_keys {
-                if result.engine.get(key.as_bytes()).unwrap().is_some() {
+                if get_for_test(&result.engine, key.as_bytes()).is_some() {
                     found_count += 1;
                 }
             }

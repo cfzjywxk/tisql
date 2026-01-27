@@ -30,11 +30,40 @@ use std::thread;
 use std::time::Duration;
 
 use tisql::error::TiSqlError;
+use tisql::storage::mvcc::{is_tombstone, MvccKey};
 use tisql::testkit::{
     ConcurrencyManager, FileClogConfig, FileClogService, LocalTso, Lock, MemTableEngine,
     TransactionService,
 };
+use tisql::types::{RawValue, Timestamp};
 use tisql::StorageEngine;
+
+// ==================== Test Helpers Using MvccKey ====================
+
+fn get_at_for_test(storage: &MemTableEngine, key: &[u8], ts: Timestamp) -> Option<RawValue> {
+    let start = MvccKey::encode(key, ts);
+    let end = MvccKey::encode(key, 0)
+        .next_key()
+        .unwrap_or_else(MvccKey::unbounded);
+    let range = start..end;
+
+    let results = storage.scan(range).unwrap();
+
+    for (mvcc_key, value) in results {
+        let (decoded_key, entry_ts) = mvcc_key.decode();
+        if decoded_key == key && entry_ts <= ts {
+            if is_tombstone(&value) {
+                return None;
+            }
+            return Some(value);
+        }
+    }
+    None
+}
+
+fn get_for_test(storage: &MemTableEngine, key: &[u8]) -> Option<RawValue> {
+    get_at_for_test(storage, key, Timestamp::MAX)
+}
 
 /// Type alias for the test storage engine
 type TestStorage = MemTableEngine;
@@ -407,7 +436,7 @@ fn test_concurrent_read_during_write() {
     );
 
     // Can read (would return None since nothing written to storage)
-    let value = storage.get(&key).unwrap();
+    let value = get_for_test(&storage, &key);
     assert!(value.is_none(), "Key should not exist yet");
 }
 
@@ -431,23 +460,23 @@ fn test_mvcc_read_at_timestamp() {
     assert!(ts2 < ts3);
 
     // Read at ts3 should see v3
-    let v = storage.get_at(key, ts3).unwrap();
+    let v = get_at_for_test(&storage, key, ts3);
     assert_eq!(v, Some(b"v3".to_vec()));
 
     // Read at ts2 should see v2
-    let v = storage.get_at(key, ts2).unwrap();
+    let v = get_at_for_test(&storage, key, ts2);
     assert_eq!(v, Some(b"v2".to_vec()));
 
     // Read at ts1 should see v1
-    let v = storage.get_at(key, ts1).unwrap();
+    let v = get_at_for_test(&storage, key, ts1);
     assert_eq!(v, Some(b"v1".to_vec()));
 
     // Read at timestamp before ts1 should see nothing
-    let v = storage.get_at(key, ts1 - 1).unwrap();
+    let v = get_at_for_test(&storage, key, ts1 - 1);
     assert!(v.is_none());
 
     // Read at latest should see v3
-    let v = storage.get(key).unwrap();
+    let v = get_for_test(&storage, key);
     assert_eq!(v, Some(b"v3".to_vec()));
 }
 
@@ -470,13 +499,12 @@ fn test_concurrent_readers_no_interference() {
         let success_count = Arc::clone(&success_count);
         handles.push(thread::spawn(move || {
             for _ in 0..reads_per_thread {
-                match storage.get(key) {
-                    Ok(Some(v)) if v == b"initial_value" => {
+                match get_for_test(&storage, key) {
+                    Some(v) if v == b"initial_value" => {
                         success_count.fetch_add(1, Ordering::Relaxed);
                     }
-                    Ok(Some(v)) => panic!("Unexpected value: {v:?}"),
-                    Ok(None) => panic!("Key should exist"),
-                    Err(e) => panic!("Read error: {e:?}"),
+                    Some(v) => panic!("Unexpected value: {v:?}"),
+                    None => panic!("Key should exist"),
                 }
             }
         }));
@@ -504,17 +532,17 @@ fn test_concurrent_read_after_delete() {
     let (_, ts1, _) = txn_service.autocommit_put(key, b"value").unwrap();
 
     // Verify value exists
-    assert!(storage.get(key).unwrap().is_some());
+    assert!(get_for_test(&storage, key).is_some());
 
     // Delete
     let (_, ts2, _) = txn_service.autocommit_delete(key).unwrap();
     assert!(ts2 > ts1);
 
     // Read at latest should see nothing (deleted)
-    assert!(storage.get(key).unwrap().is_none());
+    assert!(get_for_test(&storage, key).is_none());
 
     // Read at ts1 should still see the value (MVCC)
-    let v = storage.get_at(key, ts1).unwrap();
+    let v = get_at_for_test(&storage, key, ts1);
     assert_eq!(v, Some(b"value".to_vec()));
 }
 
@@ -734,7 +762,7 @@ mod failpoint_tests {
 
         // After writer completes, lock released and data visible
         assert!(cm.check_lock(key, 1).is_ok());
-        let v = storage.get(key).unwrap();
+        let v = get_for_test(&storage, key);
         assert_eq!(v, Some(b"value".to_vec()));
 
         scenario.teardown();
@@ -800,7 +828,7 @@ mod failpoint_tests {
 
         // Now should see v2
         assert!(cm.check_lock(key, 1).is_ok());
-        let v = storage.get(key).unwrap();
+        let v = get_for_test(&storage, key);
         assert_eq!(v, Some(b"v2".to_vec()));
 
         scenario.teardown();
@@ -837,7 +865,7 @@ mod failpoint_tests {
         }
 
         // Final value should be v2
-        let v = storage.get(key).unwrap();
+        let v = get_for_test(&storage, key);
         assert_eq!(v, Some(b"v2".to_vec()));
 
         scenario.teardown();

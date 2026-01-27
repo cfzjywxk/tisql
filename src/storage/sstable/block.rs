@@ -53,7 +53,7 @@
 //! ```
 
 use crate::error::{Result, TiSqlError};
-use crate::types::{Key, RawValue};
+use crate::types::RawValue;
 
 // ============================================================================
 // Constants
@@ -187,7 +187,7 @@ impl DataBlock {
     }
 
     /// Get a key-value entry by index.
-    pub fn get_entry(&self, idx: usize) -> Option<(Key, RawValue)> {
+    pub fn get_entry(&self, idx: usize) -> Option<(Vec<u8>, RawValue)> {
         if idx >= self.offsets.len() {
             return None;
         }
@@ -227,12 +227,12 @@ impl DataBlock {
     }
 
     /// Get the first key in this block.
-    pub fn first_key(&self) -> Option<Key> {
+    pub fn first_key(&self) -> Option<Vec<u8>> {
         self.get_entry(0).map(|(k, _)| k)
     }
 
     /// Get the last key in this block.
-    pub fn last_key(&self) -> Option<Key> {
+    pub fn last_key(&self) -> Option<Vec<u8>> {
         if self.offsets.is_empty() {
             return None;
         }
@@ -300,7 +300,7 @@ pub struct DataBlockIterator<'a> {
 }
 
 impl<'a> Iterator for DataBlockIterator<'a> {
-    type Item = (Key, RawValue);
+    type Item = (Vec<u8>, RawValue);
 
     fn next(&mut self) -> Option<Self::Item> {
         if self.current >= self.block.num_entries() {
@@ -329,9 +329,9 @@ pub struct DataBlockBuilder {
     /// Target block size
     block_size_limit: usize,
     /// First key in this block (for index)
-    first_key: Option<Key>,
+    first_key: Option<Vec<u8>>,
     /// Last key in this block (for index)
-    last_key: Option<Key>,
+    last_key: Option<Vec<u8>>,
 }
 
 impl DataBlockBuilder {
@@ -403,12 +403,12 @@ impl DataBlockBuilder {
     }
 
     /// Get the first key in this block.
-    pub fn first_key(&self) -> Option<&Key> {
+    pub fn first_key(&self) -> Option<&Vec<u8>> {
         self.first_key.as_ref()
     }
 
     /// Get the last key in this block.
-    pub fn last_key(&self) -> Option<&Key> {
+    pub fn last_key(&self) -> Option<&Vec<u8>> {
         self.last_key.as_ref()
     }
 
@@ -457,7 +457,7 @@ impl Default for DataBlockBuilder {
 #[derive(Debug, Clone, PartialEq)]
 pub struct IndexEntry {
     /// First key in the data block
-    pub first_key: Key,
+    pub first_key: Vec<u8>,
     /// Offset of the data block from file start
     pub block_offset: u64,
     /// Size of the data block in bytes
@@ -466,7 +466,7 @@ pub struct IndexEntry {
 
 impl IndexEntry {
     /// Create a new index entry.
-    pub fn new(first_key: Key, block_offset: u64, block_size: u32) -> Self {
+    pub fn new(first_key: Vec<u8>, block_offset: u64, block_size: u32) -> Self {
         Self {
             first_key,
             block_offset,
@@ -640,7 +640,7 @@ impl IndexBlock {
         } else {
             // All first_keys are greater than target, but the key might
             // still be in the first block if it's less than the first block's
-            // first key (edge case for MVCC where we seek by user_key||!ts)
+            // first key (edge case for MVCC where we seek by key||!ts)
             None
         }
     }
@@ -1085,20 +1085,20 @@ mod tests {
 
     #[test]
     fn test_data_block_with_mvcc_keys() {
-        // Simulate MVCC key encoding: user_key || !timestamp
-        fn encode_mvcc(user_key: &[u8], ts: u64) -> Vec<u8> {
-            let mut key = user_key.to_vec();
-            key.extend_from_slice(&(!ts).to_be_bytes());
-            key
+        // Simulate MVCC key encoding: key || !timestamp
+        fn encode_mvcc(key_bytes: &[u8], ts: u64) -> Vec<u8> {
+            let mut result = key_bytes.to_vec();
+            result.extend_from_slice(&(!ts).to_be_bytes());
+            result
         }
 
         let mut builder = DataBlockBuilder::new();
 
-        // Same user key with different timestamps (descending order)
-        builder.add(&encode_mvcc(b"user1", 100), b"v100");
-        builder.add(&encode_mvcc(b"user1", 50), b"v50");
-        builder.add(&encode_mvcc(b"user1", 10), b"v10");
-        builder.add(&encode_mvcc(b"user2", 200), b"v200");
+        // Same key with different timestamps (descending order)
+        builder.add(&encode_mvcc(b"key1", 100), b"v100");
+        builder.add(&encode_mvcc(b"key1", 50), b"v50");
+        builder.add(&encode_mvcc(b"key1", 10), b"v10");
+        builder.add(&encode_mvcc(b"key2", 200), b"v200");
 
         let data = builder.finish();
         let block = DataBlock::decode(&data).unwrap();

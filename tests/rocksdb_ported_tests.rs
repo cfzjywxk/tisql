@@ -30,13 +30,76 @@ use std::time::Duration;
 use tempfile::TempDir;
 
 use tisql::new_lsn_provider;
+use tisql::storage::mvcc::{is_tombstone, MvccKey};
 use tisql::storage::WriteBatch;
 use tisql::testkit::{
     IlogConfig, IlogService, LsmConfigBuilder, LsmEngine, SstBuilder, SstBuilderOptions,
     SstIterator, SstReaderRef,
 };
-use tisql::types::Timestamp;
+use tisql::types::{RawValue, Timestamp};
 use tisql::StorageEngine;
+
+// ==================== Test Helpers Using MvccKey ====================
+
+fn get_at_for_test(engine: &LsmEngine, key: &[u8], ts: Timestamp) -> Option<RawValue> {
+    let start = MvccKey::encode(key, ts);
+    let end = MvccKey::encode(key, 0)
+        .next_key()
+        .unwrap_or_else(MvccKey::unbounded);
+    let range = start..end;
+
+    let results = engine.scan(range).unwrap();
+
+    for (mvcc_key, value) in results {
+        let (decoded_key, entry_ts) = mvcc_key.decode();
+        if decoded_key == key && entry_ts <= ts {
+            if is_tombstone(&value) {
+                return None;
+            }
+            return Some(value);
+        }
+    }
+    None
+}
+
+fn get_for_test(engine: &LsmEngine, key: &[u8]) -> Option<RawValue> {
+    get_at_for_test(engine, key, Timestamp::MAX)
+}
+
+fn scan_at_for_test(
+    engine: &LsmEngine,
+    range: &std::ops::Range<Vec<u8>>,
+    ts: Timestamp,
+) -> Vec<(Vec<u8>, RawValue)> {
+    let start = MvccKey::encode(&range.start, ts);
+    let end = MvccKey::encode(&range.end, ts);
+    let mvcc_range = start..end;
+
+    let results = engine.scan(mvcc_range).unwrap();
+
+    let mut seen_keys: std::collections::HashSet<Vec<u8>> = std::collections::HashSet::new();
+    let mut output = Vec::new();
+
+    for (mvcc_key, value) in results {
+        let (decoded_key, entry_ts) = mvcc_key.decode();
+        if decoded_key < range.start || decoded_key >= range.end {
+            continue;
+        }
+        if entry_ts > ts {
+            continue;
+        }
+        if seen_keys.contains(&decoded_key) {
+            continue;
+        }
+        seen_keys.insert(decoded_key.clone());
+        if !is_tombstone(&value) {
+            output.push((decoded_key, value));
+        }
+    }
+
+    output.sort_by(|a, b| a.0.cmp(&b.0));
+    output
+}
 
 // ============================================================================
 // HELPER FUNCTIONS
@@ -106,17 +169,17 @@ fn test_memtable_duplicate_seq_mvcc() {
 
     // Both versions should exist and be accessible at appropriate timestamps
     assert_eq!(
-        engine.get_at(b"key", 10).unwrap(),
+        get_at_for_test(&engine, b"key", 10),
         Some(b"value_10".to_vec()),
         "Version at ts=10 should be accessible"
     );
     assert_eq!(
-        engine.get_at(b"key", 20).unwrap(),
+        get_at_for_test(&engine, b"key", 20),
         Some(b"value_20".to_vec()),
         "Version at ts=20 should be accessible"
     );
     assert_eq!(
-        engine.get_at(b"key", 15).unwrap(),
+        get_at_for_test(&engine, b"key", 15),
         Some(b"value_10".to_vec()),
         "ts=15 should see ts=10 version"
     );
@@ -141,7 +204,7 @@ fn test_memtable_duplicate_stress() {
     // Verify all versions are accessible
     for ts in 1..=num_versions {
         let expected = format!("value_{ts}");
-        let actual = engine.get_at(b"stress_key", ts as Timestamp).unwrap();
+        let actual = get_at_for_test(&engine, b"stress_key", ts as Timestamp);
         assert_eq!(
             actual,
             Some(expected.into_bytes()),
@@ -151,7 +214,7 @@ fn test_memtable_duplicate_stress() {
     }
 
     // Latest should be the highest timestamp
-    let latest = engine.get(b"stress_key").unwrap();
+    let latest = get_for_test(&engine, b"stress_key");
     assert_eq!(latest, Some(format!("value_{num_versions}").into_bytes()));
 }
 
@@ -196,7 +259,7 @@ fn test_memtable_concurrent_writes() {
         for i in 0..writes_per_thread {
             let key = format!("concurrent_key_{}_{}", tid, i);
             assert!(
-                engine.get(key.as_bytes()).unwrap().is_some(),
+                get_for_test(&engine, key.as_bytes()).is_some(),
                 "Key {} should exist",
                 key
             );
@@ -237,16 +300,13 @@ fn test_memtable_concurrent_reads_writes_mvcc() {
                 for _ in 0..100 {
                     for i in 0..100 {
                         let key = format!("mvcc_key_{:04}", i);
-                        match engine.get_at(key.as_bytes(), 1) {
-                            Ok(Some(v)) if v == b"base_value".to_vec() => {}
-                            Ok(None) => {
+                        match get_at_for_test(&engine, key.as_bytes(), 1) {
+                            Some(v) if v == b"base_value".to_vec() => {}
+                            None => {
                                 errors.fetch_add(1, Ordering::SeqCst);
                             }
-                            Ok(Some(_)) => {
+                            Some(_) => {
                                 // Should see base_value at ts=1, not updated value
-                                errors.fetch_add(1, Ordering::SeqCst);
-                            }
-                            Err(_) => {
                                 errors.fetch_add(1, Ordering::SeqCst);
                             }
                         }
@@ -315,21 +375,21 @@ fn test_compaction_simple_deletion() {
 
     // After flush, "c" should be deleted at latest ts
     assert_eq!(
-        engine.get(b"c").unwrap(),
+        get_for_test(&engine, b"c"),
         None,
         "Key 'c' should be deleted at latest ts"
     );
 
     // But visible at ts=3
     assert_eq!(
-        engine.get_at(b"c", 3).unwrap(),
+        get_at_for_test(&engine, b"c", 3),
         Some(b"val".to_vec()),
         "Key 'c' should be visible at ts=3"
     );
 
     // "b" should be visible
     assert_eq!(
-        engine.get(b"b").unwrap(),
+        get_for_test(&engine, b"b"),
         Some(b"val".to_vec()),
         "Key 'b' should be visible"
     );
@@ -357,14 +417,14 @@ fn test_compaction_output_nothing() {
 
     // Latest read should return None (deleted)
     assert_eq!(
-        engine.get(b"a").unwrap(),
+        get_for_test(&engine, b"a"),
         None,
         "Deleted key should not be visible"
     );
 
     // But historical read should work
     assert_eq!(
-        engine.get_at(b"a", 1).unwrap(),
+        get_at_for_test(&engine, b"a", 1),
         Some(b"val".to_vec()),
         "Historical version should be visible"
     );
@@ -394,24 +454,24 @@ fn test_compaction_simple_overwrite() {
 
     // Latest values should be the newer ones
     assert_eq!(
-        engine.get(b"a").unwrap(),
+        get_for_test(&engine, b"a"),
         Some(b"val3".to_vec()),
         "Key 'a' should have newer value"
     );
     assert_eq!(
-        engine.get(b"b").unwrap(),
+        get_for_test(&engine, b"b"),
         Some(b"val4".to_vec()),
         "Key 'b' should have newer value"
     );
 
     // Older values still accessible via MVCC
     assert_eq!(
-        engine.get_at(b"a", 1).unwrap(),
+        get_at_for_test(&engine, b"a", 1),
         Some(b"val1".to_vec()),
         "Old value of 'a' should be accessible"
     );
     assert_eq!(
-        engine.get_at(b"b", 2).unwrap(),
+        get_at_for_test(&engine, b"b", 2),
         Some(b"val2".to_vec()),
         "Old value of 'b' should be accessible"
     );
@@ -453,23 +513,23 @@ fn test_snapshot_visibility_with_deletions() {
     engine.flush_all_with_active().unwrap();
 
     // Snapshot at ts=10: should see a_v1, b_v1, c_v1
-    assert_eq!(engine.get_at(b"a", 10).unwrap(), Some(b"a_v1".to_vec()));
-    assert_eq!(engine.get_at(b"b", 10).unwrap(), Some(b"b_v1".to_vec()));
-    assert_eq!(engine.get_at(b"c", 10).unwrap(), Some(b"c_v1".to_vec()));
+    assert_eq!(get_at_for_test(&engine, b"a", 10), Some(b"a_v1".to_vec()));
+    assert_eq!(get_at_for_test(&engine, b"b", 10), Some(b"b_v1".to_vec()));
+    assert_eq!(get_at_for_test(&engine, b"c", 10), Some(b"c_v1".to_vec()));
 
     // Snapshot at ts=20: should see None (deleted), b_v2, c_v1
     assert_eq!(
-        engine.get_at(b"a", 20).unwrap(),
+        get_at_for_test(&engine, b"a", 20),
         None,
         "'a' should be deleted at ts=20"
     );
-    assert_eq!(engine.get_at(b"b", 20).unwrap(), Some(b"b_v2".to_vec()));
-    assert_eq!(engine.get_at(b"c", 20).unwrap(), Some(b"c_v1".to_vec()));
+    assert_eq!(get_at_for_test(&engine, b"b", 20), Some(b"b_v2".to_vec()));
+    assert_eq!(get_at_for_test(&engine, b"c", 20), Some(b"c_v1".to_vec()));
 
     // Latest: should see None, b_v2, c_v2
-    assert_eq!(engine.get(b"a").unwrap(), None);
-    assert_eq!(engine.get(b"b").unwrap(), Some(b"b_v2".to_vec()));
-    assert_eq!(engine.get(b"c").unwrap(), Some(b"c_v2".to_vec()));
+    assert_eq!(get_for_test(&engine, b"a"), None);
+    assert_eq!(get_for_test(&engine, b"b"), Some(b"b_v2".to_vec()));
+    assert_eq!(get_for_test(&engine, b"c"), Some(b"c_v2".to_vec()));
 }
 
 /// Test tombstone visible in snapshot (ported from RocksDB's similar test).
@@ -498,14 +558,14 @@ fn test_tombstone_visible_in_snapshot() {
 
     // Snapshot before delete (ts=15) should see value
     assert_eq!(
-        engine.get_at(b"tombstone_key", 15).unwrap(),
+        get_at_for_test(&engine, b"tombstone_key", 15),
         Some(b"original_value".to_vec()),
         "Snapshot before delete should see value"
     );
 
     // Snapshot after delete (ts=25) should see None
     assert_eq!(
-        engine.get_at(b"tombstone_key", 25).unwrap(),
+        get_at_for_test(&engine, b"tombstone_key", 25),
         None,
         "Snapshot after delete should see tombstone"
     );
@@ -583,7 +643,7 @@ fn test_flush_while_writing() {
     for tid in 0..num_writers {
         for i in 0..writes_per_writer {
             let key = format!("flush_while_write_{}_{}", tid, i);
-            let value = engine.get(key.as_bytes()).unwrap();
+            let value = get_for_test(&engine, key.as_bytes());
             assert!(
                 value.is_some(),
                 "Key {} should exist after concurrent flush/write",
@@ -620,7 +680,7 @@ fn test_flush_statistics() {
     }
 
     // Verify data is readable before flush
-    let val = engine.get(b"stat_key_1").unwrap();
+    let val = get_for_test(&engine, b"stat_key_1");
     assert!(val.is_some(), "Memtable should have data");
 
     // Get stats before flush (SST count should be 0)
@@ -641,7 +701,7 @@ fn test_flush_statistics() {
     for round in 0..10 {
         let ts = (round + 1) as Timestamp;
         assert_eq!(
-            engine.get_at(b"stat_key_1", ts).unwrap(),
+            get_at_for_test(&engine, b"stat_key_1", ts),
             Some(format!("value_{}", round).into_bytes()),
             "Version at ts={} should be accessible",
             ts
@@ -833,7 +893,7 @@ fn test_compaction_preserves_mvcc_versions() {
 
     // Verify all versions are preserved
     for ts in 1..=5 {
-        let value = engine.get_at(b"mvcc_test", ts as Timestamp).unwrap();
+        let value = get_at_for_test(&engine, b"mvcc_test", ts as Timestamp);
         assert_eq!(
             value,
             Some(format!("value_ts_{}", ts).into_bytes()),
@@ -868,13 +928,13 @@ fn test_scan_range_after_flush() {
 
     // Range scan at ts=15: should see v1 versions
     let range = b"b".to_vec()..b"d".to_vec();
-    let results: Vec<_> = engine.scan_at(&range, 15).unwrap().collect();
+    let results: Vec<_> = scan_at_for_test(&engine, &range, 15);
     assert_eq!(results.len(), 2);
     assert!(results.iter().any(|(k, v)| k == b"b" && v == b"b_v1"));
     assert!(results.iter().any(|(k, v)| k == b"c" && v == b"c_v1"));
 
     // Range scan at ts=25: should see v2 versions where updated
-    let results: Vec<_> = engine.scan_at(&range, 25).unwrap().collect();
+    let results: Vec<_> = scan_at_for_test(&engine, &range, 25);
     assert_eq!(results.len(), 2);
     assert!(results.iter().any(|(k, v)| k == b"b" && v == b"b_v2"));
     assert!(results.iter().any(|(k, v)| k == b"c" && v == b"c_v2"));
@@ -904,7 +964,7 @@ fn test_scan_excludes_deleted_keys() {
 
     // Scan at ts=25: should not include 'b' and 'd'
     let range = b"a".to_vec()..b"f".to_vec();
-    let results: Vec<_> = engine.scan_at(&range, 25).unwrap().collect();
+    let results: Vec<_> = scan_at_for_test(&engine, &range, 25);
     let keys: HashSet<_> = results.iter().map(|(k, _)| k.clone()).collect();
 
     assert!(!keys.contains(&b"b".to_vec()), "'b' should be excluded");
@@ -914,7 +974,7 @@ fn test_scan_excludes_deleted_keys() {
     assert!(keys.contains(&b"e".to_vec()), "'e' should be included");
 
     // Scan at ts=15: should include all (before delete)
-    let results: Vec<_> = engine.scan_at(&range, 15).unwrap().collect();
+    let results: Vec<_> = scan_at_for_test(&engine, &range, 15);
     assert_eq!(results.len(), 5, "All 5 keys should be visible at ts=15");
 }
 
@@ -953,7 +1013,7 @@ fn test_recovery_flushed_data() {
         let engine =
             LsmEngine::open_with_recovery(config, lsn_provider, Arc::new(ilog), version).unwrap();
 
-        let value = engine.get(b"recovery_key").unwrap();
+        let value = get_for_test(&engine, b"recovery_key");
         assert_eq!(
             value,
             Some(b"recovery_value".to_vec()),
@@ -1006,7 +1066,7 @@ fn test_recovery_multiple_flushes() {
         // Latest values should be from round 4
         for i in 0..5 {
             let key = format!("multi_flush_key_{}", i);
-            let value = engine.get(key.as_bytes()).unwrap();
+            let value = get_for_test(&engine, key.as_bytes());
             assert_eq!(
                 value,
                 Some(b"round_4".to_vec()),
@@ -1062,7 +1122,7 @@ fn test_recovery_mvcc_versions() {
 
         // Verify each version is accessible
         for ts in [10, 20, 30, 40, 50] {
-            let value = engine.get_at(b"mvcc_recovery", ts as Timestamp).unwrap();
+            let value = get_at_for_test(&engine, b"mvcc_recovery", ts as Timestamp);
             assert_eq!(
                 value,
                 Some(format!("value_ts_{}", ts).into_bytes()),
@@ -1092,7 +1152,7 @@ fn test_empty_batch() {
     batch.put(b"key".to_vec(), b"value".to_vec());
     engine.write_batch(batch).unwrap();
 
-    assert_eq!(engine.get(b"key").unwrap(), Some(b"value".to_vec()));
+    assert_eq!(get_for_test(&engine, b"key"), Some(b"value".to_vec()));
 }
 
 /// Test very large values.
@@ -1109,12 +1169,12 @@ fn test_large_values() {
     engine.write_batch(batch).unwrap();
 
     // Verify before flush
-    let value = engine.get(b"large_key").unwrap();
+    let value = get_for_test(&engine, b"large_key");
     assert_eq!(value.as_ref().map(|v| v.len()), Some(1024 * 1024));
 
     // Flush and verify
     engine.flush_all_with_active().unwrap();
-    let value = engine.get(b"large_key").unwrap();
+    let value = get_for_test(&engine, b"large_key");
     assert_eq!(value, Some(large_value));
 }
 
@@ -1137,22 +1197,22 @@ fn test_small_keys() {
 
     // Verify before flush
     assert_eq!(
-        engine.get(&[0x00]).unwrap(),
+        get_for_test(&engine, &[0x00]),
         Some(b"null_byte_value".to_vec()),
         "Null byte key should work"
     );
     assert_eq!(
-        engine.get(&[0x01]).unwrap(),
+        get_for_test(&engine, &[0x01]),
         Some(b"one_byte_value".to_vec()),
         "Single byte key should work"
     );
     assert_eq!(
-        engine.get(&[0x7F]).unwrap(),
+        get_for_test(&engine, &[0x7F]),
         Some(b"mid_byte_value".to_vec()),
         "0x7F byte key should work"
     );
     assert_eq!(
-        engine.get(&[0xFE]).unwrap(),
+        get_for_test(&engine, &[0xFE]),
         Some(b"high_byte_value".to_vec()),
         "0xFE byte key should work"
     );
@@ -1160,12 +1220,12 @@ fn test_small_keys() {
     // Flush and verify
     engine.flush_all_with_active().unwrap();
     assert_eq!(
-        engine.get(&[0x00]).unwrap(),
+        get_for_test(&engine, &[0x00]),
         Some(b"null_byte_value".to_vec()),
         "Null byte key should work after flush"
     );
     assert_eq!(
-        engine.get(&[0xFE]).unwrap(),
+        get_for_test(&engine, &[0xFE]),
         Some(b"high_byte_value".to_vec()),
         "0xFE byte key should work after flush"
     );
@@ -1190,7 +1250,7 @@ fn test_binary_keys() {
 
     // Verify all
     for byte in 0u8..=255 {
-        let value = engine.get(&[byte]).unwrap();
+        let value = get_for_test(&engine, &[byte]);
         assert_eq!(
             value,
             Some(vec![byte]),
@@ -1218,11 +1278,11 @@ fn test_timestamp_edge_cases() {
 
     // Verify
     assert_eq!(
-        engine.get_at(b"ts_0", 0).unwrap(),
+        get_at_for_test(&engine, b"ts_0", 0),
         Some(b"value_0".to_vec())
     );
     assert_eq!(
-        engine.get_at(b"ts_max", u64::MAX - 1).unwrap(),
+        get_at_for_test(&engine, b"ts_max", u64::MAX - 1),
         Some(b"value_max".to_vec())
     );
 }

@@ -51,41 +51,15 @@ use fail::fail_point;
 
 use crate::error::{Result, TiSqlError};
 use crate::lsn::SharedLsnProvider;
+use crate::storage::mvcc::{decode_mvcc_key, is_tombstone, MvccKey};
 use crate::storage::{StorageEngine, WriteBatch};
-use crate::types::{Key, RawValue, Timestamp};
+use crate::types::{RawValue, Timestamp};
 
 use super::config::LsmConfig;
 use super::ilog::IlogService;
 use super::memtable::MemTable;
 use super::sstable::{SstBuilder, SstBuilderOptions, SstIterator, SstMeta, SstReaderRef};
 use super::version::{ManifestDelta, Version, MAX_LEVELS};
-
-// ============================================================================
-// MVCC Key Encoding/Decoding (must match crossbeam_memtable.rs)
-// ============================================================================
-
-/// Tombstone marker for deleted keys.
-const TOMBSTONE: &[u8] = b"\x00\x00\x00\x00TISQL_TOMBSTONE\x01";
-
-/// Decode MVCC key to (user_key, commit_ts).
-///
-/// MVCC keys are encoded as: `user_key || !commit_ts` (8 bytes, big-endian)
-/// The bitwise NOT ensures descending order: higher timestamps come first.
-fn decode_mvcc_key(mvcc_key: &[u8]) -> Option<(Key, Timestamp)> {
-    if mvcc_key.len() < 8 {
-        return None;
-    }
-    let user_key = mvcc_key[..mvcc_key.len() - 8].to_vec();
-    let ts_bytes: [u8; 8] = mvcc_key[mvcc_key.len() - 8..].try_into().ok()?;
-    // Reverse the bitwise NOT
-    let ts = !u64::from_be_bytes(ts_bytes);
-    Some((user_key, ts))
-}
-
-/// Check if a value is a tombstone.
-fn is_tombstone(value: &[u8]) -> bool {
-    value == TOMBSTONE
-}
 
 /// Inner state of the LSM engine, protected by RwLock for atomic updates.
 struct LsmState {
@@ -378,17 +352,17 @@ impl LsmEngine {
         let mut builder = SstBuilder::new(&sst_path, options)?;
 
         // Iterate memtable and add all entries INCLUDING tombstones as raw MVCC keys.
-        // SSTs MUST store MVCC keys (user_key || !commit_ts) to preserve version information
+        // SSTs MUST store MVCC keys (key || !commit_ts) to preserve version information
         // for correct MVCC semantics during reads. Unlike the old approach that stored decoded
-        // user keys, this preserves all versions and their timestamps.
+        // keys, this preserves all versions and their timestamps.
         let inner = memtable.inner();
-        // Use truly unbounded range - empty start and end means scan all entries.
-        // This avoids the previous bug where vec![0xFF; 256] could exclude valid keys.
-        let range = vec![]..vec![];
-        let entries = inner.scan_all_mvcc(&range)?;
+        // Use truly unbounded range - MvccKey::unbounded() creates empty placeholder
+        // that signals "scan all entries" to the memtable.
+        let range = MvccKey::unbounded()..MvccKey::unbounded();
+        let entries = inner.scan_mvcc(range)?;
 
         for (mvcc_key, value) in entries {
-            builder.add(&mvcc_key, &value)?;
+            builder.add(mvcc_key.as_bytes(), &value)?;
         }
 
         // Finish building (writes to disk with fsync)
@@ -434,8 +408,8 @@ impl LsmEngine {
     /// Read a key from SST files with MVCC timestamp filtering.
     ///
     /// Searches L0 first (newest to oldest), then L1, L2, etc.
-    /// SSTs contain MVCC keys (user_key || !commit_ts), so we need to:
-    /// 1. Scan for entries matching the user key
+    /// SSTs contain MVCC keys (key || !commit_ts), so we need to:
+    /// 1. Scan for entries matching the key
     /// 2. Find the latest version with entry_ts <= ts
     /// 3. Return None if that version is a tombstone
     fn get_from_sst(&self, key: &[u8], ts: Timestamp) -> Result<Option<RawValue>> {
@@ -460,7 +434,7 @@ impl LsmEngine {
                 continue;
             }
 
-            // SST now contains MVCC keys - iterate to find matching user key with ts visibility
+            // SST now contains MVCC keys - iterate to find matching key with ts visibility
             // Propagate errors instead of silently ignoring (risks wrong reads)
             let reader = SstReaderRef::open(&sst_path)?;
             let mut iter = SstIterator::new(reader)?;
@@ -469,9 +443,9 @@ impl LsmEngine {
                 let mvcc_key = iter.key();
                 let value = iter.value();
 
-                if let Some((user_key, entry_ts)) = decode_mvcc_key(mvcc_key) {
+                if let Some((decoded_key, entry_ts)) = decode_mvcc_key(mvcc_key) {
                     // Check if this is our key and visible at ts
-                    if user_key == key && entry_ts <= ts {
+                    if decoded_key == key && entry_ts <= ts {
                         // Check if this is better than current best match
                         // (higher entry_ts but still <= ts)
                         let dominated = best_match
@@ -481,9 +455,9 @@ impl LsmEngine {
                             best_match = Some((entry_ts, value.to_vec()));
                         }
                     }
-                    // Optimization: if user_key > key, we've passed our key
-                    // (due to MVCC key ordering: same user_key groups together)
-                    if user_key.as_slice() > key {
+                    // Optimization: if decoded_key > key, we've passed our key
+                    // (due to MVCC key ordering: same key groups together)
+                    if decoded_key.as_slice() > key {
                         break;
                     }
                 }
@@ -584,15 +558,10 @@ impl LsmEngine {
 }
 
 impl StorageEngine for LsmEngine {
-    fn get(&self, key: &[u8]) -> Result<Option<RawValue>> {
-        self.get_at(key, Timestamp::MAX)
-    }
-
-    fn get_at(&self, key: &[u8], ts: Timestamp) -> Result<Option<RawValue>> {
-        use super::memtable::GetResult;
-
-        // Read lock to get snapshot of state
-        let (active, frozen, _version) = {
+    fn scan(&self, range: Range<MvccKey>) -> Result<Vec<(MvccKey, RawValue)>> {
+        // Collect all MVCC keys from all sources (SSTs, frozen memtables, active memtable)
+        // Results are sorted by MVCC key (which gives natural ordering by key then descending ts)
+        let (active, frozen, version) = {
             let state = self.state.read().unwrap();
             (
                 Arc::clone(&state.active),
@@ -601,26 +570,72 @@ impl StorageEngine for LsmEngine {
             )
         };
 
-        // 1. Check active memtable with tombstone awareness
-        // If we find a tombstone, we must NOT continue to older levels (SSTs)
-        // because that would incorrectly "resurrect" deleted keys.
-        match active.get_at_with_tombstone(key, ts)? {
-            GetResult::Found(value) => return Ok(Some(value)),
-            GetResult::FoundTombstone => return Ok(None), // Stop! Key was deleted
-            GetResult::NotFound => {}                     // Continue searching
-        }
+        let mut all_entries: Vec<(MvccKey, RawValue)> = Vec::new();
 
-        // 2. Check frozen memtables (newest first)
-        for memtable in &frozen {
-            match memtable.get_at_with_tombstone(key, ts)? {
-                GetResult::Found(value) => return Ok(Some(value)),
-                GetResult::FoundTombstone => return Ok(None), // Stop! Key was deleted
-                GetResult::NotFound => {}                     // Continue searching
+        // Convert MvccKey to bytes for comparison
+        let start_bytes: Vec<u8> = range.start.clone().into();
+        let end_bytes: Vec<u8> = range.end.clone().into();
+        let is_unbounded = start_bytes.is_empty() && end_bytes.is_empty();
+
+        // 1. Scan SST files (oldest data)
+        // Process all levels from highest to L0
+        for level in (0..MAX_LEVELS).rev() {
+            let ssts = version.ssts_at_level(level as u32);
+            let mut sorted_ssts: Vec<_> = ssts.iter().collect();
+            if level == 0 {
+                sorted_ssts.sort_by_key(|s| s.id);
+            }
+
+            for sst_meta in sorted_ssts {
+                let sst_path = self
+                    .config
+                    .sst_dir()
+                    .join(format!("{:08}.sst", sst_meta.id));
+
+                if !sst_path.exists() {
+                    continue;
+                }
+
+                let reader = SstReaderRef::open(&sst_path)?;
+                let mut iter = SstIterator::new(reader)?;
+
+                while iter.valid() {
+                    let mvcc_key_bytes = iter.key();
+                    let value = iter.value();
+
+                    // Check if within MVCC key range
+                    let in_range = if is_unbounded {
+                        true
+                    } else {
+                        mvcc_key_bytes >= start_bytes.as_slice()
+                            && (end_bytes.is_empty() || mvcc_key_bytes < end_bytes.as_slice())
+                    };
+
+                    if in_range {
+                        // Safety: SST keys are valid MVCC keys
+                        let mvcc = MvccKey::from_bytes_unchecked(mvcc_key_bytes.to_vec());
+                        all_entries.push((mvcc, value.to_vec()));
+                    }
+
+                    iter.next()?;
+                }
             }
         }
 
-        // 3. Check SST files
-        self.get_from_sst(key, ts)
+        // 2. Scan frozen memtables (older to newer)
+        for memtable in frozen.iter().rev() {
+            let memtable_entries = memtable.inner().scan_mvcc(range.clone())?;
+            all_entries.extend(memtable_entries);
+        }
+
+        // 3. Scan active memtable (newest data)
+        let active_entries = active.inner().scan_mvcc(range)?;
+        all_entries.extend(active_entries);
+
+        // Sort by MVCC key to maintain ordering
+        all_entries.sort_by(|a, b| a.0.cmp(&b.0));
+
+        Ok(all_entries)
     }
 
     fn write_batch(&self, batch: WriteBatch) -> Result<()> {
@@ -642,123 +657,6 @@ impl StorageEngine for LsmEngine {
         let _ = self.maybe_rotate();
 
         Ok(())
-    }
-
-    fn scan(&self, range: &Range<Key>) -> Result<Box<dyn Iterator<Item = (Key, RawValue)> + '_>> {
-        self.scan_at(range, Timestamp::MAX)
-    }
-
-    fn scan_at(
-        &self,
-        range: &Range<Key>,
-        ts: Timestamp,
-    ) -> Result<Box<dyn Iterator<Item = (Key, RawValue)> + '_>> {
-        // Use HashMap to track the latest visible value for each user key
-        // Key: user_key, Value: (entry_ts, Option<value>)
-        // entry_ts is tracked to ensure we keep the latest version <= ts
-        // Option<value> = None means deleted (tombstone)
-        use std::collections::HashMap;
-
-        let (active, frozen, version) = {
-            let state = self.state.read().unwrap();
-            (
-                Arc::clone(&state.active),
-                state.frozen.clone(),
-                Arc::clone(&state.version),
-            )
-        };
-
-        // Results map: user_key -> (entry_ts, Option<value>)
-        // We track entry_ts to ensure we keep the latest visible version
-        let mut results: HashMap<Key, (Timestamp, Option<RawValue>)> = HashMap::new();
-
-        // 1. Scan SST files (SSTs now contain MVCC keys: user_key || !commit_ts)
-        // Process all levels from highest to L0 (older data first)
-        for level in (0..MAX_LEVELS).rev() {
-            let ssts = version.ssts_at_level(level as u32);
-            // For L0, process in order of increasing ID (older first)
-            let mut sorted_ssts: Vec<_> = ssts.iter().collect();
-            if level == 0 {
-                sorted_ssts.sort_by_key(|s| s.id);
-            }
-
-            for sst_meta in sorted_ssts {
-                let sst_path = self
-                    .config
-                    .sst_dir()
-                    .join(format!("{:08}.sst", sst_meta.id));
-
-                if !sst_path.exists() {
-                    continue;
-                }
-
-                // Propagate SST read errors instead of silently ignoring them.
-                // Silent errors can cause wrong reads (missing data).
-                let reader = SstReaderRef::open(&sst_path)?;
-                let mut iter = SstIterator::new(reader)?;
-
-                while iter.valid() {
-                    let mvcc_key = iter.key();
-                    let value = iter.value();
-
-                    // Decode MVCC key to get user_key and entry_ts
-                    if let Some((user_key, entry_ts)) = decode_mvcc_key(mvcc_key) {
-                        // Check if within user key range and visible at ts
-                        if user_key >= range.start && user_key < range.end && entry_ts <= ts {
-                            // Check if this version is newer than what we have
-                            let dominated = results
-                                .get(&user_key)
-                                .is_some_and(|(best_ts, _)| entry_ts <= *best_ts);
-
-                            if !dominated {
-                                if is_tombstone(value) {
-                                    results.insert(user_key, (entry_ts, None));
-                                } else {
-                                    results.insert(user_key, (entry_ts, Some(value.to_vec())));
-                                }
-                            }
-                        }
-                    }
-
-                    iter.next()?;
-                }
-            }
-        }
-
-        // 2. Scan frozen memtables (oldest first, so newer overwrites older)
-        // Use scan_at_with_tombstones to get entries visible at ts INCLUDING tombstones.
-        // Tombstones in memtable mask older SST values.
-        for memtable in frozen.iter().rev() {
-            let memtable_results = memtable.inner().scan_at_with_tombstones(range, ts)?;
-            for (user_key, value) in memtable_results {
-                // Memtable data is newer than SST data, so overwrite
-                // Use Timestamp::MAX to ensure memtable entries always win
-                if is_tombstone(&value) {
-                    results.insert(user_key, (Timestamp::MAX, None));
-                } else {
-                    results.insert(user_key, (Timestamp::MAX, Some(value)));
-                }
-            }
-        }
-
-        // 3. Scan active memtable (newest data)
-        let active_results = active.inner().scan_at_with_tombstones(range, ts)?;
-        for (user_key, value) in active_results {
-            if is_tombstone(&value) {
-                results.insert(user_key, (Timestamp::MAX, None));
-            } else {
-                results.insert(user_key, (Timestamp::MAX, Some(value)));
-            }
-        }
-
-        // Convert to sorted vector, filtering out tombstones (None values)
-        let mut result_vec: Vec<(Key, RawValue)> = results
-            .into_iter()
-            .filter_map(|(k, (_, v))| v.map(|val| (k, val)))
-            .collect();
-        result_vec.sort_by(|a, b| a.0.cmp(&b.0));
-
-        Ok(Box::new(result_vec.into_iter()))
     }
 }
 
@@ -790,6 +688,7 @@ pub struct LsmStats {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::storage::mvcc::{encode_mvcc_key, is_tombstone};
     use std::path::Path;
     use tempfile::TempDir;
 
@@ -805,6 +704,87 @@ mod tests {
         let mut batch = WriteBatch::new();
         batch.set_commit_ts(commit_ts);
         batch
+    }
+
+    // ==================== Test Helpers Using MvccKey ====================
+    //
+    // These helpers use MvccKey explicitly instead of convenience methods.
+    // Tests should encode keys as MvccKey and use scan to find results.
+
+    /// Get the latest version of a key visible at the given timestamp.
+    /// Uses scan with MvccKey range and filters results.
+    fn get_at_for_test(engine: &LsmEngine, key: &[u8], ts: Timestamp) -> Option<RawValue> {
+        // Create MVCC key range: from (key, ts) to next key
+        let start = MvccKey::encode(key, ts);
+        let end = MvccKey::encode(key, 0)
+            .next_key()
+            .unwrap_or_else(|| MvccKey::unbounded());
+        let range = start..end;
+
+        let results = engine.scan(range).unwrap();
+
+        // Find the first entry matching our key (latest visible version)
+        for (mvcc_key, value) in results {
+            let (decoded_key, entry_ts) = mvcc_key.decode();
+            if decoded_key == key && entry_ts <= ts {
+                if is_tombstone(&value) {
+                    return None;
+                }
+                return Some(value);
+            }
+        }
+        None
+    }
+
+    /// Get the latest version of a key (at MAX timestamp).
+    fn get_for_test(engine: &LsmEngine, key: &[u8]) -> Option<RawValue> {
+        get_at_for_test(engine, key, Timestamp::MAX)
+    }
+
+    /// Scan a key range at the given timestamp, returning (key, value) pairs.
+    fn scan_at_for_test(
+        engine: &LsmEngine,
+        range: &Range<Vec<u8>>,
+        ts: Timestamp,
+    ) -> Vec<(Vec<u8>, RawValue)> {
+        // Convert user key range to MvccKey range
+        // Use MAX timestamp for start (smallest MVCC key for that user key)
+        // Use 0 timestamp for end (largest MVCC key for that user key)
+        // This ensures we include all versions of keys in [start, end)
+        let start = MvccKey::encode(&range.start, Timestamp::MAX);
+        let end = MvccKey::encode(&range.end, 0);
+        let mvcc_range = start..end;
+
+        let results = engine.scan(mvcc_range).unwrap();
+
+        // Deduplicate by key and filter by timestamp
+        let mut seen_keys: std::collections::HashSet<Vec<u8>> = std::collections::HashSet::new();
+        let mut output = Vec::new();
+
+        for (mvcc_key, value) in results {
+            let (decoded_key, entry_ts) = mvcc_key.decode();
+            if decoded_key < range.start || decoded_key >= range.end {
+                continue;
+            }
+            if entry_ts > ts {
+                continue;
+            }
+            if seen_keys.contains(&decoded_key) {
+                continue;
+            }
+            seen_keys.insert(decoded_key.clone());
+            if !is_tombstone(&value) {
+                output.push((decoded_key, value));
+            }
+        }
+
+        output.sort_by(|a, b| a.0.cmp(&b.0));
+        output
+    }
+
+    /// Scan a key range at latest timestamp.
+    fn scan_for_test(engine: &LsmEngine, range: &Range<Vec<u8>>) -> Vec<(Vec<u8>, RawValue)> {
+        scan_at_for_test(engine, range, Timestamp::MAX)
     }
 
     #[test]
@@ -831,9 +811,9 @@ mod tests {
         batch.put(b"key2".to_vec(), b"value2".to_vec());
         engine.write_batch(batch).unwrap();
 
-        assert_eq!(engine.get(b"key1").unwrap(), Some(b"value1".to_vec()));
-        assert_eq!(engine.get(b"key2").unwrap(), Some(b"value2".to_vec()));
-        assert_eq!(engine.get(b"key3").unwrap(), None);
+        assert_eq!(get_for_test(&engine, b"key1"), Some(b"value1".to_vec()));
+        assert_eq!(get_for_test(&engine, b"key2"), Some(b"value2".to_vec()));
+        assert_eq!(get_for_test(&engine, b"key3"), None);
     }
 
     #[test]
@@ -853,11 +833,11 @@ mod tests {
         engine.write_batch(batch).unwrap();
 
         // Read at different timestamps
-        assert_eq!(engine.get_at(b"key", 5).unwrap(), None);
-        assert_eq!(engine.get_at(b"key", 10).unwrap(), Some(b"v1".to_vec()));
-        assert_eq!(engine.get_at(b"key", 15).unwrap(), Some(b"v1".to_vec()));
-        assert_eq!(engine.get_at(b"key", 20).unwrap(), Some(b"v2".to_vec()));
-        assert_eq!(engine.get_at(b"key", 25).unwrap(), Some(b"v2".to_vec()));
+        assert_eq!(get_at_for_test(&engine, b"key", 5), None);
+        assert_eq!(get_at_for_test(&engine, b"key", 10), Some(b"v1".to_vec()));
+        assert_eq!(get_at_for_test(&engine, b"key", 15), Some(b"v1".to_vec()));
+        assert_eq!(get_at_for_test(&engine, b"key", 20), Some(b"v2".to_vec()));
+        assert_eq!(get_at_for_test(&engine, b"key", 25), Some(b"v2".to_vec()));
     }
 
     #[test]
@@ -888,7 +868,7 @@ mod tests {
             let key = format!("key_{:04}", i);
             let expected = format!("value_{:04}", i);
             assert_eq!(
-                engine.get(key.as_bytes()).unwrap(),
+                get_for_test(&engine, key.as_bytes()),
                 Some(expected.as_bytes().to_vec())
             );
         }
@@ -928,7 +908,7 @@ mod tests {
             let key = format!("key_{:04}", i);
             let expected = format!("value_{:04}", i);
             assert_eq!(
-                engine.get(key.as_bytes()).unwrap(),
+                get_for_test(&engine, key.as_bytes()),
                 Some(expected.as_bytes().to_vec()),
                 "Key {} should be readable after flush",
                 key
@@ -950,7 +930,7 @@ mod tests {
         engine.write_batch(batch).unwrap();
 
         let range = b"b".to_vec()..b"d".to_vec();
-        let results: Vec<_> = engine.scan(&range).unwrap().collect();
+        let results = scan_for_test(&engine, &range);
 
         assert_eq!(results.len(), 2);
         assert!(results.iter().any(|(k, _)| k == b"b"));
@@ -968,7 +948,7 @@ mod tests {
         batch.put(b"key".to_vec(), b"value".to_vec());
         engine.write_batch(batch).unwrap();
 
-        assert_eq!(engine.get(b"key").unwrap(), Some(b"value".to_vec()));
+        assert_eq!(get_for_test(&engine, b"key"), Some(b"value".to_vec()));
 
         // Delete
         let mut batch = new_batch(20);
@@ -976,10 +956,13 @@ mod tests {
         engine.write_batch(batch).unwrap();
 
         // Should be deleted at latest
-        assert_eq!(engine.get(b"key").unwrap(), None);
+        assert_eq!(get_for_test(&engine, b"key"), None);
 
         // Should still be visible at ts=15
-        assert_eq!(engine.get_at(b"key", 15).unwrap(), Some(b"value".to_vec()));
+        assert_eq!(
+            get_at_for_test(&engine, b"key", 15),
+            Some(b"value".to_vec())
+        );
     }
 
     #[test]
@@ -1041,7 +1024,7 @@ mod tests {
             for i in 0..writes_per_thread {
                 let key = format!("key_{}_{}", tid, i);
                 assert!(
-                    engine.get(key.as_bytes()).unwrap().is_some(),
+                    get_for_test(&engine, key.as_bytes()).is_some(),
                     "Key {} should exist",
                     key
                 );
@@ -1080,7 +1063,7 @@ mod tests {
                 thread::spawn(move || {
                     for i in 0..500 {
                         let key = format!("key{:03}", i % 100);
-                        let _ = engine.get(key.as_bytes());
+                        let _ = get_for_test(&engine, key.as_bytes());
                     }
                 })
             })
@@ -1107,7 +1090,7 @@ mod tests {
         // Verify original data still readable
         for i in 0..100 {
             let key = format!("key{:03}", i);
-            assert!(engine.get(key.as_bytes()).unwrap().is_some());
+            assert!(get_for_test(&engine, key.as_bytes()).is_some());
         }
     }
 
@@ -1151,7 +1134,7 @@ mod tests {
             let key = format!("key_{:04}", i);
             let expected = format!("value_{:04}", i);
             assert_eq!(
-                engine.get(key.as_bytes()).unwrap(),
+                get_for_test(&engine, key.as_bytes()),
                 Some(expected.as_bytes().to_vec()),
                 "Key {} should be readable after durable flush",
                 key
@@ -1216,7 +1199,7 @@ mod tests {
                 let key = format!("key_{:04}", i);
                 let expected = format!("value_{:04}", i);
                 assert_eq!(
-                    engine.get(key.as_bytes()).unwrap(),
+                    get_for_test(&engine, key.as_bytes()),
                     Some(expected.as_bytes().to_vec()),
                     "Key {} should be readable after recovery",
                     key
@@ -1248,39 +1231,39 @@ mod tests {
         engine.write_batch(batch3).unwrap();
 
         // get_at should return the correct version
-        assert_eq!(engine.get_at(b"key", 5).unwrap(), None); // Too early
+        assert_eq!(get_at_for_test(&engine, b"key", 5), None); // Too early
         assert_eq!(
-            engine.get_at(b"key", 10).unwrap(),
+            get_at_for_test(&engine, b"key", 10),
             Some(b"value_10".to_vec())
         );
         assert_eq!(
-            engine.get_at(b"key", 15).unwrap(),
+            get_at_for_test(&engine, b"key", 15),
             Some(b"value_10".to_vec())
         );
         assert_eq!(
-            engine.get_at(b"key", 20).unwrap(),
+            get_at_for_test(&engine, b"key", 20),
             Some(b"value_20".to_vec())
         );
         assert_eq!(
-            engine.get_at(b"key", 25).unwrap(),
+            get_at_for_test(&engine, b"key", 25),
             Some(b"value_20".to_vec())
         );
         assert_eq!(
-            engine.get_at(b"key", 30).unwrap(),
+            get_at_for_test(&engine, b"key", 30),
             Some(b"value_30".to_vec())
         );
         assert_eq!(
-            engine.get_at(b"key", 100).unwrap(),
+            get_at_for_test(&engine, b"key", 100),
             Some(b"value_30".to_vec())
         );
 
         // scan_at should also respect timestamp
         let range = b"key".to_vec()..b"key\xff".to_vec();
-        let results15: Vec<_> = engine.scan_at(&range, 15).unwrap().collect();
+        let results15 = scan_at_for_test(&engine, &range, 15);
         assert_eq!(results15.len(), 1);
         assert_eq!(results15[0].1, b"value_10".to_vec());
 
-        let results25: Vec<_> = engine.scan_at(&range, 25).unwrap().collect();
+        let results25 = scan_at_for_test(&engine, &range, 25);
         assert_eq!(results25.len(), 1);
         assert_eq!(results25[0].1, b"value_20".to_vec());
     }
@@ -1318,8 +1301,8 @@ mod tests {
         engine.flush_all_with_active().unwrap();
 
         // SST should contain MVCC keys - verify by reading at different timestamps
-        assert_eq!(engine.get_at(b"key", 15).unwrap(), Some(b"v1".to_vec()));
-        assert_eq!(engine.get_at(b"key", 25).unwrap(), Some(b"v2".to_vec()));
+        assert_eq!(get_at_for_test(&engine, b"key", 15), Some(b"v1".to_vec()));
+        assert_eq!(get_at_for_test(&engine, b"key", 25), Some(b"v2".to_vec()));
     }
 
     #[test]
@@ -1355,9 +1338,12 @@ mod tests {
         engine.flush_all_with_active().unwrap();
 
         // Check MVCC visibility
-        assert_eq!(engine.get_at(b"key", 15).unwrap(), Some(b"value".to_vec()));
-        assert_eq!(engine.get_at(b"key", 25).unwrap(), None); // Deleted
-        assert_eq!(engine.get(b"key").unwrap(), None); // Latest is deleted
+        assert_eq!(
+            get_at_for_test(&engine, b"key", 15),
+            Some(b"value".to_vec())
+        );
+        assert_eq!(get_at_for_test(&engine, b"key", 25), None); // Deleted
+        assert_eq!(get_for_test(&engine, b"key"), None); // Latest is deleted
     }
 
     #[test]
@@ -1409,21 +1395,21 @@ mod tests {
 
         // Scan at ts=15: should see a_v1, b_v1, c_v1
         let range = b"a".to_vec()..b"d".to_vec();
-        let results15: Vec<_> = engine.scan_at(&range, 15).unwrap().collect();
+        let results15 = scan_at_for_test(&engine, &range, 15);
         assert_eq!(results15.len(), 3);
         assert_eq!(results15[0], (b"a".to_vec(), b"a_v1".to_vec()));
         assert_eq!(results15[1], (b"b".to_vec(), b"b_v1".to_vec()));
         assert_eq!(results15[2], (b"c".to_vec(), b"c_v1".to_vec()));
 
         // Scan at ts=25: should see a_v1, b_v2, c_v1
-        let results25: Vec<_> = engine.scan_at(&range, 25).unwrap().collect();
+        let results25 = scan_at_for_test(&engine, &range, 25);
         assert_eq!(results25.len(), 3);
         assert_eq!(results25[0], (b"a".to_vec(), b"a_v1".to_vec()));
         assert_eq!(results25[1], (b"b".to_vec(), b"b_v2".to_vec()));
         assert_eq!(results25[2], (b"c".to_vec(), b"c_v1".to_vec()));
 
         // Scan at ts=35: should see b_v2, c_v1 (a deleted)
-        let results35: Vec<_> = engine.scan_at(&range, 35).unwrap().collect();
+        let results35 = scan_at_for_test(&engine, &range, 35);
         assert_eq!(results35.len(), 2);
         assert_eq!(results35[0], (b"b".to_vec(), b"b_v2".to_vec()));
         assert_eq!(results35[1], (b"c".to_vec(), b"c_v1".to_vec()));
@@ -1475,7 +1461,7 @@ mod tests {
     }
 
     #[test]
-    fn test_sst_contains_mvcc_keys_not_user_keys() {
+    fn test_sst_contains_mvcc_keys() {
         // Critical: Verify SST contains MVCC-encoded keys
         let tmp = TempDir::new().unwrap();
         let config = LsmConfig::builder(tmp.path())
@@ -1530,8 +1516,8 @@ mod tests {
             );
 
             // Decode and verify
-            if let Some((user_key, ts)) = decode_mvcc_key(mvcc_key) {
-                assert_eq!(user_key, b"key", "User key should match");
+            if let Some((decoded_key, ts)) = decode_mvcc_key(mvcc_key) {
+                assert_eq!(decoded_key, b"key", "Key should match");
                 if ts == 10 {
                     found_ts_10 = true;
                 }
@@ -1589,21 +1575,21 @@ mod tests {
 
         // Point read at ts=15 should return value (before delete)
         assert_eq!(
-            engine.get_at(b"key", 15).unwrap(),
+            get_at_for_test(&engine, b"key", 15),
             Some(b"value".to_vec()),
             "get_at(ts=15) should return value from SST"
         );
 
         // Point read at ts=25 should return None (tombstone visible)
         assert_eq!(
-            engine.get_at(b"key", 25).unwrap(),
+            get_at_for_test(&engine, b"key", 25),
             None,
             "get_at(ts=25) should return None due to tombstone in SST"
         );
 
         // Latest read should also return None
         assert_eq!(
-            engine.get(b"key").unwrap(),
+            get_for_test(&engine, b"key"),
             None,
             "get() should return None due to tombstone in SST"
         );
@@ -1648,12 +1634,12 @@ mod tests {
 
         // Both keys should be readable from SST
         assert_eq!(
-            engine.get(&long_key).unwrap(),
+            get_for_test(&engine, &long_key),
             Some(value),
             "Long key with 0xFF prefix should be readable after flush"
         );
         assert_eq!(
-            engine.get(b"normal_key").unwrap(),
+            get_for_test(&engine, b"normal_key"),
             Some(b"normal_value".to_vec()),
             "Normal key should be readable after flush"
         );
@@ -1737,7 +1723,7 @@ mod tests {
             let key = format!("key_{:04}", i);
             let expected = format!("value_{:04}", i);
             assert_eq!(
-                engine.get(key.as_bytes()).unwrap(),
+                get_for_test(&engine, key.as_bytes()),
                 Some(expected.as_bytes().to_vec()),
                 "Key {} should be readable after concurrent flushes",
                 key
@@ -1801,17 +1787,17 @@ mod tests {
 
             // MVCC visibility should work from SST
             assert_eq!(
-                engine.get_at(b"key", 5).unwrap(),
+                get_at_for_test(&engine, b"key", 5),
                 None,
                 "Nothing visible at ts=5"
             );
             assert_eq!(
-                engine.get_at(b"key", 15).unwrap(),
+                get_at_for_test(&engine, b"key", 15),
                 Some(b"v1".to_vec()),
                 "v1 visible at ts=15"
             );
             assert_eq!(
-                engine.get_at(b"key", 25).unwrap(),
+                get_at_for_test(&engine, b"key", 25),
                 Some(b"v2".to_vec()),
                 "v2 visible at ts=25"
             );
@@ -1854,7 +1840,7 @@ mod tests {
 
         // Verify value is readable from SST
         assert_eq!(
-            engine.get_at(b"key", 15).unwrap(),
+            get_at_for_test(&engine, b"key", 15),
             Some(b"value_in_sst".to_vec()),
             "Value should be readable from SST before delete"
         );
@@ -1870,27 +1856,27 @@ mod tests {
         // This is the critical test: get_at(ts>=20) MUST return None,
         // NOT the old value from SST. The tombstone in memtable must stop the search.
         assert_eq!(
-            engine.get_at(b"key", 25).unwrap(),
+            get_at_for_test(&engine, b"key", 25),
             None,
             "Delete in memtable MUST mask value in SST (ts=25 >= delete_ts=20)"
         );
 
         assert_eq!(
-            engine.get_at(b"key", 20).unwrap(),
+            get_at_for_test(&engine, b"key", 20),
             None,
             "Delete in memtable MUST mask value in SST (ts=20 == delete_ts)"
         );
 
         // Value should still be visible before the delete timestamp
         assert_eq!(
-            engine.get_at(b"key", 15).unwrap(),
+            get_at_for_test(&engine, b"key", 15),
             Some(b"value_in_sst".to_vec()),
             "Value should still be visible at ts=15 (before delete)"
         );
 
         // Latest read should also return None
         assert_eq!(
-            engine.get(b"key").unwrap(),
+            get_for_test(&engine, b"key"),
             None,
             "Latest read should return None (deleted)"
         );
@@ -1935,7 +1921,7 @@ mod tests {
 
         // Scan at ts=25: should see a, c (but NOT b - it's deleted)
         let range = b"a".to_vec()..b"d".to_vec();
-        let results: Vec<_> = engine.scan_at(&range, 25).unwrap().collect();
+        let results = scan_at_for_test(&engine, &range, 25);
         assert_eq!(results.len(), 2, "Should see 2 keys after delete");
         assert!(
             results.iter().all(|(k, _)| k != b"b"),
@@ -1943,7 +1929,7 @@ mod tests {
         );
 
         // Scan at ts=15: should see all 3 keys (before delete)
-        let results: Vec<_> = engine.scan_at(&range, 15).unwrap().collect();
+        let results = scan_at_for_test(&engine, &range, 15);
         assert_eq!(results.len(), 3, "Should see 3 keys before delete");
     }
 
@@ -2032,7 +2018,7 @@ mod tests {
             // Verify all data is recovered
             for (key, value) in &written_keys {
                 assert_eq!(
-                    result.engine.get(key).unwrap(),
+                    get_for_test(&result.engine, key),
                     Some(value.clone()),
                     "Key {:?} should be recovered in session 2",
                     String::from_utf8_lossy(key)
@@ -2056,7 +2042,7 @@ mod tests {
             // Verify all data is still present after two-crash recovery
             for (key, value) in &written_keys {
                 assert_eq!(
-                    result.engine.get(key).unwrap(),
+                    get_for_test(&result.engine, key),
                     Some(value.clone()),
                     "Key {:?} should be present after two-crash recovery",
                     String::from_utf8_lossy(key)
@@ -2098,17 +2084,17 @@ mod tests {
 
         // Verify all keys are readable from memtable
         assert_eq!(
-            engine.get(&key_all_ff_short).unwrap(),
+            get_for_test(&engine, &key_all_ff_short),
             Some(b"short_ff_value".to_vec()),
             "Short 0xFF key should be readable from memtable"
         );
         assert_eq!(
-            engine.get(&key_all_ff_long).unwrap(),
+            get_for_test(&engine, &key_all_ff_long),
             Some(b"long_ff_value".to_vec()),
             "Long 0xFF key should be readable from memtable"
         );
         assert_eq!(
-            engine.get(&key_normal).unwrap(),
+            get_for_test(&engine, &key_normal),
             Some(b"normal_value".to_vec()),
             "Normal key should be readable from memtable"
         );
@@ -2118,17 +2104,17 @@ mod tests {
 
         // Verify all keys are readable from SST
         assert_eq!(
-            engine.get(&key_all_ff_short).unwrap(),
+            get_for_test(&engine, &key_all_ff_short),
             Some(b"short_ff_value".to_vec()),
             "Short 0xFF key should be readable from SST"
         );
         assert_eq!(
-            engine.get(&key_all_ff_long).unwrap(),
+            get_for_test(&engine, &key_all_ff_long),
             Some(b"long_ff_value".to_vec()),
             "Long 0xFF key should be readable from SST"
         );
         assert_eq!(
-            engine.get(&key_normal).unwrap(),
+            get_for_test(&engine, &key_normal),
             Some(b"normal_value".to_vec()),
             "Normal key should be readable from SST"
         );

@@ -37,6 +37,7 @@ use std::time::{Duration, Instant};
 
 use clap::Parser;
 
+use tisql::storage::mvcc::{is_tombstone, MvccKey};
 use tisql::storage::{
     ArenaMemTableEngine, BTreeMemTableEngine, CrossbeamMemTableEngine, StorageEngine, WriteBatch,
 };
@@ -302,11 +303,21 @@ fn worker_thread<E: StorageEngine>(
         let start = Instant::now();
 
         if op_type < config.point_select_pct {
-            // Point select
+            // Point select using MvccKey scan
             let row_id = rng() % config.table_size as u64;
             let key = make_key(table_id, row_id);
             let ts = ts_counter.load(Ordering::Relaxed);
-            let _ = engine.get_at(&key, ts);
+            // Scan for the key at the given timestamp
+            let seek_key = MvccKey::encode(&key, ts);
+            let end_key = MvccKey::encode(&key, 0)
+                .next_key()
+                .unwrap_or_else(MvccKey::unbounded);
+            let results = engine.scan(seek_key..end_key).unwrap();
+            // Find the first visible entry
+            let _ = results.into_iter().find(|(mvcc_key, value)| {
+                let (decoded_key, entry_ts) = mvcc_key.decode();
+                decoded_key == key && entry_ts <= ts && !is_tombstone(value)
+            });
             stats.record_read(start.elapsed().as_nanos() as u64);
         } else if op_type < config.point_select_pct + config.update_pct {
             // Update

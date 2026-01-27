@@ -61,6 +61,7 @@ pub mod config;
 pub mod ilog;
 pub mod lsm;
 pub mod memtable;
+pub mod mvcc;
 pub mod recovery;
 pub mod sstable;
 pub mod version;
@@ -109,6 +110,12 @@ pub use ilog::{IlogConfig, IlogRecord, IlogService, VersionSnapshot};
 
 // Re-export recovery types
 pub use recovery::{LsmRecovery, RecoveryResult, RecoveryStats};
+
+// Re-export MVCC codec types
+pub use mvcc::{
+    decode_mvcc_key, encode_mvcc_key, extract_key, is_tombstone, next_key_bound, prev_key_bound,
+    MvccKey, TIMESTAMP_SIZE, TOMBSTONE,
+};
 
 // Re-export SST types for persistent storage
 pub use sstable::{
@@ -183,18 +190,26 @@ pub use crate::codec::row::{decode_row_to_values, encode_row};
 // Storage Engine Trait
 // ============================================================================
 
-/// Core KV storage interface with MVCC versioning.
+/// Core KV storage interface for MVCC key-value storage.
 ///
-/// This trait defines a pure key-value storage layer. Implementations should be
-/// thread-safe (Send + Sync) and provide MVCC versioning through timestamped writes.
+/// This trait defines a pure key-value storage layer that operates on `MvccKey` format.
+/// All keys in the storage layer are MVCC-encoded: `key || !commit_ts` (8-byte big-endian, bitwise NOT).
+/// Implementations should be thread-safe (Send + Sync).
+///
+/// # Key Type Separation
+///
+/// - **Storage layer**: Uses `MvccKey` exclusively (except GC compaction filter)
+/// - **Transaction layer**: Accepts `Key` (user keys) and encodes to `MvccKey` internally
 ///
 /// # Layer Separation
 ///
 /// The storage layer is responsible ONLY for:
-/// - Storing and retrieving versioned key-value pairs
-/// - Atomic batch writes with explicit timestamps
+/// - Storing `MvccKey`-value pairs
+/// - Returning `MvccKey` on iteration
+/// - Atomic batch writes (MVCC encoding done internally from user key + commit_ts)
 ///
 /// The storage layer does NOT handle:
+/// - MVCC read semantics (finding latest version <= ts) - handled by transaction layer
 /// - Lock management (handled by ConcurrencyManager in transaction layer)
 /// - Timestamp allocation (handled by TsoService in transaction layer)
 /// - Transaction coordination (handled by TransactionService)
@@ -213,29 +228,28 @@ pub use crate::codec::row::{decode_row_to_values, encode_row};
 ///
 /// | Method | Description |
 /// |--------|-------------|
-/// | `get` | Read latest version (for recovery/testing) |
-/// | `get_at` | Read at specific timestamp (MVCC) |
-/// | `scan` | Scan latest versions (for recovery/testing) |
-/// | `scan_at` | Scan at specific timestamp (MVCC) |
-/// | `write_batch` | Atomic writes with commit_ts (requires timestamp) |
+/// | `scan` | Iterate `MvccKey` entries in range |
+/// | `write_batch` | Atomic writes with commit_ts (MVCC encoding done internally) |
 pub trait StorageEngine: Send + Sync + 'static {
-    /// Point lookup - returns the latest version of a key.
+    /// Scan MVCC keys in range.
     ///
-    /// Returns the most recently committed version regardless of timestamp.
-    /// Primarily used for recovery operations and testing.
+    /// Returns all MVCC key-value pairs in the given range, including all versions
+    /// and tombstones. Keys are in `MvccKey` format (`key || !commit_ts`).
     ///
-    /// For MVCC-aware reads, use `get_at()` or `TxnService::get()`.
-    fn get(&self, key: &[u8]) -> Result<Option<RawValue>>;
-
-    /// Point lookup at specific timestamp (MVCC-aware).
+    /// The transaction layer is responsible for:
+    /// - MVCC filtering (finding latest version with ts <= read_ts)
+    /// - Tombstone handling (treating tombstones as deleted)
+    /// - Deduplication (returning only the latest visible version per key)
     ///
-    /// Returns the value visible at the given timestamp, i.e., the latest
-    /// version with `commit_ts <= ts`.
+    /// # Arguments
     ///
-    /// This is called internally by `TxnService::get()`.
-    fn get_at(&self, key: &[u8], ts: Timestamp) -> Result<Option<RawValue>>;
+    /// * `range` - MVCC key range to scan. Use `MvccKey::encode(key, ts)` to build bounds.
+    fn scan(&self, range: Range<MvccKey>) -> Result<Vec<(MvccKey, RawValue)>>;
 
     /// Apply a batch of writes atomically.
+    ///
+    /// The batch contains user keys (not MVCC keys). The storage layer encodes
+    /// MVCC keys internally using the batch's `commit_ts`.
     ///
     /// # Requirements
     ///
@@ -246,26 +260,6 @@ pub trait StorageEngine: Send + Sync + 'static {
     ///
     /// Returns an error if `commit_ts` is not set.
     fn write_batch(&self, batch: WriteBatch) -> Result<()>;
-
-    /// Range scan - returns latest versions of all keys in range.
-    ///
-    /// Returns the most recently committed version of each key.
-    /// Primarily used for recovery operations and testing.
-    ///
-    /// For MVCC-aware scans, use `scan_at()` or `TxnService::scan()`.
-    fn scan(&self, range: &Range<Key>) -> Result<Box<dyn Iterator<Item = (Key, RawValue)> + '_>>;
-
-    /// Range scan at specific timestamp (MVCC-aware).
-    ///
-    /// Returns key-value pairs visible at the given timestamp. For each key,
-    /// returns the latest version with `commit_ts <= ts`.
-    ///
-    /// This is called internally by `TxnService::scan()`.
-    fn scan_at(
-        &self,
-        range: &Range<Key>,
-        ts: Timestamp,
-    ) -> Result<Box<dyn Iterator<Item = (Key, RawValue)> + '_>>;
 }
 
 // ============================================================================

@@ -165,6 +165,8 @@ impl Version {
     }
 
     /// Find overlapping SSTs at a specific level.
+    ///
+    /// Uses key-based overlap check (extracts key portion from MVCC keys).
     pub fn find_overlapping_at_level(
         &self,
         level: usize,
@@ -177,6 +179,28 @@ impl Version {
                 level_ssts
                     .iter()
                     .filter(|sst| sst.overlaps(start, end))
+                    .cloned()
+                    .collect()
+            })
+            .unwrap_or_default()
+    }
+
+    /// Find overlapping SSTs at a specific level using MVCC key ranges.
+    ///
+    /// Compares MVCC keys directly without extracting key portions.
+    /// Each MVCC key is treated as an independent key in the storage engine.
+    pub fn find_overlapping_at_level_mvcc(
+        &self,
+        level: usize,
+        start: &[u8],
+        end: &[u8],
+    ) -> Vec<Arc<SstMeta>> {
+        self.levels
+            .get(level)
+            .map(|level_ssts| {
+                level_ssts
+                    .iter()
+                    .filter(|sst| sst.overlaps_mvcc(start, end))
                     .cloned()
                     .collect()
             })

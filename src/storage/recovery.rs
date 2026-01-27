@@ -329,8 +329,35 @@ struct ReplayResult {
 mod tests {
     use super::*;
     use crate::clog::{ClogBatch, ClogService};
+    use crate::storage::mvcc::{is_tombstone, MvccKey};
     use crate::storage::StorageEngine;
+    use crate::types::RawValue;
     use tempfile::TempDir;
+
+    fn get_at_for_test(engine: &LsmEngine, key: &[u8], ts: Timestamp) -> Option<RawValue> {
+        let start = MvccKey::encode(key, ts);
+        let end = MvccKey::encode(key, 0)
+            .next_key()
+            .unwrap_or_else(MvccKey::unbounded);
+        let range = start..end;
+
+        let results = engine.scan(range).unwrap();
+
+        for (mvcc_key, value) in results {
+            let (decoded_key, entry_ts) = mvcc_key.decode();
+            if decoded_key == key && entry_ts <= ts {
+                if is_tombstone(&value) {
+                    return None;
+                }
+                return Some(value);
+            }
+        }
+        None
+    }
+
+    fn get_for_test(engine: &LsmEngine, key: &[u8]) -> Option<RawValue> {
+        get_at_for_test(engine, key, Timestamp::MAX)
+    }
 
     fn write_test_data(
         engine: &LsmEngine,
@@ -416,7 +443,7 @@ mod tests {
             // Data should be readable from SST (not replayed from clog)
             for (key, expected_value) in &written {
                 assert_eq!(
-                    result.engine.get(key).unwrap(),
+                    get_for_test(&result.engine, key),
                     Some(expected_value.clone()),
                     "Key {:?} should be readable after recovery",
                     String::from_utf8_lossy(key)
@@ -473,7 +500,7 @@ mod tests {
             // Data should be recovered from clog replay
             for (key, expected_value) in &written {
                 assert_eq!(
-                    result.engine.get(key).unwrap(),
+                    get_for_test(&result.engine, key),
                     Some(expected_value.clone()),
                     "Key {:?} should be recovered from clog",
                     String::from_utf8_lossy(key)
@@ -522,14 +549,14 @@ mod tests {
 
             // Uncommitted data should be discarded
             assert_eq!(
-                result.engine.get(b"uncommitted_key").unwrap(),
+                get_for_test(&result.engine, b"uncommitted_key"),
                 None,
                 "Uncommitted data should be discarded"
             );
 
             // Committed data should be recovered
             assert_eq!(
-                result.engine.get(b"committed_key").unwrap(),
+                get_for_test(&result.engine, b"committed_key"),
                 Some(b"committed_value".to_vec()),
                 "Committed data should be recovered"
             );
@@ -602,7 +629,7 @@ mod tests {
             // Flushed data should be readable from SST
             for (key, expected_value) in &flushed {
                 assert_eq!(
-                    result.engine.get(key).unwrap(),
+                    get_for_test(&result.engine, key),
                     Some(expected_value.clone()),
                     "Flushed key {:?} should be readable",
                     String::from_utf8_lossy(key)
@@ -612,7 +639,7 @@ mod tests {
             // Unflushed data should be recovered from clog
             for (key, expected_value) in &unflushed {
                 assert_eq!(
-                    result.engine.get(key).unwrap(),
+                    get_for_test(&result.engine, key),
                     Some(expected_value.clone()),
                     "Unflushed key {:?} should be recovered",
                     String::from_utf8_lossy(key)
@@ -703,7 +730,7 @@ mod tests {
                 let key = format!("key_{:04}", i).into_bytes();
                 let expected_value = format!("value_{:04}", i).into_bytes();
                 assert_eq!(
-                    result.engine.get(&key).unwrap(),
+                    get_for_test(&result.engine, &key),
                     Some(expected_value),
                     "Key should be recovered"
                 );

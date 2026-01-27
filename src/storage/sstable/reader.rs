@@ -288,10 +288,10 @@ mod tests {
     use tempfile::tempdir;
 
     // Helper to create MVCC key
-    fn mvcc_key(user_key: &[u8], ts: u64) -> Vec<u8> {
-        let mut key = user_key.to_vec();
-        key.extend_from_slice(&(!ts).to_be_bytes());
-        key
+    fn mvcc_key(key_bytes: &[u8], ts: u64) -> Vec<u8> {
+        let mut result = key_bytes.to_vec();
+        result.extend_from_slice(&(!ts).to_be_bytes());
+        result
     }
 
     // Helper to create an SST file with test data

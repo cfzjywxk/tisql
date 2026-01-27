@@ -19,7 +19,7 @@
 //!
 //! ## Key Encoding
 //!
-//! MVCC keys are encoded as: `user_key || !commit_ts` (descending order)
+//! MVCC keys are encoded as: `key || !commit_ts` (descending order)
 //!
 //! The bitwise NOT of commit_ts ensures that:
 //! - Keys are sorted in descending timestamp order
@@ -41,66 +41,16 @@ use std::ops::Range;
 
 use super::arena_skiplist::ArenaSkipList;
 use crate::error::{Result, TiSqlError};
+use crate::storage::mvcc::{
+    decode_mvcc_key, encode_mvcc_key, increment_bytes, is_tombstone, MvccKey, TOMBSTONE,
+};
 use crate::storage::{StorageEngine, WriteBatch, WriteOp};
 use crate::types::{Key, RawValue, Timestamp};
 use crate::util::arena::PageArena;
 
-/// Tombstone marker for deleted keys.
-///
-/// We use a byte sequence that starts with NUL bytes (uncommon in user data)
-/// followed by a magic string and a version byte, making collision extremely unlikely.
-/// The probability of collision is ~2^-120 for random 16-byte values.
-const TOMBSTONE: &[u8] = b"\x00\x00\x00\x00TISQL_TOMBSTONE\x01";
-
-/// Encode MVCC key: user_key || !commit_ts (8 bytes, big-endian)
-///
-/// The bitwise NOT ensures descending order: higher timestamps come first.
-fn encode_mvcc_key(user_key: &[u8], ts: Timestamp) -> Key {
-    let mut mvcc_key = Vec::with_capacity(user_key.len() + 8);
-    mvcc_key.extend_from_slice(user_key);
-    // Bitwise NOT for descending order
-    mvcc_key.extend_from_slice(&(!ts).to_be_bytes());
-    mvcc_key
-}
-
-/// Decode MVCC key to (user_key, commit_ts).
-fn decode_mvcc_key(mvcc_key: &[u8]) -> Option<(Key, Timestamp)> {
-    if mvcc_key.len() < 8 {
-        return None;
-    }
-    let user_key = mvcc_key[..mvcc_key.len() - 8].to_vec();
-    let ts_bytes: [u8; 8] = mvcc_key[mvcc_key.len() - 8..].try_into().ok()?;
-    // Reverse the bitwise NOT
-    let ts = !u64::from_be_bytes(ts_bytes);
-    Some((user_key, ts))
-}
-
-/// Check if a value is a tombstone.
-fn is_tombstone(value: &[u8]) -> bool {
-    value == TOMBSTONE
-}
-
-/// Increment byte array by 1 (for range end bound).
-fn increment_bytes(bytes: &mut Vec<u8>) {
-    if bytes.is_empty() {
-        bytes.push(0);
-        return;
-    }
-
-    for i in (0..bytes.len()).rev() {
-        if bytes[i] < 255 {
-            bytes[i] += 1;
-            return;
-        }
-        bytes[i] = 0;
-    }
-    // All bytes were 255, add a new byte
-    bytes.insert(0, 1);
-}
-
 /// MVCC-aware memtable engine using arena-based skip list.
 ///
-/// This engine stores multiple versions of each key, keyed by `user_key || !commit_ts`.
+/// This engine stores multiple versions of each key, keyed by MVCC key (`key || !commit_ts`).
 /// Reads automatically find the latest visible version.
 ///
 /// # Memory Model
@@ -216,27 +166,27 @@ impl ArenaMemTableEngine {
 
     /// Get the latest version of a key visible at the given timestamp.
     ///
-    /// This scans from `user_key || !ts` to find the first version
+    /// This scans from `key || !ts` to find the first version
     /// with commit_ts <= ts.
-    fn get_at_internal(&self, user_key: &[u8], ts: Timestamp) -> Result<Option<RawValue>> {
-        // Build scan key: user_key || !ts
-        // Due to !ts encoding, this will find the first key >= user_key with ts' <= ts
-        let start = encode_mvcc_key(user_key, ts);
+    fn get_at_internal(&self, key: &[u8], ts: Timestamp) -> Result<Option<RawValue>> {
+        // Build scan key: key || !ts
+        // Due to !ts encoding, this will find the first entry >= key with ts' <= ts
+        let start = encode_mvcc_key(key, ts);
 
-        // We need to find keys that start with user_key
-        let mut end_key = user_key.to_vec();
+        // We need to find keys that start with our key
+        let mut end_key = key.to_vec();
         increment_bytes(&mut end_key);
 
         // Use iter_from to start at the right position
         for (mvcc_key, value) in self.list().iter_from(&start) {
-            // Check if we've gone past our user_key prefix
+            // Check if we've gone past our key prefix
             if mvcc_key >= &end_key {
                 break;
             }
 
-            if let Some((key, _entry_ts)) = decode_mvcc_key(mvcc_key) {
-                // Verify this is still our key (prefix match)
-                if key == user_key {
+            if let Some((decoded_key, _entry_ts)) = decode_mvcc_key(mvcc_key) {
+                // Verify this is still our key (exact match)
+                if decoded_key == key {
                     if is_tombstone(value) {
                         return Ok(None);
                     }
@@ -252,8 +202,8 @@ impl ArenaMemTableEngine {
     ///
     /// This method is exposed for benchmarking and testing. Production code
     /// should use `write_batch()` instead.
-    pub fn put_at(&self, user_key: &[u8], value: &[u8], ts: Timestamp) {
-        let mvcc_key = encode_mvcc_key(user_key, ts);
+    pub fn put_at(&self, key: &[u8], value: &[u8], ts: Timestamp) {
+        let mvcc_key = encode_mvcc_key(key, ts);
         // ArenaSkipList::insert returns Some if key exists, None if inserted
         // For MVCC, each key is unique (includes timestamp), so this should always insert
         let _ = self.list().insert(mvcc_key, value.to_vec());
@@ -263,8 +213,8 @@ impl ArenaMemTableEngine {
     ///
     /// This method is exposed for benchmarking and testing. Production code
     /// should use `write_batch()` instead.
-    pub fn delete_at(&self, user_key: &[u8], ts: Timestamp) {
-        let mvcc_key = encode_mvcc_key(user_key, ts);
+    pub fn delete_at(&self, key: &[u8], ts: Timestamp) {
+        let mvcc_key = encode_mvcc_key(key, ts);
         let _ = self.list().insert(mvcc_key, TOMBSTONE.to_vec());
     }
 
@@ -313,15 +263,52 @@ impl Drop for ArenaMemTableEngine {
     }
 }
 
-impl StorageEngine for ArenaMemTableEngine {
-    fn get(&self, key: &[u8]) -> Result<Option<RawValue>> {
-        // Get at latest timestamp (Timestamp::MAX means get the latest version)
-        self.get_at(key, Timestamp::MAX)
-    }
+impl ArenaMemTableEngine {
+    /// Scan all entries in range, returning MVCC keys.
+    ///
+    /// Returns ALL versions of each key (not just the latest), including tombstones.
+    /// This is critical for correct MVCC semantics in the SST layer.
+    ///
+    /// # Arguments
+    /// * `range` - MVCC key range to scan. Use `MvccKey::unbounded()` for unbounded.
+    pub fn scan_mvcc(&self, range: Range<MvccKey>) -> Result<Vec<(MvccKey, RawValue)>> {
+        let mut results = Vec::new();
 
-    fn get_at(&self, key: &[u8], ts: Timestamp) -> Result<Option<RawValue>> {
-        // Find latest version <= ts
-        self.get_at_internal(key, ts)
+        // Handle truly unbounded range
+        let is_unbounded = range.start.is_unbounded() && range.end.is_unbounded();
+
+        if is_unbounded {
+            // Iterate entire skiplist without artificial bounds
+            for (mvcc_key, value) in self.list().iter() {
+                // Safety: keys in skiplist are valid MVCC keys
+                let mvcc = MvccKey::from_bytes_unchecked(mvcc_key.clone());
+                results.push((mvcc, value.clone()));
+            }
+        } else {
+            // For bounded range, iterate from start and check bounds
+            let start_bytes: Vec<u8> = range.start.into();
+            let end_bytes: Vec<u8> = range.end.into();
+
+            for (mvcc_key, value) in self.list().iter_from(&start_bytes) {
+                // Check if past end of range
+                if !end_bytes.is_empty() && mvcc_key >= &end_bytes {
+                    break;
+                }
+
+                // Include ALL versions (no deduplication) and ALL values including tombstones
+                // Safety: keys in skiplist are valid MVCC keys
+                let mvcc = MvccKey::from_bytes_unchecked(mvcc_key.clone());
+                results.push((mvcc, value.clone()));
+            }
+        }
+
+        Ok(results)
+    }
+}
+
+impl StorageEngine for ArenaMemTableEngine {
+    fn scan(&self, range: Range<MvccKey>) -> Result<Vec<(MvccKey, RawValue)>> {
+        self.scan_mvcc(range)
     }
 
     fn write_batch(&self, batch: WriteBatch) -> Result<()> {
@@ -343,65 +330,6 @@ impl StorageEngine for ArenaMemTableEngine {
 
         Ok(())
     }
-
-    fn scan(&self, range: &Range<Key>) -> Result<Box<dyn Iterator<Item = (Key, RawValue)> + '_>> {
-        // Default scan uses MAX timestamp (latest visible version)
-        self.scan_at(range, Timestamp::MAX)
-    }
-
-    fn scan_at(
-        &self,
-        range: &Range<Key>,
-        ts: Timestamp,
-    ) -> Result<Box<dyn Iterator<Item = (Key, RawValue)> + '_>> {
-        // Scan MVCC keys and deduplicate by user_key
-        //
-        // MVCC key encoding: user_key || !commit_ts
-        // Due to !commit_ts, higher timestamps produce SMALLER encoded keys.
-        //
-        // To find all versions within the user key range:
-        // - start: use Timestamp::MAX to get the SMALLEST mvcc key for range.start
-        // - end: use Timestamp::MAX to get the SMALLEST mvcc key for range.end
-        //   (since range.end is exclusive, we stop right at the first version of range.end)
-        //
-        // Then filter by entry_ts <= ts during iteration for visibility.
-        let start_mvcc = encode_mvcc_key(&range.start, Timestamp::MAX);
-        let end_mvcc = encode_mvcc_key(&range.end, Timestamp::MAX);
-
-        let mut results = Vec::new();
-        let mut last_user_key: Option<Key> = None;
-
-        for (mvcc_key, value) in self.list().iter_from(&start_mvcc) {
-            // Stop when we reach the end bound
-            if mvcc_key >= &end_mvcc {
-                break;
-            }
-
-            if let Some((user_key, entry_ts)) = decode_mvcc_key(mvcc_key) {
-                // Check if within user range
-                if user_key < range.start || user_key >= range.end {
-                    continue;
-                }
-
-                // Skip if we already have this key (we want the latest visible version)
-                if let Some(ref last) = last_user_key {
-                    if &user_key == last {
-                        continue;
-                    }
-                }
-
-                // Check if this version is visible at the given timestamp
-                if entry_ts <= ts {
-                    if !is_tombstone(value) {
-                        results.push((user_key.clone(), value.clone()));
-                    }
-                    last_user_key = Some(user_key);
-                }
-            }
-        }
-
-        Ok(Box::new(results.into_iter()))
-    }
 }
 
 /// Memory usage statistics for the arena memtable.
@@ -417,20 +345,93 @@ pub struct MemoryStats {
 #[allow(clippy::uninlined_format_args)]
 mod tests {
     use super::*;
+    use crate::storage::mvcc::MvccKey;
+    use crate::storage::StorageEngine;
+    use std::ops::Range;
 
     fn new_engine() -> ArenaMemTableEngine {
         ArenaMemTableEngine::new()
     }
 
+    // ==================== Test Helpers Using MvccKey ====================
+
+    fn get_at_for_test(
+        engine: &ArenaMemTableEngine,
+        key: &[u8],
+        ts: Timestamp,
+    ) -> Option<RawValue> {
+        let start = MvccKey::encode(key, ts);
+        let end = MvccKey::encode(key, 0)
+            .next_key()
+            .unwrap_or_else(MvccKey::unbounded);
+        let range = start..end;
+
+        let results = engine.scan(range).unwrap();
+
+        for (mvcc_key, value) in results {
+            let (decoded_key, entry_ts) = mvcc_key.decode();
+            if decoded_key == key && entry_ts <= ts {
+                if is_tombstone(&value) {
+                    return None;
+                }
+                return Some(value);
+            }
+        }
+        None
+    }
+
+    fn get_for_test(engine: &ArenaMemTableEngine, key: &[u8]) -> Option<RawValue> {
+        get_at_for_test(engine, key, Timestamp::MAX)
+    }
+
+    fn scan_for_test(engine: &ArenaMemTableEngine, range: &Range<Key>) -> Vec<(Key, RawValue)> {
+        scan_at_for_test(engine, range, Timestamp::MAX)
+    }
+
+    fn scan_at_for_test(
+        engine: &ArenaMemTableEngine,
+        range: &Range<Key>,
+        ts: Timestamp,
+    ) -> Vec<(Key, RawValue)> {
+        let start = MvccKey::encode(&range.start, ts);
+        let end = MvccKey::encode(&range.end, ts);
+        let mvcc_range = start..end;
+
+        let results = engine.scan(mvcc_range).unwrap();
+
+        let mut seen_keys: std::collections::HashSet<Key> = std::collections::HashSet::new();
+        let mut output = Vec::new();
+
+        for (mvcc_key, value) in results {
+            let (decoded_key, entry_ts) = mvcc_key.decode();
+            if decoded_key < range.start || decoded_key >= range.end {
+                continue;
+            }
+            if entry_ts > ts {
+                continue;
+            }
+            if seen_keys.contains(&decoded_key) {
+                continue;
+            }
+            seen_keys.insert(decoded_key.clone());
+            if !is_tombstone(&value) {
+                output.push((decoded_key, value));
+            }
+        }
+
+        output.sort_by(|a, b| a.0.cmp(&b.0));
+        output
+    }
+
     #[test]
     fn test_encode_decode_mvcc_key() {
-        let user_key = b"test_key";
+        let key = b"test_key";
         let ts: Timestamp = 12345;
 
-        let mvcc_key = encode_mvcc_key(user_key, ts);
+        let mvcc_key = encode_mvcc_key(key, ts);
         let (decoded_key, decoded_ts) = decode_mvcc_key(&mvcc_key).unwrap();
 
-        assert_eq!(decoded_key, user_key.to_vec());
+        assert_eq!(decoded_key, key.to_vec());
         assert_eq!(decoded_ts, ts);
     }
 
@@ -452,7 +453,7 @@ mod tests {
 
         // Use put_at with explicit timestamp
         engine.put_at(b"key1", b"value1", 1);
-        let value = engine.get(b"key1").unwrap();
+        let value = get_for_test(&engine, b"key1");
 
         assert_eq!(value, Some(b"value1".to_vec()));
     }
@@ -461,7 +462,7 @@ mod tests {
     fn test_get_nonexistent() {
         let engine = new_engine();
 
-        let value = engine.get(b"nonexistent").unwrap();
+        let value = get_for_test(&engine, b"nonexistent");
         assert_eq!(value, None);
     }
 
@@ -472,7 +473,7 @@ mod tests {
         engine.put_at(b"key1", b"value1", 1);
         engine.delete_at(b"key1", 2);
 
-        let value = engine.get(b"key1").unwrap();
+        let value = get_for_test(&engine, b"key1");
         assert_eq!(value, None);
     }
 
@@ -490,23 +491,23 @@ mod tests {
         engine.put_at(b"key", b"v3", 30);
 
         // Read at ts=10 should see v1
-        let v = engine.get_at(b"key", 10).unwrap();
+        let v = get_at_for_test(&engine, b"key", 10);
         assert_eq!(v, Some(b"v1".to_vec()));
 
         // Read at ts=20 should see v2
-        let v = engine.get_at(b"key", 20).unwrap();
+        let v = get_at_for_test(&engine, b"key", 20);
         assert_eq!(v, Some(b"v2".to_vec()));
 
         // Read at ts=30 should see v3
-        let v = engine.get_at(b"key", 30).unwrap();
+        let v = get_at_for_test(&engine, b"key", 30);
         assert_eq!(v, Some(b"v3".to_vec()));
 
         // Read at latest should see v3
-        let v = engine.get_at(b"key", Timestamp::MAX).unwrap();
+        let v = get_at_for_test(&engine, b"key", Timestamp::MAX);
         assert_eq!(v, Some(b"v3".to_vec()));
 
         // Read at ts before any write should see nothing
-        let v = engine.get_at(b"key", 5).unwrap();
+        let v = get_at_for_test(&engine, b"key", 5);
         assert_eq!(v, None);
     }
 
@@ -521,19 +522,19 @@ mod tests {
         engine.delete_at(b"key", 20);
 
         // Read at ts=10 should see value
-        let v = engine.get_at(b"key", 10).unwrap();
+        let v = get_at_for_test(&engine, b"key", 10);
         assert_eq!(v, Some(b"value".to_vec()));
 
         // Read at ts=15 should still see value
-        let v = engine.get_at(b"key", 15).unwrap();
+        let v = get_at_for_test(&engine, b"key", 15);
         assert_eq!(v, Some(b"value".to_vec()));
 
         // Read at ts=20 should see nothing (deleted)
-        let v = engine.get_at(b"key", 20).unwrap();
+        let v = get_at_for_test(&engine, b"key", 20);
         assert_eq!(v, None);
 
         // Read at latest should see nothing
-        let v = engine.get_at(b"key", Timestamp::MAX).unwrap();
+        let v = get_at_for_test(&engine, b"key", Timestamp::MAX);
         assert_eq!(v, None);
     }
 
@@ -563,16 +564,16 @@ mod tests {
         engine.write_batch(batch).unwrap();
 
         // All keys should be visible at latest
-        assert_eq!(engine.get(b"k1").unwrap(), Some(b"v1".to_vec()));
-        assert_eq!(engine.get(b"k2").unwrap(), Some(b"v2".to_vec()));
-        assert_eq!(engine.get(b"k3").unwrap(), Some(b"v3".to_vec()));
+        assert_eq!(get_for_test(&engine, b"k1"), Some(b"v1".to_vec()));
+        assert_eq!(get_for_test(&engine, b"k2"), Some(b"v2".to_vec()));
+        assert_eq!(get_for_test(&engine, b"k3"), Some(b"v3".to_vec()));
 
         // Should be visible at ts >= 100
-        let v = engine.get_at(b"k1", 100).unwrap();
+        let v = get_at_for_test(&engine, b"k1", 100);
         assert_eq!(v, Some(b"v1".to_vec()));
 
         // Should not be visible at ts < 100
-        let v = engine.get_at(b"k1", 99).unwrap();
+        let v = get_at_for_test(&engine, b"k1", 99);
         assert_eq!(v, None);
     }
 
@@ -585,10 +586,8 @@ mod tests {
         engine.put_at(b"c", b"3", 1);
         engine.put_at(b"d", b"4", 1);
 
-        let results: Vec<_> = engine
-            .scan(&(b"b".to_vec()..b"d".to_vec()))
-            .unwrap()
-            .collect();
+        let range = b"b".to_vec()..b"d".to_vec();
+        let results = scan_for_test(&engine, &range);
 
         assert_eq!(results.len(), 2);
         let keys: Vec<_> = results.iter().map(|(k, _)| k.clone()).collect();
@@ -622,19 +621,19 @@ mod tests {
 
         // scan_at with ts=30 should see all data
         let range = b"a".to_vec()..b"d".to_vec();
-        let results: Vec<_> = engine.scan_at(&range, 30).unwrap().collect();
+        let results: Vec<_> = scan_at_for_test(&engine, &range, 30);
         assert_eq!(results.len(), 3, "scan_at ts=30 should see 3 keys");
 
         // scan_at with ts=20 should see a and b only
-        let results: Vec<_> = engine.scan_at(&range, 20).unwrap().collect();
+        let results: Vec<_> = scan_at_for_test(&engine, &range, 20);
         assert_eq!(results.len(), 2, "scan_at ts=20 should see 2 keys");
 
         // scan_at with ts=10 should see a only
-        let results: Vec<_> = engine.scan_at(&range, 10).unwrap().collect();
+        let results: Vec<_> = scan_at_for_test(&engine, &range, 10);
         assert_eq!(results.len(), 1, "scan_at ts=10 should see 1 key");
 
         // scan_at with ts=5 should see nothing
-        let results: Vec<_> = engine.scan_at(&range, 5).unwrap().collect();
+        let results: Vec<_> = scan_at_for_test(&engine, &range, 5);
         assert_eq!(results.len(), 0, "scan_at ts=5 should see 0 keys");
     }
 
@@ -650,12 +649,12 @@ mod tests {
 
         // scan_at ts=15 should see v1
         let range = b"key".to_vec()..b"kez".to_vec();
-        let results: Vec<_> = engine.scan_at(&range, 15).unwrap().collect();
+        let results: Vec<_> = scan_at_for_test(&engine, &range, 15);
         assert_eq!(results.len(), 1);
         assert_eq!(results[0].1, b"v1".to_vec());
 
         // scan_at ts=25 should see v2 (latest)
-        let results: Vec<_> = engine.scan_at(&range, 25).unwrap().collect();
+        let results: Vec<_> = scan_at_for_test(&engine, &range, 25);
         assert_eq!(results.len(), 1);
         assert_eq!(results[0].1, b"v2".to_vec());
     }
@@ -674,11 +673,11 @@ mod tests {
 
         // scan_at ts=15 should see all 3 keys
         let range = b"a".to_vec()..b"d".to_vec();
-        let results: Vec<_> = engine.scan_at(&range, 15).unwrap().collect();
+        let results = scan_at_for_test(&engine, &range, 15);
         assert_eq!(results.len(), 3, "ts=15 should see 3 keys (before delete)");
 
         // scan_at ts=25 should see only a and c
-        let results: Vec<_> = engine.scan_at(&range, 25).unwrap().collect();
+        let results = scan_at_for_test(&engine, &range, 25);
         assert_eq!(results.len(), 2, "ts=25 should see 2 keys (b deleted)");
         let keys: Vec<_> = results.iter().map(|(k, _)| k.clone()).collect();
         assert!(keys.contains(&b"a".to_vec()));
@@ -694,11 +693,11 @@ mod tests {
         engine.put_at(b"key", b"future_value", 100);
 
         // Reader reading at ts=50 should NOT see the write
-        let value = engine.get_at(b"key", 50).unwrap();
+        let value = get_at_for_test(&engine, b"key", 50);
         assert_eq!(value, None, "Should not see future writes");
 
         // Reader reading at ts=100 SHOULD see the write
-        let value = engine.get_at(b"key", 100).unwrap();
+        let value = get_at_for_test(&engine, b"key", 100);
         assert_eq!(value, Some(b"future_value".to_vec()));
     }
 
@@ -714,16 +713,16 @@ mod tests {
         engine.put_at(b"key", b"v4", 50);
 
         // Test visibility at various timestamps
-        assert_eq!(engine.get_at(b"key", 5).unwrap(), None);
-        assert_eq!(engine.get_at(b"key", 10).unwrap(), Some(b"v1".to_vec()));
-        assert_eq!(engine.get_at(b"key", 15).unwrap(), Some(b"v1".to_vec()));
-        assert_eq!(engine.get_at(b"key", 20).unwrap(), Some(b"v2".to_vec()));
-        assert_eq!(engine.get_at(b"key", 25).unwrap(), Some(b"v2".to_vec()));
-        assert_eq!(engine.get_at(b"key", 30).unwrap(), Some(b"v3".to_vec()));
-        assert_eq!(engine.get_at(b"key", 35).unwrap(), Some(b"v3".to_vec()));
-        assert_eq!(engine.get_at(b"key", 40).unwrap(), None); // deleted
-        assert_eq!(engine.get_at(b"key", 45).unwrap(), None); // still deleted
-        assert_eq!(engine.get_at(b"key", 50).unwrap(), Some(b"v4".to_vec())); // rewritten
+        assert_eq!(get_at_for_test(&engine, b"key", 5), None);
+        assert_eq!(get_at_for_test(&engine, b"key", 10), Some(b"v1".to_vec()));
+        assert_eq!(get_at_for_test(&engine, b"key", 15), Some(b"v1".to_vec()));
+        assert_eq!(get_at_for_test(&engine, b"key", 20), Some(b"v2".to_vec()));
+        assert_eq!(get_at_for_test(&engine, b"key", 25), Some(b"v2".to_vec()));
+        assert_eq!(get_at_for_test(&engine, b"key", 30), Some(b"v3".to_vec()));
+        assert_eq!(get_at_for_test(&engine, b"key", 35), Some(b"v3".to_vec()));
+        assert_eq!(get_at_for_test(&engine, b"key", 40), None); // deleted
+        assert_eq!(get_at_for_test(&engine, b"key", 45), None); // still deleted
+        assert_eq!(get_at_for_test(&engine, b"key", 50), Some(b"v4".to_vec())); // rewritten
     }
 
     #[test]
@@ -776,7 +775,7 @@ mod tests {
             for i in 0..writes_per_thread {
                 let key = format!("key_{}_{}", tid, i);
                 assert!(
-                    engine.get(key.as_bytes()).unwrap().is_some(),
+                    get_for_test(&engine, key.as_bytes()).is_some(),
                     "Missing key {}",
                     key
                 );
@@ -827,7 +826,7 @@ mod tests {
                     for i in 0..ops_per_thread {
                         let key = format!("key{:04}", i % 1000);
                         // Read at timestamp 1 should always see "initial"
-                        let value = engine.get_at(key.as_bytes(), 1).unwrap();
+                        let value = get_at_for_test(&engine, key.as_bytes(), 1);
                         assert_eq!(value, Some(b"initial".to_vec()));
                     }
                 });
@@ -858,7 +857,7 @@ mod tests {
 
                     let range = b"key000".to_vec()..b"key100".to_vec();
                     for _ in 0..scans_per_thread {
-                        let results: Vec<_> = engine.scan(&range).unwrap().collect();
+                        let results = scan_for_test(engine, &range);
                         assert_eq!(results.len(), 100);
                     }
                 });
@@ -892,7 +891,7 @@ mod tests {
                             }
                             2 => {
                                 // Read
-                                let _ = engine.get(key.as_bytes());
+                                let _ = get_for_test(engine, key.as_bytes());
                             }
                             _ => {
                                 // Delete
@@ -905,10 +904,8 @@ mod tests {
         });
 
         // Verify the engine is in a valid state by scanning
-        let results: Vec<_> = engine
-            .scan(&(b"stress".to_vec()..b"strest".to_vec()))
-            .unwrap()
-            .collect();
+        let range = b"stress".to_vec()..b"strest".to_vec();
+        let results = scan_for_test(&engine, &range);
         println!("Stress test: {} entries remaining", results.len());
     }
 }

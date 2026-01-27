@@ -24,14 +24,70 @@ use std::sync::Arc;
 use tempfile::TempDir;
 
 use tisql::new_lsn_provider;
+use tisql::storage::mvcc::{is_tombstone, MvccKey};
 use tisql::storage::WriteBatch;
 use tisql::testkit::{
     CompactionExecutor, CompactionPicker, CompactionTask, IlogConfig, IlogService,
     LsmConfigBuilder, LsmEngine, ManifestDelta, SstBuilder, SstBuilderOptions, SstMeta,
     SstReaderRef, Version,
 };
-use tisql::types::Timestamp;
+use tisql::types::{Key, RawValue, Timestamp};
 use tisql::StorageEngine;
+
+// ==================== Test Helpers Using MvccKey ====================
+
+fn get_at_for_test(engine: &LsmEngine, key: &[u8], ts: Timestamp) -> Option<RawValue> {
+    let start = MvccKey::encode(key, ts);
+    let end = MvccKey::encode(key, 0)
+        .next_key()
+        .unwrap_or_else(MvccKey::unbounded);
+    let range = start..end;
+
+    let results = engine.scan(range).unwrap();
+
+    for (mvcc_key, value) in results {
+        let (decoded_key, entry_ts) = mvcc_key.decode();
+        if decoded_key == key && entry_ts <= ts {
+            if is_tombstone(&value) {
+                return None;
+            }
+            return Some(value);
+        }
+    }
+    None
+}
+
+fn get_for_test(engine: &LsmEngine, key: &[u8]) -> Option<RawValue> {
+    get_at_for_test(engine, key, Timestamp::MAX)
+}
+
+fn scan_for_test(engine: &LsmEngine, range: &std::ops::Range<Key>) -> Vec<(Key, RawValue)> {
+    let start = MvccKey::encode(&range.start, Timestamp::MAX);
+    let end = MvccKey::encode(&range.end, 0);
+    let mvcc_range = start..end;
+
+    let results = engine.scan(mvcc_range).unwrap();
+
+    let mut seen_keys: std::collections::HashSet<Key> = std::collections::HashSet::new();
+    let mut output = Vec::new();
+
+    for (mvcc_key, value) in results {
+        let (decoded_key, _entry_ts) = mvcc_key.decode();
+        if decoded_key < range.start || decoded_key >= range.end {
+            continue;
+        }
+        if seen_keys.contains(&decoded_key) {
+            continue;
+        }
+        seen_keys.insert(decoded_key.clone());
+        if !is_tombstone(&value) {
+            output.push((decoded_key, value));
+        }
+    }
+
+    output.sort_by(|a, b| a.0.cmp(&b.0));
+    output
+}
 
 // ============================================================================
 // HELPER FUNCTIONS
@@ -446,7 +502,7 @@ fn test_flush_and_compaction_e2e() {
     // Verify latest values
     for i in 0..10 {
         let key = format!("key_{:03}", i);
-        let value = engine.get(key.as_bytes()).unwrap();
+        let value = get_for_test(&engine, key.as_bytes());
         assert_eq!(
             value,
             Some(b"batch_4".to_vec()),
@@ -455,7 +511,7 @@ fn test_flush_and_compaction_e2e() {
     }
 
     // Verify historical values
-    let value_at_15 = engine.get_at(b"key_000", 15).unwrap();
+    let value_at_15 = get_at_for_test(&engine, b"key_000", 15);
     assert_eq!(
         value_at_15,
         Some(b"batch_1".to_vec()),
@@ -498,7 +554,7 @@ fn test_interleaved_writes_flushes() {
     // Verify all keys exist with latest values
     for round in 0..10 {
         let key = format!("inter_key_{}", round);
-        let value = engine.get(key.as_bytes()).unwrap();
+        let value = get_for_test(&engine, key.as_bytes());
         assert!(
             value.is_some(),
             "Key {} should exist after interleaved operations",
@@ -530,7 +586,7 @@ fn test_scan_across_memtable_and_sst() {
 
     // Scan should merge both sources
     let range = b"a".to_vec()..b"g".to_vec();
-    let results: Vec<_> = engine.scan(&range).unwrap().collect();
+    let results = scan_for_test(&engine, &range);
 
     assert_eq!(results.len(), 6, "Should have 6 keys total");
 
@@ -577,26 +633,26 @@ fn test_memtable_shadows_sst() {
 
     // key1 should return updated value (memtable shadows SST)
     assert_eq!(
-        engine.get(b"key1").unwrap(),
+        get_for_test(&engine, b"key1"),
         Some(b"updated".to_vec()),
         "Memtable value should shadow SST"
     );
 
     // key2 should return original value (still in SST)
     assert_eq!(
-        engine.get(b"key2").unwrap(),
+        get_for_test(&engine, b"key2"),
         Some(b"original".to_vec()),
         "Unchanged key should return SST value"
     );
 
     // Historical read should return correct versions
     assert_eq!(
-        engine.get_at(b"key1", 15).unwrap(),
+        get_at_for_test(&engine, b"key1", 15),
         Some(b"original".to_vec()),
         "Historical read at ts=15 should return original"
     );
     assert_eq!(
-        engine.get_at(b"key1", 25).unwrap(),
+        get_at_for_test(&engine, b"key1", 25),
         Some(b"updated".to_vec()),
         "Historical read at ts=25 should return updated"
     );
@@ -626,21 +682,21 @@ fn test_delete_shadows_sst() {
 
     // Get should return None (deleted)
     assert_eq!(
-        engine.get(b"to_delete").unwrap(),
+        get_for_test(&engine, b"to_delete"),
         None,
         "Deleted key should return None"
     );
 
     // Historical read should work
     assert_eq!(
-        engine.get_at(b"to_delete", 15).unwrap(),
+        get_at_for_test(&engine, b"to_delete", 15),
         Some(b"exists".to_vec()),
         "Historical read before delete should return value"
     );
 
     // Scan should exclude deleted key
     let range = b"t".to_vec()..b"u".to_vec();
-    let results: Vec<_> = engine.scan(&range).unwrap().collect();
+    let results = scan_for_test(&engine, &range);
     assert!(results.is_empty(), "Scan should exclude deleted keys");
 }
 

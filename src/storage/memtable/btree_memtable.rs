@@ -25,7 +25,7 @@
 //!
 //! ## Key Encoding
 //!
-//! MVCC keys are encoded as: `user_key || !commit_ts` (descending order)
+//! MVCC keys are encoded as: `key || !commit_ts` (descending order)
 //!
 //! The bitwise NOT of commit_ts ensures that:
 //! - Keys are sorted in descending timestamp order
@@ -37,52 +37,11 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::RwLock;
 
 use crate::error::{Result, TiSqlError};
+use crate::storage::mvcc::{
+    decode_mvcc_key, encode_mvcc_key, increment_bytes, is_tombstone, MvccKey, TOMBSTONE,
+};
 use crate::storage::{StorageEngine, WriteBatch, WriteOp};
 use crate::types::{Key, RawValue, Timestamp};
-
-/// Tombstone marker for deleted keys.
-const TOMBSTONE: &[u8] = b"\x00\x00\x00\x00TISQL_TOMBSTONE\x01";
-
-/// Encode MVCC key: user_key || !commit_ts (8 bytes, big-endian)
-fn encode_mvcc_key(user_key: &[u8], ts: Timestamp) -> Key {
-    let mut mvcc_key = Vec::with_capacity(user_key.len() + 8);
-    mvcc_key.extend_from_slice(user_key);
-    mvcc_key.extend_from_slice(&(!ts).to_be_bytes());
-    mvcc_key
-}
-
-/// Decode MVCC key to (user_key, commit_ts).
-fn decode_mvcc_key(mvcc_key: &[u8]) -> Option<(Key, Timestamp)> {
-    if mvcc_key.len() < 8 {
-        return None;
-    }
-    let user_key = mvcc_key[..mvcc_key.len() - 8].to_vec();
-    let ts_bytes: [u8; 8] = mvcc_key[mvcc_key.len() - 8..].try_into().ok()?;
-    let ts = !u64::from_be_bytes(ts_bytes);
-    Some((user_key, ts))
-}
-
-/// Check if a value is a tombstone.
-fn is_tombstone(value: &[u8]) -> bool {
-    value == TOMBSTONE
-}
-
-/// Increment byte array by 1 (for range end bound).
-fn increment_bytes(bytes: &mut Vec<u8>) {
-    if bytes.is_empty() {
-        bytes.push(0);
-        return;
-    }
-
-    for i in (0..bytes.len()).rev() {
-        if bytes[i] < 255 {
-            bytes[i] += 1;
-            return;
-        }
-        bytes[i] = 0;
-    }
-    bytes.insert(0, 1);
-}
 
 /// MVCC-aware memtable engine using BTreeMap with RwLock.
 ///
@@ -105,9 +64,9 @@ impl BTreeMemTableEngine {
     }
 
     /// Get the latest version of a key visible at the given timestamp.
-    fn get_at_internal(&self, user_key: &[u8], ts: Timestamp) -> Result<Option<RawValue>> {
-        let start = encode_mvcc_key(user_key, ts);
-        let mut end_key = user_key.to_vec();
+    fn get_at_internal(&self, key: &[u8], ts: Timestamp) -> Result<Option<RawValue>> {
+        let start = encode_mvcc_key(key, ts);
+        let mut end_key = key.to_vec();
         increment_bytes(&mut end_key);
 
         let map = self.map.read().unwrap();
@@ -117,8 +76,8 @@ impl BTreeMemTableEngine {
                 break;
             }
 
-            if let Some((key, _entry_ts)) = decode_mvcc_key(mvcc_key) {
-                if key == user_key {
+            if let Some((decoded_key, _entry_ts)) = decode_mvcc_key(mvcc_key) {
+                if decoded_key == key {
                     if is_tombstone(value) {
                         return Ok(None);
                     }
@@ -131,16 +90,16 @@ impl BTreeMemTableEngine {
     }
 
     /// Write a key-value pair at the given timestamp.
-    pub fn put_at(&self, user_key: &[u8], value: &[u8], ts: Timestamp) {
-        let mvcc_key = encode_mvcc_key(user_key, ts);
+    pub fn put_at(&self, key: &[u8], value: &[u8], ts: Timestamp) {
+        let mvcc_key = encode_mvcc_key(key, ts);
         let mut map = self.map.write().unwrap();
         map.insert(mvcc_key, value.to_vec());
         self.entry_count.fetch_add(1, Ordering::Relaxed);
     }
 
     /// Write a tombstone (delete marker) at the given timestamp.
-    pub fn delete_at(&self, user_key: &[u8], ts: Timestamp) {
-        let mvcc_key = encode_mvcc_key(user_key, ts);
+    pub fn delete_at(&self, key: &[u8], ts: Timestamp) {
+        let mvcc_key = encode_mvcc_key(key, ts);
         let mut map = self.map.write().unwrap();
         map.insert(mvcc_key, TOMBSTONE.to_vec());
         self.entry_count.fetch_add(1, Ordering::Relaxed);
@@ -163,13 +122,49 @@ impl Default for BTreeMemTableEngine {
     }
 }
 
-impl StorageEngine for BTreeMemTableEngine {
-    fn get(&self, key: &[u8]) -> Result<Option<RawValue>> {
-        self.get_at(key, Timestamp::MAX)
-    }
+impl BTreeMemTableEngine {
+    /// Scan all entries in range, returning MVCC keys.
+    ///
+    /// Returns ALL versions of each key (not just the latest), including tombstones.
+    ///
+    /// # Arguments
+    /// * `range` - MVCC key range to scan. Use `MvccKey::unbounded()` for unbounded.
+    pub fn scan_mvcc(&self, range: Range<MvccKey>) -> Result<Vec<(MvccKey, RawValue)>> {
+        let map = self.map.read().unwrap();
+        let mut results = Vec::new();
 
-    fn get_at(&self, key: &[u8], ts: Timestamp) -> Result<Option<RawValue>> {
-        self.get_at_internal(key, ts)
+        // Handle truly unbounded range
+        let is_unbounded = range.start.is_unbounded() && range.end.is_unbounded();
+
+        if is_unbounded {
+            for (mvcc_key, value) in map.iter() {
+                // Safety: keys in map are valid MVCC keys
+                let mvcc = MvccKey::from_bytes_unchecked(mvcc_key.clone());
+                results.push((mvcc, value.clone()));
+            }
+        } else {
+            let start_bytes: Vec<u8> = range.start.into();
+            let end_bytes: Vec<u8> = range.end.into();
+
+            for (mvcc_key, value) in map.range(start_bytes.clone()..) {
+                // Check if past end of range
+                if !end_bytes.is_empty() && mvcc_key >= &end_bytes {
+                    break;
+                }
+
+                // Safety: keys in map are valid MVCC keys
+                let mvcc = MvccKey::from_bytes_unchecked(mvcc_key.clone());
+                results.push((mvcc, value.clone()));
+            }
+        }
+
+        Ok(results)
+    }
+}
+
+impl StorageEngine for BTreeMemTableEngine {
+    fn scan(&self, range: Range<MvccKey>) -> Result<Vec<(MvccKey, RawValue)>> {
+        self.scan_mvcc(range)
     }
 
     fn write_batch(&self, batch: WriteBatch) -> Result<()> {
@@ -190,58 +185,77 @@ impl StorageEngine for BTreeMemTableEngine {
 
         Ok(())
     }
-
-    fn scan(&self, range: &Range<Key>) -> Result<Box<dyn Iterator<Item = (Key, RawValue)> + '_>> {
-        self.scan_at(range, Timestamp::MAX)
-    }
-
-    fn scan_at(
-        &self,
-        range: &Range<Key>,
-        ts: Timestamp,
-    ) -> Result<Box<dyn Iterator<Item = (Key, RawValue)> + '_>> {
-        let start_mvcc = encode_mvcc_key(&range.start, Timestamp::MAX);
-        let end_mvcc = encode_mvcc_key(&range.end, Timestamp::MAX);
-
-        let map = self.map.read().unwrap();
-
-        let mut results = Vec::new();
-        let mut last_user_key: Option<Key> = None;
-
-        for (mvcc_key, value) in map.range(start_mvcc..end_mvcc) {
-            if let Some((user_key, entry_ts)) = decode_mvcc_key(mvcc_key) {
-                if user_key < range.start || user_key >= range.end {
-                    continue;
-                }
-
-                if let Some(ref last) = last_user_key {
-                    if &user_key == last {
-                        continue;
-                    }
-                }
-
-                if entry_ts <= ts {
-                    if !is_tombstone(value) {
-                        results.push((user_key.clone(), value.clone()));
-                    }
-                    last_user_key = Some(user_key);
-                }
-            }
-        }
-
-        Ok(Box::new(results.into_iter()))
-    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::ops::Range;
+
+    // ==================== Test Helpers Using MvccKey ====================
+
+    fn get_at_for_test(
+        engine: &BTreeMemTableEngine,
+        key: &[u8],
+        ts: Timestamp,
+    ) -> Option<RawValue> {
+        let start = MvccKey::encode(key, ts);
+        let end = MvccKey::encode(key, 0)
+            .next_key()
+            .unwrap_or_else(|| MvccKey::unbounded());
+        let range = start..end;
+
+        let results = engine.scan_mvcc(range).unwrap();
+
+        for (mvcc_key, value) in results {
+            let (decoded_key, entry_ts) = mvcc_key.decode();
+            if decoded_key == key && entry_ts <= ts {
+                if is_tombstone(&value) {
+                    return None;
+                }
+                return Some(value);
+            }
+        }
+        None
+    }
+
+    fn get_for_test(engine: &BTreeMemTableEngine, key: &[u8]) -> Option<RawValue> {
+        get_at_for_test(engine, key, Timestamp::MAX)
+    }
+
+    fn scan_for_test(engine: &BTreeMemTableEngine, range: &Range<Key>) -> Vec<(Key, RawValue)> {
+        let start = MvccKey::encode(&range.start, Timestamp::MAX);
+        let end = MvccKey::encode(&range.end, 0);
+        let mvcc_range = start..end;
+
+        let results = engine.scan_mvcc(mvcc_range).unwrap();
+
+        let mut seen_keys: std::collections::HashSet<Key> = std::collections::HashSet::new();
+        let mut output = Vec::new();
+
+        for (mvcc_key, value) in results {
+            let (decoded_key, _entry_ts) = mvcc_key.decode();
+            if decoded_key < range.start || decoded_key >= range.end {
+                continue;
+            }
+            if seen_keys.contains(&decoded_key) {
+                continue;
+            }
+            seen_keys.insert(decoded_key.clone());
+            if !is_tombstone(&value) {
+                output.push((decoded_key, value));
+            }
+        }
+
+        output.sort_by(|a, b| a.0.cmp(&b.0));
+        output
+    }
 
     #[test]
     fn test_basic_put_get() {
         let engine = BTreeMemTableEngine::new();
         engine.put_at(b"key1", b"value1", 1);
-        let value = engine.get(b"key1").unwrap();
+        let value = get_for_test(&engine, b"key1");
         assert_eq!(value, Some(b"value1".to_vec()));
     }
 
@@ -253,10 +267,10 @@ mod tests {
         engine.put_at(b"key", b"v2", 20);
         engine.put_at(b"key", b"v3", 30);
 
-        assert_eq!(engine.get_at(b"key", 10).unwrap(), Some(b"v1".to_vec()));
-        assert_eq!(engine.get_at(b"key", 20).unwrap(), Some(b"v2".to_vec()));
-        assert_eq!(engine.get_at(b"key", 30).unwrap(), Some(b"v3".to_vec()));
-        assert_eq!(engine.get_at(b"key", 5).unwrap(), None);
+        assert_eq!(get_at_for_test(&engine, b"key", 10), Some(b"v1".to_vec()));
+        assert_eq!(get_at_for_test(&engine, b"key", 20), Some(b"v2".to_vec()));
+        assert_eq!(get_at_for_test(&engine, b"key", 30), Some(b"v3".to_vec()));
+        assert_eq!(get_at_for_test(&engine, b"key", 5), None);
     }
 
     #[test]
@@ -266,8 +280,11 @@ mod tests {
         engine.put_at(b"key", b"value", 10);
         engine.delete_at(b"key", 20);
 
-        assert_eq!(engine.get_at(b"key", 10).unwrap(), Some(b"value".to_vec()));
-        assert_eq!(engine.get_at(b"key", 20).unwrap(), None);
+        assert_eq!(
+            get_at_for_test(&engine, b"key", 10),
+            Some(b"value".to_vec())
+        );
+        assert_eq!(get_at_for_test(&engine, b"key", 20), None);
     }
 
     #[test]
@@ -278,10 +295,7 @@ mod tests {
         engine.put_at(b"b", b"2", 1);
         engine.put_at(b"c", b"3", 1);
 
-        let results: Vec<_> = engine
-            .scan(&(b"a".to_vec()..b"c".to_vec()))
-            .unwrap()
-            .collect();
+        let results = scan_for_test(&engine, &(b"a".to_vec()..b"c".to_vec()));
         assert_eq!(results.len(), 2);
     }
 
@@ -316,7 +330,7 @@ mod tests {
         for tid in 0..num_threads {
             for i in 0..writes_per_thread {
                 let key = format!("key_{tid}_{i}");
-                assert!(engine.get(key.as_bytes()).unwrap().is_some());
+                assert!(get_for_test(&engine, key.as_bytes()).is_some());
             }
         }
     }
@@ -360,7 +374,7 @@ mod tests {
 
                     for i in 0..ops_per_thread {
                         let key = format!("key{:04}", i % 1000);
-                        let value = engine.get_at(key.as_bytes(), 1).unwrap();
+                        let value = get_at_for_test(engine, key.as_bytes(), 1);
                         assert_eq!(value, Some(b"initial".to_vec()));
                     }
                 });

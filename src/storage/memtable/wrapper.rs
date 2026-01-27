@@ -37,8 +37,9 @@ use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::time::Instant;
 
 use crate::error::Result;
+use crate::storage::mvcc::MvccKey;
 use crate::storage::{StorageEngine, WriteBatch};
-use crate::types::{Key, RawValue, Timestamp};
+use crate::types::RawValue;
 
 use super::CrossbeamMemTableEngine;
 
@@ -259,12 +260,8 @@ fn estimate_batch_size(batch: &WriteBatch) -> usize {
 
 // Implement StorageEngine for MemTable to allow transparent use
 impl StorageEngine for MemTable {
-    fn get(&self, key: &[u8]) -> Result<Option<RawValue>> {
-        self.inner.get(key)
-    }
-
-    fn get_at(&self, key: &[u8], ts: Timestamp) -> Result<Option<RawValue>> {
-        self.inner.get_at(key, ts)
+    fn scan(&self, range: Range<MvccKey>) -> Result<Vec<(MvccKey, RawValue)>> {
+        self.inner.scan(range)
     }
 
     fn write_batch(&self, batch: WriteBatch) -> Result<()> {
@@ -286,28 +283,74 @@ impl StorageEngine for MemTable {
 
         Ok(())
     }
-
-    fn scan(&self, range: &Range<Key>) -> Result<Box<dyn Iterator<Item = (Key, RawValue)> + '_>> {
-        self.inner.scan(range)
-    }
-
-    fn scan_at(
-        &self,
-        range: &Range<Key>,
-        ts: Timestamp,
-    ) -> Result<Box<dyn Iterator<Item = (Key, RawValue)> + '_>> {
-        self.inner.scan_at(range, ts)
-    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::storage::mvcc::{encode_mvcc_key, is_tombstone};
+    use crate::types::{Key, Timestamp};
 
     fn new_batch(commit_ts: Timestamp) -> WriteBatch {
         let mut batch = WriteBatch::new();
         batch.set_commit_ts(commit_ts);
         batch
+    }
+
+    // ==================== Test Helpers Using MvccKey ====================
+
+    /// Get the latest version of a key visible at the given timestamp.
+    fn get_at_for_test(mt: &MemTable, key: &[u8], ts: Timestamp) -> Option<RawValue> {
+        let start = MvccKey::encode(key, ts);
+        let end = MvccKey::encode(key, 0)
+            .next_key()
+            .unwrap_or_else(|| MvccKey::unbounded());
+        let range = start..end;
+
+        let results = mt.scan(range).unwrap();
+
+        for (mvcc_key, value) in results {
+            let (decoded_key, entry_ts) = mvcc_key.decode();
+            if decoded_key == key && entry_ts <= ts {
+                if is_tombstone(&value) {
+                    return None;
+                }
+                return Some(value);
+            }
+        }
+        None
+    }
+
+    fn get_for_test(mt: &MemTable, key: &[u8]) -> Option<RawValue> {
+        get_at_for_test(mt, key, Timestamp::MAX)
+    }
+
+    fn scan_for_test(mt: &MemTable, range: &Range<Key>) -> Vec<(Key, RawValue)> {
+        let start = MvccKey::encode(&range.start, Timestamp::MAX);
+        let end = MvccKey::encode(&range.end, 0);
+        let mvcc_range = start..end;
+
+        let results = mt.scan(mvcc_range).unwrap();
+
+        let mut seen_keys: std::collections::HashSet<Key> = std::collections::HashSet::new();
+        let mut output = Vec::new();
+
+        for (mvcc_key, value) in results {
+            let (decoded_key, _entry_ts) = mvcc_key.decode();
+            if decoded_key < range.start || decoded_key >= range.end {
+                continue;
+            }
+            if seen_keys.contains(&decoded_key) {
+                continue;
+            }
+            seen_keys.insert(decoded_key.clone());
+            if !is_tombstone(&value) {
+                output.push((decoded_key, value));
+            }
+        }
+
+        output.sort_by(|a, b| a.0.cmp(&b.0));
+        output
     }
 
     #[test]
@@ -331,8 +374,8 @@ mod tests {
 
         mt.write_batch_with_lsn(batch, 1).unwrap();
 
-        assert_eq!(mt.get(b"key1").unwrap(), Some(b"value1".to_vec()));
-        assert_eq!(mt.get(b"key2").unwrap(), Some(b"value2".to_vec()));
+        assert_eq!(get_for_test(&mt, b"key1"), Some(b"value1".to_vec()));
+        assert_eq!(get_for_test(&mt, b"key2"), Some(b"value2".to_vec()));
         assert!(mt.approximate_size() > 0);
         assert_eq!(mt.len(), 2);
     }
@@ -379,7 +422,7 @@ mod tests {
         assert!(mt.is_frozen());
 
         // Reads should still work
-        assert_eq!(mt.get(b"key1").unwrap(), Some(b"value1".to_vec()));
+        assert_eq!(get_for_test(&mt, b"key1"), Some(b"value1".to_vec()));
 
         // Writes should fail
         let mut batch = new_batch(101);
@@ -398,7 +441,7 @@ mod tests {
         // Use the StorageEngine trait method
         mt.write_batch(batch).unwrap();
 
-        assert_eq!(mt.get(b"key").unwrap(), Some(b"value".to_vec()));
+        assert_eq!(get_for_test(&mt, b"key"), Some(b"value".to_vec()));
         assert!(mt.approximate_size() > 0);
     }
 
@@ -417,11 +460,11 @@ mod tests {
         mt.write_batch_with_lsn(batch, 2).unwrap();
 
         // Read at different timestamps
-        assert_eq!(mt.get_at(b"key", 5).unwrap(), None);
-        assert_eq!(mt.get_at(b"key", 10).unwrap(), Some(b"v1".to_vec()));
-        assert_eq!(mt.get_at(b"key", 15).unwrap(), Some(b"v1".to_vec()));
-        assert_eq!(mt.get_at(b"key", 20).unwrap(), Some(b"v2".to_vec()));
-        assert_eq!(mt.get_at(b"key", 25).unwrap(), Some(b"v2".to_vec()));
+        assert_eq!(get_at_for_test(&mt, b"key", 5), None);
+        assert_eq!(get_at_for_test(&mt, b"key", 10), Some(b"v1".to_vec()));
+        assert_eq!(get_at_for_test(&mt, b"key", 15), Some(b"v1".to_vec()));
+        assert_eq!(get_at_for_test(&mt, b"key", 20), Some(b"v2".to_vec()));
+        assert_eq!(get_at_for_test(&mt, b"key", 25), Some(b"v2".to_vec()));
     }
 
     #[test]
@@ -436,7 +479,7 @@ mod tests {
         mt.write_batch_with_lsn(batch, 1).unwrap();
 
         let range = b"b".to_vec()..b"d".to_vec();
-        let results: Vec<_> = mt.scan(&range).unwrap().collect();
+        let results = scan_for_test(&mt, &range);
 
         assert_eq!(results.len(), 2);
     }
@@ -473,7 +516,7 @@ mod tests {
         batch.put(b"key".to_vec(), b"value".to_vec());
         mt.write_batch_with_lsn(batch, 1).unwrap();
 
-        assert_eq!(mt.get(b"key").unwrap(), Some(b"value".to_vec()));
+        assert_eq!(get_for_test(&mt, b"key"), Some(b"value".to_vec()));
 
         // Delete the key
         let mut batch = new_batch(20);
@@ -481,10 +524,10 @@ mod tests {
         mt.write_batch_with_lsn(batch, 2).unwrap();
 
         // Should be deleted at latest
-        assert_eq!(mt.get(b"key").unwrap(), None);
+        assert_eq!(get_for_test(&mt, b"key"), None);
 
         // Should still be visible at ts=15
-        assert_eq!(mt.get_at(b"key", 15).unwrap(), Some(b"value".to_vec()));
+        assert_eq!(get_at_for_test(&mt, b"key", 15), Some(b"value".to_vec()));
     }
 
     // ==================== Concurrent Tests ====================
@@ -559,7 +602,7 @@ mod tests {
 
                     for i in 0..1000 {
                         let key = format!("key{:03}", i % 100);
-                        let _ = mt.get(key.as_bytes());
+                        let _ = get_for_test(&mt, key.as_bytes());
                     }
                 })
             })

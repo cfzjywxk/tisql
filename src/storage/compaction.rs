@@ -48,23 +48,11 @@ use std::sync::Arc;
 use fail::fail_point;
 
 use crate::error::Result;
-use crate::types::{Key, RawValue};
+use crate::types::RawValue;
 
 use super::config::LsmConfig;
 use super::sstable::{SstBuilder, SstBuilderOptions, SstIterator, SstMeta, SstReaderRef};
 use super::version::{ManifestDelta, Version};
-
-/// Extract user key from MVCC key by removing the timestamp suffix.
-///
-/// MVCC keys are encoded as: user_key || !commit_ts (8 bytes)
-/// Returns the original key if it's too short to be an MVCC key.
-fn extract_user_key(mvcc_key: &[u8]) -> &[u8] {
-    if mvcc_key.len() >= 8 {
-        &mvcc_key[..mvcc_key.len() - 8]
-    } else {
-        mvcc_key
-    }
-}
 
 /// A compaction task describing which files to compact.
 #[derive(Debug, Clone)]
@@ -122,16 +110,13 @@ impl CompactionPicker {
         // Collect all L0 files
         let mut inputs: Vec<(u32, u64)> = l0_files.iter().map(|sst| (0, sst.id)).collect();
 
-        // Find key range covered by L0 files (returns MVCC keys)
+        // Find MVCC key range covered by L0 files
         let (min_mvcc_key, max_mvcc_key) = self.get_key_range(l0_files)?;
 
-        // Extract user keys from MVCC keys for overlap check.
-        // SST metadata stores MVCC keys but overlaps() expects user keys.
-        let min_user_key = extract_user_key(&min_mvcc_key);
-        let max_user_key = extract_user_key(&max_mvcc_key);
-
-        // Find overlapping L1 files (pass user keys, not MVCC keys)
-        let l1_overlapping = version.find_overlapping_at_level(1, min_user_key, max_user_key);
+        // Find overlapping L1 files using MVCC key ranges directly.
+        // Each MVCC key is an independent key in the storage engine.
+        let l1_overlapping =
+            version.find_overlapping_at_level_mvcc(1, &min_mvcc_key, &max_mvcc_key);
         for sst in l1_overlapping {
             inputs.push((1, sst.id));
         }
@@ -155,16 +140,15 @@ impl CompactionPicker {
 
         let mut inputs = vec![(level as u32, target.id)];
 
-        // Find overlapping files at next level
+        // Find overlapping files at next level using MVCC key ranges directly.
+        // Each MVCC key is an independent key in the storage engine.
         let next_level = level + 1;
         if next_level < self.config.max_levels {
-            // Extract user keys from MVCC keys for overlap check.
-            // SST metadata stores MVCC keys but overlaps() expects user keys.
-            let smallest_user_key = extract_user_key(&target.smallest_key);
-            let largest_user_key = extract_user_key(&target.largest_key);
-
-            let overlapping =
-                version.find_overlapping_at_level(next_level, smallest_user_key, largest_user_key);
+            let overlapping = version.find_overlapping_at_level_mvcc(
+                next_level,
+                &target.smallest_key,
+                &target.largest_key,
+            );
 
             // Check for trivial move (no overlap with next level)
             if overlapping.is_empty() {
@@ -188,7 +172,7 @@ impl CompactionPicker {
     }
 
     /// Get the key range covered by a set of SST files.
-    fn get_key_range(&self, files: &[Arc<SstMeta>]) -> Option<(Key, Key)> {
+    fn get_key_range(&self, files: &[Arc<SstMeta>]) -> Option<(Vec<u8>, Vec<u8>)> {
         if files.is_empty() {
             return None;
         }
@@ -203,7 +187,7 @@ impl CompactionPicker {
 
 /// Entry in the merge iterator priority queue.
 struct MergeEntry {
-    key: Key,
+    key: Vec<u8>,
     value: RawValue,
     /// Source index (for tie-breaking: lower index = newer)
     source_idx: usize,
@@ -236,8 +220,9 @@ impl PartialOrd for MergeEntry {
 
 /// Merge iterator that combines multiple SST iterators.
 ///
-/// For MVCC keys (user_key || !ts), it outputs all versions in order.
-/// The caller is responsible for filtering based on GC safe point.
+/// Outputs all MVCC keys in sorted order. Each MVCC key (key || !ts) is
+/// treated as an independent key. The caller is responsible for filtering
+/// based on GC safe point if needed.
 pub struct MergeIterator {
     /// Source iterators
     iters: Vec<SstIterator>,
@@ -246,7 +231,7 @@ pub struct MergeIterator {
     heap: BinaryHeap<MergeEntry>,
 
     /// Last key output (for deduplication if needed)
-    last_key: Option<Key>,
+    last_key: Option<Vec<u8>>,
 }
 
 impl MergeIterator {
@@ -288,7 +273,7 @@ impl MergeIterator {
     }
 
     /// Get the current key-value pair.
-    pub fn current(&self) -> Option<(Key, RawValue)> {
+    pub fn current(&self) -> Option<(Vec<u8>, RawValue)> {
         self.heap.peek().map(|e| (e.key.clone(), e.value.clone()))
     }
 
@@ -314,11 +299,16 @@ impl MergeIterator {
         Ok(())
     }
 
-    /// Skip entries with the same user key as the last output.
+    /// Skip entries that share the same key prefix as the last output.
     ///
-    /// Useful when you only want the latest version of each key.
-    pub fn skip_to_next_user_key(&mut self) -> Result<()> {
-        let last_user_key = match &self.last_key {
+    /// For MVCC keys (key || !ts), this skips all versions of the same key.
+    /// Useful for GC when you only want to keep the latest version.
+    ///
+    /// Note: This method extracts the key portion (removes timestamp suffix)
+    /// to compare key prefixes.
+    #[allow(dead_code)]
+    pub fn skip_to_next_key(&mut self) -> Result<()> {
+        let last_key_prefix = match &self.last_key {
             Some(k) if k.len() >= 8 => k[..k.len() - 8].to_vec(),
             _ => return Ok(()),
         };
@@ -326,8 +316,8 @@ impl MergeIterator {
         loop {
             let should_skip = match self.heap.peek() {
                 Some(entry) if entry.key.len() >= 8 => {
-                    let user_key = &entry.key[..entry.key.len() - 8];
-                    user_key == last_user_key.as_slice()
+                    let key_prefix = &entry.key[..entry.key.len() - 8];
+                    key_prefix == last_key_prefix.as_slice()
                 }
                 _ => false,
             };
