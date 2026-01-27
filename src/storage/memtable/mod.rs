@@ -26,6 +26,7 @@ pub mod arena_memtable;
 pub mod arena_skiplist;
 pub mod btree_memtable;
 pub mod crossbeam_memtable;
+pub mod wrapper;
 
 // Re-export memtable engines
 pub use arena_memtable::ArenaMemTableEngine;
@@ -36,3 +37,6 @@ pub use crossbeam_memtable::MemoryStats;
 
 // Default memtable engine alias
 pub use crossbeam_memtable::CrossbeamMemTableEngine as MemTableEngine;
+
+// LSM MemTable wrapper with metadata
+pub use wrapper::MemTable;

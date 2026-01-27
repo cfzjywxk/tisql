@@ -56,8 +56,10 @@
 //! Keys are encoded using TiDB-compatible format via the codec module.
 //! The storage layer is agnostic to key structure - it just stores bytes.
 
+pub mod config;
 pub mod memtable;
 pub mod sstable;
+pub mod version;
 
 // ============================================================================
 // Storage Implementation
@@ -77,6 +79,20 @@ pub use memtable::BTreeMemTableEngine;
 
 // Re-export CrossbeamMemTableEngine for comparison/benchmarking
 pub use memtable::CrossbeamMemTableEngine;
+
+// Re-export LSM MemTable wrapper
+pub use memtable::MemTable;
+
+// Re-export LSM configuration
+pub use config::{LsmConfig, LsmConfigBuilder};
+pub use config::{
+    DEFAULT_BLOCK_SIZE as LSM_DEFAULT_BLOCK_SIZE, DEFAULT_L0_COMPACTION_TRIGGER,
+    DEFAULT_L1_MAX_SIZE, DEFAULT_LEVEL_SIZE_MULTIPLIER, DEFAULT_MAX_FROZEN_MEMTABLES,
+    DEFAULT_MEMTABLE_SIZE, DEFAULT_TARGET_FILE_SIZE,
+};
+
+// Re-export version management
+pub use version::{ManifestDelta, Version, VersionBuilder, MAX_LEVELS};
 
 // Re-export SST types for persistent storage
 pub use sstable::{
