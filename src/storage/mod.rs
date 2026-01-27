@@ -57,6 +57,7 @@
 //! The storage layer is agnostic to key structure - it just stores bytes.
 
 pub mod config;
+pub mod lsm;
 pub mod memtable;
 pub mod sstable;
 pub mod version;
@@ -93,6 +94,9 @@ pub use config::{
 
 // Re-export version management
 pub use version::{ManifestDelta, Version, VersionBuilder, MAX_LEVELS};
+
+// Re-export LSM engine
+pub use lsm::{LsmEngine, LsmStats};
 
 // Re-export SST types for persistent storage
 pub use sstable::{
