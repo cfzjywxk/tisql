@@ -228,6 +228,18 @@ impl MemTable {
     pub fn inner(&self) -> &CrossbeamMemTableEngine {
         &self.inner
     }
+
+    /// Get a key at a specific timestamp with tombstone awareness.
+    ///
+    /// Returns `GetResult::FoundTombstone` if the key was deleted, which signals
+    /// that callers should NOT continue searching older levels.
+    pub fn get_at_with_tombstone(
+        &self,
+        key: &[u8],
+        ts: crate::types::Timestamp,
+    ) -> crate::error::Result<super::GetResult> {
+        self.inner.get_at_with_tombstone(key, ts)
+    }
 }
 
 /// Estimate the memory size of a write batch.

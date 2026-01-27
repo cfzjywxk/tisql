@@ -54,6 +54,18 @@ use super::config::LsmConfig;
 use super::sstable::{SstBuilder, SstBuilderOptions, SstIterator, SstMeta, SstReaderRef};
 use super::version::{ManifestDelta, Version};
 
+/// Extract user key from MVCC key by removing the timestamp suffix.
+///
+/// MVCC keys are encoded as: user_key || !commit_ts (8 bytes)
+/// Returns the original key if it's too short to be an MVCC key.
+fn extract_user_key(mvcc_key: &[u8]) -> &[u8] {
+    if mvcc_key.len() >= 8 {
+        &mvcc_key[..mvcc_key.len() - 8]
+    } else {
+        mvcc_key
+    }
+}
+
 /// A compaction task describing which files to compact.
 #[derive(Debug, Clone)]
 pub struct CompactionTask {
@@ -110,11 +122,16 @@ impl CompactionPicker {
         // Collect all L0 files
         let mut inputs: Vec<(u32, u64)> = l0_files.iter().map(|sst| (0, sst.id)).collect();
 
-        // Find key range covered by L0 files
-        let (min_key, max_key) = self.get_key_range(l0_files)?;
+        // Find key range covered by L0 files (returns MVCC keys)
+        let (min_mvcc_key, max_mvcc_key) = self.get_key_range(l0_files)?;
 
-        // Find overlapping L1 files
-        let l1_overlapping = version.find_overlapping_at_level(1, &min_key, &max_key);
+        // Extract user keys from MVCC keys for overlap check.
+        // SST metadata stores MVCC keys but overlaps() expects user keys.
+        let min_user_key = extract_user_key(&min_mvcc_key);
+        let max_user_key = extract_user_key(&max_mvcc_key);
+
+        // Find overlapping L1 files (pass user keys, not MVCC keys)
+        let l1_overlapping = version.find_overlapping_at_level(1, min_user_key, max_user_key);
         for sst in l1_overlapping {
             inputs.push((1, sst.id));
         }
@@ -141,11 +158,13 @@ impl CompactionPicker {
         // Find overlapping files at next level
         let next_level = level + 1;
         if next_level < self.config.max_levels {
-            let overlapping = version.find_overlapping_at_level(
-                next_level,
-                &target.smallest_key,
-                &target.largest_key,
-            );
+            // Extract user keys from MVCC keys for overlap check.
+            // SST metadata stores MVCC keys but overlaps() expects user keys.
+            let smallest_user_key = extract_user_key(&target.smallest_key);
+            let largest_user_key = extract_user_key(&target.largest_key);
+
+            let overlapping =
+                version.find_overlapping_at_level(next_level, smallest_user_key, largest_user_key);
 
             // Check for trivial move (no overlap with next level)
             if overlapping.is_empty() {

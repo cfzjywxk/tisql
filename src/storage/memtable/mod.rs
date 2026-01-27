@@ -35,6 +35,36 @@ pub use btree_memtable::BTreeMemTableEngine;
 pub use crossbeam_memtable::CrossbeamMemTableEngine;
 pub use crossbeam_memtable::MemoryStats;
 
+/// Result of a point lookup that distinguishes between "not found" and "tombstone found".
+///
+/// This tri-state is critical for correct MVCC behavior: when a tombstone is found
+/// in a memtable, we must NOT continue searching older levels (SSTs), as that would
+/// incorrectly "resurrect" deleted keys.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum GetResult {
+    /// Key found with a value.
+    Found(Vec<u8>),
+    /// Key found but it's a tombstone (delete marker).
+    FoundTombstone,
+    /// Key not found at this level.
+    NotFound,
+}
+
+impl GetResult {
+    /// Convert to Option, treating both NotFound and FoundTombstone as None.
+    pub fn into_option(self) -> Option<Vec<u8>> {
+        match self {
+            GetResult::Found(v) => Some(v),
+            GetResult::FoundTombstone | GetResult::NotFound => None,
+        }
+    }
+
+    /// Check if this result indicates the key was found (value or tombstone).
+    pub fn is_found(&self) -> bool {
+        matches!(self, GetResult::Found(_) | GetResult::FoundTombstone)
+    }
+}
+
 // Default memtable engine alias
 pub use crossbeam_memtable::CrossbeamMemTableEngine as MemTableEngine;
 

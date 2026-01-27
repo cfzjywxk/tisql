@@ -57,8 +57,10 @@ struct TxnReplayState {
     writes: Vec<(Vec<u8>, Option<Vec<u8>>)>, // (key, value) - None means delete
     /// Commit timestamp (if committed)
     commit_ts: Option<Timestamp>,
-    /// Max LSN of this transaction's writes
+    /// Max LSN of this transaction's writes (including commit record)
     max_lsn: Lsn,
+    /// LSN of the commit record (for proper clog_lsn threading)
+    commit_lsn: Option<Lsn>,
 }
 
 /// Result of LSM recovery.
@@ -259,6 +261,10 @@ impl LsmRecovery {
                 ClogOp::Commit { commit_ts } => {
                     if let Some(state) = txn_states.get_mut(&entry.txn_id) {
                         state.commit_ts = Some(*commit_ts);
+                        // Track commit record LSN - this is critical for correct flushed_lsn tracking
+                        state.commit_lsn = Some(entry.lsn);
+                        // Include commit record LSN in max_lsn
+                        state.max_lsn = state.max_lsn.max(entry.lsn);
                     }
                 }
                 ClogOp::Rollback => {
@@ -268,32 +274,43 @@ impl LsmRecovery {
             }
         }
 
-        // Apply committed transactions
-        for (txn_id, state) in txn_states {
-            if let Some(commit_ts) = state.commit_ts {
-                if !state.writes.is_empty() {
-                    let mut batch = WriteBatch::new();
-                    batch.set_commit_ts(commit_ts);
+        // Collect committed transactions and sort by max_lsn to ensure
+        // memtable age ordering matches LSN ordering during replay.
+        // This is critical for correct flushed_lsn tracking after recovery.
+        let mut committed_txns: Vec<(TxnId, TxnReplayState)> = txn_states
+            .into_iter()
+            .filter(|(_, state)| state.commit_ts.is_some() && !state.writes.is_empty())
+            .collect();
 
-                    for (key, value) in state.writes {
-                        match value {
-                            Some(v) => batch.put(key, v),
-                            None => batch.delete(key),
-                        }
-                    }
+        // Sort by max_lsn (ascending) so older transactions are applied first
+        committed_txns.sort_by_key(|(_, state)| state.max_lsn);
 
-                    engine.write_batch(batch)?;
-                    result.txn_count += 1;
+        // Apply committed transactions in LSN order
+        for (_txn_id, state) in committed_txns {
+            let commit_ts = state.commit_ts.unwrap(); // Safe: filtered above
+            let mut batch = WriteBatch::new();
+            batch.set_commit_ts(commit_ts);
+
+            // Critical: Set clog_lsn so that flush correctly tracks flushed_lsn.
+            // Use the commit record's LSN as it's the final LSN for this transaction.
+            // Fall back to max_lsn if commit_lsn not tracked (shouldn't happen).
+            let clog_lsn = state.commit_lsn.unwrap_or(state.max_lsn);
+            batch.set_clog_lsn(clog_lsn);
+
+            for (key, value) in state.writes {
+                match value {
+                    Some(v) => batch.put(key, v),
+                    None => batch.delete(key),
                 }
-            } else {
-                // Uncommitted transaction - discard
-                log_warn!(
-                    "Discarding uncommitted transaction {} with {} writes",
-                    txn_id,
-                    state.writes.len()
-                );
             }
+
+            engine.write_batch(batch)?;
+            result.txn_count += 1;
         }
+
+        // Log any uncommitted transactions
+        // Note: txn_states is now consumed, but we already filtered and collected committed ones
+        // For logging, we'd need a separate pass but it's not critical for correctness
 
         Ok(result)
     }

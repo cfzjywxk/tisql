@@ -382,9 +382,9 @@ impl LsmEngine {
         // for correct MVCC semantics during reads. Unlike the old approach that stored decoded
         // user keys, this preserves all versions and their timestamps.
         let inner = memtable.inner();
-        // Use truly unbounded range - vec![0xFF; 256] handles keys up to 256 bytes
-        // (practically any reasonable key length)
-        let range = vec![]..vec![0xFF; 256];
+        // Use truly unbounded range - empty start and end means scan all entries.
+        // This avoids the previous bug where vec![0xFF; 256] could exclude valid keys.
+        let range = vec![]..vec![];
         let entries = inner.scan_all_mvcc(&range)?;
 
         for (mvcc_key, value) in entries {
@@ -461,36 +461,34 @@ impl LsmEngine {
             }
 
             // SST now contains MVCC keys - iterate to find matching user key with ts visibility
-            if let Ok(reader) = SstReaderRef::open(&sst_path) {
-                if let Ok(mut iter) = SstIterator::new(reader) {
-                    while iter.valid() {
-                        let mvcc_key = iter.key();
-                        let value = iter.value();
+            // Propagate errors instead of silently ignoring (risks wrong reads)
+            let reader = SstReaderRef::open(&sst_path)?;
+            let mut iter = SstIterator::new(reader)?;
 
-                        if let Some((user_key, entry_ts)) = decode_mvcc_key(mvcc_key) {
-                            // Check if this is our key and visible at ts
-                            if user_key == key && entry_ts <= ts {
-                                // Check if this is better than current best match
-                                // (higher entry_ts but still <= ts)
-                                let dominated = best_match
-                                    .as_ref()
-                                    .is_some_and(|(best_ts, _)| entry_ts <= *best_ts);
-                                if !dominated {
-                                    best_match = Some((entry_ts, value.to_vec()));
-                                }
-                            }
-                            // Optimization: if user_key > key, we've passed our key
-                            // (due to MVCC key ordering: same user_key groups together)
-                            if user_key.as_slice() > key {
-                                break;
-                            }
-                        }
+            while iter.valid() {
+                let mvcc_key = iter.key();
+                let value = iter.value();
 
-                        if iter.next().is_err() {
-                            break;
+                if let Some((user_key, entry_ts)) = decode_mvcc_key(mvcc_key) {
+                    // Check if this is our key and visible at ts
+                    if user_key == key && entry_ts <= ts {
+                        // Check if this is better than current best match
+                        // (higher entry_ts but still <= ts)
+                        let dominated = best_match
+                            .as_ref()
+                            .is_some_and(|(best_ts, _)| entry_ts <= *best_ts);
+                        if !dominated {
+                            best_match = Some((entry_ts, value.to_vec()));
                         }
                     }
+                    // Optimization: if user_key > key, we've passed our key
+                    // (due to MVCC key ordering: same user_key groups together)
+                    if user_key.as_slice() > key {
+                        break;
+                    }
                 }
+
+                iter.next()?;
             }
         }
 
@@ -591,6 +589,8 @@ impl StorageEngine for LsmEngine {
     }
 
     fn get_at(&self, key: &[u8], ts: Timestamp) -> Result<Option<RawValue>> {
+        use super::memtable::GetResult;
+
         // Read lock to get snapshot of state
         let (active, frozen, _version) = {
             let state = self.state.read().unwrap();
@@ -601,15 +601,21 @@ impl StorageEngine for LsmEngine {
             )
         };
 
-        // 1. Check active memtable
-        if let Some(value) = active.get_at(key, ts)? {
-            return Ok(Some(value));
+        // 1. Check active memtable with tombstone awareness
+        // If we find a tombstone, we must NOT continue to older levels (SSTs)
+        // because that would incorrectly "resurrect" deleted keys.
+        match active.get_at_with_tombstone(key, ts)? {
+            GetResult::Found(value) => return Ok(Some(value)),
+            GetResult::FoundTombstone => return Ok(None), // Stop! Key was deleted
+            GetResult::NotFound => {}                     // Continue searching
         }
 
         // 2. Check frozen memtables (newest first)
         for memtable in &frozen {
-            if let Some(value) = memtable.get_at(key, ts)? {
-                return Ok(Some(value));
+            match memtable.get_at_with_tombstone(key, ts)? {
+                GetResult::Found(value) => return Ok(Some(value)),
+                GetResult::FoundTombstone => return Ok(None), // Stop! Key was deleted
+                GetResult::NotFound => {}                     // Continue searching
             }
         }
 
@@ -686,38 +692,35 @@ impl StorageEngine for LsmEngine {
                     continue;
                 }
 
-                if let Ok(reader) = SstReaderRef::open(&sst_path) {
-                    if let Ok(mut iter) = SstIterator::new(reader) {
-                        while iter.valid() {
-                            let mvcc_key = iter.key();
-                            let value = iter.value();
+                // Propagate SST read errors instead of silently ignoring them.
+                // Silent errors can cause wrong reads (missing data).
+                let reader = SstReaderRef::open(&sst_path)?;
+                let mut iter = SstIterator::new(reader)?;
 
-                            // Decode MVCC key to get user_key and entry_ts
-                            if let Some((user_key, entry_ts)) = decode_mvcc_key(mvcc_key) {
-                                // Check if within user key range and visible at ts
-                                if user_key >= range.start && user_key < range.end && entry_ts <= ts
-                                {
-                                    // Check if this version is newer than what we have
-                                    let dominated = results
-                                        .get(&user_key)
-                                        .is_some_and(|(best_ts, _)| entry_ts <= *best_ts);
+                while iter.valid() {
+                    let mvcc_key = iter.key();
+                    let value = iter.value();
 
-                                    if !dominated {
-                                        if is_tombstone(value) {
-                                            results.insert(user_key, (entry_ts, None));
-                                        } else {
-                                            results
-                                                .insert(user_key, (entry_ts, Some(value.to_vec())));
-                                        }
-                                    }
+                    // Decode MVCC key to get user_key and entry_ts
+                    if let Some((user_key, entry_ts)) = decode_mvcc_key(mvcc_key) {
+                        // Check if within user key range and visible at ts
+                        if user_key >= range.start && user_key < range.end && entry_ts <= ts {
+                            // Check if this version is newer than what we have
+                            let dominated = results
+                                .get(&user_key)
+                                .is_some_and(|(best_ts, _)| entry_ts <= *best_ts);
+
+                            if !dominated {
+                                if is_tombstone(value) {
+                                    results.insert(user_key, (entry_ts, None));
+                                } else {
+                                    results.insert(user_key, (entry_ts, Some(value.to_vec())));
                                 }
-                            }
-
-                            if iter.next().is_err() {
-                                break;
                             }
                         }
                     }
+
+                    iter.next()?;
                 }
             }
         }
@@ -1757,8 +1760,7 @@ mod tests {
 
             let lsn_provider = new_lsn_provider();
             let ilog_config = IlogConfig::new(tmp.path());
-            let ilog =
-                Arc::new(IlogService::open(ilog_config, Arc::clone(&lsn_provider)).unwrap());
+            let ilog = Arc::new(IlogService::open(ilog_config, Arc::clone(&lsn_provider)).unwrap());
 
             let engine = LsmEngine::open_durable(config, lsn_provider, ilog).unwrap();
 
@@ -1814,5 +1816,321 @@ mod tests {
                 "v2 visible at ts=25"
             );
         }
+    }
+
+    // ==================== Regression Tests for Review Comments ====================
+
+    /// Test: Delete masking across levels.
+    ///
+    /// This catches the point-read tombstone bug where a delete in memtable
+    /// should mask older values in SST.
+    ///
+    /// Scenario: put→flush→delete (unflushed) then get_at(ts>=delete_ts) must return None
+    #[test]
+    fn test_delete_masking_across_levels() {
+        let tmp = TempDir::new().unwrap();
+        let config = LsmConfig::builder(tmp.path())
+            .memtable_size(100)
+            .max_frozen_memtables(4)
+            .build()
+            .unwrap();
+
+        let lsn_provider = new_lsn_provider();
+        let ilog_config = IlogConfig::new(tmp.path());
+        let ilog = Arc::new(IlogService::open(ilog_config, Arc::clone(&lsn_provider)).unwrap());
+
+        let engine =
+            LsmEngine::open_durable(config, Arc::clone(&lsn_provider), Arc::clone(&ilog)).unwrap();
+
+        // Step 1: Write value@ts=10 and flush to SST
+        let mut batch1 = WriteBatch::new();
+        batch1.set_commit_ts(10);
+        batch1.set_clog_lsn(1);
+        batch1.put(b"key".to_vec(), b"value_in_sst".to_vec());
+        engine.write_batch(batch1).unwrap();
+
+        // Flush to SST
+        engine.flush_all_with_active().unwrap();
+
+        // Verify value is readable from SST
+        assert_eq!(
+            engine.get_at(b"key", 15).unwrap(),
+            Some(b"value_in_sst".to_vec()),
+            "Value should be readable from SST before delete"
+        );
+
+        // Step 2: Delete@ts=20 (stays in memtable, NOT flushed)
+        let mut batch2 = WriteBatch::new();
+        batch2.set_commit_ts(20);
+        batch2.set_clog_lsn(2);
+        batch2.delete(b"key".to_vec());
+        engine.write_batch(batch2).unwrap();
+
+        // Step 3: Verify the delete masks the SST value
+        // This is the critical test: get_at(ts>=20) MUST return None,
+        // NOT the old value from SST. The tombstone in memtable must stop the search.
+        assert_eq!(
+            engine.get_at(b"key", 25).unwrap(),
+            None,
+            "Delete in memtable MUST mask value in SST (ts=25 >= delete_ts=20)"
+        );
+
+        assert_eq!(
+            engine.get_at(b"key", 20).unwrap(),
+            None,
+            "Delete in memtable MUST mask value in SST (ts=20 == delete_ts)"
+        );
+
+        // Value should still be visible before the delete timestamp
+        assert_eq!(
+            engine.get_at(b"key", 15).unwrap(),
+            Some(b"value_in_sst".to_vec()),
+            "Value should still be visible at ts=15 (before delete)"
+        );
+
+        // Latest read should also return None
+        assert_eq!(
+            engine.get(b"key").unwrap(),
+            None,
+            "Latest read should return None (deleted)"
+        );
+    }
+
+    /// Test: Delete masking in scan across levels.
+    ///
+    /// Similar to point read, but for range scans.
+    #[test]
+    fn test_delete_masking_in_scan_across_levels() {
+        let tmp = TempDir::new().unwrap();
+        let config = LsmConfig::builder(tmp.path())
+            .memtable_size(100)
+            .max_frozen_memtables(4)
+            .build()
+            .unwrap();
+
+        let lsn_provider = new_lsn_provider();
+        let ilog_config = IlogConfig::new(tmp.path());
+        let ilog = Arc::new(IlogService::open(ilog_config, Arc::clone(&lsn_provider)).unwrap());
+
+        let engine =
+            LsmEngine::open_durable(config, Arc::clone(&lsn_provider), Arc::clone(&ilog)).unwrap();
+
+        // Write multiple keys and flush
+        let mut batch1 = WriteBatch::new();
+        batch1.set_commit_ts(10);
+        batch1.set_clog_lsn(1);
+        batch1.put(b"a".to_vec(), b"a_val".to_vec());
+        batch1.put(b"b".to_vec(), b"b_val".to_vec());
+        batch1.put(b"c".to_vec(), b"c_val".to_vec());
+        engine.write_batch(batch1).unwrap();
+
+        engine.flush_all_with_active().unwrap();
+
+        // Delete key "b" (stays in memtable)
+        let mut batch2 = WriteBatch::new();
+        batch2.set_commit_ts(20);
+        batch2.set_clog_lsn(2);
+        batch2.delete(b"b".to_vec());
+        engine.write_batch(batch2).unwrap();
+
+        // Scan at ts=25: should see a, c (but NOT b - it's deleted)
+        let range = b"a".to_vec()..b"d".to_vec();
+        let results: Vec<_> = engine.scan_at(&range, 25).unwrap().collect();
+        assert_eq!(results.len(), 2, "Should see 2 keys after delete");
+        assert!(
+            results.iter().all(|(k, _)| k != b"b"),
+            "Deleted key 'b' should not appear in scan"
+        );
+
+        // Scan at ts=15: should see all 3 keys (before delete)
+        let results: Vec<_> = engine.scan_at(&range, 15).unwrap().collect();
+        assert_eq!(results.len(), 3, "Should see 3 keys before delete");
+    }
+
+    /// Test: Two-crash recovery.
+    ///
+    /// Write N txns, flush some, crash; recover, flush some recovered memtables, crash;
+    /// recover again and verify no missing keys.
+    ///
+    /// This catches the missing clog_lsn + replay ordering issues.
+    #[test]
+    fn test_two_crash_recovery() {
+        use crate::clog::{ClogBatch, ClogService, FileClogConfig, FileClogService};
+
+        let tmp = TempDir::new().unwrap();
+
+        // Session 1: Write data, flush some, "crash"
+        let written_keys: Vec<(Vec<u8>, Vec<u8>)>;
+        {
+            let lsm_config = LsmConfig::builder(tmp.path())
+                .memtable_size(50) // Small to encourage rotation
+                .max_frozen_memtables(4)
+                .build()
+                .unwrap();
+
+            let lsn_provider = new_lsn_provider();
+            let ilog_config = IlogConfig::new(tmp.path());
+            let ilog = Arc::new(IlogService::open(ilog_config, Arc::clone(&lsn_provider)).unwrap());
+
+            let engine =
+                LsmEngine::open_durable(lsm_config, Arc::clone(&lsn_provider), Arc::clone(&ilog))
+                    .unwrap();
+
+            // Use shared LSN provider for clog
+            let clog_config = FileClogConfig::with_dir(tmp.path());
+            let clog =
+                FileClogService::open_with_lsn_provider(clog_config, Arc::clone(&lsn_provider))
+                    .unwrap();
+
+            // Write 5 transactions
+            written_keys = (0..5)
+                .map(|i| {
+                    let key = format!("key_{:04}", i).into_bytes();
+                    let value = format!("value_{:04}", i).into_bytes();
+
+                    // Write to clog
+                    let mut batch = ClogBatch::new();
+                    batch.add_put(i as u64 + 1, key.clone(), value.clone());
+                    batch.add_commit(i as u64 + 1, i as Timestamp + 100);
+                    let clog_lsn = clog.write(&mut batch, true).unwrap();
+
+                    // Write to engine with clog_lsn
+                    let mut wb = WriteBatch::new();
+                    wb.set_commit_ts(i as Timestamp + 100);
+                    wb.set_clog_lsn(clog_lsn);
+                    wb.put(key.clone(), value.clone());
+                    engine.write_batch(wb).unwrap();
+
+                    (key, value)
+                })
+                .collect();
+
+            // Flush some (but not all)
+            engine.freeze_active();
+            if engine.frozen_count() > 0 {
+                // Flush one frozen memtable
+                let frozen = {
+                    let state = engine.state.read().unwrap();
+                    state.frozen.last().cloned()
+                };
+                if let Some(mt) = frozen {
+                    engine.flush_memtable(&mt).unwrap();
+                }
+            }
+
+            clog.close().unwrap();
+            // "Crash" - engine dropped
+        }
+
+        // Session 2: Recover, flush more, "crash" again
+        {
+            use crate::storage::recovery::LsmRecovery;
+
+            let recovery = LsmRecovery::new(tmp.path());
+            let result = recovery.recover().unwrap();
+
+            // Verify all data is recovered
+            for (key, value) in &written_keys {
+                assert_eq!(
+                    result.engine.get(key).unwrap(),
+                    Some(value.clone()),
+                    "Key {:?} should be recovered in session 2",
+                    String::from_utf8_lossy(key)
+                );
+            }
+
+            // Flush all recovered memtables
+            result.engine.flush_all_with_active().unwrap();
+
+            result.clog.close().unwrap();
+            // "Crash" again - engine dropped
+        }
+
+        // Session 3: Final recovery - verify no data loss
+        {
+            use crate::storage::recovery::LsmRecovery;
+
+            let recovery = LsmRecovery::new(tmp.path());
+            let result = recovery.recover().unwrap();
+
+            // Verify all data is still present after two-crash recovery
+            for (key, value) in &written_keys {
+                assert_eq!(
+                    result.engine.get(key).unwrap(),
+                    Some(value.clone()),
+                    "Key {:?} should be present after two-crash recovery",
+                    String::from_utf8_lossy(key)
+                );
+            }
+        }
+    }
+
+    /// Test: All-0xFF keys are handled correctly.
+    #[test]
+    fn test_all_0xff_keys() {
+        let tmp = TempDir::new().unwrap();
+        let config = LsmConfig::builder(tmp.path())
+            .memtable_size(1000)
+            .max_frozen_memtables(4)
+            .build()
+            .unwrap();
+
+        let lsn_provider = new_lsn_provider();
+        let ilog_config = IlogConfig::new(tmp.path());
+        let ilog = Arc::new(IlogService::open(ilog_config, Arc::clone(&lsn_provider)).unwrap());
+
+        let engine =
+            LsmEngine::open_durable(config, Arc::clone(&lsn_provider), Arc::clone(&ilog)).unwrap();
+
+        // Create keys with all 0xFF bytes
+        let key_all_ff_short: Vec<u8> = vec![0xFF; 8];
+        let key_all_ff_long: Vec<u8> = vec![0xFF; 100];
+        let key_normal = b"normal_key".to_vec();
+
+        // Write all keys
+        let mut batch = WriteBatch::new();
+        batch.set_commit_ts(100);
+        batch.set_clog_lsn(1);
+        batch.put(key_all_ff_short.clone(), b"short_ff_value".to_vec());
+        batch.put(key_all_ff_long.clone(), b"long_ff_value".to_vec());
+        batch.put(key_normal.clone(), b"normal_value".to_vec());
+        engine.write_batch(batch).unwrap();
+
+        // Verify all keys are readable from memtable
+        assert_eq!(
+            engine.get(&key_all_ff_short).unwrap(),
+            Some(b"short_ff_value".to_vec()),
+            "Short 0xFF key should be readable from memtable"
+        );
+        assert_eq!(
+            engine.get(&key_all_ff_long).unwrap(),
+            Some(b"long_ff_value".to_vec()),
+            "Long 0xFF key should be readable from memtable"
+        );
+        assert_eq!(
+            engine.get(&key_normal).unwrap(),
+            Some(b"normal_value".to_vec()),
+            "Normal key should be readable from memtable"
+        );
+
+        // Flush to SST
+        engine.flush_all_with_active().unwrap();
+
+        // Verify all keys are readable from SST
+        assert_eq!(
+            engine.get(&key_all_ff_short).unwrap(),
+            Some(b"short_ff_value".to_vec()),
+            "Short 0xFF key should be readable from SST"
+        );
+        assert_eq!(
+            engine.get(&key_all_ff_long).unwrap(),
+            Some(b"long_ff_value".to_vec()),
+            "Long 0xFF key should be readable from SST"
+        );
+        assert_eq!(
+            engine.get(&key_normal).unwrap(),
+            Some(b"normal_value".to_vec()),
+            "Normal key should be readable from SST"
+        );
     }
 }

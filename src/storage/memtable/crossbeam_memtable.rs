@@ -85,6 +85,8 @@ fn is_tombstone(value: &[u8]) -> bool {
 }
 
 /// Increment byte array by 1 (for range end bound).
+/// Note: No longer used directly; see increment_bytes_bounded instead.
+#[allow(dead_code)]
 fn increment_bytes(bytes: &mut Vec<u8>) {
     if bytes.is_empty() {
         bytes.push(0);
@@ -100,6 +102,31 @@ fn increment_bytes(bytes: &mut Vec<u8>) {
     }
     // All bytes were 255, add a new byte
     bytes.insert(0, 1);
+}
+
+/// Increment byte array by 1 for range end bound, returning whether the result is valid.
+///
+/// Returns `true` if the increment produced a valid lexicographically greater key.
+/// Returns `false` if all bytes were 0xFF (overflow case), indicating no valid end bound.
+///
+/// For the all-0xFF case, the caller should use an alternative termination condition
+/// (e.g., checking decoded user_key > target_user_key after confirming prefix match failed).
+fn increment_bytes_bounded(bytes: &mut Vec<u8>) -> bool {
+    if bytes.is_empty() {
+        bytes.push(0);
+        return true;
+    }
+
+    for i in (0..bytes.len()).rev() {
+        if bytes[i] < 255 {
+            bytes[i] += 1;
+            return true;
+        }
+        bytes[i] = 0;
+    }
+    // All bytes were 255 - no valid successor exists that maintains the same length.
+    // Return false to signal caller needs alternative termination logic.
+    false
 }
 
 /// MVCC-aware memtable engine using crossbeam-skiplist.
@@ -146,36 +173,68 @@ impl CrossbeamMemTableEngine {
     /// This scans from `user_key || !ts` to find the first version
     /// with commit_ts <= ts.
     fn get_at_internal(&self, user_key: &[u8], ts: Timestamp) -> Result<Option<RawValue>> {
+        match self.get_at_with_tombstone(user_key, ts)? {
+            super::GetResult::Found(v) => Ok(Some(v)),
+            super::GetResult::FoundTombstone | super::GetResult::NotFound => Ok(None),
+        }
+    }
+
+    /// Get the latest version of a key visible at the given timestamp, with tombstone awareness.
+    ///
+    /// Returns a tri-state result:
+    /// - `Found(value)`: Key exists with the given value
+    /// - `FoundTombstone`: Key was deleted (tombstone marker found)
+    /// - `NotFound`: Key not found at this timestamp
+    ///
+    /// This is critical for correct MVCC: when `FoundTombstone` is returned,
+    /// callers must NOT continue searching older levels.
+    pub fn get_at_with_tombstone(
+        &self,
+        user_key: &[u8],
+        ts: Timestamp,
+    ) -> Result<super::GetResult> {
         // Build scan key: user_key || !ts
         // Due to !ts encoding, this will find the first key >= user_key with ts' <= ts
         let start = encode_mvcc_key(user_key, ts);
 
-        // We need to find keys that start with user_key
+        // Compute end bound for the range.
+        // We need to check against MVCC key (not decoded user key) because
+        // keys like "key_0_10" sort BEFORE "key_0_1" || ts in MVCC space but
+        // "key_0_10" > "key_0_1" lexicographically. Using increment_bytes
+        // ensures we continue past such keys.
         let mut end_key = user_key.to_vec();
-        increment_bytes(&mut end_key);
+        let end_key_valid = increment_bytes_bounded(&mut end_key);
 
-        // Use range to iterate from start position
         for entry in self.list.range(start..) {
             let mvcc_key = entry.key();
 
-            // Check if we've gone past our user_key prefix
-            if mvcc_key >= &end_key {
+            // Check if we've gone past our user_key prefix.
+            // Use the MVCC key directly against end_key bound.
+            if end_key_valid && mvcc_key.as_slice() >= end_key.as_slice() {
                 break;
             }
 
             if let Some((key, _entry_ts)) = decode_mvcc_key(mvcc_key) {
-                // Verify this is still our key (prefix match)
+                // Verify this is our key (exact match required)
                 if key == user_key {
                     let value = entry.value();
                     if is_tombstone(value) {
-                        return Ok(None);
+                        return Ok(super::GetResult::FoundTombstone);
                     }
-                    return Ok(Some(value.clone()));
+                    return Ok(super::GetResult::Found(value.clone()));
                 }
+                // If key > user_key and we don't have a valid end_key (all-0xFF case),
+                // we need to break manually
+                if !end_key_valid && key.as_slice() > user_key {
+                    break;
+                }
+            } else {
+                // Invalid MVCC key format, skip
+                continue;
             }
         }
 
-        Ok(None)
+        Ok(super::GetResult::NotFound)
     }
 
     /// Write a key-value pair at the given timestamp.
@@ -429,29 +488,47 @@ impl CrossbeamMemTableEngine {
     /// This is critical for correct MVCC semantics in the SST layer.
     ///
     /// # Arguments
-    /// * `range` - User key range (will be converted to MVCC bounds internally)
+    /// * `range` - User key range (will be converted to MVCC bounds internally).
+    ///   Use `vec![]..vec![]` to scan all entries (unbounded).
     pub fn scan_all_mvcc(&self, range: &Range<Key>) -> Result<Vec<(Key, RawValue)>> {
-        // Convert user key range to MVCC key range
-        // Use Timestamp::MAX for start to get smallest MVCC key for each user key
-        // Use Timestamp::MIN (0) for end to get largest MVCC key for each user key
-        let start_mvcc = encode_mvcc_key(&range.start, Timestamp::MAX);
-        let end_mvcc = encode_mvcc_key(&range.end, 0);
-
         let mut results = Vec::new();
 
-        for entry in self.list.range(start_mvcc..end_mvcc) {
-            let mvcc_key = entry.key();
+        // Handle truly unbounded range (empty start and end means scan everything)
+        let is_unbounded = range.start.is_empty() && range.end.is_empty();
 
-            // Verify the user key is within range by decoding
-            if let Some((user_key, _entry_ts)) = decode_mvcc_key(mvcc_key) {
-                if user_key < range.start || user_key >= range.end {
-                    continue;
-                }
-
-                // Include ALL versions (no deduplication) and ALL values including tombstones
-                // Return the raw MVCC key, not the decoded user key
+        if is_unbounded {
+            // Iterate entire skiplist without artificial bounds
+            for entry in self.list.iter() {
+                let mvcc_key = entry.key();
                 let value = entry.value();
                 results.push((mvcc_key.clone(), value.clone()));
+            }
+        } else {
+            // Convert user key range to MVCC key range
+            // Use Timestamp::MAX for start to get smallest MVCC key for each user key
+            // Use Timestamp::MIN (0) for end to get largest MVCC key for each user key
+            let start_mvcc = encode_mvcc_key(&range.start, Timestamp::MAX);
+
+            // For bounded range, iterate from start and check user_key bounds
+            for entry in self.list.range(start_mvcc..) {
+                let mvcc_key = entry.key();
+
+                // Verify the user key is within range by decoding
+                if let Some((user_key, _entry_ts)) = decode_mvcc_key(mvcc_key) {
+                    // Check if past end of range
+                    if !range.end.is_empty() && user_key >= range.end {
+                        break;
+                    }
+                    // Check if before start of range (shouldn't happen with start_mvcc, but defensive)
+                    if user_key < range.start {
+                        continue;
+                    }
+
+                    // Include ALL versions (no deduplication) and ALL values including tombstones
+                    // Return the raw MVCC key, not the decoded user key
+                    let value = entry.value();
+                    results.push((mvcc_key.clone(), value.clone()));
+                }
             }
         }
 

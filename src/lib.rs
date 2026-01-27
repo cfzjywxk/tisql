@@ -86,7 +86,8 @@ pub mod testkit {
     pub use crate::storage::{
         CompactionExecutor, CompactionPicker, CompactionTask, IlogConfig, IlogService, LsmConfig,
         LsmConfigBuilder, LsmEngine, LsmRecovery, LsmStats, ManifestDelta, MemTable,
-        RecoveryResult, SstBuilder, SstBuilderOptions, SstMeta, SstReader, Version,
+        RecoveryResult, SstBuilder, SstBuilderOptions, SstIterator, SstMeta, SstReader,
+        SstReaderRef, Version,
     };
 
     // ArenaSkipList (exposed for testing low-level skiplist behavior)
