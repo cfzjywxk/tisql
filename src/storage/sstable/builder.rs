@@ -117,17 +117,42 @@ pub struct SstMeta {
 }
 
 impl SstMeta {
-    /// Check if a key might be in this SST based on key range.
-    pub fn may_contain_key(&self, key: &[u8]) -> bool {
-        key >= self.smallest_key.as_slice() && key <= self.largest_key.as_slice()
+    /// Check if a user key might be in this SST based on key range.
+    ///
+    /// Since SSTs store MVCC keys (user_key || !commit_ts), we extract the
+    /// user key portion from smallest_key and largest_key for comparison.
+    pub fn may_contain_key(&self, user_key: &[u8]) -> bool {
+        // Extract user key portions from MVCC keys (remove last 8 bytes of timestamp)
+        let smallest_user_key = extract_user_key(&self.smallest_key);
+        let largest_user_key = extract_user_key(&self.largest_key);
+
+        user_key >= smallest_user_key && user_key <= largest_user_key
     }
 
-    /// Check if this SST overlaps with the given key range.
+    /// Check if this SST overlaps with the given user key range.
+    ///
+    /// Since SSTs store MVCC keys, we extract user key portions for comparison.
     pub fn overlaps(&self, start: &[u8], end: &[u8]) -> bool {
-        // SST range: [smallest, largest]
+        // Extract user key portions from MVCC keys
+        let smallest_user_key = extract_user_key(&self.smallest_key);
+        let largest_user_key = extract_user_key(&self.largest_key);
+
+        // SST range: [smallest_user_key, largest_user_key]
         // Query range: [start, end)
-        // Overlaps if: smallest < end AND largest >= start
-        self.smallest_key.as_slice() < end && self.largest_key.as_slice() >= start
+        // Overlaps if: smallest_user_key < end AND largest_user_key >= start
+        smallest_user_key < end && largest_user_key >= start
+    }
+}
+
+/// Extract user key from MVCC key by removing the timestamp suffix.
+///
+/// MVCC keys are encoded as: user_key || !commit_ts (8 bytes)
+/// Returns the original key if it's too short to be an MVCC key.
+fn extract_user_key(mvcc_key: &[u8]) -> &[u8] {
+    if mvcc_key.len() >= 8 {
+        &mvcc_key[..mvcc_key.len() - 8]
+    } else {
+        mvcc_key
     }
 }
 
@@ -617,15 +642,16 @@ mod tests {
 
     #[test]
     fn test_sst_meta_may_contain_key() {
+        // SSTs now store MVCC keys, so smallest/largest are MVCC-encoded
         let meta = SstMeta {
             id: 1,
             level: 0,
-            smallest_key: b"bbb".to_vec(),
-            largest_key: b"ddd".to_vec(),
+            smallest_key: mvcc_key(b"bbb", 100), // MVCC key for "bbb" at ts=100
+            largest_key: mvcc_key(b"ddd", 50),   // MVCC key for "ddd" at ts=50
             file_size: 1000,
             entry_count: 100,
             block_count: 5,
-            min_ts: 0,
+            min_ts: 50,
             max_ts: 100,
             created_at: 0,
         };
@@ -639,15 +665,16 @@ mod tests {
 
     #[test]
     fn test_sst_meta_overlaps() {
+        // SSTs now store MVCC keys
         let meta = SstMeta {
             id: 1,
             level: 0,
-            smallest_key: b"bbb".to_vec(),
-            largest_key: b"ddd".to_vec(),
+            smallest_key: mvcc_key(b"bbb", 100),
+            largest_key: mvcc_key(b"ddd", 50),
             file_size: 1000,
             entry_count: 100,
             block_count: 5,
-            min_ts: 0,
+            min_ts: 50,
             max_ts: 100,
             created_at: 0,
         };

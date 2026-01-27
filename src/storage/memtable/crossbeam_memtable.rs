@@ -278,12 +278,14 @@ impl StorageEngine for CrossbeamMemTableEngine {
         //
         // To find all versions within the user key range:
         // - start: use Timestamp::MAX to get the SMALLEST mvcc key for range.start
-        // - end: use Timestamp::MAX to get the SMALLEST mvcc key for range.end
-        //   (since range.end is exclusive, we stop right at the first version of range.end)
+        // - end: use Timestamp::0 to get the LARGEST mvcc key for range.end
+        //   This ensures we include all MVCC keys for user_keys in [start, end)
+        //   because MVCC keys for lower timestamps have suffix 0xFF..FF which could
+        //   exceed the end bound if we used ts=MAX
         //
         // Then filter by entry_ts <= ts during iteration for visibility.
         let start_mvcc = encode_mvcc_key(&range.start, Timestamp::MAX);
-        let end_mvcc = encode_mvcc_key(&range.end, Timestamp::MAX);
+        let end_mvcc = encode_mvcc_key(&range.end, 0);
 
         // Collect results to avoid holding iterator references for too long
         // (minimizes the memory leak from crossbeam-skiplist iterator issue)
@@ -328,12 +330,14 @@ impl CrossbeamMemTableEngine {
     /// so they can mask older values in previous SSTs.
     ///
     /// Returns (user_key, value) pairs where value may be a tombstone (empty).
+    /// NOTE: This returns DECODED user keys. For SST flush, use `scan_all_mvcc()` instead.
     pub fn scan_all(
         &self,
         range: &Range<Key>,
     ) -> Result<Box<dyn Iterator<Item = (Key, RawValue)> + '_>> {
         let start_mvcc = encode_mvcc_key(&range.start, Timestamp::MAX);
-        let end_mvcc = encode_mvcc_key(&range.end, Timestamp::MAX);
+        // Use ts=0 for end to get the LARGEST mvcc key, ensuring we include all versions
+        let end_mvcc = encode_mvcc_key(&range.end, 0);
 
         let mut results = Vec::new();
         let mut last_user_key: Option<Key> = None;
@@ -362,6 +366,96 @@ impl CrossbeamMemTableEngine {
         }
 
         Ok(Box::new(results.into_iter()))
+    }
+
+    /// Scan at timestamp, INCLUDING tombstones (for merging with SST results).
+    ///
+    /// Unlike `scan_at()` which filters out tombstones, this method returns them.
+    /// This is needed when merging memtable results with SST results - tombstones
+    /// in the memtable must mask older values in SSTs.
+    ///
+    /// Returns (user_key, value) pairs visible at `ts`, including tombstones.
+    pub fn scan_at_with_tombstones(
+        &self,
+        range: &Range<Key>,
+        ts: Timestamp,
+    ) -> Result<Vec<(Key, RawValue)>> {
+        // For the start bound, use ts=MAX to get the smallest MVCC key for that user_key
+        let start_mvcc = encode_mvcc_key(&range.start, Timestamp::MAX);
+        // For the end bound, use ts=0 to get the LARGEST MVCC key for that user_key
+        // This ensures we include all MVCC keys for user_keys in [start, end)
+        // because MVCC keys for lower timestamps have suffix 0xFF..FF which could
+        // exceed the end bound if we used ts=MAX
+        let end_mvcc = encode_mvcc_key(&range.end, 0);
+
+        let mut results = Vec::new();
+        let mut last_user_key: Option<Key> = None;
+
+        for entry in self.list.range(start_mvcc..end_mvcc) {
+            let mvcc_key = entry.key();
+
+            if let Some((user_key, entry_ts)) = decode_mvcc_key(mvcc_key) {
+                // Check if within user range
+                if user_key < range.start || user_key >= range.end {
+                    continue;
+                }
+
+                // Skip if we already have this key (we want the latest visible version)
+                if let Some(ref last) = last_user_key {
+                    if &user_key == last {
+                        continue;
+                    }
+                }
+
+                // Check if this version is visible at the given timestamp
+                if entry_ts <= ts {
+                    // Include ALL values, including tombstones (unlike scan_at)
+                    let value = entry.value();
+                    results.push((user_key.clone(), value.clone()));
+                    last_user_key = Some(user_key);
+                }
+            }
+        }
+
+        Ok(results)
+    }
+
+    /// Scan all entries in range, returning raw MVCC keys (for SST flush).
+    ///
+    /// Unlike `scan_all()`, this does NOT decode MVCC keys - SSTs must store
+    /// MVCC keys directly (`user_key || !commit_ts`) to preserve version information.
+    ///
+    /// Returns ALL versions of each key (not just the latest), including tombstones.
+    /// This is critical for correct MVCC semantics in the SST layer.
+    ///
+    /// # Arguments
+    /// * `range` - User key range (will be converted to MVCC bounds internally)
+    pub fn scan_all_mvcc(&self, range: &Range<Key>) -> Result<Vec<(Key, RawValue)>> {
+        // Convert user key range to MVCC key range
+        // Use Timestamp::MAX for start to get smallest MVCC key for each user key
+        // Use Timestamp::MIN (0) for end to get largest MVCC key for each user key
+        let start_mvcc = encode_mvcc_key(&range.start, Timestamp::MAX);
+        let end_mvcc = encode_mvcc_key(&range.end, 0);
+
+        let mut results = Vec::new();
+
+        for entry in self.list.range(start_mvcc..end_mvcc) {
+            let mvcc_key = entry.key();
+
+            // Verify the user key is within range by decoding
+            if let Some((user_key, _entry_ts)) = decode_mvcc_key(mvcc_key) {
+                if user_key < range.start || user_key >= range.end {
+                    continue;
+                }
+
+                // Include ALL versions (no deduplication) and ALL values including tombstones
+                // Return the raw MVCC key, not the decoded user key
+                let value = entry.value();
+                results.push((mvcc_key.clone(), value.clone()));
+            }
+        }
+
+        Ok(results)
     }
 }
 

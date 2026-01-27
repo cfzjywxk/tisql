@@ -296,6 +296,9 @@ pub struct WriteBatch {
     ops: HashMap<Key, WriteOp>,
     /// Commit timestamp for MVCC (set by TransactionService)
     commit_ts: Option<Timestamp>,
+    /// CLOG LSN for recovery ordering (set by TransactionService after clog write)
+    /// This ensures storage and clog share the same LSN for proper recovery semantics.
+    clog_lsn: Option<u64>,
 }
 
 impl WriteBatch {
@@ -368,6 +371,20 @@ impl WriteBatch {
     /// Get the commit timestamp.
     pub fn commit_ts(&self) -> Option<Timestamp> {
         self.commit_ts
+    }
+
+    /// Set the CLOG LSN for recovery ordering.
+    ///
+    /// This is set by TransactionService after writing to the commit log.
+    /// The storage layer uses this LSN instead of allocating an independent one,
+    /// ensuring clog and storage share the same LSN for proper recovery semantics.
+    pub fn set_clog_lsn(&mut self, lsn: u64) {
+        self.clog_lsn = Some(lsn);
+    }
+
+    /// Get the CLOG LSN if set.
+    pub fn clog_lsn(&self) -> Option<u64> {
+        self.clog_lsn
     }
 
     /// Get all keys in this batch.

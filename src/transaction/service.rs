@@ -173,8 +173,12 @@ impl<S: StorageEngine, L: ClogService, T: TsoService> TransactionService<S, L, T
         #[cfg(feature = "failpoints")]
         fail_point!("txn_after_clog_write");
 
-        // Apply to storage engine with commit_ts
+        // Apply to storage engine with commit_ts AND clog LSN
+        // Threading the CLOG LSN to storage ensures proper recovery ordering:
+        // storage LSN == clog LSN, so flushed_lsn in SST metadata correctly
+        // identifies which clog entries have been persisted.
         storage_batch.set_commit_ts(commit_ts);
+        storage_batch.set_clog_lsn(lsn);
         self.storage.write_batch(storage_batch)?;
 
         // FAILPOINT: After storage apply, before lock release
@@ -452,8 +456,9 @@ impl<S: StorageEngine + 'static, L: ClogService + 'static, T: TsoService> TxnSer
         // Write to commit log with sync (durability guarantee)
         let lsn = self.clog_service.write(&mut clog_batch, true)?;
 
-        // Apply to storage with commit_ts
+        // Apply to storage with commit_ts AND clog LSN for proper recovery ordering
         storage_batch.set_commit_ts(commit_ts);
+        storage_batch.set_clog_lsn(lsn);
         self.storage.write_batch(storage_batch)?;
 
         // Mark as committed (guards will be dropped, releasing locks)

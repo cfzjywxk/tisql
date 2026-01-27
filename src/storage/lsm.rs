@@ -57,10 +57,35 @@ use crate::types::{Key, RawValue, Timestamp};
 use super::config::LsmConfig;
 use super::ilog::IlogService;
 use super::memtable::MemTable;
-use super::sstable::{
-    SstBuilder, SstBuilderOptions, SstIterator, SstMeta, SstReader, SstReaderRef,
-};
+use super::sstable::{SstBuilder, SstBuilderOptions, SstIterator, SstMeta, SstReaderRef};
 use super::version::{ManifestDelta, Version, MAX_LEVELS};
+
+// ============================================================================
+// MVCC Key Encoding/Decoding (must match crossbeam_memtable.rs)
+// ============================================================================
+
+/// Tombstone marker for deleted keys.
+const TOMBSTONE: &[u8] = b"\x00\x00\x00\x00TISQL_TOMBSTONE\x01";
+
+/// Decode MVCC key to (user_key, commit_ts).
+///
+/// MVCC keys are encoded as: `user_key || !commit_ts` (8 bytes, big-endian)
+/// The bitwise NOT ensures descending order: higher timestamps come first.
+fn decode_mvcc_key(mvcc_key: &[u8]) -> Option<(Key, Timestamp)> {
+    if mvcc_key.len() < 8 {
+        return None;
+    }
+    let user_key = mvcc_key[..mvcc_key.len() - 8].to_vec();
+    let ts_bytes: [u8; 8] = mvcc_key[mvcc_key.len() - 8..].try_into().ok()?;
+    // Reverse the bitwise NOT
+    let ts = !u64::from_be_bytes(ts_bytes);
+    Some((user_key, ts))
+}
+
+/// Check if a value is a tombstone.
+fn is_tombstone(value: &[u8]) -> bool {
+    value == TOMBSTONE
+}
 
 /// Inner state of the LSM engine, protected by RwLock for atomic updates.
 struct LsmState {
@@ -118,6 +143,10 @@ pub struct LsmEngine {
     /// Next memtable ID.
     next_memtable_id: AtomicU64,
 
+    /// Next SST ID (atomic to prevent race conditions during concurrent flushes).
+    /// This counter is owned by LsmEngine, not Version, to ensure atomic allocation.
+    next_sst_id: AtomicU64,
+
     /// Next LSN for ordering operations (fallback if no lsn_provider).
     next_lsn: AtomicU64,
 
@@ -146,6 +175,7 @@ impl LsmEngine {
             config: Arc::new(config),
             state: RwLock::new(LsmState::new(1)),
             next_memtable_id: AtomicU64::new(2),
+            next_sst_id: AtomicU64::new(1),
             next_lsn: AtomicU64::new(1),
             lsn_provider: None,
             ilog: None,
@@ -172,6 +202,7 @@ impl LsmEngine {
             config: Arc::new(config),
             state: RwLock::new(LsmState::new(1)),
             next_memtable_id: AtomicU64::new(2),
+            next_sst_id: AtomicU64::new(1),
             next_lsn: AtomicU64::new(1),
             lsn_provider: Some(lsn_provider),
             ilog: Some(ilog),
@@ -197,12 +228,15 @@ impl LsmEngine {
 
         // Start with recovered version
         let mut state = LsmState::new(1);
+        // Initialize next_sst_id from recovered version's max SST ID + 1
+        let recovered_max_sst_id = version.next_sst_id();
         state.version = Arc::new(version);
 
         Ok(Self {
             config: Arc::new(config),
             state: RwLock::new(state),
             next_memtable_id: AtomicU64::new(2),
+            next_sst_id: AtomicU64::new(recovered_max_sst_id),
             next_lsn: AtomicU64::new(1),
             lsn_provider: Some(lsn_provider),
             ilog: Some(ilog),
@@ -231,6 +265,14 @@ impl LsmEngine {
     /// Get the next memtable ID and increment.
     fn alloc_memtable_id(&self) -> u64 {
         self.next_memtable_id.fetch_add(1, Ordering::SeqCst)
+    }
+
+    /// Allocate the next SST ID atomically.
+    ///
+    /// This is used during flush to ensure unique SST IDs even with concurrent flushes.
+    /// Unlike Version::next_sst_id() which reads from a snapshot, this is atomic.
+    fn alloc_sst_id(&self) -> u64 {
+        self.next_sst_id.fetch_add(1, Ordering::SeqCst)
     }
 
     /// Get the number of frozen memtables.
@@ -313,9 +355,8 @@ impl LsmEngine {
             ));
         }
 
-        // Get next SST ID from current version
-        let version = self.current_version();
-        let sst_id = version.next_sst_id();
+        // Allocate SST ID atomically to prevent races during concurrent flushes
+        let sst_id = self.alloc_sst_id();
         let max_memtable_lsn = memtable.max_lsn().unwrap_or(0);
 
         // Phase 1: Write flush intent (if durable)
@@ -336,14 +377,18 @@ impl LsmEngine {
 
         let mut builder = SstBuilder::new(&sst_path, options)?;
 
-        // Iterate memtable and add all entries INCLUDING tombstones
-        // Tombstones must be written to SST to mask older values in previous SSTs
+        // Iterate memtable and add all entries INCLUDING tombstones as raw MVCC keys.
+        // SSTs MUST store MVCC keys (user_key || !commit_ts) to preserve version information
+        // for correct MVCC semantics during reads. Unlike the old approach that stored decoded
+        // user keys, this preserves all versions and their timestamps.
         let inner = memtable.inner();
-        let range = vec![]..vec![0xFF; 32]; // Full range
-        let entries: Vec<_> = inner.scan_all(&range)?.collect();
+        // Use truly unbounded range - vec![0xFF; 256] handles keys up to 256 bytes
+        // (practically any reasonable key length)
+        let range = vec![]..vec![0xFF; 256];
+        let entries = inner.scan_all_mvcc(&range)?;
 
-        for (key, value) in entries {
-            builder.add(&key, &value)?;
+        for (mvcc_key, value) in entries {
+            builder.add(&mvcc_key, &value)?;
         }
 
         // Finish building (writes to disk with fsync)
@@ -386,17 +431,23 @@ impl LsmEngine {
         Ok(meta)
     }
 
-    /// Read a key from SST files.
+    /// Read a key from SST files with MVCC timestamp filtering.
     ///
     /// Searches L0 first (newest to oldest), then L1, L2, etc.
-    fn get_from_sst(&self, key: &[u8], _ts: Timestamp) -> Result<Option<RawValue>> {
-        // Tombstone marker (must match crossbeam_memtable.rs)
-        const TOMBSTONE: &[u8] = b"\x00\x00\x00\x00TISQL_TOMBSTONE\x01";
-
+    /// SSTs contain MVCC keys (user_key || !commit_ts), so we need to:
+    /// 1. Scan for entries matching the user key
+    /// 2. Find the latest version with entry_ts <= ts
+    /// 3. Return None if that version is a tombstone
+    fn get_from_sst(&self, key: &[u8], ts: Timestamp) -> Result<Option<RawValue>> {
         let version = self.current_version();
 
         // Find SSTs that may contain this key
+        // Note: find_ssts_for_key now receives user key, but SST metadata stores MVCC key ranges
+        // We need to update this to work with MVCC keys, but for now iterate all SSTs
         let candidates = version.find_ssts_for_key(key);
+
+        // Track best match: (entry_ts, value) where entry_ts <= ts
+        let mut best_match: Option<(Timestamp, RawValue)> = None;
 
         for sst_meta in candidates {
             let sst_path = self
@@ -409,21 +460,46 @@ impl LsmEngine {
                 continue;
             }
 
-            let mut reader = SstReader::open(&sst_path)?;
+            // SST now contains MVCC keys - iterate to find matching user key with ts visibility
+            if let Ok(reader) = SstReaderRef::open(&sst_path) {
+                if let Ok(mut iter) = SstIterator::new(reader) {
+                    while iter.valid() {
+                        let mvcc_key = iter.key();
+                        let value = iter.value();
 
-            // Try to find the key in this SST
-            if let Some(value) = reader.get(key)? {
-                // Check for tombstone - deleted keys should return None
-                if value == TOMBSTONE {
-                    return Ok(None);
+                        if let Some((user_key, entry_ts)) = decode_mvcc_key(mvcc_key) {
+                            // Check if this is our key and visible at ts
+                            if user_key == key && entry_ts <= ts {
+                                // Check if this is better than current best match
+                                // (higher entry_ts but still <= ts)
+                                let dominated = best_match
+                                    .as_ref()
+                                    .is_some_and(|(best_ts, _)| entry_ts <= *best_ts);
+                                if !dominated {
+                                    best_match = Some((entry_ts, value.to_vec()));
+                                }
+                            }
+                            // Optimization: if user_key > key, we've passed our key
+                            // (due to MVCC key ordering: same user_key groups together)
+                            if user_key.as_slice() > key {
+                                break;
+                            }
+                        }
+
+                        if iter.next().is_err() {
+                            break;
+                        }
+                    }
                 }
-                // TODO: Check timestamp visibility for MVCC
-                // For now, return first found value
-                return Ok(Some(value));
             }
         }
 
-        Ok(None)
+        // Return the best match, checking for tombstone
+        match best_match {
+            Some((_, value)) if is_tombstone(&value) => Ok(None),
+            Some((_, value)) => Ok(Some(value)),
+            None => Ok(None),
+        }
     }
 
     /// Force freeze the active memtable.
@@ -542,8 +618,12 @@ impl StorageEngine for LsmEngine {
     }
 
     fn write_batch(&self, batch: WriteBatch) -> Result<()> {
-        // Allocate LSN for this batch
-        let lsn = self.alloc_lsn();
+        // Use CLOG LSN if provided, otherwise allocate locally.
+        // Using the CLOG LSN ensures proper recovery ordering: when we flush
+        // the memtable to SST, the flushed_lsn in SST metadata matches the
+        // clog LSN, allowing recovery to correctly identify which clog entries
+        // have been persisted to storage.
+        let lsn = batch.clog_lsn().unwrap_or_else(|| self.alloc_lsn());
 
         // Write to active memtable
         {
@@ -565,15 +645,13 @@ impl StorageEngine for LsmEngine {
     fn scan_at(
         &self,
         range: &Range<Key>,
-        _ts: Timestamp,
+        ts: Timestamp,
     ) -> Result<Box<dyn Iterator<Item = (Key, RawValue)> + '_>> {
-        // Use HashMap to track the latest value for each user key
-        // This automatically handles MVCC deduplication
-        // Value of None means the key was deleted (tombstone)
+        // Use HashMap to track the latest visible value for each user key
+        // Key: user_key, Value: (entry_ts, Option<value>)
+        // entry_ts is tracked to ensure we keep the latest version <= ts
+        // Option<value> = None means deleted (tombstone)
         use std::collections::HashMap;
-
-        // Tombstone marker (must match crossbeam_memtable.rs)
-        const TOMBSTONE: &[u8] = b"\x00\x00\x00\x00TISQL_TOMBSTONE\x01";
 
         let (active, frozen, version) = {
             let state = self.state.read().unwrap();
@@ -584,20 +662,15 @@ impl StorageEngine for LsmEngine {
             )
         };
 
-        // Results map: user_key -> Option<value>
-        // None means deleted (tombstone), Some means value exists
-        let mut results: HashMap<Key, Option<RawValue>> = HashMap::new();
+        // Results map: user_key -> (entry_ts, Option<value>)
+        // We track entry_ts to ensure we keep the latest visible version
+        let mut results: HashMap<Key, (Timestamp, Option<RawValue>)> = HashMap::new();
 
-        // 1. Scan SST files (oldest data first, will be overwritten by newer)
-        // Note: SSTs contain user keys (not MVCC-encoded keys) because memtable.scan_all()
-        // decodes MVCC keys before writing to SST. Each SST has the latest version
-        // of each key at the time of flush, including tombstones.
-        //
-        // Process levels from highest to L0 (older data first)
+        // 1. Scan SST files (SSTs now contain MVCC keys: user_key || !commit_ts)
+        // Process all levels from highest to L0 (older data first)
         for level in (0..MAX_LEVELS).rev() {
             let ssts = version.ssts_at_level(level as u32);
             // For L0, process in order of increasing ID (older first)
-            // For other levels, they're already sorted
             let mut sorted_ssts: Vec<_> = ssts.iter().collect();
             if level == 0 {
                 sorted_ssts.sort_by_key(|s| s.id);
@@ -614,25 +687,32 @@ impl StorageEngine for LsmEngine {
                 }
 
                 if let Ok(reader) = SstReaderRef::open(&sst_path) {
-                    // Use iterator to scan the SST
                     if let Ok(mut iter) = SstIterator::new(reader) {
                         while iter.valid() {
-                            let key = iter.key();
+                            let mvcc_key = iter.key();
                             let value = iter.value();
 
-                            // SST contains user keys, so compare directly with range
-                            if key >= range.start.as_slice() && key < range.end.as_slice() {
-                                // Check for tombstone
-                                if value == TOMBSTONE {
-                                    // Mark as deleted
-                                    results.insert(key.to_vec(), None);
-                                } else {
-                                    // Newer SSTs will overwrite older values for same key
-                                    results.insert(key.to_vec(), Some(value.to_vec()));
+                            // Decode MVCC key to get user_key and entry_ts
+                            if let Some((user_key, entry_ts)) = decode_mvcc_key(mvcc_key) {
+                                // Check if within user key range and visible at ts
+                                if user_key >= range.start && user_key < range.end && entry_ts <= ts
+                                {
+                                    // Check if this version is newer than what we have
+                                    let dominated = results
+                                        .get(&user_key)
+                                        .is_some_and(|(best_ts, _)| entry_ts <= *best_ts);
+
+                                    if !dominated {
+                                        if is_tombstone(value) {
+                                            results.insert(user_key, (entry_ts, None));
+                                        } else {
+                                            results
+                                                .insert(user_key, (entry_ts, Some(value.to_vec())));
+                                        }
+                                    }
                                 }
                             }
 
-                            // Move to next entry
                             if iter.next().is_err() {
                                 break;
                             }
@@ -642,34 +722,36 @@ impl StorageEngine for LsmEngine {
             }
         }
 
-        // 2. Scan frozen memtables (newest frozen last, so newer overwrites older)
-        // Use scan_all to include tombstones so deletions mask older SST values
+        // 2. Scan frozen memtables (oldest first, so newer overwrites older)
+        // Use scan_at_with_tombstones to get entries visible at ts INCLUDING tombstones.
+        // Tombstones in memtable mask older SST values.
         for memtable in frozen.iter().rev() {
-            let memtable_results: Vec<_> = memtable.inner().scan_all(range)?.collect();
-            for (k, v) in memtable_results {
-                if v == TOMBSTONE {
-                    results.insert(k, None);
+            let memtable_results = memtable.inner().scan_at_with_tombstones(range, ts)?;
+            for (user_key, value) in memtable_results {
+                // Memtable data is newer than SST data, so overwrite
+                // Use Timestamp::MAX to ensure memtable entries always win
+                if is_tombstone(&value) {
+                    results.insert(user_key, (Timestamp::MAX, None));
                 } else {
-                    results.insert(k, Some(v));
+                    results.insert(user_key, (Timestamp::MAX, Some(value)));
                 }
             }
         }
 
         // 3. Scan active memtable (newest data)
-        // Use scan_all to include tombstones
-        let active_results: Vec<_> = active.inner().scan_all(range)?.collect();
-        for (k, v) in active_results {
-            if v == TOMBSTONE {
-                results.insert(k, None);
+        let active_results = active.inner().scan_at_with_tombstones(range, ts)?;
+        for (user_key, value) in active_results {
+            if is_tombstone(&value) {
+                results.insert(user_key, (Timestamp::MAX, None));
             } else {
-                results.insert(k, Some(v));
+                results.insert(user_key, (Timestamp::MAX, Some(value)));
             }
         }
 
         // Convert to sorted vector, filtering out tombstones (None values)
         let mut result_vec: Vec<(Key, RawValue)> = results
             .into_iter()
-            .filter_map(|(k, v)| v.map(|val| (k, val)))
+            .filter_map(|(k, (_, v))| v.map(|val| (k, val)))
             .collect();
         result_vec.sort_by(|a, b| a.0.cmp(&b.0));
 
@@ -1137,6 +1219,600 @@ mod tests {
                     key
                 );
             }
+        }
+    }
+
+    // ==================== MVCC SST Storage Tests ====================
+
+    #[test]
+    fn test_mvcc_scan_at_timestamp_filtering() {
+        // Test that scan_at returns correct versions based on timestamp
+        let tmp = TempDir::new().unwrap();
+        let config = test_config(tmp.path());
+        let engine = LsmEngine::open(config).unwrap();
+
+        // Write multiple versions of the same key at different timestamps
+        let mut batch1 = new_batch(10);
+        batch1.put(b"key".to_vec(), b"value_10".to_vec());
+        engine.write_batch(batch1).unwrap();
+
+        let mut batch2 = new_batch(20);
+        batch2.put(b"key".to_vec(), b"value_20".to_vec());
+        engine.write_batch(batch2).unwrap();
+
+        let mut batch3 = new_batch(30);
+        batch3.put(b"key".to_vec(), b"value_30".to_vec());
+        engine.write_batch(batch3).unwrap();
+
+        // get_at should return the correct version
+        assert_eq!(engine.get_at(b"key", 5).unwrap(), None); // Too early
+        assert_eq!(
+            engine.get_at(b"key", 10).unwrap(),
+            Some(b"value_10".to_vec())
+        );
+        assert_eq!(
+            engine.get_at(b"key", 15).unwrap(),
+            Some(b"value_10".to_vec())
+        );
+        assert_eq!(
+            engine.get_at(b"key", 20).unwrap(),
+            Some(b"value_20".to_vec())
+        );
+        assert_eq!(
+            engine.get_at(b"key", 25).unwrap(),
+            Some(b"value_20".to_vec())
+        );
+        assert_eq!(
+            engine.get_at(b"key", 30).unwrap(),
+            Some(b"value_30".to_vec())
+        );
+        assert_eq!(
+            engine.get_at(b"key", 100).unwrap(),
+            Some(b"value_30".to_vec())
+        );
+
+        // scan_at should also respect timestamp
+        let range = b"key".to_vec()..b"key\xff".to_vec();
+        let results15: Vec<_> = engine.scan_at(&range, 15).unwrap().collect();
+        assert_eq!(results15.len(), 1);
+        assert_eq!(results15[0].1, b"value_10".to_vec());
+
+        let results25: Vec<_> = engine.scan_at(&range, 25).unwrap().collect();
+        assert_eq!(results25.len(), 1);
+        assert_eq!(results25[0].1, b"value_20".to_vec());
+    }
+
+    #[test]
+    fn test_mvcc_scan_at_after_flush() {
+        // Test that MVCC works correctly when data is flushed to SST
+        let tmp = TempDir::new().unwrap();
+        let config = LsmConfig::builder(tmp.path())
+            .memtable_size(100) // Very small to force rotation/flush
+            .max_frozen_memtables(4)
+            .build()
+            .unwrap();
+
+        let lsn_provider = new_lsn_provider();
+        let ilog_config = IlogConfig::new(tmp.path());
+        let ilog = Arc::new(IlogService::open(ilog_config, Arc::clone(&lsn_provider)).unwrap());
+
+        let engine =
+            LsmEngine::open_durable(config, Arc::clone(&lsn_provider), Arc::clone(&ilog)).unwrap();
+
+        // Write key@ts=10
+        let mut batch1 = WriteBatch::new();
+        batch1.set_commit_ts(10);
+        batch1.put(b"key".to_vec(), b"v1".to_vec());
+        engine.write_batch(batch1).unwrap();
+
+        // Write key@ts=20
+        let mut batch2 = WriteBatch::new();
+        batch2.set_commit_ts(20);
+        batch2.put(b"key".to_vec(), b"v2".to_vec());
+        engine.write_batch(batch2).unwrap();
+
+        // Force flush to SST
+        engine.flush_all_with_active().unwrap();
+
+        // SST should contain MVCC keys - verify by reading at different timestamps
+        assert_eq!(engine.get_at(b"key", 15).unwrap(), Some(b"v1".to_vec()));
+        assert_eq!(engine.get_at(b"key", 25).unwrap(), Some(b"v2".to_vec()));
+    }
+
+    #[test]
+    fn test_mvcc_tombstone_in_sst() {
+        // Test that tombstones in SST properly mask older values
+        let tmp = TempDir::new().unwrap();
+        let config = LsmConfig::builder(tmp.path())
+            .memtable_size(100)
+            .max_frozen_memtables(4)
+            .build()
+            .unwrap();
+
+        let lsn_provider = new_lsn_provider();
+        let ilog_config = IlogConfig::new(tmp.path());
+        let ilog = Arc::new(IlogService::open(ilog_config, Arc::clone(&lsn_provider)).unwrap());
+
+        let engine =
+            LsmEngine::open_durable(config, Arc::clone(&lsn_provider), Arc::clone(&ilog)).unwrap();
+
+        // Write value@ts=10
+        let mut batch1 = WriteBatch::new();
+        batch1.set_commit_ts(10);
+        batch1.put(b"key".to_vec(), b"value".to_vec());
+        engine.write_batch(batch1).unwrap();
+
+        // Delete@ts=20
+        let mut batch2 = WriteBatch::new();
+        batch2.set_commit_ts(20);
+        batch2.delete(b"key".to_vec());
+        engine.write_batch(batch2).unwrap();
+
+        // Force flush to SST
+        engine.flush_all_with_active().unwrap();
+
+        // Check MVCC visibility
+        assert_eq!(engine.get_at(b"key", 15).unwrap(), Some(b"value".to_vec()));
+        assert_eq!(engine.get_at(b"key", 25).unwrap(), None); // Deleted
+        assert_eq!(engine.get(b"key").unwrap(), None); // Latest is deleted
+    }
+
+    #[test]
+    fn test_clog_lsn_flows_to_memtable() {
+        // Test that CLOG LSN is properly threaded to storage
+        let tmp = TempDir::new().unwrap();
+        let config = test_config(tmp.path());
+        let engine = LsmEngine::open(config).unwrap();
+
+        // Write batch with explicit CLOG LSN
+        let mut batch = WriteBatch::new();
+        batch.set_commit_ts(100);
+        batch.set_clog_lsn(42); // Simulate CLOG LSN from transaction service
+        batch.put(b"key".to_vec(), b"value".to_vec());
+        engine.write_batch(batch).unwrap();
+
+        // Check that the memtable has the correct LSN
+        let state = engine.state.read().unwrap();
+        assert_eq!(
+            state.active.max_lsn(),
+            Some(42),
+            "Memtable should have CLOG LSN"
+        );
+    }
+
+    #[test]
+    fn test_scan_at_multiple_keys_with_mvcc() {
+        // Test scanning multiple keys with different versions
+        let tmp = TempDir::new().unwrap();
+        let config = test_config(tmp.path());
+        let engine = LsmEngine::open(config).unwrap();
+
+        // Write multiple keys at ts=10
+        let mut batch1 = new_batch(10);
+        batch1.put(b"a".to_vec(), b"a_v1".to_vec());
+        batch1.put(b"b".to_vec(), b"b_v1".to_vec());
+        batch1.put(b"c".to_vec(), b"c_v1".to_vec());
+        engine.write_batch(batch1).unwrap();
+
+        // Update some keys at ts=20
+        let mut batch2 = new_batch(20);
+        batch2.put(b"b".to_vec(), b"b_v2".to_vec());
+        engine.write_batch(batch2).unwrap();
+
+        // Delete one key at ts=30
+        let mut batch3 = new_batch(30);
+        batch3.delete(b"a".to_vec());
+        engine.write_batch(batch3).unwrap();
+
+        // Scan at ts=15: should see a_v1, b_v1, c_v1
+        let range = b"a".to_vec()..b"d".to_vec();
+        let results15: Vec<_> = engine.scan_at(&range, 15).unwrap().collect();
+        assert_eq!(results15.len(), 3);
+        assert_eq!(results15[0], (b"a".to_vec(), b"a_v1".to_vec()));
+        assert_eq!(results15[1], (b"b".to_vec(), b"b_v1".to_vec()));
+        assert_eq!(results15[2], (b"c".to_vec(), b"c_v1".to_vec()));
+
+        // Scan at ts=25: should see a_v1, b_v2, c_v1
+        let results25: Vec<_> = engine.scan_at(&range, 25).unwrap().collect();
+        assert_eq!(results25.len(), 3);
+        assert_eq!(results25[0], (b"a".to_vec(), b"a_v1".to_vec()));
+        assert_eq!(results25[1], (b"b".to_vec(), b"b_v2".to_vec()));
+        assert_eq!(results25[2], (b"c".to_vec(), b"c_v1".to_vec()));
+
+        // Scan at ts=35: should see b_v2, c_v1 (a deleted)
+        let results35: Vec<_> = engine.scan_at(&range, 35).unwrap().collect();
+        assert_eq!(results35.len(), 2);
+        assert_eq!(results35[0], (b"b".to_vec(), b"b_v2".to_vec()));
+        assert_eq!(results35[1], (b"c".to_vec(), b"c_v1".to_vec()));
+    }
+
+    // ==================== Critical Issue Tests ====================
+
+    #[test]
+    fn test_clog_lsn_preserved_through_flush() {
+        // Critical: Verify that flushed_lsn matches CLOG LSN for correct recovery
+        let tmp = TempDir::new().unwrap();
+        let config = LsmConfig::builder(tmp.path())
+            .memtable_size(100)
+            .max_frozen_memtables(4)
+            .build()
+            .unwrap();
+
+        let lsn_provider = new_lsn_provider();
+        let ilog_config = IlogConfig::new(tmp.path());
+        let ilog = Arc::new(IlogService::open(ilog_config, Arc::clone(&lsn_provider)).unwrap());
+
+        let engine =
+            LsmEngine::open_durable(config, Arc::clone(&lsn_provider), Arc::clone(&ilog)).unwrap();
+
+        // Write batch with explicit CLOG LSN (simulating TransactionService behavior)
+        let clog_lsn = 100;
+        let mut batch = WriteBatch::new();
+        batch.set_commit_ts(10);
+        batch.set_clog_lsn(clog_lsn);
+        batch.put(b"key1".to_vec(), b"value1".to_vec());
+        engine.write_batch(batch).unwrap();
+
+        // Verify memtable has the CLOG LSN
+        {
+            let state = engine.state.read().unwrap();
+            assert_eq!(state.active.max_lsn(), Some(clog_lsn));
+        }
+
+        // Flush to SST
+        engine.flush_all_with_active().unwrap();
+
+        // Verify version.flushed_lsn matches the CLOG LSN
+        let version = engine.current_version();
+        assert_eq!(
+            version.flushed_lsn(),
+            clog_lsn,
+            "flushed_lsn should match CLOG LSN for correct recovery"
+        );
+    }
+
+    #[test]
+    fn test_sst_contains_mvcc_keys_not_user_keys() {
+        // Critical: Verify SST contains MVCC-encoded keys
+        let tmp = TempDir::new().unwrap();
+        let config = LsmConfig::builder(tmp.path())
+            .memtable_size(100)
+            .max_frozen_memtables(4)
+            .build()
+            .unwrap();
+
+        let lsn_provider = new_lsn_provider();
+        let ilog_config = IlogConfig::new(tmp.path());
+        let ilog = Arc::new(IlogService::open(ilog_config, Arc::clone(&lsn_provider)).unwrap());
+
+        let engine =
+            LsmEngine::open_durable(config.clone(), Arc::clone(&lsn_provider), Arc::clone(&ilog))
+                .unwrap();
+
+        // Write multiple versions of same key
+        let mut batch1 = WriteBatch::new();
+        batch1.set_commit_ts(10);
+        batch1.set_clog_lsn(1);
+        batch1.put(b"key".to_vec(), b"v1".to_vec());
+        engine.write_batch(batch1).unwrap();
+
+        let mut batch2 = WriteBatch::new();
+        batch2.set_commit_ts(20);
+        batch2.set_clog_lsn(2);
+        batch2.put(b"key".to_vec(), b"v2".to_vec());
+        engine.write_batch(batch2).unwrap();
+
+        // Flush
+        engine.flush_all_with_active().unwrap();
+
+        // Read SST directly to verify it contains MVCC keys
+        let version = engine.current_version();
+        let ssts = version.ssts_at_level(0);
+        assert!(!ssts.is_empty(), "Should have at least one SST");
+
+        let sst_path = config.sst_dir().join(format!("{:08}.sst", ssts[0].id));
+        let reader = SstReaderRef::open(&sst_path).unwrap();
+        let mut iter = SstIterator::new(reader).unwrap();
+
+        let mut entry_count = 0;
+        let mut found_ts_10 = false;
+        let mut found_ts_20 = false;
+
+        while iter.valid() {
+            let mvcc_key = iter.key();
+            // MVCC key should be longer than user key (has 8-byte timestamp suffix)
+            assert!(
+                mvcc_key.len() >= 8,
+                "SST key should have MVCC timestamp suffix"
+            );
+
+            // Decode and verify
+            if let Some((user_key, ts)) = decode_mvcc_key(mvcc_key) {
+                assert_eq!(user_key, b"key", "User key should match");
+                if ts == 10 {
+                    found_ts_10 = true;
+                }
+                if ts == 20 {
+                    found_ts_20 = true;
+                }
+            }
+            entry_count += 1;
+            if iter.next().is_err() {
+                break;
+            }
+        }
+
+        assert!(
+            entry_count >= 2,
+            "SST should contain multiple MVCC versions"
+        );
+        assert!(found_ts_10, "SST should contain version at ts=10");
+        assert!(found_ts_20, "SST should contain version at ts=20");
+    }
+
+    #[test]
+    fn test_tombstone_point_read_from_sst() {
+        // Critical: Verify get_at returns None when visible version is tombstone in SST
+        let tmp = TempDir::new().unwrap();
+        let config = LsmConfig::builder(tmp.path())
+            .memtable_size(100)
+            .max_frozen_memtables(4)
+            .build()
+            .unwrap();
+
+        let lsn_provider = new_lsn_provider();
+        let ilog_config = IlogConfig::new(tmp.path());
+        let ilog = Arc::new(IlogService::open(ilog_config, Arc::clone(&lsn_provider)).unwrap());
+
+        let engine =
+            LsmEngine::open_durable(config, Arc::clone(&lsn_provider), Arc::clone(&ilog)).unwrap();
+
+        // Write value
+        let mut batch1 = WriteBatch::new();
+        batch1.set_commit_ts(10);
+        batch1.set_clog_lsn(1);
+        batch1.put(b"key".to_vec(), b"value".to_vec());
+        engine.write_batch(batch1).unwrap();
+
+        // Delete
+        let mut batch2 = WriteBatch::new();
+        batch2.set_commit_ts(20);
+        batch2.set_clog_lsn(2);
+        batch2.delete(b"key".to_vec());
+        engine.write_batch(batch2).unwrap();
+
+        // Flush - now both value and tombstone are in SST
+        engine.flush_all_with_active().unwrap();
+
+        // Point read at ts=15 should return value (before delete)
+        assert_eq!(
+            engine.get_at(b"key", 15).unwrap(),
+            Some(b"value".to_vec()),
+            "get_at(ts=15) should return value from SST"
+        );
+
+        // Point read at ts=25 should return None (tombstone visible)
+        assert_eq!(
+            engine.get_at(b"key", 25).unwrap(),
+            None,
+            "get_at(ts=25) should return None due to tombstone in SST"
+        );
+
+        // Latest read should also return None
+        assert_eq!(
+            engine.get(b"key").unwrap(),
+            None,
+            "get() should return None due to tombstone in SST"
+        );
+    }
+
+    #[test]
+    fn test_long_key_with_0xff_prefix_flushes_correctly() {
+        // Medium: Verify keys with 0xFF prefix bytes are properly flushed
+        let tmp = TempDir::new().unwrap();
+        let config = LsmConfig::builder(tmp.path())
+            .memtable_size(100)
+            .max_frozen_memtables(4)
+            .build()
+            .unwrap();
+
+        let lsn_provider = new_lsn_provider();
+        let ilog_config = IlogConfig::new(tmp.path());
+        let ilog = Arc::new(IlogService::open(ilog_config, Arc::clone(&lsn_provider)).unwrap());
+
+        let engine =
+            LsmEngine::open_durable(config, Arc::clone(&lsn_provider), Arc::clone(&ilog)).unwrap();
+
+        // Create a key with many 0xFF bytes (longer than old 32-byte limit)
+        let long_key: Vec<u8> = std::iter::repeat(0xFF).take(64).collect();
+        let value = b"value_for_long_key".to_vec();
+
+        let mut batch = WriteBatch::new();
+        batch.set_commit_ts(100);
+        batch.set_clog_lsn(1);
+        batch.put(long_key.clone(), value.clone());
+        engine.write_batch(batch).unwrap();
+
+        // Also add a normal key to ensure both are flushed
+        let mut batch2 = WriteBatch::new();
+        batch2.set_commit_ts(101);
+        batch2.set_clog_lsn(2);
+        batch2.put(b"normal_key".to_vec(), b"normal_value".to_vec());
+        engine.write_batch(batch2).unwrap();
+
+        // Flush
+        engine.flush_all_with_active().unwrap();
+
+        // Both keys should be readable from SST
+        assert_eq!(
+            engine.get(&long_key).unwrap(),
+            Some(value),
+            "Long key with 0xFF prefix should be readable after flush"
+        );
+        assert_eq!(
+            engine.get(b"normal_key").unwrap(),
+            Some(b"normal_value".to_vec()),
+            "Normal key should be readable after flush"
+        );
+    }
+
+    #[test]
+    fn test_concurrent_flush_unique_sst_ids() {
+        // Medium: Verify concurrent flushes get unique SST IDs
+        use std::sync::Barrier;
+
+        let tmp = TempDir::new().unwrap();
+        let config = LsmConfig::builder(tmp.path())
+            .memtable_size(50) // Very small to trigger rotation
+            .max_frozen_memtables(16) // Allow many frozen memtables
+            .build()
+            .unwrap();
+
+        let lsn_provider = new_lsn_provider();
+        let ilog_config = IlogConfig::new(tmp.path());
+        let ilog = Arc::new(IlogService::open(ilog_config, Arc::clone(&lsn_provider)).unwrap());
+
+        let engine = Arc::new(
+            LsmEngine::open_durable(config.clone(), Arc::clone(&lsn_provider), Arc::clone(&ilog))
+                .unwrap(),
+        );
+
+        // Write enough data to have multiple frozen memtables
+        for i in 0..20 {
+            let mut batch = WriteBatch::new();
+            batch.set_commit_ts(i as Timestamp + 1);
+            batch.set_clog_lsn(i as u64 + 1);
+            let key = format!("key_{:04}", i);
+            let value = format!("value_{:04}", i);
+            batch.put(key.as_bytes().to_vec(), value.as_bytes().to_vec());
+            engine.write_batch(batch).unwrap();
+        }
+
+        // Now trigger concurrent flushes
+        let num_threads = 4;
+        let barrier = Arc::new(Barrier::new(num_threads));
+
+        let handles: Vec<_> = (0..num_threads)
+            .map(|_| {
+                let engine = Arc::clone(&engine);
+                let barrier = Arc::clone(&barrier);
+
+                thread::spawn(move || {
+                    barrier.wait();
+                    // Each thread tries to flush
+                    let _ = engine.flush_all();
+                })
+            })
+            .collect();
+
+        for h in handles {
+            h.join().unwrap();
+        }
+
+        // Verify all SST IDs are unique
+        let version = engine.current_version();
+        let mut all_sst_ids: Vec<u64> = Vec::new();
+
+        for level in 0..MAX_LEVELS {
+            for sst in version.ssts_at_level(level as u32) {
+                all_sst_ids.push(sst.id);
+            }
+        }
+
+        // Check for duplicates
+        let original_len = all_sst_ids.len();
+        all_sst_ids.sort();
+        all_sst_ids.dedup();
+        assert_eq!(
+            all_sst_ids.len(),
+            original_len,
+            "All SST IDs should be unique after concurrent flushes"
+        );
+
+        // Verify all data is readable
+        for i in 0..20 {
+            let key = format!("key_{:04}", i);
+            let expected = format!("value_{:04}", i);
+            assert_eq!(
+                engine.get(key.as_bytes()).unwrap(),
+                Some(expected.as_bytes().to_vec()),
+                "Key {} should be readable after concurrent flushes",
+                key
+            );
+        }
+    }
+
+    #[test]
+    fn test_mvcc_visibility_after_flush_recovery() {
+        // Critical: Verify MVCC visibility works correctly after flush and recovery
+        let tmp = TempDir::new().unwrap();
+
+        // First session: write, flush
+        {
+            let config = LsmConfig::builder(tmp.path())
+                .memtable_size(100)
+                .max_frozen_memtables(4)
+                .build()
+                .unwrap();
+
+            let lsn_provider = new_lsn_provider();
+            let ilog_config = IlogConfig::new(tmp.path());
+            let ilog =
+                Arc::new(IlogService::open(ilog_config, Arc::clone(&lsn_provider)).unwrap());
+
+            let engine = LsmEngine::open_durable(config, lsn_provider, ilog).unwrap();
+
+            // Write key@ts=10
+            let mut batch1 = WriteBatch::new();
+            batch1.set_commit_ts(10);
+            batch1.set_clog_lsn(1);
+            batch1.put(b"key".to_vec(), b"v1".to_vec());
+            engine.write_batch(batch1).unwrap();
+
+            // Write key@ts=20
+            let mut batch2 = WriteBatch::new();
+            batch2.set_commit_ts(20);
+            batch2.set_clog_lsn(2);
+            batch2.put(b"key".to_vec(), b"v2".to_vec());
+            engine.write_batch(batch2).unwrap();
+
+            // Flush
+            engine.flush_all_with_active().unwrap();
+        }
+
+        // Second session: recover and verify MVCC visibility
+        {
+            let lsn_provider = new_lsn_provider();
+            let ilog_config = IlogConfig::new(tmp.path());
+            let (ilog, version, _orphans) =
+                IlogService::recover(ilog_config, Arc::clone(&lsn_provider)).unwrap();
+
+            let config = LsmConfig::builder(tmp.path())
+                .memtable_size(100)
+                .max_frozen_memtables(4)
+                .build()
+                .unwrap();
+
+            let engine =
+                LsmEngine::open_with_recovery(config, lsn_provider, Arc::new(ilog), version)
+                    .unwrap();
+
+            // MVCC visibility should work from SST
+            assert_eq!(
+                engine.get_at(b"key", 5).unwrap(),
+                None,
+                "Nothing visible at ts=5"
+            );
+            assert_eq!(
+                engine.get_at(b"key", 15).unwrap(),
+                Some(b"v1".to_vec()),
+                "v1 visible at ts=15"
+            );
+            assert_eq!(
+                engine.get_at(b"key", 25).unwrap(),
+                Some(b"v2".to_vec()),
+                "v2 visible at ts=25"
+            );
         }
     }
 }
