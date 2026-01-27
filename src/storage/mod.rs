@@ -56,6 +56,7 @@
 //! Keys are encoded using TiDB-compatible format via the codec module.
 //! The storage layer is agnostic to key structure - it just stores bytes.
 
+pub mod compaction;
 pub mod config;
 pub mod lsm;
 pub mod memtable;
@@ -97,6 +98,9 @@ pub use version::{ManifestDelta, Version, VersionBuilder, MAX_LEVELS};
 
 // Re-export LSM engine
 pub use lsm::{LsmEngine, LsmStats};
+
+// Re-export compaction types
+pub use compaction::{CompactionExecutor, CompactionPicker, CompactionTask, MergeIterator};
 
 // Re-export SST types for persistent storage
 pub use sstable::{
