@@ -95,6 +95,41 @@ pub mod testkit {
 
     pub use crate::transaction::{ConcurrencyManager, Lock, TransactionService};
     pub use crate::tso::LocalTso;
+
+    // Test helper extension trait for TransactionService
+    use crate::clog::ClogService;
+    use crate::error::Result;
+    use crate::storage::StorageEngine;
+    use crate::transaction::{CommitInfo, TxnService};
+    use crate::tso::TsoService;
+
+    /// Extension trait for TransactionService with test-only autocommit helpers.
+    pub trait TxnServiceTestExt {
+        /// Execute a single put with autocommit (test helper).
+        fn autocommit_put(&self, key: &[u8], value: &[u8]) -> Result<CommitInfo>;
+
+        /// Execute a single delete with autocommit (test helper).
+        fn autocommit_delete(&self, key: &[u8]) -> Result<CommitInfo>;
+    }
+
+    impl<S, C, T> TxnServiceTestExt for TransactionService<S, C, T>
+    where
+        S: StorageEngine + 'static,
+        C: ClogService + 'static,
+        T: TsoService,
+    {
+        fn autocommit_put(&self, key: &[u8], value: &[u8]) -> Result<CommitInfo> {
+            let mut ctx = self.begin(false)?;
+            self.put(&mut ctx, key.to_vec(), value.to_vec())?;
+            self.commit(ctx)
+        }
+
+        fn autocommit_delete(&self, key: &[u8]) -> Result<CommitInfo> {
+            let mut ctx = self.begin(false)?;
+            self.delete(&mut ctx, key.to_vec())?;
+            self.commit(ctx)
+        }
+    }
 }
 
 // Internal imports (not re-exported)

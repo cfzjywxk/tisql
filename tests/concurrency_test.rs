@@ -33,7 +33,7 @@ use tisql::error::TiSqlError;
 use tisql::storage::mvcc::{is_tombstone, MvccKey};
 use tisql::testkit::{
     ConcurrencyManager, FileClogConfig, FileClogService, LocalTso, Lock, MemTableEngine,
-    TransactionService,
+    TransactionService, TxnServiceTestExt,
 };
 use tisql::types::{RawValue, Timestamp};
 use tisql::StorageEngine;
@@ -451,13 +451,13 @@ fn test_mvcc_read_at_timestamp() {
     let key = b"version_key";
 
     // Write version 1
-    let (_, ts1, _) = txn_service.autocommit_put(key, b"v1").unwrap();
+    let ts1 = txn_service.autocommit_put(key, b"v1").unwrap().commit_ts;
 
     // Write version 2
-    let (_, ts2, _) = txn_service.autocommit_put(key, b"v2").unwrap();
+    let ts2 = txn_service.autocommit_put(key, b"v2").unwrap().commit_ts;
 
     // Write version 3
-    let (_, ts3, _) = txn_service.autocommit_put(key, b"v3").unwrap();
+    let ts3 = txn_service.autocommit_put(key, b"v3").unwrap().commit_ts;
 
     assert!(ts1 < ts2);
     assert!(ts2 < ts3);
@@ -532,13 +532,13 @@ fn test_concurrent_read_after_delete() {
     let key = b"delete_key";
 
     // Write initial value
-    let (_, ts1, _) = txn_service.autocommit_put(key, b"value").unwrap();
+    let ts1 = txn_service.autocommit_put(key, b"value").unwrap().commit_ts;
 
     // Verify value exists
     assert!(get_for_test(&storage, key).is_some());
 
     // Delete
-    let (_, ts2, _) = txn_service.autocommit_delete(key).unwrap();
+    let ts2 = txn_service.autocommit_delete(key).unwrap().commit_ts;
     assert!(ts2 > ts1);
 
     // Read at latest should see nothing (deleted)
@@ -853,7 +853,10 @@ mod failpoint_tests {
             let value = format!("v{i}");
 
             // Each write will succeed in order since they wait for previous
-            let (_, ts, _) = txn_service.autocommit_put(key, value.as_bytes()).unwrap();
+            let ts = txn_service
+                .autocommit_put(key, value.as_bytes())
+                .unwrap()
+                .commit_ts;
             results.lock().unwrap().push((i, ts));
         }
 

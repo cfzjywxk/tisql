@@ -31,7 +31,7 @@ use super::api::{CommitInfo, TxnCtx, TxnService, TxnState};
 use super::concurrency::{ConcurrencyManager, Lock};
 use crate::storage::mvcc::{is_tombstone, MvccKey};
 use crate::storage::{StorageEngine, WriteBatch, WriteOp};
-use crate::types::{Key, Lsn, RawValue, Timestamp, TxnId};
+use crate::types::{Key, RawValue, Timestamp, TxnId};
 
 /// Transaction service manages transactions with durability and MVCC.
 ///
@@ -92,108 +92,6 @@ impl<S: StorageEngine, L: ClogService, T: TsoService> TransactionService<S, L, T
 
     /// Execute a write batch with durability guarantees (for direct/autocommit writes).
     ///
-    /// This is the core method for autocommit transactions with 1PC:
-    /// 1. Allocate commit_ts from TSO
-    /// 2. Acquire in-memory locks (blocks readers)
-    /// 3. Log all operations to commit log
-    /// 4. Sync commit log to disk (durability)
-    /// 5. Apply to storage with commit_ts
-    /// 6. Release locks (guards dropped)
-    pub fn execute_write(&self, mut batch: WriteBatch) -> Result<(TxnId, Timestamp, Lsn)> {
-        if batch.is_empty() {
-            let ts = self.get_ts();
-            return Ok((0, ts, 0));
-        }
-
-        // Acquire in-memory locks BEFORE getting commit_ts
-        // This prevents the "time-travel" anomaly where a reader with start_ts > commit_ts
-        // could miss data that commits after they started reading.
-        //
-        // By acquiring locks first:
-        // 1. Any concurrent reader will see the lock and be blocked
-        // 2. We then get commit_ts which is guaranteed > any concurrent reader's start_ts
-        //    because: start_ts = max(TSO, max_ts), and we update max_ts via lock_keys
-        //
-        // Get a preliminary timestamp for the lock (will be updated to commit_ts)
-        let preliminary_ts = self.get_ts();
-
-        // Get primary key (first key in batch) for lock info
-        let primary_key: Arc<[u8]> = batch
-            .keys()
-            .next()
-            .map(|k| Arc::from(k.as_slice()))
-            .unwrap_or_else(|| Arc::from(&[][..]));
-
-        let lock = Lock {
-            ts: preliminary_ts,
-            primary: primary_key,
-        };
-
-        // lock_keys takes an iterator - no need to clone keys into a Vec
-        let _guards = self.concurrency_manager.lock_keys(batch.keys(), lock)?;
-
-        // FAILPOINT: After locks acquired, before commit_ts computation.
-        // This is used to test the "commit in the past" fix - any reader
-        // starting now will have its start_ts recorded in max_ts, ensuring
-        // the writer's commit_ts > reader's start_ts.
-        #[cfg(feature = "failpoints")]
-        fail_point!("txn_after_lock_before_commit_ts");
-
-        // Now get commit_ts AFTER acquiring locks
-        // This ensures commit_ts > any concurrent reader's start_ts
-        let max_ts = self.concurrency_manager.max_ts();
-        let tso_ts = self.get_ts();
-        let commit_ts = std::cmp::max(max_ts + 1, tso_ts);
-        let txn_id = commit_ts;
-
-        // FAILPOINT: After commit_ts set, before any writes
-        // Readers checking now will see the lock and be blocked
-        #[cfg(feature = "failpoints")]
-        fail_point!("txn_after_lock_acquired");
-
-        // Write to commit log directly from batch references (zero-copy).
-        // The clog serializes directly from &batch without cloning key/value data.
-        let lsn = self
-            .clog_service
-            .write_batch(txn_id, &batch, commit_ts, true)?;
-
-        // FAILPOINT: After clog write, before storage apply
-        // Data is durable but not yet visible in storage
-        #[cfg(feature = "failpoints")]
-        fail_point!("txn_after_clog_write");
-
-        // Apply to storage engine with commit_ts AND clog LSN.
-        // Now we consume the batch (move ownership to storage).
-        // Threading the CLOG LSN to storage ensures proper recovery ordering:
-        // storage LSN == clog LSN, so flushed_lsn in SST metadata correctly
-        // identifies which clog entries have been persisted.
-        batch.set_commit_ts(commit_ts);
-        batch.set_clog_lsn(lsn);
-        self.storage.write_batch(batch)?;
-
-        // FAILPOINT: After storage apply, before lock release
-        // Data is visible in storage but locks still held
-        #[cfg(feature = "failpoints")]
-        fail_point!("txn_after_storage_apply");
-
-        // Guards dropped here -> locks released
-        Ok((txn_id, commit_ts, lsn))
-    }
-
-    /// Execute a single put with autocommit (for testing and simple writes).
-    pub fn autocommit_put(&self, key: &[u8], value: &[u8]) -> Result<(TxnId, Timestamp, Lsn)> {
-        let mut batch = WriteBatch::new();
-        batch.put(key.to_vec(), value.to_vec());
-        self.execute_write(batch)
-    }
-
-    /// Execute a single delete with autocommit (for testing and simple writes).
-    pub fn autocommit_delete(&self, key: &[u8]) -> Result<(TxnId, Timestamp, Lsn)> {
-        let mut batch = WriteBatch::new();
-        batch.delete(key.to_vec());
-        self.execute_write(batch)
-    }
-
     /// Recover state by replaying commit log entries.
     ///
     /// This should be called at startup to rebuild the in-memory state
@@ -471,8 +369,14 @@ impl<S: StorageEngine + 'static, L: ClogService + 'static, T: TsoService> TxnSer
             });
         }
 
-        // Acquire in-memory locks BEFORE getting commit_ts
-        // This prevents the "time-travel" anomaly (see execute_write for details)
+        // Acquire in-memory locks BEFORE getting commit_ts.
+        // This prevents the "time-travel" anomaly where a reader with start_ts > commit_ts
+        // could miss data that commits after they started reading.
+        //
+        // By acquiring locks first:
+        // 1. Any concurrent reader will see the lock and be blocked
+        // 2. We then get commit_ts which is guaranteed > any concurrent reader's start_ts
+        //    because: start_ts = max(TSO, max_ts), and we update max_ts via lock_keys
         let preliminary_ts = self.get_ts();
 
         // Get primary key (first key in write buffer) for lock info
@@ -619,19 +523,20 @@ mod tests {
         get_at_for_test(storage, key, Timestamp::MAX)
     }
 
+    // Import test extension trait for autocommit helpers
+    use crate::testkit::TxnServiceTestExt;
+
     #[test]
-    fn test_execute_write() {
+    fn test_autocommit_put() {
         let (storage, txn_service, _dir) = create_test_service();
 
-        // Execute a write
-        let mut batch = WriteBatch::new();
-        batch.put(b"key1".to_vec(), b"value1".to_vec());
-        batch.put(b"key2".to_vec(), b"value2".to_vec());
+        // Execute writes using proper transaction flow
+        let info = txn_service.autocommit_put(b"key1", b"value1").unwrap();
+        assert!(info.txn_id > 0);
+        assert!(info.commit_ts > 0);
+        assert!(info.lsn > 0);
 
-        let (txn_id, commit_ts, lsn) = txn_service.execute_write(batch).unwrap();
-        assert!(txn_id > 0);
-        assert!(commit_ts > 0);
-        assert!(lsn > 0);
+        txn_service.autocommit_put(b"key2", b"value2").unwrap();
 
         // Verify storage
         let v1 = get_for_test(&*storage, b"key1");
@@ -641,7 +546,7 @@ mod tests {
     }
 
     #[test]
-    fn test_execute_write_with_locking() {
+    fn test_autocommit_with_locking() {
         let (storage, txn_service, _dir) = create_test_service();
         let cm = txn_service.concurrency_manager();
 
@@ -705,10 +610,12 @@ mod tests {
         let (storage, txn_service, _dir) = create_test_service();
 
         // Write v1
-        let (_, ts1, _) = txn_service.autocommit_put(b"key", b"v1").unwrap();
+        let info1 = txn_service.autocommit_put(b"key", b"v1").unwrap();
+        let ts1 = info1.commit_ts;
 
         // Write v2
-        let (_, ts2, _) = txn_service.autocommit_put(b"key", b"v2").unwrap();
+        let info2 = txn_service.autocommit_put(b"key", b"v2").unwrap();
+        let ts2 = info2.commit_ts;
 
         // Reading at latest should see v2
         let v = get_for_test(&*storage, b"key");
