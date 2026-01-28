@@ -152,12 +152,12 @@ impl StorageEngine for CrossbeamMemTableEngine {
             .commit_ts()
             .ok_or_else(|| TiSqlError::Storage("WriteBatch must have commit_ts set".to_string()))?;
 
-        for op in batch.into_ops() {
+        for (key, op) in batch.into_iter() {
             match op {
-                WriteOp::Put { key, value } => {
+                WriteOp::Put { value } => {
                     self.put_at(&key, &value, commit_ts);
                 }
-                WriteOp::Delete { key } => {
+                WriteOp::Delete => {
                     self.delete_at(&key, commit_ts);
                 }
             }

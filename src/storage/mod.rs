@@ -267,10 +267,13 @@ pub trait StorageEngine: Send + Sync + 'static {
 // ============================================================================
 
 /// A write operation (put or delete).
+///
+/// Note: The key is stored separately in WriteBatch's HashMap, not in WriteOp.
+/// This avoids redundant key storage and cloning.
 #[derive(Clone, Debug)]
 pub enum WriteOp {
-    Put { key: Key, value: RawValue },
-    Delete { key: Key },
+    Put { value: RawValue },
+    Delete,
 }
 
 /// Batch of writes to apply atomically.
@@ -306,11 +309,9 @@ impl WriteBatch {
     /// If the key already exists in the batch (from a previous put or delete),
     /// the old operation is replaced. This ensures "last write wins" semantics.
     pub fn put(&mut self, key: impl Into<Key>, value: impl Into<RawValue>) {
-        let key = key.into();
         self.ops.insert(
-            key.clone(),
+            key.into(),
             WriteOp::Put {
-                key,
                 value: value.into(),
             },
         );
@@ -321,8 +322,7 @@ impl WriteBatch {
     /// If the key already exists in the batch (from a previous put or delete),
     /// the old operation is replaced. This ensures "last write wins" semantics.
     pub fn delete(&mut self, key: impl Into<Key>) {
-        let key = key.into();
-        self.ops.insert(key.clone(), WriteOp::Delete { key });
+        self.ops.insert(key.into(), WriteOp::Delete);
     }
 
     /// Clear all operations from the batch.
@@ -342,9 +342,9 @@ impl WriteBatch {
         self.ops.len()
     }
 
-    /// Iterate over the operations.
-    pub fn iter(&self) -> impl Iterator<Item = &WriteOp> {
-        self.ops.values()
+    /// Iterate over the operations as (key, op) pairs.
+    pub fn iter(&self) -> impl Iterator<Item = (&Key, &WriteOp)> {
+        self.ops.iter()
     }
 
     /// Get the operation for a specific key, if any.
@@ -352,9 +352,9 @@ impl WriteBatch {
         self.ops.get(key)
     }
 
-    /// Consume the batch and return the operations.
-    pub(crate) fn into_ops(self) -> Vec<WriteOp> {
-        self.ops.into_values().collect()
+    /// Consume the batch and return the operations as (key, op) pairs.
+    pub(crate) fn into_iter(self) -> impl Iterator<Item = (Key, WriteOp)> {
+        self.ops.into_iter()
     }
 
     /// Set the commit timestamp for MVCC.

@@ -239,9 +239,9 @@ fn estimate_batch_size(batch: &WriteBatch) -> usize {
 
     batch
         .iter()
-        .map(|op| match op {
-            crate::storage::WriteOp::Put { key, value } => key.len() + value.len() + ENTRY_OVERHEAD,
-            crate::storage::WriteOp::Delete { key } => key.len() + ENTRY_OVERHEAD,
+        .map(|(key, op)| match op {
+            crate::storage::WriteOp::Put { value } => key.len() + value.len() + ENTRY_OVERHEAD,
+            crate::storage::WriteOp::Delete => key.len() + ENTRY_OVERHEAD,
         })
         .sum()
 }

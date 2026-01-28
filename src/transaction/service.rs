@@ -300,8 +300,8 @@ impl<S: StorageEngine + 'static, L: ClogService + 'static, T: TsoService> TxnSer
         // WriteBatch has at most one op per key (last write wins)
         if let Some(op) = ctx.write_buffer.get(key) {
             return match op {
-                WriteOp::Put { value, .. } => Ok(Some(value.clone())),
-                WriteOp::Delete { .. } => Ok(None),
+                WriteOp::Put { value } => Ok(Some(value.clone())),
+                WriteOp::Delete => Ok(None),
             };
         }
 
@@ -400,15 +400,13 @@ impl<S: StorageEngine + 'static, L: ClogService + 'static, T: TsoService> TxnSer
         let mut buffer_ops: std::collections::BTreeMap<Key, Option<RawValue>> =
             std::collections::BTreeMap::new();
 
-        for op in ctx.write_buffer.iter() {
-            match op {
-                WriteOp::Put { key, value } => {
-                    if key >= &range.start && (range.end.is_empty() || key < &range.end) {
+        for (key, op) in ctx.write_buffer.iter() {
+            if key >= &range.start && (range.end.is_empty() || key < &range.end) {
+                match op {
+                    WriteOp::Put { value } => {
                         buffer_ops.insert(key.clone(), Some(value.clone()));
                     }
-                }
-                WriteOp::Delete { key } => {
-                    if key >= &range.start && (range.end.is_empty() || key < &range.end) {
+                    WriteOp::Delete => {
                         buffer_ops.insert(key.clone(), None); // None = deleted
                     }
                 }

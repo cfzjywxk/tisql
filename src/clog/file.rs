@@ -555,14 +555,14 @@ impl ClogService for FileClogService {
         let mut entries: Vec<ClogEntryRef<'_>> = Vec::with_capacity(entry_count);
         let mut lsn_idx = 0;
 
-        for op in batch.iter() {
+        for (key, op) in batch.iter() {
             let entry = match op {
-                WriteOp::Put { key, value } => ClogEntryRef {
+                WriteOp::Put { value } => ClogEntryRef {
                     lsn: lsns[lsn_idx],
                     txn_id,
                     op: ClogOpRef::Put { key, value },
                 },
-                WriteOp::Delete { key } => ClogEntryRef {
+                WriteOp::Delete => ClogEntryRef {
                     lsn: lsns[lsn_idx],
                     txn_id,
                     op: ClogOpRef::Delete { key },
