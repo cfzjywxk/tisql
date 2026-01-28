@@ -225,7 +225,7 @@ fn test_reader_sees_lock_immediately() {
     // Acquire lock
     let lock = Lock {
         ts: 100,
-        primary: key.clone(),
+        primary: key.clone().into(),
     };
     let guards = cm.lock_keys(std::slice::from_ref(&key), lock).unwrap();
 
@@ -347,7 +347,7 @@ fn test_range_lock_check() {
     // Lock a key in the middle of a range
     let lock = Lock {
         ts: 100,
-        primary: b"key_b".to_vec(),
+        primary: Arc::from(&b"key_b"[..]),
     };
     let _guards = cm.lock_keys(&[b"key_b".to_vec()], lock).unwrap();
 
@@ -389,7 +389,7 @@ fn test_concurrent_read_during_write() {
         // Acquire lock manually (simulating transaction)
         let lock = Lock {
             ts: 100,
-            primary: key_clone.clone(),
+            primary: key_clone.clone().into(),
         };
         let _guards = cm_write.lock_keys(&[key_clone], lock).unwrap();
 

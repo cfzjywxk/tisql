@@ -43,7 +43,7 @@
 //! - Version changes are atomic (swap pointer)
 
 use std::ops::Range;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicU64, Ordering as AtomicOrdering};
 use std::sync::{Arc, RwLock};
 
 #[cfg(feature = "failpoints")]
@@ -232,13 +232,13 @@ impl LsmEngine {
         if let Some(ref provider) = self.lsn_provider {
             provider.alloc_lsn()
         } else {
-            self.next_lsn.fetch_add(1, Ordering::SeqCst)
+            self.next_lsn.fetch_add(1, AtomicOrdering::SeqCst)
         }
     }
 
     /// Get the next memtable ID and increment.
     fn alloc_memtable_id(&self) -> u64 {
-        self.next_memtable_id.fetch_add(1, Ordering::SeqCst)
+        self.next_memtable_id.fetch_add(1, AtomicOrdering::SeqCst)
     }
 
     /// Allocate the next SST ID atomically.
@@ -246,7 +246,7 @@ impl LsmEngine {
     /// This is used during flush to ensure unique SST IDs even with concurrent flushes.
     /// Unlike Version::next_sst_id() which reads from a snapshot, this is atomic.
     fn alloc_sst_id(&self) -> u64 {
-        self.next_sst_id.fetch_add(1, Ordering::SeqCst)
+        self.next_sst_id.fetch_add(1, AtomicOrdering::SeqCst)
     }
 
     /// Get the number of frozen memtables.
@@ -558,10 +558,120 @@ impl LsmEngine {
     }
 }
 
+use std::collections::BinaryHeap;
+
+// Wrapper for SstIterator to implement the standard Iterator trait
+struct SstIteratorWrapper {
+    iter: SstIterator,
+    range: Range<MvccKey>,
+    is_unbounded: bool,
+}
+
+impl SstIteratorWrapper {
+    fn new(mut iter: SstIterator, range: Range<MvccKey>) -> Result<Self> {
+        let is_unbounded = range.start.is_unbounded() && range.end.is_unbounded();
+        if !is_unbounded {
+            iter.seek(range.start.as_bytes())?;
+        }
+        Ok(Self {
+            iter,
+            range,
+            is_unbounded,
+        })
+    }
+}
+
+impl Iterator for SstIteratorWrapper {
+    type Item = (MvccKey, RawValue);
+
+    fn next(&mut self) -> Option<Self::Item> {
+        if !self.iter.valid() {
+            return None;
+        }
+
+        let key_bytes = self.iter.key();
+
+        if !self.is_unbounded {
+            let end_slice: &[u8] = self.range.end.as_bytes();
+            if !end_slice.is_empty() && key_bytes >= end_slice {
+                return None;
+            }
+        }
+
+        let key = MvccKey::from_bytes_unchecked(key_bytes.to_vec());
+        let value = self.iter.value().to_vec();
+
+        self.iter.next().ok()?;
+
+        Some((key, value))
+    }
+}
+
+// A wrapper for any iterator to be used in the merge heap.
+struct HeapEntry {
+    item: (MvccKey, RawValue),
+    iter: Box<dyn Iterator<Item = (MvccKey, RawValue)>>,
+}
+
+impl PartialEq for HeapEntry {
+    fn eq(&self, other: &Self) -> bool {
+        self.item.0 == other.item.0
+    }
+}
+
+impl Eq for HeapEntry {}
+
+impl PartialOrd for HeapEntry {
+    fn partial_cmp(&self, other: &Self) -> Option<std::cmp::Ordering> {
+        Some(self.cmp(other))
+    }
+}
+
+impl Ord for HeapEntry {
+    fn cmp(&self, other: &Self) -> std::cmp::Ordering {
+        // Min-heap, so we reverse the comparison to get the smallest key
+        other.item.0.cmp(&self.item.0)
+    }
+}
+
+// The merge iterator.
+struct ScanMergeIterator {
+    heap: BinaryHeap<HeapEntry>,
+}
+
+impl ScanMergeIterator {
+    fn new(iters: Vec<Box<dyn Iterator<Item = (MvccKey, RawValue)>>>) -> Self {
+        let mut heap = BinaryHeap::new();
+        for mut iter in iters {
+            if let Some(item) = iter.next() {
+                heap.push(HeapEntry { item, iter });
+            }
+        }
+        Self { heap }
+    }
+}
+
+impl Iterator for ScanMergeIterator {
+    type Item = (MvccKey, RawValue);
+
+    fn next(&mut self) -> Option<Self::Item> {
+        if let Some(mut top) = self.heap.pop() {
+            let item = top.item;
+            if let Some(next_item) = top.iter.next() {
+                self.heap.push(HeapEntry {
+                    item: next_item,
+                    iter: top.iter,
+                });
+            }
+            Some(item)
+        } else {
+            None
+        }
+    }
+}
+
 impl StorageEngine for LsmEngine {
     fn scan(&self, range: Range<MvccKey>) -> Result<Vec<(MvccKey, RawValue)>> {
-        // Collect all MVCC keys from all sources (SSTs, frozen memtables, active memtable)
-        // Results are sorted by MVCC key (which gives natural ordering by key then descending ts)
         let (active, frozen, version) = {
             let state = self.state.read().unwrap();
             (
@@ -571,72 +681,41 @@ impl StorageEngine for LsmEngine {
             )
         };
 
-        let mut all_entries: Vec<(MvccKey, RawValue)> = Vec::new();
+        let mut iters: Vec<Box<dyn Iterator<Item = (MvccKey, RawValue)>>> = Vec::new();
 
-        // Convert MvccKey to bytes for comparison
-        let start_bytes: Vec<u8> = range.start.clone().into();
-        let end_bytes: Vec<u8> = range.end.clone().into();
-        let is_unbounded = start_bytes.is_empty() && end_bytes.is_empty();
-
-        // 1. Scan SST files (oldest data)
-        // Process all levels from highest to L0
-        for level in (0..MAX_LEVELS).rev() {
-            let ssts = version.ssts_at_level(level as u32);
-            let mut sorted_ssts: Vec<_> = ssts.iter().collect();
-            if level == 0 {
-                sorted_ssts.sort_by_key(|s| s.id);
-            }
-
-            for sst_meta in sorted_ssts {
+        // 1. Add SST iterators
+        for level in 0..MAX_LEVELS {
+            for sst_meta in version.ssts_at_level(level as u32) {
+                if !sst_meta.overlaps_mvcc(range.start.as_bytes(), range.end.as_bytes()) {
+                    continue;
+                }
                 let sst_path = self
                     .config
                     .sst_dir()
                     .join(format!("{:08}.sst", sst_meta.id));
-
                 if !sst_path.exists() {
                     continue;
                 }
-
                 let reader = SstReaderRef::open(&sst_path)?;
-                let mut iter = SstIterator::new(reader)?;
-
-                while iter.valid() {
-                    let mvcc_key_bytes = iter.key();
-                    let value = iter.value();
-
-                    // Check if within MVCC key range
-                    let in_range = if is_unbounded {
-                        true
-                    } else {
-                        mvcc_key_bytes >= start_bytes.as_slice()
-                            && (end_bytes.is_empty() || mvcc_key_bytes < end_bytes.as_slice())
-                    };
-
-                    if in_range {
-                        // Safety: SST keys are valid MVCC keys
-                        let mvcc = MvccKey::from_bytes_unchecked(mvcc_key_bytes.to_vec());
-                        all_entries.push((mvcc, value.to_vec()));
-                    }
-
-                    iter.next()?;
-                }
+                let sst_iter = SstIterator::new(reader)?;
+                iters.push(Box::new(SstIteratorWrapper::new(sst_iter, range.clone())?));
             }
         }
 
-        // 2. Scan frozen memtables (older to newer)
-        for memtable in frozen.iter().rev() {
-            let memtable_entries = memtable.inner().scan_mvcc(range.clone())?;
-            all_entries.extend(memtable_entries);
+        // 2. Add frozen memtable iterators (newest to oldest)
+        for memtable in &frozen {
+            let mem_iter = memtable.scan(range.clone())?;
+            iters.push(Box::new(mem_iter.into_iter()));
         }
 
-        // 3. Scan active memtable (newest data)
-        let active_entries = active.inner().scan_mvcc(range)?;
-        all_entries.extend(active_entries);
+        // 3. Add active memtable iterator
+        let active_iter = active.scan(range.clone())?;
+        iters.push(Box::new(active_iter.into_iter()));
 
-        // Sort by MVCC key to maintain ordering
-        all_entries.sort_by(|a, b| a.0.cmp(&b.0));
+        // Use a merge iterator to get sorted results efficiently
+        let merge_iter = ScanMergeIterator::new(iters);
 
-        Ok(all_entries)
+        Ok(merge_iter.collect())
     }
 
     fn write_batch(&self, batch: WriteBatch) -> Result<()> {

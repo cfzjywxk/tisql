@@ -121,7 +121,7 @@ impl<S: StorageEngine, L: ClogService, T: TsoService> TransactionService<S, L, T
         let preliminary_ts = self.get_ts();
         let lock = Lock {
             ts: preliminary_ts,
-            primary: keys.first().cloned().unwrap_or_default(),
+            primary: Arc::from(keys.first().map(|k| k.as_slice()).unwrap_or(&[])),
         };
         let _guards = self.concurrency_manager.lock_keys(&keys, lock)?;
 
@@ -492,7 +492,7 @@ impl<S: StorageEngine + 'static, L: ClogService + 'static, T: TsoService> TxnSer
         let preliminary_ts = self.get_ts();
         let lock = Lock {
             ts: preliminary_ts,
-            primary: keys.first().cloned().unwrap_or_default(),
+            primary: Arc::from(keys.first().map(|k| k.as_slice()).unwrap_or(&[])),
         };
         let _guards = self.concurrency_manager.lock_keys(&keys, lock)?;
 

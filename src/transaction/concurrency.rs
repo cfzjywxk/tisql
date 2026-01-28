@@ -56,7 +56,7 @@ pub struct Lock {
     /// Transaction's start_ts / commit_ts
     pub ts: Timestamp,
     /// Primary key (for future 2PC support)
-    pub primary: Key,
+    pub primary: Arc<[u8]>,
 }
 
 /// Guard that holds a lock until dropped.
@@ -179,7 +179,7 @@ impl ConcurrencyManager {
                 return Err(TiSqlError::KeyIsLocked {
                     key: key.clone(),
                     lock_ts: existing_lock.ts,
-                    primary: existing_lock.primary.clone(),
+                    primary: existing_lock.primary.to_vec(),
                 });
             }
 
@@ -206,7 +206,7 @@ impl ConcurrencyManager {
             return Err(TiSqlError::KeyIsLocked {
                 key: key.to_vec(),
                 lock_ts: lock.ts,
-                primary: lock.primary.clone(),
+                primary: lock.primary.to_vec(),
             });
         }
         Ok(())
@@ -227,7 +227,7 @@ impl ConcurrencyManager {
             return Err(TiSqlError::KeyIsLocked {
                 key: entry.key().clone(),
                 lock_ts: lock.ts,
-                primary: lock.primary.clone(),
+                primary: lock.primary.to_vec(),
             });
         }
         Ok(())
@@ -272,7 +272,7 @@ mod tests {
         let keys = vec![b"key1".to_vec(), b"key2".to_vec()];
         let lock = Lock {
             ts: 100,
-            primary: b"key1".to_vec(),
+            primary: Arc::from(&b"key1"[..]),
         };
 
         let guards = cm.lock_keys(&keys, lock).unwrap();
@@ -294,7 +294,7 @@ mod tests {
         let keys = vec![b"key1".to_vec()];
         let lock = Lock {
             ts: 100,
-            primary: b"key1".to_vec(),
+            primary: Arc::from(&b"key1"[..]),
         };
 
         {
@@ -315,11 +315,11 @@ mod tests {
         let keys = vec![b"key1".to_vec()];
         let lock1 = Lock {
             ts: 100,
-            primary: b"key1".to_vec(),
+            primary: Arc::from(&b"key1"[..]),
         };
         let lock2 = Lock {
             ts: 200,
-            primary: b"key1".to_vec(),
+            primary: Arc::from(&b"key1"[..]),
         };
 
         // First lock succeeds
@@ -337,7 +337,7 @@ mod tests {
         let keys = vec![b"key2".to_vec()];
         let lock = Lock {
             ts: 100,
-            primary: b"key2".to_vec(),
+            primary: Arc::from(&b"key2"[..]),
         };
 
         let _guards = cm.lock_keys(&keys, lock).unwrap();
@@ -358,7 +358,7 @@ mod tests {
         // First, lock k2 with a different transaction
         let lock_other = Lock {
             ts: 50,
-            primary: b"other".to_vec(),
+            primary: Arc::from(&b"other"[..]),
         };
         let _guard_k2 = cm.lock_keys(&[b"k2".to_vec()], lock_other).unwrap();
         assert_eq!(cm.lock_count(), 1);
@@ -366,7 +366,7 @@ mod tests {
         // Now try to lock k1, k2, k3 - k2 should fail
         let lock_ours = Lock {
             ts: 100,
-            primary: b"k1".to_vec(),
+            primary: Arc::from(&b"k1"[..]),
         };
         let keys = vec![b"k1".to_vec(), b"k2".to_vec(), b"k3".to_vec()];
         let result = cm.lock_keys(&keys, lock_ours);
