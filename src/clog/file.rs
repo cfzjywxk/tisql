@@ -30,10 +30,11 @@ use fail::fail_point;
 
 use crate::error::{Result, TiSqlError};
 use crate::lsn::{AtomicLsnProvider, LsnProvider, SharedLsnProvider};
-use crate::types::Lsn;
+use crate::storage::{WriteBatch, WriteOp};
+use crate::types::{Lsn, Timestamp, TxnId};
 use crate::{log_info, log_trace, log_warn};
 
-use super::{ClogBatch, ClogEntry, ClogService};
+use super::{ClogBatch, ClogEntry, ClogEntryRef, ClogOpRef, ClogService};
 
 /// File header magic bytes: "CLOG"
 const FILE_MAGIC: &[u8; 4] = b"CLOG";
@@ -431,6 +432,49 @@ impl FileClogService {
 
         Ok(())
     }
+
+    /// Write a record from reference-based entries (zero-copy serialization).
+    ///
+    /// The on-disk format is identical to `write_record`, but this method
+    /// serializes directly from borrowed data without requiring owned copies.
+    fn write_record_refs<W: Write>(writer: &mut W, entries: &[ClogEntryRef<'_>]) -> Result<()> {
+        // Serialize entries (bincode works with references via Serialize trait)
+        let data = bincode::serialize(entries).map_err(|e| {
+            TiSqlError::Internal(format!("Failed to serialize commit log entries: {e}"))
+        })?;
+
+        // Guard against records larger than u32::MAX (length field is u32)
+        if data.len() > u32::MAX as usize {
+            return Err(TiSqlError::Internal(format!(
+                "Record size {} exceeds maximum {} (u32::MAX)",
+                data.len(),
+                u32::MAX
+            )));
+        }
+
+        // Also enforce our practical limit
+        if data.len() > MAX_RECORD_SIZE {
+            return Err(TiSqlError::Internal(format!(
+                "Record size {} exceeds maximum {}",
+                data.len(),
+                MAX_RECORD_SIZE
+            )));
+        }
+
+        // Compute checksum
+        let checksum = crc32(&data);
+
+        // Write header: record_type (4) + length (4) + checksum (4)
+        let record_type: u32 = 1; // Entry record
+        writer.write_all(&record_type.to_le_bytes())?;
+        writer.write_all(&(data.len() as u32).to_le_bytes())?;
+        writer.write_all(&checksum.to_le_bytes())?;
+
+        // Write data
+        writer.write_all(&data)?;
+
+        Ok(())
+    }
 }
 
 impl ClogService for FileClogService {
@@ -474,6 +518,84 @@ impl ClogService for FileClogService {
         log_trace!(
             "Wrote {} entries to commit log, lsn={}-{}",
             batch.len(),
+            start_lsn,
+            end_lsn
+        );
+
+        Ok(end_lsn)
+    }
+
+    fn write_batch(
+        &self,
+        txn_id: TxnId,
+        batch: &WriteBatch,
+        commit_ts: Timestamp,
+        sync: bool,
+    ) -> Result<Lsn> {
+        if batch.is_empty() {
+            return Ok(self.lsn_provider.current_lsn());
+        }
+
+        // Count entries: one per op + one for commit record
+        let entry_count = batch.len() + 1;
+
+        // Acquire lock BEFORE assigning LSNs to ensure writes are ordered
+        let mut writer = self.writer.lock().unwrap();
+
+        // Allocate LSNs for all entries
+        let mut lsns = Vec::with_capacity(entry_count);
+        for _ in 0..entry_count {
+            lsns.push(self.lsn_provider.alloc_lsn());
+        }
+        let start_lsn = lsns[0];
+        let end_lsn = *lsns.last().unwrap();
+
+        // Build reference-based entries directly from WriteBatch
+        // No cloning - we serialize directly from the borrowed data
+        let mut entries: Vec<ClogEntryRef<'_>> = Vec::with_capacity(entry_count);
+        let mut lsn_idx = 0;
+
+        for op in batch.iter() {
+            let entry = match op {
+                WriteOp::Put { key, value } => ClogEntryRef {
+                    lsn: lsns[lsn_idx],
+                    txn_id,
+                    op: ClogOpRef::Put { key, value },
+                },
+                WriteOp::Delete { key } => ClogEntryRef {
+                    lsn: lsns[lsn_idx],
+                    txn_id,
+                    op: ClogOpRef::Delete { key },
+                },
+            };
+            entries.push(entry);
+            lsn_idx += 1;
+        }
+
+        // Add commit record
+        entries.push(ClogEntryRef {
+            lsn: lsns[lsn_idx],
+            txn_id,
+            op: ClogOpRef::Commit { commit_ts },
+        });
+
+        // Write to file using reference-based serialization
+        Self::write_record_refs(&mut *writer, &entries)?;
+        writer.flush()?;
+
+        if sync {
+            #[cfg(feature = "failpoints")]
+            fail_point!("clog_before_sync");
+
+            writer.get_ref().sync_data()?;
+
+            #[cfg(feature = "failpoints")]
+            fail_point!("clog_after_sync");
+        }
+
+        log_trace!(
+            "Wrote {} entries to commit log (zero-copy), lsn={}-{}",
+            entry_count,
             start_lsn,
             end_lsn
         );

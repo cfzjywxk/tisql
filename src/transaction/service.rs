@@ -23,7 +23,7 @@ use std::sync::Arc;
 #[cfg(feature = "failpoints")]
 use fail::fail_point;
 
-use crate::clog::{ClogBatch, ClogEntry, ClogOp, ClogService};
+use crate::clog::{ClogEntry, ClogOp, ClogService};
 use crate::error::{Result, TiSqlError};
 use crate::tso::TsoService;
 
@@ -99,7 +99,7 @@ impl<S: StorageEngine, L: ClogService, T: TsoService> TransactionService<S, L, T
     /// 4. Sync commit log to disk (durability)
     /// 5. Apply to storage with commit_ts
     /// 6. Release locks (guards dropped)
-    pub fn execute_write(&self, batch: WriteBatch) -> Result<(TxnId, Timestamp, Lsn)> {
+    pub fn execute_write(&self, mut batch: WriteBatch) -> Result<(TxnId, Timestamp, Lsn)> {
         if batch.is_empty() {
             let ts = self.get_ts();
             return Ok((0, ts, 0));
@@ -151,43 +151,25 @@ impl<S: StorageEngine, L: ClogService, T: TsoService> TransactionService<S, L, T
         #[cfg(feature = "failpoints")]
         fail_point!("txn_after_lock_acquired");
 
-        // Build commit log batch and storage batch from write ops
-        // Take ownership of ops to avoid extra clones
-        let mut clog_batch = ClogBatch::new();
-        let mut storage_batch = WriteBatch::new();
-
-        for op in batch.into_ops() {
-            match op {
-                WriteOp::Put { key, value } => {
-                    // Clone for clog, use owned for storage
-                    clog_batch.add_put(txn_id, key.clone(), value.clone());
-                    storage_batch.put(key, value);
-                }
-                WriteOp::Delete { key } => {
-                    clog_batch.add_delete(txn_id, key.clone());
-                    storage_batch.delete(key);
-                }
-            }
-        }
-
-        // Add commit record
-        clog_batch.add_commit(txn_id, commit_ts);
-
-        // Write to commit log with sync (durability guarantee)
-        let lsn = self.clog_service.write(&mut clog_batch, true)?;
+        // Write to commit log directly from batch references (zero-copy).
+        // The clog serializes directly from &batch without cloning key/value data.
+        let lsn = self
+            .clog_service
+            .write_batch(txn_id, &batch, commit_ts, true)?;
 
         // FAILPOINT: After clog write, before storage apply
         // Data is durable but not yet visible in storage
         #[cfg(feature = "failpoints")]
         fail_point!("txn_after_clog_write");
 
-        // Apply to storage engine with commit_ts AND clog LSN
+        // Apply to storage engine with commit_ts AND clog LSN.
+        // Now we consume the batch (move ownership to storage).
         // Threading the CLOG LSN to storage ensures proper recovery ordering:
         // storage LSN == clog LSN, so flushed_lsn in SST metadata correctly
         // identifies which clog entries have been persisted.
-        storage_batch.set_commit_ts(commit_ts);
-        storage_batch.set_clog_lsn(lsn);
-        self.storage.write_batch(storage_batch)?;
+        batch.set_commit_ts(commit_ts);
+        batch.set_clog_lsn(lsn);
+        self.storage.write_batch(batch)?;
 
         // FAILPOINT: After storage apply, before lock release
         // Data is visible in storage but locks still held
@@ -521,34 +503,19 @@ impl<S: StorageEngine + 'static, L: ClogService + 'static, T: TsoService> TxnSer
         let max_ts = self.concurrency_manager.max_ts();
         let tso_ts = self.get_ts();
         let commit_ts = std::cmp::max(max_ts + 1, tso_ts);
-
-        // Build commit log batch from write buffer ops
-        // Use into_ops() to take ownership and avoid cloning
-        let mut clog_batch = ClogBatch::new();
         let txn_id = ctx.txn_id;
-        let ops = ctx.write_buffer.into_ops();
-        let mut storage_batch = WriteBatch::new();
 
-        for op in ops {
-            match op {
-                WriteOp::Put { key, value } => {
-                    // Add to clog (takes ownership)
-                    clog_batch.add_put(txn_id, key.clone(), value.clone());
-                    // Add to storage batch
-                    storage_batch.put(key, value);
-                }
-                WriteOp::Delete { key } => {
-                    clog_batch.add_delete(txn_id, key.clone());
-                    storage_batch.delete(key);
-                }
-            }
-        }
-        clog_batch.add_commit(txn_id, commit_ts);
+        // Take ownership of write buffer (swap with empty)
+        let mut storage_batch = std::mem::take(&mut ctx.write_buffer);
 
-        // Write to commit log with sync (durability guarantee)
-        let lsn = self.clog_service.write(&mut clog_batch, true)?;
+        // Write to commit log directly from batch references (zero-copy).
+        // The clog serializes directly from &storage_batch without cloning key/value data.
+        let lsn = self
+            .clog_service
+            .write_batch(txn_id, &storage_batch, commit_ts, true)?;
 
-        // Apply to storage with commit_ts AND clog LSN for proper recovery ordering
+        // Apply to storage with commit_ts AND clog LSN for proper recovery ordering.
+        // Now we consume the batch (move ownership to storage).
         storage_batch.set_commit_ts(commit_ts);
         storage_batch.set_clog_lsn(lsn);
         self.storage.write_batch(storage_batch)?;

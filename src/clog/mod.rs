@@ -31,6 +31,7 @@ mod file;
 pub use file::{FileClogConfig, FileClogService, TruncateStats};
 
 use crate::error::Result;
+use crate::storage::WriteBatch;
 use crate::types::{Key, Lsn, RawValue, Timestamp, TxnId};
 use serde::{Deserialize, Serialize};
 
@@ -56,6 +57,25 @@ pub enum ClogOp {
     Commit { commit_ts: Timestamp },
     /// Rollback a transaction
     Rollback,
+}
+
+/// Reference-based clog entry for zero-copy serialization.
+///
+/// This allows serializing directly from borrowed data without cloning.
+/// The on-disk format is identical to `ClogEntry`.
+#[derive(Serialize)]
+pub(crate) struct ClogEntryRef<'a> {
+    pub lsn: Lsn,
+    pub txn_id: TxnId,
+    pub op: ClogOpRef<'a>,
+}
+
+/// Reference-based clog operation for zero-copy serialization.
+#[derive(Serialize)]
+pub(crate) enum ClogOpRef<'a> {
+    Put { key: &'a [u8], value: &'a [u8] },
+    Delete { key: &'a [u8] },
+    Commit { commit_ts: Timestamp },
 }
 
 /// Batch of commit log entries for atomic append
@@ -127,6 +147,24 @@ impl ClogBatch {
 pub trait ClogService: Send + Sync {
     /// Append batch atomically, returns last LSN
     fn write(&self, batch: &mut ClogBatch, sync: bool) -> Result<Lsn>;
+
+    /// Write a transaction's WriteBatch directly to clog without cloning.
+    ///
+    /// This is the preferred method for the commit path - it serializes directly
+    /// from the WriteBatch's references, avoiding unnecessary allocations.
+    ///
+    /// # Arguments
+    /// * `txn_id` - Transaction ID
+    /// * `batch` - The storage WriteBatch (borrowed, not consumed)
+    /// * `commit_ts` - Commit timestamp for the transaction
+    /// * `sync` - Whether to fsync after write
+    fn write_batch(
+        &self,
+        txn_id: TxnId,
+        batch: &WriteBatch,
+        commit_ts: Timestamp,
+        sync: bool,
+    ) -> Result<Lsn>;
 
     /// Append single entry, returns LSN
     fn append(&self, entry: ClogEntry, sync: bool) -> Result<Lsn> {
