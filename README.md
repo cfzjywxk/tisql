@@ -1,15 +1,18 @@
 # TiSQL
 
-A minimal SQL database in Rust with MySQL protocol support.
+A minimal SQL database in Rust with MySQL protocol support, designed for learning database internals.
 
 [![CI](https://github.com/cfzjywxk/tisql/actions/workflows/ci.yml/badge.svg)](https://github.com/cfzjywxk/tisql/actions/workflows/ci.yml)
+[![License](https://img.shields.io/badge/license-Apache%202.0-blue.svg)](LICENSE)
 
 ## Features
 
-- MySQL wire protocol compatibility
-- Basic SQL support (CREATE, INSERT, SELECT, UPDATE, DELETE)
-- In-memory storage engine
-- TiDB-compatible key encoding
+- **MySQL Protocol**: Connect using any MySQL client
+- **SQL Support**: CREATE, INSERT, SELECT, UPDATE, DELETE
+- **MVCC**: Snapshot isolation with TiDB-compatible key encoding
+- **Durability**: LSM-tree storage with WAL (commit log)
+- **Concurrency**: Lock table with KeyHandle pattern (TiKV-style)
+- **Recovery**: Crash-safe with coordinated clog/ilog recovery
 
 ## Quick Start
 
@@ -17,13 +20,27 @@ A minimal SQL database in Rust with MySQL protocol support.
 # Start the server
 cargo run
 
-# Connect using mysql client
+# Connect using mysql client (in another terminal)
 mysql -h127.0.0.1 -P4000 -uroot test
 
 # Example SQL
 CREATE TABLE users (id INT, name VARCHAR(100));
 INSERT INTO users VALUES (1, 'Alice'), (2, 'Bob');
 SELECT * FROM users;
+UPDATE users SET name = 'Charlie' WHERE id = 1;
+DELETE FROM users WHERE id = 2;
+```
+
+## Server Options
+
+```bash
+cargo run -- --help
+
+# Common options:
+#   -H, --host <HOST>       Host to bind (default: 127.0.0.1)
+#   -P, --port <PORT>       Port to listen (default: 4000)
+#   -D, --data-dir <DIR>    Data directory (default: data)
+#   -L, --log-level <LEVEL> Log level: trace/debug/info/warn/error (default: info)
 ```
 
 ## Building
@@ -34,41 +51,72 @@ cargo build
 
 # Release build
 cargo build --release
+
+# Format and lint
+cargo fmt && cargo clippy
 ```
 
 ## Testing
 
 ```bash
 # Run all tests
-make test
+cargo test --lib                    # Unit tests
+cargo test --test store_test        # Integration tests
+cargo test --test testkit           # Test utilities
 
-# Or individually:
-cargo test --lib          # Unit tests
-cargo test --test store_test   # Integration tests
-cargo run --bin mysqltest-runner -- --all  # E2E tests
+# Run E2E tests (MySQL-test style)
+cargo run --bin mysqltest-runner -- --all
+
+# Run with failpoints (for concurrency testing)
+cargo test --test concurrency_test --features failpoints
 ```
 
-See [TESTING.md](TESTING.md) for detailed testing documentation.
+## Architecture
+
+```
+                         MySQL Client
+                              |
+                    +---------+---------+
+                    |  Protocol Layer   |  opensrv-mysql
+                    +---------+---------+
+                              |
+                    +---------+---------+
+                    |    SQL Layer      |  Parser -> Binder -> Executor
+                    +---------+---------+
+                              |
+                    +---------+---------+
+                    | Transaction Layer |  TxnService + ConcurrencyManager
+                    +---------+---------+
+                              |
+                    +---------+---------+
+                    |   Storage Layer   |  LSM Engine + Clog + Ilog
+                    +-------------------+
+```
 
 ## Project Structure
 
 ```
 src/
-├── catalog/     # Table metadata management
-├── codec/       # TiDB-compatible key/value encoding
-├── executor/    # Query execution engine
-├── protocol/    # MySQL wire protocol
-├── sql/         # SQL parsing and binding
-├── storage/     # Storage engine
-├── transaction/ # Transaction management
-├── types/       # Data types and values
-└── worker/      # Thread pool for database work
-
-tests/
-├── integrationtest/  # E2E MySQL-test style tests
-├── store_test.rs     # Integration tests
-└── testkit.rs        # Test utilities
+├── lib.rs           # Public API: Database, traits
+├── catalog/         # Table metadata (MVCC-based)
+├── codec/           # TiDB-compatible key encoding
+├── clog/            # Commit log (WAL)
+├── executor/        # Volcano-style execution
+├── protocol/        # MySQL wire protocol
+├── session/         # Per-connection state
+├── sql/             # Parser, Binder
+├── storage/         # LSM engine, memtables, SSTables
+├── transaction/     # TxnService, ConcurrencyManager
+├── tso/             # Timestamp oracle
+└── worker/          # yatp thread pool
 ```
+
+## Design Highlights
+
+- **Trait-based layering**: Each layer depends on traits, not implementations
+- **TiDB/TiKV patterns**: MVCC key encoding, ConcurrencyManager, TSO
+- **OceanBase patterns**: Unified TxnService with TxnCtx context
+- **Zero-copy lock table**: KeyHandle pattern minimizes key cloning
 
 ## License
 

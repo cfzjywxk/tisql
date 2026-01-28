@@ -227,7 +227,7 @@ fn test_reader_sees_lock_immediately() {
         ts: 100,
         primary: key.clone().into(),
     };
-    let guards = cm.lock_keys(std::slice::from_ref(&key), lock).unwrap();
+    let guards = cm.lock_keys(std::iter::once(&key), lock).unwrap();
 
     // Immediately visible to reader
     let result = cm.check_lock(&key, 1);
@@ -349,7 +349,8 @@ fn test_range_lock_check() {
         ts: 100,
         primary: Arc::from(&b"key_b"[..]),
     };
-    let _guards = cm.lock_keys(&[b"key_b".to_vec()], lock).unwrap();
+    let key_b = b"key_b".to_vec();
+    let _guards = cm.lock_keys(std::iter::once(&key_b), lock).unwrap();
 
     // Range containing locked key should fail
     assert!(cm.check_range(b"key_a", b"key_c", 1).is_err());
@@ -391,7 +392,9 @@ fn test_concurrent_read_during_write() {
             ts: 100,
             primary: key_clone.clone().into(),
         };
-        let _guards = cm_write.lock_keys(&[key_clone], lock).unwrap();
+        let _guards = cm_write
+            .lock_keys(std::iter::once(&key_clone), lock)
+            .unwrap();
 
         // Signal writer has started
         writer_started_clone.store(true, Ordering::Release);

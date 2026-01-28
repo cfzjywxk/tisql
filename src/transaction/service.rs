@@ -105,9 +105,6 @@ impl<S: StorageEngine, L: ClogService, T: TsoService> TransactionService<S, L, T
             return Ok((0, ts, 0));
         }
 
-        // Collect keys for locking (need owned Keys for lock_keys API)
-        let keys: Vec<Key> = batch.keys().cloned().collect();
-
         // Acquire in-memory locks BEFORE getting commit_ts
         // This prevents the "time-travel" anomaly where a reader with start_ts > commit_ts
         // could miss data that commits after they started reading.
@@ -119,11 +116,21 @@ impl<S: StorageEngine, L: ClogService, T: TsoService> TransactionService<S, L, T
         //
         // Get a preliminary timestamp for the lock (will be updated to commit_ts)
         let preliminary_ts = self.get_ts();
+
+        // Get primary key (first key in batch) for lock info
+        let primary_key: Arc<[u8]> = batch
+            .keys()
+            .next()
+            .map(|k| Arc::from(k.as_slice()))
+            .unwrap_or_else(|| Arc::from(&[][..]));
+
         let lock = Lock {
             ts: preliminary_ts,
-            primary: Arc::from(keys.first().map(|k| k.as_slice()).unwrap_or(&[])),
+            primary: primary_key,
         };
-        let _guards = self.concurrency_manager.lock_keys(&keys, lock)?;
+
+        // lock_keys takes an iterator - no need to clone keys into a Vec
+        let _guards = self.concurrency_manager.lock_keys(batch.keys(), lock)?;
 
         // FAILPOINT: After locks acquired, before commit_ts computation.
         // This is used to test the "commit in the past" fix - any reader
@@ -484,17 +491,27 @@ impl<S: StorageEngine + 'static, L: ClogService + 'static, T: TsoService> TxnSer
             });
         }
 
-        // Collect keys for locking (need owned Keys for lock_keys API)
-        let keys: Vec<Key> = ctx.write_buffer.keys().cloned().collect();
-
         // Acquire in-memory locks BEFORE getting commit_ts
         // This prevents the "time-travel" anomaly (see execute_write for details)
         let preliminary_ts = self.get_ts();
+
+        // Get primary key (first key in write buffer) for lock info
+        let primary_key: Arc<[u8]> = ctx
+            .write_buffer
+            .keys()
+            .next()
+            .map(|k| Arc::from(k.as_slice()))
+            .unwrap_or_else(|| Arc::from(&[][..]));
+
         let lock = Lock {
             ts: preliminary_ts,
-            primary: Arc::from(keys.first().map(|k| k.as_slice()).unwrap_or(&[])),
+            primary: primary_key,
         };
-        let _guards = self.concurrency_manager.lock_keys(&keys, lock)?;
+
+        // lock_keys takes an iterator - no need to clone keys into a Vec
+        let _guards = self
+            .concurrency_manager
+            .lock_keys(ctx.write_buffer.keys(), lock)?;
 
         // FAILPOINT: After locks acquired, before commit_ts computation
         #[cfg(feature = "failpoints")]
