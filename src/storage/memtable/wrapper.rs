@@ -41,7 +41,7 @@ use crate::storage::mvcc::MvccKey;
 use crate::storage::{StorageEngine, WriteBatch};
 use crate::types::RawValue;
 
-use super::CrossbeamMemTableEngine;
+use super::VersionedMemTableEngine;
 
 /// MemTable wrapper with LSM metadata.
 ///
@@ -56,8 +56,8 @@ pub struct MemTable {
     /// Unique memtable ID (monotonically increasing)
     id: u64,
 
-    /// Underlying memtable engine
-    inner: CrossbeamMemTableEngine,
+    /// Underlying memtable engine (OceanBase-style versioned memtable)
+    inner: VersionedMemTableEngine,
 
     /// Approximate memory size in bytes.
     ///
@@ -92,7 +92,7 @@ impl MemTable {
     pub fn new(id: u64) -> Self {
         Self {
             id,
-            inner: CrossbeamMemTableEngine::new(),
+            inner: VersionedMemTableEngine::new(),
             approximate_size: AtomicUsize::new(0),
             min_lsn: AtomicU64::new(u64::MAX),
             max_lsn: AtomicU64::new(0),
@@ -226,7 +226,7 @@ impl MemTable {
     /// Get the underlying engine reference for iteration.
     ///
     /// This is used during flush to iterate over all entries.
-    pub fn inner(&self) -> &CrossbeamMemTableEngine {
+    pub fn inner(&self) -> &VersionedMemTableEngine {
         &self.inner
     }
 }
@@ -235,7 +235,10 @@ impl MemTable {
 ///
 /// This is a rough estimate: key size + value size + overhead per entry.
 fn estimate_batch_size(batch: &WriteBatch) -> usize {
-    const ENTRY_OVERHEAD: usize = 48; // skiplist node + timestamp encoding
+    // VersionedMemTableEngine has different overhead than crossbeam:
+    // - ~64 bytes for VersionNode (ts, value vec, next pointer)
+    // - Skiplist node overhead shared across versions of same key
+    const ENTRY_OVERHEAD: usize = 64;
 
     batch
         .iter()
@@ -489,8 +492,8 @@ mod tests {
         batch.put(b"longer_key".to_vec(), b"longer_value".to_vec()); // 10 + 12 = 22 bytes + overhead
 
         let size = estimate_batch_size(&batch);
-        // Each entry has 48 bytes overhead, so:
-        // (3 + 5 + 48) + (10 + 12 + 48) = 56 + 70 = 126
+        // Each entry has 64 bytes overhead, so:
+        // (3 + 5 + 64) + (10 + 12 + 64) = 72 + 86 = 158
         assert!(size >= 8 + 22, "Size should include key/value bytes");
         assert!(size > 8 + 22, "Size should include overhead");
     }

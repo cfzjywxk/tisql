@@ -355,11 +355,11 @@ impl LsmEngine {
         // SSTs MUST store MVCC keys (key || !commit_ts) to preserve version information
         // for correct MVCC semantics during reads. Unlike the old approach that stored decoded
         // keys, this preserves all versions and their timestamps.
-        let inner = memtable.inner();
+        //
         // Use truly unbounded range - MvccKey::unbounded() creates empty placeholder
         // that signals "scan all entries" to the memtable.
         let range = MvccKey::unbounded()..MvccKey::unbounded();
-        let entries = inner.scan_mvcc(range)?;
+        let entries = memtable.inner().scan(range)?;
 
         for (mvcc_key, value) in entries {
             builder.add(mvcc_key.as_bytes(), &value)?;

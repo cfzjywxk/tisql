@@ -14,14 +14,20 @@
 
 //! Sysbench-like OLTP benchmark tool for comparing memtable implementations.
 //!
-//! This tool simulates sysbench OLTP_RW workload to benchmark the three
-//! memtable implementations:
+//! This tool simulates sysbench OLTP_RW workload to benchmark memtable implementations:
+//!
+//! - VersionedMemTableEngine (production default - OceanBase-style user key + version chain)
+//!
+//! Legacy engines (require `--features bench`):
 //! - CrossbeamMemTableEngine (lock-free with epoch-based GC)
 //! - ArenaMemTableEngine (arena-based skip list)
 //! - BTreeMemTableEngine (BTreeMap with RwLock, baseline)
 //!
 //! Usage:
 //!     cargo run --release --bin sysbench-sim -- [OPTIONS]
+//!
+//! For comparison benchmarks:
+//!     cargo run --release --features bench --bin sysbench-sim -- --engine all
 //!
 //! Example:
 //!     cargo run --release --bin sysbench-sim -- --threads 8 --time 30 --tables 1 --table-size 100000
@@ -38,9 +44,11 @@ use std::time::{Duration, Instant};
 use clap::Parser;
 
 use tisql::storage::mvcc::{is_tombstone, MvccKey};
-use tisql::storage::{
-    ArenaMemTableEngine, BTreeMemTableEngine, CrossbeamMemTableEngine, StorageEngine, WriteBatch,
-};
+use tisql::storage::{StorageEngine, VersionedMemTableEngine, WriteBatch};
+
+// Legacy engines - available only with `--features bench`
+#[cfg(feature = "bench")]
+use tisql::storage::{ArenaMemTableEngine, BTreeMemTableEngine, CrossbeamMemTableEngine};
 
 // ============================================================================
 // Command Line Arguments
@@ -91,8 +99,9 @@ struct Args {
     #[arg(long, default_value_t = 10)]
     insert_pct: usize,
 
-    /// Run only specified engine (crossbeam, arena, btree, or all)
-    #[arg(long, default_value = "all")]
+    /// Engine to benchmark: versioned (default), crossbeam, arena, btree, or all
+    /// Note: crossbeam, arena, btree, and all require --features bench
+    #[arg(long, default_value = "versioned")]
     engine: String,
 }
 
@@ -620,20 +629,28 @@ fn main() {
     }
 
     match args.engine.as_str() {
+        "versioned" => {
+            run_benchmark::<VersionedMemTableEngine>("VersionedMemTableEngine", &args);
+        }
+        #[cfg(feature = "bench")]
         "crossbeam" => {
             run_benchmark::<CrossbeamMemTableEngine>("CrossbeamMemTableEngine", &args);
         }
+        #[cfg(feature = "bench")]
         "arena" => {
             run_benchmark::<ArenaMemTableEngine>("ArenaMemTableEngine", &args);
         }
+        #[cfg(feature = "bench")]
         "btree" => {
             run_benchmark::<BTreeMemTableEngine>("BTreeMemTableEngine", &args);
         }
+        #[cfg(feature = "bench")]
         "all" => {
-            // Run all three engines
-            run_benchmark::<CrossbeamMemTableEngine>("CrossbeamMemTableEngine", &args);
-            run_benchmark::<ArenaMemTableEngine>("ArenaMemTableEngine", &args);
-            run_benchmark::<BTreeMemTableEngine>("BTreeMemTableEngine", &args);
+            // Run all engines for comparison
+            run_benchmark::<VersionedMemTableEngine>("VersionedMemTableEngine (production)", &args);
+            run_benchmark::<CrossbeamMemTableEngine>("CrossbeamMemTableEngine (legacy)", &args);
+            run_benchmark::<ArenaMemTableEngine>("ArenaMemTableEngine (legacy)", &args);
+            run_benchmark::<BTreeMemTableEngine>("BTreeMemTableEngine (legacy)", &args);
 
             // Print comparison summary
             println!();
@@ -644,9 +661,18 @@ fn main() {
             println!("Run the benchmark multiple times for statistical significance.");
             println!("The results above show per-engine metrics.");
         }
+        #[cfg(not(feature = "bench"))]
+        "crossbeam" | "arena" | "btree" | "all" => {
+            eprintln!("Error: Legacy engines require --features bench");
+            eprintln!(
+                "Usage: cargo run --release --features bench --bin sysbench-sim -- --engine {}",
+                args.engine
+            );
+            std::process::exit(1);
+        }
         _ => {
             eprintln!(
-                "Unknown engine: {}. Use 'crossbeam', 'arena', 'btree', or 'all'",
+                "Unknown engine: {}. Use 'versioned', 'crossbeam', 'arena', 'btree', or 'all'",
                 args.engine
             );
             std::process::exit(1);

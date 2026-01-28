@@ -14,26 +14,71 @@
 
 //! MemTable implementations for in-memory key-value storage.
 //!
-//! This module provides multiple memtable implementations:
+//! ## Production Engine
 //!
-//! - [`CrossbeamMemTableEngine`]: Lock-free skiplist with epoch-based GC (default)
-//! - [`ArenaMemTableEngine`]: Arena-based skiplist with bulk deallocation
-//! - [`BTreeMemTableEngine`]: BTreeMap + RwLock (baseline for comparison)
+//! [`VersionedMemTableEngine`] is the default production memtable engine. It uses an
+//! OceanBase-style design where each user key is stored once in a skiplist with a
+//! linked list of versions, providing:
 //!
-//! All implementations support MVCC through timestamped keys.
+//! - **Space efficiency**: User key stored once per row, not repeated per version
+//! - **Fast point lookups**: Seek to user key, traverse short version chain
+//! - **Better cache locality**: All versions of a key are adjacent in memory
+//!
+//! ## Legacy Engines (Test/Benchmark Only)
+//!
+//! The following engines are available only for testing and benchmarking:
+//!
+//! - `CrossbeamMemTableEngine`: TiKV-style lock-free skiplist with epoch-based GC
+//! - `ArenaMemTableEngine`: Arena-based skiplist with bulk deallocation
+//! - `BTreeMemTableEngine`: BTreeMap + RwLock (baseline for comparison)
+//!
+//! Enable these via `#[cfg(test)]` or `#[cfg(feature = "bench")]`.
 
-pub mod arena_memtable;
-pub mod arena_skiplist;
-pub mod btree_memtable;
-pub mod crossbeam_memtable;
+// Production engine
+pub mod versioned_memtable;
 pub mod wrapper;
 
-// Re-export memtable engines
+// Legacy engines - for benchmarking and testing only
+#[cfg(any(test, feature = "bench"))]
+pub mod arena_memtable;
+#[cfg(any(test, feature = "bench"))]
+pub mod arena_skiplist;
+#[cfg(any(test, feature = "bench"))]
+pub mod btree_memtable;
+#[cfg(any(test, feature = "bench"))]
+pub mod crossbeam_memtable;
+
+// ============================================================================
+// Production Exports
+// ============================================================================
+
+// Default memtable engine (OceanBase-style versioned memtable)
+pub use versioned_memtable::VersionedMemTableEngine as MemTableEngine;
+pub use versioned_memtable::VersionedMemTableEngine;
+pub use versioned_memtable::VersionedMemoryStats;
+pub use versioned_memtable::VersionedMemoryStats as MemoryStats;
+
+// LSM MemTable wrapper with metadata
+pub use wrapper::MemTable;
+
+// ============================================================================
+// Legacy Exports (Test/Benchmark Only)
+// ============================================================================
+
+#[cfg(any(test, feature = "bench"))]
 pub use arena_memtable::ArenaMemTableEngine;
+#[cfg(any(test, feature = "bench"))]
 pub use arena_memtable::MemoryStats as ArenaMemoryStats;
+#[cfg(any(test, feature = "bench"))]
 pub use btree_memtable::BTreeMemTableEngine;
+#[cfg(any(test, feature = "bench"))]
 pub use crossbeam_memtable::CrossbeamMemTableEngine;
-pub use crossbeam_memtable::MemoryStats;
+#[cfg(any(test, feature = "bench"))]
+pub use crossbeam_memtable::MemoryStats as CrossbeamMemoryStats;
+
+// ============================================================================
+// Common Types
+// ============================================================================
 
 /// Result of a point lookup that distinguishes between "not found" and "tombstone found".
 ///
@@ -64,9 +109,3 @@ impl GetResult {
         matches!(self, GetResult::Found(_) | GetResult::FoundTombstone)
     }
 }
-
-// Default memtable engine alias
-pub use crossbeam_memtable::CrossbeamMemTableEngine as MemTableEngine;
-
-// LSM MemTable wrapper with metadata
-pub use wrapper::MemTable;

@@ -66,6 +66,8 @@ parking_lot = "0.12"
 default = ["jemalloc"]
 jemalloc = ["tikv-jemallocator"]
 failpoints = ["fail/failpoints"]
+# Enable legacy memtable engines for benchmarking comparisons
+bench = []
 
 [[bench]]
 name = "memtable_bench"

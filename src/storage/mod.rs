@@ -70,23 +70,30 @@ pub mod version;
 // Storage Implementation
 // ============================================================================
 
-// Production default: Crossbeam-based memtable with MVCC key encoding
-// (better write throughput due to smaller node size and epoch-based GC)
+// Production memtable engine: OceanBase-style versioned memtable
+// Each user key is stored once with a linked list of versions, providing:
+// - Space efficiency: key stored once per row, not repeated per version
+// - Fast point lookups: seek to user key, traverse short version chain
+// - Better cache locality: all versions of a key are adjacent in memory
 pub use memtable::MemTableEngine;
 pub use memtable::MemoryStats;
-
-// Re-export arena-based memtable for comparison/benchmarking
-pub use memtable::ArenaMemTableEngine;
-pub use memtable::ArenaMemoryStats;
-
-// Re-export BTreeMap-based memtable for comparison/benchmarking
-pub use memtable::BTreeMemTableEngine;
-
-// Re-export CrossbeamMemTableEngine for comparison/benchmarking
-pub use memtable::CrossbeamMemTableEngine;
+pub use memtable::VersionedMemTableEngine;
+pub use memtable::VersionedMemoryStats;
 
 // Re-export LSM MemTable wrapper
 pub use memtable::MemTable;
+
+// Legacy memtable engines (test/benchmark only)
+#[cfg(any(test, feature = "bench"))]
+pub use memtable::ArenaMemTableEngine;
+#[cfg(any(test, feature = "bench"))]
+pub use memtable::ArenaMemoryStats;
+#[cfg(any(test, feature = "bench"))]
+pub use memtable::BTreeMemTableEngine;
+#[cfg(any(test, feature = "bench"))]
+pub use memtable::CrossbeamMemTableEngine;
+#[cfg(any(test, feature = "bench"))]
+pub use memtable::CrossbeamMemoryStats;
 
 // Re-export LSM configuration
 pub use config::{LsmConfig, LsmConfigBuilder};

@@ -77,10 +77,19 @@ pub mod testkit {
     // Arena (from util - it's a general-purpose allocator)
     pub use crate::util::{ArenaConfig, PageArena, DEFAULT_PAGE_SIZE};
 
-    // Storage implementations
+    // Production memtable engine
+    pub use crate::storage::{MemTableEngine, MemoryStats, VersionedMemTableEngine};
+
+    // Legacy memtable engines (available in test/bench mode only)
+    #[cfg(any(test, feature = "bench"))]
     pub use crate::storage::{
-        ArenaMemTableEngine, ArenaMemoryStats, BTreeMemTableEngine, MemTableEngine, MemoryStats,
+        ArenaMemTableEngine, ArenaMemoryStats, BTreeMemTableEngine, CrossbeamMemTableEngine,
+        CrossbeamMemoryStats,
     };
+
+    // ArenaSkipList (available in test/bench mode only)
+    #[cfg(any(test, feature = "bench"))]
+    pub use crate::storage::memtable::arena_skiplist::ArenaSkipList;
 
     // LSM storage engine for testing
     pub use crate::storage::{
@@ -89,9 +98,6 @@ pub mod testkit {
         RecoveryResult, SstBuilder, SstBuilderOptions, SstIterator, SstMeta, SstReader,
         SstReaderRef, Version,
     };
-
-    // ArenaSkipList (exposed for testing low-level skiplist behavior)
-    pub use crate::storage::memtable::arena_skiplist::ArenaSkipList;
 
     pub use crate::transaction::{ConcurrencyManager, Lock, TransactionService};
     pub use crate::tso::LocalTso;
