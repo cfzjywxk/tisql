@@ -15,7 +15,8 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Barrier};
 use std::thread;
 use tisql::storage::{
-    ArenaMemTableEngine, BTreeMemTableEngine, CrossbeamMemTableEngine, StorageEngine, WriteBatch,
+    ArenaMemTableEngine, BTreeMemTableEngine, CrossbeamMemTableEngine, MvccKey, StorageEngine,
+    WriteBatch,
 };
 
 // =============================================================================
@@ -518,10 +519,9 @@ fn bench_scan_throughput(c: &mut Criterion) {
                                 let start_idx = (i * 100) % (PRE_POPULATE - scan_range_size);
                                 let start_key = format!("key{start_idx:08}");
                                 let end_key = format!("key{:08}", start_idx + scan_range_size);
-                                let range =
-                                    start_key.as_bytes().to_vec()..end_key.as_bytes().to_vec();
-                                let results: Vec<_> =
-                                    engine.scan_at(&range, read_ts).unwrap().collect();
+                                let start_mvcc = MvccKey::encode(start_key.as_bytes(), read_ts);
+                                let end_mvcc = MvccKey::encode(end_key.as_bytes(), 0);
+                                let results = engine.scan(start_mvcc..end_mvcc).unwrap();
                                 black_box(results);
                             }
                         });
@@ -560,10 +560,9 @@ fn bench_scan_throughput(c: &mut Criterion) {
                                 let start_idx = (i * 100) % (PRE_POPULATE - scan_range_size);
                                 let start_key = format!("key{start_idx:08}");
                                 let end_key = format!("key{:08}", start_idx + scan_range_size);
-                                let range =
-                                    start_key.as_bytes().to_vec()..end_key.as_bytes().to_vec();
-                                let results: Vec<_> =
-                                    engine.scan_at(&range, read_ts).unwrap().collect();
+                                let start_mvcc = MvccKey::encode(start_key.as_bytes(), read_ts);
+                                let end_mvcc = MvccKey::encode(end_key.as_bytes(), 0);
+                                let results = engine.scan(start_mvcc..end_mvcc).unwrap();
                                 black_box(results);
                             }
                         });
@@ -602,10 +601,9 @@ fn bench_scan_throughput(c: &mut Criterion) {
                                 let start_idx = (i * 100) % (PRE_POPULATE - scan_range_size);
                                 let start_key = format!("key{start_idx:08}");
                                 let end_key = format!("key{:08}", start_idx + scan_range_size);
-                                let range =
-                                    start_key.as_bytes().to_vec()..end_key.as_bytes().to_vec();
-                                let results: Vec<_> =
-                                    engine.scan_at(&range, read_ts).unwrap().collect();
+                                let start_mvcc = MvccKey::encode(start_key.as_bytes(), read_ts);
+                                let end_mvcc = MvccKey::encode(end_key.as_bytes(), 0);
+                                let results = engine.scan(start_mvcc..end_mvcc).unwrap();
                                 black_box(results);
                             }
                         });

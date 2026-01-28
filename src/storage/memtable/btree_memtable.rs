@@ -64,7 +64,7 @@ impl BTreeMemTableEngine {
     }
 
     /// Get the latest version of a key visible at the given timestamp.
-    fn get_at_internal(&self, key: &[u8], ts: Timestamp) -> Result<Option<RawValue>> {
+    pub fn get_at(&self, key: &[u8], ts: Timestamp) -> Result<Option<RawValue>> {
         let start = encode_mvcc_key(key, ts);
         let mut end_key = key.to_vec();
         increment_bytes(&mut end_key);
@@ -163,6 +163,10 @@ impl BTreeMemTableEngine {
 }
 
 impl StorageEngine for BTreeMemTableEngine {
+    fn get_at(&self, key: &[u8], ts: Timestamp) -> Result<Option<RawValue>> {
+        BTreeMemTableEngine::get_at(self, key, ts)
+    }
+
     fn scan(&self, range: Range<MvccKey>) -> Result<Vec<(MvccKey, RawValue)>> {
         self.scan_mvcc(range)
     }
@@ -202,7 +206,7 @@ mod tests {
         let start = MvccKey::encode(key, ts);
         let end = MvccKey::encode(key, 0)
             .next_key()
-            .unwrap_or_else(|| MvccKey::unbounded());
+            .unwrap_or_else(MvccKey::unbounded);
         let range = start..end;
 
         let results = engine.scan_mvcc(range).unwrap();

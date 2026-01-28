@@ -549,7 +549,7 @@ mod tests {
         let l1_inputs: Vec<_> = task.inputs.iter().filter(|(l, _)| *l == 1).collect();
 
         assert_eq!(l0_inputs.len(), 4);
-        assert!(l1_inputs.len() >= 1); // At least some L1 overlap
+        assert!(!l1_inputs.is_empty()); // At least some L1 overlap
     }
 
     #[test]

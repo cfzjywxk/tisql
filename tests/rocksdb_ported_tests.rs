@@ -208,8 +208,7 @@ fn test_memtable_duplicate_stress() {
         assert_eq!(
             actual,
             Some(expected.into_bytes()),
-            "Version at ts={} should match",
-            ts
+            "Version at ts={ts} should match"
         );
     }
 
@@ -242,7 +241,7 @@ fn test_memtable_concurrent_writes() {
                 for i in 0..writes_per_thread {
                     let ts = ts_counter.fetch_add(1, Ordering::SeqCst);
                     let mut batch = new_batch(ts);
-                    let key = format!("concurrent_key_{}_{}", tid, i);
+                    let key = format!("concurrent_key_{tid}_{i}");
                     batch.put(key.into_bytes(), b"value".to_vec());
                     engine.write_batch(batch).unwrap();
                 }
@@ -257,11 +256,10 @@ fn test_memtable_concurrent_writes() {
     // Verify all writes are present
     for tid in 0..num_threads {
         for i in 0..writes_per_thread {
-            let key = format!("concurrent_key_{}_{}", tid, i);
+            let key = format!("concurrent_key_{tid}_{i}");
             assert!(
                 get_for_test(&engine, key.as_bytes()).is_some(),
-                "Key {} should exist",
-                key
+                "Key {key} should exist"
             );
         }
     }
@@ -277,7 +275,7 @@ fn test_memtable_concurrent_reads_writes_mvcc() {
     // Pre-populate with base data
     let mut batch = new_batch(1);
     for i in 0..100 {
-        let key = format!("mvcc_key_{:04}", i);
+        let key = format!("mvcc_key_{i:04}");
         batch.put(key.into_bytes(), b"base_value".to_vec());
     }
     engine.write_batch(batch).unwrap();
@@ -299,7 +297,7 @@ fn test_memtable_concurrent_reads_writes_mvcc() {
                 // Take a snapshot at ts=1
                 for _ in 0..100 {
                     for i in 0..100 {
-                        let key = format!("mvcc_key_{:04}", i);
+                        let key = format!("mvcc_key_{i:04}");
                         match get_at_for_test(&engine, key.as_bytes(), 1) {
                             Some(v) if v == b"base_value".to_vec() => {}
                             None => {
@@ -325,7 +323,7 @@ fn test_memtable_concurrent_reads_writes_mvcc() {
                     let ts = (100 + tid * 100 + i) as Timestamp;
                     let mut batch = new_batch(ts);
                     let key = format!("mvcc_key_{:04}", i % 100);
-                    batch.put(key.into_bytes(), format!("updated_{}", ts).into_bytes());
+                    batch.put(key.into_bytes(), format!("updated_{ts}").into_bytes());
                     engine.write_batch(batch).unwrap();
                 }
             })
@@ -606,8 +604,8 @@ fn test_flush_while_writing() {
                 for i in 0..writes_per_writer {
                     let ts = (tid * writes_per_writer + i + 1) as Timestamp;
                     let mut batch = new_batch_with_lsn(ts, ts);
-                    let key = format!("flush_while_write_{}_{}", tid, i);
-                    batch.put(key.into_bytes(), format!("value_{}", ts).into_bytes());
+                    let key = format!("flush_while_write_{tid}_{i}");
+                    batch.put(key.into_bytes(), format!("value_{ts}").into_bytes());
                     engine.write_batch(batch).unwrap();
 
                     // Occasional small sleep to vary timing
@@ -642,12 +640,11 @@ fn test_flush_while_writing() {
     // Verify all data is present
     for tid in 0..num_writers {
         for i in 0..writes_per_writer {
-            let key = format!("flush_while_write_{}_{}", tid, i);
+            let key = format!("flush_while_write_{tid}_{i}");
             let value = get_for_test(&engine, key.as_bytes());
             assert!(
                 value.is_some(),
-                "Key {} should exist after concurrent flush/write",
-                key
+                "Key {key} should exist after concurrent flush/write"
             );
         }
     }
@@ -666,15 +663,15 @@ fn test_flush_statistics() {
         let mut batch = new_batch_with_lsn(ts, ts);
         batch.put(
             b"stat_key_1".to_vec(),
-            format!("value_{}", round).into_bytes(),
+            format!("value_{round}").into_bytes(),
         );
         batch.put(
             b"stat_key_2".to_vec(),
-            format!("value_{}", round).into_bytes(),
+            format!("value_{round}").into_bytes(),
         );
         batch.put(
             b"stat_key_3".to_vec(),
-            format!("value_{}", round).into_bytes(),
+            format!("value_{round}").into_bytes(),
         );
         engine.write_batch(batch).unwrap();
     }
@@ -702,9 +699,8 @@ fn test_flush_statistics() {
         let ts = (round + 1) as Timestamp;
         assert_eq!(
             get_at_for_test(&engine, b"stat_key_1", ts),
-            Some(format!("value_{}", round).into_bytes()),
-            "Version at ts={} should be accessible",
-            ts
+            Some(format!("value_{round}").into_bytes()),
+            "Version at ts={ts} should be accessible"
         );
     }
 }
@@ -779,8 +775,8 @@ fn test_sst_many_entries() {
     let mut builder = SstBuilder::new(&sst_path, options).unwrap();
 
     for i in 0..num_entries {
-        let key = format!("key_{:08}", i);
-        let value = format!("value_{:08}", i);
+        let key = format!("key_{i:08}");
+        let value = format!("value_{i:08}");
         builder.add(key.as_bytes(), value.as_bytes()).unwrap();
     }
 
@@ -800,9 +796,7 @@ fn test_sst_many_entries() {
         if let Some(ref prev) = prev_key {
             assert!(
                 key > *prev,
-                "Keys should be strictly ordered: {:?} > {:?}",
-                key,
-                prev
+                "Keys should be strictly ordered: {key:?} > {prev:?}"
             );
         }
 
@@ -881,10 +875,7 @@ fn test_compaction_preserves_mvcc_versions() {
     for ts in (1..=5).rev() {
         // Write in reverse order
         let mut batch = new_batch_with_lsn(ts as Timestamp, ts as u64);
-        batch.put(
-            b"mvcc_test".to_vec(),
-            format!("value_ts_{}", ts).into_bytes(),
-        );
+        batch.put(b"mvcc_test".to_vec(), format!("value_ts_{ts}").into_bytes());
         engine.write_batch(batch).unwrap();
     }
 
@@ -896,9 +887,8 @@ fn test_compaction_preserves_mvcc_versions() {
         let value = get_at_for_test(&engine, b"mvcc_test", ts as Timestamp);
         assert_eq!(
             value,
-            Some(format!("value_ts_{}", ts).into_bytes()),
-            "Version at ts={} should be preserved after compaction",
-            ts
+            Some(format!("value_ts_{ts}").into_bytes()),
+            "Version at ts={ts} should be preserved after compaction"
         );
     }
 }
@@ -967,11 +957,11 @@ fn test_scan_excludes_deleted_keys() {
     let results: Vec<_> = scan_at_for_test(&engine, &range, 25);
     let keys: HashSet<_> = results.iter().map(|(k, _)| k.clone()).collect();
 
-    assert!(!keys.contains(&b"b".to_vec()), "'b' should be excluded");
-    assert!(!keys.contains(&b"d".to_vec()), "'d' should be excluded");
-    assert!(keys.contains(&b"a".to_vec()), "'a' should be included");
-    assert!(keys.contains(&b"c".to_vec()), "'c' should be included");
-    assert!(keys.contains(&b"e".to_vec()), "'e' should be included");
+    assert!(!keys.contains(b"b".as_slice()), "'b' should be excluded");
+    assert!(!keys.contains(b"d".as_slice()), "'d' should be excluded");
+    assert!(keys.contains(b"a".as_slice()), "'a' should be included");
+    assert!(keys.contains(b"c".as_slice()), "'c' should be included");
+    assert!(keys.contains(b"e".as_slice()), "'e' should be included");
 
     // Scan at ts=15: should include all (before delete)
     let results: Vec<_> = scan_at_for_test(&engine, &range, 15);
@@ -1039,8 +1029,8 @@ fn test_recovery_multiple_flushes() {
                 let ts = (ts_base + i + 1) as Timestamp;
                 let lsn = (lsn_base + i + 1) as u64;
                 let mut batch = new_batch_with_lsn(ts, lsn);
-                let key = format!("multi_flush_key_{}", i);
-                batch.put(key.into_bytes(), format!("round_{}", round).into_bytes());
+                let key = format!("multi_flush_key_{i}");
+                batch.put(key.into_bytes(), format!("round_{round}").into_bytes());
                 engine.write_batch(batch).unwrap();
             }
 
@@ -1065,13 +1055,12 @@ fn test_recovery_multiple_flushes() {
 
         // Latest values should be from round 4
         for i in 0..5 {
-            let key = format!("multi_flush_key_{}", i);
+            let key = format!("multi_flush_key_{i}");
             let value = get_for_test(&engine, key.as_bytes());
             assert_eq!(
                 value,
                 Some(b"round_4".to_vec()),
-                "Key {} should have latest value",
-                key
+                "Key {key} should have latest value"
             );
         }
 
@@ -1097,7 +1086,7 @@ fn test_recovery_mvcc_versions() {
             let mut batch = new_batch_with_lsn(ts as Timestamp, ts as u64);
             batch.put(
                 b"mvcc_recovery".to_vec(),
-                format!("value_ts_{}", ts).into_bytes(),
+                format!("value_ts_{ts}").into_bytes(),
             );
             engine.write_batch(batch).unwrap();
         }
@@ -1125,9 +1114,8 @@ fn test_recovery_mvcc_versions() {
             let value = get_at_for_test(&engine, b"mvcc_recovery", ts as Timestamp);
             assert_eq!(
                 value,
-                Some(format!("value_ts_{}", ts).into_bytes()),
-                "Version at ts={} should survive recovery",
-                ts
+                Some(format!("value_ts_{ts}").into_bytes()),
+                "Version at ts={ts} should survive recovery"
             );
         }
     }
@@ -1254,8 +1242,7 @@ fn test_binary_keys() {
         assert_eq!(
             value,
             Some(vec![byte]),
-            "Binary key 0x{:02X} should be retrievable",
-            byte
+            "Binary key 0x{byte:02X} should be retrievable"
         );
     }
 }

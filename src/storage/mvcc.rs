@@ -159,6 +159,12 @@ impl MvccKey {
         self.0.len()
     }
 
+    /// Check if the encoded MVCC key is empty.
+    #[inline]
+    pub fn is_empty(&self) -> bool {
+        self.0.is_empty()
+    }
+
     /// Check if this is an unbounded placeholder (empty bytes).
     ///
     /// Returns true only for MvccKey created via `unbounded()`.

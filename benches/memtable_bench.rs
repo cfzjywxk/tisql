@@ -12,7 +12,7 @@ use std::sync::{Arc, Barrier};
 use std::thread;
 use tisql::storage::memtable::arena_memtable::ArenaMemTableEngine;
 use tisql::storage::memtable::arena_skiplist::ArenaSkipList;
-use tisql::storage::{StorageEngine, WriteBatch};
+use tisql::storage::{MvccKey, StorageEngine, WriteBatch};
 use tisql::util::arena::PageArena;
 
 // =============================================================================
@@ -340,34 +340,31 @@ fn bench_memtable_scan(c: &mut Criterion) {
 
         group.throughput(Throughput::Elements(count));
 
-        // Full scan
-        let start = make_key(0, 32);
-        let end = make_key(u64::MAX, 32);
+        // Full scan - use MvccKey encoding
+        let start_key = make_key(0, 32);
+        let end_key = make_key(u64::MAX, 32);
+        let start_mvcc = MvccKey::encode(&start_key, u64::MAX);
+        let end_mvcc = MvccKey::encode(&end_key, 0);
         group.bench_with_input(
             BenchmarkId::new("full", count),
-            &(&start, &end),
+            &(&start_mvcc, &end_mvcc),
             |b, &(start, end)| {
                 b.iter(|| {
-                    let results: Vec<_> = engine
-                        .scan(&(start.clone()..end.clone()))
-                        .unwrap()
-                        .collect();
+                    let results = engine.scan(start.clone()..end.clone()).unwrap();
                     black_box(results.len())
                 });
             },
         );
 
         // Partial scan (10% of data)
-        let partial_end = make_key(count / 10, 32);
+        let partial_end_key = make_key(count / 10, 32);
+        let partial_end_mvcc = MvccKey::encode(&partial_end_key, 0);
         group.bench_with_input(
             BenchmarkId::new("partial_10pct", count),
-            &(&start, &partial_end),
+            &(&start_mvcc, &partial_end_mvcc),
             |b, &(start, end)| {
                 b.iter(|| {
-                    let results: Vec<_> = engine
-                        .scan(&(start.clone()..end.clone()))
-                        .unwrap()
-                        .collect();
+                    let results = engine.scan(start.clone()..end.clone()).unwrap();
                     black_box(results.len())
                 });
             },

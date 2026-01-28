@@ -114,6 +114,9 @@ impl<T: TxnService> MvccCatalog<T> {
         drop(state);
         self.create_schema("default")?;
 
+        // Create test schema for MySQL compatibility (e.g., E2E tests expect it)
+        self.create_schema("test")?;
+
         // Reload the version after bootstrap
         state = self.schema_state.write().unwrap();
         state.version = self.load_schema_version_from_storage()?;
@@ -834,21 +837,23 @@ mod tests {
     fn test_schema_operations() {
         let (catalog, _dir) = create_test_catalog();
 
-        // Default schema should exist
+        // Default and test schemas should exist after bootstrap
         assert!(catalog.schema_exists("default").unwrap());
+        assert!(catalog.schema_exists("test").unwrap());
 
         // Create new schema
-        catalog.create_schema("test").unwrap();
-        assert!(catalog.schema_exists("test").unwrap());
+        catalog.create_schema("myschema").unwrap();
+        assert!(catalog.schema_exists("myschema").unwrap());
 
         // List schemas
         let schemas = catalog.list_schemas().unwrap();
         assert!(schemas.contains(&"default".to_string()));
         assert!(schemas.contains(&"test".to_string()));
+        assert!(schemas.contains(&"myschema".to_string()));
 
         // Drop schema
-        catalog.drop_schema("test").unwrap();
-        assert!(!catalog.schema_exists("test").unwrap());
+        catalog.drop_schema("myschema").unwrap();
+        assert!(!catalog.schema_exists("myschema").unwrap());
     }
 
     #[test]

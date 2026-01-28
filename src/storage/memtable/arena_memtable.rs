@@ -168,7 +168,7 @@ impl ArenaMemTableEngine {
     ///
     /// This scans from `key || !ts` to find the first version
     /// with commit_ts <= ts.
-    fn get_at_internal(&self, key: &[u8], ts: Timestamp) -> Result<Option<RawValue>> {
+    pub fn get_at(&self, key: &[u8], ts: Timestamp) -> Result<Option<RawValue>> {
         // Build scan key: key || !ts
         // Due to !ts encoding, this will find the first entry >= key with ts' <= ts
         let start = encode_mvcc_key(key, ts);
@@ -307,6 +307,10 @@ impl ArenaMemTableEngine {
 }
 
 impl StorageEngine for ArenaMemTableEngine {
+    fn get_at(&self, key: &[u8], ts: Timestamp) -> Result<Option<RawValue>> {
+        ArenaMemTableEngine::get_at(self, key, ts)
+    }
+
     fn scan(&self, range: Range<MvccKey>) -> Result<Vec<(MvccKey, RawValue)>> {
         self.scan_mvcc(range)
     }
@@ -826,7 +830,7 @@ mod tests {
                     for i in 0..ops_per_thread {
                         let key = format!("key{:04}", i % 1000);
                         // Read at timestamp 1 should always see "initial"
-                        let value = get_at_for_test(&engine, key.as_bytes(), 1);
+                        let value = get_at_for_test(engine, key.as_bytes(), 1);
                         assert_eq!(value, Some(b"initial".to_vec()));
                     }
                 });

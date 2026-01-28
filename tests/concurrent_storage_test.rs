@@ -138,7 +138,7 @@ fn test_concurrent_write_during_flush() {
                 if stop_flag.load(Ordering::Relaxed) {
                     break;
                 }
-                let key = format!("writer_{}_key_{:05}", writer_id, i);
+                let key = format!("writer_{writer_id}_key_{i:05}");
                 let ts = ts_counter.fetch_add(1, Ordering::SeqCst);
                 write_test_data(&engine, key.as_bytes(), &large_value, ts);
                 written_keys.push(key);
@@ -175,7 +175,7 @@ fn test_concurrent_write_during_flush() {
         }
     }
 
-    let flushes = flusher.join().unwrap();
+    let _flushes = flusher.join().unwrap();
 
     // Final flush to ensure all data is on disk
     while let Some(frozen) = engine.maybe_rotate() {
@@ -186,7 +186,7 @@ fn test_concurrent_write_during_flush() {
     let mut found_keys = 0;
     for key in &all_written_keys {
         let value = get_for_test(&engine, key.as_bytes());
-        assert!(value.is_some(), "Key {} should exist", key);
+        assert!(value.is_some(), "Key {key} should exist");
         found_keys += 1;
     }
 
@@ -209,7 +209,7 @@ fn test_concurrent_read_during_flush() {
 
     // Pre-populate data
     for i in 0..100 {
-        let key = format!("pre_key_{:05}", i);
+        let key = format!("pre_key_{i:05}");
         write_test_data(&engine, key.as_bytes(), b"initial", i as u64 + 1);
     }
 
@@ -234,7 +234,7 @@ fn test_concurrent_read_during_flush() {
             let mut errors = 0;
             for _ in 0..50 {
                 for i in 0..100 {
-                    let key = format!("pre_key_{:05}", i);
+                    let key = format!("pre_key_{i:05}");
                     match get_for_test(&engine, key.as_bytes()) {
                         Some(_) => reads += 1,
                         None => {
@@ -257,7 +257,7 @@ fn test_concurrent_read_during_flush() {
         // Write and flush repeatedly
         for round in 0..5 {
             for i in 0..20 {
-                let key = format!("new_key_{}_{}", round, i);
+                let key = format!("new_key_{round}_{i}");
                 let ts = (round * 100 + i + 200) as u64;
                 write_test_data(&engine_flusher, key.as_bytes(), b"new", ts);
             }
@@ -270,12 +270,8 @@ fn test_concurrent_read_during_flush() {
     // Collect results
     for handle in reader_handles {
         let (reader_id, reads, errors) = handle.join().unwrap();
-        assert_eq!(errors, 0, "Reader {} should have no errors", reader_id);
-        assert!(
-            reads > 0,
-            "Reader {} should have completed reads",
-            reader_id
-        );
+        assert_eq!(errors, 0, "Reader {reader_id} should have no errors");
+        assert!(reads > 0, "Reader {reader_id} should have completed reads");
     }
 
     flusher.join().unwrap();
@@ -299,7 +295,7 @@ fn test_concurrent_write_during_compaction() {
     // Create multiple L0 SSTs to trigger compaction
     for batch in 0..5 {
         for i in 0..10 {
-            let key = format!("batch_{}_key_{:03}", batch, i);
+            let key = format!("batch_{batch}_key_{i:03}");
             let ts = (batch * 100 + i + 1) as u64;
             write_test_data(&engine, key.as_bytes(), &large_value, ts);
 
@@ -318,7 +314,7 @@ fn test_concurrent_write_during_compaction() {
     }
 
     // Verify data integrity regardless
-    let version = engine.current_version();
+    let _version = engine.current_version();
 
     // Now do concurrent writes (compaction would run in background)
     let num_writers = 4;
@@ -332,7 +328,7 @@ fn test_concurrent_write_during_compaction() {
 
         let handle = thread::spawn(move || {
             for i in 0..writes_per_writer {
-                let key = format!("concurrent_{}_key_{:04}", writer_id, i);
+                let key = format!("concurrent_{writer_id}_key_{i:04}");
                 let ts = ts_counter.fetch_add(1, Ordering::SeqCst);
                 write_test_data(&engine, key.as_bytes(), b"concurrent_value", ts);
             }
@@ -347,9 +343,9 @@ fn test_concurrent_write_during_compaction() {
     // Verify all concurrent writes are readable
     for writer_id in 0..num_writers {
         for i in 0..writes_per_writer {
-            let key = format!("concurrent_{}_key_{:04}", writer_id, i);
+            let key = format!("concurrent_{writer_id}_key_{i:04}");
             let value = get_for_test(&engine, key.as_bytes());
-            assert!(value.is_some(), "Key {} should exist", key);
+            assert!(value.is_some(), "Key {key} should exist");
         }
     }
 }
@@ -363,7 +359,7 @@ fn test_concurrent_read_during_compaction() {
     // Create data across multiple SSTs
     for batch in 0..5 {
         for i in 0..50 {
-            let key = format!("read_batch_{}_key_{:03}", batch, i);
+            let key = format!("read_batch_{batch}_key_{i:03}");
             let ts = (batch * 100 + i + 1) as u64;
             write_test_data(&engine, key.as_bytes(), b"value", ts);
         }
@@ -389,7 +385,7 @@ fn test_concurrent_read_during_compaction() {
             for _ in 0..reads_per_reader {
                 for batch in 0..5 {
                     let idx = (reader_id * 7 + batch) % 50; // Varied access pattern
-                    let key = format!("read_batch_{}_key_{:03}", batch, idx);
+                    let key = format!("read_batch_{batch}_key_{idx:03}");
                     if get_for_test(&engine, key.as_bytes()).is_some() {
                         found += 1;
                     }
@@ -442,7 +438,7 @@ fn test_stress_mixed_operations() {
         let handle = thread::spawn(move || {
             let mut local_writes = 0;
             while !stop_flag.load(Ordering::Relaxed) {
-                let key = format!("stress_w{}_k{}", writer_id, local_writes);
+                let key = format!("stress_w{writer_id}_k{local_writes}");
                 let ts = ts_counter.fetch_add(1, Ordering::SeqCst);
                 write_test_data(&engine, key.as_bytes(), b"stress_value", ts);
                 local_writes += 1;
@@ -470,7 +466,7 @@ fn test_stress_mixed_operations() {
                 rng_seed = rng_seed.wrapping_mul(1103515245).wrapping_add(12345);
                 let writer_id = rng_seed % 8;
                 let key_id = (rng_seed / 8) % 10000;
-                let key = format!("stress_w{}_k{}", writer_id, key_id);
+                let key = format!("stress_w{writer_id}_k{key_id}");
                 let _ = get_for_test(&engine, key.as_bytes());
                 local_reads += 1;
 
@@ -517,10 +513,7 @@ fn test_stress_mixed_operations() {
     let reads = reads_done.load(Ordering::SeqCst);
     let flushes = flushes_done.load(Ordering::SeqCst);
 
-    println!(
-        "Stress test completed: {} writes, {} reads, {} flushes",
-        writes, reads, flushes
-    );
+    println!("Stress test completed: {writes} writes, {reads} reads, {flushes} flushes");
 
     assert!(writes > 0, "Should have completed writes");
     assert!(reads > 0, "Should have completed reads");
@@ -540,7 +533,7 @@ fn test_write_ordering() {
 
     // Write multiple versions
     for ts in 1..=10 {
-        let value = format!("value_at_{}", ts);
+        let value = format!("value_at_{ts}");
         write_test_data(&engine, key, value.as_bytes(), ts);
     }
 
@@ -550,9 +543,9 @@ fn test_write_ordering() {
 
     // Read at specific timestamps
     for ts in 1..=10 {
-        let expected = format!("value_at_{}", ts);
+        let expected = format!("value_at_{ts}");
         let value = get_at_for_test(&engine, key, ts);
-        assert_eq!(value, Some(expected.into_bytes()), "Value at ts={}", ts);
+        assert_eq!(value, Some(expected.into_bytes()), "Value at ts={ts}");
     }
 }
 
@@ -673,7 +666,7 @@ fn test_flushed_lsn_monotonic() {
         // Write data with larger values to exceed memtable size
         let large_value = vec![b'x'; 200];
         for i in 0..10 {
-            let key = format!("lsn_test_{}_key_{}", batch_num, i);
+            let key = format!("lsn_test_{batch_num}_key_{i}");
             write_test_data(
                 &engine,
                 key.as_bytes(),
@@ -693,9 +686,7 @@ fn test_flushed_lsn_monotonic() {
 
         assert!(
             flushed_lsn >= prev_flushed_lsn,
-            "flushed_lsn should increase monotonically: {} >= {}",
-            flushed_lsn,
-            prev_flushed_lsn
+            "flushed_lsn should increase monotonically: {flushed_lsn} >= {prev_flushed_lsn}"
         );
         prev_flushed_lsn = flushed_lsn;
     }
@@ -719,7 +710,7 @@ fn test_version_sst_count_matches_files() {
     // Create multiple SSTs
     for batch in 0..3 {
         for i in 0..30 {
-            let key = format!("sst_count_{}_key_{}", batch, i);
+            let key = format!("sst_count_{batch}_key_{i}");
             write_test_data(
                 &engine,
                 key.as_bytes(),
@@ -786,7 +777,7 @@ fn test_recovery_preserves_concurrent_writes() {
             let handle = thread::spawn(move || {
                 let mut keys = vec![];
                 for i in 0..writes_per_writer {
-                    let key = format!("recovery_w{}_k{}", writer_id, i);
+                    let key = format!("recovery_w{writer_id}_k{i}");
                     let ts = ts_counter.fetch_add(1, Ordering::SeqCst);
                     write_test_data(&engine, key.as_bytes(), &value, ts);
                     keys.push(key);
@@ -804,13 +795,9 @@ fn test_recovery_preserves_concurrent_writes() {
         }
 
         // Flush all data - keep trying until memtable is below threshold
-        loop {
-            if let Some(frozen) = engine.maybe_rotate() {
-                engine.flush_memtable(&frozen).unwrap();
-                had_flushes = true;
-            } else {
-                break;
-            }
+        while let Some(frozen) = engine.maybe_rotate() {
+            engine.flush_memtable(&frozen).unwrap();
+            had_flushes = true;
         }
 
         ilog.sync().unwrap();

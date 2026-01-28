@@ -367,8 +367,8 @@ mod tests {
         let mut written = Vec::new();
 
         for i in 0..count {
-            let key = format!("key_{:04}", i).into_bytes();
-            let value = format!("value_{:04}", i).into_bytes();
+            let key = format!("key_{i:04}").into_bytes();
+            let value = format!("value_{i:04}").into_bytes();
 
             // Write to clog
             let mut batch = ClogBatch::new();
@@ -599,8 +599,8 @@ mod tests {
             let unflushed = {
                 let mut written = Vec::new();
                 for i in 10..13 {
-                    let key = format!("key_{:04}", i).into_bytes();
-                    let value = format!("value_{:04}", i).into_bytes();
+                    let key = format!("key_{i:04}").into_bytes();
+                    let value = format!("value_{i:04}").into_bytes();
 
                     let mut batch = ClogBatch::new();
                     batch.add_put(i as u64, key.clone(), value.clone());
@@ -685,8 +685,8 @@ mod tests {
 
             // Write some data - IMPORTANT: thread CLOG LSN to storage
             for i in 0..5 {
-                let key = format!("key_{:04}", i).into_bytes();
-                let value = format!("value_{:04}", i).into_bytes();
+                let key = format!("key_{i:04}").into_bytes();
+                let value = format!("value_{i:04}").into_bytes();
 
                 // Write to clog (allocates LSN from shared provider)
                 let mut batch = ClogBatch::new();
@@ -727,8 +727,8 @@ mod tests {
 
             // Verify data is recovered
             for i in 0..5 {
-                let key = format!("key_{:04}", i).into_bytes();
-                let expected_value = format!("value_{:04}", i).into_bytes();
+                let key = format!("key_{i:04}").into_bytes();
+                let expected_value = format!("value_{i:04}").into_bytes();
                 assert_eq!(
                     get_for_test(&result.engine, &key),
                     Some(expected_value),

@@ -95,7 +95,7 @@ impl CrossbeamMemTableEngine {
     ///
     /// This scans from `key || !ts` to find the first version
     /// with commit_ts <= ts.
-    fn get_at_internal(&self, key: &[u8], ts: Timestamp) -> Result<Option<RawValue>> {
+    pub fn get_at(&self, key: &[u8], ts: Timestamp) -> Result<Option<RawValue>> {
         match self.get_at_with_tombstone(key, ts)? {
             super::GetResult::Found(v) => Ok(Some(v)),
             super::GetResult::FoundTombstone | super::GetResult::NotFound => Ok(None),
@@ -209,6 +209,10 @@ impl Default for CrossbeamMemTableEngine {
 }
 
 impl StorageEngine for CrossbeamMemTableEngine {
+    fn get_at(&self, key: &[u8], ts: Timestamp) -> Result<Option<RawValue>> {
+        CrossbeamMemTableEngine::get_at(self, key, ts)
+    }
+
     fn scan(&self, range: Range<MvccKey>) -> Result<Vec<(MvccKey, RawValue)>> {
         self.scan_mvcc(range)
     }
@@ -409,7 +413,7 @@ mod tests {
         let start = MvccKey::encode(key, ts);
         let end = MvccKey::encode(key, 0)
             .next_key()
-            .unwrap_or_else(|| MvccKey::unbounded());
+            .unwrap_or_else(MvccKey::unbounded);
         let range = start..end;
 
         let results = engine.scan_mvcc(range).unwrap();

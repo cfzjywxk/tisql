@@ -58,6 +58,7 @@ use crate::types::{RawValue, Timestamp};
 use super::config::LsmConfig;
 use super::ilog::IlogService;
 use super::memtable::MemTable;
+use super::mvcc;
 use super::sstable::{SstBuilder, SstBuilderOptions, SstIterator, SstMeta, SstReaderRef};
 use super::version::{ManifestDelta, Version, MAX_LEVELS};
 
@@ -412,6 +413,7 @@ impl LsmEngine {
     /// 1. Scan for entries matching the key
     /// 2. Find the latest version with entry_ts <= ts
     /// 3. Return None if that version is a tombstone
+    #[allow(dead_code)]
     fn get_from_sst(&self, key: &[u8], ts: Timestamp) -> Result<Option<RawValue>> {
         let version = self.current_version();
 
@@ -558,6 +560,30 @@ impl LsmEngine {
 }
 
 impl StorageEngine for LsmEngine {
+    fn get_at(&self, key: &[u8], ts: Timestamp) -> Result<Option<RawValue>> {
+        // Build scan range: from (key, ts) to next key
+        let start = MvccKey::encode(key, ts);
+        let end = MvccKey::encode(key, 0)
+            .next_key()
+            .unwrap_or_else(MvccKey::unbounded);
+        let range = start..end;
+
+        let results = self.scan(range)?;
+
+        // Find the first entry matching our key (latest visible version)
+        for (mvcc_key, value) in results {
+            let (decoded_key, entry_ts) = mvcc_key.decode();
+            if decoded_key == key && entry_ts <= ts {
+                if mvcc::is_tombstone(&value) {
+                    return Ok(None);
+                }
+                return Ok(Some(value));
+            }
+        }
+
+        Ok(None)
+    }
+
     fn scan(&self, range: Range<MvccKey>) -> Result<Vec<(MvccKey, RawValue)>> {
         // Collect all MVCC keys from all sources (SSTs, frozen memtables, active memtable)
         // Results are sorted by MVCC key (which gives natural ordering by key then descending ts)
@@ -688,7 +714,7 @@ pub struct LsmStats {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::storage::mvcc::{encode_mvcc_key, is_tombstone};
+    use crate::storage::mvcc::is_tombstone;
     use std::path::Path;
     use tempfile::TempDir;
 
@@ -718,7 +744,7 @@ mod tests {
         let start = MvccKey::encode(key, ts);
         let end = MvccKey::encode(key, 0)
             .next_key()
-            .unwrap_or_else(|| MvccKey::unbounded());
+            .unwrap_or_else(MvccKey::unbounded);
         let range = start..end;
 
         let results = engine.scan(range).unwrap();
@@ -854,8 +880,8 @@ mod tests {
         // Write enough to trigger rotation
         for i in 0..10 {
             let mut batch = new_batch(i as Timestamp + 1);
-            let key = format!("key_{:04}", i);
-            let value = format!("value_{:04}", i);
+            let key = format!("key_{i:04}");
+            let value = format!("value_{i:04}");
             batch.put(key.as_bytes().to_vec(), value.as_bytes().to_vec());
             engine.write_batch(batch).unwrap();
         }
@@ -865,8 +891,8 @@ mod tests {
 
         // All data should still be readable
         for i in 0..10 {
-            let key = format!("key_{:04}", i);
-            let expected = format!("value_{:04}", i);
+            let key = format!("key_{i:04}");
+            let expected = format!("value_{i:04}");
             assert_eq!(
                 get_for_test(&engine, key.as_bytes()),
                 Some(expected.as_bytes().to_vec())
@@ -888,8 +914,8 @@ mod tests {
         // Write some data
         for i in 0..5 {
             let mut batch = new_batch(i as Timestamp + 1);
-            let key = format!("key_{:04}", i);
-            let value = format!("value_{:04}", i);
+            let key = format!("key_{i:04}");
+            let value = format!("value_{i:04}");
             batch.put(key.as_bytes().to_vec(), value.as_bytes().to_vec());
             engine.write_batch(batch).unwrap();
         }
@@ -905,13 +931,12 @@ mod tests {
 
         // Data should still be readable
         for i in 0..5 {
-            let key = format!("key_{:04}", i);
-            let expected = format!("value_{:04}", i);
+            let key = format!("key_{i:04}");
+            let expected = format!("value_{i:04}");
             assert_eq!(
                 get_for_test(&engine, key.as_bytes()),
                 Some(expected.as_bytes().to_vec()),
-                "Key {} should be readable after flush",
-                key
+                "Key {key} should be readable after flush"
             );
         }
     }
@@ -1007,7 +1032,7 @@ mod tests {
                         let mut batch = WriteBatch::new();
                         let ts = (tid * writes_per_thread + i + 1) as Timestamp;
                         batch.set_commit_ts(ts);
-                        let key = format!("key_{}_{}", tid, i);
+                        let key = format!("key_{tid}_{i}");
                         batch.put(key.as_bytes().to_vec(), b"value".to_vec());
                         engine.write_batch(batch).unwrap();
                     }
@@ -1022,11 +1047,10 @@ mod tests {
         // Verify all writes
         for tid in 0..num_threads {
             for i in 0..writes_per_thread {
-                let key = format!("key_{}_{}", tid, i);
+                let key = format!("key_{tid}_{i}");
                 assert!(
                     get_for_test(&engine, key.as_bytes()).is_some(),
-                    "Key {} should exist",
-                    key
+                    "Key {key} should exist"
                 );
             }
         }
@@ -1047,7 +1071,7 @@ mod tests {
         let mut batch = new_batch(1);
         for i in 0..100 {
             batch.put(
-                format!("key{:03}", i).as_bytes().to_vec(),
+                format!("key{i:03}").as_bytes().to_vec(),
                 b"initial".to_vec(),
             );
         }
@@ -1075,7 +1099,7 @@ mod tests {
                         let mut batch = WriteBatch::new();
                         let ts = (100 + tid * 200 + i) as Timestamp;
                         batch.set_commit_ts(ts);
-                        let key = format!("new_key_{}_{}", tid, i);
+                        let key = format!("new_key_{tid}_{i}");
                         batch.put(key.as_bytes().to_vec(), b"value".to_vec());
                         engine.write_batch(batch).unwrap();
                     }
@@ -1089,7 +1113,7 @@ mod tests {
 
         // Verify original data still readable
         for i in 0..100 {
-            let key = format!("key{:03}", i);
+            let key = format!("key{i:03}");
             assert!(get_for_test(&engine, key.as_bytes()).is_some());
         }
     }
@@ -1120,8 +1144,8 @@ mod tests {
         // Write enough to trigger rotation
         for i in 0..5 {
             let mut batch = new_batch(i as Timestamp + 1);
-            let key = format!("key_{:04}", i);
-            let value = format!("value_{:04}", i);
+            let key = format!("key_{i:04}");
+            let value = format!("value_{i:04}");
             batch.put(key.as_bytes().to_vec(), value.as_bytes().to_vec());
             engine.write_batch(batch).unwrap();
         }
@@ -1131,13 +1155,12 @@ mod tests {
 
         // Data should still be readable
         for i in 0..5 {
-            let key = format!("key_{:04}", i);
-            let expected = format!("value_{:04}", i);
+            let key = format!("key_{i:04}");
+            let expected = format!("value_{i:04}");
             assert_eq!(
                 get_for_test(&engine, key.as_bytes()),
                 Some(expected.as_bytes().to_vec()),
-                "Key {} should be readable after durable flush",
-                key
+                "Key {key} should be readable after durable flush"
             );
         }
     }
@@ -1162,8 +1185,8 @@ mod tests {
 
             for i in 0..5 {
                 let mut batch = new_batch(i as Timestamp + 1);
-                let key = format!("key_{:04}", i);
-                let value = format!("value_{:04}", i);
+                let key = format!("key_{i:04}");
+                let value = format!("value_{i:04}");
                 batch.put(key.as_bytes().to_vec(), value.as_bytes().to_vec());
                 engine.write_batch(batch).unwrap();
             }
@@ -1196,13 +1219,12 @@ mod tests {
 
             // Data should be readable from SST
             for i in 0..5 {
-                let key = format!("key_{:04}", i);
-                let expected = format!("value_{:04}", i);
+                let key = format!("key_{i:04}");
+                let expected = format!("value_{i:04}");
                 assert_eq!(
                     get_for_test(&engine, key.as_bytes()),
                     Some(expected.as_bytes().to_vec()),
-                    "Key {} should be readable after recovery",
-                    key
+                    "Key {key} should be readable after recovery"
                 );
             }
         }
@@ -1613,7 +1635,7 @@ mod tests {
             LsmEngine::open_durable(config, Arc::clone(&lsn_provider), Arc::clone(&ilog)).unwrap();
 
         // Create a key with many 0xFF bytes (longer than old 32-byte limit)
-        let long_key: Vec<u8> = std::iter::repeat(0xFF).take(64).collect();
+        let long_key: Vec<u8> = std::iter::repeat_n(0xFF, 64).collect();
         let value = b"value_for_long_key".to_vec();
 
         let mut batch = WriteBatch::new();
@@ -1671,8 +1693,8 @@ mod tests {
             let mut batch = WriteBatch::new();
             batch.set_commit_ts(i as Timestamp + 1);
             batch.set_clog_lsn(i as u64 + 1);
-            let key = format!("key_{:04}", i);
-            let value = format!("value_{:04}", i);
+            let key = format!("key_{i:04}");
+            let value = format!("value_{i:04}");
             batch.put(key.as_bytes().to_vec(), value.as_bytes().to_vec());
             engine.write_batch(batch).unwrap();
         }
@@ -1720,13 +1742,12 @@ mod tests {
 
         // Verify all data is readable
         for i in 0..20 {
-            let key = format!("key_{:04}", i);
-            let expected = format!("value_{:04}", i);
+            let key = format!("key_{i:04}");
+            let expected = format!("value_{i:04}");
             assert_eq!(
                 get_for_test(&engine, key.as_bytes()),
                 Some(expected.as_bytes().to_vec()),
-                "Key {} should be readable after concurrent flushes",
-                key
+                "Key {key} should be readable after concurrent flushes"
             );
         }
     }
@@ -1971,8 +1992,8 @@ mod tests {
             // Write 5 transactions
             written_keys = (0..5)
                 .map(|i| {
-                    let key = format!("key_{:04}", i).into_bytes();
-                    let value = format!("value_{:04}", i).into_bytes();
+                    let key = format!("key_{i:04}").into_bytes();
+                    let value = format!("value_{i:04}").into_bytes();
 
                     // Write to clog
                     let mut batch = ClogBatch::new();

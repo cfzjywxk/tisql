@@ -39,7 +39,7 @@ use std::time::Instant;
 use crate::error::Result;
 use crate::storage::mvcc::MvccKey;
 use crate::storage::{StorageEngine, WriteBatch};
-use crate::types::RawValue;
+use crate::types::{RawValue, Timestamp};
 
 use super::CrossbeamMemTableEngine;
 
@@ -260,6 +260,10 @@ fn estimate_batch_size(batch: &WriteBatch) -> usize {
 
 // Implement StorageEngine for MemTable to allow transparent use
 impl StorageEngine for MemTable {
+    fn get_at(&self, key: &[u8], ts: Timestamp) -> Result<Option<RawValue>> {
+        self.inner.get_at(key, ts)
+    }
+
     fn scan(&self, range: Range<MvccKey>) -> Result<Vec<(MvccKey, RawValue)>> {
         self.inner.scan(range)
     }
@@ -288,7 +292,7 @@ impl StorageEngine for MemTable {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::storage::mvcc::{encode_mvcc_key, is_tombstone};
+    use crate::storage::mvcc::is_tombstone;
     use crate::types::{Key, Timestamp};
 
     fn new_batch(commit_ts: Timestamp) -> WriteBatch {
@@ -304,7 +308,7 @@ mod tests {
         let start = MvccKey::encode(key, ts);
         let end = MvccKey::encode(key, 0)
             .next_key()
-            .unwrap_or_else(|| MvccKey::unbounded());
+            .unwrap_or_else(MvccKey::unbounded);
         let range = start..end;
 
         let results = mt.scan(range).unwrap();
@@ -554,7 +558,7 @@ mod tests {
                         let mut batch = WriteBatch::new();
                         let ts = (tid * writes_per_thread + i + 1) as Timestamp;
                         batch.set_commit_ts(ts);
-                        let key = format!("key_{}_{}", tid, i);
+                        let key = format!("key_{tid}_{i}");
                         batch.put(key.as_bytes().to_vec(), b"value".to_vec());
 
                         let lsn = (tid * writes_per_thread + i) as u64;
@@ -582,7 +586,7 @@ mod tests {
         batch.set_commit_ts(1);
         for i in 0..100 {
             batch.put(
-                format!("key{:03}", i).as_bytes().to_vec(),
+                format!("key{i:03}").as_bytes().to_vec(),
                 b"initial".to_vec(),
             );
         }
@@ -617,7 +621,7 @@ mod tests {
                         let mut batch = WriteBatch::new();
                         let ts = (100 + tid * 500 + i) as Timestamp;
                         batch.set_commit_ts(ts);
-                        let key = format!("new_key_{}_{}", tid, i);
+                        let key = format!("new_key_{tid}_{i}");
                         batch.put(key.as_bytes().to_vec(), b"value".to_vec());
 
                         let lsn = (1 + tid * 500 + i) as u64;
@@ -651,10 +655,7 @@ mod tests {
                         let mut batch = WriteBatch::new();
                         let ts = (tid * writes_per_thread + i + 1) as Timestamp;
                         batch.set_commit_ts(ts);
-                        batch.put(
-                            format!("k_{}_{}", tid, i).as_bytes().to_vec(),
-                            b"v".to_vec(),
-                        );
+                        batch.put(format!("k_{tid}_{i}").as_bytes().to_vec(), b"v".to_vec());
 
                         // Use varying LSNs to test min/max tracking
                         let lsn = ((tid * writes_per_thread + i) * 2 + 1) as u64;

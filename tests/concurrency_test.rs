@@ -713,9 +713,9 @@ fn test_write_buffer_dedup_with_scan() {
 
     // Verify results (BTreeMap ordering)
     let results_map: std::collections::HashMap<_, _> = results.into_iter().collect();
-    assert_eq!(results_map.get(&b"a".to_vec()), Some(&b"a2".to_vec()));
-    assert_eq!(results_map.get(&b"b".to_vec()), None); // deleted
-    assert_eq!(results_map.get(&b"c".to_vec()), Some(&b"c1".to_vec()));
+    assert_eq!(results_map.get(b"a".as_slice()), Some(&b"a2".to_vec()));
+    assert_eq!(results_map.get(b"b".as_slice()), None); // deleted
+    assert_eq!(results_map.get(b"c".as_slice()), Some(&b"c1".to_vec()));
 }
 
 // ============================================================================

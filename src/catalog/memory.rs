@@ -49,6 +49,9 @@ impl MemoryCatalog {
         // Create default schema
         catalog.create_schema("default").unwrap();
 
+        // Create test schema for MySQL compatibility (e.g., E2E tests expect it)
+        catalog.create_schema("test").unwrap();
+
         catalog
     }
 }

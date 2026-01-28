@@ -483,11 +483,8 @@ fn test_flush_and_compaction_e2e() {
         for i in 0..10 {
             let ts = (ts_base + i + 1) as Timestamp;
             let mut batch = new_batch_with_lsn(ts, ts);
-            let key = format!("key_{:03}", i);
-            batch.put(
-                key.into_bytes(),
-                format!("batch_{}", batch_num).into_bytes(),
-            );
+            let key = format!("key_{i:03}");
+            batch.put(key.into_bytes(), format!("batch_{batch_num}").into_bytes());
             engine.write_batch(batch).unwrap();
         }
 
@@ -501,7 +498,7 @@ fn test_flush_and_compaction_e2e() {
 
     // Verify latest values
     for i in 0..10 {
-        let key = format!("key_{:03}", i);
+        let key = format!("key_{i:03}");
         let value = get_for_test(&engine, key.as_bytes());
         assert_eq!(
             value,
@@ -533,11 +530,8 @@ fn test_interleaved_writes_flushes() {
         let num_writes = (round % 3) + 1;
         for i in 0..num_writes {
             let mut batch = new_batch_with_lsn(ts_counter, ts_counter);
-            let key = format!("inter_key_{}", round);
-            batch.put(
-                key.into_bytes(),
-                format!("value_{}_{}", round, i).into_bytes(),
-            );
+            let key = format!("inter_key_{round}");
+            batch.put(key.into_bytes(), format!("value_{round}_{i}").into_bytes());
             engine.write_batch(batch).unwrap();
             ts_counter += 1;
         }
@@ -553,12 +547,11 @@ fn test_interleaved_writes_flushes() {
 
     // Verify all keys exist with latest values
     for round in 0..10 {
-        let key = format!("inter_key_{}", round);
+        let key = format!("inter_key_{round}");
         let value = get_for_test(&engine, key.as_bytes());
         assert!(
             value.is_some(),
-            "Key {} should exist after interleaved operations",
-            key
+            "Key {key} should exist after interleaved operations"
         );
     }
 }
