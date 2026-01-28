@@ -231,11 +231,6 @@ pub use crate::codec::row::{decode_row_to_values, encode_row};
 /// | `scan` | Iterate `MvccKey` entries in range |
 /// | `write_batch` | Atomic writes with commit_ts (MVCC encoding done internally) |
 pub trait StorageEngine: Send + Sync + 'static {
-    /// Get the latest version of a key visible at the given timestamp.
-    ///
-    /// Returns `None` if the key doesn't exist or was deleted (tombstone).
-    fn get_at(&self, key: &[u8], ts: Timestamp) -> Result<Option<RawValue>>;
-
     /// Scan MVCC keys in range.
     ///
     /// Returns all MVCC key-value pairs in the given range, including all versions

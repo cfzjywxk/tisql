@@ -58,7 +58,6 @@ use crate::types::{RawValue, Timestamp};
 use super::config::LsmConfig;
 use super::ilog::IlogService;
 use super::memtable::MemTable;
-use super::mvcc;
 use super::sstable::{SstBuilder, SstBuilderOptions, SstIterator, SstMeta, SstReaderRef};
 use super::version::{ManifestDelta, Version, MAX_LEVELS};
 
@@ -560,30 +559,6 @@ impl LsmEngine {
 }
 
 impl StorageEngine for LsmEngine {
-    fn get_at(&self, key: &[u8], ts: Timestamp) -> Result<Option<RawValue>> {
-        // Build scan range: from (key, ts) to next key
-        let start = MvccKey::encode(key, ts);
-        let end = MvccKey::encode(key, 0)
-            .next_key()
-            .unwrap_or_else(MvccKey::unbounded);
-        let range = start..end;
-
-        let results = self.scan(range)?;
-
-        // Find the first entry matching our key (latest visible version)
-        for (mvcc_key, value) in results {
-            let (decoded_key, entry_ts) = mvcc_key.decode();
-            if decoded_key == key && entry_ts <= ts {
-                if mvcc::is_tombstone(&value) {
-                    return Ok(None);
-                }
-                return Ok(Some(value));
-            }
-        }
-
-        Ok(None)
-    }
-
     fn scan(&self, range: Range<MvccKey>) -> Result<Vec<(MvccKey, RawValue)>> {
         // Collect all MVCC keys from all sources (SSTs, frozen memtables, active memtable)
         // Results are sorted by MVCC key (which gives natural ordering by key then descending ts)

@@ -14,6 +14,7 @@ use criterion::{black_box, criterion_group, criterion_main, BenchmarkId, Criteri
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Barrier};
 use std::thread;
+use tisql::storage::mvcc::is_tombstone;
 use tisql::storage::{
     ArenaMemTableEngine, BTreeMemTableEngine, CrossbeamMemTableEngine, MvccKey, StorageEngine,
     WriteBatch,
@@ -54,6 +55,27 @@ fn populate_engine<E: StorageEngine>(engine: &E, count: usize) {
         batch.put(key.as_bytes().to_vec(), value.as_bytes().to_vec());
         engine.write_batch(batch).unwrap();
     }
+}
+
+/// Point lookup using scan with MvccKey encoding (storage layer API)
+fn get_at_via_scan<E: StorageEngine>(engine: &E, key: &[u8], ts: u64) -> Option<Vec<u8>> {
+    let start = MvccKey::encode(key, ts);
+    let end = MvccKey::encode(key, 0)
+        .next_key()
+        .unwrap_or_else(MvccKey::unbounded);
+
+    let results = engine.scan(start..end).ok()?;
+
+    for (mvcc_key, value) in results {
+        let (decoded_key, entry_ts) = mvcc_key.decode();
+        if decoded_key == key && entry_ts <= ts {
+            if is_tombstone(&value) {
+                return None;
+            }
+            return Some(value);
+        }
+    }
+    None
 }
 
 // =============================================================================
@@ -224,7 +246,7 @@ fn bench_read_throughput(c: &mut Criterion) {
                                     barrier.wait();
                                     for i in 0..OPS_PER_THREAD {
                                         let key = format!("key{:08}", i % PRE_POPULATE);
-                                        black_box(engine.get_at(key.as_bytes(), read_ts).unwrap());
+                                        black_box(get_at_via_scan(engine, key.as_bytes(), read_ts));
                                     }
                                 });
                             }
@@ -264,7 +286,7 @@ fn bench_read_throughput(c: &mut Criterion) {
                                     barrier.wait();
                                     for i in 0..OPS_PER_THREAD {
                                         let key = format!("key{:08}", i % PRE_POPULATE);
-                                        black_box(engine.get_at(key.as_bytes(), read_ts).unwrap());
+                                        black_box(get_at_via_scan(engine, key.as_bytes(), read_ts));
                                     }
                                 });
                             }
@@ -304,7 +326,7 @@ fn bench_read_throughput(c: &mut Criterion) {
                                     barrier.wait();
                                     for i in 0..OPS_PER_THREAD {
                                         let key = format!("key{:08}", i % PRE_POPULATE);
-                                        black_box(engine.get_at(key.as_bytes(), read_ts).unwrap());
+                                        black_box(get_at_via_scan(engine, key.as_bytes(), read_ts));
                                     }
                                 });
                             }
@@ -359,9 +381,11 @@ fn bench_mixed_workload(c: &mut Criterion) {
                                     for i in 0..OPS_PER_THREAD {
                                         if (i % 100) < read_pct {
                                             let key = format!("key{:08}", i % PRE_POPULATE);
-                                            black_box(
-                                                engine.get_at(key.as_bytes(), read_ts).unwrap(),
-                                            );
+                                            black_box(get_at_via_scan(
+                                                engine,
+                                                key.as_bytes(),
+                                                read_ts,
+                                            ));
                                         } else {
                                             let key = format!("mixed_{tid}_{i}");
                                             let value = format!("value_{tid}_{i}");
@@ -408,9 +432,11 @@ fn bench_mixed_workload(c: &mut Criterion) {
                                     for i in 0..OPS_PER_THREAD {
                                         if (i % 100) < read_pct {
                                             let key = format!("key{:08}", i % PRE_POPULATE);
-                                            black_box(
-                                                engine.get_at(key.as_bytes(), read_ts).unwrap(),
-                                            );
+                                            black_box(get_at_via_scan(
+                                                engine,
+                                                key.as_bytes(),
+                                                read_ts,
+                                            ));
                                         } else {
                                             let key = format!("mixed_{tid}_{i}");
                                             let value = format!("value_{tid}_{i}");
@@ -457,9 +483,11 @@ fn bench_mixed_workload(c: &mut Criterion) {
                                     for i in 0..OPS_PER_THREAD {
                                         if (i % 100) < read_pct {
                                             let key = format!("key{:08}", i % PRE_POPULATE);
-                                            black_box(
-                                                engine.get_at(key.as_bytes(), read_ts).unwrap(),
-                                            );
+                                            black_box(get_at_via_scan(
+                                                engine,
+                                                key.as_bytes(),
+                                                read_ts,
+                                            ));
                                         } else {
                                             let key = format!("mixed_{tid}_{i}");
                                             let value = format!("value_{tid}_{i}");

@@ -46,9 +46,7 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use crossbeam_skiplist::SkipMap;
 
 use crate::error::{Result, TiSqlError};
-use crate::storage::mvcc::{
-    decode_mvcc_key, encode_mvcc_key, is_tombstone, next_key_bound, MvccKey, TOMBSTONE,
-};
+use crate::storage::mvcc::{decode_mvcc_key, encode_mvcc_key, MvccKey, TOMBSTONE};
 use crate::storage::{StorageEngine, WriteBatch, WriteOp};
 use crate::types::{Key, RawValue, Timestamp};
 
@@ -89,71 +87,6 @@ impl CrossbeamMemTableEngine {
             list: SkipMap::new(),
             entry_count: AtomicUsize::new(0),
         }
-    }
-
-    /// Get the latest version of a key visible at the given timestamp.
-    ///
-    /// This scans from `key || !ts` to find the first version
-    /// with commit_ts <= ts.
-    pub fn get_at(&self, key: &[u8], ts: Timestamp) -> Result<Option<RawValue>> {
-        match self.get_at_with_tombstone(key, ts)? {
-            super::GetResult::Found(v) => Ok(Some(v)),
-            super::GetResult::FoundTombstone | super::GetResult::NotFound => Ok(None),
-        }
-    }
-
-    /// Get the latest version of a key visible at the given timestamp, with tombstone awareness.
-    ///
-    /// Returns a tri-state result:
-    /// - `Found(value)`: Key exists with the given value
-    /// - `FoundTombstone`: Key was deleted (tombstone marker found)
-    /// - `NotFound`: Key not found at this timestamp
-    ///
-    /// This is critical for correct MVCC: when `FoundTombstone` is returned,
-    /// callers must NOT continue searching older levels.
-    pub fn get_at_with_tombstone(&self, key: &[u8], ts: Timestamp) -> Result<super::GetResult> {
-        // Build scan key: key || !ts
-        // Due to !ts encoding, this will find the first entry >= key with ts' <= ts
-        let start = encode_mvcc_key(key, ts);
-
-        // Compute end bound for the range.
-        // We need to check against MVCC key (not decoded key) because
-        // keys like "key_0_10" sort BEFORE "key_0_1" || ts in MVCC space but
-        // "key_0_10" > "key_0_1" lexicographically. Using next_key_bound
-        // ensures we continue past such keys.
-        let mut end_key = key.to_vec();
-        let end_key_valid = next_key_bound(&mut end_key);
-
-        for entry in self.list.range(start..) {
-            let mvcc_key = entry.key();
-
-            // Check if we've gone past our key prefix.
-            // Use the MVCC key directly against end_key bound.
-            if end_key_valid && mvcc_key.as_slice() >= end_key.as_slice() {
-                break;
-            }
-
-            if let Some((decoded_key, _entry_ts)) = decode_mvcc_key(mvcc_key) {
-                // Verify this is our key (exact match required)
-                if decoded_key == key {
-                    let value = entry.value();
-                    if is_tombstone(value) {
-                        return Ok(super::GetResult::FoundTombstone);
-                    }
-                    return Ok(super::GetResult::Found(value.clone()));
-                }
-                // If decoded_key > key and we don't have a valid end_key (all-0xFF case),
-                // we need to break manually
-                if !end_key_valid && decoded_key.as_slice() > key {
-                    break;
-                }
-            } else {
-                // Invalid MVCC key format, skip
-                continue;
-            }
-        }
-
-        Ok(super::GetResult::NotFound)
     }
 
     /// Write a key-value pair at the given timestamp.
@@ -209,10 +142,6 @@ impl Default for CrossbeamMemTableEngine {
 }
 
 impl StorageEngine for CrossbeamMemTableEngine {
-    fn get_at(&self, key: &[u8], ts: Timestamp) -> Result<Option<RawValue>> {
-        CrossbeamMemTableEngine::get_at(self, key, ts)
-    }
-
     fn scan(&self, range: Range<MvccKey>) -> Result<Vec<(MvccKey, RawValue)>> {
         self.scan_mvcc(range)
     }
@@ -395,7 +324,7 @@ pub struct MemoryStats {
 #[allow(clippy::uninlined_format_args)]
 mod tests {
     use super::*;
-    use crate::storage::mvcc::increment_bytes;
+    use crate::storage::mvcc::{increment_bytes, is_tombstone};
     use std::ops::Range;
 
     fn new_engine() -> CrossbeamMemTableEngine {

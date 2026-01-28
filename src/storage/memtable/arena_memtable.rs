@@ -41,9 +41,7 @@ use std::ops::Range;
 
 use super::arena_skiplist::ArenaSkipList;
 use crate::error::{Result, TiSqlError};
-use crate::storage::mvcc::{
-    decode_mvcc_key, encode_mvcc_key, increment_bytes, is_tombstone, MvccKey, TOMBSTONE,
-};
+use crate::storage::mvcc::{encode_mvcc_key, MvccKey, TOMBSTONE};
 use crate::storage::{StorageEngine, WriteBatch, WriteOp};
 use crate::types::{Key, RawValue, Timestamp};
 use crate::util::arena::PageArena;
@@ -164,40 +162,6 @@ impl ArenaMemTableEngine {
         &self.list
     }
 
-    /// Get the latest version of a key visible at the given timestamp.
-    ///
-    /// This scans from `key || !ts` to find the first version
-    /// with commit_ts <= ts.
-    pub fn get_at(&self, key: &[u8], ts: Timestamp) -> Result<Option<RawValue>> {
-        // Build scan key: key || !ts
-        // Due to !ts encoding, this will find the first entry >= key with ts' <= ts
-        let start = encode_mvcc_key(key, ts);
-
-        // We need to find keys that start with our key
-        let mut end_key = key.to_vec();
-        increment_bytes(&mut end_key);
-
-        // Use iter_from to start at the right position
-        for (mvcc_key, value) in self.list().iter_from(&start) {
-            // Check if we've gone past our key prefix
-            if mvcc_key >= &end_key {
-                break;
-            }
-
-            if let Some((decoded_key, _entry_ts)) = decode_mvcc_key(mvcc_key) {
-                // Verify this is still our key (exact match)
-                if decoded_key == key {
-                    if is_tombstone(value) {
-                        return Ok(None);
-                    }
-                    return Ok(Some(value.clone()));
-                }
-            }
-        }
-
-        Ok(None)
-    }
-
     /// Write a key-value pair at the given timestamp.
     ///
     /// This method is exposed for benchmarking and testing. Production code
@@ -307,10 +271,6 @@ impl ArenaMemTableEngine {
 }
 
 impl StorageEngine for ArenaMemTableEngine {
-    fn get_at(&self, key: &[u8], ts: Timestamp) -> Result<Option<RawValue>> {
-        ArenaMemTableEngine::get_at(self, key, ts)
-    }
-
     fn scan(&self, range: Range<MvccKey>) -> Result<Vec<(MvccKey, RawValue)>> {
         self.scan_mvcc(range)
     }
@@ -349,7 +309,7 @@ pub struct MemoryStats {
 #[allow(clippy::uninlined_format_args)]
 mod tests {
     use super::*;
-    use crate::storage::mvcc::MvccKey;
+    use crate::storage::mvcc::{decode_mvcc_key, increment_bytes, is_tombstone, MvccKey};
     use crate::storage::StorageEngine;
     use std::ops::Range;
 

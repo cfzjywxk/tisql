@@ -39,7 +39,7 @@ use std::time::Instant;
 use crate::error::Result;
 use crate::storage::mvcc::MvccKey;
 use crate::storage::{StorageEngine, WriteBatch};
-use crate::types::{RawValue, Timestamp};
+use crate::types::RawValue;
 
 use super::CrossbeamMemTableEngine;
 
@@ -229,18 +229,6 @@ impl MemTable {
     pub fn inner(&self) -> &CrossbeamMemTableEngine {
         &self.inner
     }
-
-    /// Get a key at a specific timestamp with tombstone awareness.
-    ///
-    /// Returns `GetResult::FoundTombstone` if the key was deleted, which signals
-    /// that callers should NOT continue searching older levels.
-    pub fn get_at_with_tombstone(
-        &self,
-        key: &[u8],
-        ts: crate::types::Timestamp,
-    ) -> crate::error::Result<super::GetResult> {
-        self.inner.get_at_with_tombstone(key, ts)
-    }
 }
 
 /// Estimate the memory size of a write batch.
@@ -260,10 +248,6 @@ fn estimate_batch_size(batch: &WriteBatch) -> usize {
 
 // Implement StorageEngine for MemTable to allow transparent use
 impl StorageEngine for MemTable {
-    fn get_at(&self, key: &[u8], ts: Timestamp) -> Result<Option<RawValue>> {
-        self.inner.get_at(key, ts)
-    }
-
     fn scan(&self, range: Range<MvccKey>) -> Result<Vec<(MvccKey, RawValue)>> {
         self.inner.scan(range)
     }

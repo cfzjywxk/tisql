@@ -37,9 +37,7 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::RwLock;
 
 use crate::error::{Result, TiSqlError};
-use crate::storage::mvcc::{
-    decode_mvcc_key, encode_mvcc_key, increment_bytes, is_tombstone, MvccKey, TOMBSTONE,
-};
+use crate::storage::mvcc::{encode_mvcc_key, MvccKey, TOMBSTONE};
 use crate::storage::{StorageEngine, WriteBatch, WriteOp};
 use crate::types::{Key, RawValue, Timestamp};
 
@@ -61,32 +59,6 @@ impl BTreeMemTableEngine {
             map: RwLock::new(BTreeMap::new()),
             entry_count: AtomicUsize::new(0),
         }
-    }
-
-    /// Get the latest version of a key visible at the given timestamp.
-    pub fn get_at(&self, key: &[u8], ts: Timestamp) -> Result<Option<RawValue>> {
-        let start = encode_mvcc_key(key, ts);
-        let mut end_key = key.to_vec();
-        increment_bytes(&mut end_key);
-
-        let map = self.map.read().unwrap();
-
-        for (mvcc_key, value) in map.range(start..) {
-            if mvcc_key >= &end_key {
-                break;
-            }
-
-            if let Some((decoded_key, _entry_ts)) = decode_mvcc_key(mvcc_key) {
-                if decoded_key == key {
-                    if is_tombstone(value) {
-                        return Ok(None);
-                    }
-                    return Ok(Some(value.clone()));
-                }
-            }
-        }
-
-        Ok(None)
     }
 
     /// Write a key-value pair at the given timestamp.
@@ -163,10 +135,6 @@ impl BTreeMemTableEngine {
 }
 
 impl StorageEngine for BTreeMemTableEngine {
-    fn get_at(&self, key: &[u8], ts: Timestamp) -> Result<Option<RawValue>> {
-        BTreeMemTableEngine::get_at(self, key, ts)
-    }
-
     fn scan(&self, range: Range<MvccKey>) -> Result<Vec<(MvccKey, RawValue)>> {
         self.scan_mvcc(range)
     }
@@ -194,6 +162,7 @@ impl StorageEngine for BTreeMemTableEngine {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::storage::mvcc::is_tombstone;
     use std::ops::Range;
 
     // ==================== Test Helpers Using MvccKey ====================

@@ -34,8 +34,10 @@ use std::time::{Duration, Instant};
 
 use criterion::{black_box, criterion_group, criterion_main, BenchmarkId, Criterion, Throughput};
 
+use tisql::storage::mvcc::is_tombstone;
 use tisql::storage::{
-    ArenaMemTableEngine, BTreeMemTableEngine, CrossbeamMemTableEngine, StorageEngine, WriteBatch,
+    ArenaMemTableEngine, BTreeMemTableEngine, CrossbeamMemTableEngine, MvccKey, StorageEngine,
+    WriteBatch,
 };
 
 // ============================================================================
@@ -76,6 +78,27 @@ fn make_value(row_id: u64, size: usize) -> Vec<u8> {
     }
     value.truncate(size);
     value
+}
+
+/// Point lookup using scan with MvccKey encoding (storage layer API)
+fn get_at_via_scan<E: StorageEngine>(engine: &E, key: &[u8], ts: u64) -> Option<Vec<u8>> {
+    let start = MvccKey::encode(key, ts);
+    let end = MvccKey::encode(key, 0)
+        .next_key()
+        .unwrap_or_else(MvccKey::unbounded);
+
+    let results = engine.scan(start..end).ok()?;
+
+    for (mvcc_key, value) in results {
+        let (decoded_key, entry_ts) = mvcc_key.decode();
+        if decoded_key == key && entry_ts <= ts {
+            if is_tombstone(&value) {
+                return None;
+            }
+            return Some(value);
+        }
+    }
+    None
 }
 
 /// Populate the storage engine with initial data
@@ -157,7 +180,7 @@ fn run_oltp_workload<E: StorageEngine>(
             let row_id = rng() % TABLE_SIZE as u64;
             let key = make_key(table_id, row_id);
             let ts = ts_counter.load(Ordering::Relaxed);
-            let result = engine.get_at(&key, ts);
+            let result = get_at_via_scan(engine, &key, ts);
             let _ = black_box(result);
             stats.point_selects.fetch_add(1, Ordering::Relaxed);
         } else if op_type < PCT_POINT_SELECT + PCT_UPDATE {

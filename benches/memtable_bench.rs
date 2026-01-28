@@ -12,8 +12,30 @@ use std::sync::{Arc, Barrier};
 use std::thread;
 use tisql::storage::memtable::arena_memtable::ArenaMemTableEngine;
 use tisql::storage::memtable::arena_skiplist::ArenaSkipList;
+use tisql::storage::mvcc::is_tombstone;
 use tisql::storage::{MvccKey, StorageEngine, WriteBatch};
 use tisql::util::arena::PageArena;
+
+/// Point lookup using scan with MvccKey encoding (storage layer API)
+fn get_at_via_scan<E: StorageEngine>(engine: &E, key: &[u8], ts: u64) -> Option<Vec<u8>> {
+    let start = MvccKey::encode(key, ts);
+    let end = MvccKey::encode(key, 0)
+        .next_key()
+        .unwrap_or_else(MvccKey::unbounded);
+
+    let results = engine.scan(start..end).ok()?;
+
+    for (mvcc_key, value) in results {
+        let (decoded_key, entry_ts) = mvcc_key.decode();
+        if decoded_key == key && entry_ts <= ts {
+            if is_tombstone(&value) {
+                return None;
+            }
+            return Some(value);
+        }
+    }
+    None
+}
 
 // =============================================================================
 // ArenaSkipList Benchmarks
@@ -307,7 +329,7 @@ fn bench_memtable_get(c: &mut Criterion) {
         group.bench_with_input(BenchmarkId::new("latest", count), &keys, |b, keys| {
             b.iter(|| {
                 for key in keys.iter() {
-                    black_box(engine.get_at(key, read_ts).unwrap());
+                    black_box(get_at_via_scan(engine, key, read_ts));
                 }
             });
         });
@@ -317,7 +339,7 @@ fn bench_memtable_get(c: &mut Criterion) {
         group.bench_with_input(BenchmarkId::new("historical", count), &keys, |b, keys| {
             b.iter(|| {
                 for key in keys.iter() {
-                    black_box(engine.get_at(key, historical_ts).unwrap());
+                    black_box(get_at_via_scan(engine, key, historical_ts));
                 }
             });
         });
@@ -431,7 +453,7 @@ fn bench_memtable_mvcc_versions(c: &mut Criterion) {
             &key,
             |b, key| {
                 let ts = num_versions;
-                b.iter(|| black_box(engine.get_at(key, ts).unwrap()));
+                b.iter(|| black_box(get_at_via_scan(engine, key, ts)));
             },
         );
 
@@ -439,7 +461,7 @@ fn bench_memtable_mvcc_versions(c: &mut Criterion) {
             BenchmarkId::new("read_oldest", num_versions),
             &key,
             |b, key| {
-                b.iter(|| black_box(engine.get_at(key, 1).unwrap()));
+                b.iter(|| black_box(get_at_via_scan(engine, key, 1)));
             },
         );
     }
@@ -490,7 +512,7 @@ fn bench_memtable_concurrent(c: &mut Criterion) {
                                     } else {
                                         // 75% reads
                                         let key = make_key((i as u64 * 7) % pre_populate, 32);
-                                        black_box(engine.get_at(&key, u64::MAX).unwrap());
+                                        black_box(get_at_via_scan(engine, &key, u64::MAX));
                                     }
                                 }
                             })
