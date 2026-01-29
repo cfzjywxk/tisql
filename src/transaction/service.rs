@@ -29,7 +29,7 @@ use crate::tso::TsoService;
 
 use super::api::{CommitInfo, TxnCtx, TxnService, TxnState};
 use super::concurrency::{ConcurrencyManager, Lock};
-use crate::storage::mvcc::{is_tombstone, MvccKey};
+use crate::storage::mvcc::{is_tombstone, MvccIterator, MvccKey};
 use crate::storage::{StorageEngine, WriteBatch, WriteOp};
 use crate::types::{Key, RawValue, Timestamp, TxnId};
 
@@ -264,74 +264,27 @@ impl<S: StorageEngine + 'static, L: ClogService + 'static, T: TsoService> TxnSer
             MvccKey::encode(&range.end, 0)
         };
 
-        let entries = self.storage.scan(start_mvcc..end_mvcc)?;
+        // Create streaming iterator over storage
+        let storage_iter = self.storage.scan_iter(start_mvcc..end_mvcc)?;
 
-        // Deduplicate by key, keeping the latest version with ts <= start_ts
-        // Since MVCC keys are sorted (key, !ts), we see higher timestamps first for each key
-        use std::collections::HashMap;
-        let mut results: HashMap<Key, (Timestamp, Option<RawValue>)> = HashMap::new();
+        // Extract and sort buffer entries in range (owned copy)
+        let buffer_entries: Vec<(Key, Option<RawValue>)> = ctx
+            .write_buffer
+            .iter()
+            .filter(|(k, _)| *k >= &range.start && (range.end.is_empty() || *k < &range.end))
+            .map(|(k, op)| {
+                let value = match op {
+                    WriteOp::Put { value } => Some(value.clone()),
+                    WriteOp::Delete => None,
+                };
+                (k.clone(), value)
+            })
+            .collect::<Vec<_>>();
 
-        for (mvcc_key, value) in entries {
-            let (decoded_key, entry_ts) = mvcc_key.decode();
-            // Check if within key range and visible at start_ts
-            if decoded_key >= range.start
-                && (range.end.is_empty() || decoded_key < range.end)
-                && entry_ts <= ctx.start_ts
-            {
-                // Check if this version is newer than what we have
-                let dominated = results
-                    .get(&decoded_key)
-                    .is_some_and(|(best_ts, _)| entry_ts <= *best_ts);
+        // Create streaming scan iterator that merges storage with write buffer
+        let scan_iter = MvccScanIterator::new(storage_iter, ctx.start_ts, range, buffer_entries);
 
-                if !dominated {
-                    if is_tombstone(&value) {
-                        results.insert(decoded_key, (entry_ts, None));
-                    } else {
-                        results.insert(decoded_key, (entry_ts, Some(value)));
-                    }
-                }
-            }
-        }
-
-        // Collect buffered writes in range for read-your-writes semantics
-        // Use a map to track the latest operation per key
-        let mut buffer_ops: std::collections::BTreeMap<Key, Option<RawValue>> =
-            std::collections::BTreeMap::new();
-
-        for (key, op) in ctx.write_buffer.iter() {
-            if key >= &range.start && (range.end.is_empty() || key < &range.end) {
-                match op {
-                    WriteOp::Put { value } => {
-                        buffer_ops.insert(key.clone(), Some(value.clone()));
-                    }
-                    WriteOp::Delete => {
-                        buffer_ops.insert(key.clone(), None); // None = deleted
-                    }
-                }
-            }
-        }
-
-        // Merge storage results with buffered writes
-        // Buffered writes override storage values (use MAX ts to ensure they win)
-        for (key, value_opt) in buffer_ops {
-            match value_opt {
-                Some(value) => {
-                    results.insert(key, (Timestamp::MAX, Some(value)));
-                }
-                None => {
-                    results.insert(key, (Timestamp::MAX, None)); // Buffered delete
-                }
-            }
-        }
-
-        // Convert to sorted vector, filtering out tombstones (None values)
-        let mut result_vec: Vec<(Key, RawValue)> = results
-            .into_iter()
-            .filter_map(|(k, (_, v))| v.map(|val| (k, val)))
-            .collect();
-        result_vec.sort_by(|a, b| a.0.cmp(&b.0));
-
-        Ok(Box::new(result_vec.into_iter()))
+        Ok(Box::new(scan_iter))
     }
 
     fn put(&self, ctx: &mut TxnCtx, key: Key, value: RawValue) -> Result<()> {
@@ -450,6 +403,233 @@ impl<S: StorageEngine + 'static, L: ClogService + 'static, T: TsoService> TxnSer
         ctx.state = TxnState::Aborted;
 
         Ok(())
+    }
+}
+
+// ============================================================================
+// MvccScanIterator - Streaming scan with write buffer merge
+// ============================================================================
+
+/// Streaming scan iterator that merges storage results with write buffer.
+///
+/// This iterator provides efficient MVCC scanning by:
+/// - Streaming from storage iterator (no full materialization of storage)
+/// - Deduplicating by tracking last_user_key (no HashMap for dedup)
+/// - Merging write buffer entries sorted in memory
+/// - Returning results in sorted order (no final sort needed)
+///
+/// ## MVCC Semantics
+///
+/// For each user key, we return the latest visible version where:
+/// - `entry_ts <= read_ts` (MVCC visibility)
+/// - Tombstones are filtered out (deleted keys not returned)
+/// - Write buffer entries override storage entries (read-your-writes)
+pub struct MvccScanIterator<I: MvccIterator> {
+    /// Storage iterator producing MVCC key-value pairs
+    storage_iter: I,
+    /// Transaction's read timestamp for MVCC filtering
+    read_ts: Timestamp,
+    /// Key range for filtering
+    range: Range<Key>,
+    /// Sorted write buffer entries in range (key, Option<value> where None = delete)
+    buffer_entries: Vec<(Key, Option<RawValue>)>,
+    /// Current position in buffer_entries
+    buffer_pos: usize,
+    /// Last user key returned (for deduplication)
+    last_user_key: Option<Key>,
+    /// Pending result from storage (user_key, Option<value>)
+    pending_storage: Option<(Key, Option<RawValue>)>,
+    /// Whether storage iterator is exhausted
+    storage_exhausted: bool,
+}
+
+impl<I: MvccIterator> MvccScanIterator<I> {
+    /// Create a new scan iterator.
+    ///
+    /// # Arguments
+    ///
+    /// * `storage_iter` - Iterator over storage (MVCC key-value pairs)
+    /// * `read_ts` - Transaction's read timestamp for MVCC visibility
+    /// * `range` - Key range for filtering
+    /// * `buffer_entries` - Pre-extracted write buffer entries (key, Option<value>)
+    ///
+    /// The `buffer_entries` should already be filtered to the range but may be unsorted.
+    pub fn new(
+        storage_iter: I,
+        read_ts: Timestamp,
+        range: Range<Key>,
+        mut buffer_entries: Vec<(Key, Option<RawValue>)>,
+    ) -> Self {
+        // Sort buffer entries by key
+        buffer_entries.sort_by(|a, b| a.0.cmp(&b.0));
+
+        Self {
+            storage_iter,
+            read_ts,
+            range,
+            buffer_entries,
+            buffer_pos: 0,
+            last_user_key: None,
+            pending_storage: None,
+            storage_exhausted: false,
+        }
+    }
+
+    /// Advance storage iterator to next unique user key visible at read_ts.
+    fn advance_storage(&mut self) -> crate::error::Result<()> {
+        self.pending_storage = None;
+
+        while self.storage_iter.valid() {
+            let mvcc_key = self.storage_iter.key();
+            let (user_key, ts) = mvcc_key.decode();
+
+            // Check if past end of range
+            if !self.range.end.is_empty() && user_key >= self.range.end {
+                self.storage_exhausted = true;
+                return Ok(());
+            }
+
+            // Skip if before start of range
+            if user_key < self.range.start {
+                self.storage_iter.next()?;
+                continue;
+            }
+
+            // Skip if not visible at read_ts
+            if ts > self.read_ts {
+                self.storage_iter.next()?;
+                continue;
+            }
+
+            // Skip if we've already processed this user key
+            if let Some(ref last_key) = self.last_user_key {
+                if &user_key == last_key {
+                    self.storage_iter.next()?;
+                    continue;
+                }
+            }
+
+            // Found a visible entry
+            let value = self.storage_iter.value();
+            let result = if is_tombstone(value) {
+                (user_key, None)
+            } else {
+                (user_key, Some(value.to_vec()))
+            };
+            self.pending_storage = Some(result);
+
+            // Advance past all versions of this key
+            self.storage_iter.next()?;
+            return Ok(());
+        }
+
+        self.storage_exhausted = true;
+        Ok(())
+    }
+
+    /// Peek at the next buffer entry.
+    fn peek_buffer(&self) -> Option<&(Key, Option<RawValue>)> {
+        self.buffer_entries.get(self.buffer_pos)
+    }
+
+    /// Advance buffer position.
+    fn advance_buffer(&mut self) {
+        self.buffer_pos += 1;
+    }
+}
+
+impl<I: MvccIterator> Iterator for MvccScanIterator<I> {
+    type Item = (Key, RawValue);
+
+    fn next(&mut self) -> Option<Self::Item> {
+        loop {
+            // Ensure we have a pending storage result if available
+            if self.pending_storage.is_none()
+                && !self.storage_exhausted
+                && self.advance_storage().is_err()
+            {
+                // On error, stop iteration
+                return None;
+            }
+
+            // Get next candidates from storage and buffer
+            let storage_entry = self.pending_storage.as_ref();
+            let buffer_entry = self.peek_buffer();
+
+            match (storage_entry, buffer_entry) {
+                (None, None) => {
+                    // Both exhausted
+                    return None;
+                }
+                (Some((storage_key, storage_value)), None) => {
+                    // Only storage entry available
+                    let key = storage_key.clone();
+                    let value = storage_value.clone();
+                    self.last_user_key = Some(key.clone());
+                    self.pending_storage = None;
+
+                    if let Some(val) = value {
+                        return Some((key, val));
+                    }
+                    // Tombstone, continue to next
+                }
+                (None, Some((buffer_key, buffer_value))) => {
+                    // Only buffer entry available
+                    let key = buffer_key.clone();
+                    let value = buffer_value.clone();
+                    self.last_user_key = Some(key.clone());
+                    self.advance_buffer();
+
+                    if let Some(val) = value {
+                        return Some((key, val));
+                    }
+                    // Deleted, continue to next
+                }
+                (Some((storage_key, storage_value)), Some((buffer_key, buffer_value))) => {
+                    use std::cmp::Ordering;
+
+                    match storage_key.cmp(buffer_key) {
+                        Ordering::Less => {
+                            // Storage key comes first
+                            let key = storage_key.clone();
+                            let value = storage_value.clone();
+                            self.last_user_key = Some(key.clone());
+                            self.pending_storage = None;
+
+                            if let Some(val) = value {
+                                return Some((key, val));
+                            }
+                            // Tombstone, continue to next
+                        }
+                        Ordering::Greater => {
+                            // Buffer key comes first
+                            let key = buffer_key.clone();
+                            let value = buffer_value.clone();
+                            self.last_user_key = Some(key.clone());
+                            self.advance_buffer();
+
+                            if let Some(val) = value {
+                                return Some((key, val));
+                            }
+                            // Deleted, continue to next
+                        }
+                        Ordering::Equal => {
+                            // Same key - buffer overrides storage
+                            let key = buffer_key.clone();
+                            let value = buffer_value.clone();
+                            self.last_user_key = Some(key.clone());
+                            self.pending_storage = None;
+                            self.advance_buffer();
+
+                            if let Some(val) = value {
+                                return Some((key, val));
+                            }
+                            // Deleted, continue to next
+                        }
+                    }
+                }
+            }
+        }
     }
 }
 

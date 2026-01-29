@@ -51,7 +51,7 @@ use fail::fail_point;
 
 use crate::error::{Result, TiSqlError};
 use crate::lsn::SharedLsnProvider;
-use crate::storage::mvcc::{decode_mvcc_key, is_tombstone, MvccKey};
+use crate::storage::mvcc::{decode_mvcc_key, is_tombstone, MvccIterator, MvccKey};
 use crate::storage::{StorageEngine, WriteBatch};
 use crate::types::{RawValue, Timestamp};
 
@@ -727,6 +727,167 @@ impl Iterator for ScanMergeIterator {
     }
 }
 
+// ============================================================================
+// LsmMergeIterator - Streaming merge iterator using MvccIterator trait
+// ============================================================================
+
+/// Entry in the merge heap for LsmMergeIterator.
+struct MergeHeapEntry<'a> {
+    /// Current key from this iterator
+    key: MvccKey,
+    /// Current value from this iterator
+    value: Vec<u8>,
+    /// The underlying iterator
+    iter: Box<dyn MvccIterator + 'a>,
+}
+
+impl PartialEq for MergeHeapEntry<'_> {
+    fn eq(&self, other: &Self) -> bool {
+        self.key == other.key
+    }
+}
+
+impl Eq for MergeHeapEntry<'_> {}
+
+impl PartialOrd for MergeHeapEntry<'_> {
+    fn partial_cmp(&self, other: &Self) -> Option<std::cmp::Ordering> {
+        Some(self.cmp(other))
+    }
+}
+
+impl Ord for MergeHeapEntry<'_> {
+    fn cmp(&self, other: &Self) -> std::cmp::Ordering {
+        // Min-heap: reverse comparison to get smallest key first
+        other.key.cmp(&self.key)
+    }
+}
+
+/// Streaming merge iterator that implements MvccIterator.
+///
+/// This iterator merges multiple `MvccIterator`s using a min-heap,
+/// producing entries in sorted MVCC key order without materializing
+/// all results in memory.
+pub struct LsmMergeIterator<'a> {
+    /// Min-heap of iterators with their current entries
+    heap: BinaryHeap<MergeHeapEntry<'a>>,
+    /// Current key (cached for returning reference)
+    current_key: Option<MvccKey>,
+    /// Current value (cached for returning reference)
+    current_value: Option<Vec<u8>>,
+    /// Pending error from iterator operations
+    pending_error: Option<TiSqlError>,
+}
+
+impl<'a> LsmMergeIterator<'a> {
+    /// Create a new merge iterator from multiple iterators.
+    pub fn new(iters: Vec<Box<dyn MvccIterator + 'a>>) -> Result<Self> {
+        let mut heap = BinaryHeap::new();
+        let pending_error = None;
+
+        for iter in iters {
+            if iter.valid() {
+                let key = iter.key().clone();
+                let value = iter.value().to_vec();
+                heap.push(MergeHeapEntry { key, value, iter });
+            }
+        }
+
+        let mut merge_iter = Self {
+            heap,
+            current_key: None,
+            current_value: None,
+            pending_error,
+        };
+
+        // Prime the iterator with the first entry
+        merge_iter.advance()?;
+
+        Ok(merge_iter)
+    }
+
+    /// Advance to the next entry from the heap.
+    fn advance(&mut self) -> Result<()> {
+        // Check for pending error
+        if let Some(e) = self.pending_error.take() {
+            return Err(e);
+        }
+
+        if let Some(mut top) = self.heap.pop() {
+            // Save current entry
+            self.current_key = Some(top.key.clone());
+            self.current_value = Some(top.value.clone());
+
+            // Advance the iterator
+            if let Err(e) = top.iter.next() {
+                // Store error for next operation
+                self.pending_error = Some(e);
+            }
+
+            // Re-add to heap if still valid
+            if top.iter.valid() {
+                let key = top.iter.key().clone();
+                let value = top.iter.value().to_vec();
+                self.heap.push(MergeHeapEntry {
+                    key,
+                    value,
+                    iter: top.iter,
+                });
+            }
+
+            Ok(())
+        } else {
+            // Heap exhausted
+            self.current_key = None;
+            self.current_value = None;
+            Ok(())
+        }
+    }
+}
+
+impl MvccIterator for LsmMergeIterator<'_> {
+    fn seek(&mut self, target: &MvccKey) -> Result<()> {
+        // Seek all iterators in the heap to the target
+        // This is a bit expensive but maintains correctness
+        let mut iters: Vec<Box<dyn MvccIterator>> = Vec::new();
+
+        // Drain all iterators from heap
+        while let Some(entry) = self.heap.pop() {
+            iters.push(entry.iter);
+        }
+
+        // Seek each iterator and re-add to heap
+        for mut iter in iters {
+            iter.seek(target)?;
+            if iter.valid() {
+                let key = iter.key().clone();
+                let value = iter.value().to_vec();
+                self.heap.push(MergeHeapEntry { key, value, iter });
+            }
+        }
+
+        // Prime with first entry >= target
+        self.current_key = None;
+        self.current_value = None;
+        self.advance()
+    }
+
+    fn next(&mut self) -> Result<()> {
+        self.advance()
+    }
+
+    fn valid(&self) -> bool {
+        self.current_key.is_some()
+    }
+
+    fn key(&self) -> &MvccKey {
+        self.current_key.as_ref().expect("Iterator not valid")
+    }
+
+    fn value(&self) -> &[u8] {
+        self.current_value.as_ref().expect("Iterator not valid")
+    }
+}
+
 impl StorageEngine for LsmEngine {
     fn scan(&self, range: Range<MvccKey>) -> Result<Vec<(MvccKey, RawValue)>> {
         let (active, frozen, version) = {
@@ -781,6 +942,17 @@ impl StorageEngine for LsmEngine {
 
         // Collect results, propagating any I/O errors from SST reads
         merge_iter.collect()
+    }
+
+    fn scan_iter(&self, range: Range<MvccKey>) -> Result<Box<dyn MvccIterator + '_>> {
+        // For LsmEngine, we currently fall back to materializing via scan()
+        // and using VecMvccIterator. A true streaming implementation would
+        // use LsmMergeIterator with SstMvccIterator, but that requires
+        // careful lifetime management with the state lock.
+        //
+        // This still provides the MvccIterator interface for callers.
+        let entries = self.scan(range)?;
+        Ok(Box::new(crate::storage::VecMvccIterator::new(entries)))
     }
 
     fn write_batch(&self, batch: WriteBatch) -> Result<()> {

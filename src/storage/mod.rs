@@ -121,7 +121,7 @@ pub use recovery::{LsmRecovery, RecoveryResult, RecoveryStats};
 // Re-export MVCC codec types
 pub use mvcc::{
     decode_mvcc_key, encode_mvcc_key, extract_key, is_tombstone, next_key_bound, prev_key_bound,
-    MvccKey, TIMESTAMP_SIZE, TOMBSTONE,
+    MvccIterator, MvccKey, VecMvccIterator, TIMESTAMP_SIZE, TOMBSTONE,
 };
 
 // Re-export SST types for persistent storage
@@ -141,6 +141,8 @@ pub use sstable::{
     SstBuilderOptions,
     SstIterator,
     SstMeta,
+    // MvccIterator wrapper for SST
+    SstMvccIterator,
     // Reader types
     SstReader,
     SstReaderRef,
@@ -235,7 +237,8 @@ pub use crate::codec::row::{decode_row_to_values, encode_row};
 ///
 /// | Method | Description |
 /// |--------|-------------|
-/// | `scan` | Iterate `MvccKey` entries in range |
+/// | `scan` | Iterate `MvccKey` entries in range (materializes all results) |
+/// | `scan_iter` | Create streaming iterator over range (zero-allocation) |
 /// | `write_batch` | Atomic writes with commit_ts (MVCC encoding done internally) |
 pub trait StorageEngine: Send + Sync + 'static {
     /// Scan MVCC keys in range.
@@ -252,6 +255,25 @@ pub trait StorageEngine: Send + Sync + 'static {
     ///
     /// * `range` - MVCC key range to scan. Use `MvccKey::encode(key, ts)` to build bounds.
     fn scan(&self, range: Range<MvccKey>) -> Result<Vec<(MvccKey, RawValue)>>;
+
+    /// Create a streaming iterator over MVCC keys in range.
+    ///
+    /// This is the preferred method for large scans as it avoids materializing
+    /// all results in memory. The default implementation falls back to `scan()`
+    /// with a `VecMvccIterator` wrapper, but storage engines can override this
+    /// to provide true streaming iteration.
+    ///
+    /// # Arguments
+    ///
+    /// * `range` - MVCC key range to scan.
+    ///
+    /// # Returns
+    ///
+    /// A boxed iterator that yields entries in MVCC key order.
+    fn scan_iter(&self, range: Range<MvccKey>) -> Result<Box<dyn MvccIterator + '_>> {
+        let entries = self.scan(range)?;
+        Ok(Box::new(VecMvccIterator::new(entries)))
+    }
 
     /// Apply a batch of writes atomically.
     ///

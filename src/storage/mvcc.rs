@@ -394,6 +394,162 @@ impl Ord for MvccKey {
     }
 }
 
+// ============================================================================
+// MvccIterator Trait
+// ============================================================================
+
+use crate::error::Result;
+use crate::types::RawValue;
+
+/// Streaming iterator over MVCC key-value pairs.
+///
+/// This trait provides a RocksDB-style iterator interface with explicit
+/// positioning operations. Unlike `std::iter::Iterator`, this design:
+///
+/// - Supports I/O error propagation via `Result`
+/// - Allows efficient seeking to arbitrary positions
+/// - Avoids allocation by returning references
+///
+/// ## Usage Pattern
+///
+/// ```ignore
+/// let mut iter = storage.scan_iter(range)?;
+/// while iter.valid() {
+///     let key = iter.key();
+///     let value = iter.value();
+///     // Process entry
+///     iter.next()?;
+/// }
+/// ```
+///
+/// ## Key Ordering
+///
+/// MVCC keys are ordered as `(user_key ASC, timestamp DESC)`:
+/// - Keys with the same user key are grouped together
+/// - Within a user key, newer versions (higher timestamps) come first
+///
+/// ## Thread Safety
+///
+/// Iterators are not required to be `Send` - they are typically used within
+/// a single thread for the duration of a scan operation. The `StorageEngine`
+/// itself must be `Send + Sync`, but the iterators it produces need not be.
+pub trait MvccIterator {
+    /// Seek to the first entry >= target key.
+    ///
+    /// After seeking:
+    /// - `valid()` returns true if an entry >= target exists
+    /// - `key()` returns the first entry >= target
+    fn seek(&mut self, target: &MvccKey) -> Result<()>;
+
+    /// Move to the next entry.
+    ///
+    /// This advances the iterator to the next key in MVCC order.
+    fn next(&mut self) -> Result<()>;
+
+    /// Check if the iterator is positioned on a valid entry.
+    ///
+    /// Returns false if:
+    /// - Iterator is exhausted
+    /// - Iterator is before the first entry
+    /// - An I/O error occurred (check via previous operation's Result)
+    fn valid(&self) -> bool;
+
+    /// Get the current key.
+    ///
+    /// # Panics
+    ///
+    /// Panics if `!self.valid()`. Always check `valid()` first.
+    fn key(&self) -> &MvccKey;
+
+    /// Get the current value.
+    ///
+    /// # Panics
+    ///
+    /// Panics if `!self.valid()`. Always check `valid()` first.
+    fn value(&self) -> &[u8];
+}
+
+// ============================================================================
+// VecMvccIterator - Fallback implementation using Vec
+// ============================================================================
+
+/// A simple iterator over a pre-materialized Vec.
+///
+/// This is the fallback implementation used when a storage engine
+/// doesn't provide a native streaming iterator. It wraps the results
+/// of `scan()` to implement the `MvccIterator` trait.
+pub struct VecMvccIterator {
+    /// Materialized entries
+    entries: Vec<(MvccKey, RawValue)>,
+    /// Current position
+    pos: usize,
+}
+
+impl VecMvccIterator {
+    /// Create a new iterator from a Vec of entries.
+    ///
+    /// The entries should already be sorted in MVCC key order.
+    pub fn new(entries: Vec<(MvccKey, RawValue)>) -> Self {
+        Self { entries, pos: 0 }
+    }
+}
+
+impl MvccIterator for VecMvccIterator {
+    fn seek(&mut self, target: &MvccKey) -> Result<()> {
+        // Binary search for the first entry >= target
+        self.pos = self
+            .entries
+            .partition_point(|(k, _)| k.as_bytes() < target.as_bytes());
+        Ok(())
+    }
+
+    fn next(&mut self) -> Result<()> {
+        if self.pos < self.entries.len() {
+            self.pos += 1;
+        }
+        Ok(())
+    }
+
+    fn valid(&self) -> bool {
+        self.pos < self.entries.len()
+    }
+
+    fn key(&self) -> &MvccKey {
+        &self.entries[self.pos].0
+    }
+
+    fn value(&self) -> &[u8] {
+        &self.entries[self.pos].1
+    }
+}
+
+// ============================================================================
+// Box<dyn MvccIterator> implementation
+// ============================================================================
+
+/// Implement MvccIterator for boxed trait objects to allow dynamic dispatch.
+impl MvccIterator for Box<dyn MvccIterator + '_> {
+    fn seek(&mut self, target: &MvccKey) -> Result<()> {
+        (**self).seek(target)
+    }
+
+    fn next(&mut self) -> Result<()> {
+        (**self).next()
+    }
+
+    fn valid(&self) -> bool {
+        (**self).valid()
+    }
+
+    fn key(&self) -> &MvccKey {
+        (**self).key()
+    }
+
+    fn value(&self) -> &[u8] {
+        (**self).value()
+    }
+}
+
 /// Tombstone marker for deleted keys.
 ///
 /// We use a byte sequence that starts with NUL bytes (uncommon in user data)

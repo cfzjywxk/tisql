@@ -32,7 +32,10 @@
 //! iter.seek(b"target_key")?;
 //! ```
 
+use std::ops::Range;
+
 use crate::error::Result;
+use crate::storage::mvcc::{MvccIterator, MvccKey};
 use crate::types::RawValue;
 
 use super::block::DataBlock;
@@ -473,6 +476,106 @@ impl ConcatIterator {
 
         self.current = Some(SstIterator::new(self.readers[self.sst_idx].clone())?);
         Ok(())
+    }
+}
+
+// ============================================================================
+// SstMvccIterator - MvccIterator wrapper for SstIterator
+// ============================================================================
+
+/// MvccIterator wrapper around SstIterator.
+///
+/// This wraps the existing SstIterator to implement the MvccIterator trait,
+/// providing range filtering and proper MVCC key semantics.
+pub struct SstMvccIterator {
+    /// Underlying SST iterator
+    inner: SstIterator,
+    /// Range bounds for filtering
+    range: Range<MvccKey>,
+    /// Whether the range is truly unbounded
+    is_unbounded: bool,
+    /// Cached current key (to return reference)
+    current_key: Option<MvccKey>,
+    /// Cached current value (to return reference)
+    current_value: Option<Vec<u8>>,
+}
+
+impl SstMvccIterator {
+    /// Create a new iterator over the given range.
+    ///
+    /// The iterator seeks to the start of the range and filters entries
+    /// that are beyond the end bound.
+    pub fn new(reader: SstReaderRef, range: Range<MvccKey>) -> Result<Self> {
+        let is_unbounded = range.start.is_unbounded() && range.end.is_unbounded();
+        let mut inner = SstIterator::new(reader)?;
+
+        // Seek to start of range if bounded
+        if !is_unbounded && !range.start.is_unbounded() {
+            inner.seek(range.start.as_bytes())?;
+        }
+
+        let mut iter = Self {
+            inner,
+            range,
+            is_unbounded,
+            current_key: None,
+            current_value: None,
+        };
+
+        // Cache the current entry if valid and in range
+        iter.update_current();
+        Ok(iter)
+    }
+
+    /// Update the cached current key and value.
+    fn update_current(&mut self) {
+        if !self.inner.valid() {
+            self.current_key = None;
+            self.current_value = None;
+            return;
+        }
+
+        let key_bytes = self.inner.key();
+
+        // Check if we're past the end of the range
+        if !self.is_unbounded
+            && !self.range.end.is_unbounded()
+            && key_bytes >= self.range.end.as_bytes()
+        {
+            self.current_key = None;
+            self.current_value = None;
+            return;
+        }
+
+        // Cache the current entry
+        self.current_key = MvccKey::from_bytes(key_bytes.to_vec());
+        self.current_value = Some(self.inner.value().to_vec());
+    }
+}
+
+impl MvccIterator for SstMvccIterator {
+    fn seek(&mut self, target: &MvccKey) -> Result<()> {
+        self.inner.seek(target.as_bytes())?;
+        self.update_current();
+        Ok(())
+    }
+
+    fn next(&mut self) -> Result<()> {
+        self.inner.next()?;
+        self.update_current();
+        Ok(())
+    }
+
+    fn valid(&self) -> bool {
+        self.current_key.is_some()
+    }
+
+    fn key(&self) -> &MvccKey {
+        self.current_key.as_ref().expect("Iterator not valid")
+    }
+
+    fn value(&self) -> &[u8] {
+        self.current_value.as_ref().expect("Iterator not valid")
     }
 }
 

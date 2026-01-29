@@ -164,9 +164,9 @@ impl SstMeta {
     /// # Arguments
     ///
     /// * `start` - Start of MVCC key range (inclusive)
-    /// * `end` - End of MVCC key range (inclusive)
+    /// * `end` - End of MVCC key range (exclusive), empty slice means unbounded
     pub fn overlaps_mvcc(&self, start: &[u8], end: &[u8]) -> bool {
-        // Range is [start, end)
+        // Query range is [start, end)
         // SST is [smallest_key, largest_key]
         let start_le_largest = self.largest_key.as_slice() >= start;
         let end_gt_smallest = end.is_empty() || end > self.smallest_key.as_slice();

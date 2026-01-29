@@ -58,4 +58,4 @@ pub use builder::{
 
 pub use reader::{SstReader, SstReaderRef};
 
-pub use iterator::{ConcatIterator, SstIterator};
+pub use iterator::{ConcatIterator, SstIterator, SstMvccIterator};
