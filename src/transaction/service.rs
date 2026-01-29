@@ -377,18 +377,26 @@ impl<S: StorageEngine + 'static, L: ClogService + 'static, T: TsoService> TxnSer
         // 1. Any concurrent reader will see the lock and be blocked
         // 2. We then get commit_ts which is guaranteed > any concurrent reader's start_ts
         //    because: start_ts = max(TSO, max_ts), and we update max_ts via lock_keys
-        let preliminary_ts = self.get_ts();
 
-        // Get primary key (first key in write buffer) for lock info
+        // Select primary key deterministically: lexicographically smallest key.
+        // This is important for future 2PC/lock resolution:
+        // - Primary key must be stable and deterministic across retries
+        // - TiDB uses the first key in sorted order as primary
+        // - Once selected, the primary should not change for the transaction
         let primary_key: Arc<[u8]> = ctx
             .write_buffer
             .keys()
-            .next()
+            .min()
             .map(|k| Arc::from(k.as_slice()))
             .unwrap_or_else(|| Arc::from(&[][..]));
 
+        // Lock uses transaction's start_ts, not a fresh timestamp.
+        // This is critical for lock resolution in 2PC:
+        // - Readers use lock.ts to determine if the lock is from an old/stale txn
+        // - Lock resolvers check if txn with start_ts is still alive
+        // - Using start_ts ensures consistent behavior across all keys in the txn
         let lock = Lock {
-            ts: preliminary_ts,
+            ts: ctx.start_ts,
             primary: primary_key,
         };
 
