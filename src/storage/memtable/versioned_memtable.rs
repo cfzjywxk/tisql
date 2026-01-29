@@ -412,20 +412,28 @@ impl StorageEngine for VersionedMemTableEngine {
                     let mvcc_key = MvccKey::encode(user_key, ts);
 
                     // Check if this MVCC key is within the requested range
-                    // MVCC ordering: higher ts = smaller encoded key
-                    let in_range = if user_key == &start_user_key {
-                        // Same user key as start - check timestamp
+                    // MVCC ordering: higher ts = smaller encoded key (due to !ts encoding)
+                    //
+                    // For a range [start_key@start_ts, end_key@end_ts):
+                    // - Start is inclusive: mvcc_key >= start means ts <= start_ts for same key
+                    // - End is exclusive: mvcc_key < end means ts > end_ts for same key
+                    let after_start = if user_key > &start_user_key {
+                        true
+                    } else if user_key == &start_user_key {
                         ts <= start_ts
-                    } else if !end_user_key.is_empty() && user_key == &end_user_key {
-                        // Same user key as end - check timestamp (exclusive)
-                        ts > end_ts
                     } else {
-                        // Different user key - include all versions
-                        user_key > &start_user_key
-                            && (end_user_key.is_empty() || user_key < &end_user_key)
+                        false
                     };
 
-                    if in_range {
+                    let before_end = if end_user_key.is_empty() || user_key < &end_user_key {
+                        true
+                    } else if user_key == &end_user_key {
+                        ts > end_ts // exclusive end
+                    } else {
+                        false
+                    };
+
+                    if after_start && before_end {
                         results.push((mvcc_key, value.clone()));
                     }
                 }
@@ -816,6 +824,66 @@ mod tests {
         let results = engine.scan(start..end).unwrap();
         // Now only a and b are included
         assert_eq!(results.len(), 2);
+    }
+
+    #[test]
+    fn test_storage_engine_scan_same_key_timestamp_range() {
+        // Regression test: when start_user_key == end_user_key, both timestamp
+        // bounds must be enforced. Previously the code used mutually exclusive
+        // if/else branches that only checked one bound.
+        let engine = new_engine();
+
+        // Write multiple versions of the same key
+        engine.put_at(b"key", b"v10", 10);
+        engine.put_at(b"key", b"v20", 20);
+        engine.put_at(b"key", b"v30", 30);
+        engine.put_at(b"key", b"v40", 40);
+        engine.put_at(b"key", b"v50", 50);
+
+        // Scan range: key@40 (inclusive) to key@20 (exclusive)
+        // Should include versions at ts=40 and ts=30, but NOT ts=50 or ts=20 or ts=10
+        // MVCC encoding: higher ts = smaller encoded key
+        // So key@40 < key@30 < key@20 in MVCC order
+        let start = MvccKey::encode(b"key", 40);
+        let end = MvccKey::encode(b"key", 20);
+
+        let results = engine.scan(start..end).unwrap();
+
+        // Should have exactly 2 versions: ts=40 and ts=30
+        assert_eq!(
+            results.len(),
+            2,
+            "Expected 2 versions (ts=40, ts=30), got {}",
+            results.len()
+        );
+
+        // Verify the timestamps
+        let timestamps: Vec<_> = results.iter().map(|(k, _)| k.timestamp()).collect();
+        assert!(
+            timestamps.contains(&40),
+            "Should contain ts=40, got {:?}",
+            timestamps
+        );
+        assert!(
+            timestamps.contains(&30),
+            "Should contain ts=30, got {:?}",
+            timestamps
+        );
+        assert!(
+            !timestamps.contains(&50),
+            "Should NOT contain ts=50, got {:?}",
+            timestamps
+        );
+        assert!(
+            !timestamps.contains(&20),
+            "Should NOT contain ts=20 (exclusive end), got {:?}",
+            timestamps
+        );
+        assert!(
+            !timestamps.contains(&10),
+            "Should NOT contain ts=10, got {:?}",
+            timestamps
+        );
     }
 
     // ==================== Concurrent Tests ====================
