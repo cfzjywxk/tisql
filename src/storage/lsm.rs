@@ -560,11 +560,14 @@ impl LsmEngine {
 
 use std::collections::BinaryHeap;
 
-// Wrapper for SstIterator to implement the standard Iterator trait
+// Wrapper for SstIterator to implement the standard Iterator trait.
+// Returns Result items to properly propagate I/O errors during iteration.
 struct SstIteratorWrapper {
     iter: SstIterator,
     range: Range<MvccKey>,
     is_unbounded: bool,
+    /// Tracks whether we've encountered an error. Once set, iteration stops.
+    errored: bool,
 }
 
 impl SstIteratorWrapper {
@@ -577,14 +580,20 @@ impl SstIteratorWrapper {
             iter,
             range,
             is_unbounded,
+            errored: false,
         })
     }
 }
 
 impl Iterator for SstIteratorWrapper {
-    type Item = (MvccKey, RawValue);
+    type Item = Result<(MvccKey, RawValue)>;
 
     fn next(&mut self) -> Option<Self::Item> {
+        // Stop iteration after an error
+        if self.errored {
+            return None;
+        }
+
         if !self.iter.valid() {
             return None;
         }
@@ -601,16 +610,26 @@ impl Iterator for SstIteratorWrapper {
         let key = MvccKey::from_bytes_unchecked(key_bytes.to_vec());
         let value = self.iter.value().to_vec();
 
-        self.iter.next().ok()?;
+        // Advance the iterator, propagating any I/O errors
+        if let Err(e) = self.iter.next() {
+            self.errored = true;
+            return Some(Err(e));
+        }
 
-        Some((key, value))
+        Some(Ok((key, value)))
     }
 }
 
+/// Iterator item type used throughout the merge process.
+/// Using Result allows proper error propagation from SST I/O operations.
+type ScanItem = Result<(MvccKey, RawValue)>;
+
 // A wrapper for any iterator to be used in the merge heap.
 struct HeapEntry {
+    /// The current item. For heap ordering we need the key, so we store Ok items.
+    /// Errors are handled separately in ScanMergeIterator.
     item: (MvccKey, RawValue),
-    iter: Box<dyn Iterator<Item = (MvccKey, RawValue)>>,
+    iter: Box<dyn Iterator<Item = ScanItem>>,
 }
 
 impl PartialEq for HeapEntry {
@@ -634,36 +653,69 @@ impl Ord for HeapEntry {
     }
 }
 
-// The merge iterator.
+// The merge iterator that properly propagates errors from underlying iterators.
 struct ScanMergeIterator {
     heap: BinaryHeap<HeapEntry>,
+    /// Stores the first error encountered during initialization.
+    /// This is returned on the first call to next().
+    init_error: Option<TiSqlError>,
 }
 
 impl ScanMergeIterator {
-    fn new(iters: Vec<Box<dyn Iterator<Item = (MvccKey, RawValue)>>>) -> Self {
+    fn new(iters: Vec<Box<dyn Iterator<Item = ScanItem>>>) -> Self {
         let mut heap = BinaryHeap::new();
+        let mut init_error = None;
+
         for mut iter in iters {
-            if let Some(item) = iter.next() {
-                heap.push(HeapEntry { item, iter });
+            match iter.next() {
+                Some(Ok(item)) => {
+                    heap.push(HeapEntry { item, iter });
+                }
+                Some(Err(e)) => {
+                    // Store the first error encountered
+                    if init_error.is_none() {
+                        init_error = Some(e);
+                    }
+                    // Don't add this iterator to the heap
+                }
+                None => {
+                    // Iterator is empty, skip it
+                }
             }
         }
-        Self { heap }
+        Self { heap, init_error }
     }
 }
 
 impl Iterator for ScanMergeIterator {
-    type Item = (MvccKey, RawValue);
+    type Item = ScanItem;
 
     fn next(&mut self) -> Option<Self::Item> {
+        // Return initialization error first if any
+        if let Some(e) = self.init_error.take() {
+            return Some(Err(e));
+        }
+
         if let Some(mut top) = self.heap.pop() {
             let item = top.item;
-            if let Some(next_item) = top.iter.next() {
-                self.heap.push(HeapEntry {
-                    item: next_item,
-                    iter: top.iter,
-                });
+            match top.iter.next() {
+                Some(Ok(next_item)) => {
+                    self.heap.push(HeapEntry {
+                        item: next_item,
+                        iter: top.iter,
+                    });
+                }
+                Some(Err(e)) => {
+                    // Return the current item, but the error will be returned next time
+                    // Actually, we should return the error immediately after yielding current item
+                    // Store it for the next call
+                    self.init_error = Some(e);
+                }
+                None => {
+                    // Iterator exhausted, don't re-add to heap
+                }
             }
-            Some(item)
+            Some(Ok(item))
         } else {
             None
         }
@@ -681,9 +733,9 @@ impl StorageEngine for LsmEngine {
             )
         };
 
-        let mut iters: Vec<Box<dyn Iterator<Item = (MvccKey, RawValue)>>> = Vec::new();
+        let mut iters: Vec<Box<dyn Iterator<Item = ScanItem>>> = Vec::new();
 
-        // 1. Add SST iterators
+        // 1. Add SST iterators (these can fail with I/O errors)
         for level in 0..MAX_LEVELS {
             for sst_meta in version.ssts_at_level(level as u32) {
                 if !sst_meta.overlaps_mvcc(range.start.as_bytes(), range.end.as_bytes()) {
@@ -703,19 +755,21 @@ impl StorageEngine for LsmEngine {
         }
 
         // 2. Add frozen memtable iterators (newest to oldest)
+        // Memtable iterators are infallible, wrap items in Ok
         for memtable in &frozen {
             let mem_iter = memtable.scan(range.clone())?;
-            iters.push(Box::new(mem_iter.into_iter()));
+            iters.push(Box::new(mem_iter.into_iter().map(Ok)));
         }
 
         // 3. Add active memtable iterator
         let active_iter = active.scan(range.clone())?;
-        iters.push(Box::new(active_iter.into_iter()));
+        iters.push(Box::new(active_iter.into_iter().map(Ok)));
 
         // Use a merge iterator to get sorted results efficiently
         let merge_iter = ScanMergeIterator::new(iters);
 
-        Ok(merge_iter.collect())
+        // Collect results, propagating any I/O errors from SST reads
+        merge_iter.collect()
     }
 
     fn write_batch(&self, batch: WriteBatch) -> Result<()> {
