@@ -229,8 +229,11 @@ fn test_reader_sees_lock_immediately() {
     };
     let guards = cm.lock_keys(std::iter::once(&key), lock).unwrap();
 
-    // Immediately visible to reader
-    let result = cm.check_lock(&key, 1);
+    // Snapshot isolation:
+    // - A reader with an older snapshot should NOT be blocked by this lock.
+    assert!(cm.check_lock(&key, 1).is_ok());
+    // - A reader whose snapshot is at/after the lock ts must be blocked.
+    let result = cm.check_lock(&key, 100);
     assert!(result.is_err());
     match result {
         Err(TiSqlError::KeyIsLocked { lock_ts, .. }) => {
@@ -243,7 +246,7 @@ fn test_reader_sees_lock_immediately() {
     drop(guards);
 
     // Lock should be released
-    assert!(cm.check_lock(&key, 1).is_ok());
+    assert!(cm.check_lock(&key, 100).is_ok());
 }
 
 /// Test concurrent writers to different keys succeed.
@@ -352,14 +355,16 @@ fn test_range_lock_check() {
     let key_b = b"key_b".to_vec();
     let _guards = cm.lock_keys(std::iter::once(&key_b), lock).unwrap();
 
-    // Range containing locked key should fail
-    assert!(cm.check_range(b"key_a", b"key_c", 1).is_err());
+    // Snapshot isolation: older snapshot can ignore the lock.
+    assert!(cm.check_range(b"key_a", b"key_c", 1).is_ok());
+    // Snapshot at/after the lock ts must be blocked.
+    assert!(cm.check_range(b"key_a", b"key_c", 100).is_err());
 
     // Range before locked key should pass
-    assert!(cm.check_range(b"key_0", b"key_a", 1).is_ok());
+    assert!(cm.check_range(b"key_0", b"key_a", 100).is_ok());
 
     // Range after locked key should pass
-    assert!(cm.check_range(b"key_c", b"key_z", 1).is_ok());
+    assert!(cm.check_range(b"key_c", b"key_z", 100).is_ok());
 }
 
 // ============================================================================
@@ -420,8 +425,9 @@ fn test_concurrent_read_during_write() {
             thread::yield_now();
         }
 
-        // Try to check lock - should be blocked
-        let result = cm_read.check_lock(&key_clone, 1);
+        // Try to check lock. Under snapshot isolation, a reader whose snapshot
+        // is at/after the writer start_ts should be blocked.
+        let result = cm_read.check_lock(&key_clone, 100);
         assert!(result.is_err(), "Reader should see lock");
 
         // Signal that reader was blocked
@@ -434,7 +440,7 @@ fn test_concurrent_read_during_write() {
 
     // After writer thread exits, lock should be released
     assert!(
-        cm.check_lock(&key, 1).is_ok(),
+        cm.check_lock(&key, 100).is_ok(),
         "Lock should be released after writer exits"
     );
 
@@ -752,7 +758,7 @@ mod failpoint_tests {
         thread::sleep(Duration::from_millis(50));
 
         // Reader should see lock
-        let result = cm.check_lock(key, 1);
+        let result = cm.check_lock(key, Timestamp::MAX);
         assert!(
             result.is_err(),
             "Reader should see lock while writer is paused"
@@ -764,7 +770,7 @@ mod failpoint_tests {
         writer.join().unwrap();
 
         // After writer completes, lock released and data visible
-        assert!(cm.check_lock(key, 1).is_ok());
+        assert!(cm.check_lock(key, Timestamp::MAX).is_ok());
         let v = get_for_test(&storage, key);
         assert_eq!(v, Some(b"value".to_vec()));
 
@@ -790,14 +796,14 @@ mod failpoint_tests {
         thread::sleep(Duration::from_millis(50));
 
         // Lock should still be held
-        let result = cm.check_lock(key, 1);
+        let result = cm.check_lock(key, Timestamp::MAX);
         assert!(result.is_err(), "Lock should persist through clog write");
 
         // Resume
         fail::cfg("txn_after_clog_write", "off").unwrap();
         writer.join().unwrap();
 
-        assert!(cm.check_lock(key, 1).is_ok());
+        assert!(cm.check_lock(key, Timestamp::MAX).is_ok());
 
         scenario.teardown();
     }
@@ -823,14 +829,14 @@ mod failpoint_tests {
         thread::sleep(Duration::from_millis(50));
 
         // Lock should still be held even though data is in storage
-        assert!(cm.check_lock(key, 1).is_err());
+        assert!(cm.check_lock(key, Timestamp::MAX).is_err());
 
         // Resume
         fail::cfg("txn_after_storage_apply", "off").unwrap();
         writer.join().unwrap();
 
         // Now should see v2
-        assert!(cm.check_lock(key, 1).is_ok());
+        assert!(cm.check_lock(key, Timestamp::MAX).is_ok());
         let v = get_for_test(&storage, key);
         assert_eq!(v, Some(b"v2".to_vec()));
 
@@ -916,7 +922,7 @@ mod failpoint_tests {
 
         // Verify writer has the lock
         assert!(
-            cm.check_lock(key, 1).is_err(),
+            cm.check_lock(key, Timestamp::MAX).is_err(),
             "Writer should have acquired lock"
         );
 

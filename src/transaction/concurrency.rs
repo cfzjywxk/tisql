@@ -295,12 +295,34 @@ impl LockTable {
         self.0.len()
     }
 
-    /// Iterate over a range to check for locks.
-    fn check_range(&self, start: &[u8], end: &[u8]) -> Option<(Key, Lock)> {
-        for entry in self.0.range(start.to_vec()..end.to_vec()) {
-            if let Some(handle) = entry.value().upgrade() {
-                if let Some(lock) = handle.get_lock() {
-                    return Some((handle.key.clone(), lock));
+    /// Iterate over a range to check for conflicting locks under snapshot isolation.
+    ///
+    /// Under SI, a reader at `start_ts` only needs to be blocked by locks from
+    /// transactions that started at or before the reader's snapshot:
+    /// `lock.ts <= start_ts`.
+    ///
+    /// Locks with `lock.ts > start_ts` are "from the future" relative to the
+    /// reader's snapshot and can be ignored safely.
+    fn check_range(&self, start: &[u8], end: &[u8], start_ts: Timestamp) -> Option<(Key, Lock)> {
+        if end.is_empty() {
+            // Treat empty end as unbounded (used by some callers to represent +inf).
+            for entry in self.0.range(start.to_vec()..) {
+                if let Some(handle) = entry.value().upgrade() {
+                    if let Some(lock) = handle.get_lock() {
+                        if lock.ts <= start_ts {
+                            return Some((handle.key.clone(), lock));
+                        }
+                    }
+                }
+            }
+        } else {
+            for entry in self.0.range(start.to_vec()..end.to_vec()) {
+                if let Some(handle) = entry.value().upgrade() {
+                    if let Some(lock) = handle.get_lock() {
+                        if lock.ts <= start_ts {
+                            return Some((handle.key.clone(), lock));
+                        }
+                    }
                 }
             }
         }
@@ -441,14 +463,18 @@ impl ConcurrencyManager {
     /// # Arguments
     /// * `key` - Key to check
     /// * `start_ts` - Reader's start timestamp
-    pub fn check_lock(&self, key: &[u8], _start_ts: Timestamp) -> Result<()> {
+    pub fn check_lock(&self, key: &[u8], start_ts: Timestamp) -> Result<()> {
         if let Some(handle) = self.lock_table.get(key) {
             if let Some(lock) = handle.get_lock() {
-                return Err(TiSqlError::KeyIsLocked {
-                    key: key.to_vec(),
-                    lock_ts: lock.ts,
-                    primary: lock.primary.to_vec(),
-                });
+                // Snapshot isolation: only locks from transactions that started
+                // at or before our snapshot can affect what we should see.
+                if lock.ts <= start_ts {
+                    return Err(TiSqlError::KeyIsLocked {
+                        key: key.to_vec(),
+                        lock_ts: lock.ts,
+                        primary: lock.primary.to_vec(),
+                    });
+                }
             }
         }
         Ok(())
@@ -462,8 +488,8 @@ impl ConcurrencyManager {
     /// * `start` - Range start (inclusive)
     /// * `end` - Range end (exclusive)
     /// * `start_ts` - Reader's start timestamp
-    pub fn check_range(&self, start: &[u8], end: &[u8], _start_ts: Timestamp) -> Result<()> {
-        if let Some((key, lock)) = self.lock_table.check_range(start, end) {
+    pub fn check_range(&self, start: &[u8], end: &[u8], start_ts: Timestamp) -> Result<()> {
+        if let Some((key, lock)) = self.lock_table.check_range(start, end, start_ts) {
             return Err(TiSqlError::KeyIsLocked {
                 key,
                 lock_ts: lock.ts,
@@ -519,10 +545,13 @@ mod tests {
         };
 
         let guard = cm.lock_key(&key, &lock).unwrap();
-        assert!(cm.check_lock(b"key1", 1).is_err());
+        // Snapshot isolation: a reader with an older snapshot should NOT be blocked.
+        assert!(cm.check_lock(b"key1", 1).is_ok());
+        // A reader whose snapshot is at/after the lock ts must be blocked.
+        assert!(cm.check_lock(b"key1", 100).is_err());
 
         drop(guard);
-        assert!(cm.check_lock(b"key1", 1).is_ok());
+        assert!(cm.check_lock(b"key1", 100).is_ok());
     }
 
     #[test]
@@ -538,18 +567,21 @@ mod tests {
         let guards = cm.lock_keys(keys.iter(), lock).unwrap();
         assert_eq!(guards.len(), 2);
 
-        // Check locks are visible
-        assert!(cm.check_lock(b"key1", 1).is_err());
-        assert!(cm.check_lock(b"key2", 1).is_err());
+        // Snapshot isolation:
+        // - readers with an older snapshot can ignore these locks
+        // - readers at/after lock.ts must be blocked
+        assert!(cm.check_lock(b"key1", 1).is_ok());
+        assert!(cm.check_lock(b"key1", 100).is_err());
+        assert!(cm.check_lock(b"key2", 100).is_err());
 
         // Unlocked key should pass
-        assert!(cm.check_lock(b"key3", 1).is_ok());
+        assert!(cm.check_lock(b"key3", 100).is_ok());
 
         drop(guards);
 
         // After guards dropped, locks should be released
-        assert!(cm.check_lock(b"key1", 1).is_ok());
-        assert!(cm.check_lock(b"key2", 1).is_ok());
+        assert!(cm.check_lock(b"key1", 100).is_ok());
+        assert!(cm.check_lock(b"key2", 100).is_ok());
     }
 
     #[test]
@@ -564,11 +596,11 @@ mod tests {
 
         {
             let _guards = cm.lock_keys(keys.iter(), lock).unwrap();
-            assert!(cm.check_lock(b"key1", 1).is_err());
+            assert!(cm.check_lock(b"key1", 100).is_err());
         }
 
         // After guards dropped, lock should be released
-        assert!(cm.check_lock(b"key1", 1).is_ok());
+        assert!(cm.check_lock(b"key1", 100).is_ok());
     }
 
     #[test]
@@ -606,10 +638,10 @@ mod tests {
         let _guards = cm.lock_keys(keys.iter(), lock).unwrap();
 
         // Range containing locked key should fail
-        assert!(cm.check_range(b"key1", b"key3", 1).is_err());
+        assert!(cm.check_range(b"key1", b"key3", 100).is_err());
 
         // Range not containing locked key should pass
-        assert!(cm.check_range(b"key3", b"key5", 1).is_ok());
+        assert!(cm.check_range(b"key3", b"key5", 100).is_ok());
     }
 
     #[test]
@@ -637,16 +669,22 @@ mod tests {
         assert!(result.is_err());
 
         // Verify k1 is NOT locked (was released on failure)
-        assert!(cm.check_lock(b"k1", 1).is_ok(), "k1 should not be locked");
+        assert!(
+            cm.check_lock(b"k1", Timestamp::MAX).is_ok(),
+            "k1 should not be locked"
+        );
 
         // Verify k2 is still locked (by the other transaction)
         assert!(
-            cm.check_lock(b"k2", 1).is_err(),
+            cm.check_lock(b"k2", Timestamp::MAX).is_err(),
             "k2 should still be locked"
         );
 
         // Verify k3 was never locked
-        assert!(cm.check_lock(b"k3", 1).is_ok(), "k3 should not be locked");
+        assert!(
+            cm.check_lock(b"k3", Timestamp::MAX).is_ok(),
+            "k3 should not be locked"
+        );
     }
 
     #[test]
@@ -729,20 +767,20 @@ mod tests {
         assert_eq!(guard1.key(), guard2.key());
 
         // Key is still locked
-        assert!(cm.check_lock(&key, 1).is_err());
+        assert!(cm.check_lock(&key, 100).is_err());
 
         // Drop first guard - key should STILL be locked (guard2 holds it)
         drop(guard1);
 
         // Critical check: lock must remain held while guard2 exists
         assert!(
-            cm.check_lock(&key, 1).is_err(),
+            cm.check_lock(&key, 100).is_err(),
             "lock should still be held by guard2"
         );
 
         drop(guard2);
         // Now the key should be unlocked
-        assert!(cm.check_lock(&key, 1).is_ok());
+        assert!(cm.check_lock(&key, 100).is_ok());
     }
 
     #[test]
@@ -807,7 +845,7 @@ mod tests {
         assert_eq!(guards.len(), 2);
 
         // Both keys should be locked
-        assert!(cm.check_lock(b"key1", 1).is_err());
-        assert!(cm.check_lock(b"key2", 1).is_err());
+        assert!(cm.check_lock(b"key1", 100).is_err());
+        assert!(cm.check_lock(b"key2", 100).is_err());
     }
 }
