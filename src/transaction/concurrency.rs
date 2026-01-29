@@ -44,7 +44,7 @@
 //! ```
 
 use std::cell::UnsafeCell;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, Weak};
 
 use crossbeam_skiplist::SkipMap;
@@ -82,6 +82,9 @@ pub struct KeyHandle {
     table: UnsafeCell<Option<LockTable>>,
     /// The lock state - Some when locked, None when unlocked
     lock_store: Mutex<Option<Lock>>,
+    /// Number of active guards for reentrant locking.
+    /// The lock is only cleared when this drops to 0.
+    guard_count: AtomicUsize,
 }
 
 // Safety: KeyHandle is Send+Sync because:
@@ -98,6 +101,7 @@ impl KeyHandle {
             key,
             table: UnsafeCell::new(None),
             lock_store: Mutex::new(None),
+            guard_count: AtomicUsize::new(0),
         }
     }
 
@@ -129,6 +133,9 @@ impl KeyHandle {
 
         // Acquire the lock
         *lock_store = Some(lock.clone());
+
+        // Increment guard count for reentrant locking support
+        self.guard_count.fetch_add(1, Ordering::AcqRel);
 
         Ok(KeyHandleGuard {
             handle: Arc::clone(self),
@@ -192,8 +199,15 @@ impl KeyHandleGuard {
 
 impl Drop for KeyHandleGuard {
     fn drop(&mut self) {
-        // Clear the lock state
-        *self.handle.lock_store.lock().unwrap() = None;
+        // Decrement guard count and only clear lock when last guard is dropped.
+        // This is critical for reentrant locking: if txn acquires the same key
+        // twice (guard1, guard2), dropping guard1 must NOT release the lock
+        // since guard2 still holds it.
+        let prev_count = self.handle.guard_count.fetch_sub(1, Ordering::AcqRel);
+        if prev_count == 1 {
+            // This was the last guard - clear the lock state
+            *self.handle.lock_store.lock().unwrap() = None;
+        }
         // Arc<KeyHandle> will be dropped, potentially triggering KeyHandle::drop
     }
 }
@@ -717,15 +731,58 @@ mod tests {
         // Key is still locked
         assert!(cm.check_lock(&key, 1).is_err());
 
-        // Drop first guard - key should still be locked (guard2 holds it)
+        // Drop first guard - key should STILL be locked (guard2 holds it)
         drop(guard1);
-        // Note: In our implementation, dropping guard1 clears the lock_store,
-        // so guard2's drop won't find a lock to clear. This is fine because
-        // the lock was already cleared.
+
+        // Critical check: lock must remain held while guard2 exists
+        assert!(
+            cm.check_lock(&key, 1).is_err(),
+            "lock should still be held by guard2"
+        );
 
         drop(guard2);
         // Now the key should be unlocked
         assert!(cm.check_lock(&key, 1).is_ok());
+    }
+
+    #[test]
+    fn test_reentrant_lock_blocks_other_transactions() {
+        // Regression test: verify that another transaction cannot acquire
+        // the lock while ANY reentrant guard still exists.
+        let cm = ConcurrencyManager::new(0);
+        let key = b"key1".to_vec();
+
+        let lock_txn1 = Lock {
+            ts: 100,
+            primary: Arc::from(&b"key1"[..]),
+        };
+
+        let lock_txn2 = Lock {
+            ts: 200,
+            primary: Arc::from(&b"key1"[..]),
+        };
+
+        // txn1 acquires guard1 and guard2 (reentrant)
+        let guard1 = cm.lock_key(&key, &lock_txn1).unwrap();
+        let guard2 = cm.lock_key(&key, &lock_txn1).unwrap();
+
+        // txn2 cannot acquire the lock
+        assert!(cm.lock_key(&key, &lock_txn2).is_err());
+
+        // Drop guard1 - guard2 still holds the lock
+        drop(guard1);
+
+        // Critical: txn2 STILL cannot acquire the lock
+        assert!(
+            cm.lock_key(&key, &lock_txn2).is_err(),
+            "txn2 should not acquire lock while guard2 exists"
+        );
+
+        // Drop guard2 - now lock is released
+        drop(guard2);
+
+        // Now txn2 can acquire the lock
+        let _guard_txn2 = cm.lock_key(&key, &lock_txn2).unwrap();
     }
 
     #[test]
