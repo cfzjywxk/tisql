@@ -430,9 +430,14 @@ impl LsmEngine {
                 .sst_dir()
                 .join(format!("{:08}.sst", sst_meta.id));
 
-            // Skip if file doesn't exist (defensive)
+            // SST referenced by Version must exist - missing file indicates data corruption
             if !sst_path.exists() {
-                continue;
+                return Err(TiSqlError::Storage(format!(
+                    "SST file missing: {} (id={}, level={}). This indicates data corruption or incomplete recovery.",
+                    sst_path.display(),
+                    sst_meta.id,
+                    sst_meta.level
+                )));
             }
 
             // SST now contains MVCC keys - iterate to find matching key with ts visibility
@@ -745,8 +750,14 @@ impl StorageEngine for LsmEngine {
                     .config
                     .sst_dir()
                     .join(format!("{:08}.sst", sst_meta.id));
+                // SST referenced by Version must exist - missing file indicates data corruption
                 if !sst_path.exists() {
-                    continue;
+                    return Err(TiSqlError::Storage(format!(
+                        "SST file missing: {} (id={}, level={}). This indicates data corruption or incomplete recovery.",
+                        sst_path.display(),
+                        sst_meta.id,
+                        sst_meta.level
+                    )));
                 }
                 let reader = SstReaderRef::open(&sst_path)?;
                 let sst_iter = SstIterator::new(reader)?;
