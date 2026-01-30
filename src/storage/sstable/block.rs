@@ -564,9 +564,21 @@ impl IndexBlock {
                 .unwrap(),
         ) as usize;
 
-        // Parse offsets array
-        let offsets_size = num_entries * OFFSET_SIZE;
-        let offsets_start = num_entries_offset - offsets_size;
+        // Parse offsets array with overflow protection
+        let offsets_size = num_entries.checked_mul(OFFSET_SIZE).ok_or_else(|| {
+            TiSqlError::Storage("Index block corrupted: num_entries overflow".into())
+        })?;
+        let offsets_start = num_entries_offset
+            .checked_sub(offsets_size)
+            .ok_or_else(|| {
+                TiSqlError::Storage("Index block corrupted: offsets underflow".into())
+            })?;
+
+        if offsets_start > data.len() {
+            return Err(TiSqlError::Storage(
+                "Invalid index block: offsets overflow".into(),
+            ));
+        }
 
         let mut offsets = Vec::with_capacity(num_entries);
         for i in 0..num_entries {

@@ -87,6 +87,35 @@ impl SstReader {
         file.read_exact(&mut footer_buf)?;
         let footer = Footer::decode(&footer_buf)?;
 
+        // Validate index block bounds before reading
+        // The footer stores index_offset and index_size, which must be within the file
+        let data_end = file_size - FOOTER_SIZE as u64;
+        if footer.index_offset > data_end {
+            return Err(TiSqlError::Storage(format!(
+                "SST corrupted: index_offset {} exceeds data region end {}",
+                footer.index_offset, data_end
+            )));
+        }
+        let index_end = footer
+            .index_offset
+            .checked_add(footer.index_size as u64)
+            .ok_or_else(|| {
+                TiSqlError::Storage("SST corrupted: index offset + size overflows".into())
+            })?;
+        if index_end > data_end {
+            return Err(TiSqlError::Storage(format!(
+                "SST corrupted: index block end {index_end} exceeds data region end {data_end}"
+            )));
+        }
+        // Cap index_size to a reasonable maximum (e.g., 256MB) to prevent OOM from corrupted footer
+        const MAX_INDEX_SIZE: u32 = 256 * 1024 * 1024;
+        if footer.index_size > MAX_INDEX_SIZE {
+            return Err(TiSqlError::Storage(format!(
+                "SST corrupted: index_size {} exceeds maximum {}",
+                footer.index_size, MAX_INDEX_SIZE
+            )));
+        }
+
         // Read index block
         file.seek(SeekFrom::Start(footer.index_offset))?;
         let mut index_buf = vec![0u8; footer.index_size as usize];

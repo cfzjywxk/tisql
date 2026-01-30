@@ -614,7 +614,17 @@ impl Iterator for SstIteratorWrapper {
             }
         }
 
-        let key = MvccKey::from_bytes_unchecked(key_bytes.to_vec());
+        // Use safe MvccKey construction to handle corrupted SST data gracefully
+        let key = match MvccKey::from_bytes(key_bytes.to_vec()) {
+            Some(k) => k,
+            None => {
+                self.errored = true;
+                return Some(Err(TiSqlError::Storage(format!(
+                    "SST corrupted: invalid MVCC key (len={}, need >=8)",
+                    key_bytes.len()
+                ))));
+            }
+        };
         let value = self.iter.value().to_vec();
 
         // Advance the iterator, propagating any I/O errors
