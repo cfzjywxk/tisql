@@ -129,6 +129,23 @@ impl Version {
         self.flushed_lsn
     }
 
+    /// Get the maximum commit timestamp from all SST files.
+    ///
+    /// Used during recovery to ensure TSO is initialized to at least
+    /// the highest timestamp already persisted in storage. This is
+    /// critical when clog has been truncated - the SST metadata still
+    /// preserves the max timestamp that was committed.
+    ///
+    /// Returns 0 if there are no SST files.
+    pub fn max_ts(&self) -> u64 {
+        self.levels
+            .iter()
+            .flat_map(|v| v.iter())
+            .map(|sst| sst.max_ts)
+            .max()
+            .unwrap_or(0)
+    }
+
     /// Find SST files that may contain a key.
     ///
     /// Returns SSTs from all levels that could contain the key,

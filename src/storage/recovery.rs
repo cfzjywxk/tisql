@@ -151,11 +151,13 @@ impl LsmRecovery {
         let ilog = Arc::new(ilog);
 
         let flushed_lsn = version.flushed_lsn();
+        let max_ts_from_ssts = version.max_ts();
         stats.flushed_lsn = flushed_lsn;
         log_info!(
-            "Ilog recovery complete: version_num={}, flushed_lsn={}, orphan_ssts={}",
+            "Ilog recovery complete: version_num={}, flushed_lsn={}, max_ts_from_ssts={}, orphan_ssts={}",
             version.version_num(),
             flushed_lsn,
+            max_ts_from_ssts,
             orphan_ssts.len()
         );
 
@@ -199,7 +201,10 @@ impl LsmRecovery {
         let replay_result = Self::replay_clog(&engine, &clog_entries, flushed_lsn)?;
         stats.clog_entries = replay_result.entries_replayed;
         stats.txn_count = replay_result.txn_count;
-        stats.max_commit_ts = replay_result.max_commit_ts;
+        // Use max of clog and SST timestamps to handle clog truncation correctly.
+        // If clog was truncated, old commit timestamps would be missing from clog
+        // but preserved in SST metadata. This ensures TSO never goes backwards.
+        stats.max_commit_ts = replay_result.max_commit_ts.max(max_ts_from_ssts);
 
         // LSN provider is automatically updated by clog recovery to be at least max(clog_lsn) + 1
         stats.final_lsn = lsn_provider.current_lsn();
