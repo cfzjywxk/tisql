@@ -470,6 +470,22 @@ impl SimpleExecutor {
                         encode_key(table.id(), &pk_bytes)
                     };
 
+                    // Check for duplicate primary key
+                    if txn_service.get(ctx, &key)?.is_some() {
+                        let pk_desc = if pk_indices.is_empty() {
+                            format!("row_id={}", row_id_for_key.unwrap_or(0))
+                        } else {
+                            let pk_values: Vec<_> =
+                                pk_indices.iter().map(|&i| row_values[i].clone()).collect();
+                            format!("{pk_values:?}")
+                        };
+                        return Err(TiSqlError::DuplicateKey(format!(
+                            "Duplicate entry '{}' for key '{}.PRIMARY'",
+                            pk_desc,
+                            table.name()
+                        )));
+                    }
+
                     // Encode row using TiDB codec format
                     let value = encode_row(&col_ids, &row_values);
 
@@ -580,8 +596,20 @@ impl SimpleExecutor {
                         encode_key(table_id, &pk_bytes)
                     };
 
-                    // Delete old key if PK changed
+                    // Check for duplicate key when PK changed
                     if !pk_indices.is_empty() && new_key != key {
+                        // Check if new key already exists (would conflict with another row)
+                        if txn_service.get(ctx, &new_key)?.is_some() {
+                            let pk_values: Vec<_> = pk_indices
+                                .iter()
+                                .map(|&i| row.get(i).cloned().unwrap_or(Value::Null))
+                                .collect();
+                            return Err(TiSqlError::DuplicateKey(format!(
+                                "Duplicate entry '{pk_values:?}' for key '{}.PRIMARY'",
+                                table.name()
+                            )));
+                        }
+                        // Delete old key
                         txn_service.delete(ctx, key)?;
                     }
 

@@ -756,3 +756,131 @@ mod persistence {
         }
     }
 }
+
+/// Duplicate key constraint tests
+mod duplicate_key {
+    use super::*;
+
+    #[test]
+    fn test_insert_duplicate_primary_key() {
+        let tk = TestKit::new();
+
+        tk.must_exec("CREATE TABLE t (id INT PRIMARY KEY, val INT)");
+        tk.must_exec("INSERT INTO t VALUES (1, 100)")
+            .check_affected(1);
+
+        // Try to insert duplicate key - should fail
+        let err = tk.must_exec_err("INSERT INTO t VALUES (1, 200)");
+        assert!(
+            err.contains("Duplicate") || err.contains("duplicate"),
+            "Expected duplicate key error, got: {err}"
+        );
+
+        // Original row should be unchanged
+        tk.must_query("SELECT id, val FROM t")
+            .check(rows![["1", "100"]]);
+    }
+
+    #[test]
+    fn test_insert_duplicate_composite_key() {
+        let tk = TestKit::new();
+
+        tk.must_exec("CREATE TABLE t (a INT, b INT, c INT, PRIMARY KEY (a, b))");
+        tk.must_exec("INSERT INTO t VALUES (1, 1, 100)")
+            .check_affected(1);
+        tk.must_exec("INSERT INTO t VALUES (1, 2, 200)")
+            .check_affected(1);
+        tk.must_exec("INSERT INTO t VALUES (2, 1, 300)")
+            .check_affected(1);
+
+        // Try to insert duplicate composite key - should fail
+        let err = tk.must_exec_err("INSERT INTO t VALUES (1, 1, 999)");
+        assert!(
+            err.contains("Duplicate") || err.contains("duplicate"),
+            "Expected duplicate key error, got: {err}"
+        );
+
+        // Check original data unchanged
+        tk.must_query("SELECT a, b, c FROM t ORDER BY a, b")
+            .check(rows![
+                ["1", "1", "100"],
+                ["1", "2", "200"],
+                ["2", "1", "300"]
+            ]);
+    }
+
+    #[test]
+    fn test_update_to_duplicate_primary_key() {
+        let tk = TestKit::new();
+
+        tk.must_exec("CREATE TABLE t (id INT PRIMARY KEY, name VARCHAR(100))");
+        tk.must_exec("INSERT INTO t VALUES (1, 'Alice')");
+        tk.must_exec("INSERT INTO t VALUES (2, 'Bob')");
+        tk.must_exec("INSERT INTO t VALUES (3, 'Charlie')");
+
+        // Update to existing PK - should fail
+        let err = tk.must_exec_err("UPDATE t SET id = 1 WHERE id = 2");
+        assert!(
+            err.contains("Duplicate") || err.contains("duplicate"),
+            "Expected duplicate key error, got: {err}"
+        );
+
+        // Data should be unchanged
+        tk.must_query("SELECT id, name FROM t ORDER BY id")
+            .check(rows![["1", "Alice"], ["2", "Bob"], ["3", "Charlie"]]);
+    }
+
+    #[test]
+    fn test_update_pk_to_new_value() {
+        let tk = TestKit::new();
+
+        tk.must_exec("CREATE TABLE t (id INT PRIMARY KEY, val INT)");
+        tk.must_exec("INSERT INTO t VALUES (1, 100)");
+        tk.must_exec("INSERT INTO t VALUES (2, 200)");
+
+        // Update to non-existing PK - should succeed
+        tk.must_exec("UPDATE t SET id = 10 WHERE id = 2")
+            .check_affected(1);
+
+        // Check the update was applied
+        tk.must_query("SELECT id, val FROM t ORDER BY id")
+            .check(rows![["1", "100"], ["10", "200"]]);
+    }
+
+    #[test]
+    fn test_insert_non_duplicate_succeeds() {
+        let tk = TestKit::new();
+
+        tk.must_exec("CREATE TABLE t (id INT PRIMARY KEY, val INT)");
+        tk.must_exec("INSERT INTO t VALUES (1, 100)")
+            .check_affected(1);
+
+        // Insert with different PK - should succeed
+        tk.must_exec("INSERT INTO t VALUES (2, 200)")
+            .check_affected(1);
+        tk.must_exec("INSERT INTO t VALUES (3, 300)")
+            .check_affected(1);
+
+        tk.must_query("SELECT id, val FROM t ORDER BY id")
+            .check(rows![["1", "100"], ["2", "200"], ["3", "300"]]);
+    }
+
+    #[test]
+    fn test_table_without_pk_allows_duplicates() {
+        let tk = TestKit::new();
+
+        // Table without explicit PK uses hidden row-id
+        tk.must_exec("CREATE TABLE t (a INT, b INT)");
+        tk.must_exec("INSERT INTO t VALUES (1, 100)")
+            .check_affected(1);
+
+        // Same values should work (different hidden row-ids)
+        tk.must_exec("INSERT INTO t VALUES (1, 100)")
+            .check_affected(1);
+        tk.must_exec("INSERT INTO t VALUES (1, 100)")
+            .check_affected(1);
+
+        tk.must_query("SELECT a, b FROM t ORDER BY a, b")
+            .check(rows![["1", "100"], ["1", "100"], ["1", "100"]]);
+    }
+}
