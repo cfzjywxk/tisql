@@ -32,6 +32,7 @@ use crate::error::{Result, TiSqlError};
 use crate::lsn::{AtomicLsnProvider, LsnProvider, SharedLsnProvider};
 use crate::storage::{WriteBatch, WriteOp};
 use crate::types::{Lsn, Timestamp, TxnId};
+use crate::util::fs::{rename_durable, sync_dir};
 use crate::{log_info, log_trace, log_warn};
 
 use super::{ClogBatch, ClogEntry, ClogEntryRef, ClogOpRef, ClogService};
@@ -182,6 +183,10 @@ impl FileClogService {
             let mut writer = BufWriter::new(&file);
             Self::write_header(&mut writer)?;
             writer.flush()?;
+            // Fsync the file to make header durable
+            file.sync_all()?;
+            // Fsync parent directory to make file creation durable
+            sync_dir(&config.clog_dir)?;
         }
 
         // Re-open for appending (seek to end)
@@ -702,8 +707,9 @@ impl FileClogService {
             temp_writer.get_ref().sync_data()?;
         }
 
-        // Atomically replace old file with new file
-        std::fs::rename(&temp_path, &clog_path)?;
+        // Atomically replace old file with new file, with directory fsync
+        // to ensure the rename is durable across crashes
+        rename_durable(&temp_path, &clog_path)?;
 
         // Reopen the writer
         {

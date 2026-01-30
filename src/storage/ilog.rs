@@ -54,6 +54,7 @@ use serde::{Deserialize, Serialize};
 use crate::error::{Result, TiSqlError};
 use crate::lsn::SharedLsnProvider;
 use crate::types::Lsn;
+use crate::util::fs::{create_dir_durable, sync_dir};
 use crate::{log_info, log_trace, log_warn};
 
 use super::sstable::SstMeta;
@@ -244,8 +245,8 @@ pub struct IlogService {
 impl IlogService {
     /// Open or create an ilog service.
     pub fn open(config: IlogConfig, lsn_provider: SharedLsnProvider) -> Result<Self> {
-        // Ensure directory exists
-        fs::create_dir_all(&config.ilog_dir)?;
+        // Ensure directory exists with durable creation
+        create_dir_durable(&config.ilog_dir)?;
 
         let ilog_path = config.ilog_path();
         let file_exists = ilog_path.exists();
@@ -268,6 +269,9 @@ impl IlogService {
             let mut writer = BufWriter::new(&file);
             Self::write_header(&mut writer)?;
             writer.flush()?;
+            // Sync file and directory to make creation durable
+            file.sync_all()?;
+            sync_dir(&config.ilog_dir)?;
         }
 
         // Re-open for appending

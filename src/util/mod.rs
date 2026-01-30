@@ -15,10 +15,12 @@
 // Utility modules for TiSQL
 
 pub mod arena;
+pub mod fs;
 pub mod log;
 pub mod timing;
 
 // Re-export commonly used items
 pub use arena::{ArenaConfig, PageArena, DEFAULT_PAGE_SIZE};
+pub use fs::{create_dir_durable, rename_durable, sync_dir, sync_file_and_dir};
 pub use log::{init_logger, init_logger_from_env, is_level_enabled, LogLevel};
 pub use timing::{Timer, TimerGuard};

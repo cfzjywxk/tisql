@@ -54,6 +54,7 @@ use serde::{Deserialize, Serialize};
 use crate::error::{Result, TiSqlError};
 use crate::storage::mvcc::extract_key;
 use crate::types::Timestamp;
+use crate::util::fs::sync_dir;
 
 use super::block::{DataBlockBuilder, IndexBlockBuilder, DEFAULT_BLOCK_SIZE};
 
@@ -545,9 +546,14 @@ impl SstBuilder {
         self.writer.write_all(&footer.encode())?;
         self.current_offset += FOOTER_SIZE as u64;
 
-        // Flush and sync
+        // Flush and sync file
         self.writer.flush()?;
         self.writer.get_ref().sync_all()?;
+
+        // Sync parent directory to make the file's existence durable
+        if let Some(parent) = self.path.parent() {
+            sync_dir(parent)?;
+        }
 
         let file_size = self.current_offset;
 
