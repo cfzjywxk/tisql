@@ -695,10 +695,14 @@ impl FileClogService {
     /// Only call this when you're certain all entries with lsn <= safe_lsn
     /// have been durably persisted elsewhere (e.g., in SST files).
     pub fn truncate_to(&self, safe_lsn: Lsn) -> Result<TruncateStats> {
+        // Acquire writer lock FIRST to prevent concurrent writes during truncation.
+        // This ensures no writes can occur between reading entries and replacing the file.
+        let mut writer = self.writer.lock().unwrap();
+
         let clog_path = self.config.clog_path();
         let old_size = std::fs::metadata(&clog_path).map(|m| m.len()).unwrap_or(0);
 
-        // Read all entries
+        // Read all entries (safe now that we hold the writer lock)
         let entries = self.read_all()?;
 
         // Partition entries
@@ -741,20 +745,17 @@ impl FileClogService {
         // to ensure the rename is durable across crashes
         rename_durable(&temp_path, &clog_path)?;
 
-        // Reopen the writer
-        {
-            let file = std::fs::OpenOptions::new()
-                .read(true)
-                .write(true)
-                .open(&clog_path)?;
+        // Reopen the writer and update the lock-held reference
+        let file = std::fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open(&clog_path)?;
 
-            // Seek to end for appending
-            let mut file_for_write = file;
-            file_for_write.seek(SeekFrom::End(0))?;
+        // Seek to end for appending
+        let mut file_for_write = file;
+        file_for_write.seek(SeekFrom::End(0))?;
 
-            let mut writer = self.writer.lock().unwrap();
-            *writer = BufWriter::new(file_for_write);
-        }
+        *writer = BufWriter::new(file_for_write);
 
         let new_size = std::fs::metadata(&clog_path).map(|m| m.len()).unwrap_or(0);
 

@@ -535,6 +535,15 @@ impl IlogService {
         let data = bincode::serialize(record)
             .map_err(|e| TiSqlError::Internal(format!("Failed to serialize ilog record: {e}")))?;
 
+        // Validate record size to prevent writing records that can't be read back
+        if data.len() > MAX_RECORD_SIZE {
+            return Err(TiSqlError::Internal(format!(
+                "Record size {} exceeds maximum allowed size {}",
+                data.len(),
+                MAX_RECORD_SIZE
+            )));
+        }
+
         let checksum = crc32(&data);
 
         let mut writer = self.writer.lock().unwrap();
