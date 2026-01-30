@@ -290,8 +290,10 @@ impl LsmEngine {
 
         // Check frozen limit
         if state.frozen.len() >= self.config.max_frozen_memtables {
-            // Cannot rotate - too many frozen memtables
-            // In production, this would trigger write stalling
+            // Cannot rotate - too many frozen memtables awaiting flush.
+            // TODO: Implement write stalling/backpressure when flush can't keep up.
+            // Currently, writes continue to the active memtable, which can grow
+            // memory unbounded under sustained load without flush.
             return None;
         }
 

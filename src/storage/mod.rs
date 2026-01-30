@@ -41,15 +41,15 @@
 //!
 //! ## Storage Implementations
 //!
-//! Two storage engines are available:
+//! The default memtable engine is [`VersionedMemTableEngine`] (aliased as `MemTableEngine`),
+//! which uses an OceanBase-style design storing each user key once with a linked list of
+//! versions for space efficiency and better cache locality.
 //!
-//! - [`CrossbeamMemTableEngine`] (default, aliased as `MemTableEngine`): Uses crossbeam's
-//!   lock-free skip list with epoch-based memory reclamation. Better write throughput due
-//!   to smaller node size (~40 bytes vs 192 bytes).
+//! Legacy engines available for testing/benchmarking (via `#[cfg(test)]` or `feature = "bench"`):
 //!
-//! - [`ArenaMemTableEngine`]: Uses a custom arena-based skip list for predictable memory
-//!   management and bulk deallocation. Useful for scenarios where memory release timing
-//!   is critical.
+//! - `CrossbeamMemTableEngine`: TiKV-style lock-free skiplist with epoch-based GC
+//! - `ArenaMemTableEngine`: Arena-based skiplist with bulk deallocation
+//! - `BTreeMemTableEngine`: BTreeMap + RwLock (baseline for comparison)
 //!
 //! ## Key Encoding
 //!

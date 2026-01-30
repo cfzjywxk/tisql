@@ -256,23 +256,11 @@ impl StorageEngine for MemTable {
     }
 
     fn write_batch(&self, batch: WriteBatch) -> Result<()> {
-        if self.is_frozen() {
-            return Err(crate::error::TiSqlError::Storage(
-                "Cannot write to frozen memtable".to_string(),
-            ));
-        }
-
-        // Estimate size
-        let size_delta = estimate_batch_size(&batch);
-
-        // Perform the write
-        self.inner.write_batch(batch)?;
-
-        // Update size
-        self.approximate_size
-            .fetch_add(size_delta, Ordering::Relaxed);
-
-        Ok(())
+        // Use clog_lsn from batch if available, otherwise use 0 (for testing/recovery scenarios).
+        // Note: Production code should use write_batch_with_lsn() directly via LsmEngine
+        // to ensure proper LSN tracking for recovery ordering.
+        let lsn = batch.clog_lsn().unwrap_or(0);
+        self.write_batch_with_lsn(batch, lsn)
     }
 }
 
