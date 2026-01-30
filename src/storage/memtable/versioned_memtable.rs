@@ -156,25 +156,23 @@ impl MvccRow {
             // CRITICAL INVARIANT CHECK: new version must have ts >= current head's ts
             // This ensures the chain remains ordered newest-to-oldest.
             // Violation would cause get_at() to return stale versions.
+            //
+            // This is a hard assert (not debug_assert) because:
+            // 1. Silent corruption is worse than failing loudly
+            // 2. If this invariant is violated, there's a bug in the transaction layer
+            //    (TSO, recovery, or commit ordering) that must be fixed
+            // 3. Inserting at wrong position would cause reads to return stale data,
+            //    which is effectively silent data loss
             if !current_head.is_null() {
                 // Safety: current_head is valid if non-null (nodes are never deallocated
                 // while the MvccRow exists)
                 let head_ts = unsafe { (*current_head).ts };
-                debug_assert!(
+                assert!(
                     ts >= head_ts,
                     "MVCC version chain ordering violation: new ts {ts} < head ts {head_ts} for same key. \
-                     This will cause incorrect read results. Check transaction commit ordering."
+                     This indicates a bug in transaction commit ordering (TSO, recovery, or locking). \
+                     Refusing to insert to prevent silent data corruption."
                 );
-                // In release builds, log a warning but don't panic to avoid data loss.
-                // The version will still be inserted (at wrong position) but reads may be incorrect.
-                #[cfg(not(debug_assertions))]
-                if ts < head_ts {
-                    // Use eprintln since we may not have logging initialized
-                    eprintln!(
-                        "WARNING: MVCC version chain ordering violation: new ts {ts} < head ts {head_ts}. \
-                         Reads may return stale data."
-                    );
-                }
             }
 
             new_node.next = current_head;
@@ -1258,10 +1256,9 @@ mod tests {
     }
 
     #[test]
-    #[cfg(debug_assertions)]
     #[should_panic(expected = "MVCC version chain ordering violation")]
-    fn test_version_chain_ordering_violation_panics_in_debug() {
-        // In debug builds, inserting a version with ts < head's ts should panic.
+    fn test_version_chain_ordering_violation_panics() {
+        // Inserting a version with ts < head's ts must panic to prevent silent corruption.
         // This catches bugs where the transaction layer violates the ordering invariant.
         let engine = new_engine();
 
@@ -1269,7 +1266,7 @@ mod tests {
         engine.put_at(b"key", b"v20", 20);
 
         // Try to insert version at ts=10 (WRONG: ts < head's ts)
-        // This should panic in debug builds
+        // This must panic in ALL builds (not just debug) to prevent silent data corruption
         engine.put_at(b"key", b"v10", 10);
     }
 }

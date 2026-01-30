@@ -275,8 +275,13 @@ impl<S: StorageEngine + 'static, L: ClogService + 'static, T: TsoService> TxnSer
     }
 
     fn scan(&self, ctx: &TxnCtx, range: Range<Key>) -> Result<ScanIterator<'_>> {
-        // Check for locks in range
-        if !range.is_empty() {
+        // Check for locks in range.
+        //
+        // Note: empty end (vec![]) means "unbounded" (scan to infinity), not empty range.
+        // range.is_empty() uses lexicographic comparison (start >= end), which incorrectly
+        // returns true for unbounded scans since any non-empty start >= empty end.
+        // We must explicitly handle the unbounded case.
+        if range.end.is_empty() || !range.is_empty() {
             self.concurrency_manager
                 .check_range(&range.start, &range.end, ctx.start_ts)?;
         }
@@ -1369,5 +1374,75 @@ mod tests {
             successful_count, 1,
             "should have exactly 1 successful entry before error"
         );
+    }
+
+    // ========================================================================
+    // Regression Test: Unbounded scan must check locks
+    // ========================================================================
+
+    #[test]
+    fn test_scan_unbounded_end_checks_locks() {
+        // Regression test for: Range::is_empty() returns true for unbounded end
+        // (vec![] is lexicographically smallest, so start >= [] is true),
+        // which caused lock checks to be skipped.
+        let (_storage, txn_service, _dir) = create_test_service();
+
+        // Write some data
+        txn_service.autocommit_put(b"a", b"1").unwrap();
+        txn_service.autocommit_put(b"b", b"2").unwrap();
+        txn_service.autocommit_put(b"c", b"3").unwrap();
+
+        // Directly acquire a lock using ConcurrencyManager to simulate a concurrent writer.
+        // This bypasses the transaction flow where locks are only held briefly during commit.
+        let cm = txn_service.concurrency_manager();
+        let lock = Lock {
+            ts: 100, // Lock timestamp
+            primary: Arc::from(&b"b"[..]),
+        };
+        let _guard = cm.lock_key(&b"b".to_vec(), &lock).unwrap();
+
+        // Start a reader transaction with start_ts >= lock.ts (so it should be blocked)
+        // We need to advance the TSO past the lock timestamp
+        while txn_service.tso().last_ts() < 100 {
+            let _ = txn_service.tso().get_ts();
+        }
+        let read_ctx = txn_service.begin(true).unwrap();
+        assert!(
+            read_ctx.start_ts() >= 100,
+            "reader must have snapshot at or after lock.ts"
+        );
+
+        // Unbounded end scan (empty vec) should check locks and fail
+        let result = txn_service.scan(&read_ctx, b"a".to_vec()..vec![]);
+        match result {
+            Err(TiSqlError::KeyIsLocked { key, .. }) => {
+                assert_eq!(key, b"b", "should be locked on key 'b'");
+            }
+            Err(e) => panic!("expected KeyIsLocked, got {:?}", e),
+            Ok(_) => panic!("unbounded scan should be blocked by lock"),
+        }
+
+        // Bounded scan containing the locked key should also fail
+        let result = txn_service.scan(&read_ctx, b"a".to_vec()..b"d".to_vec());
+        match result {
+            Err(TiSqlError::KeyIsLocked { .. }) => {}
+            Err(e) => panic!("expected KeyIsLocked, got {:?}", e),
+            Ok(_) => panic!("bounded scan should also be blocked by lock"),
+        }
+
+        // Bounded scan NOT containing the locked key should succeed
+        let result = txn_service.scan(&read_ctx, b"c".to_vec()..b"d".to_vec());
+        assert!(
+            result.is_ok(),
+            "scan not containing locked key should succeed"
+        );
+
+        // Drop the lock guard to release the lock
+        drop(_guard);
+
+        // Now the scan should succeed
+        let new_read_ctx = txn_service.begin(true).unwrap();
+        let result = txn_service.scan(&new_read_ctx, b"a".to_vec()..vec![]);
+        assert!(result.is_ok(), "scan should succeed after lock released");
     }
 }
