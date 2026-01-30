@@ -37,7 +37,7 @@ use tisql::new_lsn_provider;
 use tisql::storage::mvcc::{is_tombstone, MvccKey};
 use tisql::storage::WriteBatch;
 use tisql::testkit::{
-    IlogConfig, IlogService, LsmConfigBuilder, LsmEngine, LsmRecovery, RecoveryResult,
+    IlogConfig, IlogService, LsmConfigBuilder, LsmEngine, LsmRecovery, RecoveryResult, Version,
 };
 use tisql::types::{RawValue, Timestamp};
 use tisql::StorageEngine;
@@ -83,8 +83,13 @@ fn create_test_lsm_engine(dir: &TempDir) -> (Arc<LsmEngine>, Arc<IlogService>) {
     let config = LsmConfigBuilder::new(dir.path())
         .memtable_size(256) // Very small for testing to trigger rotations
         .build_unchecked();
-    let engine =
-        LsmEngine::open_durable(config, Arc::clone(&lsn_provider), Arc::clone(&ilog)).unwrap();
+    let engine = LsmEngine::open_with_recovery(
+        config,
+        Arc::clone(&lsn_provider),
+        Arc::clone(&ilog),
+        Version::new(),
+    )
+    .unwrap();
 
     (Arc::new(engine), ilog)
 }

@@ -106,11 +106,15 @@ fn scan_for_test(engine: &LsmEngine, range: &std::ops::Range<Key>) -> Vec<(Key, 
 
 #[allow(dead_code)]
 fn create_engine(dir: &TempDir) -> LsmEngine {
+    let lsn_provider = new_lsn_provider();
+    let ilog_config = IlogConfig::new(dir.path());
+    let ilog = Arc::new(IlogService::open(ilog_config, Arc::clone(&lsn_provider)).unwrap());
+
     let config = LsmConfigBuilder::new(dir.path())
         .memtable_size(4096)
         .max_frozen_memtables(8)
         .build_unchecked();
-    LsmEngine::open(config).unwrap()
+    LsmEngine::open_with_recovery(config, lsn_provider, ilog, Version::new()).unwrap()
 }
 
 fn create_durable_engine(dir: &TempDir) -> (LsmEngine, Arc<IlogService>) {
@@ -124,7 +128,9 @@ fn create_durable_engine(dir: &TempDir) -> (LsmEngine, Arc<IlogService>) {
         .l0_compaction_trigger(4)
         .build_unchecked();
 
-    let engine = LsmEngine::open_durable(config, lsn_provider, Arc::clone(&ilog)).unwrap();
+    let engine =
+        LsmEngine::open_with_recovery(config, lsn_provider, Arc::clone(&ilog), Version::new())
+            .unwrap();
     (engine, ilog)
 }
 

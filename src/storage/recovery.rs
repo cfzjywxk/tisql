@@ -335,6 +335,7 @@ mod tests {
     use super::*;
     use crate::clog::{ClogBatch, ClogService};
     use crate::storage::mvcc::{is_tombstone, MvccKey};
+    use crate::storage::version::Version;
     use crate::storage::StorageEngine;
     use crate::types::RawValue;
     use tempfile::TempDir;
@@ -421,9 +422,13 @@ mod tests {
             let ilog_config = IlogConfig::new(tmp.path());
             let ilog = Arc::new(IlogService::open(ilog_config, Arc::clone(&lsn_provider)).unwrap());
 
-            let engine =
-                LsmEngine::open_durable(lsm_config, Arc::clone(&lsn_provider), Arc::clone(&ilog))
-                    .unwrap();
+            let engine = LsmEngine::open_with_recovery(
+                lsm_config,
+                Arc::clone(&lsn_provider),
+                Arc::clone(&ilog),
+                Version::new(),
+            )
+            .unwrap();
 
             // Use shared LSN provider for clog too
             let clog_config = FileClogConfig::with_dir(tmp.path());
@@ -480,9 +485,13 @@ mod tests {
             let ilog_config = IlogConfig::new(tmp.path());
             let ilog = Arc::new(IlogService::open(ilog_config, Arc::clone(&lsn_provider)).unwrap());
 
-            let engine =
-                LsmEngine::open_durable(lsm_config, Arc::clone(&lsn_provider), Arc::clone(&ilog))
-                    .unwrap();
+            let engine = LsmEngine::open_with_recovery(
+                lsm_config,
+                Arc::clone(&lsn_provider),
+                Arc::clone(&ilog),
+                Version::new(),
+            )
+            .unwrap();
 
             // Use shared LSN provider for clog
             let clog_config = FileClogConfig::with_dir(tmp.path());
@@ -586,9 +595,13 @@ mod tests {
             let ilog_config = IlogConfig::new(tmp.path());
             let ilog = Arc::new(IlogService::open(ilog_config, Arc::clone(&lsn_provider)).unwrap());
 
-            let engine =
-                LsmEngine::open_durable(lsm_config, Arc::clone(&lsn_provider), Arc::clone(&ilog))
-                    .unwrap();
+            let engine = LsmEngine::open_with_recovery(
+                lsm_config,
+                Arc::clone(&lsn_provider),
+                Arc::clone(&ilog),
+                Version::new(),
+            )
+            .unwrap();
 
             // Use shared LSN provider for clog
             let clog_config = FileClogConfig::with_dir(tmp.path());
@@ -679,9 +692,13 @@ mod tests {
                 .build()
                 .unwrap();
 
-            let engine =
-                LsmEngine::open_durable(lsm_config, Arc::clone(&lsn_provider), Arc::clone(&ilog))
-                    .unwrap();
+            let engine = LsmEngine::open_with_recovery(
+                lsm_config,
+                Arc::clone(&lsn_provider),
+                Arc::clone(&ilog),
+                Version::new(),
+            )
+            .unwrap();
 
             let clog_config = FileClogConfig::with_dir(tmp.path());
             let clog =

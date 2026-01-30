@@ -34,7 +34,7 @@ use tisql::storage::mvcc::{is_tombstone, MvccKey};
 use tisql::storage::WriteBatch;
 use tisql::testkit::{
     IlogConfig, IlogService, LsmConfigBuilder, LsmEngine, SstBuilder, SstBuilderOptions,
-    SstIterator, SstReaderRef,
+    SstIterator, SstReaderRef, Version,
 };
 use tisql::types::{RawValue, Timestamp};
 use tisql::StorageEngine;
@@ -117,11 +117,15 @@ fn scan_at_for_test(
 // ============================================================================
 
 fn create_engine(dir: &TempDir) -> LsmEngine {
+    let lsn_provider = new_lsn_provider();
+    let ilog_config = IlogConfig::new(dir.path());
+    let ilog = Arc::new(IlogService::open(ilog_config, Arc::clone(&lsn_provider)).unwrap());
+
     let config = LsmConfigBuilder::new(dir.path())
         .memtable_size(4096)
         .max_frozen_memtables(8)
         .build_unchecked();
-    LsmEngine::open(config).unwrap()
+    LsmEngine::open_with_recovery(config, lsn_provider, ilog, Version::new()).unwrap()
 }
 
 fn create_durable_engine(dir: &TempDir) -> (LsmEngine, Arc<IlogService>) {
@@ -134,7 +138,9 @@ fn create_durable_engine(dir: &TempDir) -> (LsmEngine, Arc<IlogService>) {
         .max_frozen_memtables(16)
         .build_unchecked();
 
-    let engine = LsmEngine::open_durable(config, lsn_provider, Arc::clone(&ilog)).unwrap();
+    let engine =
+        LsmEngine::open_with_recovery(config, lsn_provider, Arc::clone(&ilog), Version::new())
+            .unwrap();
     (engine, ilog)
 }
 
@@ -602,7 +608,7 @@ fn test_flush_while_writing() {
         let lsn_provider = new_lsn_provider();
         let ilog_config = IlogConfig::new(dir.path());
         let ilog = Arc::new(IlogService::open(ilog_config, Arc::clone(&lsn_provider)).unwrap());
-        LsmEngine::open_durable(config, lsn_provider, ilog).unwrap()
+        LsmEngine::open_with_recovery(config, lsn_provider, ilog, Version::new()).unwrap()
     });
 
     let num_writers = 4;

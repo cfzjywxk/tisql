@@ -97,8 +97,13 @@ impl LsmState {
 /// ## Usage
 ///
 /// ```ignore
+/// use tisql::storage::{LsmConfig, Version, IlogConfig, IlogService};
+/// use tisql::lsn::new_lsn_provider;
+///
+/// let lsn_provider = new_lsn_provider();
+/// let ilog = Arc::new(IlogService::open(IlogConfig::new("./data"), lsn_provider.clone())?);
 /// let config = LsmConfig::new("./data");
-/// let engine = LsmEngine::open(config)?;
+/// let engine = LsmEngine::open_with_recovery(config, lsn_provider, ilog, Version::new())?;
 ///
 /// // Write with timestamp
 /// let mut batch = WriteBatch::new();
@@ -134,57 +139,6 @@ pub struct LsmEngine {
 }
 
 impl LsmEngine {
-    /// Open or create an LSM engine at the given path.
-    ///
-    /// This opens the engine without durability (no ilog).
-    /// Use `open_durable` for production with crash recovery.
-    pub fn open(config: LsmConfig) -> Result<Self> {
-        config.validate().map_err(TiSqlError::Storage)?;
-
-        // Create SST directory if needed
-        let sst_dir = config.sst_dir();
-        if !sst_dir.exists() {
-            std::fs::create_dir_all(&sst_dir)?;
-        }
-
-        Ok(Self {
-            config: Arc::new(config),
-            state: RwLock::new(LsmState::new(1)),
-            next_memtable_id: AtomicU64::new(2),
-            next_sst_id: AtomicU64::new(1),
-            next_lsn: AtomicU64::new(1),
-            lsn_provider: None,
-            ilog: None,
-        })
-    }
-
-    /// Open an LSM engine with durable ilog for crash recovery.
-    ///
-    /// This version uses intent/commit protocol for SST operations.
-    pub fn open_durable(
-        config: LsmConfig,
-        lsn_provider: SharedLsnProvider,
-        ilog: Arc<IlogService>,
-    ) -> Result<Self> {
-        config.validate().map_err(TiSqlError::Storage)?;
-
-        // Create SST directory if needed
-        let sst_dir = config.sst_dir();
-        if !sst_dir.exists() {
-            std::fs::create_dir_all(&sst_dir)?;
-        }
-
-        Ok(Self {
-            config: Arc::new(config),
-            state: RwLock::new(LsmState::new(1)),
-            next_memtable_id: AtomicU64::new(2),
-            next_sst_id: AtomicU64::new(1),
-            next_lsn: AtomicU64::new(1),
-            lsn_provider: Some(lsn_provider),
-            ilog: Some(ilog),
-        })
-    }
-
     /// Open with recovery from ilog.
     ///
     /// This replays the ilog to rebuild version state.
@@ -822,145 +776,513 @@ impl MvccIterator for OwnedMemTableIterator {
 }
 
 // ============================================================================
-// OwnedMergeIterator - Owned streaming merge iterator
+// TieredMergeIterator - Priority-aware streaming merge with lazy SST loading
 // ============================================================================
+//
+// This merge iterator is designed following RocksDB's approach:
+// 1. Active memtable has highest priority (priority=0)
+// 2. Frozen memtables come next (priority=1,2,3... by recency)
+// 3. L0 SSTs need individual iterators (files can overlap)
+// 4. L1+ SSTs use LevelIterator for lazy file opening
+//
+// For the same MVCC key from multiple sources, higher priority wins.
 
-/// Entry in the merge heap for OwnedMergeIterator.
-struct OwnedHeapEntry {
+use std::cmp::Ordering;
+use std::path::PathBuf;
+
+/// Priority levels for merge iterator sources.
+/// Lower number = higher priority (newer data).
+const PRIORITY_ACTIVE: u32 = 0;
+const PRIORITY_FROZEN_BASE: u32 = 100;
+const PRIORITY_L0_BASE: u32 = 1000;
+const PRIORITY_LEVEL_BASE: u32 = 10000; // L1 = 10000, L2 = 20000, etc.
+
+/// Entry in the merge heap with priority for proper ordering.
+struct PriorityHeapEntry {
     /// Current key from this iterator
     key: MvccKey,
     /// Current value from this iterator
     value: Vec<u8>,
+    /// Priority level (lower = higher priority)
+    priority: u32,
     /// The underlying iterator (owned)
     iter: Box<dyn MvccIterator>,
 }
 
-impl PartialEq for OwnedHeapEntry {
+impl PartialEq for PriorityHeapEntry {
     fn eq(&self, other: &Self) -> bool {
-        self.key == other.key
+        self.key == other.key && self.priority == other.priority
     }
 }
 
-impl Eq for OwnedHeapEntry {}
+impl Eq for PriorityHeapEntry {}
 
-impl PartialOrd for OwnedHeapEntry {
-    fn partial_cmp(&self, other: &Self) -> Option<std::cmp::Ordering> {
+impl PartialOrd for PriorityHeapEntry {
+    fn partial_cmp(&self, other: &Self) -> Option<Ordering> {
         Some(self.cmp(other))
     }
 }
 
-impl Ord for OwnedHeapEntry {
-    fn cmp(&self, other: &Self) -> std::cmp::Ordering {
-        // Min-heap: reverse comparison to get smallest key first
-        other.key.cmp(&self.key)
+impl Ord for PriorityHeapEntry {
+    fn cmp(&self, other: &Self) -> Ordering {
+        // Min-heap ordering: we want smallest key first
+        // For same key, we want lowest priority (highest precedence) first
+        match other.key.cmp(&self.key) {
+            Ordering::Equal => other.priority.cmp(&self.priority),
+            ord => ord,
+        }
     }
 }
 
-/// Owned streaming merge iterator that implements MvccIterator.
+/// Lazy SST iterator that defers file opening until first access.
 ///
-/// Unlike `LsmMergeIterator<'a>`, this iterator owns its child iterators,
-/// allowing it to be returned from methods without lifetime constraints.
-/// This is used by `LsmEngine::scan_iter()` to provide true streaming.
-pub struct OwnedMergeIterator {
-    /// Min-heap of iterators with their current entries
-    heap: BinaryHeap<OwnedHeapEntry>,
-    /// Current key (cached for returning reference)
-    current_key: Option<MvccKey>,
-    /// Current value (cached for returning reference)
-    current_value: Option<Vec<u8>>,
-    /// Pending error from iterator operations
+/// This avoids unnecessary I/O for SST files whose key ranges don't
+/// overlap with the actual keys being scanned.
+struct LazySstIterator {
+    /// SST metadata (key range, file ID, etc.)
+    sst_meta: Arc<SstMeta>,
+    /// Path to SST file
+    sst_path: PathBuf,
+    /// Query range
+    range: Range<MvccKey>,
+    /// Actual iterator (lazy loaded)
+    inner: Option<SstMvccIterator>,
+    /// Whether we've checked if this SST is relevant
+    initialized: bool,
+}
+
+impl LazySstIterator {
+    fn new(sst_meta: Arc<SstMeta>, sst_path: PathBuf, range: Range<MvccKey>) -> Self {
+        Self {
+            sst_meta,
+            sst_path,
+            range,
+            inner: None,
+            initialized: false,
+        }
+    }
+
+    /// Initialize the inner iterator if not already done.
+    fn ensure_initialized(&mut self) -> Result<()> {
+        if self.initialized {
+            return Ok(());
+        }
+        self.initialized = true;
+
+        // Check if SST file exists
+        if !self.sst_path.exists() {
+            let err = TiSqlError::Storage(format!(
+                "SST file missing: {} (id={}, level={})",
+                self.sst_path.display(),
+                self.sst_meta.id,
+                self.sst_meta.level
+            ));
+            return Err(err);
+        }
+
+        // Open the file and create iterator
+        let reader = SstReaderRef::open(&self.sst_path)?;
+        let iter = SstMvccIterator::new(reader, self.range.clone())?;
+        self.inner = Some(iter);
+        Ok(())
+    }
+}
+
+impl MvccIterator for LazySstIterator {
+    fn seek(&mut self, target: &MvccKey) -> Result<()> {
+        self.ensure_initialized()?;
+        if let Some(ref mut inner) = self.inner {
+            inner.seek(target)
+        } else {
+            Ok(())
+        }
+    }
+
+    fn next(&mut self) -> Result<()> {
+        self.ensure_initialized()?;
+        if let Some(ref mut inner) = self.inner {
+            inner.next()
+        } else {
+            Ok(())
+        }
+    }
+
+    fn valid(&self) -> bool {
+        self.inner.as_ref().is_some_and(|i| i.valid())
+    }
+
+    fn key(&self) -> &MvccKey {
+        self.inner.as_ref().expect("Iterator not valid").key()
+    }
+
+    fn value(&self) -> &[u8] {
+        self.inner.as_ref().expect("Iterator not valid").value()
+    }
+}
+
+/// Iterator for a non-overlapping level (L1+) that opens files lazily.
+///
+/// Files in L1+ are sorted by key range and don't overlap, so we can
+/// use binary search to find the right file and only open it when needed.
+struct LevelIterator {
+    /// SST metadata for this level, sorted by smallest_key
+    sst_metas: Vec<Arc<SstMeta>>,
+    /// Base path for SST files
+    sst_dir: PathBuf,
+    /// Query range
+    range: Range<MvccKey>,
+    /// Current file index (None = exhausted)
+    current_file_idx: Option<usize>,
+    /// Current file's iterator (lazy loaded)
+    current_iter: Option<SstMvccIterator>,
+    /// Pending error
     pending_error: Option<TiSqlError>,
 }
 
-impl OwnedMergeIterator {
-    /// Create a new owned merge iterator from multiple iterators.
-    pub fn new(iters: Vec<Box<dyn MvccIterator>>) -> Result<Self> {
-        let mut heap = BinaryHeap::new();
-        let pending_error = None;
-
-        for iter in iters {
-            if iter.valid() {
-                let key = iter.key().clone();
-                let value = iter.value().to_vec();
-                heap.push(OwnedHeapEntry { key, value, iter });
-            }
-        }
-
-        let mut merge_iter = Self {
-            heap,
-            current_key: None,
-            current_value: None,
-            pending_error,
+impl LevelIterator {
+    /// Create a new level iterator for the given SSTs.
+    fn new(sst_metas: Vec<Arc<SstMeta>>, sst_dir: PathBuf, range: Range<MvccKey>) -> Result<Self> {
+        let mut iter = Self {
+            sst_metas,
+            sst_dir,
+            range,
+            current_file_idx: None,
+            current_iter: None,
+            pending_error: None,
         };
 
-        // Prime the iterator with the first entry
-        merge_iter.advance()?;
-
-        Ok(merge_iter)
+        // Find the first file that might contain keys in range
+        iter.seek_to_first_file()?;
+        Ok(iter)
     }
 
-    /// Advance to the next entry from the heap.
-    fn advance(&mut self) -> Result<()> {
-        // Check for pending error
+    /// Find and open the first file that might contain keys >= range.start
+    fn seek_to_first_file(&mut self) -> Result<()> {
+        if self.sst_metas.is_empty() {
+            return Ok(());
+        }
+
+        // Binary search: find first file whose largest_key >= range.start
+        let start_bytes = self.range.start.as_bytes();
+        let idx = self
+            .sst_metas
+            .partition_point(|sst| sst.largest_key.as_slice() < start_bytes);
+
+        if idx >= self.sst_metas.len() {
+            // No file contains keys >= start
+            return Ok(());
+        }
+
+        self.open_file(idx)?;
+        self.skip_empty_files()
+    }
+
+    /// Open the file at the given index.
+    fn open_file(&mut self, idx: usize) -> Result<()> {
+        if idx >= self.sst_metas.len() {
+            self.current_file_idx = None;
+            self.current_iter = None;
+            return Ok(());
+        }
+
+        let sst = &self.sst_metas[idx];
+        let path = self.sst_dir.join(format!("{:08}.sst", sst.id));
+
+        if !path.exists() {
+            return Err(TiSqlError::Storage(format!(
+                "SST file missing: {} (id={}, level={})",
+                path.display(),
+                sst.id,
+                sst.level
+            )));
+        }
+
+        let reader = SstReaderRef::open(&path)?;
+        let iter = SstMvccIterator::new(reader, self.range.clone())?;
+        self.current_file_idx = Some(idx);
+        self.current_iter = Some(iter);
+        Ok(())
+    }
+
+    /// Skip empty files (files where iterator is not valid).
+    fn skip_empty_files(&mut self) -> Result<()> {
+        while let Some(ref iter) = self.current_iter {
+            if iter.valid() {
+                break;
+            }
+            // Move to next file
+            if let Some(idx) = self.current_file_idx {
+                if idx + 1 < self.sst_metas.len() {
+                    self.open_file(idx + 1)?;
+                } else {
+                    self.current_file_idx = None;
+                    self.current_iter = None;
+                    break;
+                }
+            } else {
+                break;
+            }
+        }
+        Ok(())
+    }
+}
+
+impl MvccIterator for LevelIterator {
+    fn seek(&mut self, target: &MvccKey) -> Result<()> {
         if let Some(e) = self.pending_error.take() {
             return Err(e);
         }
 
-        if let Some(mut top) = self.heap.pop() {
-            // Save current entry
-            self.current_key = Some(top.key.clone());
-            self.current_value = Some(top.value.clone());
+        // Binary search to find the right file
+        let target_bytes = target.as_bytes();
+        let idx = self
+            .sst_metas
+            .partition_point(|sst| sst.largest_key.as_slice() < target_bytes);
 
-            // Advance the iterator
-            if let Err(e) = top.iter.next() {
-                // Store error for next operation
-                self.pending_error = Some(e);
+        if idx >= self.sst_metas.len() {
+            self.current_file_idx = None;
+            self.current_iter = None;
+            return Ok(());
+        }
+
+        // Check if we can reuse current file
+        if self.current_file_idx == Some(idx) {
+            if let Some(ref mut iter) = self.current_iter {
+                iter.seek(target)?;
+                return self.skip_empty_files();
+            }
+        }
+
+        // Open the file and seek
+        self.open_file(idx)?;
+        if let Some(ref mut iter) = self.current_iter {
+            iter.seek(target)?;
+        }
+        self.skip_empty_files()
+    }
+
+    fn next(&mut self) -> Result<()> {
+        if let Some(e) = self.pending_error.take() {
+            return Err(e);
+        }
+
+        if let Some(ref mut iter) = self.current_iter {
+            iter.next()?;
+            // If current file exhausted, move to next
+            if !iter.valid() {
+                if let Some(idx) = self.current_file_idx {
+                    if idx + 1 < self.sst_metas.len() {
+                        self.open_file(idx + 1)?;
+                        return self.skip_empty_files();
+                    }
+                }
+                self.current_file_idx = None;
+                self.current_iter = None;
+            }
+        }
+        Ok(())
+    }
+
+    fn valid(&self) -> bool {
+        self.current_iter.as_ref().is_some_and(|i| i.valid())
+    }
+
+    fn key(&self) -> &MvccKey {
+        self.current_iter
+            .as_ref()
+            .expect("Iterator not valid")
+            .key()
+    }
+
+    fn value(&self) -> &[u8] {
+        self.current_iter
+            .as_ref()
+            .expect("Iterator not valid")
+            .value()
+    }
+}
+
+/// Pending iterator to be initialized during build.
+struct PendingIterator {
+    iter: Box<dyn MvccIterator>,
+    priority: u32,
+}
+
+/// Tiered merge iterator with priority-aware deduplication.
+///
+/// This iterator merges multiple sources with different priorities:
+/// - Active memtable (priority 0)
+/// - Frozen memtables (priority 100+)
+/// - L0 SSTs (priority 1000+)
+/// - L1+ levels (priority 10000+ per level)
+///
+/// For duplicate MVCC keys, the highest priority (lowest number) wins.
+pub struct TieredMergeIterator {
+    /// Min-heap of iterators with their current entries and priorities
+    heap: BinaryHeap<PriorityHeapEntry>,
+    /// Pending iterators to be initialized during build (for lazy loading)
+    pending: Vec<PendingIterator>,
+    /// Current key (cached for returning reference)
+    current_key: Option<MvccKey>,
+    /// Current value (cached for returning reference)
+    current_value: Option<Vec<u8>>,
+    /// Last emitted key (for deduplication)
+    last_emitted_key: Option<MvccKey>,
+    /// Pending error from iterator operations
+    pending_error: Option<TiSqlError>,
+}
+
+impl Default for TieredMergeIterator {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl TieredMergeIterator {
+    /// Create a new tiered merge iterator.
+    pub fn new() -> Self {
+        Self {
+            heap: BinaryHeap::new(),
+            pending: Vec::new(),
+            current_key: None,
+            current_value: None,
+            last_emitted_key: None,
+            pending_error: None,
+        }
+    }
+
+    /// Add an iterator with the given priority.
+    /// The iterator will be initialized during build().
+    pub fn add_iterator(&mut self, iter: Box<dyn MvccIterator>, priority: u32) {
+        self.pending.push(PendingIterator { iter, priority });
+    }
+
+    /// Add the active memtable iterator (highest priority).
+    pub fn add_active_memtable(&mut self, iter: Box<dyn MvccIterator>) {
+        self.add_iterator(iter, PRIORITY_ACTIVE);
+    }
+
+    /// Add a frozen memtable iterator.
+    pub fn add_frozen_memtable(&mut self, iter: Box<dyn MvccIterator>, index: usize) {
+        self.add_iterator(iter, PRIORITY_FROZEN_BASE + index as u32);
+    }
+
+    /// Add an L0 SST iterator.
+    pub fn add_l0_sst(&mut self, iter: Box<dyn MvccIterator>, index: usize) {
+        self.add_iterator(iter, PRIORITY_L0_BASE + index as u32);
+    }
+
+    /// Add a level iterator for L1+.
+    pub fn add_level(&mut self, iter: Box<dyn MvccIterator>, level: usize) {
+        self.add_iterator(iter, PRIORITY_LEVEL_BASE * level as u32);
+    }
+
+    /// Finalize and prime the iterator.
+    /// This initializes all pending iterators (triggering lazy loading for SSTs).
+    pub fn build(mut self) -> Result<Self> {
+        // Initialize all pending iterators and add valid ones to heap
+        for pending in self.pending.drain(..) {
+            let mut iter = pending.iter;
+            let priority = pending.priority;
+
+            // For lazy iterators, seeking to the start of their range initializes them
+            // This is a no-op for already-initialized iterators
+            if !iter.valid() {
+                // Try to seek to beginning to initialize
+                iter.seek(&MvccKey::unbounded())?;
             }
 
-            // Re-add to heap if still valid
-            if top.iter.valid() {
-                let key = top.iter.key().clone();
-                let value = top.iter.value().to_vec();
-                self.heap.push(OwnedHeapEntry {
+            if iter.valid() {
+                let key = iter.key().clone();
+                let value = iter.value().to_vec();
+                self.heap.push(PriorityHeapEntry {
                     key,
                     value,
-                    iter: top.iter,
+                    priority,
+                    iter,
                 });
             }
+        }
 
-            Ok(())
-        } else {
-            // Heap exhausted
-            self.current_key = None;
-            self.current_value = None;
-            Ok(())
+        self.advance()?;
+        Ok(self)
+    }
+
+    /// Advance to the next unique entry from the heap.
+    fn advance(&mut self) -> Result<()> {
+        if let Some(e) = self.pending_error.take() {
+            return Err(e);
+        }
+
+        loop {
+            if let Some(mut top) = self.heap.pop() {
+                let key = top.key.clone();
+                let value = top.value.clone();
+
+                // Advance the iterator and re-add to heap if valid
+                if let Err(e) = top.iter.next() {
+                    self.pending_error = Some(e);
+                }
+                if top.iter.valid() {
+                    let next_key = top.iter.key().clone();
+                    let next_value = top.iter.value().to_vec();
+                    self.heap.push(PriorityHeapEntry {
+                        key: next_key,
+                        value: next_value,
+                        priority: top.priority,
+                        iter: top.iter,
+                    });
+                }
+
+                // Skip if this is a duplicate of the last emitted key
+                if let Some(ref last) = self.last_emitted_key {
+                    if &key == last {
+                        continue;
+                    }
+                }
+
+                // Emit this entry
+                self.current_key = Some(key.clone());
+                self.current_value = Some(value);
+                self.last_emitted_key = Some(key);
+                return Ok(());
+            } else {
+                // Heap exhausted
+                self.current_key = None;
+                self.current_value = None;
+                return Ok(());
+            }
         }
     }
 }
 
-impl MvccIterator for OwnedMergeIterator {
+impl MvccIterator for TieredMergeIterator {
     fn seek(&mut self, target: &MvccKey) -> Result<()> {
-        // Seek all iterators in the heap to the target
-        let mut iters: Vec<Box<dyn MvccIterator>> = Vec::new();
-
         // Drain all iterators from heap
+        let mut entries: Vec<(Box<dyn MvccIterator>, u32)> = Vec::new();
         while let Some(entry) = self.heap.pop() {
-            iters.push(entry.iter);
+            entries.push((entry.iter, entry.priority));
         }
 
         // Seek each iterator and re-add to heap
-        for mut iter in iters {
+        for (mut iter, priority) in entries {
             iter.seek(target)?;
             if iter.valid() {
                 let key = iter.key().clone();
                 let value = iter.value().to_vec();
-                self.heap.push(OwnedHeapEntry { key, value, iter });
+                self.heap.push(PriorityHeapEntry {
+                    key,
+                    value,
+                    priority,
+                    iter,
+                });
             }
         }
 
-        // Prime with first entry >= target
+        // Clear dedup state and advance
         self.current_key = None;
         self.current_value = None;
+        self.last_emitted_key = None;
         self.advance()
     }
 
@@ -981,170 +1303,32 @@ impl MvccIterator for OwnedMergeIterator {
     }
 }
 
-// ============================================================================
-// LsmMergeIterator - Streaming merge iterator using MvccIterator trait
-// ============================================================================
-
-/// Entry in the merge heap for LsmMergeIterator.
-struct MergeHeapEntry<'a> {
-    /// Current key from this iterator
-    key: MvccKey,
-    /// Current value from this iterator
-    value: Vec<u8>,
-    /// The underlying iterator
-    iter: Box<dyn MvccIterator + 'a>,
-}
-
-impl PartialEq for MergeHeapEntry<'_> {
-    fn eq(&self, other: &Self) -> bool {
-        self.key == other.key
-    }
-}
-
-impl Eq for MergeHeapEntry<'_> {}
-
-impl PartialOrd for MergeHeapEntry<'_> {
-    fn partial_cmp(&self, other: &Self) -> Option<std::cmp::Ordering> {
-        Some(self.cmp(other))
-    }
-}
-
-impl Ord for MergeHeapEntry<'_> {
-    fn cmp(&self, other: &Self) -> std::cmp::Ordering {
-        // Min-heap: reverse comparison to get smallest key first
-        other.key.cmp(&self.key)
-    }
-}
-
-/// Streaming merge iterator that implements MvccIterator.
-///
-/// This iterator merges multiple `MvccIterator`s using a min-heap,
-/// producing entries in sorted MVCC key order without materializing
-/// all results in memory.
-pub struct LsmMergeIterator<'a> {
-    /// Min-heap of iterators with their current entries
-    heap: BinaryHeap<MergeHeapEntry<'a>>,
-    /// Current key (cached for returning reference)
-    current_key: Option<MvccKey>,
-    /// Current value (cached for returning reference)
-    current_value: Option<Vec<u8>>,
-    /// Pending error from iterator operations
-    pending_error: Option<TiSqlError>,
-}
-
-impl<'a> LsmMergeIterator<'a> {
-    /// Create a new merge iterator from multiple iterators.
-    pub fn new(iters: Vec<Box<dyn MvccIterator + 'a>>) -> Result<Self> {
-        let mut heap = BinaryHeap::new();
-        let pending_error = None;
-
-        for iter in iters {
-            if iter.valid() {
-                let key = iter.key().clone();
-                let value = iter.value().to_vec();
-                heap.push(MergeHeapEntry { key, value, iter });
-            }
-        }
-
-        let mut merge_iter = Self {
-            heap,
-            current_key: None,
-            current_value: None,
-            pending_error,
-        };
-
-        // Prime the iterator with the first entry
-        merge_iter.advance()?;
-
-        Ok(merge_iter)
-    }
-
-    /// Advance to the next entry from the heap.
-    fn advance(&mut self) -> Result<()> {
-        // Check for pending error
-        if let Some(e) = self.pending_error.take() {
-            return Err(e);
-        }
-
-        if let Some(mut top) = self.heap.pop() {
-            // Save current entry
-            self.current_key = Some(top.key.clone());
-            self.current_value = Some(top.value.clone());
-
-            // Advance the iterator
-            if let Err(e) = top.iter.next() {
-                // Store error for next operation
-                self.pending_error = Some(e);
-            }
-
-            // Re-add to heap if still valid
-            if top.iter.valid() {
-                let key = top.iter.key().clone();
-                let value = top.iter.value().to_vec();
-                self.heap.push(MergeHeapEntry {
-                    key,
-                    value,
-                    iter: top.iter,
-                });
-            }
-
-            Ok(())
-        } else {
-            // Heap exhausted
-            self.current_key = None;
-            self.current_value = None;
-            Ok(())
-        }
-    }
-}
-
-impl MvccIterator for LsmMergeIterator<'_> {
-    fn seek(&mut self, target: &MvccKey) -> Result<()> {
-        // Seek all iterators in the heap to the target
-        // This is a bit expensive but maintains correctness
-        let mut iters: Vec<Box<dyn MvccIterator>> = Vec::new();
-
-        // Drain all iterators from heap
-        while let Some(entry) = self.heap.pop() {
-            iters.push(entry.iter);
-        }
-
-        // Seek each iterator and re-add to heap
-        for mut iter in iters {
-            iter.seek(target)?;
-            if iter.valid() {
-                let key = iter.key().clone();
-                let value = iter.value().to_vec();
-                self.heap.push(MergeHeapEntry { key, value, iter });
-            }
-        }
-
-        // Prime with first entry >= target
-        self.current_key = None;
-        self.current_value = None;
-        self.advance()
-    }
-
-    fn next(&mut self) -> Result<()> {
-        self.advance()
-    }
-
-    fn valid(&self) -> bool {
-        self.current_key.is_some()
-    }
-
-    fn key(&self) -> &MvccKey {
-        self.current_key.as_ref().expect("Iterator not valid")
-    }
-
-    fn value(&self) -> &[u8] {
-        self.current_value.as_ref().expect("Iterator not valid")
-    }
-}
-
-/// Test-only impl block for LsmEngine::scan() - materializing version.
+/// Test-only impl block for LsmEngine.
 #[cfg(test)]
 impl LsmEngine {
+    /// Open or create an LSM engine at the given path without durability.
+    ///
+    /// This is test-only. Production code should use `open_with_recovery`.
+    pub fn open(config: LsmConfig) -> Result<Self> {
+        config.validate().map_err(TiSqlError::Storage)?;
+
+        // Create SST directory if needed
+        let sst_dir = config.sst_dir();
+        if !sst_dir.exists() {
+            std::fs::create_dir_all(&sst_dir)?;
+        }
+
+        Ok(Self {
+            config: Arc::new(config),
+            state: RwLock::new(LsmState::new(1)),
+            next_memtable_id: AtomicU64::new(2),
+            next_sst_id: AtomicU64::new(1),
+            next_lsn: AtomicU64::new(1),
+            lsn_provider: None,
+            ilog: None,
+        })
+    }
+
     /// Scan MVCC keys in range (materializing version).
     ///
     /// Returns all MVCC key-value pairs in the given range, including all versions
@@ -1221,46 +1405,52 @@ impl StorageEngine for LsmEngine {
             )
         };
 
-        let mut iters: Vec<Box<dyn MvccIterator>> = Vec::new();
+        let sst_dir = self.config.sst_dir();
+        let mut merge_iter = TieredMergeIterator::new();
 
-        // 1. Add SST iterators (true streaming via SstMvccIterator)
-        for level in 0..MAX_LEVELS {
-            for sst_meta in version.ssts_at_level(level as u32) {
-                if !sst_meta.overlaps_mvcc(range.start.as_bytes(), range.end.as_bytes()) {
-                    continue;
-                }
-                let sst_path = self
-                    .config
-                    .sst_dir()
-                    .join(format!("{:08}.sst", sst_meta.id));
-                // SST referenced by Version must exist - missing file indicates data corruption
-                if !sst_path.exists() {
-                    return Err(TiSqlError::Storage(format!(
-                        "SST file missing: {} (id={}, level={}). This indicates data corruption or incomplete recovery.",
-                        sst_path.display(),
-                        sst_meta.id,
-                        sst_meta.level
-                    )));
-                }
-                let reader = SstReaderRef::open(&sst_path)?;
-                let sst_iter = SstMvccIterator::new(reader, range.clone())?;
-                iters.push(Box::new(sst_iter));
+        // 1. Add active memtable iterator (highest priority)
+        let active_iter = OwnedMemTableIterator::new(active, range.clone())?;
+        merge_iter.add_active_memtable(Box::new(active_iter));
+
+        // 2. Add frozen memtable iterators (newest to oldest)
+        for (idx, memtable) in frozen.iter().enumerate() {
+            let mem_iter = OwnedMemTableIterator::new(Arc::clone(memtable), range.clone())?;
+            merge_iter.add_frozen_memtable(Box::new(mem_iter), idx);
+        }
+
+        // 3. Add L0 SST iterators (files can overlap, use lazy loading)
+        // L0 files are added in newest-to-oldest order (by ID descending)
+        let mut l0_ssts: Vec<Arc<SstMeta>> = version
+            .ssts_at_level(0)
+            .iter()
+            .filter(|sst| sst.overlaps_mvcc(range.start.as_bytes(), range.end.as_bytes()))
+            .cloned()
+            .collect();
+        l0_ssts.sort_by(|a, b| b.id.cmp(&a.id)); // Newest first
+
+        for (idx, sst_meta) in l0_ssts.into_iter().enumerate() {
+            let sst_path = sst_dir.join(format!("{:08}.sst", sst_meta.id));
+            let lazy_iter = LazySstIterator::new(sst_meta, sst_path, range.clone());
+            merge_iter.add_l0_sst(Box::new(lazy_iter), idx);
+        }
+
+        // 4. Add L1+ level iterators (non-overlapping, use LevelIterator for lazy loading)
+        for level in 1..MAX_LEVELS {
+            let ssts: Vec<Arc<SstMeta>> = version
+                .ssts_at_level(level as u32)
+                .iter()
+                .filter(|sst| sst.overlaps_mvcc(range.start.as_bytes(), range.end.as_bytes()))
+                .cloned()
+                .collect();
+
+            if !ssts.is_empty() {
+                let level_iter = LevelIterator::new(ssts, sst_dir.clone(), range.clone())?;
+                merge_iter.add_level(Box::new(level_iter), level);
             }
         }
 
-        // 2. Add frozen memtable iterators (newest to oldest)
-        // Use OwnedMemTableIterator to keep Arc<MemTable> alive
-        for memtable in frozen {
-            let mem_iter = OwnedMemTableIterator::new(memtable, range.clone())?;
-            iters.push(Box::new(mem_iter));
-        }
-
-        // 3. Add active memtable iterator
-        let active_iter = OwnedMemTableIterator::new(active, range)?;
-        iters.push(Box::new(active_iter));
-
-        // Use OwnedMergeIterator to merge all iterators
-        let merge_iter = OwnedMergeIterator::new(iters)?;
+        // Build and return the merge iterator
+        let merge_iter = merge_iter.build()?;
         Ok(Box::new(merge_iter))
     }
 
@@ -1736,8 +1926,13 @@ mod tests {
         let ilog_config = IlogConfig::new(tmp.path());
         let ilog = Arc::new(IlogService::open(ilog_config, Arc::clone(&lsn_provider)).unwrap());
 
-        let engine =
-            LsmEngine::open_durable(config, Arc::clone(&lsn_provider), Arc::clone(&ilog)).unwrap();
+        let engine = LsmEngine::open_with_recovery(
+            config,
+            Arc::clone(&lsn_provider),
+            Arc::clone(&ilog),
+            Version::new(),
+        )
+        .unwrap();
 
         assert!(engine.is_durable());
 
@@ -1781,7 +1976,8 @@ mod tests {
             let ilog_config = IlogConfig::new(tmp.path());
             let ilog = Arc::new(IlogService::open(ilog_config, Arc::clone(&lsn_provider)).unwrap());
 
-            let engine = LsmEngine::open_durable(config, lsn_provider, ilog).unwrap();
+            let engine =
+                LsmEngine::open_with_recovery(config, lsn_provider, ilog, Version::new()).unwrap();
 
             for i in 0..5 {
                 let mut batch = new_batch(i as Timestamp + 1);
@@ -1904,8 +2100,13 @@ mod tests {
         let ilog_config = IlogConfig::new(tmp.path());
         let ilog = Arc::new(IlogService::open(ilog_config, Arc::clone(&lsn_provider)).unwrap());
 
-        let engine =
-            LsmEngine::open_durable(config, Arc::clone(&lsn_provider), Arc::clone(&ilog)).unwrap();
+        let engine = LsmEngine::open_with_recovery(
+            config,
+            Arc::clone(&lsn_provider),
+            Arc::clone(&ilog),
+            Version::new(),
+        )
+        .unwrap();
 
         // Write key@ts=10
         let mut batch1 = WriteBatch::new();
@@ -1941,8 +2142,13 @@ mod tests {
         let ilog_config = IlogConfig::new(tmp.path());
         let ilog = Arc::new(IlogService::open(ilog_config, Arc::clone(&lsn_provider)).unwrap());
 
-        let engine =
-            LsmEngine::open_durable(config, Arc::clone(&lsn_provider), Arc::clone(&ilog)).unwrap();
+        let engine = LsmEngine::open_with_recovery(
+            config,
+            Arc::clone(&lsn_provider),
+            Arc::clone(&ilog),
+            Version::new(),
+        )
+        .unwrap();
 
         // Write value@ts=10
         let mut batch1 = WriteBatch::new();
@@ -2053,8 +2259,13 @@ mod tests {
         let ilog_config = IlogConfig::new(tmp.path());
         let ilog = Arc::new(IlogService::open(ilog_config, Arc::clone(&lsn_provider)).unwrap());
 
-        let engine =
-            LsmEngine::open_durable(config, Arc::clone(&lsn_provider), Arc::clone(&ilog)).unwrap();
+        let engine = LsmEngine::open_with_recovery(
+            config,
+            Arc::clone(&lsn_provider),
+            Arc::clone(&ilog),
+            Version::new(),
+        )
+        .unwrap();
 
         // Write batch with explicit CLOG LSN (simulating TransactionService behavior)
         let clog_lsn = 100;
@@ -2096,9 +2307,13 @@ mod tests {
         let ilog_config = IlogConfig::new(tmp.path());
         let ilog = Arc::new(IlogService::open(ilog_config, Arc::clone(&lsn_provider)).unwrap());
 
-        let engine =
-            LsmEngine::open_durable(config.clone(), Arc::clone(&lsn_provider), Arc::clone(&ilog))
-                .unwrap();
+        let engine = LsmEngine::open_with_recovery(
+            config.clone(),
+            Arc::clone(&lsn_provider),
+            Arc::clone(&ilog),
+            Version::new(),
+        )
+        .unwrap();
 
         // Write multiple versions of same key
         let mut batch1 = WriteBatch::new();
@@ -2175,8 +2390,13 @@ mod tests {
         let ilog_config = IlogConfig::new(tmp.path());
         let ilog = Arc::new(IlogService::open(ilog_config, Arc::clone(&lsn_provider)).unwrap());
 
-        let engine =
-            LsmEngine::open_durable(config, Arc::clone(&lsn_provider), Arc::clone(&ilog)).unwrap();
+        let engine = LsmEngine::open_with_recovery(
+            config,
+            Arc::clone(&lsn_provider),
+            Arc::clone(&ilog),
+            Version::new(),
+        )
+        .unwrap();
 
         // Write value
         let mut batch1 = WriteBatch::new();
@@ -2231,8 +2451,13 @@ mod tests {
         let ilog_config = IlogConfig::new(tmp.path());
         let ilog = Arc::new(IlogService::open(ilog_config, Arc::clone(&lsn_provider)).unwrap());
 
-        let engine =
-            LsmEngine::open_durable(config, Arc::clone(&lsn_provider), Arc::clone(&ilog)).unwrap();
+        let engine = LsmEngine::open_with_recovery(
+            config,
+            Arc::clone(&lsn_provider),
+            Arc::clone(&ilog),
+            Version::new(),
+        )
+        .unwrap();
 
         // Create a key with many 0xFF bytes (longer than old 32-byte limit)
         let long_key: Vec<u8> = std::iter::repeat_n(0xFF, 64).collect();
@@ -2284,8 +2509,13 @@ mod tests {
         let ilog = Arc::new(IlogService::open(ilog_config, Arc::clone(&lsn_provider)).unwrap());
 
         let engine = Arc::new(
-            LsmEngine::open_durable(config.clone(), Arc::clone(&lsn_provider), Arc::clone(&ilog))
-                .unwrap(),
+            LsmEngine::open_with_recovery(
+                config.clone(),
+                Arc::clone(&lsn_provider),
+                Arc::clone(&ilog),
+                Version::new(),
+            )
+            .unwrap(),
         );
 
         // Write enough data to have multiple frozen memtables
@@ -2369,7 +2599,8 @@ mod tests {
             let ilog_config = IlogConfig::new(tmp.path());
             let ilog = Arc::new(IlogService::open(ilog_config, Arc::clone(&lsn_provider)).unwrap());
 
-            let engine = LsmEngine::open_durable(config, lsn_provider, ilog).unwrap();
+            let engine =
+                LsmEngine::open_with_recovery(config, lsn_provider, ilog, Version::new()).unwrap();
 
             // Write key@ts=10
             let mut batch1 = WriteBatch::new();
@@ -2446,8 +2677,13 @@ mod tests {
         let ilog_config = IlogConfig::new(tmp.path());
         let ilog = Arc::new(IlogService::open(ilog_config, Arc::clone(&lsn_provider)).unwrap());
 
-        let engine =
-            LsmEngine::open_durable(config, Arc::clone(&lsn_provider), Arc::clone(&ilog)).unwrap();
+        let engine = LsmEngine::open_with_recovery(
+            config,
+            Arc::clone(&lsn_provider),
+            Arc::clone(&ilog),
+            Version::new(),
+        )
+        .unwrap();
 
         // Step 1: Write value@ts=10 and flush to SST
         let mut batch1 = WriteBatch::new();
@@ -2519,8 +2755,13 @@ mod tests {
         let ilog_config = IlogConfig::new(tmp.path());
         let ilog = Arc::new(IlogService::open(ilog_config, Arc::clone(&lsn_provider)).unwrap());
 
-        let engine =
-            LsmEngine::open_durable(config, Arc::clone(&lsn_provider), Arc::clone(&ilog)).unwrap();
+        let engine = LsmEngine::open_with_recovery(
+            config,
+            Arc::clone(&lsn_provider),
+            Arc::clone(&ilog),
+            Version::new(),
+        )
+        .unwrap();
 
         // Write multiple keys and flush
         let mut batch1 = WriteBatch::new();
@@ -2579,9 +2820,13 @@ mod tests {
             let ilog_config = IlogConfig::new(tmp.path());
             let ilog = Arc::new(IlogService::open(ilog_config, Arc::clone(&lsn_provider)).unwrap());
 
-            let engine =
-                LsmEngine::open_durable(lsm_config, Arc::clone(&lsn_provider), Arc::clone(&ilog))
-                    .unwrap();
+            let engine = LsmEngine::open_with_recovery(
+                lsm_config,
+                Arc::clone(&lsn_provider),
+                Arc::clone(&ilog),
+                Version::new(),
+            )
+            .unwrap();
 
             // Use shared LSN provider for clog
             let clog_config = FileClogConfig::with_dir(tmp.path());
@@ -2686,8 +2931,13 @@ mod tests {
         let ilog_config = IlogConfig::new(tmp.path());
         let ilog = Arc::new(IlogService::open(ilog_config, Arc::clone(&lsn_provider)).unwrap());
 
-        let engine =
-            LsmEngine::open_durable(config, Arc::clone(&lsn_provider), Arc::clone(&ilog)).unwrap();
+        let engine = LsmEngine::open_with_recovery(
+            config,
+            Arc::clone(&lsn_provider),
+            Arc::clone(&ilog),
+            Version::new(),
+        )
+        .unwrap();
 
         // Create keys with all 0xFF bytes
         let key_all_ff_short: Vec<u8> = vec![0xFF; 8];

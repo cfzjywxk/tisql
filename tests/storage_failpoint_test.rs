@@ -51,8 +51,13 @@ fn create_test_lsm_engine(
         .memtable_size(256) // Very small for testing to trigger rotations
         .max_frozen_memtables(16) // Allow more frozen memtables for testing
         .build_unchecked();
-    let engine =
-        LsmEngine::open_durable(config, Arc::clone(&lsn_provider), Arc::clone(&ilog)).unwrap();
+    let engine = LsmEngine::open_with_recovery(
+        config,
+        Arc::clone(&lsn_provider),
+        Arc::clone(&ilog),
+        Version::new(),
+    )
+    .unwrap();
 
     (Arc::new(engine), ilog, clog)
 }
