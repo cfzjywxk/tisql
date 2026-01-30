@@ -33,11 +33,22 @@
 //! 2. **Faster Point Lookups**: Seek to user key, then traverse short version chain
 //! 3. **Better Cache Locality**: All versions of a key are adjacent in memory
 //!
-//! ## Version Chain Ordering
+//! ## Version Chain Ordering (CRITICAL INVARIANT)
 //!
 //! Versions are linked **newest to oldest** (head is most recent):
 //! - Write: Prepend new version to head (O(1), lock-free CAS)
 //! - Read: Traverse from head until finding ts <= read_ts (O(versions))
+//!
+//! **INVARIANT**: New versions MUST have timestamp >= current head's timestamp.
+//! This is required for `get_at()` to return the correct (latest visible) version.
+//! Violating this invariant causes reads to return stale data.
+//!
+//! This invariant is naturally maintained when:
+//! - Transaction commit_ts comes from a monotonically increasing TSO
+//! - Per-key locking ensures commits are serialized (ConcurrencyManager)
+//! - Recovery replays transactions in commit_ts order
+//!
+//! Debug builds include assertions to catch violations early.
 //!
 //! ## Thread Safety
 //!
@@ -122,11 +133,50 @@ impl MvccRow {
     ///
     /// Uses CAS loop for lock-free concurrent writes. New versions are
     /// always prepended (newest first), maintaining temporal ordering.
+    ///
+    /// # Invariant
+    ///
+    /// **CRITICAL**: The new version's timestamp MUST be >= the current head's timestamp.
+    /// This maintains the descending timestamp order (newest at head) that `get_at()`
+    /// relies on for correctness. Violating this invariant causes reads to return
+    /// stale data instead of the latest visible version.
+    ///
+    /// This invariant is naturally maintained when:
+    /// - Transaction commit_ts comes from a monotonically increasing TSO
+    /// - Per-key locking ensures commits are serialized
+    /// - Recovery replays transactions in commit order
+    ///
+    /// Debug builds include an assertion to catch violations.
     fn prepend(&self, ts: Timestamp, value: RawValue) {
         let mut new_node = VersionNode::new(ts, value);
 
         loop {
             let current_head = self.head.load(Ordering::Acquire);
+
+            // CRITICAL INVARIANT CHECK: new version must have ts >= current head's ts
+            // This ensures the chain remains ordered newest-to-oldest.
+            // Violation would cause get_at() to return stale versions.
+            if !current_head.is_null() {
+                // Safety: current_head is valid if non-null (nodes are never deallocated
+                // while the MvccRow exists)
+                let head_ts = unsafe { (*current_head).ts };
+                debug_assert!(
+                    ts >= head_ts,
+                    "MVCC version chain ordering violation: new ts {ts} < head ts {head_ts} for same key. \
+                     This will cause incorrect read results. Check transaction commit ordering."
+                );
+                // In release builds, log a warning but don't panic to avoid data loss.
+                // The version will still be inserted (at wrong position) but reads may be incorrect.
+                #[cfg(not(debug_assertions))]
+                if ts < head_ts {
+                    // Use eprintln since we may not have logging initialized
+                    eprintln!(
+                        "WARNING: MVCC version chain ordering violation: new ts {ts} < head ts {head_ts}. \
+                         Reads may return stale data."
+                    );
+                }
+            }
+
             new_node.next = current_head;
 
             let new_ptr = Box::into_raw(new_node);
@@ -962,6 +1012,7 @@ mod tests {
 
     // ==================== Concurrent Tests ====================
 
+    use std::sync::atomic::AtomicU64;
     use std::sync::Barrier;
     use std::thread;
 
@@ -1006,22 +1057,36 @@ mod tests {
 
     #[test]
     fn test_concurrent_writes_same_key() {
-        // Multiple threads writing different versions to the same key
+        // Multiple threads writing versions to the same key.
+        //
+        // In production, the ConcurrencyManager ensures per-key serialization:
+        // only one transaction can hold a lock on a key at a time. We simulate
+        // this with a mutex to match real-world behavior.
+        use std::sync::Mutex;
+
         let engine = VersionedMemTableEngine::new();
         let num_threads = 8;
         let versions_per_thread = 100;
         let barrier = Barrier::new(num_threads);
+        let ts_counter = AtomicU64::new(1);
+        // Simulates ConcurrencyManager's per-key lock
+        let key_lock = Mutex::new(());
 
         thread::scope(|s| {
             for tid in 0..num_threads {
                 let engine = &engine;
                 let barrier = &barrier;
+                let ts_counter = &ts_counter;
+                let key_lock = &key_lock;
 
                 s.spawn(move || {
                     barrier.wait();
 
                     for i in 0..versions_per_thread {
-                        let ts = (tid * versions_per_thread + i + 1) as u64;
+                        // Acquire per-key lock (simulating ConcurrencyManager behavior)
+                        let _guard = key_lock.lock().unwrap();
+                        // Get timestamp while holding lock - ensures monotonic per-key ordering
+                        let ts = ts_counter.fetch_add(1, Ordering::SeqCst);
                         let value = format!("v{tid}_{i}");
                         engine.put_at(b"hotkey", value.as_bytes(), ts);
                     }
@@ -1045,20 +1110,27 @@ mod tests {
 
     #[test]
     fn test_concurrent_reads_and_writes() {
+        // Test concurrent reads and writes where each writer thread has its own
+        // distinct key space. This matches real-world behavior where concurrent
+        // writes to the same key would be serialized by ConcurrencyManager.
         let engine = VersionedMemTableEngine::new();
-
-        // Pre-populate some data
-        for i in 0..1000 {
-            engine.put_at(format!("key{i:04}").as_bytes(), b"initial", 1);
-        }
+        let keys_per_writer = 250; // Each writer has 250 keys
 
         let num_writers = 4;
         let num_readers = 4;
         let ops_per_thread = 1000;
         let barrier = Barrier::new(num_writers + num_readers);
 
+        // Pre-populate: each writer's key range gets initial value at ts=1
+        for tid in 0..num_writers {
+            let base = tid * keys_per_writer;
+            for i in 0..keys_per_writer {
+                engine.put_at(format!("key{:04}", base + i).as_bytes(), b"initial", 1);
+            }
+        }
+
         thread::scope(|s| {
-            // Writer threads - write new versions
+            // Writer threads - each writes to its own distinct key range
             for tid in 0..num_writers {
                 let engine = &engine;
                 let barrier = &barrier;
@@ -1066,9 +1138,12 @@ mod tests {
                 s.spawn(move || {
                     barrier.wait();
 
+                    let base = tid * keys_per_writer;
                     for i in 0..ops_per_thread {
-                        let key = format!("key{:04}", i % 1000);
-                        let ts = (100 + tid * ops_per_thread + i) as u64;
+                        // Write to this thread's key range only
+                        let key = format!("key{:04}", base + (i % keys_per_writer));
+                        // Timestamp increases with each write within this thread
+                        let ts = (100 + i) as u64;
                         let value = format!("value_{tid}_{i}");
                         engine.put_at(key.as_bytes(), value.as_bytes(), ts);
                     }
@@ -1084,7 +1159,7 @@ mod tests {
                     barrier.wait();
 
                     for i in 0..ops_per_thread {
-                        let key = format!("key{:04}", i % 1000);
+                        let key = format!("key{:04}", i % (num_writers * keys_per_writer));
                         // Read at timestamp 1 should always see "initial"
                         let value = get_at_for_test(engine, key.as_bytes(), 1);
                         assert_eq!(value, Some(b"initial".to_vec()));
@@ -1137,5 +1212,64 @@ mod tests {
         assert!(version_set.contains(&(b"b".to_vec(), 15)));
         assert!(version_set.contains(&(b"c".to_vec(), 5)));
         assert!(version_set.contains(&(b"c".to_vec(), 25))); // Tombstone included
+    }
+
+    // ==================== Version Chain Ordering Tests ====================
+
+    #[test]
+    fn test_version_chain_ordering_correct() {
+        // Verify that when versions are inserted in correct order (ascending ts),
+        // reads return the correct latest visible version.
+        let engine = new_engine();
+
+        // Insert versions in ascending timestamp order (correct)
+        engine.put_at(b"key", b"v10", 10);
+        engine.put_at(b"key", b"v20", 20);
+        engine.put_at(b"key", b"v30", 30);
+
+        // Read at ts=25 should return v20 (latest visible at ts=25)
+        let value = get_at_for_test(&engine, b"key", 25);
+        assert_eq!(
+            value,
+            Some(b"v20".to_vec()),
+            "Should return latest visible version (ts=20), not ts=10 or ts=30"
+        );
+
+        // Read at ts=30 should return v30
+        let value = get_at_for_test(&engine, b"key", 30);
+        assert_eq!(value, Some(b"v30".to_vec()));
+
+        // Read at ts=5 should return None (no visible version)
+        let value = get_at_for_test(&engine, b"key", 5);
+        assert_eq!(value, None);
+    }
+
+    #[test]
+    fn test_version_chain_ordering_same_timestamp() {
+        // Test that inserting at the same timestamp is allowed (idempotent writes)
+        let engine = new_engine();
+
+        engine.put_at(b"key", b"v1", 10);
+        engine.put_at(b"key", b"v2", 10); // Same ts, different value
+
+        // Should return the latest inserted value at ts=10
+        let value = get_at_for_test(&engine, b"key", 10);
+        assert_eq!(value, Some(b"v2".to_vec()));
+    }
+
+    #[test]
+    #[cfg(debug_assertions)]
+    #[should_panic(expected = "MVCC version chain ordering violation")]
+    fn test_version_chain_ordering_violation_panics_in_debug() {
+        // In debug builds, inserting a version with ts < head's ts should panic.
+        // This catches bugs where the transaction layer violates the ordering invariant.
+        let engine = new_engine();
+
+        // Insert version at ts=20 first
+        engine.put_at(b"key", b"v20", 20);
+
+        // Try to insert version at ts=10 (WRONG: ts < head's ts)
+        // This should panic in debug builds
+        engine.put_at(b"key", b"v10", 10);
     }
 }

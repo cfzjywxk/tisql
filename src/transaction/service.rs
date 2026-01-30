@@ -27,7 +27,7 @@ use crate::clog::{ClogEntry, ClogOp, ClogService};
 use crate::error::{Result, TiSqlError};
 use crate::tso::TsoService;
 
-use super::api::{CommitInfo, TxnCtx, TxnService, TxnState};
+use super::api::{CommitInfo, ScanIterator, TxnCtx, TxnService, TxnState};
 use super::concurrency::{ConcurrencyManager, Lock};
 use crate::storage::mvcc::{is_tombstone, MvccIterator, MvccKey};
 use crate::storage::{StorageEngine, WriteBatch, WriteOp};
@@ -240,11 +240,7 @@ impl<S: StorageEngine + 'static, L: ClogService + 'static, T: TsoService> TxnSer
         Ok(None)
     }
 
-    fn scan(
-        &self,
-        ctx: &TxnCtx,
-        range: Range<Key>,
-    ) -> Result<Box<dyn Iterator<Item = (Key, RawValue)> + '_>> {
+    fn scan(&self, ctx: &TxnCtx, range: Range<Key>) -> Result<ScanIterator<'_>> {
         // Check for locks in range
         if !range.is_empty() {
             self.concurrency_manager
@@ -424,6 +420,12 @@ impl<S: StorageEngine + 'static, L: ClogService + 'static, T: TsoService> TxnSer
 /// - `entry_ts <= read_ts` (MVCC visibility)
 /// - Tombstones are filtered out (deleted keys not returned)
 /// - Write buffer entries override storage entries (read-your-writes)
+///
+/// ## Error Handling
+///
+/// Storage errors (I/O, corruption) are propagated through the iterator's
+/// `Item` type as `Result<(Key, RawValue)>`. Callers must handle these errors
+/// rather than assuming iteration completed successfully when `None` is returned.
 pub struct MvccScanIterator<I: MvccIterator> {
     /// Storage iterator producing MVCC key-value pairs
     storage_iter: I,
@@ -441,6 +443,8 @@ pub struct MvccScanIterator<I: MvccIterator> {
     pending_storage: Option<(Key, Option<RawValue>)>,
     /// Whether storage iterator is exhausted
     storage_exhausted: bool,
+    /// Deferred error from storage iterator (returned once, then cleared)
+    deferred_error: Option<TiSqlError>,
 }
 
 impl<I: MvccIterator> MvccScanIterator<I> {
@@ -472,6 +476,7 @@ impl<I: MvccIterator> MvccScanIterator<I> {
             last_user_key: None,
             pending_storage: None,
             storage_exhausted: false,
+            deferred_error: None,
         }
     }
 
@@ -509,17 +514,21 @@ impl<I: MvccIterator> MvccScanIterator<I> {
                 }
             }
 
-            // Found a visible entry
+            // Found a visible entry - extract value before advancing
             let value = self.storage_iter.value();
             let result = if is_tombstone(value) {
                 (user_key, None)
             } else {
                 (user_key, Some(value.to_vec()))
             };
-            self.pending_storage = Some(result);
 
-            // Advance past all versions of this key
+            // Advance past all versions of this key BEFORE storing result.
+            // This ensures that if next() fails, we don't leave a stale entry
+            // in pending_storage that would be incorrectly returned later.
             self.storage_iter.next()?;
+
+            // Only store the result after successful advance
+            self.pending_storage = Some(result);
             return Ok(());
         }
 
@@ -539,17 +548,23 @@ impl<I: MvccIterator> MvccScanIterator<I> {
 }
 
 impl<I: MvccIterator> Iterator for MvccScanIterator<I> {
-    type Item = (Key, RawValue);
+    type Item = Result<(Key, RawValue)>;
 
     fn next(&mut self) -> Option<Self::Item> {
+        // If we have a deferred error from a previous iteration, return it now
+        if let Some(err) = self.deferred_error.take() {
+            return Some(Err(err));
+        }
+
         loop {
             // Ensure we have a pending storage result if available
-            if self.pending_storage.is_none()
-                && !self.storage_exhausted
-                && self.advance_storage().is_err()
-            {
-                // On error, stop iteration
-                return None;
+            if self.pending_storage.is_none() && !self.storage_exhausted {
+                if let Err(e) = self.advance_storage() {
+                    // Mark storage as exhausted to prevent further attempts
+                    self.storage_exhausted = true;
+                    // Return the error to the caller instead of silently stopping
+                    return Some(Err(e));
+                }
             }
 
             // Get next candidates from storage and buffer
@@ -569,7 +584,7 @@ impl<I: MvccIterator> Iterator for MvccScanIterator<I> {
                     self.pending_storage = None;
 
                     if let Some(val) = value {
-                        return Some((key, val));
+                        return Some(Ok((key, val)));
                     }
                     // Tombstone, continue to next
                 }
@@ -581,7 +596,7 @@ impl<I: MvccIterator> Iterator for MvccScanIterator<I> {
                     self.advance_buffer();
 
                     if let Some(val) = value {
-                        return Some((key, val));
+                        return Some(Ok((key, val)));
                     }
                     // Deleted, continue to next
                 }
@@ -597,7 +612,7 @@ impl<I: MvccIterator> Iterator for MvccScanIterator<I> {
                             self.pending_storage = None;
 
                             if let Some(val) = value {
-                                return Some((key, val));
+                                return Some(Ok((key, val)));
                             }
                             // Tombstone, continue to next
                         }
@@ -609,7 +624,7 @@ impl<I: MvccIterator> Iterator for MvccScanIterator<I> {
                             self.advance_buffer();
 
                             if let Some(val) = value {
-                                return Some((key, val));
+                                return Some(Ok((key, val)));
                             }
                             // Deleted, continue to next
                         }
@@ -622,7 +637,7 @@ impl<I: MvccIterator> Iterator for MvccScanIterator<I> {
                             self.advance_buffer();
 
                             if let Some(val) = value {
-                                return Some((key, val));
+                                return Some(Ok((key, val)));
                             }
                             // Deleted, continue to next
                         }
@@ -995,7 +1010,8 @@ mod tests {
         let results: Vec<_> = txn_service
             .scan(&ctx, b"a".to_vec()..b"d".to_vec())
             .unwrap()
-            .collect();
+            .collect::<Result<Vec<_>>>()
+            .unwrap();
 
         assert_eq!(
             results.len(),
@@ -1030,7 +1046,8 @@ mod tests {
         let results: Vec<_> = txn_service
             .scan(&ctx, b"a".to_vec()..b"d".to_vec())
             .unwrap()
-            .collect();
+            .collect::<Result<Vec<_>>>()
+            .unwrap();
 
         // Should see:
         // - 'a' deleted (removed from results)
@@ -1062,5 +1079,252 @@ mod tests {
         let _ctx2 = txn_service.begin(true).unwrap();
         let ts3 = txn_service.tso().last_ts();
         assert!(ts3 > ts2);
+    }
+
+    // ========================================================================
+    // Error Propagation Tests for MvccScanIterator
+    // ========================================================================
+
+    /// Mock MvccIterator that injects an error after N successful iterations.
+    struct ErrorInjectingIterator {
+        entries: Vec<(MvccKey, Vec<u8>)>,
+        position: usize,
+        error_after: usize,
+        has_errored: bool,
+    }
+
+    impl ErrorInjectingIterator {
+        fn new(entries: Vec<(MvccKey, Vec<u8>)>, error_after: usize) -> Self {
+            Self {
+                entries,
+                position: 0,
+                error_after,
+                has_errored: false,
+            }
+        }
+
+        fn current(&self) -> Option<&(MvccKey, Vec<u8>)> {
+            self.entries.get(self.position)
+        }
+    }
+
+    impl MvccIterator for ErrorInjectingIterator {
+        fn seek(&mut self, _target: &MvccKey) -> Result<()> {
+            self.position = 0;
+            Ok(())
+        }
+
+        fn next(&mut self) -> Result<()> {
+            if self.has_errored {
+                return Ok(());
+            }
+
+            // Increment first to move past current entry
+            self.position += 1;
+
+            // Inject error after specified number of successful next() calls
+            if self.position > self.error_after && !self.has_errored {
+                self.has_errored = true;
+                return Err(TiSqlError::Storage(
+                    "simulated I/O error during scan".to_string(),
+                ));
+            }
+            Ok(())
+        }
+
+        fn valid(&self) -> bool {
+            !self.has_errored && self.position < self.entries.len()
+        }
+
+        fn key(&self) -> &MvccKey {
+            &self.current().expect("key() called on invalid iterator").0
+        }
+
+        fn value(&self) -> &[u8] {
+            &self
+                .current()
+                .expect("value() called on invalid iterator")
+                .1
+        }
+    }
+
+    #[test]
+    fn test_mvcc_scan_iterator_propagates_storage_error() {
+        // Create test data: 3 entries (a@5, b@5, c@5)
+        let entries = vec![
+            (MvccKey::encode(b"a", 5), b"value_a".to_vec()),
+            (MvccKey::encode(b"b", 5), b"value_b".to_vec()),
+            (MvccKey::encode(b"c", 5), b"value_c".to_vec()),
+        ];
+
+        // Error after 1 successful next() - should fail on second entry
+        let mock_iter = ErrorInjectingIterator::new(entries, 1);
+
+        let scan_iter = MvccScanIterator::new(
+            mock_iter,
+            10, // read_ts
+            b"a".to_vec()..b"z".to_vec(),
+            vec![], // no buffer entries
+        );
+
+        let results: Vec<_> = scan_iter.collect();
+
+        // Should have first entry (Ok) followed by error
+        assert_eq!(results.len(), 2, "expected 2 items: 1 Ok + 1 Err");
+
+        // First result should be Ok
+        assert!(
+            results[0].is_ok(),
+            "first result should be Ok, got {:?}",
+            results[0]
+        );
+        let (key, value) = results[0].as_ref().unwrap();
+        assert_eq!(key, b"a");
+        assert_eq!(value, b"value_a");
+
+        // Second result should be Err
+        assert!(
+            results[1].is_err(),
+            "second result should be Err, got {:?}",
+            results[1]
+        );
+        let err = results[1].as_ref().unwrap_err();
+        assert!(
+            matches!(err, TiSqlError::Storage(msg) if msg.contains("simulated I/O error")),
+            "expected Storage error, got {:?}",
+            err
+        );
+    }
+
+    #[test]
+    fn test_mvcc_scan_iterator_error_on_first_advance() {
+        // Create test data
+        let entries = vec![
+            (MvccKey::encode(b"a", 5), b"value_a".to_vec()),
+            (MvccKey::encode(b"b", 5), b"value_b".to_vec()),
+        ];
+
+        // Error after 0 successful next() calls - fails on first advance_storage()
+        // When we try to read entry "a", we call next() to advance, which fails.
+        // The entry is only stored AFTER next() succeeds, so no entry is returned.
+        let mock_iter = ErrorInjectingIterator::new(entries, 0);
+
+        let scan_iter = MvccScanIterator::new(mock_iter, 10, b"a".to_vec()..b"z".to_vec(), vec![]);
+
+        let results: Vec<_> = scan_iter.collect();
+
+        // Error occurs during first advance_storage(), before any entry is returned
+        assert_eq!(results.len(), 1, "expected 1 item (just the error)");
+        assert!(results[0].is_err(), "should be an error");
+    }
+
+    #[test]
+    fn test_mvcc_scan_iterator_error_after_all_entries() {
+        // Create test data
+        let entries = vec![
+            (MvccKey::encode(b"a", 5), b"value_a".to_vec()),
+            (MvccKey::encode(b"b", 5), b"value_b".to_vec()),
+        ];
+
+        // Error after 10 successful next() calls - won't trigger (only 2 entries)
+        let mock_iter = ErrorInjectingIterator::new(entries, 10);
+
+        let scan_iter = MvccScanIterator::new(mock_iter, 10, b"a".to_vec()..b"z".to_vec(), vec![]);
+
+        let results: Vec<_> = scan_iter.collect();
+
+        // All entries should succeed
+        assert_eq!(results.len(), 2, "expected 2 successful entries");
+        assert!(results[0].is_ok());
+        assert!(results[1].is_ok());
+    }
+
+    #[test]
+    fn test_mvcc_scan_iterator_error_with_buffer_entries() {
+        // Storage has entries that will error mid-iteration
+        let storage_entries = vec![
+            (MvccKey::encode(b"a", 5), b"storage_a".to_vec()),
+            (MvccKey::encode(b"c", 5), b"storage_c".to_vec()),
+        ];
+
+        // Error after 1 successful next() from storage
+        // First next() succeeds (after reading "a"), second next() fails (when trying to read "c")
+        let mock_iter = ErrorInjectingIterator::new(storage_entries, 1);
+
+        // Buffer has an entry between 'a' and 'c'
+        let buffer_entries = vec![(b"b".to_vec(), Some(b"buffer_b".to_vec()))];
+
+        let scan_iter =
+            MvccScanIterator::new(mock_iter, 10, b"a".to_vec()..b"z".to_vec(), buffer_entries);
+
+        let results: Vec<_> = scan_iter.collect();
+
+        // Actual order of events:
+        // 1. advance_storage() reads "a", next() succeeds -> Ok("a") returned (storage < buffer)
+        // 2. advance_storage() reads "c", next() FAILS -> Err returned immediately
+        // 3. storage_exhausted=true, but buffer still has "b" -> Ok("b") returned
+        // So: Ok("a"), Err, Ok("b")
+        assert_eq!(results.len(), 3, "expected 3 items: Ok(a), Err, Ok(b)");
+
+        // First entry: 'a' from storage
+        assert!(results[0].is_ok(), "first should be Ok(a)");
+        let (k, v) = results[0].as_ref().unwrap();
+        assert_eq!(k, b"a");
+        assert_eq!(v, b"storage_a");
+
+        // Second entry: error from storage
+        assert!(results[1].is_err(), "second should be Err");
+        let err = results[1].as_ref().unwrap_err();
+        assert!(matches!(err, TiSqlError::Storage(_)));
+
+        // Third entry: 'b' from buffer (returned after storage is marked exhausted)
+        assert!(results[2].is_ok(), "third should be Ok(b)");
+        let (k, v) = results[2].as_ref().unwrap();
+        assert_eq!(k, b"b");
+        assert_eq!(v, b"buffer_b");
+    }
+
+    #[test]
+    fn test_mvcc_scan_iterator_no_silent_truncation() {
+        // This test verifies the original bug is fixed:
+        // Previously, errors would cause silent truncation (returning None)
+        // Now, errors must be explicitly returned to the caller
+
+        let entries = vec![
+            (MvccKey::encode(b"a", 5), b"value_a".to_vec()),
+            (MvccKey::encode(b"b", 5), b"value_b".to_vec()),
+            (MvccKey::encode(b"c", 5), b"value_c".to_vec()),
+        ];
+
+        // Error after 1 entry - simulates I/O error mid-scan
+        let mock_iter = ErrorInjectingIterator::new(entries.clone(), 1);
+
+        let scan_iter = MvccScanIterator::new(mock_iter, 10, b"a".to_vec()..b"z".to_vec(), vec![]);
+
+        // The key invariant: we must be able to detect the error
+        let mut saw_error = false;
+        let mut successful_count = 0;
+
+        for result in scan_iter {
+            match result {
+                Ok(_) => successful_count += 1,
+                Err(e) => {
+                    saw_error = true;
+                    // Verify it's our simulated error
+                    assert!(matches!(e, TiSqlError::Storage(_)));
+                    break;
+                }
+            }
+        }
+
+        // CRITICAL: We must have seen the error, not silent truncation
+        assert!(
+            saw_error,
+            "error must be propagated to caller, not silently dropped"
+        );
+        assert_eq!(
+            successful_count, 1,
+            "should have exactly 1 successful entry before error"
+        );
     }
 }

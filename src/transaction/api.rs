@@ -46,6 +46,12 @@ use crate::error::Result;
 use crate::storage::WriteBatch;
 use crate::types::{Key, Lsn, RawValue, Timestamp, TxnId};
 
+/// Type alias for a boxed scan iterator that yields fallible key-value pairs.
+///
+/// The inner `Result` allows propagation of I/O or corruption errors that may
+/// occur during streaming iteration over storage.
+pub type ScanIterator<'a> = Box<dyn Iterator<Item = Result<(Key, RawValue)>> + 'a>;
+
 /// Transaction state machine.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum TxnState {
@@ -190,11 +196,9 @@ pub trait TxnService: Send + Sync {
     /// implementing read-your-writes semantics.
     ///
     /// Returns an iterator over key-value pairs visible at `start_ts`.
-    fn scan(
-        &self,
-        ctx: &TxnCtx,
-        range: Range<Key>,
-    ) -> Result<Box<dyn Iterator<Item = (Key, RawValue)> + '_>>;
+    /// Each item is wrapped in `Result` to propagate I/O or corruption errors
+    /// that may occur during streaming iteration over storage.
+    fn scan(&self, ctx: &TxnCtx, range: Range<Key>) -> Result<ScanIterator<'_>>;
 
     /// Buffer a put operation.
     ///

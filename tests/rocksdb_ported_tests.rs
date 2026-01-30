@@ -272,7 +272,7 @@ fn test_memtable_concurrent_reads_writes_mvcc() {
     let dir = TempDir::new().unwrap();
     let engine = Arc::new(create_engine(&dir));
 
-    // Pre-populate with base data
+    // Pre-populate with base data at ts=1
     let mut batch = new_batch(1);
     for i in 0..100 {
         let key = format!("mvcc_key_{i:04}");
@@ -282,6 +282,7 @@ fn test_memtable_concurrent_reads_writes_mvcc() {
 
     let num_readers = 4;
     let num_writers = 2;
+    let keys_per_writer = 50; // Each writer has its own key range
     let barrier = Arc::new(Barrier::new(num_readers + num_writers));
     let errors = Arc::new(AtomicU64::new(0));
 
@@ -319,10 +320,14 @@ fn test_memtable_concurrent_reads_writes_mvcc() {
             thread::spawn(move || {
                 barrier.wait();
 
+                // Each writer writes to its own distinct key range to avoid
+                // concurrent writes to the same key (which requires external locking)
+                let key_offset = tid * keys_per_writer;
                 for i in 0..100 {
-                    let ts = (100 + tid * 100 + i) as Timestamp;
+                    // Timestamps increase within each writer thread
+                    let ts = (100 + i) as Timestamp;
                     let mut batch = new_batch(ts);
-                    let key = format!("mvcc_key_{:04}", i % 100);
+                    let key = format!("mvcc_key_{:04}", key_offset + (i % keys_per_writer));
                     batch.put(key.into_bytes(), format!("updated_{ts}").into_bytes());
                     engine.write_batch(batch).unwrap();
                 }
@@ -871,9 +876,8 @@ fn test_compaction_preserves_mvcc_versions() {
     let dir = TempDir::new().unwrap();
     let (engine, _ilog) = create_durable_engine(&dir);
 
-    // Write multiple versions
-    for ts in (1..=5).rev() {
-        // Write in reverse order
+    // Write multiple versions in ascending order (matching real transaction behavior)
+    for ts in 1..=5 {
         let mut batch = new_batch_with_lsn(ts as Timestamp, ts as u64);
         batch.put(b"mvcc_test".to_vec(), format!("value_ts_{ts}").into_bytes());
         engine.write_batch(batch).unwrap();

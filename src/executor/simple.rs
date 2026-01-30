@@ -241,7 +241,8 @@ impl SimpleExecutor {
                 let iter = txn_service.scan(ctx, start_key..end_key)?;
 
                 let mut rows = Vec::new();
-                for (_, value) in iter {
+                for result in iter {
+                    let (_, value) = result?;
                     let values = decode_row_to_values(&value, &col_ids, &data_types)?;
                     let row = Row::new(values);
 
@@ -496,7 +497,7 @@ impl SimpleExecutor {
 
                 // Scan using transaction's snapshot (reads at start_ts)
                 let iter = txn_service.scan(ctx, start_key..end_key)?;
-                let entries: Vec<_> = iter.collect();
+                let entries: Vec<_> = iter.collect::<Result<Vec<_>>>()?;
 
                 for (key, value) in entries {
                     let values = decode_row_to_values(&value, &col_ids, &data_types)?;
@@ -539,7 +540,7 @@ impl SimpleExecutor {
 
                 // Scan using transaction's snapshot
                 let iter = txn_service.scan(ctx, start_key..end_key)?;
-                let entries: Vec<_> = iter.collect();
+                let entries: Vec<_> = iter.collect::<Result<Vec<_>>>()?;
 
                 for (key, value) in entries {
                     let values = decode_row_to_values(&value, &col_ids, &data_types)?;

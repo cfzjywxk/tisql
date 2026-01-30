@@ -294,7 +294,9 @@ impl<T: TxnService> Catalog for MvccCatalog<T> {
         let end = vec![META_PREFIX, META_SCHEMA + 1];
 
         let iter = self.txn_service.scan(&ctx, start..end)?;
-        let schemas: Vec<String> = iter
+        let entries: Vec<_> = iter.collect::<Result<Vec<_>>>()?;
+        let schemas: Vec<String> = entries
+            .into_iter()
             .filter_map(|(key, _)| {
                 if key.len() > 2 && key[0] == META_PREFIX && key[1] == META_SCHEMA {
                     String::from_utf8(key[2..].to_vec()).ok()
@@ -451,7 +453,8 @@ impl<T: TxnService> Catalog for MvccCatalog<T> {
         let iter = self.txn_service.scan(&ctx, prefix.clone()..end)?;
         let mut tables = Vec::new();
 
-        for (key, value) in iter {
+        for result in iter {
+            let (key, value) = result?;
             // Verify key starts with our prefix
             if key.starts_with(&prefix) {
                 match bincode::deserialize::<TableDef>(&value) {
@@ -701,7 +704,8 @@ impl<T: TxnService> Catalog for MvccCatalog<T> {
         let iter = self.txn_service.scan(&ctx, prefix.clone()..end)?;
         let mut tables = Vec::new();
 
-        for (key, value) in iter {
+        for result in iter {
+            let (key, value) = result?;
             if key.starts_with(&prefix) {
                 match bincode::deserialize::<TableDef>(&value) {
                     Ok(table_def) => tables.push(table_def),
