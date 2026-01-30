@@ -256,8 +256,8 @@ impl MySqlBackend {
             }];
 
             let mut rw = results.start(&cols).await?;
-            // Get tables from catalog
-            if let Ok(tables) = self.db.list_tables() {
+            // Get tables from catalog using session's current database
+            if let Ok(tables) = self.db.list_tables(self.session.current_db()) {
                 for table in tables {
                     rw.write_col(table.as_str())?;
                     rw.end_row().await?;

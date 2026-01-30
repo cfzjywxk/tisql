@@ -420,9 +420,9 @@ impl Database {
         Ok(query_result)
     }
 
-    /// List tables in default schema.
-    pub fn list_tables(&self) -> Result<Vec<String>> {
-        let tables = self.catalog.list_tables("default")?;
+    /// List tables in the specified schema.
+    pub fn list_tables(&self, schema: &str) -> Result<Vec<String>> {
+        let tables = self.catalog.list_tables(schema)?;
         Ok(tables.into_iter().map(|t| t.name().to_string()).collect())
     }
 
