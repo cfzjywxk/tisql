@@ -1,7 +1,7 @@
 # Aggregate function tests
 
 # Create test table
-CREATE TABLE t_agg (id INT, val INT, category VARCHAR(10));
+CREATE TABLE t_agg (id INT PRIMARY KEY, val INT, category VARCHAR(10));
 
 # Insert test data
 INSERT INTO t_agg VALUES (1, 10, 'A'), (2, 20, 'A'), (3, 30, 'B'), (4, 40, 'B'), (5, 50, 'B');

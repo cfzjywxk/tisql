@@ -1068,7 +1068,7 @@ mod ddl_concurrency {
                     barrier.wait();
 
                     // Each thread creates a different table
-                    let sql = format!("CREATE TABLE t{i} (id INT, name VARCHAR(100))");
+                    let sql = format!("CREATE TABLE t{i} (id INT PRIMARY KEY, name VARCHAR(100))");
                     match db.handle_mp_query(&sql) {
                         Ok(_) => {
                             success_count.fetch_add(1, Ordering::SeqCst);
@@ -1124,7 +1124,7 @@ mod ddl_concurrency {
                     barrier.wait();
 
                     // All threads try to create the same table
-                    match db.handle_mp_query("CREATE TABLE conflict_table (id INT)") {
+                    match db.handle_mp_query("CREATE TABLE conflict_table (id INT PRIMARY KEY)") {
                         Ok(_) => {
                             success_count.fetch_add(1, Ordering::SeqCst);
                         }
@@ -1171,7 +1171,7 @@ mod ddl_concurrency {
         let db = Arc::new(Database::open(config).unwrap());
 
         // Create initial table
-        db.handle_mp_query("CREATE TABLE users (id INT, name VARCHAR(100))")
+        db.handle_mp_query("CREATE TABLE users (id INT PRIMARY KEY, name VARCHAR(100))")
             .unwrap();
         db.handle_mp_query("INSERT INTO users VALUES (1, 'Alice')")
             .unwrap();
@@ -1186,7 +1186,8 @@ mod ddl_concurrency {
         db.handle_mp_query("SELECT * FROM users").unwrap();
 
         // DDL changes schema
-        db.handle_mp_query("CREATE TABLE orders (id INT)").unwrap();
+        db.handle_mp_query("CREATE TABLE orders (id INT PRIMARY KEY)")
+            .unwrap();
 
         // DML on original table should still work (schema of 'users' didn't change)
         db.handle_mp_query("INSERT INTO users VALUES (2, 'Bob')")
@@ -1215,7 +1216,7 @@ mod ddl_concurrency {
 
         // Create tables sequentially to establish baseline
         for i in 0..5 {
-            db.handle_mp_query(&format!("CREATE TABLE seq_t{i} (id INT)"))
+            db.handle_mp_query(&format!("CREATE TABLE seq_t{i} (id INT PRIMARY KEY)"))
                 .unwrap();
         }
 
@@ -1230,7 +1231,7 @@ mod ddl_concurrency {
 
                 thread::spawn(move || {
                     barrier.wait();
-                    db.handle_mp_query(&format!("CREATE TABLE conc_t{i} (id INT)"))
+                    db.handle_mp_query(&format!("CREATE TABLE conc_t{i} (id INT PRIMARY KEY)"))
                         .unwrap();
                 })
             })
@@ -1267,10 +1268,11 @@ mod ddl_concurrency {
         let db = Arc::new(Database::open(config).unwrap());
 
         // Create, drop, recreate in sequence
-        db.handle_mp_query("CREATE TABLE temp (id INT)").unwrap();
+        db.handle_mp_query("CREATE TABLE temp (id INT PRIMARY KEY)")
+            .unwrap();
         db.handle_mp_query("INSERT INTO temp VALUES (1)").unwrap();
         db.handle_mp_query("DROP TABLE temp").unwrap();
-        db.handle_mp_query("CREATE TABLE temp (id INT, name VARCHAR(50))")
+        db.handle_mp_query("CREATE TABLE temp (id INT PRIMARY KEY, name VARCHAR(50))")
             .unwrap();
         db.handle_mp_query("INSERT INTO temp VALUES (2, 'test')")
             .unwrap();

@@ -2,7 +2,7 @@
 
 # Create test table
 CREATE TABLE t_insert (
-    id INT,
+    id INT PRIMARY KEY,
     name VARCHAR(100),
     value INT
 );

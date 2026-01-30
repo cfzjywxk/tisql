@@ -1,7 +1,7 @@
 # Update operation tests
 
 # Create test table
-CREATE TABLE t_update (id INT, val INT, name VARCHAR(50));
+CREATE TABLE t_update (id INT PRIMARY KEY, val INT, name VARCHAR(50));
 
 # Insert test data
 INSERT INTO t_update VALUES (1, 100, 'first'), (2, 200, 'second'), (3, 300, 'third');

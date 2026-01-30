@@ -1,7 +1,7 @@
 # Comparison expression tests
 
 # Create test table
-CREATE TABLE t_cmp (id INT, val INT, name VARCHAR(50));
+CREATE TABLE t_cmp (id INT PRIMARY KEY, val INT, name VARCHAR(50));
 
 # Insert test data
 INSERT INTO t_cmp VALUES (1, 10, 'a'), (2, 20, 'b'), (3, 20, 'c'), (4, 30, 'd');

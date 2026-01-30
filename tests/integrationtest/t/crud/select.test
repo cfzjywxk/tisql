@@ -1,7 +1,7 @@
 # Select operation tests
 
 # Create test table
-CREATE TABLE t_select (a INT, b INT, c VARCHAR(50));
+CREATE TABLE t_select (a INT PRIMARY KEY, b INT, c VARCHAR(50));
 
 # Insert test data
 INSERT INTO t_select VALUES (1, 10, 'one'), (2, 20, 'two'), (3, 30, 'three'), (4, 40, 'four'), (5, 50, 'five');

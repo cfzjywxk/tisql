@@ -1,7 +1,7 @@
 # Basic CRUD operations test
 
 # Create table
-CREATE TABLE users (id INT, name VARCHAR(100), age INT);
+CREATE TABLE users (id INT PRIMARY KEY, name VARCHAR(100), age INT);
 
 # Insert single row
 INSERT INTO users (id, name, age) VALUES (1, 'Alice', 25);

@@ -17,7 +17,7 @@
 //! Provides a session-like API for testing:
 //! ```rust
 //! let tk = TestKit::new();
-//! tk.must_exec("CREATE TABLE t (id INT)");
+//! tk.must_exec("CREATE TABLE t (id INT PRIMARY KEY)");
 //! tk.must_exec("INSERT INTO t VALUES (1), (2)");
 //! tk.must_query("SELECT * FROM t").check(rows!["1", "2"]);
 //! ```
@@ -205,7 +205,7 @@ mod tests {
     fn test_testkit_basic() {
         let tk = TestKit::new();
 
-        tk.must_exec("CREATE TABLE t (id INT, name VARCHAR(100))")
+        tk.must_exec("CREATE TABLE t (id INT PRIMARY KEY, name VARCHAR(100))")
             .check_ok();
         tk.must_exec("INSERT INTO t VALUES (1, 'Alice'), (2, 'Bob')")
             .check_affected(2);
@@ -220,7 +220,7 @@ mod tests {
     fn test_testkit_query_checker() {
         let tk = TestKit::new();
 
-        tk.must_exec("CREATE TABLE t (a INT, b INT)");
+        tk.must_exec("CREATE TABLE t (a INT PRIMARY KEY, b INT)");
         tk.must_exec("INSERT INTO t VALUES (1, 10), (2, 20), (3, 30)");
 
         let result = tk.must_query("SELECT a, b FROM t ORDER BY a");

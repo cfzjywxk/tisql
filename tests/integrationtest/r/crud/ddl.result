@@ -1,4 +1,4 @@
-CREATE TABLE t_ddl ( id INT, tiny_val TINYINT, small_val SMALLINT, big_val BIGINT, float_val FLOAT, double_val DOUBLE, char_val CHAR(10), varchar_val VARCHAR(100), text_val TEXT )
+CREATE TABLE t_ddl ( id INT PRIMARY KEY, tiny_val TINYINT, small_val SMALLINT, big_val BIGINT, float_val FLOAT, double_val DOUBLE, char_val CHAR(10), varchar_val VARCHAR(100), text_val TEXT )
 INSERT INTO t_ddl VALUES (1, 127, 32767, 9223372036854775807, 3.14, 2.718281828, 'hello', 'world', 'long text here')
 AFFECTED 1
 SELECT id, tiny_val, small_val, big_val FROM t_ddl
@@ -11,7 +11,7 @@ SELECT id, char_val, varchar_val, text_val FROM t_ddl
 id	char_val	varchar_val	text_val
 1	hello	world	long text here
 DROP TABLE t_ddl
-CREATE TABLE t_test (id INT)
-CREATE TABLE IF NOT EXISTS t_test (id INT)
+CREATE TABLE t_test (id INT PRIMARY KEY)
+CREATE TABLE IF NOT EXISTS t_test (id INT PRIMARY KEY)
 DROP TABLE t_test
 DROP TABLE IF EXISTS t_test

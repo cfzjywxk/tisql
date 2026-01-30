@@ -1,4 +1,4 @@
-CREATE TABLE t_insert ( id INT, name VARCHAR(100), value INT )
+CREATE TABLE t_insert ( id INT PRIMARY KEY, name VARCHAR(100), value INT )
 INSERT INTO t_insert (id, name, value) VALUES (1, 'first', 100)
 AFFECTED 1
 INSERT INTO t_insert VALUES (2, 'second', 200)

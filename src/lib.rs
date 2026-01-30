@@ -597,7 +597,7 @@ mod tests {
     fn test_create_and_insert() {
         let (db, _dir) = create_test_db();
 
-        db.handle_mp_query("CREATE TABLE users (id INT, name VARCHAR(255))")
+        db.handle_mp_query("CREATE TABLE users (id INT PRIMARY KEY, name VARCHAR(255))")
             .unwrap();
 
         let result = db
@@ -628,7 +628,7 @@ mod tests {
         // Create database and insert data
         {
             let db = Database::open(config.clone()).unwrap();
-            db.handle_mp_query("CREATE TABLE t (id INT, val VARCHAR(100))")
+            db.handle_mp_query("CREATE TABLE t (id INT PRIMARY KEY, val VARCHAR(100))")
                 .unwrap();
             db.handle_mp_query("INSERT INTO t VALUES (1, 'hello')")
                 .unwrap();
@@ -650,7 +650,8 @@ mod tests {
     fn test_where_clause() {
         let (db, _dir) = create_test_db();
 
-        db.handle_mp_query("CREATE TABLE t (a INT, b INT)").unwrap();
+        db.handle_mp_query("CREATE TABLE t (a INT PRIMARY KEY, b INT)")
+            .unwrap();
         db.handle_mp_query("INSERT INTO t VALUES (1, 10), (2, 20), (3, 30)")
             .unwrap();
 
@@ -669,7 +670,8 @@ mod tests {
     fn test_order_by() {
         let (db, _dir) = create_test_db();
 
-        db.handle_mp_query("CREATE TABLE t (a INT)").unwrap();
+        db.handle_mp_query("CREATE TABLE t (a INT PRIMARY KEY)")
+            .unwrap();
         db.handle_mp_query("INSERT INTO t VALUES (3), (1), (2)")
             .unwrap();
 
@@ -688,7 +690,8 @@ mod tests {
     fn test_limit() {
         let (db, _dir) = create_test_db();
 
-        db.handle_mp_query("CREATE TABLE t (a INT)").unwrap();
+        db.handle_mp_query("CREATE TABLE t (a INT PRIMARY KEY)")
+            .unwrap();
         db.handle_mp_query("INSERT INTO t VALUES (1), (2), (3), (4), (5)")
             .unwrap();
 
@@ -705,7 +708,7 @@ mod tests {
     fn test_update() {
         let (db, _dir) = create_test_db();
 
-        db.handle_mp_query("CREATE TABLE t (id INT, val INT)")
+        db.handle_mp_query("CREATE TABLE t (id INT PRIMARY KEY, val INT)")
             .unwrap();
         db.handle_mp_query("INSERT INTO t VALUES (1, 100), (2, 200)")
             .unwrap();
@@ -728,7 +731,8 @@ mod tests {
     fn test_delete() {
         let (db, _dir) = create_test_db();
 
-        db.handle_mp_query("CREATE TABLE t (a INT)").unwrap();
+        db.handle_mp_query("CREATE TABLE t (a INT PRIMARY KEY)")
+            .unwrap();
         db.handle_mp_query("INSERT INTO t VALUES (1), (2), (3)")
             .unwrap();
 

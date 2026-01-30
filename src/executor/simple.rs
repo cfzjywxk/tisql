@@ -124,6 +124,14 @@ impl SimpleExecutor {
                 table,
                 if_not_exists,
             } => {
+                // Require primary key for now (hidden row-id not fully supported)
+                if table.primary_key().is_empty() {
+                    return Err(TiSqlError::Catalog(format!(
+                        "Table '{}' must have a PRIMARY KEY (tables without primary key are not supported yet)",
+                        table.name()
+                    )));
+                }
+
                 if catalog.get_table(table.schema(), table.name())?.is_some() {
                     if if_not_exists {
                         return Ok(ExecutionResult::Ok);

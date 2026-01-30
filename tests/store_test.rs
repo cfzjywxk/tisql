@@ -30,7 +30,9 @@ mod crud {
     fn test_create_insert_select() {
         let tk = TestKit::new();
 
-        tk.must_exec("CREATE TABLE users (id INT, name VARCHAR(100), email VARCHAR(100))");
+        tk.must_exec(
+            "CREATE TABLE users (id INT PRIMARY KEY, name VARCHAR(100), email VARCHAR(100))",
+        );
 
         // Single insert
         tk.must_exec(
@@ -55,7 +57,7 @@ mod crud {
     fn test_update_single() {
         let tk = TestKit::new();
 
-        tk.must_exec("CREATE TABLE t (id INT, val INT)");
+        tk.must_exec("CREATE TABLE t (id INT PRIMARY KEY, val INT)");
         tk.must_exec("INSERT INTO t VALUES (1, 100)");
 
         // Update single row
@@ -69,7 +71,7 @@ mod crud {
     fn test_delete() {
         let tk = TestKit::new();
 
-        tk.must_exec("CREATE TABLE t (id INT)");
+        tk.must_exec("CREATE TABLE t (id INT PRIMARY KEY)");
         tk.must_exec("INSERT INTO t VALUES (1), (2), (3), (4), (5)");
 
         // Delete single row
@@ -92,7 +94,7 @@ mod select {
     fn test_order_by() {
         let tk = TestKit::new();
 
-        tk.must_exec("CREATE TABLE t (a INT, b VARCHAR(10))");
+        tk.must_exec("CREATE TABLE t (a INT PRIMARY KEY, b VARCHAR(10))");
         tk.must_exec("INSERT INTO t VALUES (3, 'c'), (1, 'a'), (2, 'b')");
 
         // ORDER BY ASC
@@ -111,7 +113,7 @@ mod select {
     fn test_limit_offset() {
         let tk = TestKit::new();
 
-        tk.must_exec("CREATE TABLE t (id INT)");
+        tk.must_exec("CREATE TABLE t (id INT PRIMARY KEY)");
         tk.must_exec("INSERT INTO t VALUES (1), (2), (3), (4), (5)");
 
         // LIMIT only
@@ -127,7 +129,7 @@ mod select {
     fn test_projection() {
         let tk = TestKit::new();
 
-        tk.must_exec("CREATE TABLE t (a INT, b INT, c INT)");
+        tk.must_exec("CREATE TABLE t (a INT PRIMARY KEY, b INT, c INT)");
         tk.must_exec("INSERT INTO t VALUES (1, 2, 3)");
 
         tk.must_query("SELECT a FROM t").check(rows![["1"]]);
@@ -154,7 +156,7 @@ mod filter {
     fn test_comparison_operators() {
         let tk = TestKit::new();
 
-        tk.must_exec("CREATE TABLE t (id INT, val INT)");
+        tk.must_exec("CREATE TABLE t (id INT PRIMARY KEY, val INT)");
         tk.must_exec("INSERT INTO t VALUES (1, 10), (2, 20), (3, 30), (4, 40)");
 
         // Equality
@@ -186,7 +188,8 @@ mod filter {
     fn test_logical_operators() {
         let tk = TestKit::new();
 
-        tk.must_exec("CREATE TABLE t (a INT, b INT)");
+        // Use composite primary key to allow (a, b) combinations
+        tk.must_exec("CREATE TABLE t (a INT, b INT, PRIMARY KEY (a, b))");
         tk.must_exec("INSERT INTO t VALUES (1, 1), (1, 2), (2, 1), (2, 2)");
 
         // AND
@@ -206,7 +209,7 @@ mod filter {
     fn test_string_comparison() {
         let tk = TestKit::new();
 
-        tk.must_exec("CREATE TABLE t (id INT, name VARCHAR(50))");
+        tk.must_exec("CREATE TABLE t (id INT PRIMARY KEY, name VARCHAR(50))");
         tk.must_exec("INSERT INTO t VALUES (1, 'Alice'), (2, 'Bob'), (3, 'Charlie')");
 
         tk.must_query("SELECT id FROM t WHERE name = 'Bob'")
@@ -222,8 +225,9 @@ mod ddl {
     fn test_create_drop_table() {
         let tk = TestKit::new();
 
-        tk.must_exec("CREATE TABLE t1 (id INT)").check_ok();
-        tk.must_exec("CREATE TABLE t2 (id INT, name VARCHAR(100))")
+        tk.must_exec("CREATE TABLE t1 (id INT PRIMARY KEY)")
+            .check_ok();
+        tk.must_exec("CREATE TABLE t2 (id INT PRIMARY KEY, name VARCHAR(100))")
             .check_ok();
 
         // Insert and verify
@@ -238,8 +242,9 @@ mod ddl {
     fn test_create_if_not_exists() {
         let tk = TestKit::new();
 
-        tk.must_exec("CREATE TABLE t (id INT)").check_ok();
-        tk.must_exec("CREATE TABLE IF NOT EXISTS t (id INT)")
+        tk.must_exec("CREATE TABLE t (id INT PRIMARY KEY)")
+            .check_ok();
+        tk.must_exec("CREATE TABLE IF NOT EXISTS t (id INT PRIMARY KEY)")
             .check_ok();
 
         tk.must_exec("DROP TABLE t");
@@ -253,7 +258,7 @@ mod ddl {
         tk.must_exec("DROP TABLE IF EXISTS non_existent").check_ok();
 
         // Create and drop
-        tk.must_exec("CREATE TABLE t (id INT)");
+        tk.must_exec("CREATE TABLE t (id INT PRIMARY KEY)");
         tk.must_exec("DROP TABLE IF EXISTS t").check_ok();
         tk.must_exec("DROP TABLE IF EXISTS t").check_ok();
     }
@@ -267,7 +272,9 @@ mod data_types {
     fn test_integer_types() {
         let tk = TestKit::new();
 
-        tk.must_exec("CREATE TABLE t (tiny TINYINT, small SMALLINT, normal INT, big BIGINT)");
+        tk.must_exec(
+            "CREATE TABLE t (tiny TINYINT PRIMARY KEY, small SMALLINT, normal INT, big BIGINT)",
+        );
         tk.must_exec("INSERT INTO t VALUES (127, 32767, 2147483647, 9223372036854775807)");
 
         tk.must_query("SELECT tiny, small, normal, big FROM t")
@@ -278,7 +285,7 @@ mod data_types {
     fn test_string_types() {
         let tk = TestKit::new();
 
-        tk.must_exec("CREATE TABLE t (c CHAR(10), vc VARCHAR(100), txt TEXT)");
+        tk.must_exec("CREATE TABLE t (c CHAR(10) PRIMARY KEY, vc VARCHAR(100), txt TEXT)");
         tk.must_exec("INSERT INTO t VALUES ('hello', 'world', 'long text content')");
 
         tk.must_query("SELECT c, vc, txt FROM t").check(rows![[
@@ -292,7 +299,7 @@ mod data_types {
     fn test_null_handling() {
         let tk = TestKit::new();
 
-        tk.must_exec("CREATE TABLE t (id INT, val INT)");
+        tk.must_exec("CREATE TABLE t (id INT PRIMARY KEY, val INT)");
         tk.must_exec("INSERT INTO t (id) VALUES (1)");
         tk.must_exec("INSERT INTO t VALUES (2, 100)");
 
@@ -320,7 +327,7 @@ mod expressions {
     fn test_arithmetic_with_columns() {
         let tk = TestKit::new();
 
-        tk.must_exec("CREATE TABLE t (a INT, b INT)");
+        tk.must_exec("CREATE TABLE t (a INT PRIMARY KEY, b INT)");
         tk.must_exec("INSERT INTO t VALUES (10, 3)");
 
         tk.must_query("SELECT a + b FROM t").check(rows![["13"]]);
@@ -354,8 +361,8 @@ mod errors {
     #[test]
     fn test_duplicate_table() {
         let tk = TestKit::new();
-        tk.must_exec("CREATE TABLE t (id INT)");
-        let err = tk.must_exec_err("CREATE TABLE t (id INT)");
+        tk.must_exec("CREATE TABLE t (id INT PRIMARY KEY)");
+        let err = tk.must_exec_err("CREATE TABLE t (id INT PRIMARY KEY)");
         assert!(
             err.contains("exists") || err.contains("already"),
             "Error: {err}"
@@ -381,7 +388,7 @@ mod persistence {
         // First session: create table and insert data
         {
             let db = Database::open(config.clone()).unwrap();
-            db.handle_mp_query("CREATE TABLE users (id INT, name VARCHAR(100))")
+            db.handle_mp_query("CREATE TABLE users (id INT PRIMARY KEY, name VARCHAR(100))")
                 .unwrap();
             db.handle_mp_query("INSERT INTO users VALUES (1, 'Alice')")
                 .unwrap();
@@ -419,8 +426,9 @@ mod persistence {
         // First session: create multiple tables
         {
             let db = Database::open(config.clone()).unwrap();
-            db.handle_mp_query("CREATE TABLE t1 (a INT)").unwrap();
-            db.handle_mp_query("CREATE TABLE t2 (b INT, c INT)")
+            db.handle_mp_query("CREATE TABLE t1 (a INT PRIMARY KEY)")
+                .unwrap();
+            db.handle_mp_query("CREATE TABLE t2 (b INT PRIMARY KEY, c INT)")
                 .unwrap();
             db.handle_mp_query("INSERT INTO t1 VALUES (100)").unwrap();
             db.handle_mp_query("INSERT INTO t2 VALUES (200, 300)")
@@ -464,11 +472,13 @@ mod persistence {
         // First session: create and drop a table
         {
             let db = Database::open(config.clone()).unwrap();
-            db.handle_mp_query("CREATE TABLE temp (x INT)").unwrap();
+            db.handle_mp_query("CREATE TABLE temp (x INT PRIMARY KEY)")
+                .unwrap();
             db.handle_mp_query("INSERT INTO temp VALUES (1)").unwrap();
             db.handle_mp_query("DROP TABLE temp").unwrap();
             // Create another table to verify we can still create tables
-            db.handle_mp_query("CREATE TABLE perm (y INT)").unwrap();
+            db.handle_mp_query("CREATE TABLE perm (y INT PRIMARY KEY)")
+                .unwrap();
             db.handle_mp_query("INSERT INTO perm VALUES (2)").unwrap();
             db.close().unwrap();
         }
@@ -502,8 +512,10 @@ mod persistence {
         // First session: create tables
         {
             let db = Database::open(config.clone()).unwrap();
-            db.handle_mp_query("CREATE TABLE t1 (a INT)").unwrap();
-            db.handle_mp_query("CREATE TABLE t2 (b INT)").unwrap();
+            db.handle_mp_query("CREATE TABLE t1 (a INT PRIMARY KEY)")
+                .unwrap();
+            db.handle_mp_query("CREATE TABLE t2 (b INT PRIMARY KEY)")
+                .unwrap();
             db.close().unwrap();
         }
 
@@ -511,7 +523,8 @@ mod persistence {
         {
             let db = Database::open(config.clone()).unwrap();
             // This should succeed without ID conflict
-            db.handle_mp_query("CREATE TABLE t3 (c INT)").unwrap();
+            db.handle_mp_query("CREATE TABLE t3 (c INT PRIMARY KEY)")
+                .unwrap();
             db.handle_mp_query("INSERT INTO t3 VALUES (333)").unwrap();
 
             let result = db.handle_mp_query("SELECT c FROM t3").unwrap();
@@ -536,7 +549,7 @@ mod persistence {
         // First session: write data and "crash" (no close)
         {
             let db = Database::open(config.clone()).unwrap();
-            db.handle_mp_query("CREATE TABLE crash_test (id INT, data VARCHAR(100))")
+            db.handle_mp_query("CREATE TABLE crash_test (id INT PRIMARY KEY, data VARCHAR(100))")
                 .unwrap();
             db.handle_mp_query("INSERT INTO crash_test VALUES (1, 'first')")
                 .unwrap();
@@ -581,7 +594,7 @@ mod persistence {
         // First session: create, insert, update, delete, then crash
         {
             let db = Database::open(config.clone()).unwrap();
-            db.handle_mp_query("CREATE TABLE modify_test (id INT, value INT)")
+            db.handle_mp_query("CREATE TABLE modify_test (id INT PRIMARY KEY, value INT)")
                 .unwrap();
             db.handle_mp_query("INSERT INTO modify_test VALUES (1, 100)")
                 .unwrap();
@@ -633,7 +646,7 @@ mod persistence {
         // Cycle 1: create and insert
         {
             let db = Database::open(config.clone()).unwrap();
-            db.handle_mp_query("CREATE TABLE cycle_test (id INT)")
+            db.handle_mp_query("CREATE TABLE cycle_test (id INT PRIMARY KEY)")
                 .unwrap();
             db.handle_mp_query("INSERT INTO cycle_test VALUES (1)")
                 .unwrap();
@@ -716,10 +729,12 @@ mod persistence {
         // Create two tables
         {
             let db = Database::open(config.clone()).unwrap();
-            db.handle_mp_query("CREATE TABLE keep_me (x INT)").unwrap();
+            db.handle_mp_query("CREATE TABLE keep_me (x INT PRIMARY KEY)")
+                .unwrap();
             db.handle_mp_query("INSERT INTO keep_me VALUES (42)")
                 .unwrap();
-            db.handle_mp_query("CREATE TABLE drop_me (y INT)").unwrap();
+            db.handle_mp_query("CREATE TABLE drop_me (y INT PRIMARY KEY)")
+                .unwrap();
             db.handle_mp_query("INSERT INTO drop_me VALUES (99)")
                 .unwrap();
             db.close().unwrap();
@@ -785,7 +800,7 @@ mod duplicate_key {
     fn test_insert_duplicate_composite_key() {
         let tk = TestKit::new();
 
-        tk.must_exec("CREATE TABLE t (a INT, b INT, c INT, PRIMARY KEY (a, b))");
+        tk.must_exec("CREATE TABLE t (a INT PRIMARY KEY, b INT, c INT, PRIMARY KEY (a, b))");
         tk.must_exec("INSERT INTO t VALUES (1, 1, 100)")
             .check_affected(1);
         tk.must_exec("INSERT INTO t VALUES (1, 2, 200)")
@@ -866,21 +881,14 @@ mod duplicate_key {
     }
 
     #[test]
-    fn test_table_without_pk_allows_duplicates() {
+    fn test_table_without_pk_requires_error() {
         let tk = TestKit::new();
 
-        // Table without explicit PK uses hidden row-id
-        tk.must_exec("CREATE TABLE t (a INT, b INT)");
-        tk.must_exec("INSERT INTO t VALUES (1, 100)")
-            .check_affected(1);
-
-        // Same values should work (different hidden row-ids)
-        tk.must_exec("INSERT INTO t VALUES (1, 100)")
-            .check_affected(1);
-        tk.must_exec("INSERT INTO t VALUES (1, 100)")
-            .check_affected(1);
-
-        tk.must_query("SELECT a, b FROM t ORDER BY a, b")
-            .check(rows![["1", "100"], ["1", "100"], ["1", "100"]]);
+        // Table without explicit PK should be rejected (not supported yet)
+        let err = tk.must_exec_err("CREATE TABLE t (a INT, b INT)");
+        assert!(
+            err.contains("PRIMARY KEY") || err.contains("primary key"),
+            "Expected PRIMARY KEY required error, got: {err}"
+        );
     }
 }

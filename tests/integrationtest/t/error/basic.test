@@ -11,7 +11,7 @@ SELECT * FROM non_existent_table;
 SELCT 1;
 
 # Regular statements still work after errors
-CREATE TABLE t (id INT);
+CREATE TABLE t (id INT PRIMARY KEY);
 INSERT INTO t VALUES (1);
 SELECT id FROM t;
 DROP TABLE t;
