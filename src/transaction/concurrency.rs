@@ -303,29 +303,32 @@ impl LockTable {
     ///
     /// Locks with `lock.ts > start_ts` are "from the future" relative to the
     /// reader's snapshot and can be ignored safely.
+    ///
+    /// Uses lower_bound + manual iteration to avoid Vec allocation for range bounds.
     fn check_range(&self, start: &[u8], end: &[u8], start_ts: Timestamp) -> Option<(Key, Lock)> {
-        if end.is_empty() {
-            // Treat empty end as unbounded (used by some callers to represent +inf).
-            for entry in self.0.range(start.to_vec()..) {
-                if let Some(handle) = entry.value().upgrade() {
-                    if let Some(lock) = handle.get_lock() {
-                        if lock.ts <= start_ts {
-                            return Some((handle.key.clone(), lock));
-                        }
+        use std::ops::Bound;
+
+        // Use lower_bound instead of range to avoid allocation.
+        // lower_bound takes Bound<&Q> directly, no owned Vec needed.
+        let mut entry_opt = self.0.lower_bound(Bound::Included(start));
+
+        while let Some(entry) = entry_opt {
+            // Check if we've passed the end bound
+            if !end.is_empty() && entry.key().as_slice() >= end {
+                break;
+            }
+
+            if let Some(handle) = entry.value().upgrade() {
+                if let Some(lock) = handle.get_lock() {
+                    if lock.ts <= start_ts {
+                        return Some((handle.key.clone(), lock));
                     }
                 }
             }
-        } else {
-            for entry in self.0.range(start.to_vec()..end.to_vec()) {
-                if let Some(handle) = entry.value().upgrade() {
-                    if let Some(lock) = handle.get_lock() {
-                        if lock.ts <= start_ts {
-                            return Some((handle.key.clone(), lock));
-                        }
-                    }
-                }
-            }
+
+            entry_opt = entry.next();
         }
+
         None
     }
 }

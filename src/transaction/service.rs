@@ -223,18 +223,26 @@ impl<S: StorageEngine + 'static, L: ClogService + 'static, T: TsoService> TxnSer
         // Build scan range for MVCC keys
         let scan_range = seek_key..end_key;
 
-        let entries = self.storage.scan(scan_range)?;
+        // Use streaming iterator to avoid materializing all entries.
+        // We only need the first visible version.
+        let mut iter = self.storage.scan_iter(scan_range)?;
 
-        // Find the first entry matching our key with ts <= start_ts
-        for (mvcc_key, value) in entries {
-            let (decoded_key, entry_ts) = mvcc_key.decode();
+        // Find the first entry matching our key with ts <= start_ts.
+        // Use zero-copy key()/timestamp() instead of decode() to avoid allocation.
+        while iter.valid() {
+            let mvcc_key = iter.key();
+            let entry_key = mvcc_key.key();
+            let entry_ts = mvcc_key.timestamp();
+
             // Check exact key match and timestamp visibility
-            if decoded_key == key && entry_ts <= ctx.start_ts {
-                if is_tombstone(&value) {
+            if entry_key == key && entry_ts <= ctx.start_ts {
+                let value = iter.value();
+                if is_tombstone(value) {
                     return Ok(None); // Key was deleted
                 }
-                return Ok(Some(value));
+                return Ok(Some(value.to_vec()));
             }
+            iter.next()?;
         }
 
         Ok(None)
@@ -325,7 +333,8 @@ impl<S: StorageEngine + 'static, L: ClogService + 'static, T: TsoService> TxnSer
         // By acquiring locks first:
         // 1. Any concurrent reader will see the lock and be blocked
         // 2. We then get commit_ts which is guaranteed > any concurrent reader's start_ts
-        //    because: start_ts = max(TSO, max_ts), and we update max_ts via lock_keys
+        //    because: each begin() calls get_ts() which updates max_ts, so
+        //    max_ts >= any_concurrent_reader.start_ts, and commit_ts = max(max_ts + 1, tso_ts)
 
         // Select primary key deterministically: lexicographically smallest key.
         // This is important for future 2PC/lock resolution:
@@ -481,21 +490,26 @@ impl<I: MvccIterator> MvccScanIterator<I> {
     }
 
     /// Advance storage iterator to next unique user key visible at read_ts.
+    ///
+    /// Uses zero-copy key()/timestamp() for filtering to avoid allocation
+    /// for skipped entries. Only allocates when a visible entry is found.
     fn advance_storage(&mut self) -> crate::error::Result<()> {
         self.pending_storage = None;
 
         while self.storage_iter.valid() {
             let mvcc_key = self.storage_iter.key();
-            let (user_key, ts) = mvcc_key.decode();
+            // Use zero-copy accessors instead of decode() to avoid allocation
+            let user_key = mvcc_key.key();
+            let ts = mvcc_key.timestamp();
 
             // Check if past end of range
-            if !self.range.end.is_empty() && user_key >= self.range.end {
+            if !self.range.end.is_empty() && user_key >= self.range.end.as_slice() {
                 self.storage_exhausted = true;
                 return Ok(());
             }
 
             // Skip if before start of range
-            if user_key < self.range.start {
+            if user_key < self.range.start.as_slice() {
                 self.storage_iter.next()?;
                 continue;
             }
@@ -508,18 +522,19 @@ impl<I: MvccIterator> MvccScanIterator<I> {
 
             // Skip if we've already processed this user key
             if let Some(ref last_key) = self.last_user_key {
-                if &user_key == last_key {
+                if user_key == last_key.as_slice() {
                     self.storage_iter.next()?;
                     continue;
                 }
             }
 
-            // Found a visible entry - extract value before advancing
+            // Found a visible entry - now allocate the user_key and extract value
+            let user_key_owned = user_key.to_vec();
             let value = self.storage_iter.value();
             let result = if is_tombstone(value) {
-                (user_key, None)
+                (user_key_owned, None)
             } else {
-                (user_key, Some(value.to_vec()))
+                (user_key_owned, Some(value.to_vec()))
             };
 
             // Advance past all versions of this key BEFORE storing result.
