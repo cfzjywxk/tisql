@@ -150,13 +150,22 @@ impl KeyHandle {
 
 impl Drop for KeyHandle {
     fn drop(&mut self) {
-        // Remove ourselves from the lock table
-        // Safety: table is only accessed here and in set_table (which happens before visibility)
-        unsafe {
-            if let Some(table) = &*self.table.get() {
-                table.remove(&self.key);
-            }
-        }
+        // NOTE: We intentionally do NOT remove ourselves from the lock table here.
+        //
+        // Unconditional "remove by key" is unsafe under concurrent lock acquisition:
+        // 1. Thread A: drops last Arc<KeyHandle>, strong count → 0
+        // 2. Thread B: upgrade() fails (sees strong=0), removes stale entry, inserts NEW entry
+        // 3. Thread A: KeyHandle::drop runs, remove(key) → REMOVES THREAD B's ENTRY!
+        //
+        // Instead, we leave stale Weak entries in the table. They are cleaned up lazily
+        // when the next lock_key() call for this key observes upgrade() failure and
+        // removes the stale entry before inserting a new one (see lock_key line 273-277).
+        //
+        // This is safe because:
+        // - Stale entries don't block new locks (upgrade fails → retry loop handles it)
+        // - Memory overhead is bounded (each unique key has at most one stale entry)
+        // - Cleanup happens on next access to that key
+        let _ = &self.table; // suppress unused field warning
     }
 }
 
@@ -270,10 +279,10 @@ impl LockTable {
                 return existing_handle.try_lock(lock);
             }
 
-            // The weak reference is stale (handle was dropped)
-            // Remove it and retry
-            // Note: This is safe because if entry.value() can't be upgraded,
-            // the KeyHandle is being/was dropped and will remove itself
+            // The weak reference is stale (handle was dropped).
+            // Remove it and retry. This is the only place stale entries are cleaned up.
+            // Note: KeyHandle::drop intentionally does NOT remove entries to avoid
+            // a race where it could remove a newly-inserted entry from another thread.
             self.0.remove(key);
         }
     }
@@ -283,16 +292,20 @@ impl LockTable {
         self.0.get(key).and_then(|entry| entry.value().upgrade())
     }
 
-    /// Remove a key from the table.
-    fn remove(&self, key: &Key) {
-        self.0.remove(key);
+    /// Get the number of entries in the table (may include stale entries).
+    #[cfg(test)]
+    fn raw_len(&self) -> usize {
+        self.0.len()
     }
 
-    /// Get the number of entries in the table.
+    /// Count active (non-stale) entries by iterating and checking upgrade.
     ///
-    /// Note: This may include stale weak references that haven't been cleaned up yet.
-    fn len(&self) -> usize {
-        self.0.len()
+    /// This is O(n) but gives an accurate count of live KeyHandles.
+    fn active_count(&self) -> usize {
+        self.0
+            .iter()
+            .filter(|e| e.value().upgrade().is_some())
+            .count()
     }
 
     /// Iterate over a range to check for conflicting locks under snapshot isolation.
@@ -504,10 +517,10 @@ impl ConcurrencyManager {
 
     /// Get number of active locks (for debugging/testing).
     ///
-    /// Note: This counts entries in the skipmap, which may include
-    /// stale weak references. For accurate count, iterate and check.
+    /// This counts only live KeyHandles (where the weak reference can be upgraded).
+    /// Stale entries left by dropped KeyHandles are not counted.
     pub fn lock_count(&self) -> usize {
-        self.lock_table.len()
+        self.lock_table.active_count()
     }
 }
 
