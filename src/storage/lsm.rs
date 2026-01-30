@@ -1203,8 +1203,8 @@ impl TieredMergeIterator {
     pub fn build(mut self) -> Result<Self> {
         // Memtable iterators are already in the heap from add_active_memtable/add_frozen_memtable.
         // L0 and L1+ iterators are in pending_l0/pending_levels.
-        // Advance to position on first entry.
-        self.advance()?;
+        // Position on first entry.
+        self.next()?;
         Ok(self)
     }
 
@@ -1245,14 +1245,54 @@ impl TieredMergeIterator {
         }
         Ok(())
     }
+}
 
-    /// Advance to the next unique entry from the heap.
-    ///
-    /// This method implements tiered lazy loading:
-    /// 1. First exhausts memtable entries (already in heap)
-    /// 2. When heap is empty, initializes L0 SST iterators
-    /// 3. When heap is empty again, initializes L1+ level iterators
-    fn advance(&mut self) -> Result<()> {
+impl MvccIterator for TieredMergeIterator {
+    fn seek(&mut self, target: &MvccKey) -> Result<()> {
+        // When seeking to a specific key, we must initialize all iterators
+        // because we need to find the smallest key >= target across all tiers.
+
+        // Collect all iterators: from heap + pending
+        let mut all_iters: Vec<(Box<dyn MvccIterator>, u32)> = Vec::new();
+
+        // Drain heap
+        while let Some(entry) = self.heap.pop() {
+            all_iters.push((entry.iter, entry.priority));
+        }
+
+        // Drain pending L0
+        for pending in self.pending_l0.drain(..) {
+            all_iters.push((pending.iter, pending.priority));
+        }
+
+        // Drain pending levels
+        for pending in self.pending_levels.drain(..) {
+            all_iters.push((pending.iter, pending.priority));
+        }
+
+        // Seek each iterator and re-add valid ones to heap
+        for (mut iter, priority) in all_iters {
+            iter.seek(target)?;
+            if iter.valid() {
+                let key = iter.key().clone();
+                let value = iter.value().to_vec();
+                self.heap.push(PriorityHeapEntry {
+                    key,
+                    value,
+                    priority,
+                    iter,
+                });
+            }
+        }
+
+        // Clear dedup state and move to first matching entry
+        self.current_key = None;
+        self.current_value = None;
+        self.last_emitted_key = None;
+        self.next()
+    }
+
+    fn next(&mut self) -> Result<()> {
         if let Some(e) = self.pending_error.take() {
             return Err(e);
         }
@@ -1308,56 +1348,6 @@ impl TieredMergeIterator {
             }
             // Unreachable: while loop above ensures heap is non-empty or returns early
         }
-    }
-}
-
-impl MvccIterator for TieredMergeIterator {
-    fn seek(&mut self, target: &MvccKey) -> Result<()> {
-        // When seeking to a specific key, we must initialize all iterators
-        // because we need to find the smallest key >= target across all tiers.
-
-        // Collect all iterators: from heap + pending
-        let mut all_iters: Vec<(Box<dyn MvccIterator>, u32)> = Vec::new();
-
-        // Drain heap
-        while let Some(entry) = self.heap.pop() {
-            all_iters.push((entry.iter, entry.priority));
-        }
-
-        // Drain pending L0
-        for pending in self.pending_l0.drain(..) {
-            all_iters.push((pending.iter, pending.priority));
-        }
-
-        // Drain pending levels
-        for pending in self.pending_levels.drain(..) {
-            all_iters.push((pending.iter, pending.priority));
-        }
-
-        // Seek each iterator and re-add valid ones to heap
-        for (mut iter, priority) in all_iters {
-            iter.seek(target)?;
-            if iter.valid() {
-                let key = iter.key().clone();
-                let value = iter.value().to_vec();
-                self.heap.push(PriorityHeapEntry {
-                    key,
-                    value,
-                    priority,
-                    iter,
-                });
-            }
-        }
-
-        // Clear dedup state and advance
-        self.current_key = None;
-        self.current_value = None;
-        self.last_emitted_key = None;
-        self.advance()
-    }
-
-    fn next(&mut self) -> Result<()> {
-        self.advance()
     }
 
     fn valid(&self) -> bool {
