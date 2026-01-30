@@ -307,19 +307,6 @@ impl VersionedMemTableEngine {
         }
     }
 
-    /// Write a key-value pair at the given timestamp.
-    ///
-    /// If the key exists, prepends a new version to the chain.
-    /// If the key is new, creates a new row with a single version.
-    pub fn put_at(&self, key: &[u8], value: &[u8], ts: Timestamp) {
-        self.put_internal(key, value.to_vec(), ts);
-    }
-
-    /// Write a tombstone (delete marker) at the given timestamp.
-    pub fn delete_at(&self, key: &[u8], ts: Timestamp) {
-        self.put_internal(key, TOMBSTONE.to_vec(), ts);
-    }
-
     /// Internal put implementation.
     ///
     /// Uses get_or_insert + prepend pattern for race-free concurrent insertion:
@@ -358,26 +345,6 @@ impl VersionedMemTableEngine {
             entry_count: self.len(),
             key_count: self.key_count(),
         }
-    }
-
-    /// Scan all versions for a range of user keys.
-    ///
-    /// This returns ALL versions (not just the latest visible), which is
-    /// needed for SST flush operations.
-    pub fn scan_all_versions(&self, range: &Range<Key>) -> Vec<(Key, Timestamp, RawValue)> {
-        let mut results = Vec::new();
-
-        for entry in self.index.range(range.start.clone()..range.end.clone()) {
-            let key = entry.key();
-            let row = entry.value();
-
-            // Collect all versions (newest first)
-            for (ts, value) in row.iter_versions() {
-                results.push((key.clone(), ts, value.clone()));
-            }
-        }
-
-        results
     }
 }
 
@@ -626,6 +593,36 @@ mod tests {
 
     // ==================== Test Helpers ====================
 
+    /// Write a key-value pair at the given timestamp (test-only).
+    fn put_at(engine: &VersionedMemTableEngine, key: &[u8], value: &[u8], ts: Timestamp) {
+        engine.put_internal(key, value.to_vec(), ts);
+    }
+
+    /// Write a tombstone (delete marker) at the given timestamp (test-only).
+    fn delete_at(engine: &VersionedMemTableEngine, key: &[u8], ts: Timestamp) {
+        engine.put_internal(key, TOMBSTONE.to_vec(), ts);
+    }
+
+    /// Scan all versions for a range of user keys (test-only).
+    fn scan_all_versions(
+        engine: &VersionedMemTableEngine,
+        range: &Range<Key>,
+    ) -> Vec<(Key, Timestamp, RawValue)> {
+        let mut results = Vec::new();
+
+        for entry in engine.index.range(range.start.clone()..range.end.clone()) {
+            let key = entry.key();
+            let row = entry.value();
+
+            // Collect all versions (newest first)
+            for (ts, value) in row.iter_versions() {
+                results.push((key.clone(), ts, value.clone()));
+            }
+        }
+
+        results
+    }
+
     /// Get the latest version of a key visible at the given timestamp.
     fn get_at_for_test(
         engine: &VersionedMemTableEngine,
@@ -678,7 +675,7 @@ mod tests {
     fn test_basic_put_get() {
         let engine = new_engine();
 
-        engine.put_at(b"key1", b"value1", 1);
+        put_at(&engine, b"key1", b"value1", 1);
         let value = get_for_test(&engine, b"key1");
 
         assert_eq!(value, Some(b"value1".to_vec()));
@@ -696,8 +693,8 @@ mod tests {
     fn test_delete() {
         let engine = new_engine();
 
-        engine.put_at(b"key1", b"value1", 1);
-        engine.delete_at(b"key1", 2);
+        put_at(&engine, b"key1", b"value1", 1);
+        delete_at(&engine, b"key1", 2);
 
         let value = get_for_test(&engine, b"key1");
         assert_eq!(value, None);
@@ -710,13 +707,13 @@ mod tests {
         let engine = new_engine();
 
         // Write version 1
-        engine.put_at(b"key", b"v1", 10);
+        put_at(&engine, b"key", b"v1", 10);
 
         // Write version 2
-        engine.put_at(b"key", b"v2", 20);
+        put_at(&engine, b"key", b"v2", 20);
 
         // Write version 3
-        engine.put_at(b"key", b"v3", 30);
+        put_at(&engine, b"key", b"v3", 30);
 
         // Only one key in the skiplist
         assert_eq!(engine.key_count(), 1);
@@ -749,10 +746,10 @@ mod tests {
         let engine = new_engine();
 
         // Write value at ts=10
-        engine.put_at(b"key", b"value", 10);
+        put_at(&engine, b"key", b"value", 10);
 
         // Delete at ts=20
-        engine.delete_at(b"key", 20);
+        delete_at(&engine, b"key", 20);
 
         // Read at ts=10 should see value
         let v = get_at_for_test(&engine, b"key", 10);
@@ -776,11 +773,11 @@ mod tests {
         let engine = new_engine();
 
         // Create multiple versions
-        engine.put_at(b"key", b"v1", 10);
-        engine.put_at(b"key", b"v2", 20);
-        engine.put_at(b"key", b"v3", 30);
-        engine.delete_at(b"key", 40);
-        engine.put_at(b"key", b"v4", 50);
+        put_at(&engine, b"key", b"v1", 10);
+        put_at(&engine, b"key", b"v2", 20);
+        put_at(&engine, b"key", b"v3", 30);
+        delete_at(&engine, b"key", 40);
+        put_at(&engine, b"key", b"v4", 50);
 
         // Test visibility at various timestamps
         assert_eq!(get_at_for_test(&engine, b"key", 5), None);
@@ -801,10 +798,10 @@ mod tests {
     fn test_scan() {
         let engine = new_engine();
 
-        engine.put_at(b"a", b"1", 1);
-        engine.put_at(b"b", b"2", 1);
-        engine.put_at(b"c", b"3", 1);
-        engine.put_at(b"d", b"4", 1);
+        put_at(&engine, b"a", b"1", 1);
+        put_at(&engine, b"b", b"2", 1);
+        put_at(&engine, b"c", b"3", 1);
+        put_at(&engine, b"d", b"4", 1);
 
         let results = scan_for_test(&engine, &(b"b".to_vec()..b"d".to_vec()));
 
@@ -819,9 +816,9 @@ mod tests {
         let engine = new_engine();
 
         // Write data at explicit timestamps
-        engine.put_at(b"a", b"1", 10);
-        engine.put_at(b"b", b"2", 20);
-        engine.put_at(b"c", b"3", 30);
+        put_at(&engine, b"a", b"1", 10);
+        put_at(&engine, b"b", b"2", 20);
+        put_at(&engine, b"c", b"3", 30);
 
         // scan_at with ts=30 should see all data
         let range = b"a".to_vec()..b"d".to_vec();
@@ -846,12 +843,12 @@ mod tests {
         let engine = new_engine();
 
         // Write keys at ts=10
-        engine.put_at(b"a", b"1", 10);
-        engine.put_at(b"b", b"2", 10);
-        engine.put_at(b"c", b"3", 10);
+        put_at(&engine, b"a", b"1", 10);
+        put_at(&engine, b"b", b"2", 10);
+        put_at(&engine, b"c", b"3", 10);
 
         // Delete b at ts=20
-        engine.delete_at(b"b", 20);
+        delete_at(&engine, b"b", 20);
 
         // scan_at ts=15 should see all 3 keys
         let range = b"a".to_vec()..b"d".to_vec();
@@ -912,9 +909,9 @@ mod tests {
     fn test_storage_engine_scan_unbounded() {
         let engine = new_engine();
 
-        engine.put_at(b"a", b"1", 10);
-        engine.put_at(b"a", b"2", 20); // Second version
-        engine.put_at(b"b", b"3", 15);
+        put_at(&engine, b"a", b"1", 10);
+        put_at(&engine, b"a", b"2", 20); // Second version
+        put_at(&engine, b"b", b"3", 15);
 
         // Scan all with unbounded range
         let results = engine
@@ -933,9 +930,9 @@ mod tests {
     fn test_storage_engine_scan_bounded() {
         let engine = new_engine();
 
-        engine.put_at(b"a", b"1", 10);
-        engine.put_at(b"b", b"2", 20);
-        engine.put_at(b"c", b"3", 30);
+        put_at(&engine, b"a", b"1", 10);
+        put_at(&engine, b"b", b"2", 20);
+        put_at(&engine, b"c", b"3", 30);
 
         // Scan with MVCC key range
         // MvccKey::encode(b"c", 0) = c || !0 = c || 0xFF...FF
@@ -968,11 +965,11 @@ mod tests {
         let engine = new_engine();
 
         // Write multiple versions of the same key
-        engine.put_at(b"key", b"v10", 10);
-        engine.put_at(b"key", b"v20", 20);
-        engine.put_at(b"key", b"v30", 30);
-        engine.put_at(b"key", b"v40", 40);
-        engine.put_at(b"key", b"v50", 50);
+        put_at(&engine, b"key", b"v10", 10);
+        put_at(&engine, b"key", b"v20", 20);
+        put_at(&engine, b"key", b"v30", 30);
+        put_at(&engine, b"key", b"v40", 40);
+        put_at(&engine, b"key", b"v50", 50);
 
         // Scan range: key@40 (inclusive) to key@20 (exclusive)
         // Should include versions at ts=40 and ts=30, but NOT ts=50 or ts=20 or ts=10
@@ -1039,7 +1036,7 @@ mod tests {
                     for i in 0..writes_per_thread {
                         let key = format!("key_{tid}_{i}");
                         let ts = (tid * writes_per_thread + i + 1) as u64;
-                        engine.put_at(key.as_bytes(), b"value", ts);
+                        put_at(&engine, key.as_bytes(), b"value", ts);
                     }
                 });
             }
@@ -1093,7 +1090,7 @@ mod tests {
                         // Get timestamp while holding lock - ensures monotonic per-key ordering
                         let ts = ts_counter.fetch_add(1, Ordering::SeqCst);
                         let value = format!("v{tid}_{i}");
-                        engine.put_at(b"hotkey", value.as_bytes(), ts);
+                        put_at(&engine, b"hotkey", value.as_bytes(), ts);
                     }
                 });
             }
@@ -1130,7 +1127,12 @@ mod tests {
         for tid in 0..num_writers {
             let base = tid * keys_per_writer;
             for i in 0..keys_per_writer {
-                engine.put_at(format!("key{:04}", base + i).as_bytes(), b"initial", 1);
+                put_at(
+                    &engine,
+                    format!("key{:04}", base + i).as_bytes(),
+                    b"initial",
+                    1,
+                );
             }
         }
 
@@ -1150,7 +1152,7 @@ mod tests {
                         // Timestamp increases with each write within this thread
                         let ts = (100 + i) as u64;
                         let value = format!("value_{tid}_{i}");
-                        engine.put_at(key.as_bytes(), value.as_bytes(), ts);
+                        put_at(&engine, key.as_bytes(), value.as_bytes(), ts);
                     }
                 });
             }
@@ -1184,8 +1186,8 @@ mod tests {
 
         // Add 100 keys, each with 2 versions
         for i in 0..100 {
-            engine.put_at(format!("key{i:03}").as_bytes(), b"v1", 10);
-            engine.put_at(format!("key{i:03}").as_bytes(), b"v2", 20);
+            put_at(&engine, format!("key{i:03}").as_bytes(), b"v1", 10);
+            put_at(&engine, format!("key{i:03}").as_bytes(), b"v2", 20);
         }
 
         let stats_after = engine.memory_stats();
@@ -1197,14 +1199,14 @@ mod tests {
     fn test_scan_all_versions() {
         let engine = new_engine();
 
-        engine.put_at(b"a", b"a1", 10);
-        engine.put_at(b"a", b"a2", 20);
-        engine.put_at(b"b", b"b1", 15);
-        engine.put_at(b"c", b"c1", 5);
-        engine.delete_at(b"c", 25); // Tombstone
+        put_at(&engine, b"a", b"a1", 10);
+        put_at(&engine, b"a", b"a2", 20);
+        put_at(&engine, b"b", b"b1", 15);
+        put_at(&engine, b"c", b"c1", 5);
+        delete_at(&engine, b"c", 25); // Tombstone
 
         let range = b"a".to_vec()..b"d".to_vec();
-        let results = engine.scan_all_versions(&range);
+        let results = scan_all_versions(&engine, &range);
 
         // Should have 5 versions total
         assert_eq!(results.len(), 5);
@@ -1228,9 +1230,9 @@ mod tests {
         let engine = new_engine();
 
         // Insert versions in ascending timestamp order (correct)
-        engine.put_at(b"key", b"v10", 10);
-        engine.put_at(b"key", b"v20", 20);
-        engine.put_at(b"key", b"v30", 30);
+        put_at(&engine, b"key", b"v10", 10);
+        put_at(&engine, b"key", b"v20", 20);
+        put_at(&engine, b"key", b"v30", 30);
 
         // Read at ts=25 should return v20 (latest visible at ts=25)
         let value = get_at_for_test(&engine, b"key", 25);
@@ -1254,8 +1256,8 @@ mod tests {
         // Test that inserting at the same timestamp is allowed (idempotent writes)
         let engine = new_engine();
 
-        engine.put_at(b"key", b"v1", 10);
-        engine.put_at(b"key", b"v2", 10); // Same ts, different value
+        put_at(&engine, b"key", b"v1", 10);
+        put_at(&engine, b"key", b"v2", 10); // Same ts, different value
 
         // Should return the latest inserted value at ts=10
         let value = get_at_for_test(&engine, b"key", 10);
@@ -1270,10 +1272,10 @@ mod tests {
         let engine = new_engine();
 
         // Insert version at ts=20 first
-        engine.put_at(b"key", b"v20", 20);
+        put_at(&engine, b"key", b"v20", 20);
 
         // Try to insert version at ts=10 (WRONG: ts < head's ts)
         // This must panic in ALL builds (not just debug) to prevent silent data corruption
-        engine.put_at(b"key", b"v10", 10);
+        put_at(&engine, b"key", b"v10", 10);
     }
 }
