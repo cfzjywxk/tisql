@@ -150,22 +150,24 @@ impl KeyHandle {
 
 impl Drop for KeyHandle {
     fn drop(&mut self) {
-        // NOTE: We intentionally do NOT remove ourselves from the lock table here.
+        // Remove ourselves from the lock table (TiKV pattern).
         //
-        // Unconditional "remove by key" is unsafe under concurrent lock acquisition:
-        // 1. Thread A: drops last Arc<KeyHandle>, strong count → 0
-        // 2. Thread B: upgrade() fails (sees strong=0), removes stale entry, inserts NEW entry
-        // 3. Thread A: KeyHandle::drop runs, remove(key) → REMOVES THREAD B's ENTRY!
+        // This is safe because we only set `table` AFTER successful insertion via ptr_eq
+        // check in lock_key(). If we failed to insert (another entry existed), table
+        // remains None and we don't remove anything.
         //
-        // Instead, we leave stale Weak entries in the table. They are cleaned up lazily
-        // when the next lock_key() call for this key observes upgrade() failure and
-        // removes the stale entry before inserting a new one (see lock_key line 273-277).
+        // The race condition we avoid:
+        // - Thread B sees stale weak, explicitly removes it, inserts new entry
+        // - Thread A's drop runs and removes Thread B's entry
         //
-        // This is safe because:
-        // - Stale entries don't block new locks (upgrade fails → retry loop handles it)
-        // - Memory overhead is bounded (each unique key has at most one stale entry)
-        // - Cleanup happens on next access to that key
-        let _ = &self.table; // suppress unused field warning
+        // TiKV's solution: Don't explicitly remove in lock_key. Just loop until the
+        // stale entry's owner runs drop and cleans it up. This ensures only the
+        // actual owner ever removes an entry.
+        unsafe {
+            if let Some(table) = &*self.table.get() {
+                table.remove(&self.key);
+            }
+        }
     }
 }
 
@@ -279,11 +281,16 @@ impl LockTable {
                 return existing_handle.try_lock(lock);
             }
 
-            // The weak reference is stale (handle was dropped).
-            // Remove it and retry. This is the only place stale entries are cleaned up.
-            // Note: KeyHandle::drop intentionally does NOT remove entries to avoid
-            // a race where it could remove a newly-inserted entry from another thread.
-            self.0.remove(key);
+            // The weak reference is stale (handle was dropped but drop hasn't run yet).
+            // TiKV pattern: Don't explicitly remove here. Just loop until the stale
+            // entry's owner runs KeyHandle::drop and removes it.
+            //
+            // Why not remove explicitly? Race condition:
+            // 1. Thread B sees stale weak, removes it, inserts new entry
+            // 2. Thread A's KeyHandle::drop runs, removes by key → removes B's entry!
+            //
+            // By only removing in drop (and only the owner has table set), we ensure
+            // each entry is only removed by its creator.
         }
     }
 
@@ -292,20 +299,19 @@ impl LockTable {
         self.0.get(key).and_then(|entry| entry.value().upgrade())
     }
 
-    /// Get the number of entries in the table (may include stale entries).
-    #[cfg(test)]
-    fn raw_len(&self) -> usize {
-        self.0.len()
+    /// Remove a key from the table.
+    fn remove(&self, key: &Key) {
+        self.0.remove(key);
     }
 
-    /// Count active (non-stale) entries by iterating and checking upgrade.
+    /// Get the number of entries in the table.
     ///
-    /// This is O(n) but gives an accurate count of live KeyHandles.
-    fn active_count(&self) -> usize {
-        self.0
-            .iter()
-            .filter(|e| e.value().upgrade().is_some())
-            .count()
+    /// With TiKV's pattern (remove in drop, not in lock_key), stale entries
+    /// are cleaned up promptly when their owner is dropped. The brief window
+    /// where a stale entry exists (between Arc refcount hitting 0 and drop
+    /// completing) is negligible.
+    fn len(&self) -> usize {
+        self.0.len()
     }
 
     /// Iterate over a range to check for conflicting locks under snapshot isolation.
@@ -515,12 +521,13 @@ impl ConcurrencyManager {
         Ok(())
     }
 
-    /// Get number of active locks (for debugging/testing).
+    /// Get number of entries in the lock table (for debugging/testing).
     ///
-    /// This counts only live KeyHandles (where the weak reference can be upgraded).
-    /// Stale entries left by dropped KeyHandles are not counted.
+    /// With TiKV's pattern (remove in drop, not in lock_key), this accurately
+    /// reflects active locks. The brief window where a stale entry exists
+    /// (between Arc refcount hitting 0 and drop completing) is negligible.
     pub fn lock_count(&self) -> usize {
-        self.lock_table.active_count()
+        self.lock_table.len()
     }
 }
 
