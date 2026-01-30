@@ -497,17 +497,20 @@ impl<I: MvccIterator> MvccScanIterator<I> {
     /// * `storage_iter` - Iterator over storage (MVCC key-value pairs)
     /// * `read_ts` - Transaction's read timestamp for MVCC visibility
     /// * `range` - Key range for filtering
-    /// * `buffer_entries` - Pre-extracted write buffer entries (key, Option<value>)
-    ///
-    /// The `buffer_entries` should already be filtered to the range but may be unsorted.
+    /// * `buffer_entries` - Pre-extracted write buffer entries (key, Option<value>),
+    ///   must be sorted by key in ascending order (guaranteed when from BTreeMap::iter)
     pub fn new(
         storage_iter: I,
         read_ts: Timestamp,
         range: Range<Key>,
-        mut buffer_entries: Vec<(Key, Option<RawValue>)>,
+        buffer_entries: Vec<(Key, Option<RawValue>)>,
     ) -> Self {
-        // Sort buffer entries by key
-        buffer_entries.sort_by(|a, b| a.0.cmp(&b.0));
+        // Note: buffer_entries comes from BTreeMap::iter() which yields entries in sorted order,
+        // so no sorting needed here.
+        debug_assert!(
+            buffer_entries.windows(2).all(|w| w[0].0 <= w[1].0),
+            "buffer_entries must be sorted by key"
+        );
 
         Self {
             storage_iter,

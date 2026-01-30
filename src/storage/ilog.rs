@@ -66,6 +66,9 @@ const FILE_MAGIC: &[u8; 4] = b"ILOG";
 /// File format version
 const FILE_VERSION: u32 = 1;
 
+/// File header size in bytes (magic + version + reserved)
+const FILE_HEADER_SIZE: usize = 16;
+
 /// Record header size in bytes (type + length + checksum)
 const RECORD_HEADER_SIZE: usize = 12;
 
@@ -259,10 +262,19 @@ impl IlogService {
             .truncate(false)
             .open(&ilog_path)?;
 
+        let mut valid_data_end: Option<u64> = None;
+
         if file_exists && file.metadata()?.len() > 0 {
-            // Validate existing file header
+            // Validate existing file header and read records to find valid length
             let mut reader = BufReader::new(&file);
             Self::validate_header(&mut reader)?;
+
+            // Read records and track valid data length
+            let (_, valid_bytes) = Self::read_records_with_valid_length(&mut reader)?;
+
+            // Calculate the total valid length: header + valid record bytes
+            valid_data_end = Some(FILE_HEADER_SIZE as u64 + valid_bytes);
+
             drop(reader);
         } else {
             // Write header to new file
@@ -275,8 +287,22 @@ impl IlogService {
         }
 
         // Re-open for appending
-        let file = OpenOptions::new().read(true).write(true).open(&ilog_path)?;
-        let mut file_for_write = file;
+        let mut file_for_write = OpenOptions::new().read(true).write(true).open(&ilog_path)?;
+
+        // If we detected corruption (file is larger than valid data), truncate it
+        if let Some(valid_end) = valid_data_end {
+            let actual_len = file_for_write.metadata()?.len();
+            if actual_len > valid_end {
+                log_warn!(
+                    "Truncating corrupted ilog tail: {} bytes -> {} bytes",
+                    actual_len,
+                    valid_end
+                );
+                file_for_write.set_len(valid_end)?;
+                file_for_write.sync_all()?;
+            }
+        }
+
         file_for_write.seek(SeekFrom::End(0))?;
 
         log_info!("Opened ilog file: {:?}", ilog_path);
@@ -565,11 +591,24 @@ impl IlogService {
     }
 
     fn read_records<R: Read>(reader: &mut R) -> Result<Vec<IlogRecord>> {
+        let (records, _) = Self::read_records_with_valid_length(reader)?;
+        Ok(records)
+    }
+
+    /// Read all records from file (after header) and return the valid length.
+    ///
+    /// Returns (records, bytes_read) where bytes_read is the number of bytes
+    /// read from valid records (not including any corrupted tail).
+    fn read_records_with_valid_length<R: Read>(reader: &mut R) -> Result<(Vec<IlogRecord>, u64)> {
         let mut records = Vec::new();
+        let mut valid_bytes = 0u64;
 
         loop {
-            match Self::read_record(reader) {
-                Ok(Some(record)) => records.push(record),
+            match Self::read_record_with_size(reader) {
+                Ok(Some((record, record_size))) => {
+                    valid_bytes += record_size as u64;
+                    records.push(record);
+                }
                 Ok(None) => break,
                 Err(e) => {
                     log_warn!("Stopping ilog recovery at corrupted record: {}", e);
@@ -578,10 +617,16 @@ impl IlogService {
             }
         }
 
-        Ok(records)
+        Ok((records, valid_bytes))
     }
 
+    #[allow(dead_code)]
     fn read_record<R: Read>(reader: &mut R) -> Result<Option<IlogRecord>> {
+        Ok(Self::read_record_with_size(reader)?.map(|(record, _)| record))
+    }
+
+    /// Read a single record from the ilog, returning record and size in bytes.
+    fn read_record_with_size<R: Read>(reader: &mut R) -> Result<Option<(IlogRecord, usize)>> {
         let mut header = [0u8; RECORD_HEADER_SIZE];
         match reader.read_exact(&mut header) {
             Ok(()) => {}
@@ -620,7 +665,10 @@ impl IlogService {
         let record: IlogRecord = bincode::deserialize(&data)
             .map_err(|e| TiSqlError::Internal(format!("Failed to deserialize ilog record: {e}")))?;
 
-        Ok(Some(record))
+        // Total record size = header + data
+        let record_size = RECORD_HEADER_SIZE + length;
+
+        Ok(Some((record, record_size)))
     }
 
     /// Replay records to rebuild Version.

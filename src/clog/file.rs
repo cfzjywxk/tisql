@@ -164,19 +164,22 @@ impl FileClogService {
             .open(&clog_path)?;
 
         let mut max_lsn = 0u64;
+        let mut valid_data_end: Option<u64> = None;
 
         if file_exists && file.metadata()?.len() > 0 {
             // Validate existing file header
             let mut reader = BufReader::new(&file);
             Self::validate_header(&mut reader)?;
 
-            // Find max LSN from existing entries
-            let entries = Self::read_entries(&mut reader)?;
+            // Find max LSN from existing entries and track valid data length
+            let (entries, valid_bytes) = Self::read_entries_with_valid_length(&mut reader)?;
             if let Some(last) = entries.last() {
                 max_lsn = last.lsn;
             }
 
-            // Seek to end for appending
+            // Calculate the total valid length: header + valid record bytes
+            valid_data_end = Some(FILE_HEADER_SIZE as u64 + valid_bytes);
+
             drop(reader);
         } else {
             // Write header to new file
@@ -190,9 +193,22 @@ impl FileClogService {
         }
 
         // Re-open for appending (seek to end)
-        let file = OpenOptions::new().read(true).write(true).open(&clog_path)?;
+        let mut file_for_write = OpenOptions::new().read(true).write(true).open(&clog_path)?;
 
-        let mut file_for_write = file;
+        // If we detected corruption (file is larger than valid data), truncate it
+        if let Some(valid_end) = valid_data_end {
+            let actual_len = file_for_write.metadata()?.len();
+            if actual_len > valid_end {
+                log_warn!(
+                    "Truncating corrupted clog tail: {} bytes -> {} bytes",
+                    actual_len,
+                    valid_end
+                );
+                file_for_write.set_len(valid_end)?;
+                file_for_write.sync_all()?;
+            }
+        }
+
         file_for_write.seek(SeekFrom::End(0))?;
 
         // Create LSN provider
@@ -324,11 +340,22 @@ impl FileClogService {
 
     /// Read all entries from file (after header)
     fn read_entries<R: Read>(reader: &mut R) -> Result<Vec<ClogEntry>> {
+        let (entries, _) = Self::read_entries_with_valid_length(reader)?;
+        Ok(entries)
+    }
+
+    /// Read all entries from file (after header) and return the valid length.
+    ///
+    /// Returns (entries, bytes_read) where bytes_read is the number of bytes
+    /// read from valid records (not including any corrupted tail).
+    fn read_entries_with_valid_length<R: Read>(reader: &mut R) -> Result<(Vec<ClogEntry>, u64)> {
         let mut entries = Vec::new();
+        let mut valid_bytes = 0u64;
 
         loop {
-            match Self::read_record(reader) {
-                Ok(Some(batch_entries)) => {
+            match Self::read_record_with_size(reader) {
+                Ok(Some((batch_entries, record_size))) => {
+                    valid_bytes += record_size as u64;
                     entries.extend(batch_entries);
                 }
                 Ok(None) => {
@@ -343,11 +370,17 @@ impl FileClogService {
             }
         }
 
-        Ok(entries)
+        Ok((entries, valid_bytes))
     }
 
     /// Read a single record from the commit log
+    #[allow(dead_code)]
     fn read_record<R: Read>(reader: &mut R) -> Result<Option<Vec<ClogEntry>>> {
+        Ok(Self::read_record_with_size(reader)?.map(|(entries, _)| entries))
+    }
+
+    /// Read a single record from the commit log, returning entries and record size in bytes.
+    fn read_record_with_size<R: Read>(reader: &mut R) -> Result<Option<(Vec<ClogEntry>, usize)>> {
         // Read record header
         let mut header = [0u8; RECORD_HEADER_SIZE];
         match reader.read_exact(&mut header) {
@@ -395,7 +428,10 @@ impl FileClogService {
             TiSqlError::Internal(format!("Failed to deserialize commit log entries: {e}"))
         })?;
 
-        Ok(Some(entries))
+        // Total record size = header + data
+        let record_size = RECORD_HEADER_SIZE + length;
+
+        Ok(Some((entries, record_size)))
     }
 
     /// Write a record to the commit log
@@ -1109,6 +1145,84 @@ mod tests {
             .collect();
         assert!(keys.contains(&b"before_crash".to_vec()));
         assert!(keys.contains(&b"after_crash".to_vec()));
+    }
+
+    /// Test that corrupted tail is truncated before continuing writes.
+    ///
+    /// This test verifies the fix for a durability bug where:
+    /// 1. Write valid data
+    /// 2. Append garbage (simulating crash during write)
+    /// 3. Recover (should see valid data only)
+    /// 4. Write more data
+    /// 5. Recover again - WITHOUT truncation fix, new data would be lost!
+    ///
+    /// The fix truncates the corrupted tail during open/recover, so subsequent
+    /// writes are appended directly after the last valid record.
+    #[test]
+    fn test_truncate_corrupted_tail_before_write() {
+        let dir = tempdir().unwrap();
+        let config = FileClogConfig::with_dir(dir.path());
+        let clog_path = config.clog_path();
+
+        // Phase 1: Write initial valid data
+        {
+            let service = FileClogService::open(config.clone()).unwrap();
+            let mut batch = ClogBatch::new();
+            batch.add_put(1, b"key1".to_vec(), b"value1".to_vec());
+            batch.add_commit(1, 100);
+            service.write(&mut batch, true).unwrap();
+            service.close().unwrap();
+        }
+
+        // Phase 2: Append garbage to simulate crash during write
+        let garbage = b"GARBAGE_FROM_PARTIAL_WRITE";
+        {
+            let mut file = OpenOptions::new().append(true).open(&clog_path).unwrap();
+            file.write_all(garbage).unwrap();
+            file.sync_all().unwrap();
+        }
+
+        // Verify garbage was appended
+        let file_size_with_garbage = std::fs::metadata(&clog_path).unwrap().len();
+
+        // Phase 3: Recover and write more data
+        let (service, entries) = FileClogService::recover(config.clone()).unwrap();
+        assert_eq!(entries.len(), 2, "Should recover 2 entries before garbage");
+
+        // After recovery, garbage should be truncated
+        let file_size_after_recover = std::fs::metadata(&clog_path).unwrap().len();
+        assert!(
+            file_size_after_recover < file_size_with_garbage,
+            "File should be truncated: {} should be < {}",
+            file_size_after_recover,
+            file_size_with_garbage
+        );
+
+        // Write new data after recovery
+        let mut batch = ClogBatch::new();
+        batch.add_put(2, b"key2".to_vec(), b"value2".to_vec());
+        batch.add_commit(2, 200);
+        service.write(&mut batch, true).unwrap();
+        service.close().unwrap();
+
+        // Phase 4: Recover again and verify all data is present
+        let (_, all_entries) = FileClogService::recover(config).unwrap();
+        assert_eq!(
+            all_entries.len(),
+            4,
+            "Should have all 4 entries: 2 from phase 1 + 2 from phase 3"
+        );
+
+        // Verify both puts are there
+        let keys: Vec<_> = all_entries
+            .iter()
+            .filter_map(|e| match &e.op {
+                ClogOp::Put { key, .. } => Some(key.clone()),
+                _ => None,
+            })
+            .collect();
+        assert!(keys.contains(&b"key1".to_vec()), "key1 should be recovered");
+        assert!(keys.contains(&b"key2".to_vec()), "key2 should be recovered");
     }
 
     /// Test recovery with empty file (only header, no records).
