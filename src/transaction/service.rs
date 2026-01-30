@@ -761,16 +761,19 @@ mod tests {
             .unwrap_or_else(MvccKey::unbounded);
         let range = seek_key..end_key;
 
-        let results = storage.scan(range).unwrap();
+        let mut iter = storage.scan_iter(range).unwrap();
 
-        for (mvcc_key, value) in results {
+        while iter.valid() {
+            let mvcc_key = iter.key();
+            let value = iter.value();
             let (decoded_key, entry_ts) = mvcc_key.decode();
             if decoded_key == key && entry_ts <= ts {
-                if is_tombstone(&value) {
+                if is_tombstone(value) {
                     return None;
                 }
-                return Some(value);
+                return Some(value.to_vec());
             }
+            iter.next().unwrap();
         }
         None
     }
@@ -1244,8 +1247,7 @@ mod tests {
         let err = results[1].as_ref().unwrap_err();
         assert!(
             matches!(err, TiSqlError::Storage(msg) if msg.contains("simulated I/O error")),
-            "expected Storage error, got {:?}",
-            err
+            "expected Storage error, got {err:?}"
         );
     }
 
@@ -1423,7 +1425,7 @@ mod tests {
             Err(TiSqlError::KeyIsLocked { key, .. }) => {
                 assert_eq!(key, b"b", "should be locked on key 'b'");
             }
-            Err(e) => panic!("expected KeyIsLocked, got {:?}", e),
+            Err(e) => panic!("expected KeyIsLocked, got {e:?}"),
             Ok(_) => panic!("unbounded scan should be blocked by lock"),
         }
 
@@ -1431,7 +1433,7 @@ mod tests {
         let result = txn_service.scan(&read_ctx, b"a".to_vec()..b"d".to_vec());
         match result {
             Err(TiSqlError::KeyIsLocked { .. }) => {}
-            Err(e) => panic!("expected KeyIsLocked, got {:?}", e),
+            Err(e) => panic!("expected KeyIsLocked, got {e:?}"),
             Ok(_) => panic!("bounded scan should also be blocked by lock"),
         }
 

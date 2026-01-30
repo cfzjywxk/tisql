@@ -80,17 +80,6 @@ pub mod testkit {
     // Production memtable engine
     pub use crate::storage::{MemTableEngine, MemoryStats, VersionedMemTableEngine};
 
-    // Legacy memtable engines (available in test/bench mode only)
-    #[cfg(any(test, feature = "bench"))]
-    pub use crate::storage::{
-        ArenaMemTableEngine, ArenaMemoryStats, BTreeMemTableEngine, CrossbeamMemTableEngine,
-        CrossbeamMemoryStats,
-    };
-
-    // ArenaSkipList (available in test/bench mode only)
-    #[cfg(any(test, feature = "bench"))]
-    pub use crate::storage::memtable::arena_skiplist::ArenaSkipList;
-
     // LSM storage engine for testing
     pub use crate::storage::{
         CompactionExecutor, CompactionPicker, CompactionTask, IlogConfig, IlogService, LsmConfig,

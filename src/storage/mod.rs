@@ -45,12 +45,6 @@
 //! which uses an OceanBase-style design storing each user key once with a linked list of
 //! versions for space efficiency and better cache locality.
 //!
-//! Legacy engines available for testing/benchmarking (via `#[cfg(test)]` or `feature = "bench"`):
-//!
-//! - `CrossbeamMemTableEngine`: TiKV-style lock-free skiplist with epoch-based GC
-//! - `ArenaMemTableEngine`: Arena-based skiplist with bulk deallocation
-//! - `BTreeMemTableEngine`: BTreeMap + RwLock (baseline for comparison)
-//!
 //! ## Key Encoding
 //!
 //! Keys are encoded using TiDB-compatible format via the codec module.
@@ -83,18 +77,6 @@ pub use memtable::VersionedMemoryStats;
 // Re-export LSM MemTable wrapper
 pub use memtable::MemTable;
 
-// Legacy memtable engines (test/benchmark only)
-#[cfg(any(test, feature = "bench"))]
-pub use memtable::ArenaMemTableEngine;
-#[cfg(any(test, feature = "bench"))]
-pub use memtable::ArenaMemoryStats;
-#[cfg(any(test, feature = "bench"))]
-pub use memtable::BTreeMemTableEngine;
-#[cfg(any(test, feature = "bench"))]
-pub use memtable::CrossbeamMemTableEngine;
-#[cfg(any(test, feature = "bench"))]
-pub use memtable::CrossbeamMemoryStats;
-
 // Re-export LSM configuration
 pub use config::{LsmConfig, LsmConfigBuilder};
 pub use config::{
@@ -121,7 +103,7 @@ pub use recovery::{LsmRecovery, RecoveryResult, RecoveryStats};
 // Re-export MVCC codec types
 pub use mvcc::{
     decode_mvcc_key, encode_mvcc_key, extract_key, is_tombstone, next_key_bound, prev_key_bound,
-    MvccIterator, MvccKey, VecMvccIterator, TIMESTAMP_SIZE, TOMBSTONE,
+    MvccIterator, MvccKey, TIMESTAMP_SIZE, TOMBSTONE,
 };
 
 // Re-export SST types for persistent storage
@@ -237,14 +219,13 @@ pub use crate::codec::row::{decode_row_to_values, encode_row};
 ///
 /// | Method | Description |
 /// |--------|-------------|
-/// | `scan` | Iterate `MvccKey` entries in range (materializes all results) |
-/// | `scan_iter` | Create streaming iterator over range (zero-allocation) |
+/// | `scan_iter` | Create streaming iterator over range |
 /// | `write_batch` | Atomic writes with commit_ts (MVCC encoding done internally) |
 pub trait StorageEngine: Send + Sync + 'static {
-    /// Scan MVCC keys in range.
+    /// Create a streaming iterator over MVCC keys in range.
     ///
-    /// Returns all MVCC key-value pairs in the given range, including all versions
-    /// and tombstones. Keys are in `MvccKey` format (`key || !commit_ts`).
+    /// Returns a streaming iterator over all MVCC key-value pairs in the given range,
+    /// including all versions and tombstones. Keys are in `MvccKey` format (`key || !commit_ts`).
     ///
     /// The transaction layer is responsible for:
     /// - MVCC filtering (finding latest version with ts <= read_ts)
@@ -254,26 +235,11 @@ pub trait StorageEngine: Send + Sync + 'static {
     /// # Arguments
     ///
     /// * `range` - MVCC key range to scan. Use `MvccKey::encode(key, ts)` to build bounds.
-    fn scan(&self, range: Range<MvccKey>) -> Result<Vec<(MvccKey, RawValue)>>;
-
-    /// Create a streaming iterator over MVCC keys in range.
-    ///
-    /// This is the preferred method for large scans as it avoids materializing
-    /// all results in memory. The default implementation falls back to `scan()`
-    /// with a `VecMvccIterator` wrapper, but storage engines can override this
-    /// to provide true streaming iteration.
-    ///
-    /// # Arguments
-    ///
-    /// * `range` - MVCC key range to scan.
     ///
     /// # Returns
     ///
     /// A boxed iterator that yields entries in MVCC key order.
-    fn scan_iter(&self, range: Range<MvccKey>) -> Result<Box<dyn MvccIterator + '_>> {
-        let entries = self.scan(range)?;
-        Ok(Box::new(VecMvccIterator::new(entries)))
-    }
+    fn scan_iter(&self, range: Range<MvccKey>) -> Result<Box<dyn MvccIterator + '_>>;
 
     /// Apply a batch of writes atomically.
     ///

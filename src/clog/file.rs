@@ -1194,9 +1194,7 @@ mod tests {
         let file_size_after_recover = std::fs::metadata(&clog_path).unwrap().len();
         assert!(
             file_size_after_recover < file_size_with_garbage,
-            "File should be truncated: {} should be < {}",
-            file_size_after_recover,
-            file_size_with_garbage
+            "File should be truncated: {file_size_after_recover} should be < {file_size_with_garbage}"
         );
 
         // Write new data after recovery

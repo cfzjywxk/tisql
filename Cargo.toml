@@ -66,24 +66,6 @@ parking_lot = "0.12"
 default = ["jemalloc"]
 jemalloc = ["tikv-jemallocator"]
 failpoints = ["fail/failpoints"]
-# Enable legacy memtable engines for benchmarking comparisons
-bench = []
-
-[[bench]]
-name = "memtable_bench"
-harness = false
-
-[[bench]]
-name = "memtable_comparison"
-harness = false
-
-[[bench]]
-name = "memtable_impl_comparison"
-harness = false
-
-[[bench]]
-name = "e2e_oltp_bench"
-harness = false
 
 [[bin]]
 name = "sysbench-sim"

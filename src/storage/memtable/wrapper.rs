@@ -249,10 +249,23 @@ fn estimate_batch_size(batch: &WriteBatch) -> usize {
         .sum()
 }
 
+impl MemTable {
+    /// Scan MVCC keys in range (materializing version).
+    ///
+    /// This is provided for convenience in tests and internal use.
+    /// For production code, prefer `scan_iter()` which provides streaming.
+    pub fn scan(&self, range: Range<MvccKey>) -> Result<Vec<(MvccKey, RawValue)>> {
+        self.inner.scan(range)
+    }
+}
+
 // Implement StorageEngine for MemTable to allow transparent use
 impl StorageEngine for MemTable {
-    fn scan(&self, range: Range<MvccKey>) -> Result<Vec<(MvccKey, RawValue)>> {
-        self.inner.scan(range)
+    fn scan_iter(
+        &self,
+        range: Range<MvccKey>,
+    ) -> Result<Box<dyn crate::storage::MvccIterator + '_>> {
+        self.inner.scan_iter(range)
     }
 
     fn write_batch(&self, batch: WriteBatch) -> Result<()> {

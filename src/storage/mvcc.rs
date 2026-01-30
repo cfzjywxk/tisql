@@ -399,7 +399,6 @@ impl Ord for MvccKey {
 // ============================================================================
 
 use crate::error::Result;
-use crate::types::RawValue;
 
 /// Streaming iterator over MVCC key-value pairs.
 ///
@@ -467,60 +466,6 @@ pub trait MvccIterator {
     ///
     /// Panics if `!self.valid()`. Always check `valid()` first.
     fn value(&self) -> &[u8];
-}
-
-// ============================================================================
-// VecMvccIterator - Fallback implementation using Vec
-// ============================================================================
-
-/// A simple iterator over a pre-materialized Vec.
-///
-/// This is the fallback implementation used when a storage engine
-/// doesn't provide a native streaming iterator. It wraps the results
-/// of `scan()` to implement the `MvccIterator` trait.
-pub struct VecMvccIterator {
-    /// Materialized entries
-    entries: Vec<(MvccKey, RawValue)>,
-    /// Current position
-    pos: usize,
-}
-
-impl VecMvccIterator {
-    /// Create a new iterator from a Vec of entries.
-    ///
-    /// The entries should already be sorted in MVCC key order.
-    pub fn new(entries: Vec<(MvccKey, RawValue)>) -> Self {
-        Self { entries, pos: 0 }
-    }
-}
-
-impl MvccIterator for VecMvccIterator {
-    fn seek(&mut self, target: &MvccKey) -> Result<()> {
-        // Binary search for the first entry >= target
-        self.pos = self
-            .entries
-            .partition_point(|(k, _)| k.as_bytes() < target.as_bytes());
-        Ok(())
-    }
-
-    fn next(&mut self) -> Result<()> {
-        if self.pos < self.entries.len() {
-            self.pos += 1;
-        }
-        Ok(())
-    }
-
-    fn valid(&self) -> bool {
-        self.pos < self.entries.len()
-    }
-
-    fn key(&self) -> &MvccKey {
-        &self.entries[self.pos].0
-    }
-
-    fn value(&self) -> &[u8] {
-        &self.entries[self.pos].1
-    }
 }
 
 // ============================================================================

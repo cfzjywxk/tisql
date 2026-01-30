@@ -12,22 +12,14 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-//! Sysbench-like OLTP benchmark tool for comparing memtable implementations.
+//! Sysbench-like OLTP benchmark tool for the VersionedMemTableEngine.
 //!
-//! This tool simulates sysbench OLTP_RW workload to benchmark memtable implementations:
+//! This tool simulates sysbench OLTP_RW workload to benchmark the production memtable:
 //!
-//! - VersionedMemTableEngine (production default - OceanBase-style user key + version chain)
-//!
-//! Legacy engines (require `--features bench`):
-//! - CrossbeamMemTableEngine (lock-free with epoch-based GC)
-//! - ArenaMemTableEngine (arena-based skip list)
-//! - BTreeMemTableEngine (BTreeMap with RwLock, baseline)
+//! - VersionedMemTableEngine (OceanBase-style user key + version chain)
 //!
 //! Usage:
 //!     cargo run --release --bin sysbench-sim -- [OPTIONS]
-//!
-//! For comparison benchmarks:
-//!     cargo run --release --features bench --bin sysbench-sim -- --engine all
 //!
 //! Example:
 //!     cargo run --release --bin sysbench-sim -- --threads 8 --time 30 --tables 1 --table-size 100000
@@ -45,10 +37,6 @@ use clap::Parser;
 
 use tisql::storage::mvcc::{is_tombstone, MvccKey};
 use tisql::storage::{StorageEngine, VersionedMemTableEngine, WriteBatch};
-
-// Legacy engines - available only with `--features bench`
-#[cfg(feature = "bench")]
-use tisql::storage::{ArenaMemTableEngine, BTreeMemTableEngine, CrossbeamMemTableEngine};
 
 // ============================================================================
 // Command Line Arguments
@@ -98,11 +86,6 @@ struct Args {
     /// Percentage of inserts (default 10%)
     #[arg(long, default_value_t = 10)]
     insert_pct: usize,
-
-    /// Engine to benchmark: versioned (default), crossbeam, arena, btree, or all
-    /// Note: crossbeam, arena, btree, and all require --features bench
-    #[arg(long, default_value = "versioned")]
-    engine: String,
 }
 
 // ============================================================================
@@ -312,7 +295,7 @@ fn worker_thread<E: StorageEngine>(
         let start = Instant::now();
 
         if op_type < config.point_select_pct {
-            // Point select using MvccKey scan
+            // Point select using MvccKey scan_iter
             let row_id = rng() % config.table_size as u64;
             let key = make_key(table_id, row_id);
             let ts = ts_counter.load(Ordering::Relaxed);
@@ -321,12 +304,19 @@ fn worker_thread<E: StorageEngine>(
             let end_key = MvccKey::encode(&key, 0)
                 .next_key()
                 .unwrap_or_else(MvccKey::unbounded);
-            let results = engine.scan(seek_key..end_key).unwrap();
+            let mut iter = engine.scan_iter(seek_key..end_key).unwrap();
             // Find the first visible entry
-            let _ = results.into_iter().find(|(mvcc_key, value)| {
+            let mut _found = false;
+            while iter.valid() {
+                let mvcc_key = iter.key();
+                let value = iter.value();
                 let (decoded_key, entry_ts) = mvcc_key.decode();
-                decoded_key == key && entry_ts <= ts && !is_tombstone(value)
-            });
+                if decoded_key == key && entry_ts <= ts && !is_tombstone(value) {
+                    _found = true;
+                    break;
+                }
+                iter.next().unwrap();
+            }
             stats.record_read(start.elapsed().as_nanos() as u64);
         } else if op_type < config.point_select_pct + config.update_pct {
             // Update
@@ -628,56 +618,7 @@ fn main() {
         std::process::exit(1);
     }
 
-    match args.engine.as_str() {
-        "versioned" => {
-            run_benchmark::<VersionedMemTableEngine>("VersionedMemTableEngine", &args);
-        }
-        #[cfg(feature = "bench")]
-        "crossbeam" => {
-            run_benchmark::<CrossbeamMemTableEngine>("CrossbeamMemTableEngine", &args);
-        }
-        #[cfg(feature = "bench")]
-        "arena" => {
-            run_benchmark::<ArenaMemTableEngine>("ArenaMemTableEngine", &args);
-        }
-        #[cfg(feature = "bench")]
-        "btree" => {
-            run_benchmark::<BTreeMemTableEngine>("BTreeMemTableEngine", &args);
-        }
-        #[cfg(feature = "bench")]
-        "all" => {
-            // Run all engines for comparison
-            run_benchmark::<VersionedMemTableEngine>("VersionedMemTableEngine (production)", &args);
-            run_benchmark::<CrossbeamMemTableEngine>("CrossbeamMemTableEngine (legacy)", &args);
-            run_benchmark::<ArenaMemTableEngine>("ArenaMemTableEngine (legacy)", &args);
-            run_benchmark::<BTreeMemTableEngine>("BTreeMemTableEngine (legacy)", &args);
-
-            // Print comparison summary
-            println!();
-            println!("{}", "=".repeat(70));
-            println!("COMPARISON SUMMARY");
-            println!("{}", "=".repeat(70));
-            println!();
-            println!("Run the benchmark multiple times for statistical significance.");
-            println!("The results above show per-engine metrics.");
-        }
-        #[cfg(not(feature = "bench"))]
-        "crossbeam" | "arena" | "btree" | "all" => {
-            eprintln!("Error: Legacy engines require --features bench");
-            eprintln!(
-                "Usage: cargo run --release --features bench --bin sysbench-sim -- --engine {}",
-                args.engine
-            );
-            std::process::exit(1);
-        }
-        _ => {
-            eprintln!(
-                "Unknown engine: {}. Use 'versioned', 'crossbeam', 'arena', 'btree', or 'all'",
-                args.engine
-            );
-            std::process::exit(1);
-        }
-    }
+    run_benchmark::<VersionedMemTableEngine>("VersionedMemTableEngine", &args);
 
     println!();
     println!("Benchmark complete!");

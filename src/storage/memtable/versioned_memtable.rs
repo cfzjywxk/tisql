@@ -387,22 +387,16 @@ impl Default for VersionedMemTableEngine {
     }
 }
 
-impl StorageEngine for VersionedMemTableEngine {
-    /// Create a streaming iterator over MVCC keys in range.
-    ///
-    /// This provides the `MvccIterator` interface. Currently falls back to
-    /// materializing via `scan()`, but can be optimized for true streaming
-    /// if profiling shows benefit.
-    fn scan_iter(&self, range: Range<MvccKey>) -> Result<Box<dyn MvccIterator + '_>> {
-        Ok(Box::new(VersionedMemTableIterator::new(self, range)?))
-    }
-
-    /// Scan MVCC keys in range.
+impl VersionedMemTableEngine {
+    /// Scan MVCC keys in range (materializing version).
     ///
     /// Returns all MVCC key-value pairs in the given range, including all versions
     /// and tombstones. Keys are returned in `MvccKey` format for compatibility
     /// with the rest of the storage layer.
-    fn scan(&self, range: Range<MvccKey>) -> Result<Vec<(MvccKey, RawValue)>> {
+    ///
+    /// This is provided for convenience in tests and internal use.
+    /// For production code, prefer `scan_iter()` which provides streaming.
+    pub fn scan(&self, range: Range<MvccKey>) -> Result<Vec<(MvccKey, RawValue)>> {
         let mut results = Vec::new();
 
         // Handle truly unbounded range
@@ -503,6 +497,17 @@ impl StorageEngine for VersionedMemTableEngine {
         // - MvccKey encoding: key || !ts, so (user_key ASC, ts DESC) = byte order
 
         Ok(results)
+    }
+}
+
+impl StorageEngine for VersionedMemTableEngine {
+    /// Create a streaming iterator over MVCC keys in range.
+    ///
+    /// This provides the `MvccIterator` interface. Currently falls back to
+    /// materializing via `scan()`, but can be optimized for true streaming
+    /// if profiling shows benefit.
+    fn scan_iter(&self, range: Range<MvccKey>) -> Result<Box<dyn MvccIterator + '_>> {
+        Ok(Box::new(VersionedMemTableIterator::new(self, range)?))
     }
 
     /// Apply a batch of writes atomically.

@@ -33,7 +33,7 @@ jobs:
             ${{ runner.os }}-cargo-
 
       - name: Check compilation
-        run: cargo check --all-targets --features bench
+        run: cargo check --all-targets
 
   fmt:
     name: Format
@@ -74,7 +74,7 @@ jobs:
             ${{ runner.os }}-cargo-
 
       - name: Run Clippy
-        run: cargo clippy --all-targets --features bench -- -D warnings
+        run: cargo clippy --all-targets -- -D warnings
 
   test:
     name: Test

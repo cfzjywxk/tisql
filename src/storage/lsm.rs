@@ -58,7 +58,9 @@ use crate::types::{RawValue, Timestamp};
 use super::config::LsmConfig;
 use super::ilog::IlogService;
 use super::memtable::MemTable;
-use super::sstable::{SstBuilder, SstBuilderOptions, SstIterator, SstMeta, SstReaderRef};
+use super::sstable::{
+    SstBuilder, SstBuilderOptions, SstIterator, SstMeta, SstMvccIterator, SstReaderRef,
+};
 use super::version::{ManifestDelta, Version, MAX_LEVELS};
 
 /// Inner state of the LSM engine, protected by RwLock for atomic updates.
@@ -740,6 +742,230 @@ impl Iterator for ScanMergeIterator {
 }
 
 // ============================================================================
+// OwnedMemTableIterator - Owned wrapper for memtable iterator
+// ============================================================================
+
+/// An owned wrapper around a memtable iterator.
+///
+/// This struct owns an `Arc<MemTable>` and the iterator created from it,
+/// allowing the iterator to outlive any borrow of the memtable.
+/// The memtable Arc is kept alive for the lifetime of this struct.
+///
+/// # Safety
+///
+/// The iterator holds a reference to the memtable's internal data.
+/// By keeping the Arc alive, we ensure the data remains valid.
+struct OwnedMemTableIterator {
+    /// Keep the memtable alive
+    _memtable: Arc<MemTable>,
+    /// Materialized entries (VersionedMemTableIterator already materializes)
+    entries: Vec<(MvccKey, RawValue)>,
+    /// Current position
+    pos: usize,
+}
+
+impl OwnedMemTableIterator {
+    /// Create a new owned iterator over the given memtable and range.
+    fn new(memtable: Arc<MemTable>, range: Range<MvccKey>) -> Result<Self> {
+        // Since VersionedMemTableIterator already materializes, we do the same
+        let entries = memtable.inner().scan(range)?;
+        Ok(Self {
+            _memtable: memtable,
+            entries,
+            pos: 0,
+        })
+    }
+}
+
+impl MvccIterator for OwnedMemTableIterator {
+    fn seek(&mut self, target: &MvccKey) -> Result<()> {
+        self.pos = self
+            .entries
+            .partition_point(|(k, _)| k.as_bytes() < target.as_bytes());
+        Ok(())
+    }
+
+    fn next(&mut self) -> Result<()> {
+        if self.pos < self.entries.len() {
+            self.pos += 1;
+        }
+        Ok(())
+    }
+
+    fn valid(&self) -> bool {
+        self.pos < self.entries.len()
+    }
+
+    fn key(&self) -> &MvccKey {
+        &self.entries[self.pos].0
+    }
+
+    fn value(&self) -> &[u8] {
+        &self.entries[self.pos].1
+    }
+}
+
+// ============================================================================
+// OwnedMergeIterator - Owned streaming merge iterator
+// ============================================================================
+
+/// Entry in the merge heap for OwnedMergeIterator.
+struct OwnedHeapEntry {
+    /// Current key from this iterator
+    key: MvccKey,
+    /// Current value from this iterator
+    value: Vec<u8>,
+    /// The underlying iterator (owned)
+    iter: Box<dyn MvccIterator>,
+}
+
+impl PartialEq for OwnedHeapEntry {
+    fn eq(&self, other: &Self) -> bool {
+        self.key == other.key
+    }
+}
+
+impl Eq for OwnedHeapEntry {}
+
+impl PartialOrd for OwnedHeapEntry {
+    fn partial_cmp(&self, other: &Self) -> Option<std::cmp::Ordering> {
+        Some(self.cmp(other))
+    }
+}
+
+impl Ord for OwnedHeapEntry {
+    fn cmp(&self, other: &Self) -> std::cmp::Ordering {
+        // Min-heap: reverse comparison to get smallest key first
+        other.key.cmp(&self.key)
+    }
+}
+
+/// Owned streaming merge iterator that implements MvccIterator.
+///
+/// Unlike `LsmMergeIterator<'a>`, this iterator owns its child iterators,
+/// allowing it to be returned from methods without lifetime constraints.
+/// This is used by `LsmEngine::scan_iter()` to provide true streaming.
+pub struct OwnedMergeIterator {
+    /// Min-heap of iterators with their current entries
+    heap: BinaryHeap<OwnedHeapEntry>,
+    /// Current key (cached for returning reference)
+    current_key: Option<MvccKey>,
+    /// Current value (cached for returning reference)
+    current_value: Option<Vec<u8>>,
+    /// Pending error from iterator operations
+    pending_error: Option<TiSqlError>,
+}
+
+impl OwnedMergeIterator {
+    /// Create a new owned merge iterator from multiple iterators.
+    pub fn new(iters: Vec<Box<dyn MvccIterator>>) -> Result<Self> {
+        let mut heap = BinaryHeap::new();
+        let pending_error = None;
+
+        for iter in iters {
+            if iter.valid() {
+                let key = iter.key().clone();
+                let value = iter.value().to_vec();
+                heap.push(OwnedHeapEntry { key, value, iter });
+            }
+        }
+
+        let mut merge_iter = Self {
+            heap,
+            current_key: None,
+            current_value: None,
+            pending_error,
+        };
+
+        // Prime the iterator with the first entry
+        merge_iter.advance()?;
+
+        Ok(merge_iter)
+    }
+
+    /// Advance to the next entry from the heap.
+    fn advance(&mut self) -> Result<()> {
+        // Check for pending error
+        if let Some(e) = self.pending_error.take() {
+            return Err(e);
+        }
+
+        if let Some(mut top) = self.heap.pop() {
+            // Save current entry
+            self.current_key = Some(top.key.clone());
+            self.current_value = Some(top.value.clone());
+
+            // Advance the iterator
+            if let Err(e) = top.iter.next() {
+                // Store error for next operation
+                self.pending_error = Some(e);
+            }
+
+            // Re-add to heap if still valid
+            if top.iter.valid() {
+                let key = top.iter.key().clone();
+                let value = top.iter.value().to_vec();
+                self.heap.push(OwnedHeapEntry {
+                    key,
+                    value,
+                    iter: top.iter,
+                });
+            }
+
+            Ok(())
+        } else {
+            // Heap exhausted
+            self.current_key = None;
+            self.current_value = None;
+            Ok(())
+        }
+    }
+}
+
+impl MvccIterator for OwnedMergeIterator {
+    fn seek(&mut self, target: &MvccKey) -> Result<()> {
+        // Seek all iterators in the heap to the target
+        let mut iters: Vec<Box<dyn MvccIterator>> = Vec::new();
+
+        // Drain all iterators from heap
+        while let Some(entry) = self.heap.pop() {
+            iters.push(entry.iter);
+        }
+
+        // Seek each iterator and re-add to heap
+        for mut iter in iters {
+            iter.seek(target)?;
+            if iter.valid() {
+                let key = iter.key().clone();
+                let value = iter.value().to_vec();
+                self.heap.push(OwnedHeapEntry { key, value, iter });
+            }
+        }
+
+        // Prime with first entry >= target
+        self.current_key = None;
+        self.current_value = None;
+        self.advance()
+    }
+
+    fn next(&mut self) -> Result<()> {
+        self.advance()
+    }
+
+    fn valid(&self) -> bool {
+        self.current_key.is_some()
+    }
+
+    fn key(&self) -> &MvccKey {
+        self.current_key.as_ref().expect("Iterator not valid")
+    }
+
+    fn value(&self) -> &[u8] {
+        self.current_value.as_ref().expect("Iterator not valid")
+    }
+}
+
+// ============================================================================
 // LsmMergeIterator - Streaming merge iterator using MvccIterator trait
 // ============================================================================
 
@@ -900,8 +1126,15 @@ impl MvccIterator for LsmMergeIterator<'_> {
     }
 }
 
-impl StorageEngine for LsmEngine {
-    fn scan(&self, range: Range<MvccKey>) -> Result<Vec<(MvccKey, RawValue)>> {
+impl LsmEngine {
+    /// Scan MVCC keys in range (materializing version).
+    ///
+    /// Returns all MVCC key-value pairs in the given range, including all versions
+    /// and tombstones. Keys are in `MvccKey` format (`key || !commit_ts`).
+    ///
+    /// This is provided for convenience in tests and internal use.
+    /// For production code, prefer `scan_iter()` which provides streaming.
+    pub fn scan(&self, range: Range<MvccKey>) -> Result<Vec<(MvccKey, RawValue)>> {
         let (active, frozen, version) = {
             let state = self.state.read().unwrap();
             (
@@ -955,16 +1188,62 @@ impl StorageEngine for LsmEngine {
         // Collect results, propagating any I/O errors from SST reads
         merge_iter.collect()
     }
+}
 
+impl StorageEngine for LsmEngine {
     fn scan_iter(&self, range: Range<MvccKey>) -> Result<Box<dyn MvccIterator + '_>> {
-        // For LsmEngine, we currently fall back to materializing via scan()
-        // and using VecMvccIterator. A true streaming implementation would
-        // use LsmMergeIterator with SstMvccIterator, but that requires
-        // careful lifetime management with the state lock.
-        //
-        // This still provides the MvccIterator interface for callers.
-        let entries = self.scan(range)?;
-        Ok(Box::new(crate::storage::VecMvccIterator::new(entries)))
+        // Snapshot the state under read lock, then release the lock.
+        // We clone Arc references so iterators can outlive the lock.
+        let (active, frozen, version) = {
+            let state = self.state.read().unwrap();
+            (
+                Arc::clone(&state.active),
+                state.frozen.clone(),
+                Arc::clone(&state.version),
+            )
+        };
+
+        let mut iters: Vec<Box<dyn MvccIterator>> = Vec::new();
+
+        // 1. Add SST iterators (true streaming via SstMvccIterator)
+        for level in 0..MAX_LEVELS {
+            for sst_meta in version.ssts_at_level(level as u32) {
+                if !sst_meta.overlaps_mvcc(range.start.as_bytes(), range.end.as_bytes()) {
+                    continue;
+                }
+                let sst_path = self
+                    .config
+                    .sst_dir()
+                    .join(format!("{:08}.sst", sst_meta.id));
+                // SST referenced by Version must exist - missing file indicates data corruption
+                if !sst_path.exists() {
+                    return Err(TiSqlError::Storage(format!(
+                        "SST file missing: {} (id={}, level={}). This indicates data corruption or incomplete recovery.",
+                        sst_path.display(),
+                        sst_meta.id,
+                        sst_meta.level
+                    )));
+                }
+                let reader = SstReaderRef::open(&sst_path)?;
+                let sst_iter = SstMvccIterator::new(reader, range.clone())?;
+                iters.push(Box::new(sst_iter));
+            }
+        }
+
+        // 2. Add frozen memtable iterators (newest to oldest)
+        // Use OwnedMemTableIterator to keep Arc<MemTable> alive
+        for memtable in frozen {
+            let mem_iter = OwnedMemTableIterator::new(memtable, range.clone())?;
+            iters.push(Box::new(mem_iter));
+        }
+
+        // 3. Add active memtable iterator
+        let active_iter = OwnedMemTableIterator::new(active, range)?;
+        iters.push(Box::new(active_iter));
+
+        // Use OwnedMergeIterator to merge all iterators
+        let merge_iter = OwnedMergeIterator::new(iters)?;
+        Ok(Box::new(merge_iter))
     }
 
     fn write_batch(&self, batch: WriteBatch) -> Result<()> {
