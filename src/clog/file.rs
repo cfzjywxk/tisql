@@ -541,45 +541,39 @@ impl ClogService for FileClogService {
             return Ok(self.lsn_provider.current_lsn());
         }
 
-        // Count entries: one per op + one for commit record
-        let entry_count = batch.len() + 1;
-
         // Acquire lock BEFORE assigning LSNs to ensure writes are ordered
         let mut writer = self.writer.lock().unwrap();
 
-        // Allocate LSNs for all entries
-        let mut lsns = Vec::with_capacity(entry_count);
-        for _ in 0..entry_count {
-            lsns.push(self.lsn_provider.alloc_lsn());
-        }
-        let start_lsn = lsns[0];
-        let end_lsn = *lsns.last().unwrap();
+        // Allocate LSNs on the fly while building entries (avoids intermediate Vec)
+        let start_lsn = self.lsn_provider.alloc_lsn();
+        let mut current_lsn = start_lsn;
 
         // Build reference-based entries directly from WriteBatch
         // No cloning - we serialize directly from the borrowed data
+        let entry_count = batch.len() + 1;
         let mut entries: Vec<ClogEntryRef<'_>> = Vec::with_capacity(entry_count);
-        let mut lsn_idx = 0;
 
         for (key, op) in batch.iter() {
             let entry = match op {
                 WriteOp::Put { value } => ClogEntryRef {
-                    lsn: lsns[lsn_idx],
+                    lsn: current_lsn,
                     txn_id,
                     op: ClogOpRef::Put { key, value },
                 },
                 WriteOp::Delete => ClogEntryRef {
-                    lsn: lsns[lsn_idx],
+                    lsn: current_lsn,
                     txn_id,
                     op: ClogOpRef::Delete { key },
                 },
             };
             entries.push(entry);
-            lsn_idx += 1;
+            current_lsn = self.lsn_provider.alloc_lsn();
         }
 
-        // Add commit record
+        // Add commit record (current_lsn is now the last allocated LSN)
+        let end_lsn = current_lsn;
         entries.push(ClogEntryRef {
-            lsn: lsns[lsn_idx],
+            lsn: end_lsn,
             txn_id,
             op: ClogOpRef::Commit { commit_ts },
         });

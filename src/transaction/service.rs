@@ -372,10 +372,12 @@ impl<S: StorageEngine + 'static, L: ClogService + 'static, T: TsoService> TxnSer
         // - Primary key must be stable and deterministic across retries
         // - TiDB uses the first key in sorted order as primary
         // - Once selected, the primary should not change for the transaction
+        //
+        // WriteBatch uses BTreeMap, so keys().next() gives the smallest key in O(1).
         let primary_key: Arc<[u8]> = ctx
             .write_buffer
             .keys()
-            .min()
+            .next()
             .map(|k| Arc::from(k.as_slice()))
             .unwrap_or_else(|| Arc::from(&[][..]));
 

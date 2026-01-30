@@ -497,8 +497,10 @@ impl StorageEngine for VersionedMemTableEngine {
             }
         }
 
-        // Sort by MVCC key order (key ascending, then ts descending)
-        results.sort_by(|a, b| a.0.cmp(&b.0));
+        // No sort needed: iteration order already matches MvccKey order.
+        // - self.index.range() iterates keys in ascending order (BTreeMap)
+        // - row.iter_versions() iterates versions in descending ts order (linked list head = newest)
+        // - MvccKey encoding: key || !ts, so (user_key ASC, ts DESC) = byte order
 
         Ok(results)
     }
