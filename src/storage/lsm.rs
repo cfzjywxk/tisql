@@ -940,41 +940,18 @@ struct LevelIterator {
 }
 
 impl LevelIterator {
-    /// Create a new level iterator for the given SSTs.
-    fn new(sst_metas: Vec<Arc<SstMeta>>, sst_dir: PathBuf, range: Range<MvccKey>) -> Result<Self> {
-        let mut iter = Self {
+    /// Create a new level iterator for the given SSTs (lazy - no I/O during construction).
+    ///
+    /// The iterator is not positioned until `seek()` is called.
+    fn new(sst_metas: Vec<Arc<SstMeta>>, sst_dir: PathBuf, range: Range<MvccKey>) -> Self {
+        Self {
             sst_metas,
             sst_dir,
             range,
             current_file_idx: None,
             current_iter: None,
             pending_error: None,
-        };
-
-        // Find the first file that might contain keys in range
-        iter.seek_to_first_file()?;
-        Ok(iter)
-    }
-
-    /// Find and open the first file that might contain keys >= range.start
-    fn seek_to_first_file(&mut self) -> Result<()> {
-        if self.sst_metas.is_empty() {
-            return Ok(());
         }
-
-        // Binary search: find first file whose largest_key >= range.start
-        let start_bytes = self.range.start.as_bytes();
-        let idx = self
-            .sst_metas
-            .partition_point(|sst| sst.largest_key.as_slice() < start_bytes);
-
-        if idx >= self.sst_metas.len() {
-            // No file contains keys >= start
-            return Ok(());
-        }
-
-        self.open_file(idx)?;
-        self.skip_empty_files()
     }
 
     /// Open the file at the given index.
@@ -1102,13 +1079,13 @@ impl MvccIterator for LevelIterator {
     }
 }
 
-/// Pending iterator to be initialized during build.
+/// Pending iterator to be initialized later.
 struct PendingIterator {
     iter: Box<dyn MvccIterator>,
     priority: u32,
 }
 
-/// Tiered merge iterator with priority-aware deduplication.
+/// Tiered merge iterator with lazy SST initialization.
 ///
 /// This iterator merges multiple sources with different priorities:
 /// - Active memtable (priority 0)
@@ -1116,12 +1093,21 @@ struct PendingIterator {
 /// - L0 SSTs (priority 1000+)
 /// - L1+ levels (priority 10000+ per level)
 ///
+/// **Lazy Loading Design:**
+/// - Memtable iterators are initialized in `build()` (in-memory, no I/O)
+/// - L0 SST iterators are kept pending until memtable tier is exhausted
+/// - L1+ level iterators are kept pending until L0 tier is also exhausted
+///
+/// This avoids unnecessary disk I/O when memtable contains the required data.
+///
 /// For duplicate MVCC keys, the highest priority (lowest number) wins.
 pub struct TieredMergeIterator {
     /// Min-heap of iterators with their current entries and priorities
     heap: BinaryHeap<PriorityHeapEntry>,
-    /// Pending iterators to be initialized during build (for lazy loading)
-    pending: Vec<PendingIterator>,
+    /// Pending L0 SST iterators (initialized when memtable tier exhausted)
+    pending_l0: Vec<PendingIterator>,
+    /// Pending L1+ level iterators (initialized when L0 tier exhausted)
+    pending_levels: Vec<PendingIterator>,
     /// Current key (cached for returning reference)
     current_key: Option<MvccKey>,
     /// Current value (cached for returning reference)
@@ -1143,7 +1129,8 @@ impl TieredMergeIterator {
     pub fn new() -> Self {
         Self {
             heap: BinaryHeap::new(),
-            pending: Vec::new(),
+            pending_l0: Vec::new(),
+            pending_levels: Vec::new(),
             current_key: None,
             current_value: None,
             last_emitted_key: None,
@@ -1151,70 +1138,137 @@ impl TieredMergeIterator {
         }
     }
 
-    /// Add an iterator with the given priority.
-    /// The iterator will be initialized during build().
-    pub fn add_iterator(&mut self, iter: Box<dyn MvccIterator>, priority: u32) {
-        self.pending.push(PendingIterator { iter, priority });
-    }
-
     /// Add the active memtable iterator (highest priority).
-    pub fn add_active_memtable(&mut self, iter: Box<dyn MvccIterator>) {
-        self.add_iterator(iter, PRIORITY_ACTIVE);
+    /// Memtable iterators are added directly to the heap (in-memory, no I/O).
+    pub fn add_active_memtable(&mut self, mut iter: Box<dyn MvccIterator>) -> Result<()> {
+        if !iter.valid() {
+            iter.seek(&MvccKey::unbounded())?;
+        }
+        if iter.valid() {
+            let key = iter.key().clone();
+            let value = iter.value().to_vec();
+            self.heap.push(PriorityHeapEntry {
+                key,
+                value,
+                priority: PRIORITY_ACTIVE,
+                iter,
+            });
+        }
+        Ok(())
     }
 
     /// Add a frozen memtable iterator.
-    pub fn add_frozen_memtable(&mut self, iter: Box<dyn MvccIterator>, index: usize) {
-        self.add_iterator(iter, PRIORITY_FROZEN_BASE + index as u32);
+    /// Memtable iterators are added directly to the heap (in-memory, no I/O).
+    pub fn add_frozen_memtable(
+        &mut self,
+        mut iter: Box<dyn MvccIterator>,
+        index: usize,
+    ) -> Result<()> {
+        if !iter.valid() {
+            iter.seek(&MvccKey::unbounded())?;
+        }
+        if iter.valid() {
+            let key = iter.key().clone();
+            let value = iter.value().to_vec();
+            self.heap.push(PriorityHeapEntry {
+                key,
+                value,
+                priority: PRIORITY_FROZEN_BASE + index as u32,
+                iter,
+            });
+        }
+        Ok(())
     }
 
-    /// Add an L0 SST iterator.
+    /// Add an L0 SST iterator (lazy - not initialized until memtable tier exhausted).
     pub fn add_l0_sst(&mut self, iter: Box<dyn MvccIterator>, index: usize) {
-        self.add_iterator(iter, PRIORITY_L0_BASE + index as u32);
+        self.pending_l0.push(PendingIterator {
+            iter,
+            priority: PRIORITY_L0_BASE + index as u32,
+        });
     }
 
-    /// Add a level iterator for L1+.
+    /// Add a level iterator for L1+ (lazy - not initialized until L0 tier exhausted).
     pub fn add_level(&mut self, iter: Box<dyn MvccIterator>, level: usize) {
-        self.add_iterator(iter, PRIORITY_LEVEL_BASE * level as u32);
+        self.pending_levels.push(PendingIterator {
+            iter,
+            priority: PRIORITY_LEVEL_BASE * level as u32,
+        });
     }
 
     /// Finalize and prime the iterator.
-    /// This initializes all pending iterators (triggering lazy loading for SSTs).
+    ///
+    /// At this point, only memtable iterators are in the heap. L0 and L1+
+    /// iterators remain pending and will be initialized lazily.
     pub fn build(mut self) -> Result<Self> {
-        // Initialize all pending iterators and add valid ones to heap
-        for pending in self.pending.drain(..) {
+        // Memtable iterators are already in the heap from add_active_memtable/add_frozen_memtable.
+        // L0 and L1+ iterators are in pending_l0/pending_levels.
+        // Advance to position on first entry.
+        self.advance()?;
+        Ok(self)
+    }
+
+    /// Initialize pending L0 SST iterators and add them to the heap.
+    fn init_l0_tier(&mut self) -> Result<()> {
+        for pending in self.pending_l0.drain(..) {
             let mut iter = pending.iter;
-            let priority = pending.priority;
-
-            // For lazy iterators, seeking to the start of their range initializes them
-            // This is a no-op for already-initialized iterators
-            if !iter.valid() {
-                // Try to seek to beginning to initialize
-                iter.seek(&MvccKey::unbounded())?;
-            }
-
+            iter.seek(&MvccKey::unbounded())?;
             if iter.valid() {
                 let key = iter.key().clone();
                 let value = iter.value().to_vec();
                 self.heap.push(PriorityHeapEntry {
                     key,
                     value,
-                    priority,
+                    priority: pending.priority,
                     iter,
                 });
             }
         }
+        Ok(())
+    }
 
-        self.advance()?;
-        Ok(self)
+    /// Initialize pending L1+ level iterators and add them to the heap.
+    fn init_levels_tier(&mut self) -> Result<()> {
+        for pending in self.pending_levels.drain(..) {
+            let mut iter = pending.iter;
+            iter.seek(&MvccKey::unbounded())?;
+            if iter.valid() {
+                let key = iter.key().clone();
+                let value = iter.value().to_vec();
+                self.heap.push(PriorityHeapEntry {
+                    key,
+                    value,
+                    priority: pending.priority,
+                    iter,
+                });
+            }
+        }
+        Ok(())
     }
 
     /// Advance to the next unique entry from the heap.
+    ///
+    /// This method implements tiered lazy loading:
+    /// 1. First exhausts memtable entries (already in heap)
+    /// 2. When heap is empty, initializes L0 SST iterators
+    /// 3. When heap is empty again, initializes L1+ level iterators
     fn advance(&mut self) -> Result<()> {
         if let Some(e) = self.pending_error.take() {
             return Err(e);
         }
 
         loop {
+            // Check if we need to initialize the next tier
+            if self.heap.is_empty() {
+                if !self.pending_l0.is_empty() {
+                    // Memtable exhausted, initialize L0 tier
+                    self.init_l0_tier()?;
+                } else if !self.pending_levels.is_empty() {
+                    // L0 exhausted, initialize L1+ tiers
+                    self.init_levels_tier()?;
+                }
+            }
+
             if let Some(mut top) = self.heap.pop() {
                 let key = top.key.clone();
                 let value = top.value.clone();
@@ -1247,7 +1301,7 @@ impl TieredMergeIterator {
                 self.last_emitted_key = Some(key);
                 return Ok(());
             } else {
-                // Heap exhausted
+                // All tiers exhausted
                 self.current_key = None;
                 self.current_value = None;
                 return Ok(());
@@ -1258,14 +1312,29 @@ impl TieredMergeIterator {
 
 impl MvccIterator for TieredMergeIterator {
     fn seek(&mut self, target: &MvccKey) -> Result<()> {
-        // Drain all iterators from heap
-        let mut entries: Vec<(Box<dyn MvccIterator>, u32)> = Vec::new();
+        // When seeking to a specific key, we must initialize all iterators
+        // because we need to find the smallest key >= target across all tiers.
+
+        // Collect all iterators: from heap + pending
+        let mut all_iters: Vec<(Box<dyn MvccIterator>, u32)> = Vec::new();
+
+        // Drain heap
         while let Some(entry) = self.heap.pop() {
-            entries.push((entry.iter, entry.priority));
+            all_iters.push((entry.iter, entry.priority));
         }
 
-        // Seek each iterator and re-add to heap
-        for (mut iter, priority) in entries {
+        // Drain pending L0
+        for pending in self.pending_l0.drain(..) {
+            all_iters.push((pending.iter, pending.priority));
+        }
+
+        // Drain pending levels
+        for pending in self.pending_levels.drain(..) {
+            all_iters.push((pending.iter, pending.priority));
+        }
+
+        // Seek each iterator and re-add valid ones to heap
+        for (mut iter, priority) in all_iters {
             iter.seek(target)?;
             if iter.valid() {
                 let key = iter.key().clone();
@@ -1409,13 +1478,15 @@ impl StorageEngine for LsmEngine {
         let mut merge_iter = TieredMergeIterator::new();
 
         // 1. Add active memtable iterator (highest priority)
+        // Memtable iterators are initialized immediately (in-memory, no I/O)
         let active_iter = OwnedMemTableIterator::new(active, range.clone())?;
-        merge_iter.add_active_memtable(Box::new(active_iter));
+        merge_iter.add_active_memtable(Box::new(active_iter))?;
 
         // 2. Add frozen memtable iterators (newest to oldest)
+        // Memtable iterators are initialized immediately (in-memory, no I/O)
         for (idx, memtable) in frozen.iter().enumerate() {
             let mem_iter = OwnedMemTableIterator::new(Arc::clone(memtable), range.clone())?;
-            merge_iter.add_frozen_memtable(Box::new(mem_iter), idx);
+            merge_iter.add_frozen_memtable(Box::new(mem_iter), idx)?;
         }
 
         // 3. Add L0 SST iterators (files can overlap, use lazy loading)
@@ -1444,7 +1515,7 @@ impl StorageEngine for LsmEngine {
                 .collect();
 
             if !ssts.is_empty() {
-                let level_iter = LevelIterator::new(ssts, sst_dir.clone(), range.clone())?;
+                let level_iter = LevelIterator::new(ssts, sst_dir.clone(), range.clone());
                 merge_iter.add_level(Box::new(level_iter), level);
             }
         }
