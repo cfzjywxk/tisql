@@ -1258,14 +1258,19 @@ impl TieredMergeIterator {
         }
 
         loop {
-            // Check if we need to initialize the next tier
-            if self.heap.is_empty() {
+            // Keep initializing tiers until we have data or all tiers are exhausted
+            while self.heap.is_empty() {
                 if !self.pending_l0.is_empty() {
                     // Memtable exhausted, initialize L0 tier
                     self.init_l0_tier()?;
                 } else if !self.pending_levels.is_empty() {
                     // L0 exhausted, initialize L1+ tiers
                     self.init_levels_tier()?;
+                } else {
+                    // All tiers exhausted
+                    self.current_key = None;
+                    self.current_value = None;
+                    return Ok(());
                 }
             }
 
@@ -1300,12 +1305,8 @@ impl TieredMergeIterator {
                 self.current_value = Some(value);
                 self.last_emitted_key = Some(key);
                 return Ok(());
-            } else {
-                // All tiers exhausted
-                self.current_key = None;
-                self.current_value = None;
-                return Ok(());
             }
+            // Unreachable: while loop above ensures heap is non-empty or returns early
         }
     }
 }
@@ -3060,5 +3061,813 @@ mod tests {
             Some(b"normal_value".to_vec()),
             "Normal key should be readable from SST"
         );
+    }
+
+    // ==================== TieredMergeIterator Tests ====================
+    //
+    // These tests verify the tiered lazy loading behavior of TieredMergeIterator:
+    // 1. Data is read in tier order: active -> frozen -> L0 -> L1+
+    // 2. SST iterators are only initialized when memtable tier is exhausted
+    // 3. All L0 SST files are considered (they can overlap/be unordered)
+    // 4. Priority-based deduplication works correctly
+    // 5. seek() initializes all pending iterators
+
+    use std::cell::RefCell;
+    use std::rc::Rc;
+
+    /// Mock iterator that tracks whether seek() has been called.
+    /// Used to verify lazy initialization behavior.
+    struct MockMvccIterator {
+        /// Data to return (sorted by MvccKey)
+        data: Vec<(MvccKey, Vec<u8>)>,
+        /// Current position (-1 = not initialized, >= data.len() = exhausted)
+        pos: i32,
+        /// Tracks whether seek() has been called (shared for external inspection)
+        seek_called: Rc<RefCell<bool>>,
+    }
+
+    impl MockMvccIterator {
+        fn new(_name: &str, data: Vec<(MvccKey, Vec<u8>)>) -> (Self, Rc<RefCell<bool>>) {
+            let seek_called = Rc::new(RefCell::new(false));
+            let iter = Self {
+                data,
+                pos: -1, // Not initialized
+                seek_called: Rc::clone(&seek_called),
+            };
+            (iter, seek_called)
+        }
+
+        fn new_with_tracker(
+            _name: &str,
+            data: Vec<(MvccKey, Vec<u8>)>,
+            seek_called: Rc<RefCell<bool>>,
+        ) -> Self {
+            Self {
+                data,
+                pos: -1,
+                seek_called,
+            }
+        }
+    }
+
+    impl MvccIterator for MockMvccIterator {
+        fn seek(&mut self, target: &MvccKey) -> Result<()> {
+            *self.seek_called.borrow_mut() = true;
+            // Binary search for first key >= target
+            self.pos = self
+                .data
+                .iter()
+                .position(|(k, _)| k >= target)
+                .map(|p| p as i32)
+                .unwrap_or(self.data.len() as i32);
+            Ok(())
+        }
+
+        fn next(&mut self) -> Result<()> {
+            if self.pos >= 0 {
+                self.pos += 1;
+            }
+            Ok(())
+        }
+
+        fn valid(&self) -> bool {
+            self.pos >= 0 && (self.pos as usize) < self.data.len()
+        }
+
+        fn key(&self) -> &MvccKey {
+            &self.data[self.pos as usize].0
+        }
+
+        fn value(&self) -> &[u8] {
+            &self.data[self.pos as usize].1
+        }
+    }
+
+    /// Helper to create an MvccKey for testing.
+    fn test_key(user_key: &[u8], ts: Timestamp) -> MvccKey {
+        MvccKey::encode(user_key, ts)
+    }
+
+    #[test]
+    fn test_tiered_merge_iterator_memtable_only() {
+        // Test that when memtable has all data, it's returned correctly
+        let (active_iter, active_seek) = MockMvccIterator::new(
+            "active",
+            vec![
+                (test_key(b"a", 100), b"a_active".to_vec()),
+                (test_key(b"b", 100), b"b_active".to_vec()),
+            ],
+        );
+
+        let mut merge_iter = TieredMergeIterator::new();
+        merge_iter
+            .add_active_memtable(Box::new(active_iter))
+            .unwrap();
+
+        let merge_iter = merge_iter.build().unwrap();
+
+        assert!(*active_seek.borrow(), "Active memtable should be seeked");
+        assert!(merge_iter.valid());
+        assert_eq!(merge_iter.key(), &test_key(b"a", 100));
+        assert_eq!(merge_iter.value(), b"a_active");
+    }
+
+    #[test]
+    fn test_tiered_merge_iterator_tier_order_active_frozen() {
+        // Test that active memtable has priority over frozen memtables
+        // Same key exists in both, active should win
+        let (active_iter, _) = MockMvccIterator::new(
+            "active",
+            vec![(test_key(b"key", 100), b"active_value".to_vec())],
+        );
+
+        let (frozen_iter, _) = MockMvccIterator::new(
+            "frozen",
+            vec![(test_key(b"key", 100), b"frozen_value".to_vec())],
+        );
+
+        let mut merge_iter = TieredMergeIterator::new();
+        merge_iter
+            .add_active_memtable(Box::new(active_iter))
+            .unwrap();
+        merge_iter
+            .add_frozen_memtable(Box::new(frozen_iter), 0)
+            .unwrap();
+
+        let merge_iter = merge_iter.build().unwrap();
+
+        assert!(merge_iter.valid());
+        // Active has priority 0, frozen has priority 100+
+        // For same key, active wins (lower priority number = higher precedence)
+        assert_eq!(merge_iter.value(), b"active_value");
+    }
+
+    #[test]
+    fn test_tiered_merge_iterator_lazy_l0_initialization() {
+        // Test that L0 SST iterators are NOT initialized until memtable is exhausted
+
+        let (active_iter, active_seek) = MockMvccIterator::new(
+            "active",
+            vec![
+                (test_key(b"a", 100), b"a_active".to_vec()),
+                (test_key(b"b", 100), b"b_active".to_vec()),
+            ],
+        );
+
+        let l0_seek = Rc::new(RefCell::new(false));
+        let l0_iter = MockMvccIterator::new_with_tracker(
+            "l0_sst",
+            vec![
+                (test_key(b"c", 100), b"c_l0".to_vec()),
+                (test_key(b"d", 100), b"d_l0".to_vec()),
+            ],
+            Rc::clone(&l0_seek),
+        );
+
+        let mut merge_iter = TieredMergeIterator::new();
+        merge_iter
+            .add_active_memtable(Box::new(active_iter))
+            .unwrap();
+        merge_iter.add_l0_sst(Box::new(l0_iter), 0);
+
+        let mut merge_iter = merge_iter.build().unwrap();
+
+        // After build, only memtable should be initialized
+        assert!(
+            *active_seek.borrow(),
+            "Active memtable should be seeked in build()"
+        );
+        assert!(
+            !*l0_seek.borrow(),
+            "L0 SST should NOT be seeked yet - memtable not exhausted"
+        );
+
+        // Read first memtable entry
+        assert!(merge_iter.valid());
+        assert_eq!(merge_iter.key(), &test_key(b"a", 100));
+        assert!(
+            !*l0_seek.borrow(),
+            "L0 SST should NOT be seeked - still reading memtable"
+        );
+
+        // Read second memtable entry
+        merge_iter.next().unwrap();
+        assert!(merge_iter.valid());
+        assert_eq!(merge_iter.key(), &test_key(b"b", 100));
+        assert!(
+            !*l0_seek.borrow(),
+            "L0 SST should NOT be seeked - still reading memtable"
+        );
+
+        // Memtable exhausted, next should trigger L0 initialization
+        merge_iter.next().unwrap();
+        assert!(
+            *l0_seek.borrow(),
+            "L0 SST should be seeked now - memtable exhausted"
+        );
+        assert!(merge_iter.valid());
+        assert_eq!(merge_iter.key(), &test_key(b"c", 100));
+        assert_eq!(merge_iter.value(), b"c_l0");
+    }
+
+    #[test]
+    fn test_tiered_merge_iterator_lazy_level_initialization() {
+        // Test that L1+ level iterators are NOT initialized until L0 is exhausted
+
+        let (active_iter, _) =
+            MockMvccIterator::new("active", vec![(test_key(b"a", 100), b"a_active".to_vec())]);
+
+        let l0_seek = Rc::new(RefCell::new(false));
+        let l0_iter = MockMvccIterator::new_with_tracker(
+            "l0_sst",
+            vec![(test_key(b"b", 100), b"b_l0".to_vec())],
+            Rc::clone(&l0_seek),
+        );
+
+        let l1_seek = Rc::new(RefCell::new(false));
+        let l1_iter = MockMvccIterator::new_with_tracker(
+            "l1_level",
+            vec![(test_key(b"c", 100), b"c_l1".to_vec())],
+            Rc::clone(&l1_seek),
+        );
+
+        let mut merge_iter = TieredMergeIterator::new();
+        merge_iter
+            .add_active_memtable(Box::new(active_iter))
+            .unwrap();
+        merge_iter.add_l0_sst(Box::new(l0_iter), 0);
+        merge_iter.add_level(Box::new(l1_iter), 1);
+
+        let mut merge_iter = merge_iter.build().unwrap();
+
+        // After build, only memtable initialized
+        assert!(!*l0_seek.borrow(), "L0 SST should NOT be seeked yet");
+        assert!(!*l1_seek.borrow(), "L1 level should NOT be seeked yet");
+
+        // Read memtable entry
+        assert!(merge_iter.valid());
+        assert_eq!(merge_iter.key(), &test_key(b"a", 100));
+
+        // Exhaust memtable -> L0 should be initialized
+        merge_iter.next().unwrap();
+        assert!(
+            *l0_seek.borrow(),
+            "L0 SST should be seeked - memtable exhausted"
+        );
+        assert!(
+            !*l1_seek.borrow(),
+            "L1 level should NOT be seeked - L0 not exhausted"
+        );
+        assert!(merge_iter.valid());
+        assert_eq!(merge_iter.key(), &test_key(b"b", 100));
+
+        // Exhaust L0 -> L1 should be initialized
+        merge_iter.next().unwrap();
+        assert!(
+            *l1_seek.borrow(),
+            "L1 level should be seeked - L0 exhausted"
+        );
+        assert!(merge_iter.valid());
+        assert_eq!(merge_iter.key(), &test_key(b"c", 100));
+
+        // Exhaust all
+        merge_iter.next().unwrap();
+        assert!(!merge_iter.valid(), "All tiers exhausted");
+    }
+
+    #[test]
+    fn test_tiered_merge_iterator_l0_unordered_all_considered() {
+        // Test that ALL L0 SST files are considered during merge.
+        // L0 files can have overlapping key ranges, so all must be in the heap.
+
+        // Active memtable is empty to trigger L0 initialization immediately
+        let (active_iter, _) = MockMvccIterator::new("active", vec![]);
+
+        // L0 SSTs with overlapping/unordered key ranges
+        // SST 0: keys a, d (newer, higher priority)
+        let l0_0_seek = Rc::new(RefCell::new(false));
+        let l0_0_iter = MockMvccIterator::new_with_tracker(
+            "l0_sst_0",
+            vec![
+                (test_key(b"a", 100), b"a_l0_0".to_vec()),
+                (test_key(b"d", 100), b"d_l0_0".to_vec()),
+            ],
+            Rc::clone(&l0_0_seek),
+        );
+
+        // SST 1: keys b, c (older, lower priority)
+        let l0_1_seek = Rc::new(RefCell::new(false));
+        let l0_1_iter = MockMvccIterator::new_with_tracker(
+            "l0_sst_1",
+            vec![
+                (test_key(b"b", 100), b"b_l0_1".to_vec()),
+                (test_key(b"c", 100), b"c_l0_1".to_vec()),
+            ],
+            Rc::clone(&l0_1_seek),
+        );
+
+        // SST 2: keys a, e (even older) - 'a' overlaps with SST 0
+        let l0_2_seek = Rc::new(RefCell::new(false));
+        let l0_2_iter = MockMvccIterator::new_with_tracker(
+            "l0_sst_2",
+            vec![
+                (test_key(b"a", 100), b"a_l0_2".to_vec()),
+                (test_key(b"e", 100), b"e_l0_2".to_vec()),
+            ],
+            Rc::clone(&l0_2_seek),
+        );
+
+        let mut merge_iter = TieredMergeIterator::new();
+        merge_iter
+            .add_active_memtable(Box::new(active_iter))
+            .unwrap();
+        // Add in index order: 0 (newest) -> 1 -> 2 (oldest)
+        merge_iter.add_l0_sst(Box::new(l0_0_iter), 0);
+        merge_iter.add_l0_sst(Box::new(l0_1_iter), 1);
+        merge_iter.add_l0_sst(Box::new(l0_2_iter), 2);
+
+        let mut merge_iter = merge_iter.build().unwrap();
+
+        // After build with empty memtable, L0 should be initialized
+        assert!(*l0_0_seek.borrow(), "L0 SST 0 should be seeked");
+        assert!(*l0_1_seek.borrow(), "L0 SST 1 should be seeked");
+        assert!(*l0_2_seek.borrow(), "L0 SST 2 should be seeked");
+
+        // Results should be in sorted order, deduplicating same keys
+        // Key 'a' exists in SST 0 (priority 1000) and SST 2 (priority 1002)
+        // SST 0 has higher priority, so its value should win
+        assert!(merge_iter.valid());
+        assert_eq!(merge_iter.key(), &test_key(b"a", 100));
+        assert_eq!(
+            merge_iter.value(),
+            b"a_l0_0",
+            "SST 0 (higher priority) should win for key 'a'"
+        );
+
+        merge_iter.next().unwrap();
+        assert!(merge_iter.valid());
+        assert_eq!(merge_iter.key(), &test_key(b"b", 100));
+        assert_eq!(merge_iter.value(), b"b_l0_1");
+
+        merge_iter.next().unwrap();
+        assert!(merge_iter.valid());
+        assert_eq!(merge_iter.key(), &test_key(b"c", 100));
+        assert_eq!(merge_iter.value(), b"c_l0_1");
+
+        merge_iter.next().unwrap();
+        assert!(merge_iter.valid());
+        assert_eq!(merge_iter.key(), &test_key(b"d", 100));
+        assert_eq!(merge_iter.value(), b"d_l0_0");
+
+        merge_iter.next().unwrap();
+        assert!(merge_iter.valid());
+        assert_eq!(merge_iter.key(), &test_key(b"e", 100));
+        assert_eq!(merge_iter.value(), b"e_l0_2");
+
+        merge_iter.next().unwrap();
+        assert!(!merge_iter.valid());
+    }
+
+    #[test]
+    fn test_tiered_merge_iterator_seek_initializes_all() {
+        // Test that seek() initializes ALL pending iterators
+
+        let (active_iter, _) =
+            MockMvccIterator::new("active", vec![(test_key(b"z", 100), b"z_active".to_vec())]);
+
+        let l0_seek = Rc::new(RefCell::new(false));
+        let l0_iter = MockMvccIterator::new_with_tracker(
+            "l0_sst",
+            vec![(test_key(b"a", 100), b"a_l0".to_vec())],
+            Rc::clone(&l0_seek),
+        );
+
+        let l1_seek = Rc::new(RefCell::new(false));
+        let l1_iter = MockMvccIterator::new_with_tracker(
+            "l1_level",
+            vec![(test_key(b"b", 100), b"b_l1".to_vec())],
+            Rc::clone(&l1_seek),
+        );
+
+        let mut merge_iter = TieredMergeIterator::new();
+        merge_iter
+            .add_active_memtable(Box::new(active_iter))
+            .unwrap();
+        merge_iter.add_l0_sst(Box::new(l0_iter), 0);
+        merge_iter.add_level(Box::new(l1_iter), 1);
+
+        let mut merge_iter = merge_iter.build().unwrap();
+
+        // After build, only memtable initialized
+        assert!(
+            !*l0_seek.borrow(),
+            "L0 SST should NOT be seeked after build"
+        );
+        assert!(
+            !*l1_seek.borrow(),
+            "L1 level should NOT be seeked after build"
+        );
+
+        // Seek to a specific key - this should initialize ALL iterators
+        merge_iter.seek(&test_key(b"a", 100)).unwrap();
+
+        assert!(*l0_seek.borrow(), "L0 SST should be seeked after seek()");
+        assert!(*l1_seek.borrow(), "L1 level should be seeked after seek()");
+
+        // Should be positioned at 'a' from L0
+        assert!(merge_iter.valid());
+        assert_eq!(merge_iter.key(), &test_key(b"a", 100));
+    }
+
+    #[test]
+    fn test_tiered_merge_iterator_full_tier_flow() {
+        // Test the complete flow: active -> frozen -> L0 -> L1 -> L2
+        // Each tier has unique keys to verify the flow
+
+        let (active_iter, _) = MockMvccIterator::new(
+            "active",
+            vec![(test_key(b"01_active", 100), b"v_active".to_vec())],
+        );
+
+        let (frozen0_iter, _) = MockMvccIterator::new(
+            "frozen0",
+            vec![(test_key(b"02_frozen0", 100), b"v_frozen0".to_vec())],
+        );
+
+        let (frozen1_iter, _) = MockMvccIterator::new(
+            "frozen1",
+            vec![(test_key(b"03_frozen1", 100), b"v_frozen1".to_vec())],
+        );
+
+        let l0_seek = Rc::new(RefCell::new(false));
+        let l0_iter = MockMvccIterator::new_with_tracker(
+            "l0_sst",
+            vec![(test_key(b"04_l0", 100), b"v_l0".to_vec())],
+            Rc::clone(&l0_seek),
+        );
+
+        let l1_seek = Rc::new(RefCell::new(false));
+        let l1_iter = MockMvccIterator::new_with_tracker(
+            "l1_level",
+            vec![(test_key(b"05_l1", 100), b"v_l1".to_vec())],
+            Rc::clone(&l1_seek),
+        );
+
+        let l2_seek = Rc::new(RefCell::new(false));
+        let l2_iter = MockMvccIterator::new_with_tracker(
+            "l2_level",
+            vec![(test_key(b"06_l2", 100), b"v_l2".to_vec())],
+            Rc::clone(&l2_seek),
+        );
+
+        let mut merge_iter = TieredMergeIterator::new();
+        merge_iter
+            .add_active_memtable(Box::new(active_iter))
+            .unwrap();
+        merge_iter
+            .add_frozen_memtable(Box::new(frozen0_iter), 0)
+            .unwrap();
+        merge_iter
+            .add_frozen_memtable(Box::new(frozen1_iter), 1)
+            .unwrap();
+        merge_iter.add_l0_sst(Box::new(l0_iter), 0);
+        merge_iter.add_level(Box::new(l1_iter), 1);
+        merge_iter.add_level(Box::new(l2_iter), 2);
+
+        let mut merge_iter = merge_iter.build().unwrap();
+
+        // Verify tier flow
+        assert!(merge_iter.valid());
+        assert_eq!(merge_iter.value(), b"v_active");
+        assert!(!*l0_seek.borrow() && !*l1_seek.borrow() && !*l2_seek.borrow());
+
+        merge_iter.next().unwrap();
+        assert!(merge_iter.valid());
+        assert_eq!(merge_iter.value(), b"v_frozen0");
+        assert!(!*l0_seek.borrow());
+
+        merge_iter.next().unwrap();
+        assert!(merge_iter.valid());
+        assert_eq!(merge_iter.value(), b"v_frozen1");
+        assert!(!*l0_seek.borrow());
+
+        // Memtable tier exhausted, L0 should be initialized
+        merge_iter.next().unwrap();
+        assert!(merge_iter.valid());
+        assert_eq!(merge_iter.value(), b"v_l0");
+        assert!(*l0_seek.borrow());
+        assert!(!*l1_seek.borrow() && !*l2_seek.borrow());
+
+        // L0 exhausted, L1+ should be initialized
+        merge_iter.next().unwrap();
+        assert!(merge_iter.valid());
+        assert_eq!(merge_iter.value(), b"v_l1");
+        assert!(*l1_seek.borrow() && *l2_seek.borrow());
+
+        merge_iter.next().unwrap();
+        assert!(merge_iter.valid());
+        assert_eq!(merge_iter.value(), b"v_l2");
+
+        merge_iter.next().unwrap();
+        assert!(!merge_iter.valid());
+    }
+
+    #[test]
+    fn test_tiered_merge_iterator_priority_deduplication() {
+        // Test that higher priority source wins for duplicate keys
+        // Priority order: active (0) > frozen (100+) > L0 (1000+) > L1+ (10000+)
+
+        let (active_iter, _) = MockMvccIterator::new(
+            "active",
+            vec![(test_key(b"key", 100), b"active_wins".to_vec())],
+        );
+
+        let (frozen_iter, _) = MockMvccIterator::new(
+            "frozen",
+            vec![(test_key(b"key", 100), b"frozen_loses".to_vec())],
+        );
+
+        let l0_seek = Rc::new(RefCell::new(false));
+        let l0_iter = MockMvccIterator::new_with_tracker(
+            "l0_sst",
+            vec![(test_key(b"key", 100), b"l0_loses".to_vec())],
+            Rc::clone(&l0_seek),
+        );
+
+        let mut merge_iter = TieredMergeIterator::new();
+        merge_iter
+            .add_active_memtable(Box::new(active_iter))
+            .unwrap();
+        merge_iter
+            .add_frozen_memtable(Box::new(frozen_iter), 0)
+            .unwrap();
+        merge_iter.add_l0_sst(Box::new(l0_iter), 0);
+
+        let mut merge_iter = merge_iter.build().unwrap();
+
+        // Only active's value should be returned
+        assert!(merge_iter.valid());
+        assert_eq!(merge_iter.key(), &test_key(b"key", 100));
+        assert_eq!(merge_iter.value(), b"active_wins");
+
+        // Next should exhaust all (duplicates were skipped)
+        merge_iter.next().unwrap();
+
+        // L0 might be initialized during the exhaustion process
+        // but its duplicate entry should have been skipped
+        assert!(!merge_iter.valid());
+    }
+
+    #[test]
+    fn test_tiered_merge_iterator_empty_memtable_immediate_l0() {
+        // Test that if memtable is empty, L0 is initialized immediately
+
+        let (active_iter, _) = MockMvccIterator::new("active", vec![]);
+
+        let l0_seek = Rc::new(RefCell::new(false));
+        let l0_iter = MockMvccIterator::new_with_tracker(
+            "l0_sst",
+            vec![(test_key(b"a", 100), b"a_l0".to_vec())],
+            Rc::clone(&l0_seek),
+        );
+
+        let mut merge_iter = TieredMergeIterator::new();
+        merge_iter
+            .add_active_memtable(Box::new(active_iter))
+            .unwrap();
+        merge_iter.add_l0_sst(Box::new(l0_iter), 0);
+
+        let merge_iter = merge_iter.build().unwrap();
+
+        // Memtable was empty, so L0 should be initialized during build/advance
+        assert!(
+            *l0_seek.borrow(),
+            "L0 should be seeked when memtable is empty"
+        );
+        assert!(merge_iter.valid());
+        assert_eq!(merge_iter.key(), &test_key(b"a", 100));
+    }
+
+    #[test]
+    fn test_tiered_merge_iterator_multiple_frozen_memtables() {
+        // Test multiple frozen memtables are merged correctly in order
+
+        let (active_iter, _) =
+            MockMvccIterator::new("active", vec![(test_key(b"a", 100), b"a_active".to_vec())]);
+
+        // Frozen memtables: index 0 is newest, higher indices are older
+        let (frozen0_iter, _) = MockMvccIterator::new(
+            "frozen0",
+            vec![
+                (test_key(b"b", 100), b"b_frozen0".to_vec()),
+                (test_key(b"shared", 100), b"shared_frozen0".to_vec()),
+            ],
+        );
+
+        let (frozen1_iter, _) = MockMvccIterator::new(
+            "frozen1",
+            vec![
+                (test_key(b"c", 100), b"c_frozen1".to_vec()),
+                (test_key(b"shared", 100), b"shared_frozen1".to_vec()),
+            ],
+        );
+
+        let mut merge_iter = TieredMergeIterator::new();
+        merge_iter
+            .add_active_memtable(Box::new(active_iter))
+            .unwrap();
+        merge_iter
+            .add_frozen_memtable(Box::new(frozen0_iter), 0)
+            .unwrap();
+        merge_iter
+            .add_frozen_memtable(Box::new(frozen1_iter), 1)
+            .unwrap();
+
+        let mut merge_iter = merge_iter.build().unwrap();
+
+        // Should get: a, b, c, shared (from frozen0 - higher priority)
+        assert!(merge_iter.valid());
+        assert_eq!(merge_iter.key(), &test_key(b"a", 100));
+
+        merge_iter.next().unwrap();
+        assert_eq!(merge_iter.key(), &test_key(b"b", 100));
+
+        merge_iter.next().unwrap();
+        assert_eq!(merge_iter.key(), &test_key(b"c", 100));
+
+        merge_iter.next().unwrap();
+        assert_eq!(merge_iter.key(), &test_key(b"shared", 100));
+        // frozen0 (priority 100) beats frozen1 (priority 101)
+        assert_eq!(merge_iter.value(), b"shared_frozen0");
+
+        merge_iter.next().unwrap();
+        assert!(!merge_iter.valid());
+    }
+
+    #[test]
+    fn test_tiered_merge_iterator_all_empty() {
+        // Test when all tiers are empty
+
+        let (active_iter, _) = MockMvccIterator::new("active", vec![]);
+
+        let l0_seek = Rc::new(RefCell::new(false));
+        let l0_iter = MockMvccIterator::new_with_tracker("l0_sst", vec![], Rc::clone(&l0_seek));
+
+        let l1_seek = Rc::new(RefCell::new(false));
+        let l1_iter = MockMvccIterator::new_with_tracker("l1_level", vec![], Rc::clone(&l1_seek));
+
+        let mut merge_iter = TieredMergeIterator::new();
+        merge_iter
+            .add_active_memtable(Box::new(active_iter))
+            .unwrap();
+        merge_iter.add_l0_sst(Box::new(l0_iter), 0);
+        merge_iter.add_level(Box::new(l1_iter), 1);
+
+        let merge_iter = merge_iter.build().unwrap();
+
+        // All tiers should be initialized (empty memtable triggers cascade)
+        assert!(*l0_seek.borrow(), "L0 should be initialized");
+        assert!(*l1_seek.borrow(), "L1 should be initialized");
+        assert!(!merge_iter.valid(), "Should be invalid - all empty");
+    }
+
+    #[test]
+    fn test_tiered_merge_iterator_interleaved_keys() {
+        // Test that keys from different tiers are properly interleaved in sorted order
+
+        let (active_iter, _) = MockMvccIterator::new(
+            "active",
+            vec![
+                (test_key(b"b", 100), b"b_active".to_vec()),
+                (test_key(b"d", 100), b"d_active".to_vec()),
+            ],
+        );
+
+        let (frozen_iter, _) = MockMvccIterator::new(
+            "frozen",
+            vec![
+                (test_key(b"a", 100), b"a_frozen".to_vec()),
+                (test_key(b"c", 100), b"c_frozen".to_vec()),
+            ],
+        );
+
+        let mut merge_iter = TieredMergeIterator::new();
+        merge_iter
+            .add_active_memtable(Box::new(active_iter))
+            .unwrap();
+        merge_iter
+            .add_frozen_memtable(Box::new(frozen_iter), 0)
+            .unwrap();
+
+        let mut merge_iter = merge_iter.build().unwrap();
+
+        // Should be sorted: a, b, c, d
+        let expected = [
+            (b"a", b"a_frozen"),
+            (b"b", b"b_active"),
+            (b"c", b"c_frozen"),
+            (b"d", b"d_active"),
+        ];
+
+        for (key, value) in expected.iter() {
+            assert!(merge_iter.valid());
+            assert_eq!(merge_iter.key(), &test_key(*key, 100));
+            assert_eq!(merge_iter.value(), *value);
+            merge_iter.next().unwrap();
+        }
+
+        assert!(!merge_iter.valid());
+    }
+
+    #[test]
+    fn test_lsm_engine_scan_iter_tiered_lazy_loading() {
+        // Integration test: verify that LsmEngine's scan_iter uses tiered lazy loading
+        // When all data is in memtable, SST files should not be opened
+
+        let tmp = TempDir::new().unwrap();
+        let config = LsmConfig::builder(tmp.path())
+            .memtable_size(4096)
+            .max_frozen_memtables(4)
+            .build()
+            .unwrap();
+
+        let engine = LsmEngine::open(config).unwrap();
+
+        // Write some data to memtable
+        let mut batch = new_batch(100);
+        batch.put(b"key1".to_vec(), b"value1".to_vec());
+        batch.put(b"key2".to_vec(), b"value2".to_vec());
+        engine.write_batch(batch).unwrap();
+
+        // Use scan_iter (streaming) to read
+        let range = MvccKey::encode(b"key1", Timestamp::MAX)..MvccKey::encode(b"key3", 0);
+        let mut iter = engine.scan_iter(range).unwrap();
+
+        // Should be able to read from memtable
+        assert!(iter.valid());
+        let (key1, _) = iter.key().decode();
+        assert_eq!(key1, b"key1");
+
+        iter.next().unwrap();
+        assert!(iter.valid());
+        let (key2, _) = iter.key().decode();
+        assert_eq!(key2, b"key2");
+
+        iter.next().unwrap();
+        assert!(!iter.valid());
+    }
+
+    #[test]
+    fn test_lsm_engine_scan_iter_with_sst_lazy_loading() {
+        // Integration test: verify SST data is loaded lazily when memtable doesn't have the key
+
+        let tmp = TempDir::new().unwrap();
+        let config = LsmConfig::builder(tmp.path())
+            .memtable_size(100) // Small to force flush
+            .max_frozen_memtables(2)
+            .build()
+            .unwrap();
+
+        let engine = LsmEngine::open(config).unwrap();
+
+        // Write data that will be flushed to SST
+        for i in 0..5 {
+            let mut batch = new_batch(i as Timestamp + 1);
+            let key = format!("old_key_{i:04}");
+            let value = format!("old_value_{i:04}");
+            batch.put(key.as_bytes().to_vec(), value.as_bytes().to_vec());
+            engine.write_batch(batch).unwrap();
+        }
+
+        // Flush to SST
+        engine.flush_all_with_active().unwrap();
+
+        // Write new data to memtable
+        let mut batch = new_batch(100);
+        batch.put(b"new_key".to_vec(), b"new_value".to_vec());
+        engine.write_batch(batch).unwrap();
+
+        // Scan for the new key first (should hit memtable only)
+        let range = MvccKey::encode(b"new_key", Timestamp::MAX)..MvccKey::encode(b"new_key\xff", 0);
+        let mut iter = engine.scan_iter(range).unwrap();
+
+        assert!(iter.valid());
+        let (key, _) = iter.key().decode();
+        assert_eq!(key, b"new_key");
+
+        iter.next().unwrap();
+        assert!(!iter.valid());
+
+        // Scan for old keys (will need SST)
+        let range = MvccKey::encode(b"old_key", Timestamp::MAX)..MvccKey::encode(b"old_key\xff", 0);
+        let mut iter = engine.scan_iter(range).unwrap();
+
+        // Should find all old keys from SST
+        let mut count = 0;
+        while iter.valid() {
+            count += 1;
+            iter.next().unwrap();
+        }
+        assert_eq!(count, 5, "Should find all 5 old keys from SST");
     }
 }
