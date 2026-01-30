@@ -293,7 +293,7 @@ impl<T: TxnService> Catalog for MvccCatalog<T> {
         let start = vec![META_PREFIX, META_SCHEMA];
         let end = vec![META_PREFIX, META_SCHEMA + 1];
 
-        let iter = self.txn_service.scan(&ctx, start..end)?;
+        let iter = self.txn_service.scan_iter(&ctx, start..end)?;
         let entries: Vec<_> = iter.collect::<Result<Vec<_>>>()?;
         let schemas: Vec<String> = entries
             .into_iter()
@@ -450,7 +450,7 @@ impl<T: TxnService> Catalog for MvccCatalog<T> {
             *last = last.saturating_add(1);
         }
 
-        let iter = self.txn_service.scan(&ctx, prefix.clone()..end)?;
+        let iter = self.txn_service.scan_iter(&ctx, prefix.clone()..end)?;
         let mut tables = Vec::new();
 
         for result in iter {
@@ -701,7 +701,7 @@ impl<T: TxnService> Catalog for MvccCatalog<T> {
             *last = last.saturating_add(1);
         }
 
-        let iter = self.txn_service.scan(&ctx, prefix.clone()..end)?;
+        let iter = self.txn_service.scan_iter(&ctx, prefix.clone()..end)?;
         let mut tables = Vec::new();
 
         for result in iter {

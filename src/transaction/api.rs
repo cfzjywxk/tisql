@@ -142,7 +142,7 @@ impl TxnCtx {
 /// // CORRECT: MVCC-aware read with transaction semantics
 /// let ctx = txn_service.begin(true)?;  // read-only transaction
 /// let value = txn_service.get(&ctx, key)?;
-/// let iter = txn_service.scan(&ctx, range)?;
+/// let iter = txn_service.scan_iter(&ctx, range)?;
 ///
 /// // WRONG: Bypasses MVCC visibility rules
 /// let value = storage.get(key)?;  // DON'T DO THIS
@@ -190,7 +190,7 @@ pub trait TxnService: Send + Sync {
     /// For read-only transactions, this reads directly from storage.
     fn get(&self, ctx: &TxnCtx, key: &[u8]) -> Result<Option<RawValue>>;
 
-    /// Scan a range of keys within the transaction.
+    /// Scan a range of keys within the transaction (streaming).
     ///
     /// For read-write transactions, this merges buffered writes with storage,
     /// implementing read-your-writes semantics.
@@ -198,7 +198,7 @@ pub trait TxnService: Send + Sync {
     /// Returns an iterator over key-value pairs visible at `start_ts`.
     /// Each item is wrapped in `Result` to propagate I/O or corruption errors
     /// that may occur during streaming iteration over storage.
-    fn scan(&self, ctx: &TxnCtx, range: Range<Key>) -> Result<ScanIterator<'_>>;
+    fn scan_iter(&self, ctx: &TxnCtx, range: Range<Key>) -> Result<ScanIterator<'_>>;
 
     /// Buffer a put operation.
     ///

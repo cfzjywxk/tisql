@@ -39,7 +39,6 @@ use std::time::Instant;
 use crate::error::Result;
 use crate::storage::mvcc::MvccKey;
 use crate::storage::{StorageEngine, WriteBatch};
-use crate::types::RawValue;
 
 use super::VersionedMemTableEngine;
 
@@ -249,16 +248,6 @@ fn estimate_batch_size(batch: &WriteBatch) -> usize {
         .sum()
 }
 
-impl MemTable {
-    /// Scan MVCC keys in range (materializing version).
-    ///
-    /// This is provided for convenience in tests and internal use.
-    /// For production code, prefer `scan_iter()` which provides streaming.
-    pub fn scan(&self, range: Range<MvccKey>) -> Result<Vec<(MvccKey, RawValue)>> {
-        self.inner.scan(range)
-    }
-}
-
 // Implement StorageEngine for MemTable to allow transparent use
 impl StorageEngine for MemTable {
     fn scan_iter(
@@ -281,7 +270,7 @@ impl StorageEngine for MemTable {
 mod tests {
     use super::*;
     use crate::storage::mvcc::is_tombstone;
-    use crate::types::{Key, Timestamp};
+    use crate::types::{Key, RawValue, Timestamp};
 
     fn new_batch(commit_ts: Timestamp) -> WriteBatch {
         let mut batch = WriteBatch::new();
@@ -299,7 +288,7 @@ mod tests {
             .unwrap_or_else(MvccKey::unbounded);
         let range = start..end;
 
-        let results = mt.scan(range).unwrap();
+        let results = mt.inner().scan(range).unwrap();
 
         for (mvcc_key, value) in results {
             let (decoded_key, entry_ts) = mvcc_key.decode();
@@ -322,7 +311,7 @@ mod tests {
         let end = MvccKey::encode(&range.end, 0);
         let mvcc_range = start..end;
 
-        let results = mt.scan(mvcc_range).unwrap();
+        let results = mt.inner().scan(mvcc_range).unwrap();
 
         let mut seen_keys: std::collections::HashSet<Key> = std::collections::HashSet::new();
         let mut output = Vec::new();

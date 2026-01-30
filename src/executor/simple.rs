@@ -238,7 +238,7 @@ impl SimpleExecutor {
                     .collect();
 
                 // Scan using transaction service (reads at start_ts)
-                let iter = txn_service.scan(ctx, start_key..end_key)?;
+                let iter = txn_service.scan_iter(ctx, start_key..end_key)?;
 
                 let mut rows = Vec::new();
                 for result in iter {
@@ -497,7 +497,7 @@ impl SimpleExecutor {
 
                 // Scan using transaction's snapshot (reads at start_ts)
                 // Use streaming iteration - process one row at a time
-                let iter = txn_service.scan(ctx, start_key..end_key)?;
+                let iter = txn_service.scan_iter(ctx, start_key..end_key)?;
 
                 for result in iter {
                     let (key, value) = result?;
@@ -541,7 +541,7 @@ impl SimpleExecutor {
 
                 // Scan using transaction's snapshot
                 // Use streaming iteration - process one row at a time
-                let iter = txn_service.scan(ctx, start_key..end_key)?;
+                let iter = txn_service.scan_iter(ctx, start_key..end_key)?;
 
                 for result in iter {
                     let (key, value) = result?;

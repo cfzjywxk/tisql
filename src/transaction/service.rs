@@ -274,7 +274,7 @@ impl<S: StorageEngine + 'static, L: ClogService + 'static, T: TsoService> TxnSer
         Ok(None)
     }
 
-    fn scan(&self, ctx: &TxnCtx, range: Range<Key>) -> Result<ScanIterator<'_>> {
+    fn scan_iter(&self, ctx: &TxnCtx, range: Range<Key>) -> Result<ScanIterator<'_>> {
         // Check for locks in range.
         //
         // Note: empty end (vec![]) means "unbounded" (scan to infinity), not empty range.
@@ -1064,7 +1064,7 @@ mod tests {
 
         // Scan should see all data
         let results: Vec<_> = txn_service
-            .scan(&ctx, b"a".to_vec()..b"d".to_vec())
+            .scan_iter(&ctx, b"a".to_vec()..b"d".to_vec())
             .unwrap()
             .collect::<Result<Vec<_>>>()
             .unwrap();
@@ -1100,7 +1100,7 @@ mod tests {
 
         // Scan should merge buffered writes with storage (read-your-writes)
         let results: Vec<_> = txn_service
-            .scan(&ctx, b"a".to_vec()..b"d".to_vec())
+            .scan_iter(&ctx, b"a".to_vec()..b"d".to_vec())
             .unwrap()
             .collect::<Result<Vec<_>>>()
             .unwrap();
@@ -1420,7 +1420,7 @@ mod tests {
         );
 
         // Unbounded end scan (empty vec) should check locks and fail
-        let result = txn_service.scan(&read_ctx, b"a".to_vec()..vec![]);
+        let result = txn_service.scan_iter(&read_ctx, b"a".to_vec()..vec![]);
         match result {
             Err(TiSqlError::KeyIsLocked { key, .. }) => {
                 assert_eq!(key, b"b", "should be locked on key 'b'");
@@ -1430,7 +1430,7 @@ mod tests {
         }
 
         // Bounded scan containing the locked key should also fail
-        let result = txn_service.scan(&read_ctx, b"a".to_vec()..b"d".to_vec());
+        let result = txn_service.scan_iter(&read_ctx, b"a".to_vec()..b"d".to_vec());
         match result {
             Err(TiSqlError::KeyIsLocked { .. }) => {}
             Err(e) => panic!("expected KeyIsLocked, got {e:?}"),
@@ -1438,7 +1438,7 @@ mod tests {
         }
 
         // Bounded scan NOT containing the locked key should succeed
-        let result = txn_service.scan(&read_ctx, b"c".to_vec()..b"d".to_vec());
+        let result = txn_service.scan_iter(&read_ctx, b"c".to_vec()..b"d".to_vec());
         assert!(
             result.is_ok(),
             "scan not containing locked key should succeed"
@@ -1449,7 +1449,7 @@ mod tests {
 
         // Now the scan should succeed
         let new_read_ctx = txn_service.begin(true).unwrap();
-        let result = txn_service.scan(&new_read_ctx, b"a".to_vec()..vec![]);
+        let result = txn_service.scan_iter(&new_read_ctx, b"a".to_vec()..vec![]);
         assert!(result.is_ok(), "scan should succeed after lock released");
     }
 }

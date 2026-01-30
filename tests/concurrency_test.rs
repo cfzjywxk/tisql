@@ -36,6 +36,7 @@ use tisql::testkit::{
     TransactionService, TxnServiceTestExt,
 };
 use tisql::types::{RawValue, Timestamp};
+use tisql::StorageEngine;
 
 // ==================== Test Helpers Using MvccKey ====================
 
@@ -46,16 +47,20 @@ fn get_at_for_test(storage: &MemTableEngine, key: &[u8], ts: Timestamp) -> Optio
         .unwrap_or_else(MvccKey::unbounded);
     let range = start..end;
 
-    let results = storage.scan(range).unwrap();
+    // Use streaming scan_iter() - process one entry at a time
+    let mut iter = storage.scan_iter(range).unwrap();
 
-    for (mvcc_key, value) in results {
+    while iter.valid() {
+        let mvcc_key = iter.key();
         let (decoded_key, entry_ts) = mvcc_key.decode();
         if decoded_key == key && entry_ts <= ts {
+            let value = iter.value().to_vec();
             if is_tombstone(&value) {
                 return None;
             }
             return Some(value);
         }
+        iter.next().unwrap();
     }
     None
 }
@@ -716,7 +721,7 @@ fn test_write_buffer_dedup_with_scan() {
     // Scan should show: a=a2, c=c1 (b is deleted)
     let range = b"a".to_vec()..b"d".to_vec();
     let results: Vec<_> = txn_service
-        .scan(&ctx, range)
+        .scan_iter(&ctx, range)
         .unwrap()
         .collect::<Result<Vec<_>, _>>()
         .unwrap();

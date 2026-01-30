@@ -28,7 +28,7 @@
 //! // CORRECT: Use TxnService for reads
 //! let ctx = txn_service.begin(true)?;  // read-only transaction
 //! let value = txn_service.get(&ctx, key)?;
-//! let iter = txn_service.scan(&ctx, range)?;
+//! let iter = txn_service.scan_iter(&ctx, range)?;
 //!
 //! // WRONG: Direct storage access bypasses MVCC and buffered writes
 //! let value = storage.get(key)?;  // DON'T DO THIS

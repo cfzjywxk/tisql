@@ -1376,12 +1376,12 @@ impl LsmEngine {
         // 2. Add frozen memtable iterators (newest to oldest)
         // Memtable iterators are infallible, wrap items in Ok
         for memtable in &frozen {
-            let mem_iter = memtable.scan(range.clone())?;
+            let mem_iter = memtable.inner().scan(range.clone())?;
             iters.push(Box::new(mem_iter.into_iter().map(Ok)));
         }
 
         // 3. Add active memtable iterator
-        let active_iter = active.scan(range.clone())?;
+        let active_iter = active.inner().scan(range.clone())?;
         iters.push(Box::new(active_iter.into_iter().map(Ok)));
 
         // Use a merge iterator to get sorted results efficiently

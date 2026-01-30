@@ -394,9 +394,9 @@ impl VersionedMemTableEngine {
     /// and tombstones. Keys are returned in `MvccKey` format for compatibility
     /// with the rest of the storage layer.
     ///
-    /// This is provided for convenience in tests and internal use.
-    /// For production code, prefer `scan_iter()` which provides streaming.
-    pub fn scan(&self, range: Range<MvccKey>) -> Result<Vec<(MvccKey, RawValue)>> {
+    /// This is for internal use only (flush, iterator construction).
+    /// External code should use `scan_iter()` for streaming iteration.
+    pub(crate) fn scan(&self, range: Range<MvccKey>) -> Result<Vec<(MvccKey, RawValue)>> {
         let mut results = Vec::new();
 
         // Handle truly unbounded range
