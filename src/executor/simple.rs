@@ -496,10 +496,11 @@ impl SimpleExecutor {
                 let mut count = 0u64;
 
                 // Scan using transaction's snapshot (reads at start_ts)
+                // Use streaming iteration - process one row at a time
                 let iter = txn_service.scan(ctx, start_key..end_key)?;
-                let entries: Vec<_> = iter.collect::<Result<Vec<_>>>()?;
 
-                for (key, value) in entries {
+                for result in iter {
+                    let (key, value) = result?;
                     let values = decode_row_to_values(&value, &col_ids, &data_types)?;
                     let row = Row::new(values);
 
@@ -539,10 +540,11 @@ impl SimpleExecutor {
                 let mut count = 0u64;
 
                 // Scan using transaction's snapshot
+                // Use streaming iteration - process one row at a time
                 let iter = txn_service.scan(ctx, start_key..end_key)?;
-                let entries: Vec<_> = iter.collect::<Result<Vec<_>>>()?;
 
-                for (key, value) in entries {
+                for result in iter {
+                    let (key, value) = result?;
                     let values = decode_row_to_values(&value, &col_ids, &data_types)?;
                     let mut row = Row::new(values);
 

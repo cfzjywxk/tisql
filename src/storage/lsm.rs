@@ -569,8 +569,13 @@ impl LsmEngine {
 
 use std::collections::BinaryHeap;
 
+// ============================================================================
+// Test-only types for LsmEngine::scan() - materializing version
+// ============================================================================
+
 // Wrapper for SstIterator to implement the standard Iterator trait.
 // Returns Result items to properly propagate I/O errors during iteration.
+#[cfg(test)]
 struct SstIteratorWrapper {
     iter: SstIterator,
     range: Range<MvccKey>,
@@ -579,6 +584,7 @@ struct SstIteratorWrapper {
     errored: bool,
 }
 
+#[cfg(test)]
 impl SstIteratorWrapper {
     fn new(mut iter: SstIterator, range: Range<MvccKey>) -> Result<Self> {
         let is_unbounded = range.start.is_unbounded() && range.end.is_unbounded();
@@ -594,6 +600,7 @@ impl SstIteratorWrapper {
     }
 }
 
+#[cfg(test)]
 impl Iterator for SstIteratorWrapper {
     type Item = Result<(MvccKey, RawValue)>;
 
@@ -641,9 +648,11 @@ impl Iterator for SstIteratorWrapper {
 
 /// Iterator item type used throughout the merge process.
 /// Using Result allows proper error propagation from SST I/O operations.
+#[cfg(test)]
 type ScanItem = Result<(MvccKey, RawValue)>;
 
 // A wrapper for any iterator to be used in the merge heap.
+#[cfg(test)]
 struct HeapEntry {
     /// The current item. For heap ordering we need the key, so we store Ok items.
     /// Errors are handled separately in ScanMergeIterator.
@@ -651,20 +660,24 @@ struct HeapEntry {
     iter: Box<dyn Iterator<Item = ScanItem>>,
 }
 
+#[cfg(test)]
 impl PartialEq for HeapEntry {
     fn eq(&self, other: &Self) -> bool {
         self.item.0 == other.item.0
     }
 }
 
+#[cfg(test)]
 impl Eq for HeapEntry {}
 
+#[cfg(test)]
 impl PartialOrd for HeapEntry {
     fn partial_cmp(&self, other: &Self) -> Option<std::cmp::Ordering> {
         Some(self.cmp(other))
     }
 }
 
+#[cfg(test)]
 impl Ord for HeapEntry {
     fn cmp(&self, other: &Self) -> std::cmp::Ordering {
         // Min-heap, so we reverse the comparison to get the smallest key
@@ -673,6 +686,7 @@ impl Ord for HeapEntry {
 }
 
 // The merge iterator that properly propagates errors from underlying iterators.
+#[cfg(test)]
 struct ScanMergeIterator {
     heap: BinaryHeap<HeapEntry>,
     /// Stores the first error encountered during initialization.
@@ -680,6 +694,7 @@ struct ScanMergeIterator {
     init_error: Option<TiSqlError>,
 }
 
+#[cfg(test)]
 impl ScanMergeIterator {
     fn new(iters: Vec<Box<dyn Iterator<Item = ScanItem>>>) -> Self {
         let mut heap = BinaryHeap::new();
@@ -706,6 +721,7 @@ impl ScanMergeIterator {
     }
 }
 
+#[cfg(test)]
 impl Iterator for ScanMergeIterator {
     type Item = ScanItem;
 
@@ -1126,14 +1142,16 @@ impl MvccIterator for LsmMergeIterator<'_> {
     }
 }
 
+/// Test-only impl block for LsmEngine::scan() - materializing version.
+#[cfg(test)]
 impl LsmEngine {
     /// Scan MVCC keys in range (materializing version).
     ///
     /// Returns all MVCC key-value pairs in the given range, including all versions
     /// and tombstones. Keys are in `MvccKey` format (`key || !commit_ts`).
     ///
-    /// This is provided for convenience in tests and internal use.
-    /// For production code, prefer `scan_iter()` which provides streaming.
+    /// This is provided for convenience in tests only.
+    /// For production code, use `scan_iter()` which provides streaming.
     pub fn scan(&self, range: Range<MvccKey>) -> Result<Vec<(MvccKey, RawValue)>> {
         let (active, frozen, version) = {
             let state = self.state.read().unwrap();

@@ -48,16 +48,20 @@ fn get_at_for_test(engine: &LsmEngine, key: &[u8], ts: Timestamp) -> Option<RawV
         .unwrap_or_else(MvccKey::unbounded);
     let range = start..end;
 
-    let results = engine.scan(range).unwrap();
+    // Use streaming scan_iter() - process one entry at a time
+    let mut iter = engine.scan_iter(range).unwrap();
 
-    for (mvcc_key, value) in results {
+    while iter.valid() {
+        let mvcc_key = iter.key();
         let (decoded_key, entry_ts) = mvcc_key.decode();
         if decoded_key == key && entry_ts <= ts {
+            let value = iter.value().to_vec();
             if is_tombstone(&value) {
                 return None;
             }
             return Some(value);
         }
+        iter.next().unwrap();
     }
     None
 }
@@ -75,13 +79,20 @@ fn scan_at_for_test(
     let end = MvccKey::encode(&range.end, ts);
     let mvcc_range = start..end;
 
-    let results = engine.scan(mvcc_range).unwrap();
+    // Use streaming scan_iter() - process one entry at a time
+    let mut iter = engine.scan_iter(mvcc_range).unwrap();
 
     let mut seen_keys: std::collections::HashSet<Vec<u8>> = std::collections::HashSet::new();
     let mut output = Vec::new();
 
-    for (mvcc_key, value) in results {
+    while iter.valid() {
+        let mvcc_key = iter.key();
+        let value = iter.value().to_vec();
         let (decoded_key, entry_ts) = mvcc_key.decode();
+
+        // Move to next before continue checks (so we don't get stuck)
+        iter.next().unwrap();
+
         if decoded_key < range.start || decoded_key >= range.end {
             continue;
         }

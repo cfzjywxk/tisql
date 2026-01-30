@@ -51,16 +51,20 @@ fn get_at_for_test(engine: &LsmEngine, key: &[u8], ts: Timestamp) -> Option<RawV
         .unwrap_or_else(MvccKey::unbounded);
     let range = start..end;
 
-    let results = engine.scan(range).unwrap();
+    // Use streaming scan_iter() - process one entry at a time
+    let mut iter = engine.scan_iter(range).unwrap();
 
-    for (mvcc_key, value) in results {
+    while iter.valid() {
+        let mvcc_key = iter.key();
         let (decoded_key, entry_ts) = mvcc_key.decode();
         if decoded_key == key && entry_ts <= ts {
+            let value = iter.value().to_vec();
             if is_tombstone(&value) {
                 return None;
             }
             return Some(value);
         }
+        iter.next().unwrap();
     }
     None
 }
