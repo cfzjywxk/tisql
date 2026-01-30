@@ -25,6 +25,7 @@ use fail::fail_point;
 
 use crate::clog::{ClogEntry, ClogOp, ClogService};
 use crate::error::{Result, TiSqlError};
+use crate::log_warn;
 use crate::tso::TsoService;
 
 use super::api::{CommitInfo, ScanIterator, TxnCtx, TxnService, TxnState};
@@ -100,26 +101,34 @@ impl<S: StorageEngine, L: ClogService, T: TsoService> TransactionService<S, L, T
         let mut stats = RecoveryStats::default();
         let mut max_ts: Timestamp = 0;
 
-        // First pass: identify committed transactions and find max commit_ts
+        // First pass: identify committed transactions, find max commit_ts,
+        // and build txn metadata (commit_ts, commit LSN, and max LSN per txn)
         let mut committed_txns = std::collections::HashSet::new();
+        let mut txn_commit_ts: std::collections::HashMap<TxnId, Timestamp> =
+            std::collections::HashMap::new();
+        let mut txn_commit_lsn: std::collections::HashMap<TxnId, u64> =
+            std::collections::HashMap::new();
+        let mut txn_max_lsn: std::collections::HashMap<TxnId, u64> =
+            std::collections::HashMap::new();
+
         for entry in entries {
+            // Track max LSN per transaction for recovery ordering
+            txn_max_lsn
+                .entry(entry.txn_id)
+                .and_modify(|lsn| *lsn = (*lsn).max(entry.lsn))
+                .or_insert(entry.lsn);
+
             if let ClogOp::Commit { commit_ts } = entry.op {
                 committed_txns.insert(entry.txn_id);
+                txn_commit_ts.insert(entry.txn_id, commit_ts);
+                txn_commit_lsn.insert(entry.txn_id, entry.lsn);
                 max_ts = max_ts.max(commit_ts);
                 stats.committed_txns += 1;
             }
         }
 
-        // Build a map of txn_id -> commit_ts for applying writes with correct ts
-        let mut txn_commit_ts: std::collections::HashMap<TxnId, Timestamp> =
-            std::collections::HashMap::new();
-        for entry in entries {
-            if let ClogOp::Commit { commit_ts } = entry.op {
-                txn_commit_ts.insert(entry.txn_id, commit_ts);
-            }
-        }
-
-        // Second pass: apply committed operations with their commit_ts
+        // Second pass: apply committed operations with their commit_ts and LSN
+        // Also validate per-txn shape: ops should appear before their Commit record
         for entry in entries {
             if !committed_txns.contains(&entry.txn_id) {
                 stats.rolled_back_entries += 1;
@@ -127,13 +136,29 @@ impl<S: StorageEngine, L: ClogService, T: TsoService> TransactionService<S, L, T
             }
 
             let commit_ts = *txn_commit_ts.get(&entry.txn_id).unwrap_or(&max_ts);
+            // Use the max LSN of the transaction (the commit record's LSN) for proper ordering
+            let lsn = *txn_max_lsn.get(&entry.txn_id).unwrap_or(&entry.lsn);
+
+            // Validate per-txn shape: non-commit ops should have LSN < commit LSN
+            // This detects potential log corruption where ops appear after commit
+            if let Some(&commit_lsn) = txn_commit_lsn.get(&entry.txn_id) {
+                if !matches!(entry.op, ClogOp::Commit { .. }) && entry.lsn > commit_lsn {
+                    log_warn!(
+                        "Recovery: txn {} has op at LSN {} after commit at LSN {} (possible corruption)",
+                        entry.txn_id, entry.lsn, commit_lsn
+                    );
+                    stats.post_commit_ops += 1;
+                    // Still apply the op to preserve all data, but flag it
+                }
+            }
 
             match &entry.op {
                 ClogOp::Put { key, value } => {
-                    // Create a write batch with commit_ts
+                    // Create a write batch with commit_ts and clog LSN
                     let mut batch = WriteBatch::new();
                     batch.put(key.clone(), value.clone());
                     batch.set_commit_ts(commit_ts);
+                    batch.set_clog_lsn(lsn);
                     self.storage.write_batch(batch)?;
                     stats.applied_puts += 1;
                 }
@@ -141,6 +166,7 @@ impl<S: StorageEngine, L: ClogService, T: TsoService> TransactionService<S, L, T
                     let mut batch = WriteBatch::new();
                     batch.delete(key.clone());
                     batch.set_commit_ts(commit_ts);
+                    batch.set_clog_lsn(lsn);
                     self.storage.write_batch(batch)?;
                     stats.applied_deletes += 1;
                 }
@@ -674,6 +700,8 @@ pub struct RecoveryStats {
     pub applied_deletes: u64,
     /// Number of entries from uncommitted transactions (rolled back)
     pub rolled_back_entries: u64,
+    /// Number of ops that appeared after their txn's Commit record (possible corruption)
+    pub post_commit_ops: u64,
 }
 
 impl RecoveryStats {

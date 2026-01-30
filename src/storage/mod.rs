@@ -152,7 +152,7 @@ pub use sstable::{
     SST_VERSION,
 };
 
-use std::collections::HashMap;
+use std::collections::BTreeMap;
 use std::ops::Range;
 
 use crate::error::Result;
@@ -316,10 +316,17 @@ pub enum WriteOp {
 /// followed by `put(k, v2)`, only `v2` will be committed. Similarly, `put(k, v)`
 /// followed by `delete(k)` results in only the delete. This is "last write wins"
 /// semantics required for correct MVCC behavior.
+///
+/// # Iteration Order
+///
+/// Keys are iterated in lexicographic order (via BTreeMap), ensuring deterministic
+/// ordering across runs. This improves reproducibility and debuggability of the
+/// commit log, as entries for a transaction are written in consistent order.
 #[derive(Default, Clone, Debug)]
 pub struct WriteBatch {
-    /// Operations indexed by key - ensures at most one op per key (last write wins)
-    ops: HashMap<Key, WriteOp>,
+    /// Operations indexed by key - ensures at most one op per key (last write wins).
+    /// BTreeMap ensures deterministic iteration order (lexicographic by key).
+    ops: BTreeMap<Key, WriteOp>,
     /// Commit timestamp for MVCC (set by TransactionService)
     commit_ts: Option<Timestamp>,
     /// CLOG LSN for recovery ordering (set by TransactionService after clog write)
