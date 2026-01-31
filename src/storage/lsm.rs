@@ -2882,7 +2882,7 @@ mod tests {
         merge_iter
             .add_active_memtable(Box::new(active_iter))
             .unwrap();
-        merge_iter.add_l0_sst(Box::new(l0_iter), 0);
+        merge_iter.add_l0_sst(Box::new(l0_iter), 0).unwrap();
 
         let mut merge_iter = merge_iter.build().unwrap();
 
@@ -2941,8 +2941,8 @@ mod tests {
         merge_iter
             .add_active_memtable(Box::new(active_iter))
             .unwrap();
-        merge_iter.add_l0_sst(Box::new(l0_iter), 0);
-        merge_iter.add_level(Box::new(l1_iter), 1);
+        merge_iter.add_l0_sst(Box::new(l0_iter), 0).unwrap();
+        merge_iter.add_level(Box::new(l1_iter), 1).unwrap();
 
         let mut merge_iter = merge_iter.build().unwrap();
 
@@ -3015,9 +3015,9 @@ mod tests {
             .add_active_memtable(Box::new(active_iter))
             .unwrap();
         // Add in index order: 0 (newest) -> 1 -> 2 (oldest)
-        merge_iter.add_l0_sst(Box::new(l0_0_iter), 0);
-        merge_iter.add_l0_sst(Box::new(l0_1_iter), 1);
-        merge_iter.add_l0_sst(Box::new(l0_2_iter), 2);
+        merge_iter.add_l0_sst(Box::new(l0_0_iter), 0).unwrap();
+        merge_iter.add_l0_sst(Box::new(l0_1_iter), 1).unwrap();
+        merge_iter.add_l0_sst(Box::new(l0_2_iter), 2).unwrap();
 
         let mut merge_iter = merge_iter.build().unwrap();
 
@@ -3089,8 +3089,8 @@ mod tests {
         merge_iter
             .add_active_memtable(Box::new(active_iter))
             .unwrap();
-        merge_iter.add_l0_sst(Box::new(l0_iter), 0);
-        merge_iter.add_level(Box::new(l1_iter), 1);
+        merge_iter.add_l0_sst(Box::new(l0_iter), 0).unwrap();
+        merge_iter.add_level(Box::new(l1_iter), 1).unwrap();
 
         let mut merge_iter = merge_iter.build().unwrap();
 
@@ -3157,9 +3157,9 @@ mod tests {
         merge_iter
             .add_frozen_memtable(Box::new(frozen1_iter), 1)
             .unwrap();
-        merge_iter.add_l0_sst(Box::new(l0_iter), 0);
-        merge_iter.add_level(Box::new(l1_iter), 1);
-        merge_iter.add_level(Box::new(l2_iter), 2);
+        merge_iter.add_l0_sst(Box::new(l0_iter), 0).unwrap();
+        merge_iter.add_level(Box::new(l1_iter), 1).unwrap();
+        merge_iter.add_level(Box::new(l2_iter), 2).unwrap();
 
         let mut merge_iter = merge_iter.build().unwrap();
 
@@ -3224,7 +3224,7 @@ mod tests {
         merge_iter
             .add_frozen_memtable(Box::new(frozen_iter), 0)
             .unwrap();
-        merge_iter.add_l0_sst(Box::new(l0_iter), 0);
+        merge_iter.add_l0_sst(Box::new(l0_iter), 0).unwrap();
 
         let mut merge_iter = merge_iter.build().unwrap();
 
@@ -3261,7 +3261,7 @@ mod tests {
         merge_iter
             .add_active_memtable(Box::new(active_iter))
             .unwrap();
-        merge_iter.add_l0_sst(Box::new(l0_iter), 0);
+        merge_iter.add_l0_sst(Box::new(l0_iter), 0).unwrap();
 
         let mut merge_iter = merge_iter.build().unwrap();
 
@@ -3349,8 +3349,8 @@ mod tests {
         merge_iter
             .add_active_memtable(Box::new(active_iter))
             .unwrap();
-        merge_iter.add_l0_sst(Box::new(l0_iter), 0);
-        merge_iter.add_level(Box::new(l1_iter), 1);
+        merge_iter.add_l0_sst(Box::new(l0_iter), 0).unwrap();
+        merge_iter.add_level(Box::new(l1_iter), 1).unwrap();
 
         let mut merge_iter = merge_iter.build().unwrap();
 

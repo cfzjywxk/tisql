@@ -1181,6 +1181,277 @@ mod tests {
     }
 
     #[test]
+    fn test_scan_read_your_writes_buffer_only() {
+        // Test: Buffer has writes, storage is empty in range
+        let (_storage, txn_service, _dir) = create_test_service();
+
+        // Begin a transaction and buffer writes (no prior storage data)
+        let mut ctx = txn_service.begin(false).unwrap();
+        txn_service
+            .put(&mut ctx, b"x".to_vec(), b"x_value".to_vec())
+            .unwrap();
+        txn_service
+            .put(&mut ctx, b"y".to_vec(), b"y_value".to_vec())
+            .unwrap();
+        txn_service
+            .put(&mut ctx, b"z".to_vec(), b"z_value".to_vec())
+            .unwrap();
+
+        // Scan should return only buffered writes
+        let mut iter = txn_service
+            .scan_iter(&ctx, b"x".to_vec()..b"zz".to_vec())
+            .unwrap();
+        let mut results = Vec::new();
+        iter.advance().unwrap();
+        while iter.valid() {
+            results.push((iter.user_key().to_vec(), iter.value().to_vec()));
+            iter.advance().unwrap();
+        }
+
+        assert_eq!(results.len(), 3, "should see all 3 buffered keys");
+        assert_eq!(results[0], (b"x".to_vec(), b"x_value".to_vec()));
+        assert_eq!(results[1], (b"y".to_vec(), b"y_value".to_vec()));
+        assert_eq!(results[2], (b"z".to_vec(), b"z_value".to_vec()));
+    }
+
+    #[test]
+    fn test_scan_read_your_writes_storage_only() {
+        // Test: Storage has data, buffer is empty
+        let (_storage, txn_service, _dir) = create_test_service();
+
+        // Commit some data first
+        txn_service.autocommit_put(b"m", b"m_value").unwrap();
+        txn_service.autocommit_put(b"n", b"n_value").unwrap();
+        txn_service.autocommit_put(b"o", b"o_value").unwrap();
+
+        // Begin a read-only transaction (no buffered writes)
+        let ctx = txn_service.begin(true).unwrap();
+
+        // Scan should return only storage data
+        let mut iter = txn_service
+            .scan_iter(&ctx, b"m".to_vec()..b"p".to_vec())
+            .unwrap();
+        let mut results = Vec::new();
+        iter.advance().unwrap();
+        while iter.valid() {
+            results.push((iter.user_key().to_vec(), iter.value().to_vec()));
+            iter.advance().unwrap();
+        }
+
+        assert_eq!(results.len(), 3, "should see all 3 storage keys");
+        assert_eq!(results[0], (b"m".to_vec(), b"m_value".to_vec()));
+        assert_eq!(results[1], (b"n".to_vec(), b"n_value".to_vec()));
+        assert_eq!(results[2], (b"o".to_vec(), b"o_value".to_vec()));
+    }
+
+    #[test]
+    fn test_scan_read_your_writes_interleaved_keys() {
+        // Test: Buffer and storage keys interleave
+        // Storage: a, c, e
+        // Buffer: b, d
+        // Expected order: a, b, c, d, e
+        let (_storage, txn_service, _dir) = create_test_service();
+
+        // Commit interleaved keys
+        txn_service.autocommit_put(b"a", b"a_storage").unwrap();
+        txn_service.autocommit_put(b"c", b"c_storage").unwrap();
+        txn_service.autocommit_put(b"e", b"e_storage").unwrap();
+
+        // Buffer the other keys
+        let mut ctx = txn_service.begin(false).unwrap();
+        txn_service
+            .put(&mut ctx, b"b".to_vec(), b"b_buffer".to_vec())
+            .unwrap();
+        txn_service
+            .put(&mut ctx, b"d".to_vec(), b"d_buffer".to_vec())
+            .unwrap();
+
+        // Scan full range
+        let mut iter = txn_service
+            .scan_iter(&ctx, b"a".to_vec()..b"f".to_vec())
+            .unwrap();
+        let mut results = Vec::new();
+        iter.advance().unwrap();
+        while iter.valid() {
+            results.push((iter.user_key().to_vec(), iter.value().to_vec()));
+            iter.advance().unwrap();
+        }
+
+        assert_eq!(results.len(), 5, "should see all 5 keys interleaved");
+        assert_eq!(results[0], (b"a".to_vec(), b"a_storage".to_vec()));
+        assert_eq!(results[1], (b"b".to_vec(), b"b_buffer".to_vec()));
+        assert_eq!(results[2], (b"c".to_vec(), b"c_storage".to_vec()));
+        assert_eq!(results[3], (b"d".to_vec(), b"d_buffer".to_vec()));
+        assert_eq!(results[4], (b"e".to_vec(), b"e_storage".to_vec()));
+    }
+
+    #[test]
+    fn test_scan_read_your_writes_delete_nonexistent() {
+        // Test: Buffer deletes a key that doesn't exist in storage
+        let (_storage, txn_service, _dir) = create_test_service();
+
+        // Commit some data
+        txn_service.autocommit_put(b"k1", b"v1").unwrap();
+        txn_service.autocommit_put(b"k3", b"v3").unwrap();
+
+        // Buffer a delete for non-existent key k2
+        let mut ctx = txn_service.begin(false).unwrap();
+        txn_service.delete(&mut ctx, b"k2".to_vec()).unwrap();
+
+        // Scan should skip the non-existent delete
+        let mut iter = txn_service
+            .scan_iter(&ctx, b"k1".to_vec()..b"k4".to_vec())
+            .unwrap();
+        let mut results = Vec::new();
+        iter.advance().unwrap();
+        while iter.valid() {
+            results.push((iter.user_key().to_vec(), iter.value().to_vec()));
+            iter.advance().unwrap();
+        }
+
+        assert_eq!(results.len(), 2, "should see 2 keys (k2 delete is no-op)");
+        assert_eq!(results[0], (b"k1".to_vec(), b"v1".to_vec()));
+        assert_eq!(results[1], (b"k3".to_vec(), b"v3".to_vec()));
+    }
+
+    #[test]
+    fn test_scan_read_your_writes_empty_range() {
+        // Test: Both buffer and storage empty in range
+        let (_storage, txn_service, _dir) = create_test_service();
+
+        // Commit data outside range
+        txn_service.autocommit_put(b"aaa", b"before").unwrap();
+        txn_service.autocommit_put(b"zzz", b"after").unwrap();
+
+        // Buffer data outside range
+        let mut ctx = txn_service.begin(false).unwrap();
+        txn_service
+            .put(&mut ctx, b"bbb".to_vec(), b"also_before".to_vec())
+            .unwrap();
+
+        // Scan a range that has no data
+        let mut iter = txn_service
+            .scan_iter(&ctx, b"mmm".to_vec()..b"nnn".to_vec())
+            .unwrap();
+        iter.advance().unwrap();
+        assert!(!iter.valid(), "should be empty - no data in range");
+    }
+
+    #[test]
+    fn test_scan_read_your_writes_multiple_updates_same_key() {
+        // Test: Multiple updates to the same key in buffer
+        // Only the latest buffered value should be seen
+        let (_storage, txn_service, _dir) = create_test_service();
+
+        // Commit initial value
+        txn_service.autocommit_put(b"key", b"v1").unwrap();
+
+        // Buffer multiple updates
+        let mut ctx = txn_service.begin(false).unwrap();
+        txn_service
+            .put(&mut ctx, b"key".to_vec(), b"v2".to_vec())
+            .unwrap();
+        txn_service
+            .put(&mut ctx, b"key".to_vec(), b"v3".to_vec())
+            .unwrap();
+        txn_service
+            .put(&mut ctx, b"key".to_vec(), b"v4_final".to_vec())
+            .unwrap();
+
+        // Scan should return only the final buffered value
+        let mut iter = txn_service
+            .scan_iter(&ctx, b"key".to_vec()..b"keyz".to_vec())
+            .unwrap();
+        let mut results = Vec::new();
+        iter.advance().unwrap();
+        while iter.valid() {
+            results.push((iter.user_key().to_vec(), iter.value().to_vec()));
+            iter.advance().unwrap();
+        }
+
+        assert_eq!(results.len(), 1, "should see only 1 key");
+        assert_eq!(results[0], (b"key".to_vec(), b"v4_final".to_vec()));
+    }
+
+    #[test]
+    fn test_scan_read_your_writes_delete_then_put() {
+        // Test: Delete a key then put it back
+        let (_storage, txn_service, _dir) = create_test_service();
+
+        // Commit initial value
+        txn_service.autocommit_put(b"toggle", b"original").unwrap();
+
+        // Delete then put it back with new value
+        let mut ctx = txn_service.begin(false).unwrap();
+        txn_service.delete(&mut ctx, b"toggle".to_vec()).unwrap();
+        txn_service
+            .put(&mut ctx, b"toggle".to_vec(), b"restored".to_vec())
+            .unwrap();
+
+        // Scan should return the restored value
+        let mut iter = txn_service
+            .scan_iter(&ctx, b"toggle".to_vec()..b"togglez".to_vec())
+            .unwrap();
+        let mut results = Vec::new();
+        iter.advance().unwrap();
+        while iter.valid() {
+            results.push((iter.user_key().to_vec(), iter.value().to_vec()));
+            iter.advance().unwrap();
+        }
+
+        assert_eq!(results.len(), 1, "should see restored key");
+        assert_eq!(results[0], (b"toggle".to_vec(), b"restored".to_vec()));
+    }
+
+    #[test]
+    fn test_scan_read_your_writes_put_then_delete() {
+        // Test: Put a new key then delete it
+        let (_storage, txn_service, _dir) = create_test_service();
+
+        // Buffer put then delete
+        let mut ctx = txn_service.begin(false).unwrap();
+        txn_service
+            .put(&mut ctx, b"ephemeral".to_vec(), b"short_lived".to_vec())
+            .unwrap();
+        txn_service.delete(&mut ctx, b"ephemeral".to_vec()).unwrap();
+
+        // Scan should not see the key
+        let mut iter = txn_service
+            .scan_iter(&ctx, b"ephemeral".to_vec()..b"ephemeralz".to_vec())
+            .unwrap();
+        iter.advance().unwrap();
+        assert!(!iter.valid(), "should not see deleted key");
+    }
+
+    #[test]
+    fn test_scan_read_your_writes_range_boundaries() {
+        // Test: Keys exactly at range boundaries
+        let (_storage, txn_service, _dir) = create_test_service();
+
+        // Storage: "aaa", "bbb", "ccc" (lexicographically ordered)
+        txn_service.autocommit_put(b"aaa", b"a_val").unwrap();
+        txn_service.autocommit_put(b"bbb", b"b_val").unwrap();
+        txn_service.autocommit_put(b"ccc", b"c_val").unwrap();
+
+        let ctx = txn_service.begin(true).unwrap();
+
+        // Range [aaa, ccc) - includes "aaa", excludes "ccc"
+        let mut iter = txn_service
+            .scan_iter(&ctx, b"aaa".to_vec()..b"ccc".to_vec())
+            .unwrap();
+        let mut results = Vec::new();
+        iter.advance().unwrap();
+        while iter.valid() {
+            results.push((iter.user_key().to_vec(), iter.value().to_vec()));
+            iter.advance().unwrap();
+        }
+
+        assert_eq!(results.len(), 2, "should see aaa and bbb only");
+        assert_eq!(results[0], (b"aaa".to_vec(), b"a_val".to_vec()));
+        assert_eq!(results[1], (b"bbb".to_vec(), b"b_val".to_vec()));
+    }
+
+    #[test]
     fn test_tso_advances_on_begin() {
         let (_storage, txn_service, _dir) = create_test_service();
 
