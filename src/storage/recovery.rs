@@ -341,22 +341,24 @@ mod tests {
     use tempfile::TempDir;
 
     fn get_at_for_test(engine: &LsmEngine, key: &[u8], ts: Timestamp) -> Option<RawValue> {
+        use crate::storage::StorageEngine;
         let start = MvccKey::encode(key, ts);
         let end = MvccKey::encode(key, 0)
             .next_key()
             .unwrap_or_else(MvccKey::unbounded);
         let range = start..end;
 
-        let results = engine.scan(range).unwrap();
+        let mut iter = engine.scan_iter(range).unwrap();
 
-        for (mvcc_key, value) in results {
-            let (decoded_key, entry_ts) = mvcc_key.decode();
+        while iter.valid() {
+            let (decoded_key, entry_ts) = iter.key().decode();
             if decoded_key == key && entry_ts <= ts {
-                if is_tombstone(&value) {
+                if is_tombstone(iter.value()) {
                     return None;
                 }
-                return Some(value);
+                return Some(iter.value().to_vec());
             }
+            iter.next().unwrap();
         }
         None
     }

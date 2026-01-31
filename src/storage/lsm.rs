@@ -309,18 +309,19 @@ impl LsmEngine {
 
         let mut builder = SstBuilder::new(&sst_path, options)?;
 
-        // Iterate memtable and add all entries INCLUDING tombstones as raw MVCC keys.
-        // SSTs MUST store MVCC keys (key || !commit_ts) to preserve version information
-        // for correct MVCC semantics during reads. Unlike the old approach that stored decoded
-        // keys, this preserves all versions and their timestamps.
+        // Iterate memtable using streaming iterator and add all entries INCLUDING tombstones
+        // as raw MVCC keys. SSTs MUST store MVCC keys (key || !commit_ts) to preserve version
+        // information for correct MVCC semantics during reads.
         //
         // Use truly unbounded range - MvccKey::unbounded() creates empty placeholder
         // that signals "scan all entries" to the memtable.
         let range = MvccKey::unbounded()..MvccKey::unbounded();
-        let entries = memtable.inner().scan(range)?;
+        let mut iter = memtable.inner().create_streaming_iter(range);
+        iter.next()?; // Initialize iterator to first entry
 
-        for (mvcc_key, value) in entries {
-            builder.add(mvcc_key.as_bytes(), &value)?;
+        while iter.valid() {
+            builder.add(iter.key().as_bytes(), iter.value())?;
+            iter.next()?;
         }
 
         // Finish building (writes to disk with fsync)
@@ -524,254 +525,72 @@ impl LsmEngine {
 use std::collections::BinaryHeap;
 
 // ============================================================================
-// Test-only types for LsmEngine::scan() - materializing version
+// ArcMemTableIterator - Streaming iterator that owns Arc<MemTable>
 // ============================================================================
 
-// Wrapper for SstIterator to implement the standard Iterator trait.
-// Returns Result items to properly propagate I/O errors during iteration.
-#[cfg(test)]
-struct SstIteratorWrapper {
-    iter: SstIterator,
-    range: Range<MvccKey>,
-    is_unbounded: bool,
-    /// Tracks whether we've encountered an error. Once set, iteration stops.
-    errored: bool,
-}
+use super::memtable::VersionedMemTableIterator;
 
-#[cfg(test)]
-impl SstIteratorWrapper {
-    fn new(mut iter: SstIterator, range: Range<MvccKey>) -> Result<Self> {
-        let is_unbounded = range.start.is_unbounded() && range.end.is_unbounded();
-        if !is_unbounded {
-            iter.seek(range.start.as_bytes())?;
-        }
-        Ok(Self {
-            iter,
-            range,
-            is_unbounded,
-            errored: false,
-        })
-    }
-}
-
-#[cfg(test)]
-impl Iterator for SstIteratorWrapper {
-    type Item = Result<(MvccKey, RawValue)>;
-
-    fn next(&mut self) -> Option<Self::Item> {
-        // Stop iteration after an error
-        if self.errored {
-            return None;
-        }
-
-        if !self.iter.valid() {
-            return None;
-        }
-
-        let key_bytes = self.iter.key();
-
-        if !self.is_unbounded {
-            let end_slice: &[u8] = self.range.end.as_bytes();
-            if !end_slice.is_empty() && key_bytes >= end_slice {
-                return None;
-            }
-        }
-
-        // Use safe MvccKey construction to handle corrupted SST data gracefully
-        let key = match MvccKey::from_bytes(key_bytes.to_vec()) {
-            Some(k) => k,
-            None => {
-                self.errored = true;
-                return Some(Err(TiSqlError::Storage(format!(
-                    "SST corrupted: invalid MVCC key (len={}, need >=8)",
-                    key_bytes.len()
-                ))));
-            }
-        };
-        let value = self.iter.value().to_vec();
-
-        // Advance the iterator, propagating any I/O errors
-        if let Err(e) = self.iter.next() {
-            self.errored = true;
-            return Some(Err(e));
-        }
-
-        Some(Ok((key, value)))
-    }
-}
-
-/// Iterator item type used throughout the merge process.
-/// Using Result allows proper error propagation from SST I/O operations.
-#[cfg(test)]
-type ScanItem = Result<(MvccKey, RawValue)>;
-
-// A wrapper for any iterator to be used in the merge heap.
-#[cfg(test)]
-struct HeapEntry {
-    /// The current item. For heap ordering we need the key, so we store Ok items.
-    /// Errors are handled separately in ScanMergeIterator.
-    item: (MvccKey, RawValue),
-    iter: Box<dyn Iterator<Item = ScanItem>>,
-}
-
-#[cfg(test)]
-impl PartialEq for HeapEntry {
-    fn eq(&self, other: &Self) -> bool {
-        self.item.0 == other.item.0
-    }
-}
-
-#[cfg(test)]
-impl Eq for HeapEntry {}
-
-#[cfg(test)]
-impl PartialOrd for HeapEntry {
-    fn partial_cmp(&self, other: &Self) -> Option<std::cmp::Ordering> {
-        Some(self.cmp(other))
-    }
-}
-
-#[cfg(test)]
-impl Ord for HeapEntry {
-    fn cmp(&self, other: &Self) -> std::cmp::Ordering {
-        // Min-heap, so we reverse the comparison to get the smallest key
-        other.item.0.cmp(&self.item.0)
-    }
-}
-
-// The merge iterator that properly propagates errors from underlying iterators.
-#[cfg(test)]
-struct ScanMergeIterator {
-    heap: BinaryHeap<HeapEntry>,
-    /// Stores the first error encountered during initialization.
-    /// This is returned on the first call to next().
-    init_error: Option<TiSqlError>,
-}
-
-#[cfg(test)]
-impl ScanMergeIterator {
-    fn new(iters: Vec<Box<dyn Iterator<Item = ScanItem>>>) -> Self {
-        let mut heap = BinaryHeap::new();
-        let mut init_error = None;
-
-        for mut iter in iters {
-            match iter.next() {
-                Some(Ok(item)) => {
-                    heap.push(HeapEntry { item, iter });
-                }
-                Some(Err(e)) => {
-                    // Store the first error encountered
-                    if init_error.is_none() {
-                        init_error = Some(e);
-                    }
-                    // Don't add this iterator to the heap
-                }
-                None => {
-                    // Iterator is empty, skip it
-                }
-            }
-        }
-        Self { heap, init_error }
-    }
-}
-
-#[cfg(test)]
-impl Iterator for ScanMergeIterator {
-    type Item = ScanItem;
-
-    fn next(&mut self) -> Option<Self::Item> {
-        // Return initialization error first if any
-        if let Some(e) = self.init_error.take() {
-            return Some(Err(e));
-        }
-
-        if let Some(mut top) = self.heap.pop() {
-            let item = top.item;
-            match top.iter.next() {
-                Some(Ok(next_item)) => {
-                    self.heap.push(HeapEntry {
-                        item: next_item,
-                        iter: top.iter,
-                    });
-                }
-                Some(Err(e)) => {
-                    // Return the current item, but the error will be returned next time
-                    // Actually, we should return the error immediately after yielding current item
-                    // Store it for the next call
-                    self.init_error = Some(e);
-                }
-                None => {
-                    // Iterator exhausted, don't re-add to heap
-                }
-            }
-            Some(Ok(item))
-        } else {
-            None
-        }
-    }
-}
-
-// ============================================================================
-// OwnedMemTableIterator - Owned wrapper for memtable iterator
-// ============================================================================
-
-/// An owned wrapper around a memtable iterator.
+/// Streaming iterator that owns an `Arc<MemTable>` and iterates without materialization.
 ///
-/// This struct owns an `Arc<MemTable>` and the iterator created from it,
-/// allowing the iterator to outlive any borrow of the memtable.
-/// The memtable Arc is kept alive for the lifetime of this struct.
+/// This struct combines:
+/// - Ownership of `Arc<MemTable>` to keep the memtable data alive
+/// - A `VersionedMemTableIterator<'static>` for true streaming iteration
 ///
-/// # Safety
+/// ## Safety
 ///
-/// The iterator holds a reference to the memtable's internal data.
-/// By keeping the Arc alive, we ensure the data remains valid.
-struct OwnedMemTableIterator {
-    /// Keep the memtable alive
+/// The `VersionedMemTableIterator` holds a reference to the `VersionedMemTableEngine`
+/// inside the memtable. We use unsafe to extend this reference's lifetime to `'static`,
+/// which is safe because:
+///
+/// 1. The `_memtable: Arc<MemTable>` field keeps the underlying data alive
+/// 2. Rust's struct field drop order is declaration order, so `_memtable` is dropped
+///    after `iter` (which doesn't have a custom Drop impl that accesses the memtable)
+/// 3. The skipmap used internally is a lock-free concurrent data structure that
+///    allows safe concurrent iteration
+struct ArcMemTableIterator {
+    /// Keep the memtable alive. MUST be declared before `iter` so it's dropped last.
     _memtable: Arc<MemTable>,
-    /// Materialized entries (VersionedMemTableIterator already materializes)
-    entries: Vec<(MvccKey, RawValue)>,
-    /// Current position
-    pos: usize,
+    /// The streaming iterator with erased lifetime (safe because _memtable keeps data alive)
+    iter: VersionedMemTableIterator<'static>,
 }
 
-impl OwnedMemTableIterator {
-    /// Create a new owned iterator over the given memtable and range.
-    fn new(memtable: Arc<MemTable>, range: Range<MvccKey>) -> Result<Self> {
-        // Since VersionedMemTableIterator already materializes, we do the same
-        let entries = memtable.inner().scan(range)?;
-        Ok(Self {
+impl ArcMemTableIterator {
+    /// Create a new streaming iterator over the given memtable and range.
+    fn new(memtable: Arc<MemTable>, range: Range<MvccKey>) -> Self {
+        // Safety: We're extending the lifetime of the reference from the Arc's lifetime
+        // to 'static. This is safe because:
+        // 1. The Arc keeps the MemTable alive for as long as this struct exists
+        // 2. The _memtable field is declared before iter, ensuring proper drop order
+        // 3. VersionedMemTableIterator doesn't access the memtable in its Drop impl
+        let engine_ref: &'static super::memtable::VersionedMemTableEngine =
+            unsafe { std::mem::transmute(memtable.inner()) };
+        let iter = engine_ref.create_streaming_iter(range);
+        Self {
             _memtable: memtable,
-            entries,
-            pos: 0,
-        })
+            iter,
+        }
     }
 }
 
-impl MvccIterator for OwnedMemTableIterator {
+impl MvccIterator for ArcMemTableIterator {
     fn seek(&mut self, target: &MvccKey) -> Result<()> {
-        self.pos = self
-            .entries
-            .partition_point(|(k, _)| k.as_bytes() < target.as_bytes());
-        Ok(())
+        self.iter.seek(target)
     }
 
     fn next(&mut self) -> Result<()> {
-        if self.pos < self.entries.len() {
-            self.pos += 1;
-        }
-        Ok(())
+        self.iter.next()
     }
 
     fn valid(&self) -> bool {
-        self.pos < self.entries.len()
+        self.iter.valid()
     }
 
     fn key(&self) -> &MvccKey {
-        &self.entries[self.pos].0
+        self.iter.key()
     }
 
     fn value(&self) -> &[u8] {
-        &self.entries[self.pos].1
+        self.iter.value()
     }
 }
 
@@ -1388,68 +1207,6 @@ impl LsmEngine {
             ilog: None,
         })
     }
-
-    /// Scan MVCC keys in range (materializing version).
-    ///
-    /// Returns all MVCC key-value pairs in the given range, including all versions
-    /// and tombstones. Keys are in `MvccKey` format (`key || !commit_ts`).
-    ///
-    /// This is provided for convenience in tests only.
-    /// For production code, use `scan_iter()` which provides streaming.
-    pub fn scan(&self, range: Range<MvccKey>) -> Result<Vec<(MvccKey, RawValue)>> {
-        let (active, frozen, version) = {
-            let state = self.state.read().unwrap();
-            (
-                Arc::clone(&state.active),
-                state.frozen.clone(),
-                Arc::clone(&state.version),
-            )
-        };
-
-        let mut iters: Vec<Box<dyn Iterator<Item = ScanItem>>> = Vec::new();
-
-        // 1. Add SST iterators (these can fail with I/O errors)
-        for level in 0..MAX_LEVELS {
-            for sst_meta in version.ssts_at_level(level as u32) {
-                if !sst_meta.overlaps_mvcc(range.start.as_bytes(), range.end.as_bytes()) {
-                    continue;
-                }
-                let sst_path = self
-                    .config
-                    .sst_dir()
-                    .join(format!("{:08}.sst", sst_meta.id));
-                // SST referenced by Version must exist - missing file indicates data corruption
-                if !sst_path.exists() {
-                    return Err(TiSqlError::Storage(format!(
-                        "SST file missing: {} (id={}, level={}). This indicates data corruption or incomplete recovery.",
-                        sst_path.display(),
-                        sst_meta.id,
-                        sst_meta.level
-                    )));
-                }
-                let reader = SstReaderRef::open(&sst_path)?;
-                let sst_iter = SstIterator::new(reader)?;
-                iters.push(Box::new(SstIteratorWrapper::new(sst_iter, range.clone())?));
-            }
-        }
-
-        // 2. Add frozen memtable iterators (newest to oldest)
-        // Memtable iterators are infallible, wrap items in Ok
-        for memtable in &frozen {
-            let mem_iter = memtable.inner().scan(range.clone())?;
-            iters.push(Box::new(mem_iter.into_iter().map(Ok)));
-        }
-
-        // 3. Add active memtable iterator
-        let active_iter = active.inner().scan(range.clone())?;
-        iters.push(Box::new(active_iter.into_iter().map(Ok)));
-
-        // Use a merge iterator to get sorted results efficiently
-        let merge_iter = ScanMergeIterator::new(iters);
-
-        // Collect results, propagating any I/O errors from SST reads
-        merge_iter.collect()
-    }
 }
 
 impl StorageEngine for LsmEngine {
@@ -1470,13 +1227,13 @@ impl StorageEngine for LsmEngine {
 
         // 1. Add active memtable iterator (highest priority)
         // Memtable iterators are initialized immediately (in-memory, no I/O)
-        let active_iter = OwnedMemTableIterator::new(active, range.clone())?;
+        let active_iter = ArcMemTableIterator::new(active, range.clone());
         merge_iter.add_active_memtable(Box::new(active_iter))?;
 
         // 2. Add frozen memtable iterators (newest to oldest)
         // Memtable iterators are initialized immediately (in-memory, no I/O)
         for (idx, memtable) in frozen.iter().enumerate() {
-            let mem_iter = OwnedMemTableIterator::new(Arc::clone(memtable), range.clone())?;
+            let mem_iter = ArcMemTableIterator::new(Arc::clone(memtable), range.clone());
             merge_iter.add_frozen_memtable(Box::new(mem_iter), idx)?;
         }
 
@@ -1589,8 +1346,19 @@ mod tests {
     // These helpers use MvccKey explicitly instead of convenience methods.
     // Tests should encode keys as MvccKey and use scan to find results.
 
+    /// Scan MVCC keys in range using streaming iterator (test-only helper).
+    fn scan_mvcc(engine: &LsmEngine, range: Range<MvccKey>) -> Vec<(MvccKey, RawValue)> {
+        let mut results = Vec::new();
+        let mut iter = engine.scan_iter(range).unwrap();
+        while iter.valid() {
+            results.push((iter.key().clone(), iter.value().to_vec()));
+            iter.next().unwrap();
+        }
+        results
+    }
+
     /// Get the latest version of a key visible at the given timestamp.
-    /// Uses scan with MvccKey range and filters results.
+    /// Uses streaming iterator with MvccKey range.
     fn get_at_for_test(engine: &LsmEngine, key: &[u8], ts: Timestamp) -> Option<RawValue> {
         // Create MVCC key range: from (key, ts) to next key
         let start = MvccKey::encode(key, ts);
@@ -1599,7 +1367,7 @@ mod tests {
             .unwrap_or_else(MvccKey::unbounded);
         let range = start..end;
 
-        let results = engine.scan(range).unwrap();
+        let results = scan_mvcc(engine, range);
 
         // Find the first entry matching our key (latest visible version)
         for (mvcc_key, value) in results {
@@ -1626,14 +1394,11 @@ mod tests {
         ts: Timestamp,
     ) -> Vec<(Vec<u8>, RawValue)> {
         // Convert user key range to MvccKey range
-        // Use MAX timestamp for start (smallest MVCC key for that user key)
-        // Use 0 timestamp for end (largest MVCC key for that user key)
-        // This ensures we include all versions of keys in [start, end)
         let start = MvccKey::encode(&range.start, Timestamp::MAX);
         let end = MvccKey::encode(&range.end, 0);
         let mvcc_range = start..end;
 
-        let results = engine.scan(mvcc_range).unwrap();
+        let results = scan_mvcc(engine, mvcc_range);
 
         // Deduplicate by key and filter by timestamp
         let mut seen_keys: std::collections::HashSet<Vec<u8>> = std::collections::HashSet::new();

@@ -269,7 +269,7 @@ impl StorageEngine for MemTable {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::storage::mvcc::is_tombstone;
+    use crate::storage::mvcc::{is_tombstone, MvccIterator};
     use crate::types::{Key, RawValue, Timestamp};
 
     fn new_batch(commit_ts: Timestamp) -> WriteBatch {
@@ -280,6 +280,18 @@ mod tests {
 
     // ==================== Test Helpers Using MvccKey ====================
 
+    /// Scan MVCC keys in range using streaming iterator (test-only helper).
+    fn scan_mvcc(mt: &MemTable, range: Range<MvccKey>) -> Vec<(MvccKey, RawValue)> {
+        let mut results = Vec::new();
+        let mut iter = mt.inner().create_streaming_iter(range);
+        iter.next().unwrap();
+        while iter.valid() {
+            results.push((iter.key().clone(), iter.value().to_vec()));
+            iter.next().unwrap();
+        }
+        results
+    }
+
     /// Get the latest version of a key visible at the given timestamp.
     fn get_at_for_test(mt: &MemTable, key: &[u8], ts: Timestamp) -> Option<RawValue> {
         let start = MvccKey::encode(key, ts);
@@ -288,7 +300,7 @@ mod tests {
             .unwrap_or_else(MvccKey::unbounded);
         let range = start..end;
 
-        let results = mt.inner().scan(range).unwrap();
+        let results = scan_mvcc(mt, range);
 
         for (mvcc_key, value) in results {
             let (decoded_key, entry_ts) = mvcc_key.decode();
@@ -311,7 +323,7 @@ mod tests {
         let end = MvccKey::encode(&range.end, 0);
         let mvcc_range = start..end;
 
-        let results = mt.inner().scan(mvcc_range).unwrap();
+        let results = scan_mvcc(mt, mvcc_range);
 
         let mut seen_keys: std::collections::HashSet<Key> = std::collections::HashSet::new();
         let mut output = Vec::new();
