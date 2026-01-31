@@ -62,7 +62,7 @@ mod concurrency;
 mod service;
 
 // Public API - only expose traits and types needed by consumers
-pub use api::{CommitInfo, IsolationLevel, TxnCtx, TxnScanIterator, TxnService, TxnState};
+pub use api::{CommitInfo, IsolationLevel, TxnCtx, TxnService, TxnState};
 
 // Implementation types - not re-exported from lib.rs main API
 // Available via testkit for integration tests

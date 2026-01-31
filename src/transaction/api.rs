@@ -43,72 +43,8 @@
 use std::ops::Range;
 
 use crate::error::Result;
-use crate::storage::WriteBatch;
+use crate::storage::{MvccIterator, WriteBatch};
 use crate::types::{Key, Lsn, RawValue, Timestamp, TxnId};
-
-/// Streaming iterator for transaction scans with zero-copy access.
-///
-/// This trait provides a RocksDB-style iterator interface for scanning
-/// key-value pairs within a transaction. Unlike `std::iter::Iterator`,
-/// this design:
-///
-/// - Supports I/O error propagation via `Result`
-/// - Returns references to avoid allocation during iteration
-/// - Allows callers to decide when to copy data
-///
-/// ## Usage Pattern
-///
-/// ```ignore
-/// let mut iter = txn_service.scan_iter(ctx, range)?;
-/// iter.advance()?;  // Position on first entry
-/// while iter.valid() {
-///     let key = iter.user_key();     // Reference, no copy
-///     let value = iter.value();      // Reference, no copy
-///     // Only allocate when needed for the result
-///     let row = decode_row_to_values(value, &col_ids, &types)?;
-///     iter.advance()?;
-/// }
-/// ```
-///
-/// ## Zero-Copy Guarantee
-///
-/// The `user_key()` and `value()` methods return references to data stored
-/// in the underlying iterator. No allocation occurs during iteration.
-pub trait TxnScanIterator {
-    /// Advance to the next entry.
-    ///
-    /// After calling `advance()`:
-    /// - `valid()` returns true if positioned on a valid entry
-    /// - `user_key()` and `value()` return the current entry's data
-    ///
-    /// Named `advance` instead of `next` to avoid conflict with `Iterator::next`.
-    fn advance(&mut self) -> Result<()>;
-
-    /// Check if positioned on a valid entry.
-    ///
-    /// Returns false when:
-    /// - Iterator exhausted (all entries consumed)
-    /// - `next()` has never been called
-    fn valid(&self) -> bool;
-
-    /// Get current entry's user key.
-    ///
-    /// Returns a reference to the key - no allocation occurs.
-    ///
-    /// # Panics
-    ///
-    /// Panics if `!self.valid()`. Always check `valid()` first.
-    fn user_key(&self) -> &[u8];
-
-    /// Get current entry's value.
-    ///
-    /// Returns a reference to the value - no allocation occurs.
-    ///
-    /// # Panics
-    ///
-    /// Panics if `!self.valid()`. Always check `valid()` first.
-    fn value(&self) -> &[u8];
-}
 
 /// Transaction state machine.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -234,7 +170,7 @@ pub trait TxnService: Send + Sync {
     ///
     /// Using an associated type avoids boxing and dynamic dispatch overhead.
     /// Each transaction service implementation defines its own concrete iterator type.
-    type ScanIter: TxnScanIterator;
+    type ScanIter: MvccIterator;
 
     // === Factory ===
 

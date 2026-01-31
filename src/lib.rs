@@ -56,7 +56,7 @@ pub use lsn::{new_lsn_provider, LsnProvider, SharedLsnProvider};
 pub use protocol::{MySqlServer, MYSQL_DEFAULT_PORT};
 pub use session::{Priority, QueryCtx, Session, SessionVars};
 pub use storage::StorageEngine;
-pub use transaction::{CommitInfo, TxnCtx, TxnScanIterator, TxnService, TxnState};
+pub use transaction::{CommitInfo, TxnCtx, TxnService, TxnState};
 pub use tso::TsoService;
 pub use worker::{WorkerPool, WorkerPoolConfig};
 

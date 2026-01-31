@@ -457,8 +457,6 @@ impl<S: StorageEngine + 'static, L: ClogService + 'static, T: TsoService> TxnSer
 // MvccScanIterator - Streaming scan with write buffer merge
 // ============================================================================
 
-use super::api::TxnScanIterator;
-
 /// Streaming scan iterator that merges storage results with write buffer.
 ///
 /// This iterator provides efficient MVCC scanning by:
@@ -502,11 +500,12 @@ pub struct MvccScanIterator<I: MvccIterator> {
     buffer_entries: Vec<(Key, Option<RawValue>)>,
     /// Next buffer position to consider
     buffer_pos: usize,
-    /// Pre-cached next visible storage entry (key, value) for comparison.
+    /// Pre-cached next visible storage entry (key, timestamp, value) for comparison.
     /// None if storage is exhausted or hasn't been initialized yet.
-    storage_next: Option<(Vec<u8>, Vec<u8>)>,
-    /// Current entry (key, value). None if not positioned on a valid entry.
-    current: Option<(Vec<u8>, Vec<u8>)>,
+    storage_next: Option<(Vec<u8>, Timestamp, Vec<u8>)>,
+    /// Current entry (key, timestamp, value). None if not positioned on a valid entry.
+    /// For buffer entries (uncommitted writes), timestamp is Timestamp::MAX.
+    current: Option<(Vec<u8>, Timestamp, Vec<u8>)>,
 }
 
 impl<I: MvccIterator> MvccScanIterator<I> {
@@ -547,7 +546,7 @@ impl<I: MvccIterator> MvccScanIterator<I> {
     /// Ensure `storage_next` contains the next visible entry from storage.
     ///
     /// After this call, `storage_next` is either:
-    /// - `Some((key, value))` if there's a visible entry
+    /// - `Some((key, timestamp, value))` if there's a visible entry
     /// - `None` if storage is exhausted
     fn ensure_storage_next(&mut self) -> crate::error::Result<()> {
         // If we already have a cached entry, nothing to do
@@ -595,9 +594,10 @@ impl<I: MvccIterator> MvccScanIterator<I> {
                 continue;
             }
 
-            // Found a visible, non-tombstone entry - cache it
+            // Found a visible, non-tombstone entry - cache it with timestamp
             self.storage_next = Some((
                 self.storage_iter.user_key().to_vec(),
+                self.storage_iter.timestamp(),
                 self.storage_iter.value().to_vec(),
             ));
             return Ok(());
@@ -608,7 +608,7 @@ impl<I: MvccIterator> MvccScanIterator<I> {
 
     /// Consume the cached storage entry and advance past all versions of that key.
     fn consume_storage(&mut self) -> crate::error::Result<()> {
-        if let Some((ref key, _)) = self.storage_next.take() {
+        if let Some((ref key, _, _)) = self.storage_next.take() {
             // Skip all versions of this key in storage
             while self.storage_iter.valid() && self.storage_iter.user_key() == key.as_slice() {
                 self.storage_iter.advance()?;
@@ -618,7 +618,14 @@ impl<I: MvccIterator> MvccScanIterator<I> {
     }
 }
 
-impl<I: MvccIterator> TxnScanIterator for MvccScanIterator<I> {
+impl<I: MvccIterator> MvccIterator for MvccScanIterator<I> {
+    fn seek(&mut self, _target: &MvccKey) -> crate::error::Result<()> {
+        // MvccScanIterator is created for a specific range and merges buffer + storage.
+        // Seeking within the merged result is not supported - this is a forward-only iterator.
+        // The iterator should be created with the appropriate range instead.
+        Ok(())
+    }
+
     fn advance(&mut self) -> crate::error::Result<()> {
         self.current = None;
 
@@ -638,7 +645,7 @@ impl<I: MvccIterator> TxnScanIterator for MvccScanIterator<I> {
             }
 
             let action = {
-                let storage_key = self.storage_next.as_ref().map(|(k, _)| k.as_slice());
+                let storage_key = self.storage_next.as_ref().map(|(k, _, _)| k.as_slice());
                 let buffer_entry = self.buffer_entries.get(self.buffer_pos);
 
                 match (storage_key, buffer_entry) {
@@ -682,8 +689,8 @@ impl<I: MvccIterator> TxnScanIterator for MvccScanIterator<I> {
             match action {
                 Action::Exhausted => return Ok(()),
                 Action::UseStorage => {
-                    let (k, v) = self.storage_next.take().unwrap();
-                    self.current = Some((k.clone(), v));
+                    let (k, ts, v) = self.storage_next.take().unwrap();
+                    self.current = Some((k.clone(), ts, v));
                     // Skip all versions of this key
                     while self.storage_iter.valid() && self.storage_iter.user_key() == k.as_slice()
                     {
@@ -693,7 +700,8 @@ impl<I: MvccIterator> TxnScanIterator for MvccScanIterator<I> {
                 }
                 Action::UseBuffer { key, value } => {
                     self.buffer_pos += 1;
-                    self.current = Some((key, value));
+                    // Buffer entries are uncommitted writes - use MAX timestamp
+                    self.current = Some((key, Timestamp::MAX, value));
                     return Ok(());
                 }
                 Action::SkipBuffer => {
@@ -703,7 +711,8 @@ impl<I: MvccIterator> TxnScanIterator for MvccScanIterator<I> {
                 Action::UseBufferSkipStorage { key, value } => {
                     self.consume_storage()?;
                     self.buffer_pos += 1;
-                    self.current = Some((key, value));
+                    // Buffer entries are uncommitted writes - use MAX timestamp
+                    self.current = Some((key, Timestamp::MAX, value));
                     return Ok(());
                 }
                 Action::SkipBoth => {
@@ -722,14 +731,21 @@ impl<I: MvccIterator> TxnScanIterator for MvccScanIterator<I> {
     fn user_key(&self) -> &[u8] {
         self.current
             .as_ref()
-            .map(|(k, _)| k.as_slice())
+            .map(|(k, _, _)| k.as_slice())
+            .expect("Iterator not valid")
+    }
+
+    fn timestamp(&self) -> Timestamp {
+        self.current
+            .as_ref()
+            .map(|(_, ts, _)| *ts)
             .expect("Iterator not valid")
     }
 
     fn value(&self) -> &[u8] {
         self.current
             .as_ref()
-            .map(|(_, v)| v.as_slice())
+            .map(|(_, _, v)| v.as_slice())
             .expect("Iterator not valid")
     }
 }
@@ -1264,7 +1280,7 @@ mod tests {
     ) -> Vec<Result<(Key, RawValue)>> {
         let mut results = Vec::new();
         loop {
-            match TxnScanIterator::advance(&mut iter) {
+            match MvccIterator::advance(&mut iter) {
                 Ok(()) => {
                     if !iter.valid() {
                         break;

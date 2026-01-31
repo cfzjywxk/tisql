@@ -26,7 +26,8 @@ use crate::codec::key::{
     META_PREFIX, META_SCHEMA,
 };
 use crate::error::{Result, TiSqlError};
-use crate::transaction::{CommitInfo, TxnCtx, TxnScanIterator, TxnService};
+use crate::storage::MvccIterator;
+use crate::transaction::{CommitInfo, TxnCtx, TxnService};
 use crate::types::{IndexId, TableId, Timestamp};
 
 use super::{Catalog, IndexDef, TableDef};

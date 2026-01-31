@@ -36,7 +36,7 @@ use tisql::testkit::{
     TransactionService, TxnServiceTestExt,
 };
 use tisql::types::{RawValue, Timestamp};
-use tisql::{StorageEngine, TxnScanIterator};
+use tisql::StorageEngine;
 
 // ==================== Test Helpers Using MvccKey ====================
 
