@@ -293,18 +293,18 @@ impl<T: TxnService> Catalog for MvccCatalog<T> {
         let start = vec![META_PREFIX, META_SCHEMA];
         let end = vec![META_PREFIX, META_SCHEMA + 1];
 
-        let iter = self.txn_service.scan_iter(&ctx, start..end)?;
-        let entries: Vec<_> = iter.collect::<Result<Vec<_>>>()?;
-        let schemas: Vec<String> = entries
-            .into_iter()
-            .filter_map(|(key, _)| {
-                if key.len() > 2 && key[0] == META_PREFIX && key[1] == META_SCHEMA {
-                    String::from_utf8(key[2..].to_vec()).ok()
-                } else {
-                    None
+        let mut iter = self.txn_service.scan_iter(&ctx, start..end)?;
+        let mut schemas: Vec<String> = Vec::new();
+        iter.next()?;
+        while iter.valid() {
+            let key = iter.user_key();
+            if key.len() > 2 && key[0] == META_PREFIX && key[1] == META_SCHEMA {
+                if let Ok(name) = String::from_utf8(key[2..].to_vec()) {
+                    schemas.push(name);
                 }
-            })
-            .collect();
+            }
+            iter.next()?;
+        }
 
         Ok(schemas)
     }
@@ -450,14 +450,16 @@ impl<T: TxnService> Catalog for MvccCatalog<T> {
             *last = last.saturating_add(1);
         }
 
-        let iter = self.txn_service.scan_iter(&ctx, prefix.clone()..end)?;
+        let mut iter = self.txn_service.scan_iter(&ctx, prefix.clone()..end)?;
         let mut tables = Vec::new();
 
-        for result in iter {
-            let (key, value) = result?;
+        iter.next()?;
+        while iter.valid() {
+            let key = iter.user_key();
+            let value = iter.value();
             // Verify key starts with our prefix
             if key.starts_with(&prefix) {
-                match bincode::deserialize::<TableDef>(&value) {
+                match bincode::deserialize::<TableDef>(value) {
                     Ok(table_def) => tables.push(table_def),
                     Err(e) => {
                         return Err(TiSqlError::Catalog(format!(
@@ -466,6 +468,7 @@ impl<T: TxnService> Catalog for MvccCatalog<T> {
                     }
                 }
             }
+            iter.next()?;
         }
 
         Ok(tables)
@@ -701,13 +704,15 @@ impl<T: TxnService> Catalog for MvccCatalog<T> {
             *last = last.saturating_add(1);
         }
 
-        let iter = self.txn_service.scan_iter(&ctx, prefix.clone()..end)?;
+        let mut iter = self.txn_service.scan_iter(&ctx, prefix.clone()..end)?;
         let mut tables = Vec::new();
 
-        for result in iter {
-            let (key, value) = result?;
+        iter.next()?;
+        while iter.valid() {
+            let key = iter.user_key();
+            let value = iter.value();
             if key.starts_with(&prefix) {
-                match bincode::deserialize::<TableDef>(&value) {
+                match bincode::deserialize::<TableDef>(value) {
                     Ok(table_def) => tables.push(table_def),
                     Err(e) => {
                         return Err(TiSqlError::Catalog(format!(
@@ -716,6 +721,7 @@ impl<T: TxnService> Catalog for MvccCatalog<T> {
                     }
                 }
             }
+            iter.next()?;
         }
 
         Ok(tables)

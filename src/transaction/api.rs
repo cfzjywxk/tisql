@@ -46,11 +46,70 @@ use crate::error::Result;
 use crate::storage::WriteBatch;
 use crate::types::{Key, Lsn, RawValue, Timestamp, TxnId};
 
-/// Type alias for a boxed scan iterator that yields fallible key-value pairs.
+/// Streaming iterator for transaction scans with zero-copy access.
 ///
-/// The inner `Result` allows propagation of I/O or corruption errors that may
-/// occur during streaming iteration over storage.
-pub type ScanIterator<'a> = Box<dyn Iterator<Item = Result<(Key, RawValue)>> + 'a>;
+/// This trait provides a RocksDB-style iterator interface for scanning
+/// key-value pairs within a transaction. Unlike `std::iter::Iterator`,
+/// this design:
+///
+/// - Supports I/O error propagation via `Result`
+/// - Returns references to avoid allocation during iteration
+/// - Allows callers to decide when to copy data
+///
+/// ## Usage Pattern
+///
+/// ```ignore
+/// let mut iter = txn_service.scan_iter(ctx, range)?;
+/// iter.next()?;  // Position on first entry
+/// while iter.valid() {
+///     let key = iter.user_key();     // Reference, no copy
+///     let value = iter.value();      // Reference, no copy
+///     // Only allocate when needed for the result
+///     let row = decode_row_to_values(value, &col_ids, &types)?;
+///     iter.next()?;
+/// }
+/// ```
+///
+/// ## Zero-Copy Guarantee
+///
+/// The `user_key()` and `value()` methods return references to data stored
+/// in the underlying iterator. No allocation occurs during iteration.
+pub trait TxnScanIterator {
+    /// Advance to next entry.
+    ///
+    /// After calling `next()`:
+    /// - `valid()` returns true if positioned on a valid entry
+    /// - `user_key()` and `value()` return the current entry's data
+    fn next(&mut self) -> Result<()>;
+
+    /// Check if positioned on a valid entry.
+    ///
+    /// Returns false when:
+    /// - Iterator exhausted (all entries consumed)
+    /// - `next()` has never been called
+    fn valid(&self) -> bool;
+
+    /// Get current entry's user key.
+    ///
+    /// Returns a reference to the key - no allocation occurs.
+    ///
+    /// # Panics
+    ///
+    /// Panics if `!self.valid()`. Always check `valid()` first.
+    fn user_key(&self) -> &[u8];
+
+    /// Get current entry's value.
+    ///
+    /// Returns a reference to the value - no allocation occurs.
+    ///
+    /// # Panics
+    ///
+    /// Panics if `!self.valid()`. Always check `valid()` first.
+    fn value(&self) -> &[u8];
+}
+
+/// Type alias for a boxed scan iterator with zero-copy access.
+pub type ScanIterator<'a> = Box<dyn TxnScanIterator + 'a>;
 
 /// Transaction state machine.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

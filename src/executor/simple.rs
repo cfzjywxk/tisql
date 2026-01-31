@@ -246,18 +246,22 @@ impl SimpleExecutor {
                     .collect();
 
                 // Scan using transaction service (reads at start_ts)
-                let iter = txn_service.scan_iter(ctx, start_key..end_key)?;
+                // Uses zero-copy iterator - allocation only when decoding rows
+                let mut iter = txn_service.scan_iter(ctx, start_key..end_key)?;
 
                 let mut rows = Vec::new();
-                for result in iter {
-                    let (_, value) = result?;
-                    let values = decode_row_to_values(&value, &col_ids, &data_types)?;
+                iter.next()?; // Position on first entry
+                while iter.valid() {
+                    // Zero-copy: value is a reference to underlying storage
+                    let value = iter.value();
+                    let values = decode_row_to_values(value, &col_ids, &data_types)?;
                     let row = Row::new(values);
 
                     // Apply filter
                     if let Some(ref filter_expr) = filter {
                         let result = self.eval_expr(filter_expr, &row)?;
                         if !self.value_to_bool(&result)? {
+                            iter.next()?;
                             continue;
                         }
                     }
@@ -274,6 +278,7 @@ impl SimpleExecutor {
                     };
 
                     rows.push(projected_row);
+                    iter.next()?;
                 }
 
                 let schema = Schema::new(
@@ -520,25 +525,30 @@ impl SimpleExecutor {
                 let mut count = 0u64;
 
                 // Scan using transaction's snapshot (reads at start_ts)
-                // Use streaming iteration - process one row at a time
-                let iter = txn_service.scan_iter(ctx, start_key..end_key)?;
+                // Use zero-copy streaming iteration - process one row at a time
+                let mut iter = txn_service.scan_iter(ctx, start_key..end_key)?;
 
-                for result in iter {
-                    let (key, value) = result?;
-                    let values = decode_row_to_values(&value, &col_ids, &data_types)?;
+                iter.next()?; // Position on first entry
+                while iter.valid() {
+                    // Zero-copy: references to underlying storage
+                    let key = iter.user_key();
+                    let value = iter.value();
+                    let values = decode_row_to_values(value, &col_ids, &data_types)?;
                     let row = Row::new(values);
 
                     // Apply filter
                     if let Some(ref filter_expr) = filter {
                         let result = self.eval_expr(filter_expr, &row)?;
                         if !self.value_to_bool(&result)? {
+                            iter.next()?;
                             continue;
                         }
                     }
 
-                    // Buffer delete in transaction
-                    txn_service.delete(ctx, key)?;
+                    // Buffer delete in transaction (need to clone key for ownership)
+                    txn_service.delete(ctx, key.to_vec())?;
                     count += 1;
+                    iter.next()?;
                 }
 
                 Ok(ExecutionResult::Affected { count })
@@ -564,18 +574,22 @@ impl SimpleExecutor {
                 let mut count = 0u64;
 
                 // Scan using transaction's snapshot
-                // Use streaming iteration - process one row at a time
-                let iter = txn_service.scan_iter(ctx, start_key..end_key)?;
+                // Use zero-copy streaming iteration - process one row at a time
+                let mut iter = txn_service.scan_iter(ctx, start_key..end_key)?;
 
-                for result in iter {
-                    let (key, value) = result?;
-                    let values = decode_row_to_values(&value, &col_ids, &data_types)?;
+                iter.next()?; // Position on first entry
+                while iter.valid() {
+                    // Zero-copy: references to underlying storage
+                    let key_ref = iter.user_key();
+                    let value = iter.value();
+                    let values = decode_row_to_values(value, &col_ids, &data_types)?;
                     let mut row = Row::new(values);
 
                     // Apply filter
                     if let Some(ref filter_expr) = filter {
                         let result = self.eval_expr(filter_expr, &row)?;
                         if !self.value_to_bool(&result)? {
+                            iter.next()?;
                             continue;
                         }
                     }
@@ -594,7 +608,7 @@ impl SimpleExecutor {
 
                     // Compute new key if PK changed
                     let new_key = if pk_indices.is_empty() {
-                        key.clone()
+                        key_ref.to_vec() // Clone only when needed
                     } else {
                         let pk_values: Vec<_> = pk_indices
                             .iter()
@@ -605,7 +619,7 @@ impl SimpleExecutor {
                     };
 
                     // Check for duplicate key when PK changed
-                    if !pk_indices.is_empty() && new_key != key {
+                    if !pk_indices.is_empty() && new_key.as_slice() != key_ref {
                         // Check if new key already exists (would conflict with another row)
                         if txn_service.get(ctx, &new_key)?.is_some() {
                             let pk_values: Vec<_> = pk_indices
@@ -617,14 +631,15 @@ impl SimpleExecutor {
                                 table.name()
                             )));
                         }
-                        // Delete old key
-                        txn_service.delete(ctx, key)?;
+                        // Delete old key (need to clone for ownership)
+                        txn_service.delete(ctx, key_ref.to_vec())?;
                     }
 
                     // Write new row
                     let new_value = encode_row(&col_ids, row.values());
                     txn_service.put(ctx, new_key, new_value)?;
                     count += 1;
+                    iter.next()?;
                 }
 
                 Ok(ExecutionResult::Affected { count })

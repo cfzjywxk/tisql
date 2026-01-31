@@ -444,16 +444,29 @@ impl<S: StorageEngine + 'static, L: ClogService + 'static, T: TsoService> TxnSer
 }
 
 // ============================================================================
-// MvccScanIterator - Streaming scan with write buffer merge
+// MvccScanIterator - Zero-copy streaming scan with write buffer merge
 // ============================================================================
 
-/// Streaming scan iterator that merges storage results with write buffer.
+use super::api::TxnScanIterator;
+
+/// Which source the current entry comes from.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum CurrentSource {
+    /// Not positioned on any entry.
+    None,
+    /// Current entry is from storage iterator.
+    Storage,
+    /// Current entry is from buffer at the given index.
+    Buffer(usize),
+}
+
+/// Zero-copy streaming scan iterator that merges storage results with write buffer.
 ///
 /// This iterator provides efficient MVCC scanning by:
 /// - Streaming from storage iterator (no full materialization of storage)
-/// - Deduplicating by tracking last_user_key (no HashMap for dedup)
+/// - Deduplicating by tracking last returned key
 /// - Merging write buffer entries sorted in memory
-/// - Returning results in sorted order (no final sort needed)
+/// - **Zero-copy**: Returns references to underlying data, no allocation during iteration
 ///
 /// ## MVCC Semantics
 ///
@@ -462,11 +475,16 @@ impl<S: StorageEngine + 'static, L: ClogService + 'static, T: TsoService> TxnSer
 /// - Tombstones are filtered out (deleted keys not returned)
 /// - Write buffer entries override storage entries (read-your-writes)
 ///
+/// ## Zero-Copy Design
+///
+/// The iterator tracks which source (storage or buffer) holds the current entry.
+/// `user_key()` and `value()` return references to the actual data without copying.
+/// Callers must clone if they need to own the data.
+///
 /// ## Error Handling
 ///
-/// Storage errors (I/O, corruption) are propagated through the iterator's
-/// `Item` type as `Result<(Key, RawValue)>`. Callers must handle these errors
-/// rather than assuming iteration completed successfully when `None` is returned.
+/// Storage errors (I/O, corruption) are propagated through `next()`.
+/// After an error, `valid()` returns false.
 pub struct MvccScanIterator<I: MvccIterator> {
     /// Storage iterator producing MVCC key-value pairs
     storage_iter: I,
@@ -476,16 +494,16 @@ pub struct MvccScanIterator<I: MvccIterator> {
     range: Range<Key>,
     /// Sorted write buffer entries in range (key, Option<value> where None = delete)
     buffer_entries: Vec<(Key, Option<RawValue>)>,
-    /// Current position in buffer_entries
+    /// Next buffer position to consider (entries before this have been consumed or skipped)
     buffer_pos: usize,
-    /// Last user key returned (for deduplication)
-    last_user_key: Option<Key>,
-    /// Pending result from storage (user_key, Option<value>)
-    pending_storage: Option<(Key, Option<RawValue>)>,
+    /// Where the current valid entry comes from
+    current: CurrentSource,
+    /// Index of current buffer entry (only valid when current == Buffer)
+    current_buffer_idx: usize,
+    /// Whether storage iterator is positioned on a visible entry
+    storage_ready: bool,
     /// Whether storage iterator is exhausted
     storage_exhausted: bool,
-    /// Deferred error from storage iterator (returned once, then cleared)
-    deferred_error: Option<TiSqlError>,
 }
 
 impl<I: MvccIterator> MvccScanIterator<I> {
@@ -504,8 +522,6 @@ impl<I: MvccIterator> MvccScanIterator<I> {
         range: Range<Key>,
         buffer_entries: Vec<(Key, Option<RawValue>)>,
     ) -> Self {
-        // Note: buffer_entries comes from BTreeMap::iter() which yields entries in sorted order,
-        // so no sorting needed here.
         debug_assert!(
             buffer_entries.windows(2).all(|w| w[0].0 <= w[1].0),
             "buffer_entries must be sorted by key"
@@ -517,22 +533,24 @@ impl<I: MvccIterator> MvccScanIterator<I> {
             range,
             buffer_entries,
             buffer_pos: 0,
-            last_user_key: None,
-            pending_storage: None,
+            current: CurrentSource::None,
+            current_buffer_idx: 0,
+            storage_ready: false,
             storage_exhausted: false,
-            deferred_error: None,
         }
     }
 
-    /// Advance storage iterator to next unique user key visible at read_ts.
+    /// Position storage iterator on next visible entry (or mark exhausted).
     ///
-    /// Uses zero-copy key()/timestamp() for filtering to avoid allocation
-    /// for skipped entries. Only allocates when a visible entry is found.
-    fn advance_storage(&mut self) -> crate::error::Result<()> {
-        self.pending_storage = None;
+    /// After this call:
+    /// - `storage_ready = true` if positioned on a visible, non-tombstone entry
+    /// - `storage_exhausted = true` if no more visible entries
+    ///
+    /// Returns Err if I/O error occurs.
+    fn advance_storage_to_visible(&mut self) -> crate::error::Result<()> {
+        self.storage_ready = false;
 
         while self.storage_iter.valid() {
-            // Use zero-copy accessors to avoid allocation
             let user_key = self.storage_iter.user_key();
             let ts = self.storage_iter.timestamp();
 
@@ -554,30 +572,22 @@ impl<I: MvccIterator> MvccScanIterator<I> {
                 continue;
             }
 
-            // Skip if we've already processed this user key
-            if let Some(ref last_key) = self.last_user_key {
-                if user_key == last_key.as_slice() {
+            // Found a visible entry - check if tombstone
+            if is_tombstone(self.storage_iter.value()) {
+                // Remember this key to skip older versions
+                let skip_key = user_key.to_vec();
+                self.storage_iter.next()?;
+                // Skip all older versions of this key
+                while self.storage_iter.valid()
+                    && self.storage_iter.user_key() == skip_key.as_slice()
+                {
                     self.storage_iter.next()?;
-                    continue;
                 }
+                continue;
             }
 
-            // Found a visible entry - now allocate the user_key and extract value
-            let user_key_owned = user_key.to_vec();
-            let value = self.storage_iter.value();
-            let result = if is_tombstone(value) {
-                (user_key_owned, None)
-            } else {
-                (user_key_owned, Some(value.to_vec()))
-            };
-
-            // Advance past all versions of this key BEFORE storing result.
-            // This ensures that if next() fails, we don't leave a stale entry
-            // in pending_storage that would be incorrectly returned later.
-            self.storage_iter.next()?;
-
-            // Only store the result after successful advance
-            self.pending_storage = Some(result);
+            // Found a visible, non-tombstone entry
+            self.storage_ready = true;
             return Ok(());
         }
 
@@ -585,115 +595,163 @@ impl<I: MvccIterator> MvccScanIterator<I> {
         Ok(())
     }
 
-    /// Peek at the next buffer entry.
-    fn peek_buffer(&self) -> Option<&(Key, Option<RawValue>)> {
-        self.buffer_entries.get(self.buffer_pos)
+    /// Skip all versions of current storage key (called after consuming an entry).
+    fn skip_current_storage_key(&mut self) -> crate::error::Result<()> {
+        if !self.storage_iter.valid() {
+            return Ok(());
+        }
+        let current_key = self.storage_iter.user_key().to_vec();
+        self.storage_iter.next()?;
+        while self.storage_iter.valid() && self.storage_iter.user_key() == current_key.as_slice() {
+            self.storage_iter.next()?;
+        }
+        Ok(())
     }
 
-    /// Advance buffer position.
-    fn advance_buffer(&mut self) {
-        self.buffer_pos += 1;
+    /// Get reference to current buffer entry's key (if buffer_pos is valid).
+    fn peek_buffer_key(&self) -> Option<&[u8]> {
+        self.buffer_entries
+            .get(self.buffer_pos)
+            .map(|(k, _)| k.as_slice())
+    }
+
+    /// Check if current buffer entry is a delete (None value).
+    fn is_buffer_delete(&self) -> bool {
+        self.buffer_entries
+            .get(self.buffer_pos)
+            .is_some_and(|(_, v)| v.is_none())
     }
 }
 
+impl<I: MvccIterator> TxnScanIterator for MvccScanIterator<I> {
+    fn next(&mut self) -> crate::error::Result<()> {
+        // If previous current was Storage, skip past that entry now
+        // (we deferred the skip to keep the iterator positioned for user_key()/value())
+        if self.current == CurrentSource::Storage {
+            self.skip_current_storage_key()?;
+            self.storage_ready = false;
+        }
+
+        // Clear current position
+        self.current = CurrentSource::None;
+
+        loop {
+            // Ensure storage is positioned on next visible entry
+            if !self.storage_ready && !self.storage_exhausted {
+                self.advance_storage_to_visible()?;
+            }
+
+            // Get candidates
+            let storage_key = if self.storage_ready {
+                Some(self.storage_iter.user_key())
+            } else {
+                None
+            };
+            let buffer_key = self.peek_buffer_key();
+
+            match (storage_key, buffer_key) {
+                (None, None) => {
+                    // Both exhausted
+                    return Ok(());
+                }
+                (Some(_), None) => {
+                    // Only storage - use it (keep iterator positioned for zero-copy access)
+                    self.current = CurrentSource::Storage;
+                    // Note: storage_ready stays true, we'll skip on next next() call
+                    return Ok(());
+                }
+                (None, Some(_)) => {
+                    // Only buffer
+                    if self.is_buffer_delete() {
+                        // Skip delete
+                        self.buffer_pos += 1;
+                        continue;
+                    }
+                    self.current = CurrentSource::Buffer(self.buffer_pos);
+                    self.current_buffer_idx = self.buffer_pos;
+                    self.buffer_pos += 1;
+                    return Ok(());
+                }
+                (Some(s_key), Some(b_key)) => {
+                    use std::cmp::Ordering;
+                    match s_key.cmp(b_key) {
+                        Ordering::Less => {
+                            // Storage key comes first (keep iterator positioned)
+                            self.current = CurrentSource::Storage;
+                            return Ok(());
+                        }
+                        Ordering::Greater => {
+                            // Buffer key comes first
+                            if self.is_buffer_delete() {
+                                self.buffer_pos += 1;
+                                continue;
+                            }
+                            self.current = CurrentSource::Buffer(self.buffer_pos);
+                            self.current_buffer_idx = self.buffer_pos;
+                            self.buffer_pos += 1;
+                            return Ok(());
+                        }
+                        Ordering::Equal => {
+                            // Same key - buffer wins (read-your-writes)
+                            // Skip the storage entry immediately (won't be returned)
+                            self.skip_current_storage_key()?;
+                            self.storage_ready = false;
+
+                            if self.is_buffer_delete() {
+                                // Buffer says delete - skip both
+                                self.buffer_pos += 1;
+                                continue;
+                            }
+                            self.current = CurrentSource::Buffer(self.buffer_pos);
+                            self.current_buffer_idx = self.buffer_pos;
+                            self.buffer_pos += 1;
+                            return Ok(());
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    fn valid(&self) -> bool {
+        self.current != CurrentSource::None
+    }
+
+    fn user_key(&self) -> &[u8] {
+        match self.current {
+            CurrentSource::None => panic!("Iterator not valid"),
+            CurrentSource::Storage => self.storage_iter.user_key(),
+            CurrentSource::Buffer(idx) => self.buffer_entries[idx].0.as_slice(),
+        }
+    }
+
+    fn value(&self) -> &[u8] {
+        match self.current {
+            CurrentSource::None => panic!("Iterator not valid"),
+            CurrentSource::Storage => self.storage_iter.value(),
+            CurrentSource::Buffer(idx) => self.buffer_entries[idx]
+                .1
+                .as_ref()
+                .expect("Buffer entry should not be delete when current points to it")
+                .as_slice(),
+        }
+    }
+}
+
+// Implement Iterator trait for backwards compatibility during migration
 impl<I: MvccIterator> Iterator for MvccScanIterator<I> {
     type Item = Result<(Key, RawValue)>;
 
     fn next(&mut self) -> Option<Self::Item> {
-        // If we have a deferred error from a previous iteration, return it now
-        if let Some(err) = self.deferred_error.take() {
-            return Some(Err(err));
+        // Use the TxnScanIterator::next
+        if let Err(e) = TxnScanIterator::next(self) {
+            return Some(Err(e));
         }
-
-        loop {
-            // Ensure we have a pending storage result if available
-            if self.pending_storage.is_none() && !self.storage_exhausted {
-                if let Err(e) = self.advance_storage() {
-                    // Mark storage as exhausted to prevent further attempts
-                    self.storage_exhausted = true;
-                    // Return the error to the caller instead of silently stopping
-                    return Some(Err(e));
-                }
-            }
-
-            // Get next candidates from storage and buffer
-            let storage_entry = self.pending_storage.as_ref();
-            let buffer_entry = self.peek_buffer();
-
-            match (storage_entry, buffer_entry) {
-                (None, None) => {
-                    // Both exhausted
-                    return None;
-                }
-                (Some((storage_key, storage_value)), None) => {
-                    // Only storage entry available
-                    let key = storage_key.clone();
-                    let value = storage_value.clone();
-                    self.last_user_key = Some(key.clone());
-                    self.pending_storage = None;
-
-                    if let Some(val) = value {
-                        return Some(Ok((key, val)));
-                    }
-                    // Tombstone, continue to next
-                }
-                (None, Some((buffer_key, buffer_value))) => {
-                    // Only buffer entry available
-                    let key = buffer_key.clone();
-                    let value = buffer_value.clone();
-                    self.last_user_key = Some(key.clone());
-                    self.advance_buffer();
-
-                    if let Some(val) = value {
-                        return Some(Ok((key, val)));
-                    }
-                    // Deleted, continue to next
-                }
-                (Some((storage_key, storage_value)), Some((buffer_key, buffer_value))) => {
-                    use std::cmp::Ordering;
-
-                    match storage_key.cmp(buffer_key) {
-                        Ordering::Less => {
-                            // Storage key comes first
-                            let key = storage_key.clone();
-                            let value = storage_value.clone();
-                            self.last_user_key = Some(key.clone());
-                            self.pending_storage = None;
-
-                            if let Some(val) = value {
-                                return Some(Ok((key, val)));
-                            }
-                            // Tombstone, continue to next
-                        }
-                        Ordering::Greater => {
-                            // Buffer key comes first
-                            let key = buffer_key.clone();
-                            let value = buffer_value.clone();
-                            self.last_user_key = Some(key.clone());
-                            self.advance_buffer();
-
-                            if let Some(val) = value {
-                                return Some(Ok((key, val)));
-                            }
-                            // Deleted, continue to next
-                        }
-                        Ordering::Equal => {
-                            // Same key - buffer overrides storage
-                            let key = buffer_key.clone();
-                            let value = buffer_value.clone();
-                            self.last_user_key = Some(key.clone());
-                            self.pending_storage = None;
-                            self.advance_buffer();
-
-                            if let Some(val) = value {
-                                return Some(Ok((key, val)));
-                            }
-                            // Deleted, continue to next
-                        }
-                    }
-                }
-            }
+        if !self.valid() {
+            return None;
         }
+        // Clone for backwards compatibility
+        Some(Ok((self.user_key().to_vec(), self.value().to_vec())))
     }
 }
 
@@ -1061,11 +1119,15 @@ mod tests {
         let ctx = txn_service.begin(true).unwrap();
 
         // Scan should see all data
-        let results: Vec<_> = txn_service
+        let mut iter = txn_service
             .scan_iter(&ctx, b"a".to_vec()..b"d".to_vec())
-            .unwrap()
-            .collect::<Result<Vec<_>>>()
             .unwrap();
+        let mut results = Vec::new();
+        iter.next().unwrap();
+        while iter.valid() {
+            results.push((iter.user_key().to_vec(), iter.value().to_vec()));
+            iter.next().unwrap();
+        }
 
         assert_eq!(
             results.len(),
@@ -1097,11 +1159,15 @@ mod tests {
         txn_service.delete(&mut ctx, b"a".to_vec()).unwrap(); // Delete existing
 
         // Scan should merge buffered writes with storage (read-your-writes)
-        let results: Vec<_> = txn_service
+        let mut iter = txn_service
             .scan_iter(&ctx, b"a".to_vec()..b"d".to_vec())
-            .unwrap()
-            .collect::<Result<Vec<_>>>()
             .unwrap();
+        let mut results = Vec::new();
+        iter.next().unwrap();
+        while iter.valid() {
+            results.push((iter.user_key().to_vec(), iter.value().to_vec()));
+            iter.next().unwrap();
+        }
 
         // Should see:
         // - 'a' deleted (removed from results)
@@ -1221,7 +1287,13 @@ mod tests {
             (MvccKey::encode(b"c", 5), b"value_c".to_vec()),
         ];
 
-        // Error after 1 successful next() - should fail on second entry
+        // Error after 1 successful next() call on mock.
+        // Zero-copy iterator behavior:
+        // - Read "a" at position 0 (no next() call)
+        // - Return "a", then next() -> skip "a" (next() #1, position=1, ok)
+        // - Read "b" at position 1 (no next() call)
+        // - Return "b", then next() -> skip "b" (next() #2, position=2 > 1, ERROR!)
+        // Result: 2 Ok entries + 1 Err
         let mock_iter = ErrorInjectingIterator::new(entries, 1);
 
         let scan_iter = MvccScanIterator::new(
@@ -1233,26 +1305,16 @@ mod tests {
 
         let results: Vec<_> = scan_iter.collect();
 
-        // Should have first entry (Ok) followed by error
-        assert_eq!(results.len(), 2, "expected 2 items: 1 Ok + 1 Err");
+        // Should have 2 Ok entries followed by error
+        assert_eq!(results.len(), 3, "expected 3 items: 2 Ok + 1 Err");
 
-        // First result should be Ok
-        assert!(
-            results[0].is_ok(),
-            "first result should be Ok, got {:?}",
-            results[0]
-        );
-        let (key, value) = results[0].as_ref().unwrap();
-        assert_eq!(key, b"a");
-        assert_eq!(value, b"value_a");
+        // First two results should be Ok
+        assert!(results[0].is_ok(), "first result should be Ok");
+        assert!(results[1].is_ok(), "second result should be Ok");
 
-        // Second result should be Err
-        assert!(
-            results[1].is_err(),
-            "second result should be Err, got {:?}",
-            results[1]
-        );
-        let err = results[1].as_ref().unwrap_err();
+        // Third result should be Err
+        assert!(results[2].is_err(), "third result should be Err");
+        let err = results[2].as_ref().unwrap_err();
         assert!(
             matches!(err, TiSqlError::Storage(msg) if msg.contains("simulated I/O error")),
             "expected Storage error, got {err:?}"
@@ -1267,18 +1329,21 @@ mod tests {
             (MvccKey::encode(b"b", 5), b"value_b".to_vec()),
         ];
 
-        // Error after 0 successful next() calls - fails on first advance_storage()
-        // When we try to read entry "a", we call next() to advance, which fails.
-        // The entry is only stored AFTER next() succeeds, so no entry is returned.
+        // Error after 0 successful next() calls on mock.
+        // Zero-copy iterator behavior:
+        // - Read "a" at position 0 (no next() call, iterator starts valid)
+        // - Return "a", then next() -> skip "a" (next() #1, position=1 > 0, ERROR!)
+        // Result: 1 Ok entry + 1 Err
         let mock_iter = ErrorInjectingIterator::new(entries, 0);
 
         let scan_iter = MvccScanIterator::new(mock_iter, 10, b"a".to_vec()..b"z".to_vec(), vec![]);
 
         let results: Vec<_> = scan_iter.collect();
 
-        // Error occurs during first advance_storage(), before any entry is returned
-        assert_eq!(results.len(), 1, "expected 1 item (just the error)");
-        assert!(results[0].is_err(), "should be an error");
+        // One successful entry, then error when trying to advance
+        assert_eq!(results.len(), 2, "expected 2 items: 1 Ok + 1 Err");
+        assert!(results[0].is_ok(), "first should be Ok");
+        assert!(results[1].is_err(), "second should be error");
     }
 
     #[test]
@@ -1310,8 +1375,13 @@ mod tests {
             (MvccKey::encode(b"c", 5), b"storage_c".to_vec()),
         ];
 
-        // Error after 1 successful next() from storage
-        // First next() succeeds (after reading "a"), second next() fails (when trying to read "c")
+        // Error after 1 successful next() from storage mock.
+        // Zero-copy iterator behavior:
+        // 1. Read "a" at pos 0, compare with buffer "b": "a" < "b", return Ok("a")
+        // 2. Skip "a" (next() #1, pos=1 ok), read "c", compare with buffer "b": "c" > "b", return Ok("b")
+        // 3. Buffer consumed, read "c" at pos 1, return Ok("c")
+        // 4. Skip "c" (next() #2, pos=2 > 1, ERROR!)
+        // Result: Ok("a"), Ok("b"), Ok("c"), Err
         let mock_iter = ErrorInjectingIterator::new(storage_entries, 1);
 
         // Buffer has an entry between 'a' and 'c'
@@ -1322,12 +1392,11 @@ mod tests {
 
         let results: Vec<_> = scan_iter.collect();
 
-        // Actual order of events:
-        // 1. advance_storage() reads "a", next() succeeds -> Ok("a") returned (storage < buffer)
-        // 2. advance_storage() reads "c", next() FAILS -> Err returned immediately
-        // 3. storage_exhausted=true, but buffer still has "b" -> Ok("b") returned
-        // So: Ok("a"), Err, Ok("b")
-        assert_eq!(results.len(), 3, "expected 3 items: Ok(a), Err, Ok(b)");
+        assert_eq!(
+            results.len(),
+            4,
+            "expected 4 items: Ok(a), Ok(b), Ok(c), Err"
+        );
 
         // First entry: 'a' from storage
         assert!(results[0].is_ok(), "first should be Ok(a)");
@@ -1335,16 +1404,22 @@ mod tests {
         assert_eq!(k, b"a");
         assert_eq!(v, b"storage_a");
 
-        // Second entry: error from storage
-        assert!(results[1].is_err(), "second should be Err");
-        let err = results[1].as_ref().unwrap_err();
-        assert!(matches!(err, TiSqlError::Storage(_)));
-
-        // Third entry: 'b' from buffer (returned after storage is marked exhausted)
-        assert!(results[2].is_ok(), "third should be Ok(b)");
-        let (k, v) = results[2].as_ref().unwrap();
+        // Second entry: 'b' from buffer
+        assert!(results[1].is_ok(), "second should be Ok(b)");
+        let (k, v) = results[1].as_ref().unwrap();
         assert_eq!(k, b"b");
         assert_eq!(v, b"buffer_b");
+
+        // Third entry: 'c' from storage
+        assert!(results[2].is_ok(), "third should be Ok(c)");
+        let (k, v) = results[2].as_ref().unwrap();
+        assert_eq!(k, b"c");
+        assert_eq!(v, b"storage_c");
+
+        // Fourth entry: error from storage
+        assert!(results[3].is_err(), "fourth should be Err");
+        let err = results[3].as_ref().unwrap_err();
+        assert!(matches!(err, TiSqlError::Storage(_)));
     }
 
     #[test]
@@ -1359,7 +1434,10 @@ mod tests {
             (MvccKey::encode(b"c", 5), b"value_c".to_vec()),
         ];
 
-        // Error after 1 entry - simulates I/O error mid-scan
+        // Error after 1 successful next() call on mock.
+        // Zero-copy: Read and return an entry before calling next() to skip.
+        // So with error_after=1: get "a", skip ok (next #1), get "b", skip ERROR (next #2)
+        // Result: 2 successful entries before error
         let mock_iter = ErrorInjectingIterator::new(entries.clone(), 1);
 
         let scan_iter = MvccScanIterator::new(mock_iter, 10, b"a".to_vec()..b"z".to_vec(), vec![]);
@@ -1386,8 +1464,8 @@ mod tests {
             "error must be propagated to caller, not silently dropped"
         );
         assert_eq!(
-            successful_count, 1,
-            "should have exactly 1 successful entry before error"
+            successful_count, 2,
+            "should have exactly 2 successful entries before error (zero-copy reads before skip)"
         );
     }
 
