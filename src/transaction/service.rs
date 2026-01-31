@@ -270,7 +270,7 @@ impl<S: StorageEngine + 'static, L: ClogService + 'static, T: TsoService> TxnSer
                 }
                 return Ok(Some(value.to_vec()));
             }
-            iter.next()?;
+            iter.advance()?;
         }
 
         Ok(None)
@@ -559,7 +559,7 @@ impl<I: MvccIterator> MvccScanIterator<I> {
 
         // First call: initialize the iterator by calling next()
         if !self.storage_iter.valid() && !self.storage_exhausted {
-            self.storage_iter.next()?;
+            self.storage_iter.advance()?;
         }
 
         while self.storage_iter.valid() {
@@ -574,13 +574,13 @@ impl<I: MvccIterator> MvccScanIterator<I> {
 
             // Skip if before start of range
             if user_key < self.range.start.as_slice() {
-                self.storage_iter.next()?;
+                self.storage_iter.advance()?;
                 continue;
             }
 
             // Skip if not visible at read_ts
             if ts > self.read_ts {
-                self.storage_iter.next()?;
+                self.storage_iter.advance()?;
                 continue;
             }
 
@@ -588,12 +588,12 @@ impl<I: MvccIterator> MvccScanIterator<I> {
             if is_tombstone(self.storage_iter.value()) {
                 // Remember this key to skip older versions
                 let skip_key = user_key.to_vec();
-                self.storage_iter.next()?;
+                self.storage_iter.advance()?;
                 // Skip all older versions of this key
                 while self.storage_iter.valid()
                     && self.storage_iter.user_key() == skip_key.as_slice()
                 {
-                    self.storage_iter.next()?;
+                    self.storage_iter.advance()?;
                 }
                 continue;
             }
@@ -613,9 +613,9 @@ impl<I: MvccIterator> MvccScanIterator<I> {
             return Ok(());
         }
         let current_key = self.storage_iter.user_key().to_vec();
-        self.storage_iter.next()?;
+        self.storage_iter.advance()?;
         while self.storage_iter.valid() && self.storage_iter.user_key() == current_key.as_slice() {
-            self.storage_iter.next()?;
+            self.storage_iter.advance()?;
         }
         Ok(())
     }
@@ -636,7 +636,7 @@ impl<I: MvccIterator> MvccScanIterator<I> {
 }
 
 impl<I: MvccIterator> TxnScanIterator for MvccScanIterator<I> {
-    fn next(&mut self) -> crate::error::Result<()> {
+    fn advance(&mut self) -> crate::error::Result<()> {
         // If previous current was Storage, skip past that entry now
         // (we deferred the skip to keep the iterator positioned for user_key()/value())
         if self.current == CurrentSource::Storage {
@@ -669,7 +669,7 @@ impl<I: MvccIterator> TxnScanIterator for MvccScanIterator<I> {
                 (Some(_), None) => {
                     // Only storage - use it (keep iterator positioned for zero-copy access)
                     self.current = CurrentSource::Storage;
-                    // Note: storage_ready stays true, we'll skip on next next() call
+                    // Note: storage_ready stays true, we'll skip on next advance() call
                     return Ok(());
                 }
                 (None, Some(_)) => {
@@ -825,7 +825,7 @@ mod tests {
                 }
                 return Some(value.to_vec());
             }
-            iter.next().unwrap();
+            iter.advance().unwrap();
         }
         None
     }
@@ -1119,10 +1119,10 @@ mod tests {
             .scan_iter(&ctx, b"a".to_vec()..b"d".to_vec())
             .unwrap();
         let mut results = Vec::new();
-        iter.next().unwrap();
+        iter.advance().unwrap();
         while iter.valid() {
             results.push((iter.user_key().to_vec(), iter.value().to_vec()));
-            iter.next().unwrap();
+            iter.advance().unwrap();
         }
 
         assert_eq!(
@@ -1159,10 +1159,10 @@ mod tests {
             .scan_iter(&ctx, b"a".to_vec()..b"d".to_vec())
             .unwrap();
         let mut results = Vec::new();
-        iter.next().unwrap();
+        iter.advance().unwrap();
         while iter.valid() {
             results.push((iter.user_key().to_vec(), iter.value().to_vec()));
-            iter.next().unwrap();
+            iter.advance().unwrap();
         }
 
         // Should see:
@@ -1230,7 +1230,7 @@ mod tests {
             Ok(())
         }
 
-        fn next(&mut self) -> Result<()> {
+        fn advance(&mut self) -> Result<()> {
             if self.has_errored {
                 return Ok(());
             }
@@ -1238,7 +1238,7 @@ mod tests {
             // Increment first to move past current entry
             self.position += 1;
 
-            // Inject error after specified number of successful next() calls
+            // Inject error after specified number of successful advance() calls
             if self.position > self.error_after && !self.has_errored {
                 self.has_errored = true;
                 return Err(TiSqlError::Storage(
@@ -1280,7 +1280,7 @@ mod tests {
     ) -> Vec<Result<(Key, RawValue)>> {
         let mut results = Vec::new();
         loop {
-            match TxnScanIterator::next(&mut iter) {
+            match TxnScanIterator::advance(&mut iter) {
                 Ok(()) => {
                     if !iter.valid() {
                         break;

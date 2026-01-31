@@ -359,7 +359,7 @@ mod tests {
                 }
                 return Some(iter.value().to_vec());
             }
-            iter.next().unwrap();
+            iter.advance().unwrap();
         }
         None
     }

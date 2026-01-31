@@ -278,14 +278,13 @@ impl MergeIterator {
     }
 
     /// Advance to the next entry.
-    #[allow(clippy::should_implement_trait)]
-    pub fn next(&mut self) -> Result<()> {
+    pub fn advance(&mut self) -> Result<()> {
         if let Some(entry) = self.heap.pop() {
             let idx = entry.source_idx;
             self.last_key = Some(entry.key);
 
             // Advance the source iterator and push next entry
-            self.iters[idx].next()?;
+            self.iters[idx].advance()?;
             if self.iters[idx].valid() {
                 let key = self.iters[idx].key().to_vec();
                 let value = self.iters[idx].value().to_vec();
@@ -323,7 +322,7 @@ impl MergeIterator {
             };
 
             if should_skip {
-                self.next()?;
+                self.advance()?;
             } else {
                 break;
             }
@@ -409,7 +408,7 @@ impl CompactionExecutor {
                     current_size = 0;
                 }
             }
-            merge_iter.next()?;
+            merge_iter.advance()?;
         }
 
         // Finish last output file
@@ -621,15 +620,15 @@ mod tests {
         assert_eq!(k, b"key1");
         assert_eq!(v, b"value1");
 
-        iter.next().unwrap();
+        iter.advance().unwrap();
         let (k, _) = iter.current().unwrap();
         assert_eq!(k, b"key2");
 
-        iter.next().unwrap();
+        iter.advance().unwrap();
         let (k, _) = iter.current().unwrap();
         assert_eq!(k, b"key3");
 
-        iter.next().unwrap();
+        iter.advance().unwrap();
         assert!(!iter.valid());
     }
 
@@ -663,7 +662,7 @@ mod tests {
         while iter.valid() {
             let (k, _) = iter.current().unwrap();
             keys.push(k);
-            iter.next().unwrap();
+            iter.advance().unwrap();
         }
 
         assert_eq!(
@@ -706,7 +705,7 @@ mod tests {
         assert_eq!(v, b"new");
 
         // Second should be older value (both versions preserved)
-        iter.next().unwrap();
+        iter.advance().unwrap();
         let (k, v) = iter.current().unwrap();
         assert_eq!(k, b"key");
         assert_eq!(v, b"old");

@@ -317,13 +317,13 @@ impl LsmEngine {
         // that signals "scan all entries" to the memtable.
         let range = Arc::new(MvccKey::unbounded()..MvccKey::unbounded());
         let mut iter = memtable.inner().create_streaming_iter(range);
-        iter.next()?; // Initialize iterator to first entry
+        iter.advance()?; // Initialize iterator to first entry
 
         while iter.valid() {
             // Reconstruct MVCC key from user_key + timestamp
             let mvcc_key = MvccKey::encode(iter.user_key(), iter.timestamp());
             builder.add(mvcc_key.as_bytes(), iter.value())?;
-            iter.next()?;
+            iter.advance()?;
         }
 
         // Finish building (writes to disk with fsync)
@@ -429,7 +429,7 @@ impl LsmEngine {
                     }
                 }
 
-                iter.next()?;
+                iter.advance()?;
             }
         }
 
@@ -581,8 +581,8 @@ impl MvccIterator for ArcMemTableIterator {
         self.iter.seek(target)
     }
 
-    fn next(&mut self) -> Result<()> {
-        self.iter.next()
+    fn advance(&mut self) -> Result<()> {
+        self.iter.advance()
     }
 
     fn valid(&self) -> bool {
@@ -753,10 +753,10 @@ impl MvccIterator for LazySstIterator {
         }
     }
 
-    fn next(&mut self) -> Result<()> {
+    fn advance(&mut self) -> Result<()> {
         self.ensure_initialized()?;
         if let Some(ref mut inner) = self.inner {
-            inner.next()
+            inner.advance()
         } else {
             Ok(())
         }
@@ -897,13 +897,13 @@ impl MvccIterator for LevelIterator {
         self.skip_empty_files()
     }
 
-    fn next(&mut self) -> Result<()> {
+    fn advance(&mut self) -> Result<()> {
         if let Some(e) = self.pending_error.take() {
             return Err(e);
         }
 
         if let Some(ref mut iter) = self.current_iter {
-            iter.next()?;
+            iter.advance()?;
             // If current file exhausted, move to next
             if !iter.valid() {
                 if let Some(idx) = self.current_file_idx {
@@ -1071,7 +1071,7 @@ impl TieredMergeIterator {
         // Memtable iterators are already in the heap from add_active_memtable/add_frozen_memtable.
         // L0 and L1+ iterators are in pending_l0/pending_levels.
         // Position on first entry.
-        self.next()?;
+        self.advance()?;
         Ok(self)
     }
 
@@ -1141,10 +1141,10 @@ impl MvccIterator for TieredMergeIterator {
         self.current_user_key = None;
         self.current_value = None;
         self.last_emitted_key = None;
-        self.next()
+        self.advance()
     }
 
-    fn next(&mut self) -> Result<()> {
+    fn advance(&mut self) -> Result<()> {
         if let Some(e) = self.pending_error.take() {
             return Err(e);
         }
@@ -1173,7 +1173,7 @@ impl MvccIterator for TieredMergeIterator {
                 let value = top.iter.value().to_vec();
 
                 // Advance the iterator and re-add to heap if valid
-                if let Err(e) = top.iter.next() {
+                if let Err(e) = top.iter.advance() {
                     self.pending_error = Some(e);
                 }
                 if top.iter.valid() {
@@ -1397,7 +1397,7 @@ mod tests {
         while iter.valid() {
             let key = MvccKey::encode(iter.user_key(), iter.timestamp());
             results.push((key, iter.value().to_vec()));
-            iter.next().unwrap();
+            iter.advance().unwrap();
         }
         results
     }
@@ -2235,7 +2235,7 @@ mod tests {
                 }
             }
             entry_count += 1;
-            if iter.next().is_err() {
+            if iter.advance().is_err() {
                 break;
             }
         }
@@ -2923,7 +2923,7 @@ mod tests {
             Ok(())
         }
 
-        fn next(&mut self) -> Result<()> {
+        fn advance(&mut self) -> Result<()> {
             if self.pos >= 0 {
                 self.pos += 1;
             }
@@ -3060,7 +3060,7 @@ mod tests {
         );
 
         // Read second memtable entry
-        merge_iter.next().unwrap();
+        merge_iter.advance().unwrap();
         assert!(merge_iter.valid());
         assert_eq!(iter_key(&merge_iter), test_key(b"b", 100));
         assert!(
@@ -3069,7 +3069,7 @@ mod tests {
         );
 
         // Memtable exhausted, next should trigger L0 initialization
-        merge_iter.next().unwrap();
+        merge_iter.advance().unwrap();
         assert!(
             *l0_seek.borrow(),
             "L0 SST should be seeked now - memtable exhausted"
@@ -3118,7 +3118,7 @@ mod tests {
         assert_eq!(iter_key(&merge_iter), test_key(b"a", 100));
 
         // Exhaust memtable -> L0 should be initialized
-        merge_iter.next().unwrap();
+        merge_iter.advance().unwrap();
         assert!(
             *l0_seek.borrow(),
             "L0 SST should be seeked - memtable exhausted"
@@ -3131,7 +3131,7 @@ mod tests {
         assert_eq!(iter_key(&merge_iter), test_key(b"b", 100));
 
         // Exhaust L0 -> L1 should be initialized
-        merge_iter.next().unwrap();
+        merge_iter.advance().unwrap();
         assert!(
             *l1_seek.borrow(),
             "L1 level should be seeked - L0 exhausted"
@@ -3140,7 +3140,7 @@ mod tests {
         assert_eq!(iter_key(&merge_iter), test_key(b"c", 100));
 
         // Exhaust all
-        merge_iter.next().unwrap();
+        merge_iter.advance().unwrap();
         assert!(!merge_iter.valid(), "All tiers exhausted");
     }
 
@@ -3213,27 +3213,27 @@ mod tests {
             "SST 0 (higher priority) should win for key 'a'"
         );
 
-        merge_iter.next().unwrap();
+        merge_iter.advance().unwrap();
         assert!(merge_iter.valid());
         assert_eq!(iter_key(&merge_iter), test_key(b"b", 100));
         assert_eq!(merge_iter.value(), b"b_l0_1");
 
-        merge_iter.next().unwrap();
+        merge_iter.advance().unwrap();
         assert!(merge_iter.valid());
         assert_eq!(iter_key(&merge_iter), test_key(b"c", 100));
         assert_eq!(merge_iter.value(), b"c_l0_1");
 
-        merge_iter.next().unwrap();
+        merge_iter.advance().unwrap();
         assert!(merge_iter.valid());
         assert_eq!(iter_key(&merge_iter), test_key(b"d", 100));
         assert_eq!(merge_iter.value(), b"d_l0_0");
 
-        merge_iter.next().unwrap();
+        merge_iter.advance().unwrap();
         assert!(merge_iter.valid());
         assert_eq!(iter_key(&merge_iter), test_key(b"e", 100));
         assert_eq!(merge_iter.value(), b"e_l0_2");
 
-        merge_iter.next().unwrap();
+        merge_iter.advance().unwrap();
         assert!(!merge_iter.valid());
     }
 
@@ -3350,34 +3350,34 @@ mod tests {
         assert_eq!(merge_iter.value(), b"v_active");
         assert!(!*l0_seek.borrow() && !*l1_seek.borrow() && !*l2_seek.borrow());
 
-        merge_iter.next().unwrap();
+        merge_iter.advance().unwrap();
         assert!(merge_iter.valid());
         assert_eq!(merge_iter.value(), b"v_frozen0");
         assert!(!*l0_seek.borrow());
 
-        merge_iter.next().unwrap();
+        merge_iter.advance().unwrap();
         assert!(merge_iter.valid());
         assert_eq!(merge_iter.value(), b"v_frozen1");
         assert!(!*l0_seek.borrow());
 
         // Memtable tier exhausted, L0 should be initialized
-        merge_iter.next().unwrap();
+        merge_iter.advance().unwrap();
         assert!(merge_iter.valid());
         assert_eq!(merge_iter.value(), b"v_l0");
         assert!(*l0_seek.borrow());
         assert!(!*l1_seek.borrow() && !*l2_seek.borrow());
 
         // L0 exhausted, L1+ should be initialized
-        merge_iter.next().unwrap();
+        merge_iter.advance().unwrap();
         assert!(merge_iter.valid());
         assert_eq!(merge_iter.value(), b"v_l1");
         assert!(*l1_seek.borrow() && *l2_seek.borrow());
 
-        merge_iter.next().unwrap();
+        merge_iter.advance().unwrap();
         assert!(merge_iter.valid());
         assert_eq!(merge_iter.value(), b"v_l2");
 
-        merge_iter.next().unwrap();
+        merge_iter.advance().unwrap();
         assert!(!merge_iter.valid());
     }
 
@@ -3420,7 +3420,7 @@ mod tests {
         assert_eq!(merge_iter.value(), b"active_wins");
 
         // Next should exhaust all (duplicates were skipped)
-        merge_iter.next().unwrap();
+        merge_iter.advance().unwrap();
 
         // L0 might be initialized during the exhaustion process
         // but its duplicate entry should have been skipped
@@ -3498,18 +3498,18 @@ mod tests {
         assert!(merge_iter.valid());
         assert_eq!(iter_key(&merge_iter), test_key(b"a", 100));
 
-        merge_iter.next().unwrap();
+        merge_iter.advance().unwrap();
         assert_eq!(iter_key(&merge_iter), test_key(b"b", 100));
 
-        merge_iter.next().unwrap();
+        merge_iter.advance().unwrap();
         assert_eq!(iter_key(&merge_iter), test_key(b"c", 100));
 
-        merge_iter.next().unwrap();
+        merge_iter.advance().unwrap();
         assert_eq!(iter_key(&merge_iter), test_key(b"shared", 100));
         // frozen0 (priority 100) beats frozen1 (priority 101)
         assert_eq!(merge_iter.value(), b"shared_frozen0");
 
-        merge_iter.next().unwrap();
+        merge_iter.advance().unwrap();
         assert!(!merge_iter.valid());
     }
 
@@ -3582,7 +3582,7 @@ mod tests {
             assert!(merge_iter.valid());
             assert_eq!(iter_key(&merge_iter), test_key(*key, 100));
             assert_eq!(merge_iter.value(), *value);
-            merge_iter.next().unwrap();
+            merge_iter.advance().unwrap();
         }
 
         assert!(!merge_iter.valid());
@@ -3616,11 +3616,11 @@ mod tests {
         assert!(iter.valid());
         assert_eq!(iter.user_key(), b"key1");
 
-        iter.next().unwrap();
+        iter.advance().unwrap();
         assert!(iter.valid());
         assert_eq!(iter.user_key(), b"key2");
 
-        iter.next().unwrap();
+        iter.advance().unwrap();
         assert!(!iter.valid());
     }
 
@@ -3661,7 +3661,7 @@ mod tests {
         assert!(iter.valid());
         assert_eq!(iter.user_key(), b"new_key");
 
-        iter.next().unwrap();
+        iter.advance().unwrap();
         assert!(!iter.valid());
 
         // Scan for old keys (will need SST)
@@ -3672,7 +3672,7 @@ mod tests {
         let mut count = 0;
         while iter.valid() {
             count += 1;
-            iter.next().unwrap();
+            iter.advance().unwrap();
         }
         assert_eq!(count, 5, "Should find all 5 old keys from SST");
     }

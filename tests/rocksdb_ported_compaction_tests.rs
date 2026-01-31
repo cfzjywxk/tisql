@@ -56,7 +56,7 @@ fn get_at_for_test(engine: &LsmEngine, key: &[u8], ts: Timestamp) -> Option<RawV
             }
             return Some(value);
         }
-        iter.next().unwrap();
+        iter.advance().unwrap();
     }
     None
 }
@@ -81,7 +81,7 @@ fn scan_for_test(engine: &LsmEngine, range: &std::ops::Range<Key>) -> Vec<(Key, 
         let value = iter.value().to_vec();
 
         // Move to next before continue checks (so we don't get stuck)
-        iter.next().unwrap();
+        iter.advance().unwrap();
 
         if decoded_key < range.start || decoded_key >= range.end {
             continue;
@@ -345,7 +345,7 @@ fn test_executor_merge_keys() {
     let mut keys = Vec::new();
     while iter.valid() {
         keys.push(iter.key().to_vec());
-        iter.next().unwrap();
+        iter.advance().unwrap();
     }
 
     // Should be in sorted order: a, b, c, d, e, f
@@ -419,7 +419,7 @@ fn test_executor_mvcc_ordering() {
     let mut values = Vec::new();
     while iter.valid() {
         values.push(iter.value().to_vec());
-        iter.next().unwrap();
+        iter.advance().unwrap();
     }
 
     // All 3 versions should be preserved: v20, v10, v5 (in MVCC order)
@@ -477,7 +477,7 @@ fn test_executor_tombstones() {
     let mut entries = Vec::new();
     while iter.valid() {
         entries.push((iter.key().to_vec(), iter.value().to_vec()));
-        iter.next().unwrap();
+        iter.advance().unwrap();
     }
 
     assert_eq!(entries.len(), 2, "Both versions should be preserved");

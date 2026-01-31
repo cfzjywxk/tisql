@@ -421,13 +421,13 @@ use crate::error::Result;
 ///
 /// ```ignore
 /// let mut iter = storage.scan_iter(range)?;
-/// iter.next()?;  // Position on first entry
+/// iter.advance()?;  // Position on first entry
 /// while iter.valid() {
 ///     let user_key = iter.user_key();
 ///     let timestamp = iter.timestamp();
 ///     let value = iter.value();
 ///     // Process entry - clone if you need to keep the data
-///     iter.next()?;
+///     iter.advance()?;
 /// }
 /// ```
 ///
@@ -457,11 +457,13 @@ pub trait MvccIterator {
     /// - `user_key()` and `timestamp()` return the positioned entry's components
     fn seek(&mut self, target: &MvccKey) -> Result<()>;
 
-    /// Move to the next entry.
+    /// Advance to the next entry.
     ///
     /// This advances the iterator to the next key in MVCC order.
     /// No memory allocation occurs during this operation.
-    fn next(&mut self) -> Result<()>;
+    ///
+    /// Named `advance` instead of `next` to avoid conflict with `Iterator::next`.
+    fn advance(&mut self) -> Result<()>;
 
     /// Check if the iterator is positioned on a valid entry.
     ///
@@ -509,8 +511,8 @@ impl MvccIterator for Box<dyn MvccIterator> {
         (**self).seek(target)
     }
 
-    fn next(&mut self) -> Result<()> {
-        (**self).next()
+    fn advance(&mut self) -> Result<()> {
+        (**self).advance()
     }
 
     fn valid(&self) -> bool {

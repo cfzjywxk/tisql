@@ -270,11 +270,11 @@ mod tests {
     fn scan_mvcc(mt: &MemTable, range: Range<MvccKey>) -> Vec<(MvccKey, RawValue)> {
         let mut results = Vec::new();
         let mut iter = mt.inner().create_streaming_iter(std::sync::Arc::new(range));
-        iter.next().unwrap();
+        iter.advance().unwrap();
         while iter.valid() {
             let key = MvccKey::encode(iter.user_key(), iter.timestamp());
             results.push((key, iter.value().to_vec()));
-            iter.next().unwrap();
+            iter.advance().unwrap();
         }
         results
     }

@@ -295,7 +295,7 @@ impl<T: TxnService> Catalog for MvccCatalog<T> {
 
         let mut iter = self.txn_service.scan_iter(&ctx, start..end)?;
         let mut schemas: Vec<String> = Vec::new();
-        iter.next()?;
+        iter.advance()?;
         while iter.valid() {
             let key = iter.user_key();
             if key.len() > 2 && key[0] == META_PREFIX && key[1] == META_SCHEMA {
@@ -303,7 +303,7 @@ impl<T: TxnService> Catalog for MvccCatalog<T> {
                     schemas.push(name);
                 }
             }
-            iter.next()?;
+            iter.advance()?;
         }
 
         Ok(schemas)
@@ -453,7 +453,7 @@ impl<T: TxnService> Catalog for MvccCatalog<T> {
         let mut iter = self.txn_service.scan_iter(&ctx, prefix.clone()..end)?;
         let mut tables = Vec::new();
 
-        iter.next()?;
+        iter.advance()?;
         while iter.valid() {
             let key = iter.user_key();
             let value = iter.value();
@@ -468,7 +468,7 @@ impl<T: TxnService> Catalog for MvccCatalog<T> {
                     }
                 }
             }
-            iter.next()?;
+            iter.advance()?;
         }
 
         Ok(tables)
@@ -707,7 +707,7 @@ impl<T: TxnService> Catalog for MvccCatalog<T> {
         let mut iter = self.txn_service.scan_iter(&ctx, prefix.clone()..end)?;
         let mut tables = Vec::new();
 
-        iter.next()?;
+        iter.advance()?;
         while iter.valid() {
             let key = iter.user_key();
             let value = iter.value();
@@ -721,7 +721,7 @@ impl<T: TxnService> Catalog for MvccCatalog<T> {
                     }
                 }
             }
-            iter.next()?;
+            iter.advance()?;
         }
 
         Ok(tables)

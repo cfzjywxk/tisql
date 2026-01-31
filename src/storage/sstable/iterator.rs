@@ -25,7 +25,7 @@
 //!     let key = iter.key();
 //!     let value = iter.value();
 //!     // Process entry
-//!     iter.next()?;
+//!     iter.advance()?;
 //! }
 //!
 //! // Seek to a specific key
@@ -275,8 +275,7 @@ impl SstIterator {
     /// Move to the next entry.
     ///
     /// Note: This returns `Result` for I/O error handling, unlike `std::iter::Iterator`.
-    #[allow(clippy::should_implement_trait)]
-    pub fn next(&mut self) -> Result<()> {
+    pub fn advance(&mut self) -> Result<()> {
         if !self.valid() {
             return Ok(());
         }
@@ -446,14 +445,13 @@ impl ConcatIterator {
     /// Move to the next entry.
     ///
     /// Note: This returns `Result` for I/O error handling, unlike `std::iter::Iterator`.
-    #[allow(clippy::should_implement_trait)]
-    pub fn next(&mut self) -> Result<()> {
+    pub fn advance(&mut self) -> Result<()> {
         if !self.valid() {
             return Ok(());
         }
 
         if let Some(ref mut current) = self.current {
-            current.next()?;
+            current.advance()?;
         }
 
         // If current SST exhausted, move to next
@@ -565,8 +563,8 @@ impl MvccIterator for SstMvccIterator {
         self.inner.seek(target.as_bytes())
     }
 
-    fn next(&mut self) -> Result<()> {
-        self.inner.next()
+    fn advance(&mut self) -> Result<()> {
+        self.inner.advance()
     }
 
     fn valid(&self) -> bool {
@@ -688,7 +686,7 @@ mod tests {
             let expected_value = format!("value_{count:05}");
             assert_eq!(iter.key(), expected_key.as_bytes());
             assert_eq!(iter.value(), expected_value.as_bytes());
-            iter.next().unwrap();
+            iter.advance().unwrap();
             count += 1;
         }
 
@@ -704,8 +702,8 @@ mod tests {
         let mut iter = SstIterator::new(reader).unwrap();
 
         // Move forward
-        iter.next().unwrap();
-        iter.next().unwrap();
+        iter.advance().unwrap();
+        iter.advance().unwrap();
         assert_eq!(iter.key(), b"key_00002".as_slice());
 
         // Seek to first
@@ -804,7 +802,7 @@ mod tests {
         while iter.valid() {
             let expected_key = format!("key_{count:05}");
             assert_eq!(iter.key(), expected_key.as_bytes());
-            iter.next().unwrap();
+            iter.advance().unwrap();
             count += 1;
         }
         assert_eq!(count, 100);
@@ -874,11 +872,11 @@ mod tests {
         // Verify order
         assert!(iter.valid());
         assert_eq!(iter.key(), entries[0].0.as_slice());
-        iter.next().unwrap();
+        iter.advance().unwrap();
         assert_eq!(iter.key(), entries[1].0.as_slice());
-        iter.next().unwrap();
+        iter.advance().unwrap();
         assert_eq!(iter.key(), entries[2].0.as_slice());
-        iter.next().unwrap();
+        iter.advance().unwrap();
         assert!(!iter.valid());
     }
 
@@ -904,7 +902,7 @@ mod tests {
         while iter.valid() {
             let expected_key = format!("key_{count:05}");
             assert_eq!(iter.key(), expected_key.as_bytes());
-            iter.next().unwrap();
+            iter.advance().unwrap();
             count += 1;
         }
         assert_eq!(count, 10);
@@ -926,7 +924,7 @@ mod tests {
         while iter.valid() {
             let expected_key = format!("key_{count:05}");
             assert_eq!(iter.key(), expected_key.as_bytes());
-            iter.next().unwrap();
+            iter.advance().unwrap();
             count += 1;
         }
         assert_eq!(count, 30);
@@ -977,7 +975,7 @@ mod tests {
         let mut count = 0;
         while iter.valid() {
             count += 1;
-            iter.next().unwrap();
+            iter.advance().unwrap();
         }
         assert_eq!(count, 5);
     }

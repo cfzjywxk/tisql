@@ -61,7 +61,7 @@ fn get_at_for_test(engine: &LsmEngine, key: &[u8], ts: Timestamp) -> Option<RawV
             }
             return Some(value);
         }
-        iter.next().unwrap();
+        iter.advance().unwrap();
     }
     None
 }
@@ -91,7 +91,7 @@ fn scan_at_for_test(
         let value = iter.value().to_vec();
 
         // Move to next before continue checks (so we don't get stuck)
-        iter.next().unwrap();
+        iter.advance().unwrap();
 
         if decoded_key < range.start || decoded_key >= range.end {
             continue;
@@ -769,7 +769,7 @@ fn test_sst_iterator_key_patterns() {
     let mut keys = Vec::new();
     while iter.valid() {
         keys.push(iter.key().to_vec());
-        iter.next().unwrap();
+        iter.advance().unwrap();
     }
 
     // Keys should be in sorted order
@@ -824,7 +824,7 @@ fn test_sst_many_entries() {
 
         prev_key = Some(key);
         count += 1;
-        iter.next().unwrap();
+        iter.advance().unwrap();
     }
 
     assert_eq!(count, num_entries);
@@ -868,7 +868,7 @@ fn test_sst_mvcc_keys() {
     let mut entries: Vec<(Vec<u8>, Vec<u8>)> = Vec::new();
     while iter.valid() {
         entries.push((iter.key().to_vec(), iter.value().to_vec()));
-        iter.next().unwrap();
+        iter.advance().unwrap();
     }
 
     // Should have 5 entries

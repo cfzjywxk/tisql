@@ -647,8 +647,8 @@ impl<'a> VersionedMemTableIterator<'a> {
         true
     }
 
-    /// Advance to the next valid entry.
-    fn advance(&mut self) {
+    /// Move to the next valid entry (internal helper).
+    fn step_forward(&mut self) {
         if self.current_entry.is_none() {
             return; // Already exhausted
         }
@@ -745,11 +745,11 @@ impl<'a> MvccIterator for VersionedMemTableIterator<'a> {
         Ok(())
     }
 
-    fn next(&mut self) -> Result<()> {
+    fn advance(&mut self) -> Result<()> {
         if !self.initialized {
             self.initialize();
         } else {
-            self.advance();
+            self.step_forward();
         }
         Ok(())
     }
@@ -817,7 +817,7 @@ impl ArcVersionedMemTableIterator {
             unsafe { std::mem::transmute(inner.as_ref()) };
         let mut iter = VersionedMemTableIterator::new(inner_ref, range);
         // Position on first entry to be consistent with TieredMergeIterator behavior
-        let _ = iter.next();
+        let _ = iter.advance();
         Self {
             _inner: inner,
             iter,
@@ -830,8 +830,8 @@ impl MvccIterator for ArcVersionedMemTableIterator {
         self.iter.seek(target)
     }
 
-    fn next(&mut self) -> Result<()> {
-        self.iter.next()
+    fn advance(&mut self) -> Result<()> {
+        self.iter.advance()
     }
 
     fn valid(&self) -> bool {
@@ -885,11 +885,11 @@ mod tests {
     ) -> Vec<(MvccKey, RawValue)> {
         let mut results = Vec::new();
         let mut iter = engine.create_streaming_iter(std::sync::Arc::new(range));
-        iter.next().unwrap();
+        iter.advance().unwrap();
         while iter.valid() {
             let key = MvccKey::encode(iter.user_key(), iter.timestamp());
             results.push((key, iter.value().to_vec()));
-            iter.next().unwrap();
+            iter.advance().unwrap();
         }
         results
     }

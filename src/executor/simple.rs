@@ -250,7 +250,7 @@ impl SimpleExecutor {
                 let mut iter = txn_service.scan_iter(ctx, start_key..end_key)?;
 
                 let mut rows = Vec::new();
-                iter.next()?; // Position on first entry
+                iter.advance()?; // Position on first entry
                 while iter.valid() {
                     // Zero-copy: value is a reference to underlying storage
                     let value = iter.value();
@@ -261,7 +261,7 @@ impl SimpleExecutor {
                     if let Some(ref filter_expr) = filter {
                         let result = self.eval_expr(filter_expr, &row)?;
                         if !self.value_to_bool(&result)? {
-                            iter.next()?;
+                            iter.advance()?;
                             continue;
                         }
                     }
@@ -278,7 +278,7 @@ impl SimpleExecutor {
                     };
 
                     rows.push(projected_row);
-                    iter.next()?;
+                    iter.advance()?;
                 }
 
                 let schema = Schema::new(
@@ -528,7 +528,7 @@ impl SimpleExecutor {
                 // Use zero-copy streaming iteration - process one row at a time
                 let mut iter = txn_service.scan_iter(ctx, start_key..end_key)?;
 
-                iter.next()?; // Position on first entry
+                iter.advance()?; // Position on first entry
                 while iter.valid() {
                     // Zero-copy: references to underlying storage
                     let key = iter.user_key();
@@ -540,7 +540,7 @@ impl SimpleExecutor {
                     if let Some(ref filter_expr) = filter {
                         let result = self.eval_expr(filter_expr, &row)?;
                         if !self.value_to_bool(&result)? {
-                            iter.next()?;
+                            iter.advance()?;
                             continue;
                         }
                     }
@@ -548,7 +548,7 @@ impl SimpleExecutor {
                     // Buffer delete in transaction (need to clone key for ownership)
                     txn_service.delete(ctx, key.to_vec())?;
                     count += 1;
-                    iter.next()?;
+                    iter.advance()?;
                 }
 
                 Ok(ExecutionResult::Affected { count })
@@ -577,7 +577,7 @@ impl SimpleExecutor {
                 // Use zero-copy streaming iteration - process one row at a time
                 let mut iter = txn_service.scan_iter(ctx, start_key..end_key)?;
 
-                iter.next()?; // Position on first entry
+                iter.advance()?; // Position on first entry
                 while iter.valid() {
                     // Zero-copy: references to underlying storage
                     let key_ref = iter.user_key();
@@ -589,7 +589,7 @@ impl SimpleExecutor {
                     if let Some(ref filter_expr) = filter {
                         let result = self.eval_expr(filter_expr, &row)?;
                         if !self.value_to_bool(&result)? {
-                            iter.next()?;
+                            iter.advance()?;
                             continue;
                         }
                     }
@@ -639,7 +639,7 @@ impl SimpleExecutor {
                     let new_value = encode_row(&col_ids, row.values());
                     txn_service.put(ctx, new_key, new_value)?;
                     count += 1;
-                    iter.next()?;
+                    iter.advance()?;
                 }
 
                 Ok(ExecutionResult::Affected { count })

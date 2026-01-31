@@ -315,7 +315,7 @@ fn worker_thread<E: StorageEngine>(
                     _found = true;
                     break;
                 }
-                iter.next().unwrap();
+                iter.advance().unwrap();
             }
             stats.record_read(start.elapsed().as_nanos() as u64);
         } else if op_type < config.point_select_pct + config.update_pct {

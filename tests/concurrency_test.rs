@@ -60,7 +60,7 @@ fn get_at_for_test(storage: &MemTableEngine, key: &[u8], ts: Timestamp) -> Optio
             }
             return Some(value);
         }
-        iter.next().unwrap();
+        iter.advance().unwrap();
     }
     None
 }
@@ -722,10 +722,10 @@ fn test_write_buffer_dedup_with_scan() {
     let range = b"a".to_vec()..b"d".to_vec();
     let mut iter = txn_service.scan_iter(&ctx, range).unwrap();
     let mut results = Vec::new();
-    iter.next().unwrap();
+    iter.advance().unwrap();
     while iter.valid() {
         results.push((iter.user_key().to_vec(), iter.value().to_vec()));
-        iter.next().unwrap();
+        iter.advance().unwrap();
     }
 
     assert_eq!(results.len(), 2, "Should have 2 keys (a and c, not b)");

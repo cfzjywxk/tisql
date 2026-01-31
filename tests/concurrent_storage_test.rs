@@ -64,7 +64,7 @@ fn get_at_for_test(engine: &LsmEngine, key: &[u8], ts: Timestamp) -> Option<RawV
             }
             return Some(value);
         }
-        iter.next().unwrap();
+        iter.advance().unwrap();
     }
     None
 }

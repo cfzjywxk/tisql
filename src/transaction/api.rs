@@ -60,13 +60,13 @@ use crate::types::{Key, Lsn, RawValue, Timestamp, TxnId};
 ///
 /// ```ignore
 /// let mut iter = txn_service.scan_iter(ctx, range)?;
-/// iter.next()?;  // Position on first entry
+/// iter.advance()?;  // Position on first entry
 /// while iter.valid() {
 ///     let key = iter.user_key();     // Reference, no copy
 ///     let value = iter.value();      // Reference, no copy
 ///     // Only allocate when needed for the result
 ///     let row = decode_row_to_values(value, &col_ids, &types)?;
-///     iter.next()?;
+///     iter.advance()?;
 /// }
 /// ```
 ///
@@ -75,12 +75,14 @@ use crate::types::{Key, Lsn, RawValue, Timestamp, TxnId};
 /// The `user_key()` and `value()` methods return references to data stored
 /// in the underlying iterator. No allocation occurs during iteration.
 pub trait TxnScanIterator {
-    /// Advance to next entry.
+    /// Advance to the next entry.
     ///
-    /// After calling `next()`:
+    /// After calling `advance()`:
     /// - `valid()` returns true if positioned on a valid entry
     /// - `user_key()` and `value()` return the current entry's data
-    fn next(&mut self) -> Result<()>;
+    ///
+    /// Named `advance` instead of `next` to avoid conflict with `Iterator::next`.
+    fn advance(&mut self) -> Result<()>;
 
     /// Check if positioned on a valid entry.
     ///
