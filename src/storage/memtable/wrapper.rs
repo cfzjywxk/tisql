@@ -286,7 +286,8 @@ mod tests {
         let mut iter = mt.inner().create_streaming_iter(range);
         iter.next().unwrap();
         while iter.valid() {
-            results.push((iter.key().clone(), iter.value().to_vec()));
+            let key = MvccKey::encode(iter.user_key(), iter.timestamp());
+            results.push((key, iter.value().to_vec()));
             iter.next().unwrap();
         }
         results

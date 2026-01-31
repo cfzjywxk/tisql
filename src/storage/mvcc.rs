@@ -407,16 +407,18 @@ use crate::error::Result;
 ///
 /// - Supports I/O error propagation via `Result`
 /// - Allows efficient seeking to arbitrary positions
-/// - Avoids allocation by returning references
+/// - **Zero-copy**: Returns references to existing memory, no cloning
 ///
 /// ## Usage Pattern
 ///
 /// ```ignore
 /// let mut iter = storage.scan_iter(range)?;
+/// iter.next()?;  // Position on first entry
 /// while iter.valid() {
-///     let key = iter.key();
+///     let user_key = iter.user_key();
+///     let timestamp = iter.timestamp();
 ///     let value = iter.value();
-///     // Process entry
+///     // Process entry - clone if you need to keep the data
 ///     iter.next()?;
 /// }
 /// ```
@@ -427,22 +429,30 @@ use crate::error::Result;
 /// - Keys with the same user key are grouped together
 /// - Within a user key, newer versions (higher timestamps) come first
 ///
+/// ## Zero-Copy Guarantee
+///
+/// All accessor methods (`user_key()`, `timestamp()`, `value()`) return
+/// references to data stored in the underlying data structure. No memory
+/// allocation or copying occurs during iteration. If callers need to own
+/// the data, they must clone it explicitly.
+///
 /// ## Thread Safety
 ///
 /// Iterators are not required to be `Send` - they are typically used within
 /// a single thread for the duration of a scan operation. The `StorageEngine`
 /// itself must be `Send + Sync`, but the iterators it produces need not be.
 pub trait MvccIterator {
-    /// Seek to the first entry >= target key.
+    /// Seek to the first entry with MVCC key >= target.
     ///
     /// After seeking:
-    /// - `valid()` returns true if an entry >= target exists
-    /// - `key()` returns the first entry >= target
+    /// - `valid()` returns true if an entry with MVCC key >= target exists
+    /// - `user_key()` and `timestamp()` return the positioned entry's components
     fn seek(&mut self, target: &MvccKey) -> Result<()>;
 
     /// Move to the next entry.
     ///
     /// This advances the iterator to the next key in MVCC order.
+    /// No memory allocation occurs during this operation.
     fn next(&mut self) -> Result<()>;
 
     /// Check if the iterator is positioned on a valid entry.
@@ -453,14 +463,27 @@ pub trait MvccIterator {
     /// - An I/O error occurred (check via previous operation's Result)
     fn valid(&self) -> bool;
 
-    /// Get the current key.
+    /// Get the current entry's user key (without timestamp suffix).
+    ///
+    /// Returns a reference to the key stored in the underlying data structure.
+    /// No allocation or copying occurs.
     ///
     /// # Panics
     ///
     /// Panics if `!self.valid()`. Always check `valid()` first.
-    fn key(&self) -> &MvccKey;
+    fn user_key(&self) -> &[u8];
+
+    /// Get the current entry's commit timestamp.
+    ///
+    /// # Panics
+    ///
+    /// Panics if `!self.valid()`. Always check `valid()` first.
+    fn timestamp(&self) -> Timestamp;
 
     /// Get the current value.
+    ///
+    /// Returns a reference to the value stored in the underlying data structure.
+    /// No allocation or copying occurs.
     ///
     /// # Panics
     ///
@@ -486,8 +509,12 @@ impl MvccIterator for Box<dyn MvccIterator + '_> {
         (**self).valid()
     }
 
-    fn key(&self) -> &MvccKey {
-        (**self).key()
+    fn user_key(&self) -> &[u8] {
+        (**self).user_key()
+    }
+
+    fn timestamp(&self) -> Timestamp {
+        (**self).timestamp()
     }
 
     fn value(&self) -> &[u8] {

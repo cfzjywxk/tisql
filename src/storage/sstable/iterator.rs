@@ -34,9 +34,9 @@
 
 use std::ops::Range;
 
-use crate::error::{Result, TiSqlError};
-use crate::storage::mvcc::{MvccIterator, MvccKey};
-use crate::types::RawValue;
+use crate::error::Result;
+use crate::storage::mvcc::{MvccIterator, MvccKey, TIMESTAMP_SIZE};
+use crate::types::{RawValue, Timestamp};
 
 use super::block::DataBlock;
 use super::reader::SstReaderRef;
@@ -488,11 +488,17 @@ impl ConcatIterator {
 /// This wraps the existing SstIterator to implement the MvccIterator trait,
 /// providing range filtering and proper MVCC key semantics.
 ///
+/// ## Zero-Copy Design
+///
+/// This iterator returns references directly to data cached in the underlying
+/// `BlockState`. No additional allocations occur during iteration - the
+/// `user_key()`, `timestamp()`, and `value()` methods extract data from the
+/// block's cached entry without copying.
+///
 /// ## Error Handling
 ///
 /// If the SST contains corrupted MVCC keys (too short to be valid), the
-/// iterator enters an error state. The error is returned on the next
-/// call to `seek()` or `next()`, and `valid()` returns false.
+/// iterator becomes invalid (`valid()` returns false).
 pub struct SstMvccIterator {
     /// Underlying SST iterator
     inner: SstIterator,
@@ -500,12 +506,6 @@ pub struct SstMvccIterator {
     range: Range<MvccKey>,
     /// Whether the range is truly unbounded
     is_unbounded: bool,
-    /// Cached current key (to return reference)
-    current_key: Option<MvccKey>,
-    /// Cached current value (to return reference)
-    current_value: Option<Vec<u8>>,
-    /// Pending error from corrupted data
-    pending_error: Option<TiSqlError>,
 }
 
 impl SstMvccIterator {
@@ -522,101 +522,75 @@ impl SstMvccIterator {
             inner.seek(range.start.as_bytes())?;
         }
 
-        let mut iter = Self {
+        Ok(Self {
             inner,
             range,
             is_unbounded,
-            current_key: None,
-            current_value: None,
-            pending_error: None,
-        };
-
-        // Cache the current entry if valid and in range
-        iter.update_current();
-        Ok(iter)
+        })
     }
 
-    /// Update the cached current key and value.
+    /// Check if the current position is within the range bounds.
     ///
-    /// If the current key is corrupted (too short for MVCC format), sets
-    /// an error that will be returned on the next operation.
-    fn update_current(&mut self) {
+    /// Returns true if:
+    /// - The iterator is valid AND
+    /// - The current key is a valid MVCC key (>= 8 bytes) AND
+    /// - The current key is within the range end bound
+    #[inline]
+    fn is_in_range(&self) -> bool {
         if !self.inner.valid() {
-            self.current_key = None;
-            self.current_value = None;
-            return;
+            return false;
         }
 
         let key_bytes = self.inner.key();
 
-        // Check if we're past the end of the range
+        // Check MVCC key validity (must have at least 8 bytes for timestamp)
+        if key_bytes.len() < TIMESTAMP_SIZE {
+            return false;
+        }
+
+        // Check range end bound
         if !self.is_unbounded
             && !self.range.end.is_unbounded()
             && key_bytes >= self.range.end.as_bytes()
         {
-            self.current_key = None;
-            self.current_value = None;
-            return;
+            return false;
         }
 
-        // Cache the current entry, checking for corruption
-        match MvccKey::from_bytes(key_bytes.to_vec()) {
-            Some(key) => {
-                self.current_key = Some(key);
-                self.current_value = Some(self.inner.value().to_vec());
-            }
-            None => {
-                // Corrupted key - set error state
-                self.current_key = None;
-                self.current_value = None;
-                self.pending_error = Some(TiSqlError::Storage(format!(
-                    "SST corrupted: invalid MVCC key (len={}, need >=8)",
-                    key_bytes.len()
-                )));
-            }
-        }
-    }
-
-    /// Check and return any pending error.
-    fn check_error(&mut self) -> Result<()> {
-        if let Some(e) = self.pending_error.take() {
-            Err(e)
-        } else {
-            Ok(())
-        }
+        true
     }
 }
 
 impl MvccIterator for SstMvccIterator {
     fn seek(&mut self, target: &MvccKey) -> Result<()> {
-        // Check for pending error from previous operation
-        self.check_error()?;
-        self.inner.seek(target.as_bytes())?;
-        self.update_current();
-        // Return error immediately if update_current found corruption
-        self.check_error()
+        self.inner.seek(target.as_bytes())
     }
 
     fn next(&mut self) -> Result<()> {
-        // Check for pending error from previous operation
-        self.check_error()?;
-        self.inner.next()?;
-        self.update_current();
-        // Return error immediately if update_current found corruption
-        self.check_error()
+        self.inner.next()
     }
 
     fn valid(&self) -> bool {
-        // Not valid if we have a pending error or no current key
-        self.pending_error.is_none() && self.current_key.is_some()
+        self.is_in_range()
     }
 
-    fn key(&self) -> &MvccKey {
-        self.current_key.as_ref().expect("Iterator not valid")
+    fn user_key(&self) -> &[u8] {
+        let key_bytes = self.inner.key();
+        // Safe: is_in_range() already verified len >= TIMESTAMP_SIZE
+        &key_bytes[..key_bytes.len() - TIMESTAMP_SIZE]
+    }
+
+    fn timestamp(&self) -> Timestamp {
+        let key_bytes = self.inner.key();
+        // Safe: is_in_range() already verified len >= TIMESTAMP_SIZE
+        let ts_start = key_bytes.len() - TIMESTAMP_SIZE;
+        let ts_bytes: [u8; 8] = key_bytes[ts_start..]
+            .try_into()
+            .expect("is_in_range verified length");
+        !u64::from_be_bytes(ts_bytes)
     }
 
     fn value(&self) -> &[u8] {
-        self.current_value.as_ref().expect("Iterator not valid")
+        self.inner.value()
     }
 }
 

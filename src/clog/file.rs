@@ -1461,4 +1461,1132 @@ mod tests {
 
         service.close().unwrap();
     }
+
+    // ========================================================================
+    // write_batch() Zero-Copy Path Tests
+    // ========================================================================
+
+    /// Test write_batch() zero-copy serialization path.
+    /// This is the preferred method for transaction commits.
+    #[test]
+    fn test_write_batch_zero_copy() {
+        use crate::storage::WriteBatch;
+
+        let dir = tempdir().unwrap();
+        let config = FileClogConfig::with_dir(dir.path());
+        let service = FileClogService::open(config.clone()).unwrap();
+
+        // Create a WriteBatch with various operations
+        let mut batch = WriteBatch::new();
+        batch.put(b"key1".to_vec(), b"value1".to_vec());
+        batch.put(b"key2".to_vec(), b"value2".to_vec());
+        batch.delete(b"key3".to_vec());
+
+        let txn_id = 42;
+        let commit_ts = 100;
+
+        // Write using zero-copy path
+        let lsn = service
+            .write_batch(txn_id, &batch, commit_ts, true)
+            .unwrap();
+        // 3 ops + 1 commit = 4 entries, so last LSN is 4
+        assert_eq!(lsn, 4);
+
+        service.close().unwrap();
+
+        // Recover and verify
+        let (_, entries) = FileClogService::recover(config).unwrap();
+        assert_eq!(entries.len(), 4);
+
+        // Verify Put 1
+        assert_eq!(entries[0].txn_id, txn_id);
+        assert_eq!(entries[0].lsn, 1);
+        match &entries[0].op {
+            ClogOp::Put { key, value } => {
+                assert_eq!(key, b"key1");
+                assert_eq!(value, b"value1");
+            }
+            _ => panic!("Expected Put"),
+        }
+
+        // Verify Put 2
+        assert_eq!(entries[1].lsn, 2);
+        match &entries[1].op {
+            ClogOp::Put { key, value } => {
+                assert_eq!(key, b"key2");
+                assert_eq!(value, b"value2");
+            }
+            _ => panic!("Expected Put"),
+        }
+
+        // Verify Delete
+        assert_eq!(entries[2].lsn, 3);
+        match &entries[2].op {
+            ClogOp::Delete { key } => {
+                assert_eq!(key, b"key3");
+            }
+            _ => panic!("Expected Delete"),
+        }
+
+        // Verify Commit
+        assert_eq!(entries[3].lsn, 4);
+        match &entries[3].op {
+            ClogOp::Commit { commit_ts: ts } => {
+                assert_eq!(*ts, commit_ts);
+            }
+            _ => panic!("Expected Commit"),
+        }
+    }
+
+    /// Test that write_batch() and write() produce compatible on-disk formats.
+    /// Both should be readable after recovery.
+    #[test]
+    fn test_write_batch_and_write_interleaved() {
+        use crate::storage::WriteBatch;
+
+        let dir = tempdir().unwrap();
+        let config = FileClogConfig::with_dir(dir.path());
+        let service = FileClogService::open(config.clone()).unwrap();
+
+        // Write using ClogBatch (owned path)
+        let mut clog_batch = ClogBatch::new();
+        clog_batch.add_put(1, b"owned_key".to_vec(), b"owned_value".to_vec());
+        clog_batch.add_commit(1, 100);
+        let lsn1 = service.write(&mut clog_batch, true).unwrap();
+        assert_eq!(lsn1, 2);
+
+        // Write using WriteBatch (zero-copy path)
+        let mut write_batch = WriteBatch::new();
+        write_batch.put(b"zerocopy_key".to_vec(), b"zerocopy_value".to_vec());
+        let lsn2 = service.write_batch(2, &write_batch, 200, true).unwrap();
+        assert_eq!(lsn2, 4); // 1 put + 1 commit = 2 more entries
+
+        service.close().unwrap();
+
+        // Recover and verify all entries
+        let (_, entries) = FileClogService::recover(config).unwrap();
+        assert_eq!(entries.len(), 4);
+
+        // Verify first batch (owned)
+        match &entries[0].op {
+            ClogOp::Put { key, .. } => assert_eq!(key, b"owned_key"),
+            _ => panic!("Expected Put"),
+        }
+        match &entries[1].op {
+            ClogOp::Commit { commit_ts } => assert_eq!(*commit_ts, 100),
+            _ => panic!("Expected Commit"),
+        }
+
+        // Verify second batch (zero-copy)
+        match &entries[2].op {
+            ClogOp::Put { key, .. } => assert_eq!(key, b"zerocopy_key"),
+            _ => panic!("Expected Put"),
+        }
+        match &entries[3].op {
+            ClogOp::Commit { commit_ts } => assert_eq!(*commit_ts, 200),
+            _ => panic!("Expected Commit"),
+        }
+    }
+
+    /// Test write_batch() with empty WriteBatch returns current LSN.
+    #[test]
+    fn test_write_batch_empty() {
+        use crate::storage::WriteBatch;
+
+        let dir = tempdir().unwrap();
+        let config = FileClogConfig::with_dir(dir.path());
+        let service = FileClogService::open(config.clone()).unwrap();
+
+        // Write some entries first
+        let mut batch = ClogBatch::new();
+        batch.add_put(1, b"k".to_vec(), b"v".to_vec());
+        service.write(&mut batch, true).unwrap();
+
+        // Now try write_batch with empty batch
+        let empty_batch = WriteBatch::new();
+        let lsn = service.write_batch(2, &empty_batch, 100, true).unwrap();
+
+        // Should return current LSN (2, since we wrote 1 entry)
+        assert_eq!(lsn, 2);
+
+        // Verify no extra entries were written
+        let entries = service.read_all().unwrap();
+        assert_eq!(entries.len(), 1);
+
+        service.close().unwrap();
+    }
+
+    // ========================================================================
+    // Empty Batch Tests
+    // ========================================================================
+
+    /// Test write() with empty ClogBatch returns current LSN without writing.
+    #[test]
+    fn test_write_empty_clog_batch() {
+        let dir = tempdir().unwrap();
+        let config = FileClogConfig::with_dir(dir.path());
+        let service = FileClogService::open(config.clone()).unwrap();
+
+        // Initial LSN is 1
+        assert_eq!(service.current_lsn(), 1);
+
+        // Write empty batch
+        let mut empty_batch = ClogBatch::new();
+        assert!(empty_batch.is_empty());
+        let lsn = service.write(&mut empty_batch, true).unwrap();
+
+        // Should return current LSN without incrementing
+        assert_eq!(lsn, 1);
+        assert_eq!(service.current_lsn(), 1);
+
+        // Verify nothing was written
+        let entries = service.read_all().unwrap();
+        assert!(entries.is_empty());
+
+        service.close().unwrap();
+    }
+
+    // ========================================================================
+    // sync() and close() Tests
+    // ========================================================================
+
+    /// Test sync() flushes pending writes to disk.
+    #[test]
+    fn test_sync() {
+        let dir = tempdir().unwrap();
+        let config = FileClogConfig::with_dir(dir.path());
+        let service = FileClogService::open(config.clone()).unwrap();
+
+        // Write without sync
+        let mut batch = ClogBatch::new();
+        batch.add_put(1, b"key".to_vec(), b"value".to_vec());
+        service.write(&mut batch, false).unwrap(); // sync=false
+
+        // Explicitly sync
+        service.sync().unwrap();
+
+        // Verify data is readable
+        let entries = service.read_all().unwrap();
+        assert_eq!(entries.len(), 1);
+
+        service.close().unwrap();
+    }
+
+    /// Test close() properly flushes and syncs.
+    #[test]
+    fn test_close() {
+        let dir = tempdir().unwrap();
+        let config = FileClogConfig::with_dir(dir.path());
+
+        {
+            let service = FileClogService::open(config.clone()).unwrap();
+            let mut batch = ClogBatch::new();
+            batch.add_put(1, b"key".to_vec(), b"value".to_vec());
+            service.write(&mut batch, false).unwrap(); // No sync during write
+
+            // Close should flush and sync
+            service.close().unwrap();
+        }
+
+        // Verify data persisted after close
+        let (_, entries) = FileClogService::recover(config).unwrap();
+        assert_eq!(entries.len(), 1);
+    }
+
+    // ========================================================================
+    // oldest_lsn() and file_size() Tests
+    // ========================================================================
+
+    /// Test oldest_lsn() returns correct value.
+    #[test]
+    fn test_oldest_lsn() {
+        let dir = tempdir().unwrap();
+        let config = FileClogConfig::with_dir(dir.path());
+        let service = FileClogService::open(config.clone()).unwrap();
+
+        // Empty clog
+        assert_eq!(service.oldest_lsn().unwrap(), 0);
+
+        // Write entries
+        let mut batch = ClogBatch::new();
+        batch.add_put(1, b"k1".to_vec(), b"v1".to_vec());
+        batch.add_put(1, b"k2".to_vec(), b"v2".to_vec());
+        batch.add_put(1, b"k3".to_vec(), b"v3".to_vec());
+        service.write(&mut batch, true).unwrap();
+
+        // Oldest should be 1
+        assert_eq!(service.oldest_lsn().unwrap(), 1);
+
+        service.close().unwrap();
+    }
+
+    /// Test file_size() returns correct value.
+    #[test]
+    fn test_file_size() {
+        let dir = tempdir().unwrap();
+        let config = FileClogConfig::with_dir(dir.path());
+        let service = FileClogService::open(config.clone()).unwrap();
+
+        // Initial file has just header (16 bytes)
+        let initial_size = service.file_size().unwrap();
+        assert_eq!(initial_size, FILE_HEADER_SIZE as u64);
+
+        // Write some data
+        let mut batch = ClogBatch::new();
+        batch.add_put(1, b"key".to_vec(), b"value".to_vec());
+        service.write(&mut batch, true).unwrap();
+
+        // File should be larger now
+        let new_size = service.file_size().unwrap();
+        assert!(new_size > initial_size);
+
+        service.close().unwrap();
+    }
+
+    // ========================================================================
+    // truncate_to() Tests
+    // ========================================================================
+
+    /// Test truncate_to() removes entries with lsn <= safe_lsn.
+    #[test]
+    fn test_truncate_to() {
+        let dir = tempdir().unwrap();
+        let config = FileClogConfig::with_dir(dir.path());
+        let service = FileClogService::open(config.clone()).unwrap();
+
+        // Write 5 entries (LSN 1-5)
+        for i in 1..=5 {
+            let mut batch = ClogBatch::new();
+            batch.add_put(
+                i,
+                format!("key{i}").into_bytes(),
+                format!("val{i}").into_bytes(),
+            );
+            service.write(&mut batch, true).unwrap();
+        }
+
+        // Verify we have 5 entries
+        assert_eq!(service.read_all().unwrap().len(), 5);
+
+        // Truncate entries with LSN <= 3
+        let stats = service.truncate_to(3).unwrap();
+        assert_eq!(stats.entries_removed, 3);
+        assert_eq!(stats.entries_kept, 2);
+        assert!(stats.bytes_freed > 0);
+
+        // Verify only entries 4 and 5 remain
+        let remaining = service.read_all().unwrap();
+        assert_eq!(remaining.len(), 2);
+        assert_eq!(remaining[0].lsn, 4);
+        assert_eq!(remaining[1].lsn, 5);
+
+        // Oldest LSN should now be 4
+        assert_eq!(service.oldest_lsn().unwrap(), 4);
+
+        service.close().unwrap();
+    }
+
+    /// Test truncate_to() with safe_lsn higher than all entries (removes all).
+    #[test]
+    fn test_truncate_to_all() {
+        let dir = tempdir().unwrap();
+        let config = FileClogConfig::with_dir(dir.path());
+        let service = FileClogService::open(config.clone()).unwrap();
+
+        // Write 3 entries
+        let mut batch = ClogBatch::new();
+        batch.add_put(1, b"k1".to_vec(), b"v1".to_vec());
+        batch.add_put(1, b"k2".to_vec(), b"v2".to_vec());
+        batch.add_put(1, b"k3".to_vec(), b"v3".to_vec());
+        service.write(&mut batch, true).unwrap();
+
+        // Truncate all (safe_lsn >= max LSN)
+        let stats = service.truncate_to(10).unwrap();
+        assert_eq!(stats.entries_removed, 3);
+        assert_eq!(stats.entries_kept, 0);
+
+        // Verify clog is empty (just header)
+        let entries = service.read_all().unwrap();
+        assert!(entries.is_empty());
+        assert_eq!(service.oldest_lsn().unwrap(), 0);
+        assert_eq!(service.file_size().unwrap(), FILE_HEADER_SIZE as u64);
+
+        service.close().unwrap();
+    }
+
+    /// Test truncate_to() when nothing needs to be truncated.
+    #[test]
+    fn test_truncate_to_none() {
+        let dir = tempdir().unwrap();
+        let config = FileClogConfig::with_dir(dir.path());
+        let service = FileClogService::open(config.clone()).unwrap();
+
+        // Write entries with LSN 1-3
+        let mut batch = ClogBatch::new();
+        batch.add_put(1, b"k1".to_vec(), b"v1".to_vec());
+        batch.add_put(1, b"k2".to_vec(), b"v2".to_vec());
+        batch.add_put(1, b"k3".to_vec(), b"v3".to_vec());
+        service.write(&mut batch, true).unwrap();
+
+        let size_before = service.file_size().unwrap();
+
+        // Truncate with safe_lsn = 0 (nothing to remove)
+        let stats = service.truncate_to(0).unwrap();
+        assert_eq!(stats.entries_removed, 0);
+        assert_eq!(stats.entries_kept, 3);
+        assert_eq!(stats.bytes_freed, 0);
+        assert_eq!(stats.new_file_size, size_before);
+
+        // All entries still present
+        assert_eq!(service.read_all().unwrap().len(), 3);
+
+        service.close().unwrap();
+    }
+
+    /// Test truncate_to() then continue writing.
+    #[test]
+    fn test_truncate_then_write() {
+        let dir = tempdir().unwrap();
+        let config = FileClogConfig::with_dir(dir.path());
+        let service = FileClogService::open(config.clone()).unwrap();
+
+        // Write entries with LSN 1-3
+        let mut batch = ClogBatch::new();
+        batch.add_put(1, b"k1".to_vec(), b"v1".to_vec());
+        batch.add_put(1, b"k2".to_vec(), b"v2".to_vec());
+        batch.add_put(1, b"k3".to_vec(), b"v3".to_vec());
+        service.write(&mut batch, true).unwrap();
+
+        // Truncate LSN 1-2
+        service.truncate_to(2).unwrap();
+
+        // Write more entries
+        let mut batch2 = ClogBatch::new();
+        batch2.add_put(2, b"k4".to_vec(), b"v4".to_vec());
+        let lsn = service.write(&mut batch2, true).unwrap();
+        assert_eq!(lsn, 4); // LSN continues from 4
+
+        // Verify entries
+        let entries = service.read_all().unwrap();
+        assert_eq!(entries.len(), 2);
+        assert_eq!(entries[0].lsn, 3);
+        assert_eq!(entries[1].lsn, 4);
+
+        service.close().unwrap();
+    }
+
+    // ========================================================================
+    // append() Tests
+    // ========================================================================
+
+    /// Test append() default trait method.
+    #[test]
+    fn test_append() {
+        let dir = tempdir().unwrap();
+        let config = FileClogConfig::with_dir(dir.path());
+        let service = FileClogService::open(config.clone()).unwrap();
+
+        // Use append (default implementation wraps write)
+        let entry = ClogEntry {
+            lsn: 0, // Will be assigned
+            txn_id: 1,
+            op: ClogOp::Put {
+                key: b"key".to_vec(),
+                value: b"value".to_vec(),
+            },
+        };
+        let lsn = service.append(entry, true).unwrap();
+        assert_eq!(lsn, 1);
+
+        // Append another
+        let entry2 = ClogEntry {
+            lsn: 0,
+            txn_id: 1,
+            op: ClogOp::Commit { commit_ts: 100 },
+        };
+        let lsn2 = service.append(entry2, true).unwrap();
+        assert_eq!(lsn2, 2);
+
+        // Verify
+        let entries = service.read_all().unwrap();
+        assert_eq!(entries.len(), 2);
+
+        service.close().unwrap();
+    }
+
+    // ========================================================================
+    // ClogBatch Method Tests
+    // ========================================================================
+
+    /// Test ClogBatch methods: entries(), into_entries(), len(), is_empty().
+    #[test]
+    fn test_clog_batch_methods() {
+        let mut batch = ClogBatch::new();
+        assert!(batch.is_empty());
+        assert_eq!(batch.len(), 0);
+
+        batch.add_put(1, b"k1".to_vec(), b"v1".to_vec());
+        assert!(!batch.is_empty());
+        assert_eq!(batch.len(), 1);
+
+        batch.add_delete(1, b"k2".to_vec());
+        batch.add_commit(1, 100);
+        assert_eq!(batch.len(), 3);
+
+        // Test entries() borrowing
+        let entries = batch.entries();
+        assert_eq!(entries.len(), 3);
+        match &entries[0].op {
+            ClogOp::Put { key, value } => {
+                assert_eq!(key, b"k1");
+                assert_eq!(value, b"v1");
+            }
+            _ => panic!("Expected Put"),
+        }
+
+        // Test into_entries() consuming
+        let owned_entries = batch.into_entries();
+        assert_eq!(owned_entries.len(), 3);
+    }
+
+    /// Test ClogBatch::add() directly with ClogEntry.
+    #[test]
+    fn test_clog_batch_add_direct() {
+        let mut batch = ClogBatch::new();
+
+        // Add entry directly
+        let entry = ClogEntry {
+            lsn: 0,
+            txn_id: 42,
+            op: ClogOp::Rollback,
+        };
+        batch.add(entry);
+
+        assert_eq!(batch.len(), 1);
+        match &batch.entries()[0].op {
+            ClogOp::Rollback => {}
+            _ => panic!("Expected Rollback"),
+        }
+    }
+
+    // ========================================================================
+    // FileClogConfig Tests
+    // ========================================================================
+
+    /// Test FileClogConfig::default().
+    #[test]
+    fn test_config_default() {
+        let config = FileClogConfig::default();
+        assert_eq!(config.clog_dir, PathBuf::from("data"));
+        assert_eq!(config.clog_file, "tisql.clog");
+        assert_eq!(config.clog_path(), PathBuf::from("data/tisql.clog"));
+    }
+
+    /// Test FileClogConfig::with_dir().
+    #[test]
+    fn test_config_with_dir() {
+        let config = FileClogConfig::with_dir("/custom/path");
+        assert_eq!(config.clog_dir, PathBuf::from("/custom/path"));
+        assert_eq!(config.clog_file, "tisql.clog");
+        assert_eq!(config.clog_path(), PathBuf::from("/custom/path/tisql.clog"));
+    }
+
+    // ========================================================================
+    // Error Path Tests
+    // ========================================================================
+
+    /// Test recovery with invalid magic bytes.
+    #[test]
+    fn test_invalid_magic() {
+        let dir = tempdir().unwrap();
+        let clog_path = dir.path().join("tisql.clog");
+
+        // Write file with wrong magic
+        {
+            let mut file = std::fs::File::create(&clog_path).unwrap();
+            file.write_all(b"XXXX").unwrap(); // Wrong magic
+            file.write_all(&FILE_VERSION.to_le_bytes()).unwrap();
+            file.write_all(&[0u8; 8]).unwrap();
+            file.sync_all().unwrap();
+        }
+
+        let config = FileClogConfig::with_dir(dir.path());
+        let result = FileClogService::open(config);
+
+        match result {
+            Err(e) => {
+                let err = e.to_string();
+                assert!(
+                    err.contains("Invalid commit log file magic"),
+                    "Unexpected error: {err}"
+                );
+            }
+            Ok(_) => panic!("Expected error for invalid magic"),
+        }
+    }
+
+    /// Test recovery with unsupported version.
+    #[test]
+    fn test_unsupported_version() {
+        let dir = tempdir().unwrap();
+        let clog_path = dir.path().join("tisql.clog");
+
+        // Write file with wrong version
+        {
+            let mut file = std::fs::File::create(&clog_path).unwrap();
+            file.write_all(FILE_MAGIC).unwrap();
+            file.write_all(&99u32.to_le_bytes()).unwrap(); // Wrong version
+            file.write_all(&[0u8; 8]).unwrap();
+            file.sync_all().unwrap();
+        }
+
+        let config = FileClogConfig::with_dir(dir.path());
+        let result = FileClogService::open(config);
+
+        match result {
+            Err(e) => {
+                let err = e.to_string();
+                assert!(
+                    err.contains("Unsupported commit log file version"),
+                    "Unexpected error: {err}"
+                );
+            }
+            Ok(_) => panic!("Expected error for unsupported version"),
+        }
+    }
+
+    /// Test recovery with unknown record type.
+    #[test]
+    fn test_unknown_record_type() {
+        let dir = tempdir().unwrap();
+        let config = FileClogConfig::with_dir(dir.path());
+        let clog_path = config.clog_path();
+
+        // Create valid clog first
+        {
+            let service = FileClogService::open(config.clone()).unwrap();
+            let mut batch = ClogBatch::new();
+            batch.add_put(1, b"key".to_vec(), b"value".to_vec());
+            service.write(&mut batch, true).unwrap();
+            service.close().unwrap();
+        }
+
+        // Append a record with unknown type
+        {
+            let mut file = OpenOptions::new().append(true).open(&clog_path).unwrap();
+            let record_type: u32 = 99; // Unknown type
+            let length: u32 = 4;
+            let data = [0u8; 4];
+            let checksum = crc32(&data);
+
+            file.write_all(&record_type.to_le_bytes()).unwrap();
+            file.write_all(&length.to_le_bytes()).unwrap();
+            file.write_all(&checksum.to_le_bytes()).unwrap();
+            file.write_all(&data).unwrap();
+            file.sync_all().unwrap();
+        }
+
+        // Recovery should stop at unknown record type
+        let (service, entries) = FileClogService::recover(config).unwrap();
+        assert_eq!(entries.len(), 1); // Only the first valid entry
+        assert_eq!(service.current_lsn(), 2);
+    }
+
+    /// Test recovery with record size exceeding MAX_RECORD_SIZE.
+    #[test]
+    fn test_record_size_exceeds_max() {
+        let dir = tempdir().unwrap();
+        let config = FileClogConfig::with_dir(dir.path());
+        let clog_path = config.clog_path();
+
+        // Create valid clog first
+        {
+            let service = FileClogService::open(config.clone()).unwrap();
+            let mut batch = ClogBatch::new();
+            batch.add_put(1, b"key".to_vec(), b"value".to_vec());
+            service.write(&mut batch, true).unwrap();
+            service.close().unwrap();
+        }
+
+        // Append a record with size > MAX_RECORD_SIZE
+        {
+            let mut file = OpenOptions::new().append(true).open(&clog_path).unwrap();
+            let record_type: u32 = 1;
+            let length: u32 = (MAX_RECORD_SIZE + 1) as u32; // Exceeds max
+            let checksum: u32 = 0;
+
+            file.write_all(&record_type.to_le_bytes()).unwrap();
+            file.write_all(&length.to_le_bytes()).unwrap();
+            file.write_all(&checksum.to_le_bytes()).unwrap();
+            // Don't write actual data - just testing the check
+            file.sync_all().unwrap();
+        }
+
+        // Recovery should stop at the oversized record
+        let (service, entries) = FileClogService::recover(config).unwrap();
+        assert_eq!(entries.len(), 1);
+        assert_eq!(service.current_lsn(), 2);
+    }
+
+    // ========================================================================
+    // Recovery from Non-Existent File
+    // ========================================================================
+
+    /// Test recover() when clog file doesn't exist.
+    #[test]
+    fn test_recover_nonexistent_file() {
+        let dir = tempdir().unwrap();
+        let config = FileClogConfig::with_dir(dir.path());
+
+        // Don't create any file - just recover
+        let (service, entries) = FileClogService::recover(config).unwrap();
+        assert!(entries.is_empty());
+        assert_eq!(service.current_lsn(), 1);
+    }
+
+    // ========================================================================
+    // Directory Auto-Creation Tests
+    // ========================================================================
+
+    /// Test that open() creates directory if it doesn't exist.
+    #[test]
+    fn test_auto_create_directory() {
+        let dir = tempdir().unwrap();
+        let nested_dir = dir.path().join("nested").join("path");
+        let config = FileClogConfig::with_dir(&nested_dir);
+
+        // Directory doesn't exist yet
+        assert!(!nested_dir.exists());
+
+        // Open should create it
+        let service = FileClogService::open(config.clone()).unwrap();
+        assert!(nested_dir.exists());
+
+        // Write and verify
+        let mut batch = ClogBatch::new();
+        batch.add_put(1, b"key".to_vec(), b"value".to_vec());
+        service.write(&mut batch, true).unwrap();
+        service.close().unwrap();
+
+        let (_, entries) = FileClogService::recover(config).unwrap();
+        assert_eq!(entries.len(), 1);
+    }
+
+    // ========================================================================
+    // Rollback Operation Tests
+    // ========================================================================
+
+    /// Test Rollback operation serialization and recovery.
+    #[test]
+    fn test_rollback_operation() {
+        let dir = tempdir().unwrap();
+        let config = FileClogConfig::with_dir(dir.path());
+        let service = FileClogService::open(config.clone()).unwrap();
+
+        // Write a put followed by rollback
+        let mut batch = ClogBatch::new();
+        batch.add_put(1, b"key".to_vec(), b"value".to_vec());
+        batch.add(ClogEntry {
+            lsn: 0,
+            txn_id: 1,
+            op: ClogOp::Rollback,
+        });
+        service.write(&mut batch, true).unwrap();
+        service.close().unwrap();
+
+        // Recover and verify rollback
+        let (_, entries) = FileClogService::recover(config).unwrap();
+        assert_eq!(entries.len(), 2);
+
+        match &entries[1].op {
+            ClogOp::Rollback => {}
+            _ => panic!("Expected Rollback"),
+        }
+    }
+
+    // ========================================================================
+    // Concurrent write_batch Tests
+    // ========================================================================
+
+    /// Test concurrent writes using write_batch() (zero-copy path).
+    #[test]
+    fn test_concurrent_write_batch() {
+        use crate::storage::WriteBatch;
+        use std::sync::{Arc, Barrier};
+        use std::thread;
+
+        let dir = tempdir().unwrap();
+        let config = FileClogConfig::with_dir(dir.path());
+        let service = Arc::new(FileClogService::open(config.clone()).unwrap());
+
+        let num_threads = 4;
+        let writes_per_thread = 50;
+        let barrier = Arc::new(Barrier::new(num_threads));
+
+        let mut handles = Vec::new();
+        for tid in 0..num_threads {
+            let service = Arc::clone(&service);
+            let barrier = Arc::clone(&barrier);
+
+            handles.push(thread::spawn(move || {
+                barrier.wait();
+
+                for i in 0..writes_per_thread {
+                    let mut batch = WriteBatch::new();
+                    batch.put(
+                        format!("key_{tid}_{i}").into_bytes(),
+                        format!("value_{tid}_{i}").into_bytes(),
+                    );
+                    service
+                        .write_batch(tid as u64, &batch, (tid * 1000 + i) as u64, false)
+                        .unwrap();
+                }
+            }));
+        }
+
+        for h in handles {
+            h.join().unwrap();
+        }
+
+        service.close().unwrap();
+
+        // Recover and verify
+        let (_, entries) = FileClogService::recover(config).unwrap();
+
+        // Each thread writes: 1 put + 1 commit = 2 entries per iteration
+        let expected_count = num_threads * writes_per_thread * 2;
+        assert_eq!(entries.len(), expected_count);
+
+        // Verify LSN ordering
+        for i in 1..entries.len() {
+            assert!(
+                entries[i].lsn > entries[i - 1].lsn,
+                "LSNs not monotonic at index {}: {} <= {}",
+                i,
+                entries[i].lsn,
+                entries[i - 1].lsn
+            );
+        }
+    }
+
+    // ========================================================================
+    // Mixed Operations in Single Batch
+    // ========================================================================
+
+    /// Test batch with multiple operation types.
+    #[test]
+    fn test_mixed_operations_batch() {
+        let dir = tempdir().unwrap();
+        let config = FileClogConfig::with_dir(dir.path());
+        let service = FileClogService::open(config.clone()).unwrap();
+
+        // Create batch with all operation types
+        let mut batch = ClogBatch::new();
+        batch.add_put(1, b"key1".to_vec(), b"value1".to_vec());
+        batch.add_put(1, b"key2".to_vec(), b"value2".to_vec());
+        batch.add_delete(1, b"key_to_delete".to_vec());
+        batch.add_put(1, b"key3".to_vec(), b"value3".to_vec());
+        batch.add_commit(1, 1000);
+
+        let lsn = service.write(&mut batch, true).unwrap();
+        assert_eq!(lsn, 5);
+
+        service.close().unwrap();
+
+        // Recover and verify order
+        let (_, entries) = FileClogService::recover(config).unwrap();
+        assert_eq!(entries.len(), 5);
+
+        // Verify order and types
+        assert!(matches!(&entries[0].op, ClogOp::Put { key, .. } if key == b"key1"));
+        assert!(matches!(&entries[1].op, ClogOp::Put { key, .. } if key == b"key2"));
+        assert!(matches!(
+            &entries[2].op,
+            ClogOp::Delete { key } if key == b"key_to_delete"
+        ));
+        assert!(matches!(&entries[3].op, ClogOp::Put { key, .. } if key == b"key3"));
+        assert!(matches!(
+            &entries[4].op,
+            ClogOp::Commit { commit_ts } if *commit_ts == 1000
+        ));
+    }
+
+    // ========================================================================
+    // Bincode Deserialization Error Path
+    // ========================================================================
+
+    /// Test recovery with corrupted data that passes CRC but fails deserialization.
+    #[test]
+    fn test_corrupted_bincode_data() {
+        let dir = tempdir().unwrap();
+        let config = FileClogConfig::with_dir(dir.path());
+        let clog_path = config.clog_path();
+
+        // Write valid data first
+        {
+            let service = FileClogService::open(config.clone()).unwrap();
+            let mut batch = ClogBatch::new();
+            batch.add_put(1, b"key".to_vec(), b"value".to_vec());
+            service.write(&mut batch, true).unwrap();
+            service.close().unwrap();
+        }
+
+        // Append data with valid CRC but invalid bincode format
+        {
+            let mut file = OpenOptions::new().append(true).open(&clog_path).unwrap();
+
+            // Create some garbage data that won't deserialize as Vec<ClogEntry>
+            let garbage_data = b"this is not valid bincode data for ClogEntry";
+            let checksum = crc32(garbage_data);
+
+            let record_type: u32 = 1;
+            let length: u32 = garbage_data.len() as u32;
+
+            file.write_all(&record_type.to_le_bytes()).unwrap();
+            file.write_all(&length.to_le_bytes()).unwrap();
+            file.write_all(&checksum.to_le_bytes()).unwrap();
+            file.write_all(garbage_data).unwrap();
+            file.sync_all().unwrap();
+        }
+
+        // Recovery should stop at the bad record
+        let (service, entries) = FileClogService::recover(config).unwrap();
+        assert_eq!(entries.len(), 1); // Only the first valid entry
+        assert_eq!(service.current_lsn(), 2);
+    }
+
+    // ========================================================================
+    // TruncateStats Default Trait
+    // ========================================================================
+
+    /// Test TruncateStats Default implementation.
+    #[test]
+    fn test_truncate_stats_default() {
+        let stats = TruncateStats::default();
+        assert_eq!(stats.entries_removed, 0);
+        assert_eq!(stats.entries_kept, 0);
+        assert_eq!(stats.bytes_freed, 0);
+        assert_eq!(stats.new_file_size, 0);
+    }
+
+    // ========================================================================
+    // Debug and Clone Trait Coverage
+    // ========================================================================
+
+    /// Test Debug trait for ClogEntry, ClogOp, FileClogConfig.
+    #[test]
+    fn test_debug_traits() {
+        // ClogEntry and ClogOp Debug
+        let entry = ClogEntry {
+            lsn: 1,
+            txn_id: 42,
+            op: ClogOp::Put {
+                key: b"k".to_vec(),
+                value: b"v".to_vec(),
+            },
+        };
+        let debug_str = format!("{entry:?}");
+        assert!(debug_str.contains("ClogEntry"));
+        assert!(debug_str.contains("42"));
+
+        // ClogOp variants
+        let op_put = ClogOp::Put {
+            key: b"k".to_vec(),
+            value: b"v".to_vec(),
+        };
+        let debug_put = format!("{op_put:?}");
+        assert!(debug_put.contains("Put"));
+
+        let op_delete = ClogOp::Delete { key: b"k".to_vec() };
+        let debug_delete = format!("{op_delete:?}");
+        assert!(debug_delete.contains("Delete"));
+
+        let op_commit = ClogOp::Commit { commit_ts: 100 };
+        let debug_commit = format!("{op_commit:?}");
+        assert!(debug_commit.contains("Commit"));
+        assert!(debug_commit.contains("100"));
+
+        let op_rollback = ClogOp::Rollback;
+        let debug_rollback = format!("{op_rollback:?}");
+        assert!(debug_rollback.contains("Rollback"));
+
+        // FileClogConfig Debug
+        let config = FileClogConfig::default();
+        let debug_config = format!("{config:?}");
+        assert!(debug_config.contains("FileClogConfig"));
+        assert!(debug_config.contains("data"));
+    }
+
+    /// Test Clone trait for ClogEntry and ClogOp.
+    #[test]
+    fn test_clone_traits() {
+        let entry = ClogEntry {
+            lsn: 1,
+            txn_id: 42,
+            op: ClogOp::Put {
+                key: b"k".to_vec(),
+                value: b"v".to_vec(),
+            },
+        };
+
+        let cloned = entry.clone();
+        assert_eq!(cloned.lsn, entry.lsn);
+        assert_eq!(cloned.txn_id, entry.txn_id);
+
+        // Clone ClogOp variants
+        let op_put = ClogOp::Put {
+            key: b"k".to_vec(),
+            value: b"v".to_vec(),
+        };
+        let cloned_put = op_put.clone();
+        match cloned_put {
+            ClogOp::Put { key, value } => {
+                assert_eq!(key, b"k");
+                assert_eq!(value, b"v");
+            }
+            _ => panic!("Expected Put"),
+        }
+
+        let op_rollback = ClogOp::Rollback;
+        let cloned_rollback = op_rollback.clone();
+        assert!(matches!(cloned_rollback, ClogOp::Rollback));
+
+        // Clone config
+        let config = FileClogConfig::default();
+        let cloned_config = config.clone();
+        assert_eq!(cloned_config.clog_dir, config.clog_dir);
+        assert_eq!(cloned_config.clog_file, config.clog_file);
+    }
+
+    // ========================================================================
+    // TruncateStats Debug Trait
+    // ========================================================================
+
+    /// Test TruncateStats Debug implementation.
+    #[test]
+    fn test_truncate_stats_debug() {
+        let stats = TruncateStats {
+            entries_removed: 5,
+            entries_kept: 10,
+            bytes_freed: 1024,
+            new_file_size: 2048,
+        };
+        let debug_str = format!("{stats:?}");
+        assert!(debug_str.contains("TruncateStats"));
+        assert!(debug_str.contains("5"));
+        assert!(debug_str.contains("10"));
+        assert!(debug_str.contains("1024"));
+        assert!(debug_str.contains("2048"));
+    }
+
+    // ========================================================================
+    // Write Without Sync Tests
+    // ========================================================================
+
+    /// Test writes with sync=false still work and data is recoverable.
+    #[test]
+    fn test_write_without_sync() {
+        let dir = tempdir().unwrap();
+        let config = FileClogConfig::with_dir(dir.path());
+        let service = FileClogService::open(config.clone()).unwrap();
+
+        // Write multiple batches without sync
+        for i in 1..=5 {
+            let mut batch = ClogBatch::new();
+            batch.add_put(
+                i,
+                format!("key{i}").into_bytes(),
+                format!("val{i}").into_bytes(),
+            );
+            service.write(&mut batch, false).unwrap(); // sync=false
+        }
+
+        // Close (which flushes and syncs)
+        service.close().unwrap();
+
+        // Verify data is recoverable
+        let (_, entries) = FileClogService::recover(config).unwrap();
+        assert_eq!(entries.len(), 5);
+    }
+
+    // ========================================================================
+    // Multiple Batches Recovery Test
+    // ========================================================================
+
+    /// Test recovery with many separate batches.
+    #[test]
+    fn test_many_batches_recovery() {
+        let dir = tempdir().unwrap();
+        let config = FileClogConfig::with_dir(dir.path());
+        let service = FileClogService::open(config.clone()).unwrap();
+
+        // Write 20 separate batches
+        for i in 1..=20 {
+            let mut batch = ClogBatch::new();
+            batch.add_put(
+                i,
+                format!("key{i}").into_bytes(),
+                format!("val{i}").into_bytes(),
+            );
+            batch.add_commit(i, i * 100);
+            service.write(&mut batch, true).unwrap();
+        }
+
+        service.close().unwrap();
+
+        // Recover and verify all batches
+        let (service2, entries) = FileClogService::recover(config.clone()).unwrap();
+        assert_eq!(entries.len(), 40); // 20 puts + 20 commits
+        assert_eq!(service2.current_lsn(), 41);
+
+        // Verify first and last entries
+        assert_eq!(entries[0].lsn, 1);
+        assert_eq!(entries[39].lsn, 40);
+    }
+
+    // ========================================================================
+    // Large Key/Value Test
+    // ========================================================================
+
+    /// Test with larger key and value sizes.
+    #[test]
+    fn test_large_key_value() {
+        let dir = tempdir().unwrap();
+        let config = FileClogConfig::with_dir(dir.path());
+        let service = FileClogService::open(config.clone()).unwrap();
+
+        // Create large key and value (1KB each)
+        let large_key: Vec<u8> = (0..1024).map(|i| (i % 256) as u8).collect();
+        let large_value: Vec<u8> = (0..1024).map(|i| ((i * 7) % 256) as u8).collect();
+
+        let mut batch = ClogBatch::new();
+        batch.add_put(1, large_key.clone(), large_value.clone());
+        batch.add_commit(1, 100);
+        service.write(&mut batch, true).unwrap();
+        service.close().unwrap();
+
+        // Recover and verify
+        let (_, entries) = FileClogService::recover(config).unwrap();
+        assert_eq!(entries.len(), 2);
+
+        match &entries[0].op {
+            ClogOp::Put { key, value } => {
+                assert_eq!(key, &large_key);
+                assert_eq!(value, &large_value);
+            }
+            _ => panic!("Expected Put"),
+        }
+    }
+
+    // ========================================================================
+    // ClogBatch Default Trait
+    // ========================================================================
+
+    /// Test ClogBatch Default implementation.
+    #[test]
+    fn test_clog_batch_default() {
+        let batch: ClogBatch = Default::default();
+        assert!(batch.is_empty());
+        assert_eq!(batch.len(), 0);
+    }
 }

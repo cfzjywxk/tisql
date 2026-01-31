@@ -320,7 +320,9 @@ impl LsmEngine {
         iter.next()?; // Initialize iterator to first entry
 
         while iter.valid() {
-            builder.add(iter.key().as_bytes(), iter.value())?;
+            // Reconstruct MVCC key from user_key + timestamp
+            let mvcc_key = MvccKey::encode(iter.user_key(), iter.timestamp());
+            builder.add(mvcc_key.as_bytes(), iter.value())?;
             iter.next()?;
         }
 
@@ -585,8 +587,12 @@ impl MvccIterator for ArcMemTableIterator {
         self.iter.valid()
     }
 
-    fn key(&self) -> &MvccKey {
-        self.iter.key()
+    fn user_key(&self) -> &[u8] {
+        self.iter.user_key()
+    }
+
+    fn timestamp(&self) -> Timestamp {
+        self.iter.timestamp()
     }
 
     fn value(&self) -> &[u8] {
@@ -617,20 +623,42 @@ const PRIORITY_L0_BASE: u32 = 1000;
 const PRIORITY_LEVEL_BASE: u32 = 10000; // L1 = 10000, L2 = 20000, etc.
 
 /// Entry in the merge heap with priority for proper ordering.
+///
+/// Zero-copy design: does not store key/value copies. Ordering is computed
+/// from the iterator's current position. Only valid iterators should be
+/// in the heap.
 struct PriorityHeapEntry {
-    /// Current key from this iterator
-    key: MvccKey,
-    /// Current value from this iterator
-    value: Vec<u8>,
     /// Priority level (lower = higher priority)
     priority: u32,
-    /// The underlying iterator (owned)
+    /// The underlying iterator (owned). MUST be valid when in heap.
     iter: Box<dyn MvccIterator>,
+}
+
+impl PriorityHeapEntry {
+    /// Compare MVCC keys in memory-comparable order.
+    ///
+    /// MVCC ordering: (user_key ASC, timestamp DESC)
+    /// Since encoded key is `user_key || !ts`, comparing raw bytes gives us
+    /// the right order: same user_key sorts by !ts ascending = ts descending.
+    #[inline]
+    fn cmp_mvcc_key(
+        user_key1: &[u8],
+        ts1: Timestamp,
+        user_key2: &[u8],
+        ts2: Timestamp,
+    ) -> Ordering {
+        match user_key1.cmp(user_key2) {
+            Ordering::Equal => ts2.cmp(&ts1), // Higher timestamp first
+            ord => ord,
+        }
+    }
 }
 
 impl PartialEq for PriorityHeapEntry {
     fn eq(&self, other: &Self) -> bool {
-        self.key == other.key && self.priority == other.priority
+        self.iter.user_key() == other.iter.user_key()
+            && self.iter.timestamp() == other.iter.timestamp()
+            && self.priority == other.priority
     }
 }
 
@@ -646,7 +674,13 @@ impl Ord for PriorityHeapEntry {
     fn cmp(&self, other: &Self) -> Ordering {
         // Min-heap ordering: we want smallest key first
         // For same key, we want lowest priority (highest precedence) first
-        match other.key.cmp(&self.key) {
+        let key_cmp = Self::cmp_mvcc_key(
+            other.iter.user_key(),
+            other.iter.timestamp(),
+            self.iter.user_key(),
+            self.iter.timestamp(),
+        );
+        match key_cmp {
             Ordering::Equal => other.priority.cmp(&self.priority),
             ord => ord,
         }
@@ -730,8 +764,12 @@ impl MvccIterator for LazySstIterator {
         self.inner.as_ref().is_some_and(|i| i.valid())
     }
 
-    fn key(&self) -> &MvccKey {
-        self.inner.as_ref().expect("Iterator not valid").key()
+    fn user_key(&self) -> &[u8] {
+        self.inner.as_ref().expect("Iterator not valid").user_key()
+    }
+
+    fn timestamp(&self) -> Timestamp {
+        self.inner.as_ref().expect("Iterator not valid").timestamp()
     }
 
     fn value(&self) -> &[u8] {
@@ -883,11 +921,18 @@ impl MvccIterator for LevelIterator {
         self.current_iter.as_ref().is_some_and(|i| i.valid())
     }
 
-    fn key(&self) -> &MvccKey {
+    fn user_key(&self) -> &[u8] {
         self.current_iter
             .as_ref()
             .expect("Iterator not valid")
-            .key()
+            .user_key()
+    }
+
+    fn timestamp(&self) -> Timestamp {
+        self.current_iter
+            .as_ref()
+            .expect("Iterator not valid")
+            .timestamp()
     }
 
     fn value(&self) -> &[u8] {
@@ -920,19 +965,27 @@ struct PendingIterator {
 /// This avoids unnecessary disk I/O when memtable contains the required data.
 ///
 /// For duplicate MVCC keys, the highest priority (lowest number) wins.
+///
+/// **Zero-Copy Design:**
+/// - PriorityHeapEntry does not store key/value copies
+/// - Only the "emitted" entry is cached for returning via user_key()/value()
+/// - Deduplication tracks only the user key bytes (not full MVCC key)
 pub struct TieredMergeIterator {
-    /// Min-heap of iterators with their current entries and priorities
+    /// Min-heap of iterators with their priorities
     heap: BinaryHeap<PriorityHeapEntry>,
     /// Pending L0 SST iterators (initialized when memtable tier exhausted)
     pending_l0: Vec<PendingIterator>,
     /// Pending L1+ level iterators (initialized when L0 tier exhausted)
     pending_levels: Vec<PendingIterator>,
-    /// Current key (cached for returning reference)
-    current_key: Option<MvccKey>,
+    /// Current user key (cached for returning reference)
+    current_user_key: Option<Vec<u8>>,
+    /// Current timestamp
+    current_timestamp: Timestamp,
     /// Current value (cached for returning reference)
     current_value: Option<Vec<u8>>,
-    /// Last emitted key (for deduplication)
-    last_emitted_key: Option<MvccKey>,
+    /// Last emitted MVCC key: (user_key, timestamp) for deduplication
+    /// We skip entries with the same (user_key, timestamp) from different sources
+    last_emitted_key: Option<(Vec<u8>, Timestamp)>,
     /// Pending error from iterator operations
     pending_error: Option<TiSqlError>,
 }
@@ -950,7 +1003,8 @@ impl TieredMergeIterator {
             heap: BinaryHeap::new(),
             pending_l0: Vec::new(),
             pending_levels: Vec::new(),
-            current_key: None,
+            current_user_key: None,
+            current_timestamp: 0,
             current_value: None,
             last_emitted_key: None,
             pending_error: None,
@@ -964,11 +1018,7 @@ impl TieredMergeIterator {
             iter.seek(&MvccKey::unbounded())?;
         }
         if iter.valid() {
-            let key = iter.key().clone();
-            let value = iter.value().to_vec();
             self.heap.push(PriorityHeapEntry {
-                key,
-                value,
                 priority: PRIORITY_ACTIVE,
                 iter,
             });
@@ -987,11 +1037,7 @@ impl TieredMergeIterator {
             iter.seek(&MvccKey::unbounded())?;
         }
         if iter.valid() {
-            let key = iter.key().clone();
-            let value = iter.value().to_vec();
             self.heap.push(PriorityHeapEntry {
-                key,
-                value,
                 priority: PRIORITY_FROZEN_BASE + index as u32,
                 iter,
             });
@@ -1033,11 +1079,7 @@ impl TieredMergeIterator {
             let mut iter = pending.iter;
             iter.seek(&MvccKey::unbounded())?;
             if iter.valid() {
-                let key = iter.key().clone();
-                let value = iter.value().to_vec();
                 self.heap.push(PriorityHeapEntry {
-                    key,
-                    value,
                     priority: pending.priority,
                     iter,
                 });
@@ -1052,11 +1094,7 @@ impl TieredMergeIterator {
             let mut iter = pending.iter;
             iter.seek(&MvccKey::unbounded())?;
             if iter.valid() {
-                let key = iter.key().clone();
-                let value = iter.value().to_vec();
                 self.heap.push(PriorityHeapEntry {
-                    key,
-                    value,
                     priority: pending.priority,
                     iter,
                 });
@@ -1093,19 +1131,12 @@ impl MvccIterator for TieredMergeIterator {
         for (mut iter, priority) in all_iters {
             iter.seek(target)?;
             if iter.valid() {
-                let key = iter.key().clone();
-                let value = iter.value().to_vec();
-                self.heap.push(PriorityHeapEntry {
-                    key,
-                    value,
-                    priority,
-                    iter,
-                });
+                self.heap.push(PriorityHeapEntry { priority, iter });
             }
         }
 
         // Clear dedup state and move to first matching entry
-        self.current_key = None;
+        self.current_user_key = None;
         self.current_value = None;
         self.last_emitted_key = None;
         self.next()
@@ -1127,42 +1158,43 @@ impl MvccIterator for TieredMergeIterator {
                     self.init_levels_tier()?;
                 } else {
                     // All tiers exhausted
-                    self.current_key = None;
+                    self.current_user_key = None;
                     self.current_value = None;
                     return Ok(());
                 }
             }
 
             if let Some(mut top) = self.heap.pop() {
-                let key = top.key.clone();
-                let value = top.value.clone();
+                // Cache the current entry for returning (allocation needed here)
+                let user_key = top.iter.user_key().to_vec();
+                let timestamp = top.iter.timestamp();
+                let value = top.iter.value().to_vec();
 
                 // Advance the iterator and re-add to heap if valid
                 if let Err(e) = top.iter.next() {
                     self.pending_error = Some(e);
                 }
                 if top.iter.valid() {
-                    let next_key = top.iter.key().clone();
-                    let next_value = top.iter.value().to_vec();
                     self.heap.push(PriorityHeapEntry {
-                        key: next_key,
-                        value: next_value,
                         priority: top.priority,
                         iter: top.iter,
                     });
                 }
 
-                // Skip if this is a duplicate of the last emitted key
-                if let Some(ref last) = self.last_emitted_key {
-                    if &key == last {
+                // Skip if this is a duplicate MVCC key (same user_key AND timestamp)
+                // This can happen when the same MVCC key exists in multiple sources
+                // (e.g., memtable and SST). We only emit the highest-priority version.
+                if let Some((ref last_key, last_ts)) = self.last_emitted_key {
+                    if user_key == *last_key && timestamp == last_ts {
                         continue;
                     }
                 }
 
                 // Emit this entry
-                self.current_key = Some(key.clone());
+                self.current_user_key = Some(user_key.clone());
+                self.current_timestamp = timestamp;
                 self.current_value = Some(value);
-                self.last_emitted_key = Some(key);
+                self.last_emitted_key = Some((user_key, timestamp));
                 return Ok(());
             }
             // Unreachable: while loop above ensures heap is non-empty or returns early
@@ -1170,11 +1202,15 @@ impl MvccIterator for TieredMergeIterator {
     }
 
     fn valid(&self) -> bool {
-        self.current_key.is_some()
+        self.current_user_key.is_some()
     }
 
-    fn key(&self) -> &MvccKey {
-        self.current_key.as_ref().expect("Iterator not valid")
+    fn user_key(&self) -> &[u8] {
+        self.current_user_key.as_ref().expect("Iterator not valid")
+    }
+
+    fn timestamp(&self) -> Timestamp {
+        self.current_timestamp
     }
 
     fn value(&self) -> &[u8] {
@@ -1353,7 +1389,8 @@ mod tests {
         let mut results = Vec::new();
         let mut iter = engine.scan_iter(range).unwrap();
         while iter.valid() {
-            results.push((iter.key().clone(), iter.value().to_vec()));
+            let key = MvccKey::encode(iter.user_key(), iter.timestamp());
+            results.push((key, iter.value().to_vec()));
             iter.next().unwrap();
         }
         results
@@ -2891,8 +2928,12 @@ mod tests {
             self.pos >= 0 && (self.pos as usize) < self.data.len()
         }
 
-        fn key(&self) -> &MvccKey {
-            &self.data[self.pos as usize].0
+        fn user_key(&self) -> &[u8] {
+            self.data[self.pos as usize].0.key()
+        }
+
+        fn timestamp(&self) -> Timestamp {
+            self.data[self.pos as usize].0.timestamp()
         }
 
         fn value(&self) -> &[u8] {
@@ -2903,6 +2944,11 @@ mod tests {
     /// Helper to create an MvccKey for testing.
     fn test_key(user_key: &[u8], ts: Timestamp) -> MvccKey {
         MvccKey::encode(user_key, ts)
+    }
+
+    /// Helper to get the current MVCC key from an iterator (for test assertions).
+    fn iter_key<I: MvccIterator + ?Sized>(iter: &I) -> MvccKey {
+        MvccKey::encode(iter.user_key(), iter.timestamp())
     }
 
     #[test]
@@ -2925,7 +2971,7 @@ mod tests {
 
         assert!(*active_seek.borrow(), "Active memtable should be seeked");
         assert!(merge_iter.valid());
-        assert_eq!(merge_iter.key(), &test_key(b"a", 100));
+        assert_eq!(iter_key(&merge_iter), test_key(b"a", 100));
         assert_eq!(merge_iter.value(), b"a_active");
     }
 
@@ -3001,7 +3047,7 @@ mod tests {
 
         // Read first memtable entry
         assert!(merge_iter.valid());
-        assert_eq!(merge_iter.key(), &test_key(b"a", 100));
+        assert_eq!(iter_key(&merge_iter), test_key(b"a", 100));
         assert!(
             !*l0_seek.borrow(),
             "L0 SST should NOT be seeked - still reading memtable"
@@ -3010,7 +3056,7 @@ mod tests {
         // Read second memtable entry
         merge_iter.next().unwrap();
         assert!(merge_iter.valid());
-        assert_eq!(merge_iter.key(), &test_key(b"b", 100));
+        assert_eq!(iter_key(&merge_iter), test_key(b"b", 100));
         assert!(
             !*l0_seek.borrow(),
             "L0 SST should NOT be seeked - still reading memtable"
@@ -3023,7 +3069,7 @@ mod tests {
             "L0 SST should be seeked now - memtable exhausted"
         );
         assert!(merge_iter.valid());
-        assert_eq!(merge_iter.key(), &test_key(b"c", 100));
+        assert_eq!(iter_key(&merge_iter), test_key(b"c", 100));
         assert_eq!(merge_iter.value(), b"c_l0");
     }
 
@@ -3063,7 +3109,7 @@ mod tests {
 
         // Read memtable entry
         assert!(merge_iter.valid());
-        assert_eq!(merge_iter.key(), &test_key(b"a", 100));
+        assert_eq!(iter_key(&merge_iter), test_key(b"a", 100));
 
         // Exhaust memtable -> L0 should be initialized
         merge_iter.next().unwrap();
@@ -3076,7 +3122,7 @@ mod tests {
             "L1 level should NOT be seeked - L0 not exhausted"
         );
         assert!(merge_iter.valid());
-        assert_eq!(merge_iter.key(), &test_key(b"b", 100));
+        assert_eq!(iter_key(&merge_iter), test_key(b"b", 100));
 
         // Exhaust L0 -> L1 should be initialized
         merge_iter.next().unwrap();
@@ -3085,7 +3131,7 @@ mod tests {
             "L1 level should be seeked - L0 exhausted"
         );
         assert!(merge_iter.valid());
-        assert_eq!(merge_iter.key(), &test_key(b"c", 100));
+        assert_eq!(iter_key(&merge_iter), test_key(b"c", 100));
 
         // Exhaust all
         merge_iter.next().unwrap();
@@ -3154,7 +3200,7 @@ mod tests {
         // Key 'a' exists in SST 0 (priority 1000) and SST 2 (priority 1002)
         // SST 0 has higher priority, so its value should win
         assert!(merge_iter.valid());
-        assert_eq!(merge_iter.key(), &test_key(b"a", 100));
+        assert_eq!(iter_key(&merge_iter), test_key(b"a", 100));
         assert_eq!(
             merge_iter.value(),
             b"a_l0_0",
@@ -3163,22 +3209,22 @@ mod tests {
 
         merge_iter.next().unwrap();
         assert!(merge_iter.valid());
-        assert_eq!(merge_iter.key(), &test_key(b"b", 100));
+        assert_eq!(iter_key(&merge_iter), test_key(b"b", 100));
         assert_eq!(merge_iter.value(), b"b_l0_1");
 
         merge_iter.next().unwrap();
         assert!(merge_iter.valid());
-        assert_eq!(merge_iter.key(), &test_key(b"c", 100));
+        assert_eq!(iter_key(&merge_iter), test_key(b"c", 100));
         assert_eq!(merge_iter.value(), b"c_l0_1");
 
         merge_iter.next().unwrap();
         assert!(merge_iter.valid());
-        assert_eq!(merge_iter.key(), &test_key(b"d", 100));
+        assert_eq!(iter_key(&merge_iter), test_key(b"d", 100));
         assert_eq!(merge_iter.value(), b"d_l0_0");
 
         merge_iter.next().unwrap();
         assert!(merge_iter.valid());
-        assert_eq!(merge_iter.key(), &test_key(b"e", 100));
+        assert_eq!(iter_key(&merge_iter), test_key(b"e", 100));
         assert_eq!(merge_iter.value(), b"e_l0_2");
 
         merge_iter.next().unwrap();
@@ -3233,7 +3279,7 @@ mod tests {
 
         // Should be positioned at 'a' from L0
         assert!(merge_iter.valid());
-        assert_eq!(merge_iter.key(), &test_key(b"a", 100));
+        assert_eq!(iter_key(&merge_iter), test_key(b"a", 100));
     }
 
     #[test]
@@ -3364,7 +3410,7 @@ mod tests {
 
         // Only active's value should be returned
         assert!(merge_iter.valid());
-        assert_eq!(merge_iter.key(), &test_key(b"key", 100));
+        assert_eq!(iter_key(&merge_iter), test_key(b"key", 100));
         assert_eq!(merge_iter.value(), b"active_wins");
 
         // Next should exhaust all (duplicates were skipped)
@@ -3402,7 +3448,7 @@ mod tests {
             "L0 should be seeked when memtable is empty"
         );
         assert!(merge_iter.valid());
-        assert_eq!(merge_iter.key(), &test_key(b"a", 100));
+        assert_eq!(iter_key(&merge_iter), test_key(b"a", 100));
     }
 
     #[test]
@@ -3444,16 +3490,16 @@ mod tests {
 
         // Should get: a, b, c, shared (from frozen0 - higher priority)
         assert!(merge_iter.valid());
-        assert_eq!(merge_iter.key(), &test_key(b"a", 100));
+        assert_eq!(iter_key(&merge_iter), test_key(b"a", 100));
 
         merge_iter.next().unwrap();
-        assert_eq!(merge_iter.key(), &test_key(b"b", 100));
+        assert_eq!(iter_key(&merge_iter), test_key(b"b", 100));
 
         merge_iter.next().unwrap();
-        assert_eq!(merge_iter.key(), &test_key(b"c", 100));
+        assert_eq!(iter_key(&merge_iter), test_key(b"c", 100));
 
         merge_iter.next().unwrap();
-        assert_eq!(merge_iter.key(), &test_key(b"shared", 100));
+        assert_eq!(iter_key(&merge_iter), test_key(b"shared", 100));
         // frozen0 (priority 100) beats frozen1 (priority 101)
         assert_eq!(merge_iter.value(), b"shared_frozen0");
 
@@ -3528,7 +3574,7 @@ mod tests {
 
         for (key, value) in expected.iter() {
             assert!(merge_iter.valid());
-            assert_eq!(merge_iter.key(), &test_key(*key, 100));
+            assert_eq!(iter_key(&merge_iter), test_key(*key, 100));
             assert_eq!(merge_iter.value(), *value);
             merge_iter.next().unwrap();
         }
@@ -3562,13 +3608,11 @@ mod tests {
 
         // Should be able to read from memtable
         assert!(iter.valid());
-        let (key1, _) = iter.key().decode();
-        assert_eq!(key1, b"key1");
+        assert_eq!(iter.user_key(), b"key1");
 
         iter.next().unwrap();
         assert!(iter.valid());
-        let (key2, _) = iter.key().decode();
-        assert_eq!(key2, b"key2");
+        assert_eq!(iter.user_key(), b"key2");
 
         iter.next().unwrap();
         assert!(!iter.valid());
@@ -3609,8 +3653,7 @@ mod tests {
         let mut iter = engine.scan_iter(range).unwrap();
 
         assert!(iter.valid());
-        let (key, _) = iter.key().decode();
-        assert_eq!(key, b"new_key");
+        assert_eq!(iter.user_key(), b"new_key");
 
         iter.next().unwrap();
         assert!(!iter.valid());

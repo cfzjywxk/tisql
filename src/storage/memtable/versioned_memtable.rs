@@ -56,9 +56,10 @@
 //! - Version chain updates use atomic CAS on the head pointer
 //! - Reads are lock-free: atomic load of head, then traverse
 
-use std::ops::Range;
+use std::ops::{Bound, Range};
 use std::sync::atomic::{AtomicPtr, AtomicU32, AtomicUsize, Ordering};
 
+use crossbeam_skiplist::map::Entry;
 use crossbeam_skiplist::SkipMap;
 
 use crate::error::{Result, TiSqlError};
@@ -373,16 +374,20 @@ pub struct VersionedMemoryStats {
 }
 
 // ============================================================================
-// VersionedMemTableIterator - True streaming iterator for versioned memtable
+// VersionedMemTableIterator - Zero-copy streaming iterator
 // ============================================================================
 
-/// True streaming iterator over the versioned memtable (no materialization).
+/// Zero-copy streaming iterator over the versioned memtable.
 ///
-/// This iterator provides efficient MVCC key iteration by:
-/// - Directly traversing the skiplist (user keys in ascending order)
-/// - Traversing version chains for each user key (timestamps descending)
-/// - Filtering by MVCC range bounds during iteration
-/// - Using raw pointers to navigate version chains (safe because memtable keeps data alive)
+/// This iterator provides efficient MVCC key iteration with **zero allocations**
+/// during iteration (seek, next, user_key, timestamp, value).
+///
+/// ## Design Principles
+///
+/// 1. **No caching**: Returns references directly to stored data
+/// 2. **No cloning**: Never clones keys or values during iteration
+/// 3. **Pointer-based traversal**: Uses raw pointers for version chains
+/// 4. **Efficient next-key**: Uses `Bound::Excluded` instead of key increment
 ///
 /// ## MVCC Key Order
 ///
@@ -396,6 +401,9 @@ pub struct VersionedMemoryStats {
 /// 1. The iterator holds a reference to the `VersionedMemTableEngine`
 /// 2. Version nodes are never deallocated while the engine exists
 /// 3. The version chain is prepend-only (no concurrent modification of existing nodes)
+///
+/// Also stores `Entry<'a, ...>` from crossbeam skiplist which is valid for the
+/// lifetime of the skiplist (guaranteed by the engine reference).
 pub struct VersionedMemTableIterator<'a> {
     /// Reference to the memtable engine
     engine: &'a VersionedMemTableEngine,
@@ -405,18 +413,15 @@ pub struct VersionedMemTableIterator<'a> {
     range_end: MvccKey,
     /// Whether the iterator has been initialized
     initialized: bool,
-    /// Current user key being iterated (None if exhausted)
-    current_user_key: Option<Vec<u8>>,
+    /// Current skiplist entry (holds reference to user key)
+    current_entry: Option<Entry<'a, Vec<u8>, MvccRow>>,
     /// Current position in version chain (null if at end of chain)
     current_version: *const VersionNode,
-    /// Cached current MVCC key (for returning reference)
-    cached_key: Option<MvccKey>,
-    /// Cached current value (for returning reference)
-    cached_value: Option<Vec<u8>>,
 }
 
 // Safety: The iterator only holds references to data owned by the memtable.
 // The memtable guarantees that version nodes are not deallocated while it exists.
+// Entry<'a, ...> is valid as long as the skiplist exists.
 unsafe impl<'a> Send for VersionedMemTableIterator<'a> {}
 unsafe impl<'a> Sync for VersionedMemTableIterator<'a> {}
 
@@ -431,10 +436,8 @@ impl<'a> VersionedMemTableIterator<'a> {
             range_start: range.start,
             range_end: range.end,
             initialized: false,
-            current_user_key: None,
+            current_entry: None,
             current_version: std::ptr::null(),
-            cached_key: None,
-            cached_value: None,
         }
     }
 
@@ -445,77 +448,125 @@ impl<'a> VersionedMemTableIterator<'a> {
         }
         self.initialized = true;
 
-        // Determine the starting user key
-        let start_user_key = if self.range_start.is_unbounded() {
-            Vec::new()
+        // Get the range bounds for the skiplist query
+        let start_bound: Bound<&[u8]> = if self.range_start.is_unbounded() {
+            Bound::Unbounded
         } else {
-            self.range_start.key().to_vec()
-        };
-        let start_ts = if self.range_start.is_unbounded() {
-            Timestamp::MAX
-        } else {
-            self.range_start.timestamp()
+            Bound::Included(self.range_start.key())
         };
 
-        // Find the first user key >= start_user_key
-        for entry in self.engine.index.range(start_user_key.clone()..) {
-            let user_key = entry.key();
+        // Iterate through entries starting from range_start
+        for entry in self.engine.index.range::<[u8], _>((start_bound, Bound::Unbounded)) {
+            let user_key = entry.key().as_slice();
 
             // Check if past end of range
-            if !self.range_end.is_unbounded() {
-                let end_user_key = self.range_end.key();
-                if user_key.as_slice() > end_user_key {
-                    break;
-                }
+            if !self.range_end.is_unbounded() && user_key > self.range_end.key() {
+                break;
             }
 
-            // Get the row's version chain
             let row = entry.value();
             let head = row.head.load(Ordering::Acquire);
 
             if head.is_null() {
-                continue; // Empty row, skip
+                continue;
             }
 
-            // If this is the exact start user key, find the right version
-            if user_key.as_slice() == start_user_key.as_slice() {
-                // Find first version with ts <= start_ts
-                let mut version_ptr = head;
-                while !version_ptr.is_null() {
-                    let node = unsafe { &*version_ptr };
-                    if node.ts <= start_ts && self.is_version_in_range(user_key, node.ts) {
-                        self.current_user_key = Some(user_key.clone());
-                        self.current_version = version_ptr;
-                        self.cache_current();
-                        return;
-                    }
-                    version_ptr = node.next;
-                }
-                // No valid version in this key, continue to next key
+            // For the first key matching range_start exactly, filter by timestamp
+            let ts_filter = if !self.range_start.is_unbounded()
+                && user_key == self.range_start.key()
+            {
+                Some(self.range_start.timestamp())
             } else {
-                // This is a key after start_user_key, start from head (newest version)
-                let mut version_ptr = head;
-                while !version_ptr.is_null() {
-                    let node = unsafe { &*version_ptr };
-                    if self.is_version_in_range(user_key, node.ts) {
-                        self.current_user_key = Some(user_key.clone());
-                        self.current_version = version_ptr;
-                        self.cache_current();
-                        return;
-                    }
-                    version_ptr = node.next;
-                }
+                None
+            };
+
+            if let Some(version_ptr) = self.find_first_valid_version(user_key, head, ts_filter) {
+                self.current_entry = Some(entry);
+                self.current_version = version_ptr;
+                return;
             }
         }
 
         // No entry found
-        self.current_user_key = None;
+        self.current_entry = None;
         self.current_version = std::ptr::null();
-        self.cached_key = None;
-        self.cached_value = None;
+    }
+
+    /// Seek to first valid entry starting from the given user key.
+    ///
+    /// If `exact_start_ts` is Some, the first user key matching `start_key` will
+    /// only consider versions with ts <= exact_start_ts. Subsequent keys start from head.
+    fn seek_from_user_key(&mut self, start_key: &[u8], exact_start_ts: Option<Timestamp>) {
+        for entry in self
+            .engine
+            .index
+            .range::<[u8], _>((Bound::Included(start_key), Bound::Unbounded))
+        {
+            let user_key = entry.key().as_slice();
+
+            // Check if past end of range
+            if !self.range_end.is_unbounded() && user_key > self.range_end.key() {
+                break;
+            }
+
+            let row = entry.value();
+            let head = row.head.load(Ordering::Acquire);
+
+            if head.is_null() {
+                continue;
+            }
+
+            // Apply timestamp filter only for exact match on start_key
+            let ts_filter = if user_key == start_key {
+                exact_start_ts
+            } else {
+                None
+            };
+
+            if let Some(version_ptr) = self.find_first_valid_version(user_key, head, ts_filter) {
+                self.current_entry = Some(entry);
+                self.current_version = version_ptr;
+                return;
+            }
+        }
+
+        // No entry found
+        self.current_entry = None;
+        self.current_version = std::ptr::null();
+    }
+
+    /// Find the first valid version in a version chain.
+    ///
+    /// If `ts_filter` is Some, only consider versions with ts <= ts_filter.
+    /// Returns the pointer to the first valid version, or None if none found.
+    fn find_first_valid_version(
+        &self,
+        user_key: &[u8],
+        head: *mut VersionNode,
+        ts_filter: Option<Timestamp>,
+    ) -> Option<*const VersionNode> {
+        let mut version_ptr = head;
+        while !version_ptr.is_null() {
+            let node = unsafe { &*version_ptr };
+
+            // Apply timestamp filter if specified
+            if let Some(max_ts) = ts_filter {
+                if node.ts > max_ts {
+                    version_ptr = node.next;
+                    continue;
+                }
+            }
+
+            if self.is_version_in_range(user_key, node.ts) {
+                return Some(version_ptr);
+            }
+            version_ptr = node.next;
+        }
+        None
     }
 
     /// Check if a (user_key, ts) pair is within the MVCC key range.
+    #[inline]
     fn is_version_in_range(&self, user_key: &[u8], ts: Timestamp) -> bool {
         // Check start bound (inclusive)
         if !self.range_start.is_unbounded() {
@@ -546,36 +597,25 @@ impl<'a> VersionedMemTableIterator<'a> {
         true
     }
 
-    /// Cache the current entry's key and value.
-    fn cache_current(&mut self) {
-        if let Some(ref user_key) = self.current_user_key {
-            if !self.current_version.is_null() {
-                let node = unsafe { &*self.current_version };
-                self.cached_key = Some(MvccKey::encode(user_key, node.ts));
-                self.cached_value = Some(node.value.clone());
-            }
-        }
-    }
-
     /// Advance to the next valid entry.
     fn advance(&mut self) {
-        if self.current_user_key.is_none() {
+        if self.current_entry.is_none() {
             return; // Already exhausted
         }
 
-        let current_key = self.current_user_key.clone().unwrap();
+        // Get current user key (reference, no clone)
+        let current_user_key = self.current_entry.as_ref().unwrap().key().as_slice();
 
         // Try to advance within the current version chain
         if !self.current_version.is_null() {
             let node = unsafe { &*self.current_version };
             let mut next_version = node.next;
 
-            // Find next version in range
+            // Find next version in range (no allocation, just pointer traversal)
             while !next_version.is_null() {
                 let next_node = unsafe { &*next_version };
-                if self.is_version_in_range(&current_key, next_node.ts) {
+                if self.is_version_in_range(current_user_key, next_node.ts) {
                     self.current_version = next_version;
-                    self.cache_current();
                     return;
                 }
                 next_version = next_node.next;
@@ -583,92 +623,62 @@ impl<'a> VersionedMemTableIterator<'a> {
         }
 
         // Version chain exhausted, move to next user key
-        self.move_to_next_user_key(&current_key);
+        self.move_to_next_user_key();
     }
 
-    /// Move to the next user key after the given key.
-    fn move_to_next_user_key(&mut self, current_key: &[u8]) {
-        // Find next user key after current_key
-        let mut next_key_bytes = current_key.to_vec();
-        // Increment to get exclusive start
-        increment_bytes(&mut next_key_bytes);
+    /// Move to the next user key after the current one.
+    ///
+    /// Uses `Bound::Excluded` to efficiently skip to the next key without
+    /// any allocation or key modification.
+    fn move_to_next_user_key(&mut self) {
+        // Get current key for the excluded bound
+        let next_entry = {
+            let current_key = self.current_entry.as_ref().unwrap().key().as_slice();
 
-        for entry in self.engine.index.range(next_key_bytes..) {
-            let user_key = entry.key();
+            // Find next user key using Excluded bound (no allocation!)
+            let mut found_entry = None;
+            for entry in self
+                .engine
+                .index
+                .range::<[u8], _>((Bound::Excluded(current_key), Bound::Unbounded))
+            {
+                let user_key = entry.key().as_slice();
 
-            // Check if past end of range
-            if !self.range_end.is_unbounded() {
-                let end_user_key = self.range_end.key();
-                if user_key.as_slice() > end_user_key {
+                // Check if past end of range
+                if !self.range_end.is_unbounded() && user_key > self.range_end.key() {
+                    break;
+                }
+
+                let row = entry.value();
+                let head = row.head.load(Ordering::Acquire);
+
+                if head.is_null() {
+                    continue;
+                }
+
+                // Find first version in range
+                if let Some(version_ptr) = self.find_first_valid_version(user_key, head, None) {
+                    self.current_version = version_ptr;
+                    found_entry = Some(entry);
                     break;
                 }
             }
+            found_entry
+        };
 
-            let row = entry.value();
-            let head = row.head.load(Ordering::Acquire);
-
-            if head.is_null() {
-                continue;
-            }
-
-            // Find first version in range
-            let mut version_ptr = head;
-            while !version_ptr.is_null() {
-                let node = unsafe { &*version_ptr };
-                if self.is_version_in_range(user_key, node.ts) {
-                    self.current_user_key = Some(user_key.clone());
-                    self.current_version = version_ptr;
-                    self.cache_current();
-                    return;
-                }
-                version_ptr = node.next;
-            }
+        self.current_entry = next_entry;
+        if self.current_entry.is_none() {
+            self.current_version = std::ptr::null();
         }
-
-        // No more entries
-        self.current_user_key = None;
-        self.current_version = std::ptr::null();
-        self.cached_key = None;
-        self.cached_value = None;
     }
-}
-
-/// Increment a byte array to get the next key (for exclusive range start).
-///
-/// For keys like `[0xFF; 8]`, we append a zero byte to get `[0xFF; 8, 0x00]`
-/// which is lexicographically greater. This ensures we skip past the current
-/// key when iterating.
-fn increment_bytes(bytes: &mut Vec<u8>) {
-    if bytes.is_empty() {
-        bytes.push(0);
-        return;
-    }
-
-    for i in (0..bytes.len()).rev() {
-        if bytes[i] < 255 {
-            bytes[i] += 1;
-            return;
-        }
-        bytes[i] = 0;
-    }
-    // All bytes were 255, append a zero byte to get the next key.
-    // Example: [0xFF, 0xFF] -> [0xFF, 0xFF, 0x00]
-    // This is lexicographically greater because the original key is a prefix.
-    // Reset the bytes to their original values first.
-    for byte in bytes.iter_mut() {
-        *byte = 0xFF;
-    }
-    bytes.push(0);
 }
 
 impl<'a> MvccIterator for VersionedMemTableIterator<'a> {
     fn seek(&mut self, target: &MvccKey) -> Result<()> {
-        // Reset state and seek to target
+        // Reset state
         self.initialized = true;
-        self.current_user_key = None;
+        self.current_entry = None;
         self.current_version = std::ptr::null();
-        self.cached_key = None;
-        self.cached_value = None;
 
         // Handle unbounded target - seek to first entry within range
         if target.is_unbounded() {
@@ -680,54 +690,8 @@ impl<'a> MvccIterator for VersionedMemTableIterator<'a> {
         let target_user_key = target.key();
         let target_ts = target.timestamp();
 
-        for entry in self.engine.index.range(target_user_key.to_vec()..) {
-            let user_key = entry.key();
-
-            // Check if past end of range
-            if !self.range_end.is_unbounded() {
-                let end_user_key = self.range_end.key();
-                if user_key.as_slice() > end_user_key {
-                    break;
-                }
-            }
-
-            let row = entry.value();
-            let head = row.head.load(Ordering::Acquire);
-
-            if head.is_null() {
-                continue;
-            }
-
-            // If this is the target user key, find version with ts <= target_ts
-            if user_key.as_slice() == target_user_key {
-                let mut version_ptr = head;
-                while !version_ptr.is_null() {
-                    let node = unsafe { &*version_ptr };
-                    if node.ts <= target_ts && self.is_version_in_range(user_key, node.ts) {
-                        self.current_user_key = Some(user_key.clone());
-                        self.current_version = version_ptr;
-                        self.cache_current();
-                        return Ok(());
-                    }
-                    version_ptr = node.next;
-                }
-                // No valid version at target key, continue to next key
-            } else {
-                // This is a key after target, start from head
-                let mut version_ptr = head;
-                while !version_ptr.is_null() {
-                    let node = unsafe { &*version_ptr };
-                    if self.is_version_in_range(user_key, node.ts) {
-                        self.current_user_key = Some(user_key.clone());
-                        self.current_version = version_ptr;
-                        self.cache_current();
-                        return Ok(());
-                    }
-                    version_ptr = node.next;
-                }
-            }
-        }
-
+        // Seek to target (reuse the same logic)
+        self.seek_from_user_key(target_user_key, Some(target_ts));
         Ok(())
     }
 
@@ -741,15 +705,25 @@ impl<'a> MvccIterator for VersionedMemTableIterator<'a> {
     }
 
     fn valid(&self) -> bool {
-        self.initialized && self.current_user_key.is_some() && self.cached_key.is_some()
+        self.initialized && self.current_entry.is_some() && !self.current_version.is_null()
     }
 
-    fn key(&self) -> &MvccKey {
-        self.cached_key.as_ref().expect("Iterator not valid")
+    fn user_key(&self) -> &[u8] {
+        self.current_entry
+            .as_ref()
+            .expect("Iterator not valid")
+            .key()
+            .as_slice()
+    }
+
+    fn timestamp(&self) -> Timestamp {
+        debug_assert!(!self.current_version.is_null(), "Iterator not valid");
+        unsafe { (*self.current_version).ts }
     }
 
     fn value(&self) -> &[u8] {
-        self.cached_value.as_ref().expect("Iterator not valid")
+        debug_assert!(!self.current_version.is_null(), "Iterator not valid");
+        unsafe { &(*self.current_version).value }
     }
 }
 
@@ -789,7 +763,8 @@ mod tests {
         let mut iter = engine.create_streaming_iter(range);
         iter.next().unwrap();
         while iter.valid() {
-            results.push((iter.key().clone(), iter.value().to_vec()));
+            let key = MvccKey::encode(iter.user_key(), iter.timestamp());
+            results.push((key, iter.value().to_vec()));
             iter.next().unwrap();
         }
         results
@@ -1230,7 +1205,7 @@ mod tests {
                     for i in 0..writes_per_thread {
                         let key = format!("key_{tid}_{i}");
                         let ts = (tid * writes_per_thread + i + 1) as u64;
-                        put_at(&engine, key.as_bytes(), b"value", ts);
+                        put_at(engine, key.as_bytes(), b"value", ts);
                     }
                 });
             }
@@ -1284,7 +1259,7 @@ mod tests {
                         // Get timestamp while holding lock - ensures monotonic per-key ordering
                         let ts = ts_counter.fetch_add(1, Ordering::SeqCst);
                         let value = format!("v{tid}_{i}");
-                        put_at(&engine, b"hotkey", value.as_bytes(), ts);
+                        put_at(engine, b"hotkey", value.as_bytes(), ts);
                     }
                 });
             }
@@ -1346,7 +1321,7 @@ mod tests {
                         // Timestamp increases with each write within this thread
                         let ts = (100 + i) as u64;
                         let value = format!("value_{tid}_{i}");
-                        put_at(&engine, key.as_bytes(), value.as_bytes(), ts);
+                        put_at(engine, key.as_bytes(), value.as_bytes(), ts);
                     }
                 });
             }

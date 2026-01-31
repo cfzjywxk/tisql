@@ -254,11 +254,10 @@ impl<S: StorageEngine + 'static, L: ClogService + 'static, T: TsoService> TxnSer
         let mut iter = self.storage.scan_iter(scan_range)?;
 
         // Find the first entry matching our key with ts <= start_ts.
-        // Use zero-copy key()/timestamp() instead of decode() to avoid allocation.
+        // Use zero-copy user_key()/timestamp() instead of decode() to avoid allocation.
         while iter.valid() {
-            let mvcc_key = iter.key();
-            let entry_key = mvcc_key.key();
-            let entry_ts = mvcc_key.timestamp();
+            let entry_key = iter.user_key();
+            let entry_ts = iter.timestamp();
 
             // Check exact key match and timestamp visibility
             if entry_key == key && entry_ts <= ctx.start_ts {
@@ -533,10 +532,9 @@ impl<I: MvccIterator> MvccScanIterator<I> {
         self.pending_storage = None;
 
         while self.storage_iter.valid() {
-            let mvcc_key = self.storage_iter.key();
-            // Use zero-copy accessors instead of decode() to avoid allocation
-            let user_key = mvcc_key.key();
-            let ts = mvcc_key.timestamp();
+            // Use zero-copy accessors to avoid allocation
+            let user_key = self.storage_iter.user_key();
+            let ts = self.storage_iter.timestamp();
 
             // Check if past end of range
             if !self.range.end.is_empty() && user_key >= self.range.end.as_slice() {
@@ -764,9 +762,9 @@ mod tests {
         let mut iter = storage.scan_iter(range).unwrap();
 
         while iter.valid() {
-            let mvcc_key = iter.key();
+            let decoded_key = iter.user_key();
+            let entry_ts = iter.timestamp();
             let value = iter.value();
-            let (decoded_key, entry_ts) = mvcc_key.decode();
             if decoded_key == key && entry_ts <= ts {
                 if is_tombstone(value) {
                     return None;
@@ -1192,8 +1190,18 @@ mod tests {
             !self.has_errored && self.position < self.entries.len()
         }
 
-        fn key(&self) -> &MvccKey {
-            &self.current().expect("key() called on invalid iterator").0
+        fn user_key(&self) -> &[u8] {
+            self.current()
+                .expect("user_key() called on invalid iterator")
+                .0
+                .key()
+        }
+
+        fn timestamp(&self) -> Timestamp {
+            self.current()
+                .expect("timestamp() called on invalid iterator")
+                .0
+                .timestamp()
         }
 
         fn value(&self) -> &[u8] {

@@ -308,9 +308,9 @@ fn worker_thread<E: StorageEngine>(
             // Find the first visible entry
             let mut _found = false;
             while iter.valid() {
-                let mvcc_key = iter.key();
+                let decoded_key = iter.user_key();
+                let entry_ts = iter.timestamp();
                 let value = iter.value();
-                let (decoded_key, entry_ts) = mvcc_key.decode();
                 if decoded_key == key && entry_ts <= ts && !is_tombstone(value) {
                     _found = true;
                     break;

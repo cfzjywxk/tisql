@@ -51,8 +51,8 @@ fn get_at_for_test(storage: &MemTableEngine, key: &[u8], ts: Timestamp) -> Optio
     let mut iter = storage.scan_iter(range).unwrap();
 
     while iter.valid() {
-        let mvcc_key = iter.key();
-        let (decoded_key, entry_ts) = mvcc_key.decode();
+        let decoded_key = iter.user_key();
+        let entry_ts = iter.timestamp();
         if decoded_key == key && entry_ts <= ts {
             let value = iter.value().to_vec();
             if is_tombstone(&value) {
