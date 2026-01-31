@@ -288,9 +288,10 @@ impl<S: StorageEngine + 'static, L: ClogService + 'static, T: TsoService> TxnSer
         // MVCC scan: find the latest version of each key with commit_ts <= start_ts
         //
         // Build MVCC key range:
-        // - Start: MvccKey::encode(range.start, MAX) - smallest MVCC key for range.start
+        // - Start: MvccKey::encode(range.start, start_ts) - seek to first visible version
+        //   (MVCC keys with ts > start_ts have smaller encoded values, so we skip them)
         // - End: MvccKey::encode(range.end, 0) - largest MVCC key for range.end (exclusive)
-        let start_mvcc = MvccKey::encode(&range.start, Timestamp::MAX);
+        let start_mvcc = MvccKey::encode(&range.start, ctx.start_ts);
         let end_mvcc = if range.end.is_empty() {
             MvccKey::unbounded()
         } else {
