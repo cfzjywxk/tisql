@@ -28,7 +28,7 @@ use crate::error::{Result, TiSqlError};
 use crate::log_warn;
 use crate::tso::TsoService;
 
-use super::api::{CommitInfo, ScanIterator, TxnCtx, TxnService, TxnState};
+use super::api::{CommitInfo, TxnCtx, TxnService, TxnState};
 use super::concurrency::{ConcurrencyManager, Lock};
 use crate::storage::mvcc::{is_tombstone, MvccIterator, MvccKey};
 use crate::storage::{StorageEngine, WriteBatch, WriteOp};
@@ -211,6 +211,8 @@ impl<S: StorageEngine, L: ClogService, T: TsoService> TransactionService<S, L, T
 impl<S: StorageEngine + 'static, L: ClogService + 'static, T: TsoService> TxnService
     for TransactionService<S, L, T>
 {
+    type ScanIter = MvccScanIterator<S::Iter>;
+
     fn begin(&self, read_only: bool) -> Result<TxnCtx> {
         // Allocate txn_id and start_ts from TSO
         let txn_id = self.get_ts();
@@ -274,7 +276,7 @@ impl<S: StorageEngine + 'static, L: ClogService + 'static, T: TsoService> TxnSer
         Ok(None)
     }
 
-    fn scan_iter(&self, ctx: &TxnCtx, range: Range<Key>) -> Result<ScanIterator> {
+    fn scan_iter(&self, ctx: &TxnCtx, range: Range<Key>) -> Result<MvccScanIterator<S::Iter>> {
         // Check for locks in range.
         //
         // Note: empty end (vec![]) means "unbounded" (scan to infinity), not empty range.
@@ -318,9 +320,12 @@ impl<S: StorageEngine + 'static, L: ClogService + 'static, T: TsoService> TxnSer
             .collect::<Vec<_>>();
 
         // Create streaming scan iterator that merges storage with write buffer
-        let scan_iter = MvccScanIterator::new(storage_iter, ctx.start_ts, range, buffer_entries);
-
-        Ok(Box::new(scan_iter))
+        Ok(MvccScanIterator::new(
+            storage_iter,
+            ctx.start_ts,
+            range,
+            buffer_entries,
+        ))
     }
 
     fn put(&self, ctx: &mut TxnCtx, key: Key, value: RawValue) -> Result<()> {
@@ -742,23 +747,6 @@ impl<I: MvccIterator> TxnScanIterator for MvccScanIterator<I> {
                 .expect("Buffer entry should not be delete when current points to it")
                 .as_slice(),
         }
-    }
-}
-
-// Implement Iterator trait for backwards compatibility during migration
-impl<I: MvccIterator> Iterator for MvccScanIterator<I> {
-    type Item = Result<(Key, RawValue)>;
-
-    fn next(&mut self) -> Option<Self::Item> {
-        // Use the TxnScanIterator::next
-        if let Err(e) = TxnScanIterator::next(self) {
-            return Some(Err(e));
-        }
-        if !self.valid() {
-            return None;
-        }
-        // Clone for backwards compatibility
-        Some(Ok((self.user_key().to_vec(), self.value().to_vec())))
     }
 }
 
@@ -1286,6 +1274,28 @@ mod tests {
         }
     }
 
+    /// Helper to collect scan results using streaming API
+    fn collect_scan_results<I: MvccIterator>(
+        mut iter: MvccScanIterator<I>,
+    ) -> Vec<Result<(Key, RawValue)>> {
+        let mut results = Vec::new();
+        loop {
+            match TxnScanIterator::next(&mut iter) {
+                Ok(()) => {
+                    if !iter.valid() {
+                        break;
+                    }
+                    results.push(Ok((iter.user_key().to_vec(), iter.value().to_vec())));
+                }
+                Err(e) => {
+                    results.push(Err(e));
+                    break;
+                }
+            }
+        }
+        results
+    }
+
     #[test]
     fn test_mvcc_scan_iterator_propagates_storage_error() {
         // Create test data: 3 entries (a@5, b@5, c@5)
@@ -1311,7 +1321,7 @@ mod tests {
             vec![], // no buffer entries
         );
 
-        let results: Vec<_> = scan_iter.collect();
+        let results = collect_scan_results(scan_iter);
 
         // Should have 2 Ok entries followed by error
         assert_eq!(results.len(), 3, "expected 3 items: 2 Ok + 1 Err");
@@ -1346,7 +1356,7 @@ mod tests {
 
         let scan_iter = MvccScanIterator::new(mock_iter, 10, b"a".to_vec()..b"z".to_vec(), vec![]);
 
-        let results: Vec<_> = scan_iter.collect();
+        let results = collect_scan_results(scan_iter);
 
         // One successful entry, then error when trying to advance
         assert_eq!(results.len(), 2, "expected 2 items: 1 Ok + 1 Err");
@@ -1367,7 +1377,7 @@ mod tests {
 
         let scan_iter = MvccScanIterator::new(mock_iter, 10, b"a".to_vec()..b"z".to_vec(), vec![]);
 
-        let results: Vec<_> = scan_iter.collect();
+        let results = collect_scan_results(scan_iter);
 
         // All entries should succeed
         assert_eq!(results.len(), 2, "expected 2 successful entries");
@@ -1398,7 +1408,7 @@ mod tests {
         let scan_iter =
             MvccScanIterator::new(mock_iter, 10, b"a".to_vec()..b"z".to_vec(), buffer_entries);
 
-        let results: Vec<_> = scan_iter.collect();
+        let results = collect_scan_results(scan_iter);
 
         assert_eq!(
             results.len(),
@@ -1450,20 +1460,15 @@ mod tests {
 
         let scan_iter = MvccScanIterator::new(mock_iter, 10, b"a".to_vec()..b"z".to_vec(), vec![]);
 
-        // The key invariant: we must be able to detect the error
-        let mut saw_error = false;
-        let mut successful_count = 0;
+        let results = collect_scan_results(scan_iter);
 
-        for result in scan_iter {
-            match result {
-                Ok(_) => successful_count += 1,
-                Err(e) => {
-                    saw_error = true;
-                    // Verify it's our simulated error
-                    assert!(matches!(e, TiSqlError::Storage(_)));
-                    break;
-                }
-            }
+        // Count successful and error results
+        let successful_count = results.iter().filter(|r| r.is_ok()).count();
+        let saw_error = results.iter().any(|r| r.is_err());
+
+        // Verify error is a Storage error
+        if let Some(Err(e)) = results.iter().find(|r| r.is_err()) {
+            assert!(matches!(e, TiSqlError::Storage(_)));
         }
 
         // CRITICAL: We must have seen the error, not silent truncation

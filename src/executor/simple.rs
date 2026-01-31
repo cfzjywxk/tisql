@@ -22,7 +22,7 @@ use crate::catalog::Catalog;
 use crate::error::{Result, TiSqlError};
 use crate::sql::{AggFunc, BinaryOp, Expr, LogicalPlan, UnaryOp};
 use crate::storage::{decode_row_to_values, encode_int_key, encode_key, encode_pk, encode_row};
-use crate::transaction::{TxnCtx, TxnService};
+use crate::transaction::{TxnCtx, TxnScanIterator, TxnService};
 use crate::types::{ColumnId, ColumnInfo, DataType, Row, Schema, Value};
 
 use super::{ExecutionResult, Executor};

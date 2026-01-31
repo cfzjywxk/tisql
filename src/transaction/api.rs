@@ -108,11 +108,6 @@ pub trait TxnScanIterator {
     fn value(&self) -> &[u8];
 }
 
-/// Type alias for a boxed scan iterator with zero-copy access.
-///
-/// No lifetime parameter needed - iterators own all their data via Arc.
-pub type ScanIterator = Box<dyn TxnScanIterator>;
-
 /// Transaction state machine.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum TxnState {
@@ -233,6 +228,12 @@ impl TxnCtx {
 /// read-write transactions at the API level. The `read_only` flag is
 /// a hint for optimization, not a hard constraint.
 pub trait TxnService: Send + Sync {
+    /// The iterator type returned by `scan_iter`.
+    ///
+    /// Using an associated type avoids boxing and dynamic dispatch overhead.
+    /// Each transaction service implementation defines its own concrete iterator type.
+    type ScanIter: TxnScanIterator;
+
     // === Factory ===
 
     /// Begin a new transaction.
@@ -259,7 +260,7 @@ pub trait TxnService: Send + Sync {
     /// Returns an iterator over key-value pairs visible at `start_ts`.
     /// Each item is wrapped in `Result` to propagate I/O or corruption errors
     /// that may occur during streaming iteration over storage.
-    fn scan_iter(&self, ctx: &TxnCtx, range: Range<Key>) -> Result<ScanIterator>;
+    fn scan_iter(&self, ctx: &TxnCtx, range: Range<Key>) -> Result<Self::ScanIter>;
 
     /// Buffer a put operation.
     ///
