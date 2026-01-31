@@ -788,13 +788,13 @@ impl<'a> MvccIterator for VersionedMemTableIterator<'a> {
 /// Uses `unsafe` to extend the lifetime of the `VersionedMemTableIterator` from
 /// the `Arc`'s lifetime to `'static`. This is safe because:
 /// 1. The `Arc` keeps the inner data alive for as long as this struct exists
-/// 2. The `_inner` field is declared before `iter`, ensuring proper drop order
+/// 2. The `_inner` field is declared after `iter`, ensuring proper drop order
 /// 3. `VersionedMemTableIterator` doesn't access the inner data in its `Drop` impl
 pub struct ArcVersionedMemTableIterator {
-    /// Keep the inner data alive. MUST be declared before `iter` so it's dropped last.
-    _inner: Arc<VersionedMemTableEngineInner>,
     /// The streaming iterator with erased lifetime (safe because _inner keeps data alive)
     iter: VersionedMemTableIterator<'static>,
+    /// Keep the inner data alive. MUST be declared after `iter` so it's dropped last.
+    _inner: Arc<VersionedMemTableEngineInner>,
 }
 
 impl ArcVersionedMemTableIterator {
@@ -809,15 +809,15 @@ impl ArcVersionedMemTableIterator {
         // Safety: We're extending the lifetime of the reference from the Arc's lifetime
         // to 'static. This is safe because:
         // 1. The Arc keeps the inner data alive for as long as this struct exists
-        // 2. The _inner field is declared before iter, ensuring proper drop order
+        // 2. The _inner field is declared after iter, ensuring proper drop order
         // 3. VersionedMemTableIterator doesn't access the inner in its Drop impl
         let inner_ref: &'static VersionedMemTableEngineInner =
             unsafe { std::mem::transmute(inner.as_ref()) };
         let iter = VersionedMemTableIterator::new(inner_ref, range);
         // Caller must call advance() to position on first entry
         Self {
-            _inner: inner,
             iter,
+            _inner: inner,
         }
     }
 }

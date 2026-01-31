@@ -566,7 +566,14 @@ impl SstMvccIterator {
 
 impl MvccIterator for SstMvccIterator {
     fn seek(&mut self, target: &MvccKey) -> Result<()> {
-        self.inner.seek(target.as_bytes())
+        // If seeking to unbounded target, use range start instead.
+        // This ensures we position within the range, not at the beginning of the SST.
+        // The VersionedMemTableIterator handles this similarly in its seek() method.
+        if target.is_unbounded() && !self.range.start.is_unbounded() {
+            self.inner.seek(self.range.start.as_bytes())
+        } else {
+            self.inner.seek(target.as_bytes())
+        }
     }
 
     fn advance(&mut self) -> Result<()> {
