@@ -32,10 +32,8 @@
 //! iter.seek(b"target_key")?;
 //! ```
 
-use std::ops::Range;
-
 use crate::error::Result;
-use crate::storage::mvcc::{MvccIterator, MvccKey, TIMESTAMP_SIZE};
+use crate::storage::mvcc::{MvccIterator, MvccKey, SharedMvccRange, TIMESTAMP_SIZE};
 use crate::types::{RawValue, Timestamp};
 
 use super::block::DataBlock;
@@ -502,8 +500,8 @@ impl ConcatIterator {
 pub struct SstMvccIterator {
     /// Underlying SST iterator
     inner: SstIterator,
-    /// Range bounds for filtering
-    range: Range<MvccKey>,
+    /// Shared range bounds for filtering (avoids cloning per iterator)
+    range: SharedMvccRange,
     /// Whether the range is truly unbounded
     is_unbounded: bool,
 }
@@ -513,7 +511,9 @@ impl SstMvccIterator {
     ///
     /// The iterator seeks to the start of the range and filters entries
     /// that are beyond the end bound.
-    pub fn new(reader: SstReaderRef, range: Range<MvccKey>) -> Result<Self> {
+    ///
+    /// Takes `SharedMvccRange` (Arc) to avoid cloning when creating multiple iterators.
+    pub fn new(reader: SstReaderRef, range: SharedMvccRange) -> Result<Self> {
         let is_unbounded = range.start.is_unbounded() && range.end.is_unbounded();
         let mut inner = SstIterator::new(reader)?;
 

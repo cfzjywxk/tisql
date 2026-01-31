@@ -38,12 +38,20 @@
 //! handle deleted keys at specific versions.
 
 use std::cmp::Ordering;
-use std::ops::Deref;
+use std::ops::{Deref, Range};
+use std::sync::Arc;
 
 use crate::types::{Key, Timestamp};
 
 /// Size of the timestamp suffix in MVCC keys (8 bytes).
 pub const TIMESTAMP_SIZE: usize = 8;
+
+/// Shared MVCC range for zero-allocation iterator construction.
+///
+/// By wrapping the range in `Arc`, multiple iterators (memtable, SST, level)
+/// can share the same range data. `Arc::clone()` is just a refcount increment,
+/// avoiding repeated `MvccKey` allocations during `scan_iter()`.
+pub type SharedMvccRange = Arc<Range<MvccKey>>;
 
 // ============================================================================
 // MvccKey Newtype

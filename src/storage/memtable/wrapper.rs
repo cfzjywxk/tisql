@@ -283,7 +283,7 @@ mod tests {
     /// Scan MVCC keys in range using streaming iterator (test-only helper).
     fn scan_mvcc(mt: &MemTable, range: Range<MvccKey>) -> Vec<(MvccKey, RawValue)> {
         let mut results = Vec::new();
-        let mut iter = mt.inner().create_streaming_iter(range);
+        let mut iter = mt.inner().create_streaming_iter(std::sync::Arc::new(range));
         iter.next().unwrap();
         while iter.valid() {
             let key = MvccKey::encode(iter.user_key(), iter.timestamp());

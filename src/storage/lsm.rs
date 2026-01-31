@@ -51,7 +51,7 @@ use fail::fail_point;
 
 use crate::error::{Result, TiSqlError};
 use crate::lsn::SharedLsnProvider;
-use crate::storage::mvcc::{decode_mvcc_key, is_tombstone, MvccIterator, MvccKey};
+use crate::storage::mvcc::{decode_mvcc_key, is_tombstone, MvccIterator, MvccKey, SharedMvccRange};
 use crate::storage::{StorageEngine, WriteBatch};
 use crate::types::{RawValue, Timestamp};
 
@@ -315,7 +315,7 @@ impl LsmEngine {
         //
         // Use truly unbounded range - MvccKey::unbounded() creates empty placeholder
         // that signals "scan all entries" to the memtable.
-        let range = MvccKey::unbounded()..MvccKey::unbounded();
+        let range = Arc::new(MvccKey::unbounded()..MvccKey::unbounded());
         let mut iter = memtable.inner().create_streaming_iter(range);
         iter.next()?; // Initialize iterator to first entry
 
@@ -558,7 +558,9 @@ struct ArcMemTableIterator {
 
 impl ArcMemTableIterator {
     /// Create a new streaming iterator over the given memtable and range.
-    fn new(memtable: Arc<MemTable>, range: Range<MvccKey>) -> Self {
+    ///
+    /// Takes `SharedMvccRange` (Arc) to avoid cloning when creating multiple iterators.
+    fn new(memtable: Arc<MemTable>, range: SharedMvccRange) -> Self {
         // Safety: We're extending the lifetime of the reference from the Arc's lifetime
         // to 'static. This is safe because:
         // 1. The Arc keeps the MemTable alive for as long as this struct exists
@@ -696,8 +698,8 @@ struct LazySstIterator {
     sst_meta: Arc<SstMeta>,
     /// Path to SST file
     sst_path: PathBuf,
-    /// Query range
-    range: Range<MvccKey>,
+    /// Shared query range (avoids cloning per iterator)
+    range: SharedMvccRange,
     /// Actual iterator (lazy loaded)
     inner: Option<SstMvccIterator>,
     /// Whether we've checked if this SST is relevant
@@ -705,7 +707,7 @@ struct LazySstIterator {
 }
 
 impl LazySstIterator {
-    fn new(sst_meta: Arc<SstMeta>, sst_path: PathBuf, range: Range<MvccKey>) -> Self {
+    fn new(sst_meta: Arc<SstMeta>, sst_path: PathBuf, range: SharedMvccRange) -> Self {
         Self {
             sst_meta,
             sst_path,
@@ -735,7 +737,7 @@ impl LazySstIterator {
 
         // Open the file and create iterator
         let reader = SstReaderRef::open(&self.sst_path)?;
-        let iter = SstMvccIterator::new(reader, self.range.clone())?;
+        let iter = SstMvccIterator::new(reader, Arc::clone(&self.range))?;
         self.inner = Some(iter);
         Ok(())
     }
@@ -786,8 +788,8 @@ struct LevelIterator {
     sst_metas: Vec<Arc<SstMeta>>,
     /// Base path for SST files
     sst_dir: PathBuf,
-    /// Query range
-    range: Range<MvccKey>,
+    /// Shared query range (avoids cloning per iterator)
+    range: SharedMvccRange,
     /// Current file index (None = exhausted)
     current_file_idx: Option<usize>,
     /// Current file's iterator (lazy loaded)
@@ -800,7 +802,7 @@ impl LevelIterator {
     /// Create a new level iterator for the given SSTs (lazy - no I/O during construction).
     ///
     /// The iterator is not positioned until `seek()` is called.
-    fn new(sst_metas: Vec<Arc<SstMeta>>, sst_dir: PathBuf, range: Range<MvccKey>) -> Self {
+    fn new(sst_metas: Vec<Arc<SstMeta>>, sst_dir: PathBuf, range: SharedMvccRange) -> Self {
         Self {
             sst_metas,
             sst_dir,
@@ -832,7 +834,7 @@ impl LevelIterator {
         }
 
         let reader = SstReaderRef::open(&path)?;
-        let iter = SstMvccIterator::new(reader, self.range.clone())?;
+        let iter = SstMvccIterator::new(reader, Arc::clone(&self.range))?;
         self.current_file_idx = Some(idx);
         self.current_iter = Some(iter);
         Ok(())
@@ -1220,6 +1222,9 @@ impl MvccIterator for TieredMergeIterator {
 
 impl StorageEngine for LsmEngine {
     fn scan_iter(&self, range: Range<MvccKey>) -> Result<Box<dyn MvccIterator + '_>> {
+        // Wrap range in Arc for zero-copy sharing across all iterators
+        let range = Arc::new(range);
+
         // Snapshot the state under read lock, then release the lock.
         // We clone Arc references so iterators can outlive the lock.
         let (active, frozen, version) = {
@@ -1236,13 +1241,13 @@ impl StorageEngine for LsmEngine {
 
         // 1. Add active memtable iterator (highest priority)
         // Memtable iterators are initialized immediately (in-memory, no I/O)
-        let active_iter = ArcMemTableIterator::new(active, range.clone());
+        let active_iter = ArcMemTableIterator::new(active, Arc::clone(&range));
         merge_iter.add_active_memtable(Box::new(active_iter))?;
 
         // 2. Add frozen memtable iterators (newest to oldest)
         // Memtable iterators are initialized immediately (in-memory, no I/O)
         for (idx, memtable) in frozen.iter().enumerate() {
-            let mem_iter = ArcMemTableIterator::new(Arc::clone(memtable), range.clone());
+            let mem_iter = ArcMemTableIterator::new(Arc::clone(memtable), Arc::clone(&range));
             merge_iter.add_frozen_memtable(Box::new(mem_iter), idx)?;
         }
 
@@ -1258,7 +1263,7 @@ impl StorageEngine for LsmEngine {
 
         for (idx, sst_meta) in l0_ssts.into_iter().enumerate() {
             let sst_path = sst_dir.join(format!("{:08}.sst", sst_meta.id));
-            let lazy_iter = LazySstIterator::new(sst_meta, sst_path, range.clone());
+            let lazy_iter = LazySstIterator::new(sst_meta, sst_path, Arc::clone(&range));
             merge_iter.add_l0_sst(Box::new(lazy_iter), idx);
         }
 
@@ -1272,7 +1277,7 @@ impl StorageEngine for LsmEngine {
                 .collect();
 
             if !ssts.is_empty() {
-                let level_iter = LevelIterator::new(ssts, sst_dir.clone(), range.clone());
+                let level_iter = LevelIterator::new(ssts, sst_dir.clone(), Arc::clone(&range));
                 merge_iter.add_level(Box::new(level_iter), level);
             }
         }

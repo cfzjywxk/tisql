@@ -63,7 +63,7 @@ use crossbeam_skiplist::map::Entry;
 use crossbeam_skiplist::SkipMap;
 
 use crate::error::{Result, TiSqlError};
-use crate::storage::mvcc::{MvccIterator, MvccKey, TOMBSTONE};
+use crate::storage::mvcc::{MvccIterator, MvccKey, SharedMvccRange, TOMBSTONE};
 use crate::storage::{StorageEngine, WriteBatch, WriteOp};
 use crate::types::{Key, RawValue, Timestamp};
 
@@ -326,7 +326,9 @@ impl VersionedMemTableEngine {
     /// This is the internal method used by the LSM layer for creating owned iterators.
     /// The returned iterator is in an uninitialized state; call `next()` to
     /// position on the first entry.
-    pub fn create_streaming_iter(&self, range: Range<MvccKey>) -> VersionedMemTableIterator<'_> {
+    ///
+    /// Takes `SharedMvccRange` (Arc) to avoid cloning when creating multiple iterators.
+    pub fn create_streaming_iter(&self, range: SharedMvccRange) -> VersionedMemTableIterator<'_> {
         VersionedMemTableIterator::new(self, range)
     }
 }
@@ -337,6 +339,7 @@ impl StorageEngine for VersionedMemTableEngine {
     /// This is a true streaming iterator - no materialization occurs.
     /// Iteration happens directly over the skiplist and version chains.
     fn scan_iter(&self, range: Range<MvccKey>) -> Result<Box<dyn MvccIterator + '_>> {
+        let range = std::sync::Arc::new(range);
         let mut iter = VersionedMemTableIterator::new(self, range);
         // Initialize iterator to position on first entry
         iter.next()?;
@@ -407,10 +410,8 @@ pub struct VersionedMemoryStats {
 pub struct VersionedMemTableIterator<'a> {
     /// Reference to the memtable engine
     engine: &'a VersionedMemTableEngine,
-    /// Start of MVCC key range (inclusive)
-    range_start: MvccKey,
-    /// End of MVCC key range (exclusive)
-    range_end: MvccKey,
+    /// Shared MVCC key range (avoids cloning range for each iterator)
+    range: SharedMvccRange,
     /// Whether the iterator has been initialized
     initialized: bool,
     /// Current skiplist entry (holds reference to user key)
@@ -430,11 +431,13 @@ impl<'a> VersionedMemTableIterator<'a> {
     ///
     /// The iterator is created in an uninitialized state. Call `next()` to position
     /// on the first entry.
-    pub fn new(engine: &'a VersionedMemTableEngine, range: Range<MvccKey>) -> Self {
+    ///
+    /// Takes `SharedMvccRange` (Arc) to avoid cloning range data when constructing
+    /// multiple iterators over the same range.
+    pub fn new(engine: &'a VersionedMemTableEngine, range: SharedMvccRange) -> Self {
         Self {
             engine,
-            range_start: range.start,
-            range_end: range.end,
+            range,
             initialized: false,
             current_entry: None,
             current_version: std::ptr::null(),
@@ -449,18 +452,22 @@ impl<'a> VersionedMemTableIterator<'a> {
         self.initialized = true;
 
         // Get the range bounds for the skiplist query
-        let start_bound: Bound<&[u8]> = if self.range_start.is_unbounded() {
+        let start_bound: Bound<&[u8]> = if self.range.start.is_unbounded() {
             Bound::Unbounded
         } else {
-            Bound::Included(self.range_start.key())
+            Bound::Included(self.range.start.key())
         };
 
         // Iterate through entries starting from range_start
-        for entry in self.engine.index.range::<[u8], _>((start_bound, Bound::Unbounded)) {
+        for entry in self
+            .engine
+            .index
+            .range::<[u8], _>((start_bound, Bound::Unbounded))
+        {
             let user_key = entry.key().as_slice();
 
             // Check if past end of range
-            if !self.range_end.is_unbounded() && user_key > self.range_end.key() {
+            if !self.range.end.is_unbounded() && user_key > self.range.end.key() {
                 break;
             }
 
@@ -472,13 +479,12 @@ impl<'a> VersionedMemTableIterator<'a> {
             }
 
             // For the first key matching range_start exactly, filter by timestamp
-            let ts_filter = if !self.range_start.is_unbounded()
-                && user_key == self.range_start.key()
-            {
-                Some(self.range_start.timestamp())
-            } else {
-                None
-            };
+            let ts_filter =
+                if !self.range.start.is_unbounded() && user_key == self.range.start.key() {
+                    Some(self.range.start.timestamp())
+                } else {
+                    None
+                };
 
             if let Some(version_ptr) = self.find_first_valid_version(user_key, head, ts_filter) {
                 self.current_entry = Some(entry);
@@ -505,7 +511,7 @@ impl<'a> VersionedMemTableIterator<'a> {
             let user_key = entry.key().as_slice();
 
             // Check if past end of range
-            if !self.range_end.is_unbounded() && user_key > self.range_end.key() {
+            if !self.range.end.is_unbounded() && user_key > self.range.end.key() {
                 break;
             }
 
@@ -569,9 +575,9 @@ impl<'a> VersionedMemTableIterator<'a> {
     #[inline]
     fn is_version_in_range(&self, user_key: &[u8], ts: Timestamp) -> bool {
         // Check start bound (inclusive)
-        if !self.range_start.is_unbounded() {
-            let start_user_key = self.range_start.key();
-            let start_ts = self.range_start.timestamp();
+        if !self.range.start.is_unbounded() {
+            let start_user_key = self.range.start.key();
+            let start_ts = self.range.start.timestamp();
 
             if user_key < start_user_key {
                 return false;
@@ -582,9 +588,9 @@ impl<'a> VersionedMemTableIterator<'a> {
         }
 
         // Check end bound (exclusive)
-        if !self.range_end.is_unbounded() {
-            let end_user_key = self.range_end.key();
-            let end_ts = self.range_end.timestamp();
+        if !self.range.end.is_unbounded() {
+            let end_user_key = self.range.end.key();
+            let end_ts = self.range.end.timestamp();
 
             if user_key > end_user_key {
                 return false;
@@ -645,7 +651,7 @@ impl<'a> VersionedMemTableIterator<'a> {
                 let user_key = entry.key().as_slice();
 
                 // Check if past end of range
-                if !self.range_end.is_unbounded() && user_key > self.range_end.key() {
+                if !self.range.end.is_unbounded() && user_key > self.range.end.key() {
                     break;
                 }
 
@@ -760,7 +766,7 @@ mod tests {
         range: Range<MvccKey>,
     ) -> Vec<(MvccKey, RawValue)> {
         let mut results = Vec::new();
-        let mut iter = engine.create_streaming_iter(range);
+        let mut iter = engine.create_streaming_iter(std::sync::Arc::new(range));
         iter.next().unwrap();
         while iter.valid() {
             let key = MvccKey::encode(iter.user_key(), iter.timestamp());
