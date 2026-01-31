@@ -457,11 +457,16 @@ pub struct VersionedMemTableIterator<'a> {
     current_version: *const VersionNode,
 }
 
-// Safety: The iterator only holds references to data owned by the memtable.
-// The memtable guarantees that version nodes are not deallocated while it exists.
-// Entry<'a, ...> is valid as long as the skiplist exists.
-unsafe impl<'a> Send for VersionedMemTableIterator<'a> {}
-unsafe impl<'a> Sync for VersionedMemTableIterator<'a> {}
+// Note: This iterator is intentionally !Send and !Sync because:
+// 1. It contains raw pointers (*const VersionNode) which are !Send by default
+// 2. The MvccIterator trait explicitly states Send/Sync is not required
+// 3. Iterators are used within single-threaded scan operations only
+// 4. Removing unsafe impls eliminates soundness concerns about crossbeam internals
+//
+// If Send/Sync is ever needed, it would require careful analysis of:
+// - crossbeam_skiplist::Entry thread-safety guarantees
+// - Version chain node lifetime across threads
+// - Memory ordering requirements for concurrent access
 
 impl<'a> VersionedMemTableIterator<'a> {
     /// Create a new iterator over the given range.

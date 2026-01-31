@@ -532,7 +532,7 @@ impl SstMvccIterator {
     /// Returns true if:
     /// - The iterator is valid AND
     /// - The current key is a valid MVCC key (>= 8 bytes) AND
-    /// - The current key is within the range end bound
+    /// - The current key is within the range start and end bounds
     #[inline]
     fn is_in_range(&self) -> bool {
         if !self.inner.valid() {
@@ -546,11 +546,17 @@ impl SstMvccIterator {
             return false;
         }
 
+        if self.is_unbounded {
+            return true;
+        }
+
+        // Check range start bound
+        if !self.range.start.is_unbounded() && key_bytes < self.range.start.as_bytes() {
+            return false;
+        }
+
         // Check range end bound
-        if !self.is_unbounded
-            && !self.range.end.is_unbounded()
-            && key_bytes >= self.range.end.as_bytes()
-        {
+        if !self.range.end.is_unbounded() && key_bytes >= self.range.end.as_bytes() {
             return false;
         }
 
