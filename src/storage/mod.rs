@@ -145,9 +145,7 @@ use crate::types::{Key, RawValue, TableId, Timestamp};
 // Key Encoding (re-exports from codec for convenience)
 // ============================================================================
 
-use crate::codec::key::{
-    decode_record_key, encode_record_key, encode_record_key_with_handle, Handle,
-};
+use crate::codec::key::{encode_record_key, encode_record_key_with_handle};
 
 /// Encode a table key (TiDB-compatible format).
 /// Format: 't' + tableID + "_r" + user_key
@@ -161,17 +159,6 @@ pub fn encode_key(table_id: TableId, user_key: &[u8]) -> Vec<u8> {
 /// a hidden row-id (similar to TiDB's `_tidb_rowid`).
 pub fn encode_int_key(table_id: TableId, handle: i64) -> Vec<u8> {
     encode_record_key_with_handle(table_id, handle)
-}
-
-/// Decode a table key back to (table_id, user_key).
-#[allow(dead_code)]
-pub fn decode_key(key: &[u8]) -> Result<(TableId, Vec<u8>)> {
-    let (table_id, handle) = decode_record_key(key)?;
-    let user_key = match handle {
-        Handle::Int(_) => handle.encoded(),
-        Handle::Common(bytes) => bytes,
-    };
-    Ok((table_id, user_key))
 }
 
 // Re-export commonly used codec functions for row encoding

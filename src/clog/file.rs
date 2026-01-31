@@ -44,7 +44,6 @@ const FILE_MAGIC: &[u8; 4] = b"CLOG";
 const FILE_VERSION: u32 = 1;
 
 /// File header size in bytes (magic + version + reserved)
-#[allow(dead_code)]
 const FILE_HEADER_SIZE: usize = 16;
 
 /// Record header size in bytes (type + length + checksum)
@@ -106,14 +105,6 @@ impl LsnProviderKind {
         match self {
             LsnProviderKind::Shared(p) => p.current_lsn(),
             LsnProviderKind::Local(p) => p.current_lsn(),
-        }
-    }
-
-    #[allow(dead_code)]
-    fn set_lsn(&self, lsn: Lsn) {
-        match self {
-            LsnProviderKind::Shared(p) => p.set_lsn(lsn),
-            LsnProviderKind::Local(p) => p.set_lsn(lsn),
         }
     }
 }
@@ -371,12 +362,6 @@ impl FileClogService {
         }
 
         Ok((entries, valid_bytes))
-    }
-
-    /// Read a single record from the commit log
-    #[allow(dead_code)]
-    fn read_record<R: Read>(reader: &mut R) -> Result<Option<Vec<ClogEntry>>> {
-        Ok(Self::read_record_with_size(reader)?.map(|(entries, _)| entries))
     }
 
     /// Read a single record from the commit log, returning entries and record size in bytes.

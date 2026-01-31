@@ -629,11 +629,6 @@ impl IlogService {
         Ok((records, valid_bytes))
     }
 
-    #[allow(dead_code)]
-    fn read_record<R: Read>(reader: &mut R) -> Result<Option<IlogRecord>> {
-        Ok(Self::read_record_with_size(reader)?.map(|(record, _)| record))
-    }
-
     /// Read a single record from the ilog, returning record and size in bytes.
     fn read_record_with_size<R: Read>(reader: &mut R) -> Result<Option<(IlogRecord, usize)>> {
         let mut header = [0u8; RECORD_HEADER_SIZE];

@@ -43,8 +43,6 @@ use crate::types::{ColumnId, DataType, Value};
 
 /// Row format flags
 const ROW_FLAG_LARGE: u8 = 0x01;
-#[allow(dead_code)] // Will be used when checksum support is added
-const ROW_FLAG_CHECKSUM: u8 = 0x02;
 
 /// Header size for small rows: VER + FLAGS + NOT_NULL_CNT + NULL_CNT
 const SMALL_ROW_HEADER_SIZE: usize = 1 + 1 + 2 + 2;

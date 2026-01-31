@@ -658,37 +658,6 @@ pub fn next_key_bound(bytes: &mut Vec<u8>) -> bool {
     false
 }
 
-/// Increment byte array by 1 (for range end bound).
-///
-/// Unlike `next_key_bound`, this always produces a result by appending
-/// a zero byte if needed. This maintains memory-comparable ordering:
-/// `[0xFF, 0xFF]` → `[0xFF, 0xFF, 0x00]` which is lexicographically larger.
-///
-/// Use `next_key_bound` when you need to detect overflow.
-#[allow(dead_code)]
-pub fn increment_bytes(bytes: &mut Vec<u8>) {
-    if bytes.is_empty() {
-        bytes.push(0);
-        return;
-    }
-
-    for i in (0..bytes.len()).rev() {
-        if bytes[i] < 255 {
-            bytes[i] += 1;
-            return;
-        }
-        bytes[i] = 0;
-    }
-    // All bytes were 255, append a zero byte to get the next key.
-    // Example: [0xFF, 0xFF] -> [0xFF, 0xFF, 0x00]
-    // This is lexicographically greater because the original key is a prefix.
-    // Reset the bytes to their original values first.
-    for byte in bytes.iter_mut() {
-        *byte = 0xFF;
-    }
-    bytes.push(0);
-}
-
 /// Compute the lexicographically previous key.
 ///
 /// Decrements the byte array by 1. Returns `true` if the decrement produced
@@ -1005,30 +974,6 @@ mod tests {
         let mut v = vec![1u8, 255u8];
         assert!(next_key_bound(&mut v));
         assert_eq!(v, vec![2u8, 0u8]);
-    }
-
-    #[test]
-    fn test_increment_bytes() {
-        // Normal increment
-        let mut v = vec![0u8];
-        increment_bytes(&mut v);
-        assert_eq!(v, vec![1u8]);
-
-        // All 0xFF: append 0x00 to maintain lexicographic ordering
-        // [0xFF] -> [0xFF, 0x00] which is greater than [0xFF]
-        let mut v = vec![255u8];
-        increment_bytes(&mut v);
-        assert_eq!(v, vec![255u8, 0u8]);
-
-        // Carry propagation
-        let mut v = vec![1u8, 255u8];
-        increment_bytes(&mut v);
-        assert_eq!(v, vec![2u8, 0u8]);
-
-        // Multiple 0xFF bytes
-        let mut v = vec![255u8, 255u8];
-        increment_bytes(&mut v);
-        assert_eq!(v, vec![255u8, 255u8, 0u8]);
     }
 
     #[test]

@@ -94,13 +94,6 @@ impl VersionNode {
             next: std::ptr::null_mut(),
         })
     }
-
-    /// Check if this version is a tombstone (delete marker).
-    #[inline]
-    #[allow(dead_code)]
-    fn is_tombstone(&self) -> bool {
-        self.value == TOMBSTONE
-    }
 }
 
 // ============================================================================
@@ -204,7 +197,7 @@ impl MvccRow {
     ///
     /// Traverses the chain from head (newest) until finding a version
     /// with ts <= read_ts. Returns None if no visible version exists.
-    #[allow(dead_code)] // Used by tests
+    #[cfg(test)]
     fn get_at(&self, read_ts: Timestamp) -> Option<&RawValue> {
         let mut current = self.head.load(Ordering::Acquire);
 
@@ -434,7 +427,7 @@ pub struct VersionedMemoryStats {
 /// 1. **No caching**: Returns references directly to stored data
 /// 2. **No cloning**: Never clones keys or values during iteration
 /// 3. **Pointer-based traversal**: Uses raw pointers for version chains
-/// 4. **Efficient next-key**: Uses `Bound::Excluded` instead of key increment
+/// 4. **Efficient next-key**: Uses `Entry::next()` for O(1) traversal
 ///
 /// ## MVCC Key Order
 ///
@@ -678,47 +671,46 @@ impl<'a> VersionedMemTableIterator<'a> {
 
     /// Move to the next user key after the current one.
     ///
-    /// Uses `Bound::Excluded` to efficiently skip to the next key without
-    /// any allocation or key modification.
+    /// Uses `Entry::next()` for O(1) amortized traversal instead of seeking.
     fn move_to_next_user_key(&mut self) {
-        // Get current key for the excluded bound
-        let next_entry = {
-            let current_key = self.current_entry.as_ref().unwrap().key().as_slice();
+        loop {
+            let next_entry = self.current_entry.as_ref().and_then(|e| e.next());
 
-            // Find next user key using Excluded bound (no allocation!)
-            let mut found_entry = None;
-            for entry in self
-                .inner
-                .index
-                .range::<[u8], _>((Bound::Excluded(current_key), Bound::Unbounded))
-            {
-                let user_key = entry.key().as_slice();
-
-                // Check if past end of range
-                if !self.range.end.is_unbounded() && user_key > self.range.end.key() {
-                    break;
+            match next_entry {
+                None => {
+                    self.current_entry = None;
+                    self.current_version = std::ptr::null();
+                    return;
                 }
+                Some(entry) => {
+                    let user_key = entry.key().as_slice();
 
-                let row = entry.value();
-                let head = row.head.load(Ordering::Acquire);
+                    // Check if past end of range
+                    if !self.range.end.is_unbounded() && user_key > self.range.end.key() {
+                        self.current_entry = None;
+                        self.current_version = std::ptr::null();
+                        return;
+                    }
 
-                if head.is_null() {
-                    continue;
-                }
+                    let row = entry.value();
+                    let head = row.head.load(Ordering::Acquire);
 
-                // Find first version in range
-                if let Some(version_ptr) = self.find_first_valid_version(user_key, head, None) {
-                    self.current_version = version_ptr;
-                    found_entry = Some(entry);
-                    break;
+                    if head.is_null() {
+                        self.current_entry = Some(entry);
+                        continue; // Try next entry
+                    }
+
+                    // Find first version in range
+                    if let Some(version_ptr) = self.find_first_valid_version(user_key, head, None) {
+                        self.current_version = version_ptr;
+                        self.current_entry = Some(entry);
+                        return;
+                    }
+
+                    self.current_entry = Some(entry);
+                    // No valid version in this entry, loop continues to next
                 }
             }
-            found_entry
-        };
-
-        self.current_entry = next_entry;
-        if self.current_entry.is_none() {
-            self.current_version = std::ptr::null();
         }
     }
 }
