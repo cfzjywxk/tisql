@@ -53,6 +53,7 @@ fn get_at_for_test(engine: &LsmEngine, key: &[u8], ts: Timestamp) -> Option<RawV
 
     // Use streaming scan_iter() - process one entry at a time
     let mut iter = engine.scan_iter(range).unwrap();
+    iter.advance().unwrap(); // Position on first entry
 
     while iter.valid() {
         let decoded_key = iter.user_key();

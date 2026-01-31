@@ -349,6 +349,7 @@ mod tests {
         let range = start..end;
 
         let mut iter = engine.scan_iter(range).unwrap();
+        iter.advance().unwrap(); // Position on first entry
 
         while iter.valid() {
             let decoded_key = iter.user_key();

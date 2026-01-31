@@ -795,8 +795,9 @@ pub struct ArcVersionedMemTableIterator {
 impl ArcVersionedMemTableIterator {
     /// Create a new owned iterator over the given inner data and range.
     ///
-    /// The iterator is positioned on the first entry (if any) after construction,
-    /// consistent with `TieredMergeIterator::build()` behavior.
+    /// The iterator is NOT positioned after construction - caller must call
+    /// `advance()` before accessing data. This follows the unified iterator pattern:
+    /// `advance()` → `valid()` → `read()`.
     ///
     /// Takes `SharedMvccRange` (Arc) to avoid cloning when creating multiple iterators.
     pub fn new(inner: Arc<VersionedMemTableEngineInner>, range: SharedMvccRange) -> Self {
@@ -807,9 +808,8 @@ impl ArcVersionedMemTableIterator {
         // 3. VersionedMemTableIterator doesn't access the inner in its Drop impl
         let inner_ref: &'static VersionedMemTableEngineInner =
             unsafe { std::mem::transmute(inner.as_ref()) };
-        let mut iter = VersionedMemTableIterator::new(inner_ref, range);
-        // Position on first entry to be consistent with TieredMergeIterator behavior
-        let _ = iter.advance();
+        let iter = VersionedMemTableIterator::new(inner_ref, range);
+        // Caller must call advance() to position on first entry
         Self {
             _inner: inner,
             iter,

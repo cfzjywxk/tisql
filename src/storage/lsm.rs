@@ -746,6 +746,12 @@ impl LazySstIterator {
 impl MvccIterator for LazySstIterator {
     fn seek(&mut self, target: &MvccKey) -> Result<()> {
         self.ensure_initialized()?;
+        // If target is unbounded, the iterator is already positioned at the range start
+        // after initialization - no need to seek again (which would seek to file start
+        // instead of range start).
+        if target.is_unbounded() {
+            return Ok(());
+        }
         if let Some(ref mut inner) = self.inner {
             inner.seek(target)
         } else {
@@ -867,6 +873,18 @@ impl MvccIterator for LevelIterator {
     fn seek(&mut self, target: &MvccKey) -> Result<()> {
         if let Some(e) = self.pending_error.take() {
             return Err(e);
+        }
+
+        // Handle unbounded target: position at range start (first file)
+        if target.is_unbounded() {
+            if self.sst_metas.is_empty() {
+                self.current_file_idx = None;
+                self.current_iter = None;
+                return Ok(());
+            }
+            // Open first file - SstMvccIterator::new() positions at range start
+            self.open_file(0)?;
+            return self.skip_empty_files();
         }
 
         // Binary search to find the right file
@@ -1063,15 +1081,28 @@ impl TieredMergeIterator {
         });
     }
 
-    /// Finalize and prime the iterator.
+    /// Finalize and return the iterator.
     ///
     /// At this point, only memtable iterators are in the heap. L0 and L1+
     /// iterators remain pending and will be initialized lazily.
-    pub fn build(mut self) -> Result<Self> {
+    ///
+    /// The iterator is NOT positioned after construction. Call `advance()`
+    /// to position on the first entry:
+    ///
+    /// ```ignore
+    /// let mut iter = TieredMergeIterator::new()
+    ///     .add_active_memtable(mem)?
+    ///     .build()?;
+    /// iter.advance()?;  // Position on first entry
+    /// while iter.valid() {
+    ///     // process...
+    ///     iter.advance()?;
+    /// }
+    /// ```
+    pub fn build(self) -> Result<Self> {
         // Memtable iterators are already in the heap from add_active_memtable/add_frozen_memtable.
         // L0 and L1+ iterators are in pending_l0/pending_levels.
-        // Position on first entry.
-        self.advance()?;
+        // Caller must call advance() to position on first entry.
         Ok(self)
     }
 
@@ -1394,6 +1425,7 @@ mod tests {
     fn scan_mvcc(engine: &LsmEngine, range: Range<MvccKey>) -> Vec<(MvccKey, RawValue)> {
         let mut results = Vec::new();
         let mut iter = engine.scan_iter(range).unwrap();
+        iter.advance().unwrap(); // Position on first entry
         while iter.valid() {
             let key = MvccKey::encode(iter.user_key(), iter.timestamp());
             results.push((key, iter.value().to_vec()));
@@ -2973,9 +3005,10 @@ mod tests {
             .add_active_memtable(Box::new(active_iter))
             .unwrap();
 
-        let merge_iter = merge_iter.build().unwrap();
+        let mut merge_iter = merge_iter.build().unwrap();
 
         assert!(*active_seek.borrow(), "Active memtable should be seeked");
+        merge_iter.advance().unwrap(); // Position on first entry
         assert!(merge_iter.valid());
         assert_eq!(iter_key(&merge_iter), test_key(b"a", 100));
         assert_eq!(merge_iter.value(), b"a_active");
@@ -3003,7 +3036,8 @@ mod tests {
             .add_frozen_memtable(Box::new(frozen_iter), 0)
             .unwrap();
 
-        let merge_iter = merge_iter.build().unwrap();
+        let mut merge_iter = merge_iter.build().unwrap();
+        merge_iter.advance().unwrap(); // Position on first entry
 
         assert!(merge_iter.valid());
         // Active has priority 0, frozen has priority 100+
@@ -3041,17 +3075,18 @@ mod tests {
 
         let mut merge_iter = merge_iter.build().unwrap();
 
-        // After build, only memtable should be initialized
+        // After build, only memtable should be initialized (seeked in add_active_memtable)
         assert!(
             *active_seek.borrow(),
-            "Active memtable should be seeked in build()"
+            "Active memtable should be seeked in add_active_memtable()"
         );
         assert!(
             !*l0_seek.borrow(),
             "L0 SST should NOT be seeked yet - memtable not exhausted"
         );
 
-        // Read first memtable entry
+        // Position on first entry and read
+        merge_iter.advance().unwrap();
         assert!(merge_iter.valid());
         assert_eq!(iter_key(&merge_iter), test_key(b"a", 100));
         assert!(
@@ -3113,7 +3148,8 @@ mod tests {
         assert!(!*l0_seek.borrow(), "L0 SST should NOT be seeked yet");
         assert!(!*l1_seek.borrow(), "L1 level should NOT be seeked yet");
 
-        // Read memtable entry
+        // Position on first entry and read memtable entry
+        merge_iter.advance().unwrap();
         assert!(merge_iter.valid());
         assert_eq!(iter_key(&merge_iter), test_key(b"a", 100));
 
@@ -3197,10 +3233,25 @@ mod tests {
 
         let mut merge_iter = merge_iter.build().unwrap();
 
-        // After build with empty memtable, L0 should be initialized
-        assert!(*l0_0_seek.borrow(), "L0 SST 0 should be seeked");
-        assert!(*l0_1_seek.borrow(), "L0 SST 1 should be seeked");
-        assert!(*l0_2_seek.borrow(), "L0 SST 2 should be seeked");
+        // After build, L0 should NOT be initialized yet (lazy)
+        assert!(!*l0_0_seek.borrow(), "L0 SST 0 should NOT be seeked yet");
+        assert!(!*l0_1_seek.borrow(), "L0 SST 1 should NOT be seeked yet");
+        assert!(!*l0_2_seek.borrow(), "L0 SST 2 should NOT be seeked yet");
+
+        // First advance with empty memtable triggers L0 initialization
+        merge_iter.advance().unwrap();
+        assert!(
+            *l0_0_seek.borrow(),
+            "L0 SST 0 should be seeked after advance"
+        );
+        assert!(
+            *l0_1_seek.borrow(),
+            "L0 SST 1 should be seeked after advance"
+        );
+        assert!(
+            *l0_2_seek.borrow(),
+            "L0 SST 2 should be seeked after advance"
+        );
 
         // Results should be in sorted order, deduplicating same keys
         // Key 'a' exists in SST 0 (priority 1000) and SST 2 (priority 1002)
@@ -3345,7 +3396,11 @@ mod tests {
 
         let mut merge_iter = merge_iter.build().unwrap();
 
-        // Verify tier flow
+        // After build, L0/L1/L2 should NOT be initialized
+        assert!(!*l0_seek.borrow() && !*l1_seek.borrow() && !*l2_seek.borrow());
+
+        // Position on first entry
+        merge_iter.advance().unwrap();
         assert!(merge_iter.valid());
         assert_eq!(merge_iter.value(), b"v_active");
         assert!(!*l0_seek.borrow() && !*l1_seek.borrow() && !*l2_seek.borrow());
@@ -3414,6 +3469,9 @@ mod tests {
 
         let mut merge_iter = merge_iter.build().unwrap();
 
+        // Position on first entry
+        merge_iter.advance().unwrap();
+
         // Only active's value should be returned
         assert!(merge_iter.valid());
         assert_eq!(iter_key(&merge_iter), test_key(b"key", 100));
@@ -3429,7 +3487,7 @@ mod tests {
 
     #[test]
     fn test_tiered_merge_iterator_empty_memtable_immediate_l0() {
-        // Test that if memtable is empty, L0 is initialized immediately
+        // Test that if memtable is empty, L0 is initialized on first advance
 
         let (active_iter, _) = MockMvccIterator::new("active", vec![]);
 
@@ -3446,12 +3504,19 @@ mod tests {
             .unwrap();
         merge_iter.add_l0_sst(Box::new(l0_iter), 0);
 
-        let merge_iter = merge_iter.build().unwrap();
+        let mut merge_iter = merge_iter.build().unwrap();
 
-        // Memtable was empty, so L0 should be initialized during build/advance
+        // L0 should NOT be seeked yet after build
+        assert!(
+            !*l0_seek.borrow(),
+            "L0 should NOT be seeked until first advance"
+        );
+
+        // First advance with empty memtable triggers L0 initialization
+        merge_iter.advance().unwrap();
         assert!(
             *l0_seek.borrow(),
-            "L0 should be seeked when memtable is empty"
+            "L0 should be seeked after advance with empty memtable"
         );
         assert!(merge_iter.valid());
         assert_eq!(iter_key(&merge_iter), test_key(b"a", 100));
@@ -3494,6 +3559,9 @@ mod tests {
 
         let mut merge_iter = merge_iter.build().unwrap();
 
+        // Position on first entry
+        merge_iter.advance().unwrap();
+
         // Should get: a, b, c, shared (from frozen0 - higher priority)
         assert!(merge_iter.valid());
         assert_eq!(iter_key(&merge_iter), test_key(b"a", 100));
@@ -3532,11 +3600,16 @@ mod tests {
         merge_iter.add_l0_sst(Box::new(l0_iter), 0);
         merge_iter.add_level(Box::new(l1_iter), 1);
 
-        let merge_iter = merge_iter.build().unwrap();
+        let mut merge_iter = merge_iter.build().unwrap();
 
-        // All tiers should be initialized (empty memtable triggers cascade)
-        assert!(*l0_seek.borrow(), "L0 should be initialized");
-        assert!(*l1_seek.borrow(), "L1 should be initialized");
+        // After build, nothing initialized yet
+        assert!(!*l0_seek.borrow(), "L0 should NOT be initialized yet");
+        assert!(!*l1_seek.borrow(), "L1 should NOT be initialized yet");
+
+        // First advance triggers cascade through all empty tiers
+        merge_iter.advance().unwrap();
+        assert!(*l0_seek.borrow(), "L0 should be initialized after advance");
+        assert!(*l1_seek.borrow(), "L1 should be initialized after advance");
         assert!(!merge_iter.valid(), "Should be invalid - all empty");
     }
 
@@ -3569,6 +3642,9 @@ mod tests {
             .unwrap();
 
         let mut merge_iter = merge_iter.build().unwrap();
+
+        // Position on first entry
+        merge_iter.advance().unwrap();
 
         // Should be sorted: a, b, c, d
         let expected = [
@@ -3611,6 +3687,9 @@ mod tests {
         // Use scan_iter (streaming) to read
         let range = MvccKey::encode(b"key1", Timestamp::MAX)..MvccKey::encode(b"key3", 0);
         let mut iter = engine.scan_iter(range).unwrap();
+
+        // Position on first entry
+        iter.advance().unwrap();
 
         // Should be able to read from memtable
         assert!(iter.valid());
@@ -3658,6 +3737,7 @@ mod tests {
         let range = MvccKey::encode(b"new_key", Timestamp::MAX)..MvccKey::encode(b"new_key\xff", 0);
         let mut iter = engine.scan_iter(range).unwrap();
 
+        iter.advance().unwrap();
         assert!(iter.valid());
         assert_eq!(iter.user_key(), b"new_key");
 
@@ -3669,6 +3749,7 @@ mod tests {
         let mut iter = engine.scan_iter(range).unwrap();
 
         // Should find all old keys from SST
+        iter.advance().unwrap();
         let mut count = 0;
         while iter.valid() {
             count += 1;
