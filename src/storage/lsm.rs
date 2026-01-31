@@ -1182,33 +1182,6 @@ impl MvccIterator for TieredMergeIterator {
     }
 }
 
-/// Test-only impl block for LsmEngine.
-#[cfg(test)]
-impl LsmEngine {
-    /// Open or create an LSM engine at the given path without durability.
-    ///
-    /// This is test-only. Production code should use `open_with_recovery`.
-    pub fn open(config: LsmConfig) -> Result<Self> {
-        config.validate().map_err(TiSqlError::Storage)?;
-
-        // Create SST directory if needed
-        let sst_dir = config.sst_dir();
-        if !sst_dir.exists() {
-            std::fs::create_dir_all(&sst_dir)?;
-        }
-
-        Ok(Self {
-            config: Arc::new(config),
-            state: RwLock::new(LsmState::new(1)),
-            next_memtable_id: AtomicU64::new(2),
-            next_sst_id: AtomicU64::new(1),
-            next_lsn: AtomicU64::new(1),
-            lsn_provider: None,
-            ilog: None,
-        })
-    }
-}
-
 impl StorageEngine for LsmEngine {
     fn scan_iter(&self, range: Range<MvccKey>) -> Result<Box<dyn MvccIterator + '_>> {
         // Snapshot the state under read lock, then release the lock.
@@ -1326,6 +1299,35 @@ mod tests {
     use crate::storage::mvcc::is_tombstone;
     use std::path::Path;
     use tempfile::TempDir;
+
+    // ==================== Test-only LsmEngine Methods ====================
+
+    impl LsmEngine {
+        /// Open or create an LSM engine at the given path without durability.
+        ///
+        /// This is test-only. Production code should use `open_with_recovery`.
+        pub fn open(config: LsmConfig) -> Result<Self> {
+            config.validate().map_err(TiSqlError::Storage)?;
+
+            // Create SST directory if needed
+            let sst_dir = config.sst_dir();
+            if !sst_dir.exists() {
+                std::fs::create_dir_all(&sst_dir)?;
+            }
+
+            Ok(Self {
+                config: Arc::new(config),
+                state: RwLock::new(LsmState::new(1)),
+                next_memtable_id: AtomicU64::new(2),
+                next_sst_id: AtomicU64::new(1),
+                next_lsn: AtomicU64::new(1),
+                lsn_provider: None,
+                ilog: None,
+            })
+        }
+    }
+
+    // ==================== Test Configuration Helpers ====================
 
     fn test_config(dir: &Path) -> LsmConfig {
         LsmConfig::builder(dir)
