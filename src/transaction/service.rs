@@ -251,6 +251,7 @@ impl<S: StorageEngine + 'static, L: ClogService + 'static, T: TsoService> TxnSer
 
         // Use streaming iterator to avoid materializing all entries.
         // We only need the first visible version.
+        // Note: TieredMergeIterator::build() already positions on first entry.
         let mut iter = self.storage.scan_iter(scan_range)?;
 
         // Find the first entry matching our key with ts <= start_ts.
@@ -273,7 +274,7 @@ impl<S: StorageEngine + 'static, L: ClogService + 'static, T: TsoService> TxnSer
         Ok(None)
     }
 
-    fn scan_iter(&self, ctx: &TxnCtx, range: Range<Key>) -> Result<ScanIterator<'_>> {
+    fn scan_iter(&self, ctx: &TxnCtx, range: Range<Key>) -> Result<ScanIterator> {
         // Check for locks in range.
         //
         // Note: empty end (vec![]) means "unbounded" (scan to infinity), not empty range.
@@ -551,6 +552,11 @@ impl<I: MvccIterator> MvccScanIterator<I> {
     fn advance_storage_to_visible(&mut self) -> crate::error::Result<()> {
         self.storage_ready = false;
 
+        // First call: initialize the iterator by calling next()
+        if !self.storage_iter.valid() && !self.storage_exhausted {
+            self.storage_iter.next()?;
+        }
+
         while self.storage_iter.valid() {
             let user_key = self.storage_iter.user_key();
             let ts = self.storage_iter.timestamp();
@@ -818,6 +824,7 @@ mod tests {
             .unwrap_or_else(MvccKey::unbounded);
         let range = seek_key..end_key;
 
+        // Note: TieredMergeIterator::build() already positions on first entry
         let mut iter = storage.scan_iter(range).unwrap();
 
         while iter.valid() {

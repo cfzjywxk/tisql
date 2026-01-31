@@ -58,6 +58,7 @@
 
 use std::ops::{Bound, Range};
 use std::sync::atomic::{AtomicPtr, AtomicU32, AtomicUsize, Ordering};
+use std::sync::Arc;
 
 use crossbeam_skiplist::map::Entry;
 use crossbeam_skiplist::SkipMap;
@@ -239,6 +240,18 @@ impl Drop for MvccRow {
 // VersionedMemTableEngine - Main memtable implementation
 // ============================================================================
 
+/// Inner data structure holding the actual memtable data.
+///
+/// This is wrapped in Arc by `VersionedMemTableEngine` to allow the
+/// `StorageEngine::scan_iter` method to return owned iterators that
+/// don't borrow from the engine.
+pub struct VersionedMemTableEngineInner {
+    /// Skiplist mapping user keys to MVCC rows
+    index: SkipMap<Key, MvccRow>,
+    /// Entry count (number of versions across all keys)
+    entry_count: AtomicUsize,
+}
+
 /// OceanBase-style versioned memtable engine.
 ///
 /// This implementation stores user keys in a skiplist with linked version chains,
@@ -257,19 +270,25 @@ impl Drop for MvccRow {
 /// - Skiplist operations are lock-free (crossbeam-skiplist)
 /// - Version chain updates use CAS for the head pointer
 /// - Reads are lock-free via atomic loads
+///
+/// # StorageEngine Implementation
+///
+/// The inner data is wrapped in `Arc` to allow `scan_iter` to return owned
+/// iterators. This enables the engine to implement `StorageEngine` where
+/// iterators cannot borrow from `self`.
 pub struct VersionedMemTableEngine {
-    /// Skiplist mapping user keys to MVCC rows
-    index: SkipMap<Key, MvccRow>,
-    /// Entry count (number of versions across all keys)
-    entry_count: AtomicUsize,
+    /// Inner data wrapped in Arc for owned iterator support
+    inner: Arc<VersionedMemTableEngineInner>,
 }
 
 impl VersionedMemTableEngine {
     /// Create a new versioned memtable engine.
     pub fn new() -> Self {
         Self {
-            index: SkipMap::new(),
-            entry_count: AtomicUsize::new(0),
+            inner: Arc::new(VersionedMemTableEngineInner {
+                index: SkipMap::new(),
+                entry_count: AtomicUsize::new(0),
+            }),
         }
     }
 
@@ -282,17 +301,20 @@ impl VersionedMemTableEngine {
     /// This ensures no versions are lost even with concurrent inserts to same key.
     fn put_internal(&self, key: &[u8], value: RawValue, ts: Timestamp) {
         // get_or_insert is atomic: returns existing entry or inserts new empty row
-        let entry = self.index.get_or_insert(key.to_vec(), MvccRow::new_empty());
+        let entry = self
+            .inner
+            .index
+            .get_or_insert(key.to_vec(), MvccRow::new_empty());
 
         // Prepend version to the row (works for both new and existing rows)
         entry.value().prepend(ts, value);
 
-        self.entry_count.fetch_add(1, Ordering::Relaxed);
+        self.inner.entry_count.fetch_add(1, Ordering::Relaxed);
     }
 
     /// Get the number of version entries in the memtable.
     pub fn len(&self) -> usize {
-        self.entry_count.load(Ordering::Relaxed)
+        self.inner.entry_count.load(Ordering::Relaxed)
     }
 
     /// Check if the memtable is empty.
@@ -302,7 +324,7 @@ impl VersionedMemTableEngine {
 
     /// Get the number of unique keys in the memtable.
     pub fn key_count(&self) -> usize {
-        self.index.len()
+        self.inner.index.len()
     }
 
     /// Get memory usage statistics.
@@ -311,6 +333,22 @@ impl VersionedMemTableEngine {
             entry_count: self.len(),
             key_count: self.key_count(),
         }
+    }
+
+    /// Get a reference to the inner engine data.
+    ///
+    /// This is used by the LSM layer for creating iterators.
+    #[inline]
+    pub fn inner_ref(&self) -> &VersionedMemTableEngineInner {
+        &self.inner
+    }
+
+    /// Clone the Arc to the inner data.
+    ///
+    /// This is used for creating owned iterators that outlive `&self`.
+    #[inline]
+    pub fn inner_arc(&self) -> Arc<VersionedMemTableEngineInner> {
+        Arc::clone(&self.inner)
     }
 }
 
@@ -329,25 +367,31 @@ impl VersionedMemTableEngine {
     ///
     /// Takes `SharedMvccRange` (Arc) to avoid cloning when creating multiple iterators.
     pub fn create_streaming_iter(&self, range: SharedMvccRange) -> VersionedMemTableIterator<'_> {
-        VersionedMemTableIterator::new(self, range)
+        VersionedMemTableIterator::new(self.inner.as_ref(), range)
     }
 }
 
 impl StorageEngine for VersionedMemTableEngine {
-    /// Create a streaming iterator over MVCC keys in range.
-    ///
-    /// This is a true streaming iterator - no materialization occurs.
-    /// Iteration happens directly over the skiplist and version chains.
-    fn scan_iter(&self, range: Range<MvccKey>) -> Result<Box<dyn MvccIterator + '_>> {
-        let range = std::sync::Arc::new(range);
-        let mut iter = VersionedMemTableIterator::new(self, range);
-        // Initialize iterator to position on first entry
-        iter.next()?;
-        Ok(Box::new(iter))
+    type Iter = ArcVersionedMemTableIterator;
+
+    fn scan_iter(&self, range: Range<MvccKey>) -> Result<ArcVersionedMemTableIterator> {
+        let range = Arc::new(range);
+        let iter = ArcVersionedMemTableIterator::new(self.inner_arc(), range);
+        Ok(iter)
     }
 
-    /// Apply a batch of writes atomically.
     fn write_batch(&self, batch: WriteBatch) -> Result<()> {
+        // Delegate to the inherent method
+        VersionedMemTableEngine::write_batch(self, batch)
+    }
+}
+
+impl VersionedMemTableEngine {
+    /// Apply a batch of writes atomically.
+    ///
+    /// Note: This is not part of StorageEngine trait because VersionedMemTableEngine
+    /// is an internal component. Use LsmEngine for the public StorageEngine interface.
+    pub fn write_batch(&self, batch: WriteBatch) -> Result<()> {
         let commit_ts = batch
             .commit_ts()
             .ok_or_else(|| TiSqlError::Storage("WriteBatch must have commit_ts set".to_string()))?;
@@ -401,15 +445,15 @@ pub struct VersionedMemoryStats {
 /// ## Safety
 ///
 /// Uses raw pointers (`*const VersionNode`) to traverse version chains. This is safe because:
-/// 1. The iterator holds a reference to the `VersionedMemTableEngine`
+/// 1. The iterator holds a reference to the `VersionedMemTableEngineInner`
 /// 2. Version nodes are never deallocated while the engine exists
 /// 3. The version chain is prepend-only (no concurrent modification of existing nodes)
 ///
 /// Also stores `Entry<'a, ...>` from crossbeam skiplist which is valid for the
 /// lifetime of the skiplist (guaranteed by the engine reference).
 pub struct VersionedMemTableIterator<'a> {
-    /// Reference to the memtable engine
-    engine: &'a VersionedMemTableEngine,
+    /// Reference to the memtable engine inner data
+    inner: &'a VersionedMemTableEngineInner,
     /// Shared MVCC key range (avoids cloning range for each iterator)
     range: SharedMvccRange,
     /// Whether the iterator has been initialized
@@ -434,9 +478,9 @@ impl<'a> VersionedMemTableIterator<'a> {
     ///
     /// Takes `SharedMvccRange` (Arc) to avoid cloning range data when constructing
     /// multiple iterators over the same range.
-    pub fn new(engine: &'a VersionedMemTableEngine, range: SharedMvccRange) -> Self {
+    pub fn new(inner: &'a VersionedMemTableEngineInner, range: SharedMvccRange) -> Self {
         Self {
-            engine,
+            inner,
             range,
             initialized: false,
             current_entry: None,
@@ -460,7 +504,7 @@ impl<'a> VersionedMemTableIterator<'a> {
 
         // Iterate through entries starting from range_start
         for entry in self
-            .engine
+            .inner
             .index
             .range::<[u8], _>((start_bound, Bound::Unbounded))
         {
@@ -504,7 +548,7 @@ impl<'a> VersionedMemTableIterator<'a> {
     /// only consider versions with ts <= exact_start_ts. Subsequent keys start from head.
     fn seek_from_user_key(&mut self, start_key: &[u8], exact_start_ts: Option<Timestamp>) {
         for entry in self
-            .engine
+            .inner
             .index
             .range::<[u8], _>((Bound::Included(start_key), Bound::Unbounded))
         {
@@ -644,7 +688,7 @@ impl<'a> VersionedMemTableIterator<'a> {
             // Find next user key using Excluded bound (no allocation!)
             let mut found_entry = None;
             for entry in self
-                .engine
+                .inner
                 .index
                 .range::<[u8], _>((Bound::Excluded(current_key), Bound::Unbounded))
             {
@@ -734,6 +778,80 @@ impl<'a> MvccIterator for VersionedMemTableIterator<'a> {
 }
 
 // ============================================================================
+// ArcVersionedMemTableIterator - Owned iterator for StorageEngine
+// ============================================================================
+
+/// Owned iterator over the versioned memtable for `StorageEngine` implementation.
+///
+/// This iterator owns its data via `Arc<VersionedMemTableEngineInner>`, allowing
+/// it to be returned from `StorageEngine::scan_iter` without borrowing from `self`.
+///
+/// # Safety
+///
+/// Uses `unsafe` to extend the lifetime of the `VersionedMemTableIterator` from
+/// the `Arc`'s lifetime to `'static`. This is safe because:
+/// 1. The `Arc` keeps the inner data alive for as long as this struct exists
+/// 2. The `_inner` field is declared before `iter`, ensuring proper drop order
+/// 3. `VersionedMemTableIterator` doesn't access the inner data in its `Drop` impl
+pub struct ArcVersionedMemTableIterator {
+    /// Keep the inner data alive. MUST be declared before `iter` so it's dropped last.
+    _inner: Arc<VersionedMemTableEngineInner>,
+    /// The streaming iterator with erased lifetime (safe because _inner keeps data alive)
+    iter: VersionedMemTableIterator<'static>,
+}
+
+impl ArcVersionedMemTableIterator {
+    /// Create a new owned iterator over the given inner data and range.
+    ///
+    /// The iterator is positioned on the first entry (if any) after construction,
+    /// consistent with `TieredMergeIterator::build()` behavior.
+    ///
+    /// Takes `SharedMvccRange` (Arc) to avoid cloning when creating multiple iterators.
+    pub fn new(inner: Arc<VersionedMemTableEngineInner>, range: SharedMvccRange) -> Self {
+        // Safety: We're extending the lifetime of the reference from the Arc's lifetime
+        // to 'static. This is safe because:
+        // 1. The Arc keeps the inner data alive for as long as this struct exists
+        // 2. The _inner field is declared before iter, ensuring proper drop order
+        // 3. VersionedMemTableIterator doesn't access the inner in its Drop impl
+        let inner_ref: &'static VersionedMemTableEngineInner =
+            unsafe { std::mem::transmute(inner.as_ref()) };
+        let mut iter = VersionedMemTableIterator::new(inner_ref, range);
+        // Position on first entry to be consistent with TieredMergeIterator behavior
+        let _ = iter.next();
+        Self {
+            _inner: inner,
+            iter,
+        }
+    }
+}
+
+impl MvccIterator for ArcVersionedMemTableIterator {
+    fn seek(&mut self, target: &MvccKey) -> Result<()> {
+        self.iter.seek(target)
+    }
+
+    fn next(&mut self) -> Result<()> {
+        self.iter.next()
+    }
+
+    fn valid(&self) -> bool {
+        self.iter.valid()
+    }
+
+    fn user_key(&self) -> &[u8] {
+        self.iter.user_key()
+    }
+
+    fn timestamp(&self) -> Timestamp {
+        self.iter.timestamp()
+    }
+
+    fn value(&self) -> &[u8] {
+        self.iter.value()
+    }
+}
+
+// ============================================================================
 // Tests
 // ============================================================================
 
@@ -783,7 +901,11 @@ mod tests {
     ) -> Vec<(Key, Timestamp, RawValue)> {
         let mut results = Vec::new();
 
-        for entry in engine.index.range(range.start.clone()..range.end.clone()) {
+        for entry in engine
+            .inner
+            .index
+            .range(range.start.clone()..range.end.clone())
+        {
             let key = entry.key();
             let row = entry.value();
 
@@ -806,7 +928,7 @@ mod tests {
         key: &[u8],
         ts: Timestamp,
     ) -> Option<RawValue> {
-        if let Some(entry) = engine.index.get(key) {
+        if let Some(entry) = engine.inner.index.get(key) {
             if let Some(value) = entry.value().get_at(ts) {
                 if !is_tombstone(value) {
                     return Some(value.clone());
@@ -827,7 +949,11 @@ mod tests {
     ) -> Vec<(Key, RawValue)> {
         let mut results = Vec::new();
 
-        for entry in engine.index.range(range.start.clone()..range.end.clone()) {
+        for entry in engine
+            .inner
+            .index
+            .range(range.start.clone()..range.end.clone())
+        {
             let key = entry.key();
             let row = entry.value();
 

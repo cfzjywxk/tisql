@@ -334,7 +334,7 @@ struct ReplayResult {
 mod tests {
     use super::*;
     use crate::clog::{ClogBatch, ClogService};
-    use crate::storage::mvcc::{is_tombstone, MvccKey};
+    use crate::storage::mvcc::{is_tombstone, MvccIterator, MvccKey};
     use crate::storage::version::Version;
     use crate::storage::StorageEngine;
     use crate::types::RawValue;

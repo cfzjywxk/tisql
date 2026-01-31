@@ -1221,7 +1221,9 @@ impl MvccIterator for TieredMergeIterator {
 }
 
 impl StorageEngine for LsmEngine {
-    fn scan_iter(&self, range: Range<MvccKey>) -> Result<Box<dyn MvccIterator + '_>> {
+    type Iter = TieredMergeIterator;
+
+    fn scan_iter(&self, range: Range<MvccKey>) -> Result<TieredMergeIterator> {
         // Wrap range in Arc for zero-copy sharing across all iterators
         let range = Arc::new(range);
 
@@ -1283,8 +1285,7 @@ impl StorageEngine for LsmEngine {
         }
 
         // Build and return the merge iterator
-        let merge_iter = merge_iter.build()?;
-        Ok(Box::new(merge_iter))
+        merge_iter.build()
     }
 
     fn write_batch(&self, batch: WriteBatch) -> Result<()> {

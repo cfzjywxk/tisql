@@ -69,6 +69,7 @@ pub mod version;
 // - Space efficiency: key stored once per row, not repeated per version
 // - Fast point lookups: seek to user key, traverse short version chain
 // - Better cache locality: all versions of a key are adjacent in memory
+pub use memtable::ArcVersionedMemTableIterator;
 pub use memtable::MemTableEngine;
 pub use memtable::MemoryStats;
 pub use memtable::VersionedMemTableEngine;
@@ -89,7 +90,7 @@ pub use config::{
 pub use version::{ManifestDelta, Version, VersionBuilder, MAX_LEVELS};
 
 // Re-export LSM engine
-pub use lsm::{LsmEngine, LsmStats};
+pub use lsm::{LsmEngine, LsmStats, TieredMergeIterator};
 
 // Re-export compaction types
 pub use compaction::{CompactionExecutor, CompactionPicker, CompactionTask, MergeIterator};
@@ -222,6 +223,12 @@ pub use crate::codec::row::{decode_row_to_values, encode_row};
 /// | `scan_iter` | Create streaming iterator over range |
 /// | `write_batch` | Atomic writes with commit_ts (MVCC encoding done internally) |
 pub trait StorageEngine: Send + Sync + 'static {
+    /// The iterator type returned by `scan_iter`.
+    ///
+    /// Using an associated type avoids boxing and dynamic dispatch overhead.
+    /// Each storage implementation defines its own concrete iterator type.
+    type Iter: MvccIterator;
+
     /// Create a streaming iterator over MVCC keys in range.
     ///
     /// Returns a streaming iterator over all MVCC key-value pairs in the given range,
@@ -238,8 +245,8 @@ pub trait StorageEngine: Send + Sync + 'static {
     ///
     /// # Returns
     ///
-    /// A boxed iterator that yields entries in MVCC key order.
-    fn scan_iter(&self, range: Range<MvccKey>) -> Result<Box<dyn MvccIterator + '_>>;
+    /// An iterator that yields entries in MVCC key order.
+    fn scan_iter(&self, range: Range<MvccKey>) -> Result<Self::Iter>;
 
     /// Apply a batch of writes atomically.
     ///

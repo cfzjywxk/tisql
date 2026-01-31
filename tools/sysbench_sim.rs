@@ -35,7 +35,7 @@ use std::time::{Duration, Instant};
 
 use clap::Parser;
 
-use tisql::storage::mvcc::{is_tombstone, MvccKey};
+use tisql::storage::mvcc::{is_tombstone, MvccIterator, MvccKey};
 use tisql::storage::{StorageEngine, VersionedMemTableEngine, WriteBatch};
 
 // ============================================================================

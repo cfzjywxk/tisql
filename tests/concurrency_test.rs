@@ -30,7 +30,7 @@ use std::thread;
 use std::time::Duration;
 
 use tisql::error::TiSqlError;
-use tisql::storage::mvcc::{is_tombstone, MvccKey};
+use tisql::storage::mvcc::{is_tombstone, MvccIterator, MvccKey};
 use tisql::testkit::{
     ConcurrencyManager, FileClogConfig, FileClogService, LocalTso, Lock, MemTableEngine,
     TransactionService, TxnServiceTestExt,
@@ -720,11 +720,13 @@ fn test_write_buffer_dedup_with_scan() {
 
     // Scan should show: a=a2, c=c1 (b is deleted)
     let range = b"a".to_vec()..b"d".to_vec();
-    let results: Vec<_> = txn_service
-        .scan_iter(&ctx, range)
-        .unwrap()
-        .collect::<Result<Vec<_>, _>>()
-        .unwrap();
+    let mut iter = txn_service.scan_iter(&ctx, range).unwrap();
+    let mut results = Vec::new();
+    iter.next().unwrap();
+    while iter.valid() {
+        results.push((iter.user_key().to_vec(), iter.value().to_vec()));
+        iter.next().unwrap();
+    }
 
     assert_eq!(results.len(), 2, "Should have 2 keys (a and c, not b)");
 

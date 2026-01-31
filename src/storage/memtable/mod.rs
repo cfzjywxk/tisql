@@ -28,6 +28,7 @@ pub mod versioned_memtable;
 pub mod wrapper;
 
 // Default memtable engine (OceanBase-style versioned memtable)
+pub use versioned_memtable::ArcVersionedMemTableIterator;
 pub use versioned_memtable::VersionedMemTableEngine as MemTableEngine;
 pub use versioned_memtable::VersionedMemTableEngine;
 pub use versioned_memtable::VersionedMemTableIterator;

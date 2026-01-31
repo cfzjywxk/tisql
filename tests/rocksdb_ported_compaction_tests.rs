@@ -24,7 +24,7 @@ use std::sync::Arc;
 use tempfile::TempDir;
 
 use tisql::new_lsn_provider;
-use tisql::storage::mvcc::{is_tombstone, MvccKey};
+use tisql::storage::mvcc::{is_tombstone, MvccIterator, MvccKey};
 use tisql::storage::WriteBatch;
 use tisql::testkit::{
     CompactionExecutor, CompactionPicker, CompactionTask, IlogConfig, IlogService,

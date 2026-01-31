@@ -504,7 +504,7 @@ pub trait MvccIterator {
 // ============================================================================
 
 /// Implement MvccIterator for boxed trait objects to allow dynamic dispatch.
-impl MvccIterator for Box<dyn MvccIterator + '_> {
+impl MvccIterator for Box<dyn MvccIterator> {
     fn seek(&mut self, target: &MvccKey) -> Result<()> {
         (**self).seek(target)
     }

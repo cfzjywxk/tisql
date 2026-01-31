@@ -109,7 +109,9 @@ pub trait TxnScanIterator {
 }
 
 /// Type alias for a boxed scan iterator with zero-copy access.
-pub type ScanIterator<'a> = Box<dyn TxnScanIterator + 'a>;
+///
+/// No lifetime parameter needed - iterators own all their data via Arc.
+pub type ScanIterator = Box<dyn TxnScanIterator>;
 
 /// Transaction state machine.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -257,7 +259,7 @@ pub trait TxnService: Send + Sync {
     /// Returns an iterator over key-value pairs visible at `start_ts`.
     /// Each item is wrapped in `Result` to propagate I/O or corruption errors
     /// that may occur during streaming iteration over storage.
-    fn scan_iter(&self, ctx: &TxnCtx, range: Range<Key>) -> Result<ScanIterator<'_>>;
+    fn scan_iter(&self, ctx: &TxnCtx, range: Range<Key>) -> Result<ScanIterator>;
 
     /// Buffer a put operation.
     ///

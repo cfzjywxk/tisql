@@ -32,13 +32,11 @@
 //! it is frozen and a new active memtable is created. Frozen memtables are
 //! flushed to SST files asynchronously.
 
-use std::ops::Range;
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::time::Instant;
 
 use crate::error::Result;
-use crate::storage::mvcc::MvccKey;
-use crate::storage::{StorageEngine, WriteBatch};
+use crate::storage::WriteBatch;
 
 use super::VersionedMemTableEngine;
 
@@ -248,28 +246,16 @@ fn estimate_batch_size(batch: &WriteBatch) -> usize {
         .sum()
 }
 
-// Implement StorageEngine for MemTable to allow transparent use
-impl StorageEngine for MemTable {
-    fn scan_iter(
-        &self,
-        range: Range<MvccKey>,
-    ) -> Result<Box<dyn crate::storage::MvccIterator + '_>> {
-        self.inner.scan_iter(range)
-    }
-
-    fn write_batch(&self, batch: WriteBatch) -> Result<()> {
-        // Use clog_lsn from batch if available, otherwise use 0 (for testing/recovery scenarios).
-        // Note: Production code should use write_batch_with_lsn() directly via LsmEngine
-        // to ensure proper LSN tracking for recovery ordering.
-        let lsn = batch.clog_lsn().unwrap_or(0);
-        self.write_batch_with_lsn(batch, lsn)
-    }
-}
+// Note: MemTable does not implement StorageEngine directly.
+// Use LsmEngine for the public StorageEngine interface.
+// MemTable is an internal component wrapped in Arc by LsmEngine.
 
 #[cfg(test)]
 mod tests {
+    use std::ops::Range;
+
     use super::*;
-    use crate::storage::mvcc::{is_tombstone, MvccIterator};
+    use crate::storage::mvcc::{is_tombstone, MvccIterator, MvccKey};
     use crate::types::{Key, RawValue, Timestamp};
 
     fn new_batch(commit_ts: Timestamp) -> WriteBatch {
@@ -423,20 +409,6 @@ mod tests {
         batch.put(b"key2".to_vec(), b"value2".to_vec());
         let result = mt.write_batch_with_lsn(batch, 2);
         assert!(result.is_err());
-    }
-
-    #[test]
-    fn test_memtable_write_batch_trait() {
-        let mt = MemTable::new(1);
-
-        let mut batch = new_batch(100);
-        batch.put(b"key".to_vec(), b"value".to_vec());
-
-        // Use the StorageEngine trait method
-        mt.write_batch(batch).unwrap();
-
-        assert_eq!(get_for_test(&mt, b"key"), Some(b"value".to_vec()));
-        assert!(mt.approximate_size() > 0);
     }
 
     #[test]
