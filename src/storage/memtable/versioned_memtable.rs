@@ -1576,4 +1576,404 @@ mod tests {
         // This must panic in ALL builds (not just debug) to prevent silent data corruption
         put_at(&engine, b"key", b"v10", 10);
     }
+
+    // ==================== Iterator Edge Case Tests ====================
+
+    #[test]
+    fn test_iterator_empty_memtable() {
+        // Iterating over an empty memtable should immediately be invalid
+        let engine = new_engine();
+
+        let range = MvccKey::unbounded()..MvccKey::unbounded();
+        let mut iter = engine.create_streaming_iter(std::sync::Arc::new(range));
+
+        iter.advance().unwrap();
+        assert!(
+            !iter.valid(),
+            "Iterator over empty memtable should be invalid"
+        );
+    }
+
+    #[test]
+    fn test_iterator_single_entry() {
+        // Single entry iteration
+        let engine = new_engine();
+        put_at(&engine, b"only_key", b"only_value", 100);
+
+        let range = MvccKey::unbounded()..MvccKey::unbounded();
+        let mut iter = engine.create_streaming_iter(std::sync::Arc::new(range));
+
+        iter.advance().unwrap();
+        assert!(iter.valid());
+        assert_eq!(iter.user_key(), b"only_key");
+        assert_eq!(iter.timestamp(), 100);
+        assert_eq!(iter.value(), b"only_value");
+
+        iter.advance().unwrap();
+        assert!(!iter.valid(), "Should be invalid after single entry");
+    }
+
+    #[test]
+    fn test_iterator_single_key_multiple_versions() {
+        // Single key with multiple versions
+        let engine = new_engine();
+        for ts in 1..=10 {
+            let value = format!("v{ts}");
+            put_at(&engine, b"key", value.as_bytes(), ts);
+        }
+
+        let range = MvccKey::unbounded()..MvccKey::unbounded();
+        let results = scan_mvcc(&engine, range);
+
+        // Should see all 10 versions in descending timestamp order (newest first)
+        assert_eq!(results.len(), 10);
+        for (i, (mvcc_key, value)) in results.iter().enumerate() {
+            let expected_ts = 10 - i as u64;
+            let (_, ts) = MvccKey::decode(mvcc_key);
+            assert_eq!(ts, expected_ts, "Version {i} should have ts={expected_ts}");
+            assert_eq!(value, format!("v{expected_ts}").as_bytes());
+        }
+    }
+
+    #[test]
+    fn test_iterator_large_version_chain() {
+        // Large version chain (100+ versions per key)
+        let engine = new_engine();
+        let num_versions = 200;
+
+        for ts in 1..=num_versions {
+            let value = format!("version_{ts:04}");
+            put_at(&engine, b"hot_key", value.as_bytes(), ts);
+        }
+
+        assert_eq!(engine.len(), num_versions as usize);
+        assert_eq!(engine.key_count(), 1);
+
+        // Verify all versions are accessible via scan
+        let range = MvccKey::unbounded()..MvccKey::unbounded();
+        let results = scan_mvcc(&engine, range);
+        assert_eq!(results.len(), num_versions as usize);
+
+        // Verify point reads at various timestamps
+        for ts in [1, 50, 100, 150, 200] {
+            let value = get_at_for_test(&engine, b"hot_key", ts);
+            assert_eq!(
+                value,
+                Some(format!("version_{ts:04}").into_bytes()),
+                "Read at ts={ts} should return version_{ts}"
+            );
+        }
+    }
+
+    #[test]
+    fn test_iterator_seek_to_nonexistent_key() {
+        // Seek to a key that doesn't exist should find the next key
+        let engine = new_engine();
+        put_at(&engine, b"aaa", b"v1", 10);
+        put_at(&engine, b"ccc", b"v2", 20);
+        put_at(&engine, b"eee", b"v3", 30);
+
+        // Seek to "bbb" should position on "ccc"
+        let range = MvccKey::encode(b"bbb", Timestamp::MAX)..MvccKey::unbounded();
+        let mut iter = engine.create_streaming_iter(std::sync::Arc::new(range));
+
+        iter.advance().unwrap();
+        assert!(iter.valid());
+        assert_eq!(iter.user_key(), b"ccc");
+        assert_eq!(iter.timestamp(), 20);
+    }
+
+    #[test]
+    fn test_iterator_seek_past_all_keys() {
+        // Seek past all keys should be invalid
+        let engine = new_engine();
+        put_at(&engine, b"aaa", b"v1", 10);
+        put_at(&engine, b"bbb", b"v2", 20);
+
+        let range = MvccKey::encode(b"zzz", Timestamp::MAX)..MvccKey::unbounded();
+        let mut iter = engine.create_streaming_iter(std::sync::Arc::new(range));
+
+        iter.advance().unwrap();
+        assert!(!iter.valid(), "Seek past all keys should be invalid");
+    }
+
+    #[test]
+    fn test_iterator_seek_before_all_keys() {
+        // Seek before all keys should find the first key
+        let engine = new_engine();
+        put_at(&engine, b"mmm", b"v1", 10);
+        put_at(&engine, b"nnn", b"v2", 20);
+
+        // Start from very beginning (before "mmm")
+        let range = MvccKey::encode(b"aaa", Timestamp::MAX)..MvccKey::unbounded();
+        let mut iter = engine.create_streaming_iter(std::sync::Arc::new(range));
+
+        iter.advance().unwrap();
+        assert!(iter.valid());
+        assert_eq!(iter.user_key(), b"mmm");
+    }
+
+    #[test]
+    fn test_iterator_seek_exact_match() {
+        // Seek to exact key and timestamp
+        let engine = new_engine();
+        put_at(&engine, b"key", b"v10", 10);
+        put_at(&engine, b"key", b"v20", 20);
+        put_at(&engine, b"key", b"v30", 30);
+
+        // Seek to exactly (key, 20)
+        let range = MvccKey::encode(b"key", 20)..MvccKey::unbounded();
+        let mut iter = engine.create_streaming_iter(std::sync::Arc::new(range));
+
+        iter.advance().unwrap();
+        assert!(iter.valid());
+        assert_eq!(iter.user_key(), b"key");
+        assert_eq!(iter.timestamp(), 20);
+
+        iter.advance().unwrap();
+        assert!(iter.valid());
+        assert_eq!(iter.timestamp(), 10, "Next version should be ts=10");
+    }
+
+    // ==================== Boundary Condition Tests ====================
+
+    #[test]
+    fn test_timestamp_boundary_zero() {
+        // Timestamp 0 is the minimum timestamp
+        let engine = new_engine();
+        put_at(&engine, b"key", b"at_zero", 0);
+        put_at(&engine, b"key", b"at_one", 1);
+
+        // Read at ts=0 should see the value at ts=0
+        let value = get_at_for_test(&engine, b"key", 0);
+        assert_eq!(value, Some(b"at_zero".to_vec()));
+
+        // Read at ts=1 should see the value at ts=1
+        let value = get_at_for_test(&engine, b"key", 1);
+        assert_eq!(value, Some(b"at_one".to_vec()));
+    }
+
+    #[test]
+    fn test_timestamp_boundary_max() {
+        // Timestamp::MAX is the maximum timestamp
+        let engine = new_engine();
+        put_at(&engine, b"key", b"at_max", Timestamp::MAX);
+
+        let value = get_at_for_test(&engine, b"key", Timestamp::MAX);
+        assert_eq!(value, Some(b"at_max".to_vec()));
+
+        // Reading at MAX-1 should not see it (version not yet visible)
+        let value = get_at_for_test(&engine, b"key", Timestamp::MAX - 1);
+        assert_eq!(value, None);
+    }
+
+    #[test]
+    fn test_empty_range_scan() {
+        // Range where start >= end (empty range)
+        let engine = new_engine();
+        put_at(&engine, b"aaa", b"v1", 10);
+        put_at(&engine, b"bbb", b"v2", 20);
+
+        // Empty range: start == end
+        let range = MvccKey::encode(b"bbb", 15)..MvccKey::encode(b"bbb", 15);
+        let results = scan_mvcc(&engine, range);
+        assert!(results.is_empty(), "Empty range should return no results");
+    }
+
+    #[test]
+    fn test_single_key_range_scan() {
+        // Range covering exactly one key
+        let engine = new_engine();
+        put_at(&engine, b"aaa", b"v1", 10);
+        put_at(&engine, b"bbb", b"v2", 20);
+        put_at(&engine, b"ccc", b"v3", 30);
+
+        // Range covering only "bbb"
+        let range =
+            MvccKey::encode(b"bbb", Timestamp::MAX)..MvccKey::encode(b"ccc", Timestamp::MAX);
+        let results = scan_mvcc(&engine, range);
+        assert_eq!(results.len(), 1);
+        let (key, _) = &results[0];
+        let (user_key, _) = MvccKey::decode(key);
+        assert_eq!(user_key, b"bbb");
+    }
+
+    #[test]
+    fn test_unbounded_range_with_no_data() {
+        // Full unbounded range on empty memtable
+        let engine = new_engine();
+
+        let range = MvccKey::unbounded()..MvccKey::unbounded();
+        let results = scan_mvcc(&engine, range);
+        assert!(results.is_empty());
+    }
+
+    #[test]
+    fn test_range_excludes_exact_end_bound() {
+        // Range end is exclusive - key at exact end bound should not be included
+        let engine = new_engine();
+        put_at(&engine, b"aaa", b"v1", 10);
+        put_at(&engine, b"bbb", b"v2", 20);
+        put_at(&engine, b"ccc", b"v3", 30);
+
+        // Range excludes "bbb" at ts=20 exactly
+        let range = MvccKey::encode(b"aaa", Timestamp::MAX)..MvccKey::encode(b"bbb", 20);
+        let results = scan_mvcc(&engine, range);
+
+        // Should only include "aaa" (bbb@20 is excluded by exclusive end bound)
+        assert_eq!(results.len(), 1);
+        let (key, _) = &results[0];
+        let (user_key, _) = MvccKey::decode(key);
+        assert_eq!(user_key, b"aaa");
+    }
+
+    // ==================== Arc Iterator Lifetime Tests ====================
+
+    #[test]
+    fn test_arc_iterator_outlives_engine_reference() {
+        // The Arc iterator should be usable after the engine reference is dropped
+        let engine = new_engine();
+        put_at(&engine, b"key1", b"value1", 10);
+        put_at(&engine, b"key2", b"value2", 20);
+
+        // Get Arc to inner
+        let inner = engine.inner_arc();
+        let range = std::sync::Arc::new(MvccKey::unbounded()..MvccKey::unbounded());
+
+        // Create Arc iterator
+        let mut iter = ArcVersionedMemTableIterator::new(inner, range);
+
+        // Drop the engine (but Arc keeps inner alive)
+        drop(engine);
+
+        // Iterator should still work
+        iter.advance().unwrap();
+        assert!(iter.valid());
+        assert_eq!(iter.user_key(), b"key1");
+
+        iter.advance().unwrap();
+        assert!(iter.valid());
+        assert_eq!(iter.user_key(), b"key2");
+
+        iter.advance().unwrap();
+        assert!(!iter.valid());
+    }
+
+    #[test]
+    fn test_arc_iterator_seek_operations() {
+        // Test seek operations on Arc iterator
+        let engine = new_engine();
+        for i in 0..10 {
+            let key = format!("key_{i:02}");
+            put_at(&engine, key.as_bytes(), b"value", i as u64 + 1);
+        }
+
+        let inner = engine.inner_arc();
+        let range = std::sync::Arc::new(MvccKey::unbounded()..MvccKey::unbounded());
+        let mut iter = ArcVersionedMemTableIterator::new(inner, range);
+
+        // Seek to middle
+        let target = MvccKey::encode(b"key_05", Timestamp::MAX);
+        iter.seek(&target).unwrap();
+        assert!(iter.valid());
+        assert_eq!(iter.user_key(), b"key_05");
+
+        // Seek to non-existent key
+        let target = MvccKey::encode(b"key_03a", Timestamp::MAX);
+        iter.seek(&target).unwrap();
+        assert!(iter.valid());
+        assert_eq!(iter.user_key(), b"key_04"); // Next key after "key_03a"
+    }
+
+    // ==================== MvccRow Edge Case Tests ====================
+
+    #[test]
+    fn test_mvcc_row_get_at_empty_chain() {
+        // Getting from an empty row should return None
+        let row = MvccRow::new_empty();
+        assert!(row.get_at(100).is_none());
+        assert!(row.get_at(0).is_none());
+        assert!(row.get_at(Timestamp::MAX).is_none());
+    }
+
+    #[test]
+    fn test_mvcc_row_version_count_accuracy() {
+        // Version count should accurately reflect the number of versions
+        let row = MvccRow::new_empty();
+        assert_eq!(row.version_count.load(Ordering::Relaxed), 0);
+
+        row.prepend(10, b"v1".to_vec());
+        assert_eq!(row.version_count.load(Ordering::Relaxed), 1);
+
+        row.prepend(20, b"v2".to_vec());
+        assert_eq!(row.version_count.load(Ordering::Relaxed), 2);
+
+        row.prepend(30, b"v3".to_vec());
+        assert_eq!(row.version_count.load(Ordering::Relaxed), 3);
+    }
+
+    #[test]
+    fn test_key_with_binary_data() {
+        // Keys and values can contain arbitrary binary data including nulls
+        let engine = new_engine();
+
+        let binary_key = b"\x00\x01\x02\xff\xfe\xfd";
+        let binary_value = b"\x00\x00\x00null\x00bytes";
+
+        put_at(&engine, binary_key, binary_value, 100);
+
+        let value = get_for_test(&engine, binary_key);
+        assert_eq!(value, Some(binary_value.to_vec()));
+    }
+
+    #[test]
+    fn test_empty_key_and_value() {
+        // Empty keys and values should work
+        let engine = new_engine();
+
+        put_at(&engine, b"", b"", 10);
+
+        let value = get_for_test(&engine, b"");
+        assert_eq!(value, Some(vec![]));
+    }
+
+    #[test]
+    fn test_large_value() {
+        // Large values (1MB+) should work
+        let engine = new_engine();
+
+        let large_value = vec![b'x'; 1024 * 1024]; // 1MB
+        put_at(&engine, b"large_key", &large_value, 100);
+
+        let value = get_for_test(&engine, b"large_key");
+        assert_eq!(value.as_ref().map(|v| v.len()), Some(1024 * 1024));
+        assert_eq!(value, Some(large_value));
+    }
+
+    #[test]
+    fn test_many_keys_iteration_order() {
+        // Verify iteration order is correct across many keys
+        let engine = new_engine();
+
+        // Insert keys in random-ish order
+        for i in [5, 3, 8, 1, 9, 2, 7, 4, 6, 0] {
+            let key = format!("key_{i:02}");
+            put_at(&engine, key.as_bytes(), b"value", (i + 1) as u64);
+        }
+
+        // Scan should return keys in sorted order
+        let range = MvccKey::unbounded()..MvccKey::unbounded();
+        let results = scan_mvcc(&engine, range);
+
+        assert_eq!(results.len(), 10);
+        for (i, (mvcc_key, _)) in results.iter().enumerate() {
+            let expected_key = format!("key_{i:02}");
+            let (user_key, _) = MvccKey::decode(mvcc_key);
+            assert_eq!(
+                user_key,
+                expected_key.as_bytes(),
+                "Key {i} should be {expected_key}"
+            );
+        }
+    }
 }
