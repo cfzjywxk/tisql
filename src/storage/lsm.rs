@@ -739,8 +739,8 @@ impl ChildIterator {
 /// - L0 SSTs: stored as metadata, opened on first seek
 /// - Levels: LevelIterator created, internally lazy
 enum ChildSource {
-    /// Ready iterator - can be used immediately
-    Ready(ChildIterator),
+    /// Ready iterator - can be used immediately (boxed to reduce enum size)
+    Ready(Box<ChildIterator>),
     /// Pending L0 SST - opened lazily on first seek
     L0Pending {
         meta: Arc<SstMeta>,
@@ -762,7 +762,7 @@ impl ChildSource {
             let path = sst_dir.join(format!("{:08}.sst", meta.id));
             let reader = SstReaderRef::open(&path)?;
             let iter = SstMvccIterator::new(reader, Arc::clone(range))?;
-            *self = Self::Ready(ChildIterator::L0Sst(iter));
+            *self = Self::Ready(Box::new(ChildIterator::L0Sst(iter)));
         }
         Ok(())
     }
@@ -1124,7 +1124,7 @@ impl TieredMergeIterator {
     /// Memtable iterators are cheap (in-memory), so we create them immediately.
     fn add_active_memtable(&mut self, iter: ArcMemTableIterator) {
         self.children.push(ChildHandle {
-            source: ChildSource::Ready(ChildIterator::Memtable(iter)),
+            source: ChildSource::Ready(Box::new(ChildIterator::Memtable(iter))),
             priority: PRIORITY_ACTIVE,
         });
     }
@@ -1134,7 +1134,7 @@ impl TieredMergeIterator {
     /// Memtable iterators are cheap (in-memory), so we create them immediately.
     fn add_frozen_memtable(&mut self, iter: ArcMemTableIterator, index: usize) {
         self.children.push(ChildHandle {
-            source: ChildSource::Ready(ChildIterator::Memtable(iter)),
+            source: ChildSource::Ready(Box::new(ChildIterator::Memtable(iter))),
             priority: PRIORITY_FROZEN_BASE + index as u32,
         });
     }
@@ -1166,7 +1166,7 @@ impl TieredMergeIterator {
     #[allow(dead_code)] // Useful for testing
     fn add_l0_sst(&mut self, iter: SstMvccIterator, index: usize) {
         self.children.push(ChildHandle {
-            source: ChildSource::Ready(ChildIterator::L0Sst(iter)),
+            source: ChildSource::Ready(Box::new(ChildIterator::L0Sst(iter))),
             priority: PRIORITY_L0_BASE + index as u32,
         });
     }
@@ -1177,7 +1177,7 @@ impl TieredMergeIterator {
     /// create it immediately but no I/O happens until iteration.
     fn add_level(&mut self, iter: LevelIterator, level: usize) {
         self.children.push(ChildHandle {
-            source: ChildSource::Ready(ChildIterator::Level(iter)),
+            source: ChildSource::Ready(Box::new(ChildIterator::Level(iter))),
             priority: PRIORITY_LEVEL_BASE * level as u32,
         });
     }
@@ -1294,7 +1294,7 @@ impl TieredMergeIterator {
     /// Add a mock iterator as active memtable (test-only).
     fn add_mock_active(&mut self, iter: MockMvccIterator) {
         self.children.push(ChildHandle {
-            source: ChildSource::Ready(ChildIterator::Mock(iter)),
+            source: ChildSource::Ready(Box::new(ChildIterator::Mock(iter))),
             priority: PRIORITY_ACTIVE,
         });
     }
@@ -1302,7 +1302,7 @@ impl TieredMergeIterator {
     /// Add a mock iterator as frozen memtable (test-only).
     fn add_mock_frozen(&mut self, iter: MockMvccIterator, index: usize) {
         self.children.push(ChildHandle {
-            source: ChildSource::Ready(ChildIterator::Mock(iter)),
+            source: ChildSource::Ready(Box::new(ChildIterator::Mock(iter))),
             priority: PRIORITY_FROZEN_BASE + index as u32,
         });
     }
@@ -1310,7 +1310,7 @@ impl TieredMergeIterator {
     /// Add a mock iterator as L0 SST (test-only).
     fn add_mock_l0(&mut self, iter: MockMvccIterator, index: usize) {
         self.children.push(ChildHandle {
-            source: ChildSource::Ready(ChildIterator::Mock(iter)),
+            source: ChildSource::Ready(Box::new(ChildIterator::Mock(iter))),
             priority: PRIORITY_L0_BASE + index as u32,
         });
     }
@@ -1318,7 +1318,7 @@ impl TieredMergeIterator {
     /// Add a mock iterator as level (test-only).
     fn add_mock_level(&mut self, iter: MockMvccIterator, level: usize) {
         self.children.push(ChildHandle {
-            source: ChildSource::Ready(ChildIterator::Mock(iter)),
+            source: ChildSource::Ready(Box::new(ChildIterator::Mock(iter))),
             priority: PRIORITY_LEVEL_BASE * level as u32,
         });
     }
@@ -3994,8 +3994,7 @@ mod tests {
         for expected_key in expected_order {
             assert!(
                 iter.valid(),
-                "Expected key {:?} but iterator exhausted",
-                expected_key
+                "Expected key {expected_key:?} but iterator exhausted"
             );
             assert_eq!(
                 iter.user_key(),
@@ -4136,7 +4135,7 @@ mod tests {
         let ssts = version.ssts_at_level(0);
         assert!(!ssts.is_empty());
         let sst_id = ssts[0].id;
-        let sst_path = sst_dir.join(format!("{:08}.sst", sst_id));
+        let sst_path = sst_dir.join(format!("{sst_id:08}.sst"));
         assert!(sst_path.exists(), "SST file should exist");
 
         // Verify data is readable from SST
@@ -4400,7 +4399,10 @@ mod tests {
         merge_iter.seek(&test_key(b"b", 100)).unwrap();
 
         // After seek: ALL iterators seeked
-        assert!(*active_seek.borrow(), "Active should be seeked after seek()");
+        assert!(
+            *active_seek.borrow(),
+            "Active should be seeked after seek()"
+        );
         assert!(*l0_seek.borrow(), "L0 should be seeked after seek()");
         assert!(*l1_seek.borrow(), "L1 should be seeked after seek()");
 
@@ -4512,10 +4514,7 @@ mod tests {
     fn test_lazy_io_valid_returns_false_before_init() {
         // Verify that valid() returns false before any seek/advance.
 
-        let (iter, _) = MockMvccIterator::new(
-            "test",
-            vec![(test_key(b"a", 100), b"v".to_vec())],
-        );
+        let (iter, _) = MockMvccIterator::new("test", vec![(test_key(b"a", 100), b"v".to_vec())]);
 
         let mut merge_iter = TieredMergeIterator::new();
         merge_iter.add_mock_active(iter);

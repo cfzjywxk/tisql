@@ -150,11 +150,18 @@ impl TxnCtx {
 /// 2. **Lock Checking**: Reads check for conflicting locks from concurrent
 ///    transactions, returning `KeyIsLocked` error when blocked.
 ///
-/// 3. **Read-Your-Writes**: Within a transaction, reads see buffered writes
-///    that haven't been committed yet.
-///
-/// 4. **Consistent Timestamps**: The `TxnCtx` carries `start_ts` for debugging
+/// 3. **Consistent Timestamps**: The `TxnCtx` carries `start_ts` for debugging
 ///    and ensures all operations in a transaction use the same snapshot.
+///
+/// ## Note on Read-Your-Writes
+///
+/// Currently, read-your-writes is NOT supported. Reads always go to storage
+/// and do not see buffered (uncommitted) writes in the same transaction.
+/// This is because explicit transactions (BEGIN/COMMIT/ROLLBACK) are not yet
+/// supported - all writes are auto-committed.
+///
+/// In the future, with pessimistic locking, uncommitted writes will be written
+/// directly to storage with locks, making read-your-writes work naturally.
 ///
 /// ## Design Rationale
 ///
@@ -184,20 +191,19 @@ pub trait TxnService: Send + Sync {
 
     /// Read a key within the transaction.
     ///
-    /// For read-write transactions, this checks the write buffer first,
-    /// then reads from storage at `start_ts`.
+    /// Reads from storage at `start_ts`, returning the latest visible version.
+    /// Returns `None` if the key doesn't exist or was deleted.
     ///
-    /// For read-only transactions, this reads directly from storage.
+    /// Note: This does NOT see uncommitted writes in the transaction's buffer.
     fn get(&self, ctx: &TxnCtx, key: &[u8]) -> Result<Option<RawValue>>;
 
     /// Scan a range of keys within the transaction (streaming).
     ///
-    /// For read-write transactions, this merges buffered writes with storage,
-    /// implementing read-your-writes semantics.
-    ///
     /// Returns an iterator over key-value pairs visible at `start_ts`.
     /// Each item is wrapped in `Result` to propagate I/O or corruption errors
     /// that may occur during streaming iteration over storage.
+    ///
+    /// Note: This does NOT see uncommitted writes in the transaction's buffer.
     fn scan_iter(&self, ctx: &TxnCtx, range: Range<Key>) -> Result<Self::ScanIter>;
 
     /// Buffer a put operation.

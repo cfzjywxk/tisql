@@ -561,10 +561,10 @@ fn test_concurrent_read_after_delete() {
 }
 
 // ============================================================================
-// Write Buffer Deduplication Tests
+// Write Buffer Deduplication Tests (commit behavior)
 // ============================================================================
 
-/// Test that multiple puts to the same key in one transaction keeps only the last value.
+/// Test that multiple puts to the same key in one transaction commits only the last value.
 ///
 /// Regression test for: "Multiple ops on the same key in one commit are silently mishandled"
 /// Previously, put(k,v1); put(k,v2) would commit v1 instead of v2.
@@ -591,14 +591,6 @@ fn test_write_buffer_last_put_wins() {
         .put(&mut ctx, key.to_vec(), value3.to_vec())
         .unwrap();
 
-    // Read-your-writes should see the last value
-    let result = txn_service.get(&ctx, key).unwrap();
-    assert_eq!(
-        result,
-        Some(value3.to_vec()),
-        "Read-your-writes should see last put value"
-    );
-
     // Commit the transaction
     txn_service.commit(ctx).unwrap();
 
@@ -612,7 +604,7 @@ fn test_write_buffer_last_put_wins() {
     );
 }
 
-/// Test that put followed by delete in the same transaction results in delete.
+/// Test that put followed by delete in the same transaction commits as delete.
 ///
 /// Regression test for: "Multiple ops on the same key in one commit are silently mishandled"
 /// Previously, put(k,v); delete(k) would commit the put instead of the delete.
@@ -632,20 +624,16 @@ fn test_write_buffer_put_then_delete() {
         .unwrap();
     txn_service.delete(&mut ctx, key.to_vec()).unwrap();
 
-    // Read-your-writes should see None (deleted)
-    let result = txn_service.get(&ctx, key).unwrap();
-    assert_eq!(result, None, "Read-your-writes should see deletion (None)");
-
     // Commit the transaction
     txn_service.commit(ctx).unwrap();
 
-    // Read after commit should see None
+    // Read after commit should see None (delete wins)
     let read_ctx = txn_service.begin(true).unwrap();
     let result = txn_service.get(&read_ctx, key).unwrap();
     assert_eq!(result, None, "Committed result should be delete (None)");
 }
 
-/// Test that delete followed by put in the same transaction results in put.
+/// Test that delete followed by put in the same transaction commits the put.
 #[test]
 fn test_write_buffer_delete_then_put() {
     use tisql::TxnService;
@@ -669,18 +657,10 @@ fn test_write_buffer_delete_then_put() {
         .put(&mut ctx, key.to_vec(), value.to_vec())
         .unwrap();
 
-    // Read-your-writes should see the new value
-    let result = txn_service.get(&ctx, key).unwrap();
-    assert_eq!(
-        result,
-        Some(value.to_vec()),
-        "Read-your-writes should see put after delete"
-    );
-
     // Commit the transaction
     txn_service.commit(ctx).unwrap();
 
-    // Read after commit should see the new value
+    // Read after commit should see the new value (put wins)
     let read_ctx = txn_service.begin(true).unwrap();
     let result = txn_service.get(&read_ctx, key).unwrap();
     assert_eq!(
@@ -690,9 +670,9 @@ fn test_write_buffer_delete_then_put() {
     );
 }
 
-/// Test write buffer deduplication with scan (read-your-writes in range).
+/// Test write buffer deduplication - only final ops are committed.
 #[test]
-fn test_write_buffer_dedup_with_scan() {
+fn test_write_buffer_dedup_commit() {
     use tisql::TxnService;
 
     let (_storage, txn_service, _tso, _cm, _dir) = create_test_service();
@@ -719,9 +699,13 @@ fn test_write_buffer_dedup_with_scan() {
         .put(&mut ctx, b"c".to_vec(), b"c1".to_vec())
         .unwrap();
 
-    // Scan should show: a=a2, c=c1 (b is deleted)
+    // Commit the transaction
+    txn_service.commit(ctx).unwrap();
+
+    // Scan after commit should show: a=a2, c=c1 (b is deleted/absent)
+    let read_ctx = txn_service.begin(true).unwrap();
     let range = b"a".to_vec()..b"d".to_vec();
-    let mut iter = txn_service.scan_iter(&ctx, range).unwrap();
+    let mut iter = txn_service.scan_iter(&read_ctx, range).unwrap();
     let mut results = Vec::new();
     iter.advance().unwrap();
     while iter.valid() {
@@ -731,7 +715,7 @@ fn test_write_buffer_dedup_with_scan() {
 
     assert_eq!(results.len(), 2, "Should have 2 keys (a and c, not b)");
 
-    // Verify results (BTreeMap ordering)
+    // Verify results
     let results_map: std::collections::HashMap<_, _> = results.into_iter().collect();
     assert_eq!(results_map.get(b"a".as_slice()), Some(&b"a2".to_vec()));
     assert_eq!(results_map.get(b"b".as_slice()), None); // deleted

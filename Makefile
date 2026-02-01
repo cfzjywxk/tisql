@@ -1,6 +1,6 @@
 # TiSQL Makefile
 
-.PHONY: all build test unit-test store-test e2e-test fmt clippy clean run help
+.PHONY: all build test unit-test store-test e2e-test fmt clippy clean run help prepare
 
 # Default target
 all: build
@@ -44,6 +44,10 @@ fmt-check:
 clippy:
 	cargo clippy --all-targets -- -D warnings
 
+# Format and lint - run before pushing to pass CI
+prepare:
+	cargo fmt && cargo clippy --all-targets -- -D warnings
+
 # Run all CI checks locally
 ci: fmt-check clippy test
 
@@ -76,6 +80,7 @@ help:
 	@echo "  fmt          Format code"
 	@echo "  fmt-check    Check code formatting"
 	@echo "  clippy       Run clippy linter"
+	@echo "  prepare      Format and lint (run before push)"
 	@echo "  ci           Run all CI checks locally"
 	@echo "  clean        Clean build artifacts"
 	@echo "  run          Run the server (debug)"

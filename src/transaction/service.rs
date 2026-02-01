@@ -31,7 +31,7 @@ use crate::tso::TsoService;
 use super::api::{CommitInfo, TxnCtx, TxnService, TxnState};
 use super::concurrency::{ConcurrencyManager, Lock};
 use crate::storage::mvcc::{is_tombstone, MvccIterator, MvccKey};
-use crate::storage::{StorageEngine, WriteBatch, WriteOp};
+use crate::storage::{StorageEngine, WriteBatch};
 use crate::types::{Key, RawValue, Timestamp, TxnId};
 
 /// Transaction service manages transactions with durability and MVCC.
@@ -222,15 +222,6 @@ impl<S: StorageEngine + 'static, L: ClogService + 'static, T: TsoService> TxnSer
     }
 
     fn get(&self, ctx: &TxnCtx, key: &[u8]) -> Result<Option<RawValue>> {
-        // First check write buffer for uncommitted writes (read-your-writes)
-        // WriteBatch has at most one op per key (last write wins)
-        if let Some(op) = ctx.write_buffer.get(key) {
-            return match op {
-                WriteOp::Put { value } => Ok(Some(value.clone())),
-                WriteOp::Delete => Ok(None),
-            };
-        }
-
         // Check for locks from other transactions
         self.concurrency_manager.check_lock(key, ctx.start_ts)?;
 
@@ -295,7 +286,7 @@ impl<S: StorageEngine + 'static, L: ClogService + 'static, T: TsoService> TxnSer
         //   We use Timestamp::MAX because !MAX = 0, producing the smallest suffix.
         //   This ensures we find all keys that start with range.start, even when
         //   range.start is a prefix (like table scan without a specific row key).
-        //   Visibility filtering by start_ts happens in ensure_storage_next().
+        //   Visibility filtering by start_ts happens in find_next_visible().
         // - End: MvccKey::encode(range.end, 0) - largest MVCC key for range.end (exclusive)
         let start_mvcc = MvccKey::encode(&range.start, Timestamp::MAX);
         let end_mvcc = if range.end.is_empty() {
@@ -308,27 +299,8 @@ impl<S: StorageEngine + 'static, L: ClogService + 'static, T: TsoService> TxnSer
         // Create streaming iterator over storage
         let storage_iter = self.storage.scan_iter(start_mvcc..end_mvcc)?;
 
-        // Extract and sort buffer entries in range (owned copy)
-        let buffer_entries: Vec<(Key, Option<RawValue>)> = ctx
-            .write_buffer
-            .iter()
-            .filter(|(k, _)| *k >= &range.start && (range.end.is_empty() || *k < &range.end))
-            .map(|(k, op)| {
-                let value = match op {
-                    WriteOp::Put { value } => Some(value.clone()),
-                    WriteOp::Delete => None,
-                };
-                (k.clone(), value)
-            })
-            .collect::<Vec<_>>();
-
-        // Create streaming scan iterator that merges storage with write buffer
-        Ok(MvccScanIterator::new(
-            storage_iter,
-            ctx.start_ts,
-            range,
-            buffer_entries,
-        ))
+        // Create streaming scan iterator that wraps storage with MVCC filtering
+        Ok(MvccScanIterator::new(storage_iter, ctx.start_ts, range))
     }
 
     fn put(&self, ctx: &mut TxnCtx, key: Key, value: RawValue) -> Result<()> {
@@ -454,22 +426,15 @@ impl<S: StorageEngine + 'static, L: ClogService + 'static, T: TsoService> TxnSer
 }
 
 // ============================================================================
-// MvccScanIterator - Streaming scan with write buffer merge
+// MvccScanIterator - Transaction layer wrapper for storage iterator
 // ============================================================================
 
-/// Streaming scan iterator that merges storage results with write buffer.
+/// Streaming MVCC scan iterator wrapping the storage iterator.
 ///
-/// This iterator provides efficient MVCC scanning by:
-/// - Streaming from storage iterator (no full materialization of storage)
-/// - Merging write buffer entries sorted in memory
-/// - Caching the next visible storage entry for efficient comparison
-///
-/// ## MVCC Semantics
-///
-/// For each user key, we return the latest visible version where:
-/// - `entry_ts <= read_ts` (MVCC visibility)
-/// - Tombstones are filtered out (deleted keys not returned)
-/// - Write buffer entries override storage entries (read-your-writes)
+/// This is a thin wrapper that provides MVCC visibility filtering:
+/// - Filters entries by `read_ts` (only entries with `ts <= read_ts` are visible)
+/// - Filters out tombstones (deleted keys)
+/// - Skips older versions of the same key (returns only latest visible version)
 ///
 /// ## Iterator Pattern
 ///
@@ -496,15 +461,7 @@ pub struct MvccScanIterator<I: MvccIterator> {
     read_ts: Timestamp,
     /// Key range for filtering
     range: Range<Key>,
-    /// Sorted write buffer entries in range (key, Option<value> where None = delete)
-    buffer_entries: Vec<(Key, Option<RawValue>)>,
-    /// Next buffer position to consider
-    buffer_pos: usize,
-    /// Pre-cached next visible storage entry (key, timestamp, value) for comparison.
-    /// None if storage is exhausted or hasn't been initialized yet.
-    storage_next: Option<(Vec<u8>, Timestamp, Vec<u8>)>,
     /// Current entry (key, timestamp, value). None if not positioned on a valid entry.
-    /// For buffer entries (uncommitted writes), timestamp is Timestamp::MAX.
     current: Option<(Vec<u8>, Timestamp, Vec<u8>)>,
 }
 
@@ -519,54 +476,38 @@ impl<I: MvccIterator> MvccScanIterator<I> {
     /// * `storage_iter` - Iterator over storage (MVCC key-value pairs)
     /// * `read_ts` - Transaction's read timestamp for MVCC visibility
     /// * `range` - Key range for filtering
-    /// * `buffer_entries` - Pre-extracted write buffer entries (key, Option<value>),
-    ///   must be sorted by key in ascending order (guaranteed when from BTreeMap::iter)
-    pub fn new(
-        storage_iter: I,
-        read_ts: Timestamp,
-        range: Range<Key>,
-        buffer_entries: Vec<(Key, Option<RawValue>)>,
-    ) -> Self {
-        debug_assert!(
-            buffer_entries.windows(2).all(|w| w[0].0 <= w[1].0),
-            "buffer_entries must be sorted by key"
-        );
-
+    pub fn new(storage_iter: I, read_ts: Timestamp, range: Range<Key>) -> Self {
         Self {
             storage_iter,
             read_ts,
             range,
-            buffer_entries,
-            buffer_pos: 0,
-            storage_next: None,
             current: None,
         }
     }
 
-    /// Ensure `storage_next` contains the next visible entry from storage.
+    /// Find the next visible entry from storage.
     ///
-    /// After this call, `storage_next` is either:
-    /// - `Some((key, timestamp, value))` if there's a visible entry
-    /// - `None` if storage is exhausted
-    fn ensure_storage_next(&mut self) -> crate::error::Result<()> {
-        // If we already have a cached entry, nothing to do
-        if self.storage_next.is_some() {
-            return Ok(());
-        }
+    /// Advances the storage iterator until we find an entry that:
+    /// - Is within the key range
+    /// - Has `ts <= read_ts` (MVCC visibility)
+    /// - Is not a tombstone
+    ///
+    /// After finding a visible entry, skips all older versions of the same key.
+    fn find_next_visible(&mut self) -> crate::error::Result<()> {
+        self.current = None;
 
         // Initialize storage iterator if needed
         if !self.storage_iter.valid() {
             self.storage_iter.advance()?;
         }
 
-        // Find next visible, non-tombstone entry
         while self.storage_iter.valid() {
             let user_key = self.storage_iter.user_key();
             let ts = self.storage_iter.timestamp();
 
             // Check if past end of range
             if !self.range.end.is_empty() && user_key >= self.range.end.as_slice() {
-                return Ok(()); // storage_next stays None
+                return Ok(()); // current stays None
             }
 
             // Skip if before start of range
@@ -594,134 +535,35 @@ impl<I: MvccIterator> MvccScanIterator<I> {
                 continue;
             }
 
-            // Found a visible, non-tombstone entry - cache it with timestamp
-            self.storage_next = Some((
-                self.storage_iter.user_key().to_vec(),
-                self.storage_iter.timestamp(),
-                self.storage_iter.value().to_vec(),
-            ));
-            return Ok(());
-        }
+            // Found a visible, non-tombstone entry - cache it
+            let key = self.storage_iter.user_key().to_vec();
+            let timestamp = self.storage_iter.timestamp();
+            let value = self.storage_iter.value().to_vec();
+            self.current = Some((key.clone(), timestamp, value));
 
-        Ok(()) // storage_next stays None - exhausted
-    }
-
-    /// Consume the cached storage entry and advance past all versions of that key.
-    fn consume_storage(&mut self) -> crate::error::Result<()> {
-        if let Some((ref key, _, _)) = self.storage_next.take() {
-            // Skip all versions of this key in storage
+            // Skip all older versions of this key
+            self.storage_iter.advance()?;
             while self.storage_iter.valid() && self.storage_iter.user_key() == key.as_slice() {
                 self.storage_iter.advance()?;
             }
+
+            return Ok(());
         }
-        Ok(())
+
+        Ok(()) // current stays None - exhausted
     }
 }
 
 impl<I: MvccIterator> MvccIterator for MvccScanIterator<I> {
     fn seek(&mut self, _target: &MvccKey) -> crate::error::Result<()> {
-        // MvccScanIterator is created for a specific range and merges buffer + storage.
-        // Seeking within the merged result is not supported - this is a forward-only iterator.
+        // MvccScanIterator is created for a specific range.
+        // Seeking within the result is not supported - this is a forward-only iterator.
         // The iterator should be created with the appropriate range instead.
         Ok(())
     }
 
     fn advance(&mut self) -> crate::error::Result<()> {
-        self.current = None;
-
-        loop {
-            // Ensure we have the next visible storage entry cached
-            self.ensure_storage_next()?;
-
-            // Determine which source to use and what action to take.
-            // We extract all needed data first to avoid borrow conflicts.
-            enum Action {
-                Exhausted,
-                UseStorage,
-                UseBuffer { key: Vec<u8>, value: Vec<u8> },
-                SkipBuffer,
-                UseBufferSkipStorage { key: Vec<u8>, value: Vec<u8> },
-                SkipBoth,
-            }
-
-            let action = {
-                let storage_key = self.storage_next.as_ref().map(|(k, _, _)| k.as_slice());
-                let buffer_entry = self.buffer_entries.get(self.buffer_pos);
-
-                match (storage_key, buffer_entry) {
-                    (None, None) => Action::Exhausted,
-                    (Some(_), None) => Action::UseStorage,
-                    (None, Some((bk, Some(bv)))) => Action::UseBuffer {
-                        key: bk.clone(),
-                        value: bv.clone(),
-                    },
-                    (None, Some((_, None))) => Action::SkipBuffer,
-                    (Some(sk), Some((bk, bv))) => {
-                        use std::cmp::Ordering;
-                        match sk.cmp(bk.as_slice()) {
-                            Ordering::Less => Action::UseStorage,
-                            Ordering::Greater => {
-                                if let Some(v) = bv {
-                                    Action::UseBuffer {
-                                        key: bk.clone(),
-                                        value: v.clone(),
-                                    }
-                                } else {
-                                    Action::SkipBuffer
-                                }
-                            }
-                            Ordering::Equal => {
-                                if let Some(v) = bv {
-                                    Action::UseBufferSkipStorage {
-                                        key: bk.clone(),
-                                        value: v.clone(),
-                                    }
-                                } else {
-                                    Action::SkipBoth
-                                }
-                            }
-                        }
-                    }
-                }
-            };
-
-            // Now execute the action with full mutable access to self
-            match action {
-                Action::Exhausted => return Ok(()),
-                Action::UseStorage => {
-                    let (k, ts, v) = self.storage_next.take().unwrap();
-                    self.current = Some((k.clone(), ts, v));
-                    // Skip all versions of this key
-                    while self.storage_iter.valid() && self.storage_iter.user_key() == k.as_slice()
-                    {
-                        self.storage_iter.advance()?;
-                    }
-                    return Ok(());
-                }
-                Action::UseBuffer { key, value } => {
-                    self.buffer_pos += 1;
-                    // Buffer entries are uncommitted writes - use MAX timestamp
-                    self.current = Some((key, Timestamp::MAX, value));
-                    return Ok(());
-                }
-                Action::SkipBuffer => {
-                    self.buffer_pos += 1;
-                    // Continue loop
-                }
-                Action::UseBufferSkipStorage { key, value } => {
-                    self.consume_storage()?;
-                    self.buffer_pos += 1;
-                    // Buffer entries are uncommitted writes - use MAX timestamp
-                    self.current = Some((key, Timestamp::MAX, value));
-                    return Ok(());
-                }
-                Action::SkipBoth => {
-                    self.consume_storage()?;
-                    self.buffer_pos += 1;
-                    // Continue loop
-                }
-            }
-        }
+        self.find_next_visible()
     }
 
     fn valid(&self) -> bool {
@@ -971,7 +813,7 @@ mod tests {
     }
 
     #[test]
-    fn test_txn_service_get_put() {
+    fn test_txn_service_put_commit() {
         let (storage, txn_service, _dir) = create_test_service();
 
         let mut ctx = txn_service.begin(false).unwrap();
@@ -981,11 +823,7 @@ mod tests {
             .put(&mut ctx, b"key1".to_vec(), b"value1".to_vec())
             .unwrap();
 
-        // Should see buffered write
-        let value = txn_service.get(&ctx, b"key1").unwrap();
-        assert_eq!(value, Some(b"value1".to_vec()));
-
-        // Not yet in storage
+        // Not yet in storage (buffered, uncommitted)
         let storage_value = get_for_test(&*storage, b"key1");
         assert!(storage_value.is_none());
 
@@ -1000,19 +838,20 @@ mod tests {
     }
 
     #[test]
-    fn test_txn_service_delete() {
-        let (_storage, txn_service, _dir) = create_test_service();
+    fn test_txn_service_delete_commit() {
+        let (storage, txn_service, _dir) = create_test_service();
 
+        // First commit a value
+        txn_service.autocommit_put(b"key1", b"value1").unwrap();
+        assert_eq!(get_for_test(&*storage, b"key1"), Some(b"value1".to_vec()));
+
+        // Delete via transaction
         let mut ctx = txn_service.begin(false).unwrap();
-
-        txn_service
-            .put(&mut ctx, b"key1".to_vec(), b"value1".to_vec())
-            .unwrap();
         txn_service.delete(&mut ctx, b"key1".to_vec()).unwrap();
+        txn_service.commit(ctx).unwrap();
 
-        // Should see delete in buffer
-        let value = txn_service.get(&ctx, b"key1").unwrap();
-        assert!(value.is_none());
+        // Should be deleted in storage
+        assert!(get_for_test(&*storage, b"key1").is_none());
     }
 
     #[test]
@@ -1041,7 +880,7 @@ mod tests {
         txn_service.autocommit_put(b"key", b"v1").unwrap();
 
         // Begin transaction
-        let mut ctx = txn_service.begin(false).unwrap();
+        let ctx = txn_service.begin(true).unwrap();
 
         // Transaction should see v1
         let value = txn_service.get(&ctx, b"key").unwrap();
@@ -1057,15 +896,6 @@ mod tests {
         // But reading via storage should see v2
         let latest = get_for_test(txn_service.storage(), b"key");
         assert_eq!(latest, Some(b"v2".to_vec()));
-
-        // Transaction write
-        txn_service
-            .put(&mut ctx, b"key".to_vec(), b"v3".to_vec())
-            .unwrap();
-
-        // Transaction should see its own write
-        let value = txn_service.get(&ctx, b"key").unwrap();
-        assert_eq!(value, Some(b"v3".to_vec()));
     }
 
     #[test]
@@ -1135,88 +965,8 @@ mod tests {
     }
 
     #[test]
-    fn test_txn_service_scan_read_your_writes() {
-        let (_storage, txn_service, _dir) = create_test_service();
-
-        // Write some data via autocommit first
-        txn_service.autocommit_put(b"a", b"1").unwrap();
-        txn_service.autocommit_put(b"b", b"2").unwrap();
-
-        // Begin a read-write transaction
-        let mut ctx = txn_service.begin(false).unwrap();
-
-        // Buffer some writes
-        txn_service
-            .put(&mut ctx, b"c".to_vec(), b"3".to_vec())
-            .unwrap();
-        txn_service
-            .put(&mut ctx, b"b".to_vec(), b"modified".to_vec())
-            .unwrap(); // Override existing
-        txn_service.delete(&mut ctx, b"a".to_vec()).unwrap(); // Delete existing
-
-        // Scan should merge buffered writes with storage (read-your-writes)
-        let mut iter = txn_service
-            .scan_iter(&ctx, b"a".to_vec()..b"d".to_vec())
-            .unwrap();
-        let mut results = Vec::new();
-        iter.advance().unwrap();
-        while iter.valid() {
-            results.push((iter.user_key().to_vec(), iter.value().to_vec()));
-            iter.advance().unwrap();
-        }
-
-        // Should see:
-        // - 'a' deleted (removed from results)
-        // - 'b' modified (buffered write overrides storage)
-        // - 'c' added (buffered write)
-        assert_eq!(results.len(), 2, "scan should see 2 keys (a deleted)");
-
-        let result_map: std::collections::HashMap<_, _> = results.into_iter().collect();
-        assert_eq!(result_map.get(b"b".as_slice()), Some(&b"modified".to_vec()));
-        assert_eq!(result_map.get(b"c".as_slice()), Some(&b"3".to_vec()));
-        assert!(
-            !result_map.contains_key(b"a".as_slice()),
-            "a should be deleted"
-        );
-    }
-
-    #[test]
-    fn test_scan_read_your_writes_buffer_only() {
-        // Test: Buffer has writes, storage is empty in range
-        let (_storage, txn_service, _dir) = create_test_service();
-
-        // Begin a transaction and buffer writes (no prior storage data)
-        let mut ctx = txn_service.begin(false).unwrap();
-        txn_service
-            .put(&mut ctx, b"x".to_vec(), b"x_value".to_vec())
-            .unwrap();
-        txn_service
-            .put(&mut ctx, b"y".to_vec(), b"y_value".to_vec())
-            .unwrap();
-        txn_service
-            .put(&mut ctx, b"z".to_vec(), b"z_value".to_vec())
-            .unwrap();
-
-        // Scan should return only buffered writes
-        let mut iter = txn_service
-            .scan_iter(&ctx, b"x".to_vec()..b"zz".to_vec())
-            .unwrap();
-        let mut results = Vec::new();
-        iter.advance().unwrap();
-        while iter.valid() {
-            results.push((iter.user_key().to_vec(), iter.value().to_vec()));
-            iter.advance().unwrap();
-        }
-
-        assert_eq!(results.len(), 3, "should see all 3 buffered keys");
-        assert_eq!(results[0], (b"x".to_vec(), b"x_value".to_vec()));
-        assert_eq!(results[1], (b"y".to_vec(), b"y_value".to_vec()));
-        assert_eq!(results[2], (b"z".to_vec(), b"z_value".to_vec()));
-    }
-
-    #[test]
-    fn test_scan_read_your_writes_storage_only() {
-        // Test: Storage has data, buffer is empty
+    fn test_scan_storage_only() {
+        // Test: Storage has data, scan returns it
         let (_storage, txn_service, _dir) = create_test_service();
 
         // Commit some data first
@@ -1224,10 +974,10 @@ mod tests {
         txn_service.autocommit_put(b"n", b"n_value").unwrap();
         txn_service.autocommit_put(b"o", b"o_value").unwrap();
 
-        // Begin a read-only transaction (no buffered writes)
+        // Begin a read-only transaction
         let ctx = txn_service.begin(true).unwrap();
 
-        // Scan should return only storage data
+        // Scan should return storage data
         let mut iter = txn_service
             .scan_iter(&ctx, b"m".to_vec()..b"p".to_vec())
             .unwrap();
@@ -1245,89 +995,15 @@ mod tests {
     }
 
     #[test]
-    fn test_scan_read_your_writes_interleaved_keys() {
-        // Test: Buffer and storage keys interleave
-        // Storage: a, c, e
-        // Buffer: b, d
-        // Expected order: a, b, c, d, e
-        let (_storage, txn_service, _dir) = create_test_service();
-
-        // Commit interleaved keys
-        txn_service.autocommit_put(b"a", b"a_storage").unwrap();
-        txn_service.autocommit_put(b"c", b"c_storage").unwrap();
-        txn_service.autocommit_put(b"e", b"e_storage").unwrap();
-
-        // Buffer the other keys
-        let mut ctx = txn_service.begin(false).unwrap();
-        txn_service
-            .put(&mut ctx, b"b".to_vec(), b"b_buffer".to_vec())
-            .unwrap();
-        txn_service
-            .put(&mut ctx, b"d".to_vec(), b"d_buffer".to_vec())
-            .unwrap();
-
-        // Scan full range
-        let mut iter = txn_service
-            .scan_iter(&ctx, b"a".to_vec()..b"f".to_vec())
-            .unwrap();
-        let mut results = Vec::new();
-        iter.advance().unwrap();
-        while iter.valid() {
-            results.push((iter.user_key().to_vec(), iter.value().to_vec()));
-            iter.advance().unwrap();
-        }
-
-        assert_eq!(results.len(), 5, "should see all 5 keys interleaved");
-        assert_eq!(results[0], (b"a".to_vec(), b"a_storage".to_vec()));
-        assert_eq!(results[1], (b"b".to_vec(), b"b_buffer".to_vec()));
-        assert_eq!(results[2], (b"c".to_vec(), b"c_storage".to_vec()));
-        assert_eq!(results[3], (b"d".to_vec(), b"d_buffer".to_vec()));
-        assert_eq!(results[4], (b"e".to_vec(), b"e_storage".to_vec()));
-    }
-
-    #[test]
-    fn test_scan_read_your_writes_delete_nonexistent() {
-        // Test: Buffer deletes a key that doesn't exist in storage
-        let (_storage, txn_service, _dir) = create_test_service();
-
-        // Commit some data
-        txn_service.autocommit_put(b"k1", b"v1").unwrap();
-        txn_service.autocommit_put(b"k3", b"v3").unwrap();
-
-        // Buffer a delete for non-existent key k2
-        let mut ctx = txn_service.begin(false).unwrap();
-        txn_service.delete(&mut ctx, b"k2".to_vec()).unwrap();
-
-        // Scan should skip the non-existent delete
-        let mut iter = txn_service
-            .scan_iter(&ctx, b"k1".to_vec()..b"k4".to_vec())
-            .unwrap();
-        let mut results = Vec::new();
-        iter.advance().unwrap();
-        while iter.valid() {
-            results.push((iter.user_key().to_vec(), iter.value().to_vec()));
-            iter.advance().unwrap();
-        }
-
-        assert_eq!(results.len(), 2, "should see 2 keys (k2 delete is no-op)");
-        assert_eq!(results[0], (b"k1".to_vec(), b"v1".to_vec()));
-        assert_eq!(results[1], (b"k3".to_vec(), b"v3".to_vec()));
-    }
-
-    #[test]
-    fn test_scan_read_your_writes_empty_range() {
-        // Test: Both buffer and storage empty in range
+    fn test_scan_empty_range() {
+        // Test: Empty range returns nothing
         let (_storage, txn_service, _dir) = create_test_service();
 
         // Commit data outside range
         txn_service.autocommit_put(b"aaa", b"before").unwrap();
         txn_service.autocommit_put(b"zzz", b"after").unwrap();
 
-        // Buffer data outside range
-        let mut ctx = txn_service.begin(false).unwrap();
-        txn_service
-            .put(&mut ctx, b"bbb".to_vec(), b"also_before".to_vec())
-            .unwrap();
+        let ctx = txn_service.begin(true).unwrap();
 
         // Scan a range that has no data
         let mut iter = txn_service
@@ -1338,93 +1014,7 @@ mod tests {
     }
 
     #[test]
-    fn test_scan_read_your_writes_multiple_updates_same_key() {
-        // Test: Multiple updates to the same key in buffer
-        // Only the latest buffered value should be seen
-        let (_storage, txn_service, _dir) = create_test_service();
-
-        // Commit initial value
-        txn_service.autocommit_put(b"key", b"v1").unwrap();
-
-        // Buffer multiple updates
-        let mut ctx = txn_service.begin(false).unwrap();
-        txn_service
-            .put(&mut ctx, b"key".to_vec(), b"v2".to_vec())
-            .unwrap();
-        txn_service
-            .put(&mut ctx, b"key".to_vec(), b"v3".to_vec())
-            .unwrap();
-        txn_service
-            .put(&mut ctx, b"key".to_vec(), b"v4_final".to_vec())
-            .unwrap();
-
-        // Scan should return only the final buffered value
-        let mut iter = txn_service
-            .scan_iter(&ctx, b"key".to_vec()..b"keyz".to_vec())
-            .unwrap();
-        let mut results = Vec::new();
-        iter.advance().unwrap();
-        while iter.valid() {
-            results.push((iter.user_key().to_vec(), iter.value().to_vec()));
-            iter.advance().unwrap();
-        }
-
-        assert_eq!(results.len(), 1, "should see only 1 key");
-        assert_eq!(results[0], (b"key".to_vec(), b"v4_final".to_vec()));
-    }
-
-    #[test]
-    fn test_scan_read_your_writes_delete_then_put() {
-        // Test: Delete a key then put it back
-        let (_storage, txn_service, _dir) = create_test_service();
-
-        // Commit initial value
-        txn_service.autocommit_put(b"toggle", b"original").unwrap();
-
-        // Delete then put it back with new value
-        let mut ctx = txn_service.begin(false).unwrap();
-        txn_service.delete(&mut ctx, b"toggle".to_vec()).unwrap();
-        txn_service
-            .put(&mut ctx, b"toggle".to_vec(), b"restored".to_vec())
-            .unwrap();
-
-        // Scan should return the restored value
-        let mut iter = txn_service
-            .scan_iter(&ctx, b"toggle".to_vec()..b"togglez".to_vec())
-            .unwrap();
-        let mut results = Vec::new();
-        iter.advance().unwrap();
-        while iter.valid() {
-            results.push((iter.user_key().to_vec(), iter.value().to_vec()));
-            iter.advance().unwrap();
-        }
-
-        assert_eq!(results.len(), 1, "should see restored key");
-        assert_eq!(results[0], (b"toggle".to_vec(), b"restored".to_vec()));
-    }
-
-    #[test]
-    fn test_scan_read_your_writes_put_then_delete() {
-        // Test: Put a new key then delete it
-        let (_storage, txn_service, _dir) = create_test_service();
-
-        // Buffer put then delete
-        let mut ctx = txn_service.begin(false).unwrap();
-        txn_service
-            .put(&mut ctx, b"ephemeral".to_vec(), b"short_lived".to_vec())
-            .unwrap();
-        txn_service.delete(&mut ctx, b"ephemeral".to_vec()).unwrap();
-
-        // Scan should not see the key
-        let mut iter = txn_service
-            .scan_iter(&ctx, b"ephemeral".to_vec()..b"ephemeralz".to_vec())
-            .unwrap();
-        iter.advance().unwrap();
-        assert!(!iter.valid(), "should not see deleted key");
-    }
-
-    #[test]
-    fn test_scan_read_your_writes_range_boundaries() {
+    fn test_scan_range_boundaries() {
         // Test: Keys exactly at range boundaries
         let (_storage, txn_service, _dir) = create_test_service();
 
@@ -1588,7 +1178,6 @@ mod tests {
             mock_iter,
             10, // read_ts
             b"a".to_vec()..b"z".to_vec(),
-            vec![], // no buffer entries
         );
 
         let results = collect_scan_results(scan_iter);
@@ -1624,7 +1213,7 @@ mod tests {
         // Result: 1 Ok entry + 1 Err
         let mock_iter = ErrorInjectingIterator::new(entries, 1);
 
-        let scan_iter = MvccScanIterator::new(mock_iter, 10, b"a".to_vec()..b"z".to_vec(), vec![]);
+        let scan_iter = MvccScanIterator::new(mock_iter, 10, b"a".to_vec()..b"z".to_vec());
 
         let results = collect_scan_results(scan_iter);
 
@@ -1645,7 +1234,7 @@ mod tests {
         // Error after 10 successful next() calls - won't trigger (only 2 entries)
         let mock_iter = ErrorInjectingIterator::new(entries, 10);
 
-        let scan_iter = MvccScanIterator::new(mock_iter, 10, b"a".to_vec()..b"z".to_vec(), vec![]);
+        let scan_iter = MvccScanIterator::new(mock_iter, 10, b"a".to_vec()..b"z".to_vec());
 
         let results = collect_scan_results(scan_iter);
 
@@ -1653,56 +1242,6 @@ mod tests {
         assert_eq!(results.len(), 2, "expected 2 successful entries");
         assert!(results[0].is_ok());
         assert!(results[1].is_ok());
-    }
-
-    #[test]
-    fn test_mvcc_scan_iterator_error_with_buffer_entries() {
-        // Storage has entries that will error mid-iteration
-        let storage_entries = vec![
-            (MvccKey::encode(b"a", 5), b"storage_a".to_vec()),
-            (MvccKey::encode(b"c", 5), b"storage_c".to_vec()),
-        ];
-
-        // Error after 2 successful advance() calls from storage mock.
-        // Caching iterator behavior:
-        // 1. Cache "a", skip "a" (advance #1, ok), compare with buffer "b": "a" < "b", return Ok("a")
-        // 2. Cache "c", compare with buffer "b": "c" > "b", return Ok("b") (no skip on buffer)
-        // 3. "c" already cached, skip "c" (advance #2, ok), return Ok("c")
-        // 4. Cache next (position=2 invalid), exhausted
-        // With error_after=2, we need 3 successful advances to trigger error
-        // But we only have 2 entries, so let's use error_after=1 to trigger on "c"
-        let mock_iter = ErrorInjectingIterator::new(storage_entries, 1);
-
-        // Buffer has an entry between 'a' and 'c'
-        let buffer_entries = vec![(b"b".to_vec(), Some(b"buffer_b".to_vec()))];
-
-        let scan_iter =
-            MvccScanIterator::new(mock_iter, 10, b"a".to_vec()..b"z".to_vec(), buffer_entries);
-
-        let results = collect_scan_results(scan_iter);
-
-        // We expect: Ok(a), Ok(b), Err on trying to process c
-        // Because: skip "a" (advance #1 ok), buffer "b" (no advance), skip "c" (advance #2, 1>1=false ok??)
-        // Actually with error_after=1, error when position > 1, i.e., position >= 2
-        // advance #1: pos 0->1, 0>1=false, ok
-        // advance #2: pos 1->2, 1>1=false, ok
-        // So no error with 2 storage entries and error_after=1
-        // Let's just verify the basic flow works
-        assert!(results.len() >= 2, "should get at least Ok(a) and Ok(b)");
-
-        // First entry: 'a' from storage
-        assert!(results[0].is_ok(), "first should be Ok(a)");
-        let (k, v) = results[0].as_ref().unwrap();
-        assert_eq!(k, b"a");
-        assert_eq!(v, b"storage_a");
-
-        // Second entry: 'b' from buffer
-        assert!(results[1].is_ok(), "second should be Ok(b)");
-        let (k, v) = results[1].as_ref().unwrap();
-        assert_eq!(k, b"b");
-        assert_eq!(v, b"buffer_b");
-
-        // The merge with buffer entries works correctly
     }
 
     #[test]
@@ -1723,7 +1262,7 @@ mod tests {
         // Result: 2 successful entries before error
         let mock_iter = ErrorInjectingIterator::new(entries.clone(), 2);
 
-        let scan_iter = MvccScanIterator::new(mock_iter, 10, b"a".to_vec()..b"z".to_vec(), vec![]);
+        let scan_iter = MvccScanIterator::new(mock_iter, 10, b"a".to_vec()..b"z".to_vec());
 
         let results = collect_scan_results(scan_iter);
 
