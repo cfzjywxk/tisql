@@ -14,21 +14,30 @@
 
 //! SST file iterators for sequential access to SST files.
 //!
+//! ## Iterator Convention
+//!
+//! All iterators follow the "construct-then-position" pattern:
+//! - `new()` creates an unpositioned iterator (no I/O)
+//! - Call `seek()`, `seek_to_first()`, or `advance()` to position
+//! - `valid()` returns false until positioned
+//!
 //! ## Usage
 //!
 //! ```ignore
-//! // Create an iterator over an SST file
-//! let iter = SstIterator::new(reader)?;
+//! // Create an iterator (not positioned)
+//! let mut iter = SstIterator::new(reader)?;
+//!
+//! // Position at first entry
+//! iter.seek_to_first()?;
 //!
 //! // Iterate all entries
 //! while iter.valid() {
 //!     let key = iter.key();
 //!     let value = iter.value();
-//!     // Process entry
 //!     iter.advance()?;
 //! }
 //!
-//! // Seek to a specific key
+//! // Or seek to a specific key
 //! iter.seek(b"target_key")?;
 //! ```
 
@@ -154,23 +163,19 @@ pub struct SstIterator {
 }
 
 impl SstIterator {
-    /// Create a new iterator starting at the beginning of the SST.
+    /// Create a new iterator (not positioned).
+    ///
+    /// The iterator is NOT positioned after construction. Call `seek()`,
+    /// `seek_to_first()`, or `advance()` to position it.
     pub fn new(reader: SstReaderRef) -> Result<Self> {
         let num_blocks = reader.num_blocks()?;
 
-        let mut iter = Self {
+        Ok(Self {
             reader,
             num_blocks,
             block_idx: 0,
             block_state: None,
-        };
-
-        // Position at first entry if exists
-        if num_blocks > 0 {
-            iter.seek_to_first()?;
-        }
-
-        Ok(iter)
+        })
     }
 
     /// Check if the iterator is positioned on a valid entry.
@@ -463,14 +468,16 @@ impl ConcatIterator {
         Ok(())
     }
 
-    /// Load the iterator for the current SST.
+    /// Load the iterator for the current SST and position at first entry.
     fn load_current_sst(&mut self) -> Result<()> {
         if self.sst_idx >= self.readers.len() {
             self.current = None;
             return Ok(());
         }
 
-        self.current = Some(SstIterator::new(self.readers[self.sst_idx].clone())?);
+        let mut iter = SstIterator::new(self.readers[self.sst_idx].clone())?;
+        iter.seek_to_first()?; // Position the iterator
+        self.current = Some(iter);
         Ok(())
     }
 }
@@ -505,20 +512,16 @@ pub struct SstMvccIterator {
 }
 
 impl SstMvccIterator {
-    /// Create a new iterator over the given range.
+    /// Create a new iterator over the given range (not positioned).
     ///
-    /// The iterator seeks to the start of the range and filters entries
-    /// that are beyond the end bound.
+    /// The iterator is NOT positioned after construction. Call `seek()` or
+    /// `advance()` to position it. The first `advance()` will position at
+    /// the start of the range.
     ///
     /// Takes `SharedMvccRange` (Arc) to avoid cloning when creating multiple iterators.
     pub fn new(reader: SstReaderRef, range: SharedMvccRange) -> Result<Self> {
         let is_unbounded = range.start.is_unbounded() && range.end.is_unbounded();
-        let mut inner = SstIterator::new(reader)?;
-
-        // Seek to start of range if bounded
-        if !is_unbounded && !range.start.is_unbounded() {
-            inner.seek(range.start.as_bytes())?;
-        }
+        let inner = SstIterator::new(reader)?;
 
         Ok(Self {
             inner,
@@ -577,6 +580,15 @@ impl MvccIterator for SstMvccIterator {
     }
 
     fn advance(&mut self) -> Result<()> {
+        // If not yet positioned, seek to range start first
+        if !self.inner.valid() {
+            if self.range.start.is_unbounded() {
+                self.inner.seek_to_first()?;
+            } else {
+                self.inner.seek(self.range.start.as_bytes())?;
+            }
+            return Ok(());
+        }
         self.inner.advance()
     }
 
@@ -664,7 +676,8 @@ mod tests {
         builder.finish(1, 0).unwrap();
 
         let reader = SstReaderRef::open(&path).unwrap();
-        let iter = SstIterator::new(reader).unwrap();
+        let mut iter = SstIterator::new(reader).unwrap();
+        iter.seek_to_first().unwrap(); // Position the iterator
 
         assert!(!iter.valid());
     }
@@ -678,7 +691,8 @@ mod tests {
         let value = b"value".to_vec();
         let reader = create_test_sst(&path, &[(&key, &value)]).unwrap();
 
-        let iter = SstIterator::new(reader).unwrap();
+        let mut iter = SstIterator::new(reader).unwrap();
+        iter.seek_to_first().unwrap(); // Position the iterator
 
         assert!(iter.valid());
         assert_eq!(iter.key(), key.as_slice());
@@ -692,6 +706,7 @@ mod tests {
 
         let reader = create_sequential_sst(&path, 0, 10).unwrap();
         let mut iter = SstIterator::new(reader).unwrap();
+        iter.seek_to_first().unwrap(); // Position the iterator
 
         let mut count = 0;
         while iter.valid() {
@@ -713,6 +728,7 @@ mod tests {
 
         let reader = create_sequential_sst(&path, 0, 10).unwrap();
         let mut iter = SstIterator::new(reader).unwrap();
+        iter.seek_to_first().unwrap(); // Position the iterator
 
         // Move forward
         iter.advance().unwrap();
@@ -732,6 +748,7 @@ mod tests {
 
         let reader = create_sequential_sst(&path, 0, 10).unwrap();
         let mut iter = SstIterator::new(reader).unwrap();
+        // No need to seek_to_first - we're testing seek_to_last
 
         iter.seek_to_last().unwrap();
         assert!(iter.valid());
@@ -745,6 +762,7 @@ mod tests {
 
         let reader = create_sequential_sst(&path, 0, 10).unwrap();
         let mut iter = SstIterator::new(reader).unwrap();
+        // No need to seek_to_first - we're testing seek
 
         // Seek to existing key
         iter.seek(b"key_00005").unwrap();
@@ -809,6 +827,7 @@ mod tests {
 
         let reader = SstReaderRef::open(&path).unwrap();
         let mut iter = SstIterator::new(reader).unwrap();
+        iter.seek_to_first().unwrap(); // Position the iterator
 
         // Iterate forward through all blocks
         let mut count = 0;
@@ -881,6 +900,7 @@ mod tests {
 
         let reader = SstReaderRef::open(&path).unwrap();
         let mut iter = SstIterator::new(reader).unwrap();
+        iter.seek_to_first().unwrap(); // Position the iterator
 
         // Verify order
         assert!(iter.valid());

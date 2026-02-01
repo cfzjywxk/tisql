@@ -242,7 +242,9 @@ impl MergeIterator {
     pub fn new(readers: Vec<SstReaderRef>) -> Result<Self> {
         let mut iters = Vec::with_capacity(readers.len());
         for r in readers {
-            iters.push(SstIterator::new(r)?);
+            let mut iter = SstIterator::new(r)?;
+            iter.seek_to_first()?; // Position at first entry
+            iters.push(iter);
         }
 
         let mut heap = BinaryHeap::new();

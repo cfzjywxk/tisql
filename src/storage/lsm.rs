@@ -405,6 +405,7 @@ impl LsmEngine {
             // Propagate errors instead of silently ignoring (risks wrong reads)
             let reader = SstReaderRef::open(&sst_path)?;
             let mut iter = SstIterator::new(reader)?;
+            iter.seek_to_first()?; // Position at first entry
 
             while iter.valid() {
                 let mvcc_key = iter.key();
@@ -887,14 +888,9 @@ impl MvccIterator for L0SstIterator {
             return Err(e);
         }
 
-        // If not yet opened, open and position at start of range
+        // If not yet opened, open and advance (which positions at range start)
         if self.inner.is_none() {
             self.ensure_open()?;
-            // SstMvccIterator::new positions at range start, just advance
-            if let Some(ref mut iter) = self.inner {
-                iter.advance()?;
-            }
-            return Ok(());
         }
 
         if let Some(ref mut iter) = self.inner {
@@ -990,13 +986,25 @@ impl LevelIterator {
         Ok(())
     }
 
-    /// Skip empty files (files where iterator is not valid).
+    /// Position and skip empty files.
+    ///
+    /// If the current iterator is not positioned, positions it first (via advance).
+    /// Then skips to the next file if the current file has no entries in range.
     fn skip_empty_files(&mut self) -> Result<()> {
-        while let Some(ref iter) = self.current_iter {
-            if iter.valid() {
-                break;
+        loop {
+            // Position the iterator if not already positioned
+            if let Some(ref mut iter) = self.current_iter {
+                if !iter.valid() {
+                    iter.advance()?; // Positions at range start if not positioned
+                }
+                if iter.valid() {
+                    break; // Found valid entry
+                }
+            } else {
+                break; // No iterator
             }
-            // Move to next file
+
+            // Current file exhausted, move to next file
             if let Some(idx) = self.current_file_idx {
                 if idx + 1 < self.sst_metas.len() {
                     self.open_file(idx + 1)?;
@@ -1026,7 +1034,7 @@ impl MvccIterator for LevelIterator {
                 self.current_iter = None;
                 return Ok(());
             }
-            // Open first file - SstMvccIterator::new() positions at range start
+            // Open first file, skip_empty_files will position the iterator
             self.open_file(0)?;
             return self.skip_empty_files();
         }
@@ -2520,6 +2528,7 @@ mod tests {
         let sst_path = config.sst_dir().join(format!("{:08}.sst", ssts[0].id));
         let reader = SstReaderRef::open(&sst_path).unwrap();
         let mut iter = SstIterator::new(reader).unwrap();
+        iter.seek_to_first().unwrap(); // Position the iterator
 
         let mut entry_count = 0;
         let mut found_ts_10 = false;
