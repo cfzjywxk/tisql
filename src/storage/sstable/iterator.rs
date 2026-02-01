@@ -381,18 +381,18 @@ pub struct ConcatIterator {
 }
 
 impl ConcatIterator {
-    /// Create a new concat iterator over the given SST readers.
+    /// Create a new concat iterator (not positioned).
+    ///
+    /// The iterator is NOT positioned after construction. Call `seek()`,
+    /// `seek_to_first()`, or `advance()` to position it.
     ///
     /// Readers should be in sorted order (by key range).
     pub fn new(readers: Vec<SstReaderRef>) -> Result<Self> {
-        let mut iter = Self {
+        Ok(Self {
             readers,
             sst_idx: 0,
             current: None,
-        };
-
-        iter.seek_to_first()?;
-        Ok(iter)
+        })
     }
 
     /// Check if the iterator is valid.
@@ -919,7 +919,8 @@ mod tests {
 
     #[test]
     fn test_concat_iterator_empty() {
-        let iter = ConcatIterator::new(vec![]).unwrap();
+        let mut iter = ConcatIterator::new(vec![]).unwrap();
+        iter.seek_to_first().unwrap(); // Position the iterator
         assert!(!iter.valid());
     }
 
@@ -930,6 +931,7 @@ mod tests {
 
         let reader = create_sequential_sst(&path, 0, 10).unwrap();
         let mut iter = ConcatIterator::new(vec![reader]).unwrap();
+        iter.seek_to_first().unwrap(); // Position the iterator
 
         let mut count = 0;
         while iter.valid() {
@@ -951,6 +953,7 @@ mod tests {
         let reader3 = create_sequential_sst(&dir.path().join("sst3.sst"), 20, 10).unwrap();
 
         let mut iter = ConcatIterator::new(vec![reader1, reader2, reader3]).unwrap();
+        iter.seek_to_first().unwrap(); // Position the iterator
 
         // Should iterate through all 30 entries in order
         let mut count = 0;
@@ -971,6 +974,7 @@ mod tests {
         let reader2 = create_sequential_sst(&dir.path().join("sst2.sst"), 10, 10).unwrap();
 
         let mut iter = ConcatIterator::new(vec![reader1, reader2]).unwrap();
+        // No need to seek_to_first - we're testing seek
 
         // Seek to key in first SST
         iter.seek(b"key_00005").unwrap();
@@ -998,13 +1002,15 @@ mod tests {
             create_sequential_sst(&dir.path().join("nonempty.sst"), 0, 5).unwrap();
 
         // Empty first, then non-empty
-        let iter =
+        let mut iter =
             ConcatIterator::new(vec![empty_reader.clone(), non_empty_reader.clone()]).unwrap();
+        iter.seek_to_first().unwrap(); // Position the iterator
         assert!(iter.valid());
         assert_eq!(iter.key(), b"key_00000".as_slice());
 
         // Non-empty first, then empty
         let mut iter = ConcatIterator::new(vec![non_empty_reader, empty_reader]).unwrap();
+        iter.seek_to_first().unwrap(); // Position the iterator
         let mut count = 0;
         while iter.valid() {
             count += 1;

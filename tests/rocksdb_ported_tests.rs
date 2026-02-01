@@ -767,6 +767,7 @@ fn test_sst_iterator_key_patterns() {
     // Read and verify
     let reader = SstReaderRef::open(&sst_path).unwrap();
     let mut iter = SstIterator::new(reader).unwrap();
+    iter.seek_to_first().unwrap();
 
     let mut keys = Vec::new();
     while iter.valid() {
@@ -810,6 +811,7 @@ fn test_sst_many_entries() {
     // Read and count
     let reader = SstReaderRef::open(&sst_path).unwrap();
     let mut iter = SstIterator::new(reader).unwrap();
+    iter.seek_to_first().unwrap();
 
     let mut count = 0;
     let mut prev_key: Option<Vec<u8>> = None;
@@ -866,6 +868,7 @@ fn test_sst_mvcc_keys() {
     // Read and verify order
     let reader = SstReaderRef::open(&sst_path).unwrap();
     let mut iter = SstIterator::new(reader).unwrap();
+    iter.seek_to_first().unwrap();
 
     let mut entries: Vec<(Vec<u8>, Vec<u8>)> = Vec::new();
     while iter.valid() {

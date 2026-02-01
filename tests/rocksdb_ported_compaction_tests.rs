@@ -343,6 +343,7 @@ fn test_executor_merge_keys() {
     let output_path = sst_dir.join(format!("{:08}.sst", output_sst.id));
     let reader = SstReaderRef::open(&output_path).unwrap();
     let mut iter = tisql::testkit::SstIterator::new(reader).unwrap();
+    iter.seek_to_first().unwrap();
 
     let mut keys = Vec::new();
     while iter.valid() {
@@ -417,6 +418,7 @@ fn test_executor_mvcc_ordering() {
     let output_path = sst_dir.join(format!("{:08}.sst", delta.new_ssts[0].id));
     let reader = SstReaderRef::open(&output_path).unwrap();
     let mut iter = tisql::testkit::SstIterator::new(reader).unwrap();
+    iter.seek_to_first().unwrap();
 
     let mut values = Vec::new();
     while iter.valid() {
@@ -475,6 +477,7 @@ fn test_executor_tombstones() {
     let output_path = sst_dir.join(format!("{:08}.sst", delta.new_ssts[0].id));
     let reader = SstReaderRef::open(&output_path).unwrap();
     let mut iter = tisql::testkit::SstIterator::new(reader).unwrap();
+    iter.seek_to_first().unwrap();
 
     let mut entries = Vec::new();
     while iter.valid() {

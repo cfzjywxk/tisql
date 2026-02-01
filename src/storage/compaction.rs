@@ -237,24 +237,41 @@ pub struct MergeIterator {
 impl MergeIterator {
     /// Create a new merge iterator from SST readers.
     ///
+    /// This is a pure construction operation - no I/O or seeking is performed.
+    /// Call `seek_to_first()` after construction to position the iterator.
+    ///
     /// Readers should be ordered from newest to oldest for correct
     /// tie-breaking behavior.
     pub fn new(readers: Vec<SstReaderRef>) -> Result<Self> {
         let mut iters = Vec::with_capacity(readers.len());
         for r in readers {
-            let mut iter = SstIterator::new(r)?;
-            iter.seek_to_first()?; // Position at first entry
+            let iter = SstIterator::new(r)?;
             iters.push(iter);
         }
 
-        let mut heap = BinaryHeap::new();
+        Ok(Self {
+            iters,
+            heap: BinaryHeap::new(),
+            last_key: None,
+        })
+    }
 
-        // Initialize: add first entry from each iterator
-        for (idx, iter) in iters.iter().enumerate() {
+    /// Position the iterator at the first entry.
+    ///
+    /// This must be called after `new()` before accessing entries.
+    pub fn seek_to_first(&mut self) -> Result<()> {
+        // Position all child iterators
+        for iter in &mut self.iters {
+            iter.seek_to_first()?;
+        }
+
+        // Initialize heap with first entry from each valid iterator
+        self.heap.clear();
+        for (idx, iter) in self.iters.iter().enumerate() {
             if iter.valid() {
                 let key = iter.key().to_vec();
                 let value = iter.value().to_vec();
-                heap.push(MergeEntry {
+                self.heap.push(MergeEntry {
                     key,
                     value,
                     source_idx: idx,
@@ -262,11 +279,7 @@ impl MergeIterator {
             }
         }
 
-        Ok(Self {
-            iters,
-            heap,
-            last_key: None,
-        })
+        Ok(())
     }
 
     /// Check if the iterator has more entries.
@@ -374,6 +387,7 @@ impl CompactionExecutor {
         fail_point!("compaction_before_merge");
 
         let mut merge_iter = MergeIterator::new(readers)?;
+        merge_iter.seek_to_first()?;
 
         // Create output SST builder
         let next_sst_id = version.next_sst_id();
@@ -615,6 +629,7 @@ mod tests {
         // Create merge iterator
         let reader = SstReaderRef::open(&sst_path).unwrap();
         let mut iter = MergeIterator::new(vec![reader]).unwrap();
+        iter.seek_to_first().unwrap();
 
         // Verify iteration
         assert!(iter.valid());
@@ -658,6 +673,7 @@ mod tests {
         let reader1 = SstReaderRef::open(&sst1_path).unwrap();
         let reader2 = SstReaderRef::open(&sst2_path).unwrap();
         let mut iter = MergeIterator::new(vec![reader1, reader2]).unwrap();
+        iter.seek_to_first().unwrap();
 
         // Should be in sorted order
         let mut keys = Vec::new();
@@ -700,6 +716,7 @@ mod tests {
         let reader1 = SstReaderRef::open(&sst1_path).unwrap();
         let reader2 = SstReaderRef::open(&sst2_path).unwrap();
         let mut iter = MergeIterator::new(vec![reader1, reader2]).unwrap();
+        iter.seek_to_first().unwrap();
 
         // First should be newer value
         let (k, v) = iter.current().unwrap();
