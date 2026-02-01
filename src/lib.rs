@@ -55,7 +55,7 @@ pub use clog::ClogService;
 pub use lsn::{new_lsn_provider, LsnProvider, SharedLsnProvider};
 pub use protocol::{MySqlServer, MYSQL_DEFAULT_PORT};
 pub use session::{Priority, QueryCtx, Session, SessionVars};
-pub use storage::StorageEngine;
+pub use storage::{PessimisticStorage, StorageEngine};
 pub use transaction::{CommitInfo, TxnCtx, TxnService, TxnState};
 pub use tso::TsoService;
 pub use worker::{WorkerPool, WorkerPoolConfig};
@@ -88,13 +88,13 @@ pub mod testkit {
         SstReaderRef, Version,
     };
 
-    pub use crate::transaction::{ConcurrencyManager, Lock, TransactionService};
+    pub use crate::transaction::{ConcurrencyManager, TransactionService};
     pub use crate::tso::LocalTso;
 
     // Test helper extension trait for TransactionService
     use crate::clog::ClogService;
     use crate::error::Result;
-    use crate::storage::StorageEngine;
+    use crate::storage::PessimisticStorage;
     use crate::transaction::{CommitInfo, TxnService};
     use crate::tso::TsoService;
 
@@ -109,7 +109,7 @@ pub mod testkit {
 
     impl<S, C, T> TxnServiceTestExt for TransactionService<S, C, T>
     where
-        S: StorageEngine + 'static,
+        S: PessimisticStorage + 'static,
         C: ClogService + 'static,
         T: TsoService,
     {

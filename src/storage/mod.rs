@@ -382,3 +382,86 @@ impl WriteBatch {
         self.ops.keys()
     }
 }
+
+// ============================================================================
+// Pessimistic Storage Trait - For Explicit Transactions
+// ============================================================================
+
+/// Pessimistic storage operations for explicit transactions.
+///
+/// This trait extends `StorageEngine` with methods for pessimistic locking:
+/// - `put_pending()`: Write a pending value with owner_start_ts
+/// - `finalize_pending()`: Convert pending writes to committed on commit
+/// - `abort_pending()`: Mark pending writes as aborted on rollback
+/// - `get_lock_owner()`: Check if a key is locked
+///
+/// ## Design
+///
+/// Pessimistic transactions write pending nodes directly to storage with
+/// `owner_start_ts > 0`. The node's `ts` field is 0 until commit, when it's
+/// set to `commit_ts`. Readers skip nodes where `owner_start_ts > 0` and
+/// `ts == 0` (uncommitted).
+///
+/// ## Usage
+///
+/// ```ignore
+/// // Explicit transaction: acquire lock on write
+/// let result = storage.put_pending(key, value, txn.start_ts);
+/// match result {
+///     Ok(()) => { /* lock acquired, value written */ },
+///     Err(lock_owner) => { /* blocked by another transaction */ },
+/// }
+///
+/// // On commit: finalize all pending writes
+/// storage.finalize_pending(&keys, txn.start_ts, commit_ts);
+///
+/// // On rollback: abort all pending writes
+/// storage.abort_pending(&keys, txn.start_ts);
+/// ```
+pub trait PessimisticStorage: StorageEngine {
+    /// Write a pending value for pessimistic transactions.
+    ///
+    /// # Arguments
+    ///
+    /// * `key` - The key to write
+    /// * `value` - The value to write (use TOMBSTONE for deletes)
+    /// * `owner_start_ts` - The transaction's start_ts (used as lock identifier)
+    ///
+    /// # Returns
+    ///
+    /// * `Ok(())` - Write successful, lock acquired
+    /// * `Err(lock_owner)` - Key is locked by another transaction with start_ts = lock_owner
+    ///
+    /// If the key is already locked by the same transaction (owner_start_ts matches),
+    /// the value is updated in place without error.
+    fn put_pending(
+        &self,
+        key: &[u8],
+        value: RawValue,
+        owner_start_ts: Timestamp,
+    ) -> std::result::Result<(), Timestamp>;
+
+    /// Check if a key is locked by a pending write.
+    ///
+    /// # Returns
+    ///
+    /// * `None` - Key is not locked
+    /// * `Some(owner_start_ts)` - Key is locked by transaction with this start_ts
+    fn get_lock_owner(&self, key: &[u8]) -> Option<Timestamp>;
+
+    /// Finalize all pending writes for a transaction.
+    ///
+    /// Called during commit. Converts pending nodes to committed by setting
+    /// their `ts` field to `commit_ts` and clearing `owner_start_ts`.
+    ///
+    /// Only affects nodes where `owner_start_ts` matches.
+    fn finalize_pending(&self, keys: &[Key], owner_start_ts: Timestamp, commit_ts: Timestamp);
+
+    /// Abort all pending writes for a transaction.
+    ///
+    /// Called during rollback. Marks pending nodes as aborted so readers skip them.
+    /// Does not physically remove nodes to avoid use-after-free issues.
+    ///
+    /// Only affects nodes where `owner_start_ts` matches.
+    fn abort_pending(&self, keys: &[Key], owner_start_ts: Timestamp);
+}

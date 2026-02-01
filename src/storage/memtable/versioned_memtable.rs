@@ -57,7 +57,7 @@
 //! - Reads are lock-free: atomic load of head, then traverse
 
 use std::ops::{Bound, Range};
-use std::sync::atomic::{AtomicPtr, AtomicU32, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicPtr, AtomicU32, AtomicU64, AtomicUsize, Ordering};
 use std::sync::Arc;
 
 use crossbeam_skiplist::map::Entry;
@@ -65,7 +65,7 @@ use crossbeam_skiplist::SkipMap;
 
 use crate::error::{Result, TiSqlError};
 use crate::storage::mvcc::{MvccIterator, MvccKey, SharedMvccRange, TOMBSTONE};
-use crate::storage::{StorageEngine, WriteBatch, WriteOp};
+use crate::storage::{PessimisticStorage, StorageEngine, WriteBatch, WriteOp};
 use crate::types::{Key, RawValue, Timestamp};
 
 // ============================================================================
@@ -76,23 +76,103 @@ use crate::types::{Key, RawValue, Timestamp};
 ///
 /// Each node contains a timestamp and value (or tombstone marker).
 /// Nodes are linked from newest to oldest via the `next` pointer.
+///
+/// ## Pessimistic Locking Support
+///
+/// The `owner_start_ts` and `aborted` fields support OceanBase-style pessimistic locking:
+///
+/// - `owner_start_ts == 0`: This is a committed version (ts is the commit timestamp)
+/// - `owner_start_ts > 0`: This is a pending write owned by transaction with this start_ts
+///   - Readers lookup txn state to determine visibility
+///   - Writers check if key is already locked by another txn
+///
+/// - `aborted == true`: This pending node was rolled back
+///   - Readers skip aborted nodes
+///   - Aborted nodes are not written to SST during flush
 struct VersionNode {
-    /// Commit timestamp for this version
-    ts: Timestamp,
+    /// Commit timestamp for committed versions.
+    /// For pending nodes, this is initially 0 and set to commit_ts when finalized.
+    /// Uses AtomicU64 for thread-safe finalization during commit.
+    ts: AtomicU64,
     /// Value at this version (TOMBSTONE for deletes)
     value: RawValue,
     /// Pointer to the next (older) version, or null if this is the oldest
     next: *mut VersionNode,
+    /// Owner transaction's start_ts for pessimistic locking.
+    /// - 0: This is a committed version
+    /// - >0: This is a pending write owned by txn with this start_ts
+    owner_start_ts: AtomicU64,
+    /// Whether this pending node has been aborted (for rollback).
+    /// Aborted nodes are skipped by readers and not written to SST.
+    aborted: AtomicBool,
 }
 
 impl VersionNode {
-    /// Create a new version node.
+    /// Create a new committed version node.
+    ///
+    /// Used for optimistic transactions where writes go directly to committed state.
     fn new(ts: Timestamp, value: RawValue) -> Box<Self> {
         Box::new(Self {
-            ts,
+            ts: AtomicU64::new(ts),
             value,
             next: std::ptr::null_mut(),
+            owner_start_ts: AtomicU64::new(0),
+            aborted: AtomicBool::new(false),
         })
+    }
+
+    /// Create a new pending version node for pessimistic transactions.
+    ///
+    /// The node is owned by the transaction with `owner_start_ts` and is not yet visible
+    /// to other transactions until committed.
+    fn new_pending(owner_start_ts: Timestamp, value: RawValue) -> Box<Self> {
+        Box::new(Self {
+            ts: AtomicU64::new(0), // Will be set to commit_ts when finalized
+            value,
+            next: std::ptr::null_mut(),
+            owner_start_ts: AtomicU64::new(owner_start_ts),
+            aborted: AtomicBool::new(false),
+        })
+    }
+
+    /// Get the commit timestamp of this version.
+    #[inline]
+    fn get_ts(&self) -> Timestamp {
+        self.ts.load(Ordering::Acquire)
+    }
+
+    /// Check if this node is a pending write (uncommitted).
+    #[inline]
+    fn is_pending(&self) -> bool {
+        self.owner_start_ts.load(Ordering::Acquire) > 0
+    }
+
+    /// Check if this node has been aborted.
+    #[inline]
+    fn is_aborted(&self) -> bool {
+        self.aborted.load(Ordering::Acquire)
+    }
+
+    /// Get the owner transaction's start_ts.
+    /// Returns 0 if this is a committed version.
+    #[inline]
+    fn get_owner(&self) -> Timestamp {
+        self.owner_start_ts.load(Ordering::Acquire)
+    }
+
+    /// Mark this pending node as aborted (for rollback).
+    fn mark_aborted(&self) {
+        self.aborted.store(true, Ordering::Release);
+    }
+
+    /// Finalize a pending node by setting commit_ts and clearing owner.
+    ///
+    /// After finalization, the node becomes a committed version.
+    fn finalize(&self, commit_ts: Timestamp) {
+        // Set the commit timestamp atomically
+        self.ts.store(commit_ts, Ordering::Release);
+        // Clear owner to mark as committed
+        self.owner_start_ts.store(0, Ordering::Release);
     }
 }
 
@@ -161,7 +241,7 @@ impl MvccRow {
             if !current_head.is_null() {
                 // Safety: current_head is valid if non-null (nodes are never deallocated
                 // while the MvccRow exists)
-                let head_ts = unsafe { (*current_head).ts };
+                let head_ts = unsafe { (*current_head).get_ts() };
                 assert!(
                     ts >= head_ts,
                     "MVCC version chain ordering violation: new ts {ts} < head ts {head_ts} for same key. \
@@ -197,6 +277,9 @@ impl MvccRow {
     ///
     /// Traverses the chain from head (newest) until finding a version
     /// with ts <= read_ts. Returns None if no visible version exists.
+    ///
+    /// Note: This method skips pending and aborted nodes since they are not
+    /// yet committed. Use `get_at_with_pending` for read-your-writes semantics.
     #[cfg(test)]
     fn get_at(&self, read_ts: Timestamp) -> Option<&RawValue> {
         let mut current = self.head.load(Ordering::Acquire);
@@ -205,13 +288,163 @@ impl MvccRow {
         // while the row exists (deallocation happens when the memtable is dropped).
         while !current.is_null() {
             let node = unsafe { &*current };
-            if node.ts <= read_ts {
+
+            // Skip aborted nodes
+            if node.is_aborted() {
+                current = node.next;
+                continue;
+            }
+
+            // Skip pending nodes (not committed yet)
+            if node.is_pending() {
+                current = node.next;
+                continue;
+            }
+
+            if node.get_ts() <= read_ts {
                 return Some(&node.value);
             }
             current = node.next;
         }
 
         None
+    }
+
+    // ========================================================================
+    // Pessimistic Locking Methods
+    // ========================================================================
+
+    /// Check if the head of the version chain is a pending (uncommitted) write.
+    ///
+    /// Returns:
+    /// - `None` if head is null, aborted, or committed
+    /// - `Some(owner_start_ts)` if head is a pending write
+    fn get_head_pending_owner(&self) -> Option<Timestamp> {
+        let head = self.head.load(Ordering::Acquire);
+        if head.is_null() {
+            return None;
+        }
+
+        let node = unsafe { &*head };
+
+        // Skip aborted nodes
+        if node.is_aborted() {
+            return None;
+        }
+
+        let owner = node.get_owner();
+        if owner > 0 {
+            Some(owner)
+        } else {
+            None
+        }
+    }
+
+    /// Prepend a pending write for pessimistic transactions.
+    ///
+    /// Returns:
+    /// - `Ok(true)` if a new node was created
+    /// - `Ok(false)` if the value was updated in place (same txn re-writing)
+    /// - `Err(lock_owner)` if the key is already locked by another transaction
+    ///
+    /// If the key is already locked by the same transaction (owner == my_start_ts),
+    /// the value is updated in place.
+    fn prepend_pending(
+        &self,
+        my_start_ts: Timestamp,
+        mut value: RawValue,
+    ) -> std::result::Result<bool, Timestamp> {
+        loop {
+            let current_head = self.head.load(Ordering::Acquire);
+
+            // Check for conflicts with existing pending writes
+            if !current_head.is_null() {
+                let head_node = unsafe { &*current_head };
+
+                // Skip aborted nodes - they don't conflict
+                if !head_node.is_aborted() {
+                    let owner = head_node.get_owner();
+                    if owner > 0 && owner != my_start_ts {
+                        // Key is locked by another transaction
+                        return Err(owner);
+                    }
+
+                    if owner == my_start_ts {
+                        // Same transaction writing again - update value in place
+                        // Safety: We own this node (same start_ts), so we can mutate it.
+                        // This is safe because:
+                        // 1. Only our transaction can write to this node
+                        // 2. Readers will see either the old or new value, both are valid
+                        let value_ptr = &head_node.value as *const RawValue as *mut RawValue;
+                        unsafe {
+                            std::ptr::swap(value_ptr, &mut value);
+                        }
+                        return Ok(false); // Updated in place, no new node
+                    }
+                }
+            }
+
+            // Create pending node - take ownership of value
+            let mut new_node = VersionNode::new_pending(my_start_ts, std::mem::take(&mut value));
+            new_node.next = current_head;
+
+            let new_ptr = Box::into_raw(new_node);
+
+            match self.head.compare_exchange_weak(
+                current_head,
+                new_ptr,
+                Ordering::Release,
+                Ordering::Relaxed,
+            ) {
+                Ok(_) => {
+                    self.version_count.fetch_add(1, Ordering::Relaxed);
+                    return Ok(true); // New node created
+                }
+                Err(_) => {
+                    // CAS failed, retry with updated head
+                    // Safety: we just created this node, no one else has a reference
+                    // Recover the value for retry
+                    let recovered_node = unsafe { Box::from_raw(new_ptr) };
+                    value = recovered_node.value;
+                }
+            }
+        }
+    }
+
+    /// Finalize all pending nodes owned by the given transaction.
+    ///
+    /// Sets the commit_ts and clears owner_start_ts for each pending node.
+    /// Called during transaction commit.
+    fn finalize_pending(&self, owner_start_ts: Timestamp, commit_ts: Timestamp) {
+        let mut current = self.head.load(Ordering::Acquire);
+
+        while !current.is_null() {
+            let node = unsafe { &*current };
+
+            if node.get_owner() == owner_start_ts && !node.is_aborted() {
+                node.finalize(commit_ts);
+            }
+
+            current = node.next;
+        }
+    }
+
+    /// Mark all pending nodes owned by the given transaction as aborted.
+    ///
+    /// Aborted nodes are skipped by readers and not written to SST during flush.
+    /// Called during transaction rollback.
+    fn abort_pending(&self, owner_start_ts: Timestamp) {
+        let mut current = self.head.load(Ordering::Acquire);
+
+        while !current.is_null() {
+            let node = unsafe { &*current };
+
+            if node.get_owner() == owner_start_ts {
+                node.mark_aborted();
+            }
+
+            current = node.next;
+        }
     }
 }
 
@@ -305,6 +538,73 @@ impl VersionedMemTableEngine {
         self.inner.entry_count.fetch_add(1, Ordering::Relaxed);
     }
 
+    // ========================================================================
+    // Pessimistic Locking Methods
+    // ========================================================================
+
+    /// Write a pending value for pessimistic transactions.
+    ///
+    /// Returns:
+    /// - `Ok(())` if the write was successful
+    /// - `Err(lock_owner)` if the key is already locked by another transaction
+    ///
+    /// If the key is already locked by the same transaction, the value is updated in place.
+    pub fn put_pending(
+        &self,
+        key: &[u8],
+        value: RawValue,
+        owner_start_ts: Timestamp,
+    ) -> std::result::Result<(), Timestamp> {
+        let entry = self
+            .inner
+            .index
+            .get_or_insert(key.to_vec(), MvccRow::new_empty());
+
+        match entry.value().prepend_pending(owner_start_ts, value) {
+            Ok(new_node_created) => {
+                if new_node_created {
+                    self.inner.entry_count.fetch_add(1, Ordering::Relaxed);
+                }
+                Ok(())
+            }
+            Err(lock_owner) => Err(lock_owner),
+        }
+    }
+
+    /// Check if a key is locked by a pending write.
+    ///
+    /// Returns:
+    /// - `None` if the key is not locked (no pending write at head)
+    /// - `Some(owner_start_ts)` if the key is locked
+    pub fn get_lock_owner(&self, key: &[u8]) -> Option<Timestamp> {
+        self.inner
+            .index
+            .get(key)
+            .and_then(|entry| entry.value().get_head_pending_owner())
+    }
+
+    /// Finalize all pending writes for a transaction by setting commit_ts.
+    ///
+    /// Called during transaction commit. Converts pending nodes to committed nodes.
+    pub fn finalize_pending(&self, keys: &[Key], owner_start_ts: Timestamp, commit_ts: Timestamp) {
+        for key in keys {
+            if let Some(entry) = self.inner.index.get(key) {
+                entry.value().finalize_pending(owner_start_ts, commit_ts);
+            }
+        }
+    }
+
+    /// Mark all pending writes for a transaction as aborted.
+    ///
+    /// Called during transaction rollback. Aborted nodes are skipped by readers.
+    pub fn abort_pending(&self, keys: &[Key], owner_start_ts: Timestamp) {
+        for key in keys {
+            if let Some(entry) = self.inner.index.get(key) {
+                entry.value().abort_pending(owner_start_ts);
+            }
+        }
+    }
+
     /// Get the number of version entries in the memtable.
     pub fn len(&self) -> usize {
         self.inner.entry_count.load(Ordering::Relaxed)
@@ -376,6 +676,33 @@ impl StorageEngine for VersionedMemTableEngine {
     fn write_batch(&self, batch: WriteBatch) -> Result<()> {
         // Delegate to the inherent method
         VersionedMemTableEngine::write_batch(self, batch)
+    }
+}
+
+impl PessimisticStorage for VersionedMemTableEngine {
+    fn put_pending(
+        &self,
+        key: &[u8],
+        value: RawValue,
+        owner_start_ts: Timestamp,
+    ) -> std::result::Result<(), Timestamp> {
+        // Delegate to the inherent method
+        VersionedMemTableEngine::put_pending(self, key, value, owner_start_ts)
+    }
+
+    fn get_lock_owner(&self, key: &[u8]) -> Option<Timestamp> {
+        // Delegate to the inherent method
+        VersionedMemTableEngine::get_lock_owner(self, key)
+    }
+
+    fn finalize_pending(&self, keys: &[Key], owner_start_ts: Timestamp, commit_ts: Timestamp) {
+        // Delegate to the inherent method
+        VersionedMemTableEngine::finalize_pending(self, keys, owner_start_ts, commit_ts)
+    }
+
+    fn abort_pending(&self, keys: &[Key], owner_start_ts: Timestamp) {
+        // Delegate to the inherent method
+        VersionedMemTableEngine::abort_pending(self, keys, owner_start_ts)
     }
 }
 
@@ -597,15 +924,29 @@ impl<'a> VersionedMemTableIterator<'a> {
         while !version_ptr.is_null() {
             let node = unsafe { &*version_ptr };
 
+            // Skip aborted nodes
+            if node.is_aborted() {
+                version_ptr = node.next;
+                continue;
+            }
+
+            // Skip pending nodes (not committed yet)
+            // Readers should not see uncommitted writes from other transactions.
+            // Read-your-writes is handled separately by the transaction layer.
+            if node.is_pending() {
+                version_ptr = node.next;
+                continue;
+            }
+
             // Apply timestamp filter if specified
             if let Some(max_ts) = ts_filter {
-                if node.ts > max_ts {
+                if node.get_ts() > max_ts {
                     version_ptr = node.next;
                     continue;
                 }
             }
 
-            if self.is_version_in_range(user_key, node.ts) {
+            if self.is_version_in_range(user_key, node.get_ts()) {
                 return Some(version_ptr);
             }
             version_ptr = node.next;
@@ -662,7 +1003,20 @@ impl<'a> VersionedMemTableIterator<'a> {
             // Find next version in range (no allocation, just pointer traversal)
             while !next_version.is_null() {
                 let next_node = unsafe { &*next_version };
-                if self.is_version_in_range(current_user_key, next_node.ts) {
+
+                // Skip aborted nodes
+                if next_node.is_aborted() {
+                    next_version = next_node.next;
+                    continue;
+                }
+
+                // Skip pending nodes (uncommitted)
+                if next_node.is_pending() {
+                    next_version = next_node.next;
+                    continue;
+                }
+
+                if self.is_version_in_range(current_user_key, next_node.get_ts()) {
                     self.current_version = next_version;
                     return;
                 }
@@ -765,7 +1119,7 @@ impl<'a> MvccIterator for VersionedMemTableIterator<'a> {
 
     fn timestamp(&self) -> Timestamp {
         debug_assert!(!self.current_version.is_null(), "Iterator not valid");
-        unsafe { (*self.current_version).ts }
+        unsafe { (*self.current_version).get_ts() }
     }
 
     fn value(&self) -> &[u8] {
@@ -911,7 +1265,7 @@ mod tests {
             while !current.is_null() {
                 // Safety: current points to a valid node owned by MvccRow
                 let node = unsafe { &*current };
-                results.push((key.clone(), node.ts, node.value.clone()));
+                results.push((key.clone(), node.get_ts(), node.value.clone()));
                 current = node.next;
             }
         }
@@ -1975,5 +2329,163 @@ mod tests {
                 "Key {i} should be {expected_key}"
             );
         }
+    }
+
+    // ==================== Pessimistic Locking Tests ====================
+
+    #[test]
+    fn test_put_pending_basic() {
+        let engine = new_engine();
+
+        // Write pending value
+        engine
+            .put_pending(b"key1", b"value1".to_vec(), 100)
+            .unwrap();
+
+        // Pending write should not be visible via normal read
+        assert!(get_for_test(&engine, b"key1").is_none());
+
+        // But should be able to check lock owner
+        assert_eq!(engine.get_lock_owner(b"key1"), Some(100));
+    }
+
+    #[test]
+    fn test_put_pending_conflict() {
+        let engine = new_engine();
+
+        // First write from txn 100
+        engine.put_pending(b"key1", b"v1".to_vec(), 100).unwrap();
+
+        // Second write from txn 200 should fail (key locked)
+        let result = engine.put_pending(b"key1", b"v2".to_vec(), 200);
+        assert_eq!(result, Err(100)); // Returns lock owner
+    }
+
+    #[test]
+    fn test_put_pending_same_txn_update() {
+        let engine = new_engine();
+
+        // First write
+        engine.put_pending(b"key1", b"v1".to_vec(), 100).unwrap();
+
+        // Same txn writing again should update value in place
+        engine.put_pending(b"key1", b"v2".to_vec(), 100).unwrap();
+
+        // Should still be locked by txn 100
+        assert_eq!(engine.get_lock_owner(b"key1"), Some(100));
+
+        // Should have only 1 entry (update in place, not new node)
+        // Actually prepend_pending adds a new node if it's a new insert,
+        // but updates in place on same txn re-write
+        assert_eq!(engine.len(), 1);
+    }
+
+    #[test]
+    fn test_finalize_pending() {
+        let engine = new_engine();
+
+        // Write pending values
+        engine.put_pending(b"key1", b"v1".to_vec(), 100).unwrap();
+        engine.put_pending(b"key2", b"v2".to_vec(), 100).unwrap();
+
+        // Neither should be visible
+        assert!(get_for_test(&engine, b"key1").is_none());
+        assert!(get_for_test(&engine, b"key2").is_none());
+
+        // Finalize (commit) the pending writes
+        let keys = vec![b"key1".to_vec(), b"key2".to_vec()];
+        engine.finalize_pending(&keys, 100, 150); // commit_ts = 150
+
+        // Now both should be visible
+        assert_eq!(get_for_test(&engine, b"key1"), Some(b"v1".to_vec()));
+        assert_eq!(get_for_test(&engine, b"key2"), Some(b"v2".to_vec()));
+
+        // No longer locked
+        assert_eq!(engine.get_lock_owner(b"key1"), None);
+        assert_eq!(engine.get_lock_owner(b"key2"), None);
+    }
+
+    #[test]
+    fn test_abort_pending() {
+        let engine = new_engine();
+
+        // Write pending values
+        engine.put_pending(b"key1", b"v1".to_vec(), 100).unwrap();
+
+        // Key is locked
+        assert_eq!(engine.get_lock_owner(b"key1"), Some(100));
+
+        // Abort the transaction
+        let keys = vec![b"key1".to_vec()];
+        engine.abort_pending(&keys, 100);
+
+        // Key should no longer appear as locked (aborted nodes don't conflict)
+        assert_eq!(engine.get_lock_owner(b"key1"), None);
+
+        // Value should not be visible
+        assert!(get_for_test(&engine, b"key1").is_none());
+    }
+
+    #[test]
+    fn test_abort_pending_allows_new_write() {
+        let engine = new_engine();
+
+        // Txn 100 writes and aborts
+        engine.put_pending(b"key1", b"v1".to_vec(), 100).unwrap();
+        let keys = vec![b"key1".to_vec()];
+        engine.abort_pending(&keys, 100);
+
+        // Txn 200 should now be able to write
+        let result = engine.put_pending(b"key1", b"v2".to_vec(), 200);
+        assert!(result.is_ok());
+
+        // Key locked by txn 200
+        assert_eq!(engine.get_lock_owner(b"key1"), Some(200));
+    }
+
+    #[test]
+    fn test_pending_not_visible_to_scan() {
+        let engine = new_engine();
+
+        // Write committed value
+        put_at(&engine, b"a", b"committed", 10);
+
+        // Write pending value
+        engine.put_pending(b"b", b"pending".to_vec(), 100).unwrap();
+
+        // Write another committed value
+        put_at(&engine, b"c", b"committed2", 20);
+
+        // Scan should only see committed values
+        let range = MvccKey::unbounded()..MvccKey::unbounded();
+        let results = scan_mvcc(&engine, range);
+
+        // Should have 2 entries (committed ones only)
+        assert_eq!(results.len(), 2);
+
+        let keys: Vec<_> = results.iter().map(|(k, _)| k.key().to_vec()).collect();
+        assert!(keys.contains(&b"a".to_vec()));
+        assert!(keys.contains(&b"c".to_vec()));
+        assert!(!keys.iter().any(|k| k == b"b"));
+    }
+
+    #[test]
+    fn test_finalized_visible_to_scan() {
+        let engine = new_engine();
+
+        // Write and finalize pending value
+        engine.put_pending(b"key", b"value".to_vec(), 100).unwrap();
+        let keys = vec![b"key".to_vec()];
+        engine.finalize_pending(&keys, 100, 150);
+
+        // Scan should see the finalized value
+        let range = MvccKey::unbounded()..MvccKey::unbounded();
+        let results = scan_mvcc(&engine, range);
+
+        assert_eq!(results.len(), 1);
+        let (key, value) = &results[0];
+        assert_eq!(key.key(), b"key");
+        assert_eq!(key.timestamp(), 150); // commit_ts
+        assert_eq!(value, b"value");
     }
 }

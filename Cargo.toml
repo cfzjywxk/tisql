@@ -46,6 +46,7 @@ num_cpus = "1"
 # Concurrent data structures for MVCC
 crossbeam-skiplist = "0.1"
 crossbeam-epoch = "0.9"
+dashmap = "5"
 
 # Memory allocator (jemalloc for production, like TiKV)
 [target.'cfg(unix)'.dependencies]

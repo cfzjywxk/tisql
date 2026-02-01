@@ -226,6 +226,51 @@ impl MemTable {
     pub fn inner(&self) -> &VersionedMemTableEngine {
         &self.inner
     }
+
+    // ========================================================================
+    // Pessimistic Locking Methods (forward to inner VersionedMemTableEngine)
+    // ========================================================================
+
+    /// Write a pending value for pessimistic transactions.
+    ///
+    /// Returns `Ok(())` if write was successful, `Err(lock_owner)` if locked by another txn.
+    pub fn put_pending(
+        &self,
+        key: &[u8],
+        value: Vec<u8>,
+        owner_start_ts: crate::types::Timestamp,
+    ) -> std::result::Result<(), crate::types::Timestamp> {
+        if self.is_frozen() {
+            // Frozen memtables cannot accept new writes
+            // Return a sentinel value to indicate this - the caller should handle this case
+            return Err(0);
+        }
+        self.inner.put_pending(key, value, owner_start_ts)
+    }
+
+    /// Check if a key is locked by a pending write.
+    pub fn get_lock_owner(&self, key: &[u8]) -> Option<crate::types::Timestamp> {
+        self.inner.get_lock_owner(key)
+    }
+
+    /// Finalize all pending writes for a transaction.
+    pub fn finalize_pending(
+        &self,
+        keys: &[crate::types::Key],
+        owner_start_ts: crate::types::Timestamp,
+        commit_ts: crate::types::Timestamp,
+    ) {
+        self.inner.finalize_pending(keys, owner_start_ts, commit_ts)
+    }
+
+    /// Abort all pending writes for a transaction.
+    pub fn abort_pending(
+        &self,
+        keys: &[crate::types::Key],
+        owner_start_ts: crate::types::Timestamp,
+    ) {
+        self.inner.abort_pending(keys, owner_start_ts)
+    }
 }
 
 /// Estimate the memory size of a write batch.

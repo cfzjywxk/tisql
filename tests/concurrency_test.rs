@@ -27,12 +27,11 @@
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::Arc;
 use std::thread;
-use std::time::Duration;
 
 use tisql::error::TiSqlError;
 use tisql::storage::mvcc::{is_tombstone, MvccIterator, MvccKey};
 use tisql::testkit::{
-    ConcurrencyManager, FileClogConfig, FileClogService, LocalTso, Lock, MemTableEngine,
+    ConcurrencyManager, FileClogConfig, FileClogService, LocalTso, MemTableEngine,
     TransactionService, TxnServiceTestExt,
 };
 use tisql::types::{RawValue, Timestamp};
@@ -215,49 +214,13 @@ fn test_max_ts_concurrent_updates() {
 }
 
 // ============================================================================
-// Lock Conflict Tests
+// Lock Conflict Tests (via PessimisticStorage)
 // ============================================================================
-
-/// Verify that readers see locks immediately after acquisition.
-#[test]
-fn test_reader_sees_lock_immediately() {
-    let cm = Arc::new(ConcurrencyManager::new(0));
-    let key = b"test_key".to_vec();
-
-    // Initially no lock
-    assert!(cm.check_lock(&key, 1).is_ok());
-
-    // Acquire lock
-    let lock = Lock {
-        ts: 100,
-        primary: key.clone().into(),
-    };
-    let guards = cm.lock_keys(std::iter::once(&key), lock).unwrap();
-
-    // Snapshot isolation:
-    // - A reader with an older snapshot should NOT be blocked by this lock.
-    assert!(cm.check_lock(&key, 1).is_ok());
-    // - A reader whose snapshot is at/after the lock ts must be blocked.
-    let result = cm.check_lock(&key, 100);
-    assert!(result.is_err());
-    match result {
-        Err(TiSqlError::KeyIsLocked { lock_ts, .. }) => {
-            assert_eq!(lock_ts, 100);
-        }
-        _ => panic!("Expected KeyIsLocked error"),
-    }
-
-    // Drop guards
-    drop(guards);
-
-    // Lock should be released
-    assert!(cm.check_lock(&key, 100).is_ok());
-}
 
 /// Test concurrent writers to different keys succeed.
 #[test]
 fn test_concurrent_writes_different_keys() {
-    let (_storage, txn_service, _tso, cm, _dir) = create_test_service();
+    let (_storage, txn_service, _tso, _cm, _dir) = create_test_service();
     let num_threads = 4;
     let writes_per_thread = 100;
 
@@ -288,13 +251,12 @@ fn test_concurrent_writes_different_keys() {
     // All writes should succeed since they're to different keys
     let total_writes = num_threads * writes_per_thread;
     assert_eq!(success_count.load(Ordering::Relaxed), total_writes as u64);
-    assert_eq!(cm.lock_count(), 0, "All locks should be released");
 }
 
 /// Test concurrent writers to same key - one should get lock conflict.
 #[test]
 fn test_concurrent_writes_same_key() {
-    let (_storage, txn_service, _tso, cm, _dir) = create_test_service();
+    let (_storage, txn_service, _tso, _cm, _dir) = create_test_service();
     let num_threads = 10;
     let key = b"shared_key";
 
@@ -342,117 +304,11 @@ fn test_concurrent_writes_same_key() {
 
     // At least one should succeed (first to acquire lock)
     assert!(successes >= 1, "At least one write should succeed");
-
-    // All locks should be released
-    assert_eq!(cm.lock_count(), 0, "All locks should be released");
-}
-
-/// Verify range lock check blocks correctly.
-#[test]
-fn test_range_lock_check() {
-    let cm = Arc::new(ConcurrencyManager::new(0));
-
-    // Lock a key in the middle of a range
-    let lock = Lock {
-        ts: 100,
-        primary: Arc::from(&b"key_b"[..]),
-    };
-    let key_b = b"key_b".to_vec();
-    let _guards = cm.lock_keys(std::iter::once(&key_b), lock).unwrap();
-
-    // Snapshot isolation: older snapshot can ignore the lock.
-    assert!(cm.check_range(b"key_a", b"key_c", 1).is_ok());
-    // Snapshot at/after the lock ts must be blocked.
-    assert!(cm.check_range(b"key_a", b"key_c", 100).is_err());
-
-    // Range before locked key should pass
-    assert!(cm.check_range(b"key_0", b"key_a", 100).is_ok());
-
-    // Range after locked key should pass
-    assert!(cm.check_range(b"key_c", b"key_z", 100).is_ok());
 }
 
 // ============================================================================
 // Write-Read Conflict Scenarios
 // ============================================================================
-
-/// Simulate concurrent read while write is in progress (without failpoints).
-///
-/// This test manually simulates the scenario where:
-/// 1. Writer acquires lock
-/// 2. Reader tries to read the locked key
-/// 3. Reader should get KeyIsLocked error
-#[test]
-fn test_concurrent_read_during_write() {
-    let (storage, _txn_service, _tso, cm, _dir) = create_test_service();
-
-    let key = b"test_key".to_vec();
-    let writer_started = Arc::new(AtomicBool::new(false));
-    let reader_blocked = Arc::new(AtomicBool::new(false));
-
-    // Spawn writer thread
-    let cm_write = Arc::clone(&cm);
-    let writer_started_clone = Arc::clone(&writer_started);
-    let reader_blocked_clone = Arc::clone(&reader_blocked);
-    let key_clone = key.clone();
-
-    let writer = thread::spawn(move || {
-        // Acquire lock manually (simulating transaction)
-        let lock = Lock {
-            ts: 100,
-            primary: key_clone.clone().into(),
-        };
-        let _guards = cm_write
-            .lock_keys(std::iter::once(&key_clone), lock)
-            .unwrap();
-
-        // Signal writer has started
-        writer_started_clone.store(true, Ordering::Release);
-
-        // Wait for reader to be blocked
-        while !reader_blocked_clone.load(Ordering::Acquire) {
-            thread::yield_now();
-        }
-
-        // Simulate write delay
-        thread::sleep(Duration::from_millis(10));
-
-        // Guards dropped here, releasing lock
-    });
-
-    // Reader thread
-    let cm_read = Arc::clone(&cm);
-    let key_clone = key.clone();
-
-    let reader = thread::spawn(move || {
-        // Wait for writer to start
-        while !writer_started.load(Ordering::Acquire) {
-            thread::yield_now();
-        }
-
-        // Try to check lock. Under snapshot isolation, a reader whose snapshot
-        // is at/after the writer start_ts should be blocked.
-        let result = cm_read.check_lock(&key_clone, 100);
-        assert!(result.is_err(), "Reader should see lock");
-
-        // Signal that reader was blocked
-        reader_blocked.store(true, Ordering::Release);
-    });
-
-    // Wait for both threads to complete
-    writer.join().unwrap();
-    reader.join().unwrap();
-
-    // After writer thread exits, lock should be released
-    assert!(
-        cm.check_lock(&key, 100).is_ok(),
-        "Lock should be released after writer exits"
-    );
-
-    // Can read (would return None since nothing written to storage)
-    let value = get_for_test(&storage, &key);
-    assert!(value.is_none(), "Key should not exist yet");
-}
 
 /// Test that MVCC read at specific timestamp works correctly.
 #[test]
@@ -729,114 +585,7 @@ fn test_write_buffer_dedup_commit() {
 #[cfg(feature = "failpoints")]
 mod failpoint_tests {
     use super::*;
-
-    /// Test reader blocked when writer has lock but hasn't applied yet.
-    ///
-    /// Uses failpoint to pause writer after acquiring lock.
-    #[test]
-    fn test_reader_blocked_during_write_with_failpoint() {
-        let scenario = fail::FailScenario::setup();
-
-        let (storage, txn_service, _tso, cm, _dir) = create_test_service();
-        let key = b"fp_test_key";
-
-        // Configure failpoint to pause after lock acquisition
-        fail::cfg("txn_after_lock_before_commit_ts", "pause").unwrap();
-
-        let txn_service_clone = Arc::clone(&txn_service);
-        let writer = thread::spawn(move || {
-            // This will pause at the failpoint
-            txn_service_clone.autocommit_put(key, b"value").unwrap()
-        });
-
-        // Give writer time to reach failpoint
-        thread::sleep(Duration::from_millis(50));
-
-        // Reader should see lock
-        let result = cm.check_lock(key, Timestamp::MAX);
-        assert!(
-            result.is_err(),
-            "Reader should see lock while writer is paused"
-        );
-
-        // Resume writer
-        fail::cfg("txn_after_lock_before_commit_ts", "off").unwrap();
-
-        writer.join().unwrap();
-
-        // After writer completes, lock released and data visible
-        assert!(cm.check_lock(key, Timestamp::MAX).is_ok());
-        let v = get_for_test(&storage, key);
-        assert_eq!(v, Some(b"value".to_vec()));
-
-        scenario.teardown();
-    }
-
-    /// Test that lock persists through clog write but before storage apply.
-    #[test]
-    fn test_lock_during_clog_write_with_failpoint() {
-        let scenario = fail::FailScenario::setup();
-
-        let (_storage, txn_service, _tso, cm, _dir) = create_test_service();
-        let key = b"fp_clog_key";
-
-        // Pause after clog write, before storage apply
-        fail::cfg("txn_after_clog_write", "pause").unwrap();
-
-        let txn_service_clone = Arc::clone(&txn_service);
-        let writer =
-            thread::spawn(move || txn_service_clone.autocommit_put(key, b"value").unwrap());
-
-        // Give writer time to reach failpoint
-        thread::sleep(Duration::from_millis(50));
-
-        // Lock should still be held
-        let result = cm.check_lock(key, Timestamp::MAX);
-        assert!(result.is_err(), "Lock should persist through clog write");
-
-        // Resume
-        fail::cfg("txn_after_clog_write", "off").unwrap();
-        writer.join().unwrap();
-
-        assert!(cm.check_lock(key, Timestamp::MAX).is_ok());
-
-        scenario.teardown();
-    }
-
-    /// Test concurrent read-write with controlled timing.
-    #[test]
-    fn test_read_write_race_with_failpoint() {
-        let scenario = fail::FailScenario::setup();
-
-        let (storage, txn_service, _tso, cm, _dir) = create_test_service();
-        let key = b"race_key";
-
-        // Write initial value
-        txn_service.autocommit_put(key, b"v1").unwrap();
-
-        // Pause after storage apply but before lock release
-        fail::cfg("txn_after_storage_apply", "pause").unwrap();
-
-        let txn_service_clone = Arc::clone(&txn_service);
-        let writer = thread::spawn(move || txn_service_clone.autocommit_put(key, b"v2").unwrap());
-
-        // Give writer time to reach failpoint
-        thread::sleep(Duration::from_millis(50));
-
-        // Lock should still be held even though data is in storage
-        assert!(cm.check_lock(key, Timestamp::MAX).is_err());
-
-        // Resume
-        fail::cfg("txn_after_storage_apply", "off").unwrap();
-        writer.join().unwrap();
-
-        // Now should see v2
-        assert!(cm.check_lock(key, Timestamp::MAX).is_ok());
-        let v = get_for_test(&storage, key);
-        assert_eq!(v, Some(b"v2".to_vec()));
-
-        scenario.teardown();
-    }
+    use std::time::Duration;
 
     /// Test multiple writers with controlled ordering.
     #[test]
@@ -885,7 +634,7 @@ mod failpoint_tests {
     ///             -> Writer acquires lock -> Writer commits
     ///             -> Reader misses committed data because start_ts > commit_ts
     ///
-    /// AFTER FIX: Writer acquires lock -> updates max_ts -> Reader starts
+    /// AFTER FIX: Writer acquires pending lock -> Reader starts
     ///            -> Reader's start_ts is recorded in max_ts
     ///            -> Writer picks commit_ts = max(max_ts + 1, tso_ts) > start_ts
     ///            -> Reader correctly sees the committed data OR is blocked by lock
@@ -912,14 +661,8 @@ mod failpoint_tests {
             txn_service_clone.autocommit_put(key, b"value").unwrap()
         });
 
-        // Give writer time to reach failpoint (locks acquired)
+        // Give writer time to reach failpoint (pending locks acquired)
         thread::sleep(Duration::from_millis(50));
-
-        // Verify writer has the lock
-        assert!(
-            cm.check_lock(key, Timestamp::MAX).is_err(),
-            "Writer should have acquired lock"
-        );
 
         // Phase 2: Reader starts a transaction - this updates max_ts
         // In a buggy implementation, if commit_ts was picked before locks,
@@ -1565,4 +1308,200 @@ fn test_mvcc_scan_iterator_returns_latest_visible_only() {
     assert_eq!(results[0], (b"key_a".to_vec(), b"a_v3".to_vec()));
     assert_eq!(results[1], (b"key_b".to_vec(), b"b_v2".to_vec()));
     assert_eq!(results[2], (b"key_c".to_vec(), b"c_v1".to_vec()));
+}
+
+// ============================================================================
+// E2E Tests for KeyIsLocked Error Path
+// ============================================================================
+
+/// E2E test for concurrent SQL INSERTs to the same key triggering KeyIsLocked error.
+///
+/// This tests the full path from SQL layer through transaction layer to storage layer,
+/// verifying that concurrent writes to the same primary key result in proper lock
+/// conflict errors.
+#[test]
+fn test_e2e_key_is_locked_concurrent_inserts() {
+    use tisql::{Database, DatabaseConfig, QueryResult};
+
+    let dir = tempfile::tempdir().unwrap();
+    let config = DatabaseConfig::with_data_dir(dir.path());
+    let db = Arc::new(Database::open(config).unwrap());
+
+    // Create table with primary key
+    db.handle_mp_query("CREATE TABLE lock_test (id INT PRIMARY KEY, value VARCHAR(100))")
+        .unwrap();
+
+    let num_threads = 10;
+    let barrier = Arc::new(std::sync::Barrier::new(num_threads));
+    let success_count = Arc::new(AtomicU64::new(0));
+    let lock_error_count = Arc::new(AtomicU64::new(0));
+    let duplicate_error_count = Arc::new(AtomicU64::new(0));
+
+    let mut handles = vec![];
+    for i in 0..num_threads {
+        let db = Arc::clone(&db);
+        let barrier = Arc::clone(&barrier);
+        let success_count = Arc::clone(&success_count);
+        let lock_error_count = Arc::clone(&lock_error_count);
+        let duplicate_error_count = Arc::clone(&duplicate_error_count);
+
+        handles.push(thread::spawn(move || {
+            // Synchronize all threads to maximize contention
+            barrier.wait();
+
+            // All threads try to insert with the same primary key
+            let sql = format!("INSERT INTO lock_test (id, value) VALUES (1, 'thread_{i}')");
+            match db.handle_mp_query(&sql) {
+                Ok(QueryResult::Affected(_)) => {
+                    success_count.fetch_add(1, Ordering::Relaxed);
+                }
+                Err(e) => {
+                    let msg = e.to_string().to_lowercase();
+                    if msg.contains("key is locked") || msg.contains("locked") {
+                        lock_error_count.fetch_add(1, Ordering::Relaxed);
+                    } else if msg.contains("duplicate") {
+                        duplicate_error_count.fetch_add(1, Ordering::Relaxed);
+                    } else {
+                        panic!("Thread {i} got unexpected error: {e}");
+                    }
+                }
+                Ok(other) => {
+                    panic!("Thread {i} got unexpected result: {other:?}");
+                }
+            }
+        }));
+    }
+
+    for handle in handles {
+        handle.join().unwrap();
+    }
+
+    let successes = success_count.load(Ordering::Relaxed);
+    let lock_errors = lock_error_count.load(Ordering::Relaxed);
+    let duplicate_errors = duplicate_error_count.load(Ordering::Relaxed);
+
+    // Verify results
+    assert!(
+        successes >= 1,
+        "At least one insert should succeed, got {successes}"
+    );
+    assert!(
+        lock_errors + duplicate_errors > 0,
+        "Some threads should get lock conflict or duplicate key error"
+    );
+    assert_eq!(
+        successes + lock_errors + duplicate_errors,
+        num_threads as u64,
+        "All threads should complete with success, lock error, or duplicate error"
+    );
+
+    // Verify the data is consistent - exactly one row should exist
+    match db
+        .handle_mp_query("SELECT COUNT(*) FROM lock_test")
+        .unwrap()
+    {
+        QueryResult::Rows { data, .. } => {
+            assert_eq!(data.len(), 1);
+            assert_eq!(data[0][0], "1", "Exactly one row should exist");
+        }
+        other => panic!("Expected rows, got: {other:?}"),
+    }
+
+    db.close().unwrap();
+}
+
+/// E2E test for concurrent SQL UPDATEs to the same key triggering KeyIsLocked error.
+///
+/// Similar to the INSERT test, but tests UPDATE operations where multiple threads
+/// try to update the same row concurrently.
+#[test]
+fn test_e2e_key_is_locked_concurrent_updates() {
+    use tisql::{Database, DatabaseConfig, QueryResult};
+
+    let dir = tempfile::tempdir().unwrap();
+    let config = DatabaseConfig::with_data_dir(dir.path());
+    let db = Arc::new(Database::open(config).unwrap());
+
+    // Create table and insert initial row
+    db.handle_mp_query("CREATE TABLE update_lock_test (id INT PRIMARY KEY, counter INT)")
+        .unwrap();
+    db.handle_mp_query("INSERT INTO update_lock_test VALUES (1, 0)")
+        .unwrap();
+
+    let num_threads = 10;
+    let updates_per_thread = 5;
+    let barrier = Arc::new(std::sync::Barrier::new(num_threads));
+    let success_count = Arc::new(AtomicU64::new(0));
+    let lock_error_count = Arc::new(AtomicU64::new(0));
+
+    let mut handles = vec![];
+    for _ in 0..num_threads {
+        let db = Arc::clone(&db);
+        let barrier = Arc::clone(&barrier);
+        let success_count = Arc::clone(&success_count);
+        let lock_error_count = Arc::clone(&lock_error_count);
+
+        handles.push(thread::spawn(move || {
+            // Synchronize all threads
+            barrier.wait();
+
+            for _ in 0..updates_per_thread {
+                match db.handle_mp_query(
+                    "UPDATE update_lock_test SET counter = counter + 1 WHERE id = 1",
+                ) {
+                    Ok(QueryResult::Affected(_)) => {
+                        success_count.fetch_add(1, Ordering::Relaxed);
+                    }
+                    Err(e) => {
+                        let msg = e.to_string().to_lowercase();
+                        if msg.contains("key is locked") || msg.contains("locked") {
+                            lock_error_count.fetch_add(1, Ordering::Relaxed);
+                        } else {
+                            panic!("Got unexpected error: {e}");
+                        }
+                    }
+                    Ok(other) => {
+                        panic!("Got unexpected result: {other:?}");
+                    }
+                }
+                // Small delay to allow other threads to compete
+                thread::yield_now();
+            }
+        }));
+    }
+
+    for handle in handles {
+        handle.join().unwrap();
+    }
+
+    let successes = success_count.load(Ordering::Relaxed);
+    let lock_errors = lock_error_count.load(Ordering::Relaxed);
+
+    // Verify results
+    assert!(
+        successes >= 1,
+        "At least some updates should succeed, got {successes}"
+    );
+    assert_eq!(
+        successes + lock_errors,
+        (num_threads * updates_per_thread) as u64,
+        "All update attempts should complete with success or lock error"
+    );
+
+    // The counter should equal the number of successful updates
+    match db
+        .handle_mp_query("SELECT counter FROM update_lock_test WHERE id = 1")
+        .unwrap()
+    {
+        QueryResult::Rows { data, .. } => {
+            let counter: i64 = data[0][0].parse().unwrap();
+            assert_eq!(
+                counter as u64, successes,
+                "Counter ({counter}) should equal successful updates ({successes})"
+            );
+        }
+        other => panic!("Expected rows, got: {other:?}"),
+    }
+
+    db.close().unwrap();
 }

@@ -52,8 +52,8 @@ use fail::fail_point;
 use crate::error::{Result, TiSqlError};
 use crate::lsn::SharedLsnProvider;
 use crate::storage::mvcc::{decode_mvcc_key, is_tombstone, MvccIterator, MvccKey, SharedMvccRange};
-use crate::storage::{StorageEngine, WriteBatch};
-use crate::types::{RawValue, Timestamp};
+use crate::storage::{PessimisticStorage, StorageEngine, WriteBatch};
+use crate::types::{Key, RawValue, Timestamp};
 
 use super::config::LsmConfig;
 use super::ilog::IlogService;
@@ -1623,6 +1623,56 @@ impl StorageEngine for LsmEngine {
         let _ = self.maybe_rotate();
 
         Ok(())
+    }
+}
+
+impl PessimisticStorage for LsmEngine {
+    fn put_pending(
+        &self,
+        key: &[u8],
+        value: RawValue,
+        owner_start_ts: Timestamp,
+    ) -> std::result::Result<(), Timestamp> {
+        // Forward to active memtable
+        let state = self.state.read().unwrap();
+        state.active.put_pending(key, value, owner_start_ts)
+    }
+
+    fn get_lock_owner(&self, key: &[u8]) -> Option<Timestamp> {
+        // Check active memtable first
+        let state = self.state.read().unwrap();
+        if let Some(owner) = state.active.get_lock_owner(key) {
+            return Some(owner);
+        }
+        // Check frozen memtables (newest to oldest)
+        for frozen in &state.frozen {
+            if let Some(owner) = frozen.get_lock_owner(key) {
+                return Some(owner);
+            }
+        }
+        None
+    }
+
+    fn finalize_pending(&self, keys: &[Key], owner_start_ts: Timestamp, commit_ts: Timestamp) {
+        // Finalize in active memtable
+        let state = self.state.read().unwrap();
+        state
+            .active
+            .finalize_pending(keys, owner_start_ts, commit_ts);
+        // Also finalize in frozen memtables in case writes happened before rotation
+        for frozen in &state.frozen {
+            frozen.finalize_pending(keys, owner_start_ts, commit_ts);
+        }
+    }
+
+    fn abort_pending(&self, keys: &[Key], owner_start_ts: Timestamp) {
+        // Abort in active memtable
+        let state = self.state.read().unwrap();
+        state.active.abort_pending(keys, owner_start_ts);
+        // Also abort in frozen memtables in case writes happened before rotation
+        for frozen in &state.frozen {
+            frozen.abort_pending(keys, owner_start_ts);
+        }
     }
 }
 

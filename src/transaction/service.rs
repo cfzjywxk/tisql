@@ -29,9 +29,9 @@ use crate::log_warn;
 use crate::tso::TsoService;
 
 use super::api::{CommitInfo, TxnCtx, TxnService, TxnState};
-use super::concurrency::{ConcurrencyManager, Lock};
-use crate::storage::mvcc::{is_tombstone, MvccIterator, MvccKey};
-use crate::storage::{StorageEngine, WriteBatch};
+use super::concurrency::ConcurrencyManager;
+use crate::storage::mvcc::{is_tombstone, MvccIterator, MvccKey, TOMBSTONE};
+use crate::storage::{PessimisticStorage, StorageEngine, WriteBatch, WriteOp};
 use crate::types::{Key, RawValue, Timestamp, TxnId};
 
 /// Transaction service manages transactions with durability and MVCC.
@@ -40,12 +40,10 @@ use crate::types::{Key, RawValue, Timestamp, TxnId};
 /// OceanBase's `ObTransService` pattern. Transaction state is held in `TxnCtx`
 /// and passed to each operation.
 ///
-/// All write operations follow the 1PC pattern:
-/// 1. Acquire in-memory locks (blocks concurrent readers)
-/// 2. Log to commit log
-/// 3. Sync commit log to disk (durability)
-/// 4. Apply to storage with commit_ts
-/// 5. Release locks (on guard drop)
+/// All write operations use pessimistic locking via PessimisticStorage:
+/// 1. Write pending nodes to storage (locks acquired immediately)
+/// 2. On commit: finalize pending nodes with commit_ts
+/// 3. On rollback: abort pending nodes
 pub struct TransactionService<S: StorageEngine, L: ClogService, T: TsoService> {
     /// Storage engine for state
     storage: Arc<S>,
@@ -196,8 +194,11 @@ impl<S: StorageEngine, L: ClogService, T: TsoService> TransactionService<S, L, T
     /// Check if transaction is in active state
     fn check_active(ctx: &TxnCtx) -> Result<()> {
         match ctx.state {
-            TxnState::Active => Ok(()),
-            TxnState::Committed => Err(crate::error::TiSqlError::Internal(
+            TxnState::Running => Ok(()),
+            TxnState::Prepared { .. } => Err(crate::error::TiSqlError::Internal(
+                "Transaction already in prepared state".into(),
+            )),
+            TxnState::Committed { .. } => Err(crate::error::TiSqlError::Internal(
                 "Transaction already committed".into(),
             )),
             TxnState::Aborted => Err(crate::error::TiSqlError::Internal(
@@ -208,7 +209,11 @@ impl<S: StorageEngine, L: ClogService, T: TsoService> TransactionService<S, L, T
 }
 
 /// Implement TxnService trait for TransactionService
-impl<S: StorageEngine + 'static, L: ClogService + 'static, T: TsoService> TxnService
+///
+/// Note: `S: PessimisticStorage` is required to support explicit transactions
+/// with pessimistic locking. Since `PessimisticStorage: StorageEngine`, this
+/// is backwards compatible with code that only uses implicit transactions.
+impl<S: PessimisticStorage + 'static, L: ClogService + 'static, T: TsoService> TxnService
     for TransactionService<S, L, T>
 {
     type ScanIter = MvccScanIterator<S::Iter>;
@@ -221,11 +226,20 @@ impl<S: StorageEngine + 'static, L: ClogService + 'static, T: TsoService> TxnSer
         Ok(TxnCtx::new(txn_id, start_ts, read_only))
     }
 
-    fn get(&self, ctx: &TxnCtx, key: &[u8]) -> Result<Option<RawValue>> {
-        // Check for locks from other transactions
-        self.concurrency_manager.check_lock(key, ctx.start_ts)?;
+    fn begin_explicit(&self, read_only: bool) -> Result<TxnCtx> {
+        // Allocate txn_id and start_ts from TSO
+        let txn_id = self.get_ts();
+        let start_ts = self.get_ts();
 
+        // Register transaction in state cache for visibility tracking
+        self.concurrency_manager.register_txn(start_ts);
+
+        Ok(TxnCtx::new_explicit(txn_id, start_ts, read_only))
+    }
+
+    fn get(&self, ctx: &TxnCtx, key: &[u8]) -> Result<Option<RawValue>> {
         // MVCC read: find the latest version with commit_ts <= start_ts
+        // Note: Pending/aborted nodes are skipped by the iterator (pessimistic locking in storage)
         //
         // MVCC key encoding: key || !commit_ts (8 bytes big-endian, bitwise NOT)
         // This means higher timestamps produce SMALLER encoded keys.
@@ -268,18 +282,8 @@ impl<S: StorageEngine + 'static, L: ClogService + 'static, T: TsoService> TxnSer
     }
 
     fn scan_iter(&self, ctx: &TxnCtx, range: Range<Key>) -> Result<MvccScanIterator<S::Iter>> {
-        // Check for locks in range.
-        //
-        // Note: empty end (vec![]) means "unbounded" (scan to infinity), not empty range.
-        // range.is_empty() uses lexicographic comparison (start >= end), which incorrectly
-        // returns true for unbounded scans since any non-empty start >= empty end.
-        // We must explicitly handle the unbounded case.
-        if range.end.is_empty() || !range.is_empty() {
-            self.concurrency_manager
-                .check_range(&range.start, &range.end, ctx.start_ts)?;
-        }
-
         // MVCC scan: find the latest version of each key with commit_ts <= start_ts
+        // Note: Pending/aborted nodes are skipped by the iterator (pessimistic locking in storage)
         //
         // Build MVCC key range:
         // - Start: MvccKey::encode(range.start, MAX) - smallest MVCC key with this prefix
@@ -304,122 +308,251 @@ impl<S: StorageEngine + 'static, L: ClogService + 'static, T: TsoService> TxnSer
     }
 
     fn put(&self, ctx: &mut TxnCtx, key: Key, value: RawValue) -> Result<()> {
-        if ctx.state != TxnState::Active {
+        if ctx.state != TxnState::Running {
             return Err(TiSqlError::TransactionNotActive(format!("{:?}", ctx.state)));
         }
         if ctx.read_only {
             return Err(TiSqlError::ReadOnlyTransaction);
         }
-        ctx.write_buffer.put(key, value);
-        Ok(())
+
+        if ctx.is_explicit() {
+            // Explicit transaction: write pending node directly to storage
+            // This acquires the lock immediately (pessimistic locking)
+            match self.storage.put_pending(&key, value, ctx.start_ts) {
+                Ok(()) => {
+                    // Track key for commit/rollback
+                    ctx.add_locked_key(key);
+                    Ok(())
+                }
+                Err(lock_owner) => {
+                    // Key is locked by another transaction
+                    Err(TiSqlError::KeyIsLocked {
+                        key,
+                        lock_ts: lock_owner,
+                        primary: vec![], // Unknown for now
+                    })
+                }
+            }
+        } else {
+            // Implicit transaction: buffer the write
+            ctx.write_buffer.put(key, value);
+            Ok(())
+        }
     }
 
     fn delete(&self, ctx: &mut TxnCtx, key: Key) -> Result<()> {
-        if ctx.state != TxnState::Active {
+        if ctx.state != TxnState::Running {
             return Err(TiSqlError::TransactionNotActive(format!("{:?}", ctx.state)));
         }
         if ctx.read_only {
             return Err(TiSqlError::ReadOnlyTransaction);
         }
-        ctx.write_buffer.delete(key);
-        Ok(())
+
+        if ctx.is_explicit() {
+            // Explicit transaction: write pending tombstone directly to storage
+            // This acquires the lock immediately (pessimistic locking)
+            match self
+                .storage
+                .put_pending(&key, TOMBSTONE.to_vec(), ctx.start_ts)
+            {
+                Ok(()) => {
+                    // Track key for commit/rollback
+                    ctx.add_locked_key(key);
+                    Ok(())
+                }
+                Err(lock_owner) => {
+                    // Key is locked by another transaction
+                    Err(TiSqlError::KeyIsLocked {
+                        key,
+                        lock_ts: lock_owner,
+                        primary: vec![],
+                    })
+                }
+            }
+        } else {
+            // Implicit transaction: buffer the delete
+            ctx.write_buffer.delete(key);
+            Ok(())
+        }
     }
 
     fn commit(&self, mut ctx: TxnCtx) -> Result<CommitInfo> {
         Self::check_active(&ctx)?;
 
-        if ctx.write_buffer.is_empty() {
-            // No writes - just mark as committed
-            ctx.state = TxnState::Committed;
-            return Ok(CommitInfo {
-                txn_id: ctx.txn_id,
-                commit_ts: ctx.start_ts,
+        if ctx.is_explicit() {
+            // =================================================================
+            // Explicit Transaction Commit (Pessimistic Locking)
+            // =================================================================
+            // Pending writes are already in storage. We just need to:
+            // 1. Prepare (compute commit_ts)
+            // 2. Finalize pending nodes (set their ts to commit_ts)
+            // 3. Update txn state
+
+            let locked_keys = std::mem::take(&mut ctx.locked_keys);
+
+            if locked_keys.is_empty() {
+                // No writes - just mark as committed
+                self.concurrency_manager.remove_txn(ctx.start_ts);
+                ctx.state = TxnState::Committed {
+                    commit_ts: ctx.start_ts,
+                };
+                return Ok(CommitInfo {
+                    txn_id: ctx.txn_id,
+                    commit_ts: ctx.start_ts,
+                    lsn: 0,
+                });
+            }
+
+            // Get commit_ts: max(max_ts + 1, tso_ts)
+            // For OceanBase-style 1PC: prepared_ts = commit_ts
+            let max_ts = self.concurrency_manager.max_ts();
+            let tso_ts = self.get_ts();
+            let commit_ts = std::cmp::max(max_ts + 1, tso_ts);
+            let txn_id = ctx.txn_id;
+
+            // Prepare phase: register prepared state for visibility tracking
+            self.concurrency_manager
+                .prepare_txn(ctx.start_ts, commit_ts)?;
+
+            // Finalize all pending nodes by setting their commit_ts
+            // This makes the writes visible to readers with read_ts >= commit_ts
+            self.storage
+                .finalize_pending(&locked_keys, ctx.start_ts, commit_ts);
+
+            // Update state cache: Prepared -> Committed
+            self.concurrency_manager
+                .commit_txn(ctx.start_ts, commit_ts)?;
+
+            // Mark context as committed
+            ctx.state = TxnState::Committed { commit_ts };
+
+            // Note: For now, explicit transactions don't write to clog.
+            // TODO: Add clog support for explicit transactions
+            Ok(CommitInfo {
+                txn_id,
+                commit_ts,
                 lsn: 0,
-            });
+            })
+        } else {
+            // =================================================================
+            // Implicit Transaction Commit (Optimistic Locking)
+            // =================================================================
+            // Writes are buffered. We need to:
+            // 1. Acquire in-memory locks
+            // 2. Write to clog
+            // 3. Apply to storage
+
+            if ctx.write_buffer.is_empty() {
+                // No writes - just mark as committed
+                ctx.state = TxnState::Committed {
+                    commit_ts: ctx.start_ts,
+                };
+                return Ok(CommitInfo {
+                    txn_id: ctx.txn_id,
+                    commit_ts: ctx.start_ts,
+                    lsn: 0,
+                });
+            }
+
+            let txn_id = ctx.txn_id;
+            let start_ts = ctx.start_ts;
+
+            // Take ownership of write buffer (swap with empty)
+            let storage_batch = std::mem::take(&mut ctx.write_buffer);
+
+            // Phase 1: Acquire locks by writing pending nodes to storage.
+            // This prevents concurrent writers from conflicting.
+            let mut locked_keys: Vec<Key> = Vec::with_capacity(storage_batch.len());
+
+            for (key, op) in storage_batch.iter() {
+                let value = match op {
+                    WriteOp::Put { value } => value.clone(),
+                    WriteOp::Delete => TOMBSTONE.to_vec(),
+                };
+
+                match self.storage.put_pending(key, value, start_ts) {
+                    Ok(()) => {
+                        locked_keys.push(key.clone());
+                    }
+                    Err(lock_owner) => {
+                        // Conflict - abort all pending writes we made
+                        if !locked_keys.is_empty() {
+                            self.storage.abort_pending(&locked_keys, start_ts);
+                        }
+                        return Err(TiSqlError::KeyIsLocked {
+                            key: key.clone(),
+                            lock_ts: lock_owner,
+                            primary: vec![],
+                        });
+                    }
+                }
+            }
+
+            // FAILPOINT: After locks acquired, before commit_ts computation
+            #[cfg(feature = "failpoints")]
+            fail_point!("txn_after_lock_before_commit_ts");
+
+            // Phase 2: Get commit_ts AFTER acquiring locks
+            let max_ts = self.concurrency_manager.max_ts();
+            let tso_ts = self.get_ts();
+            let commit_ts = std::cmp::max(max_ts + 1, tso_ts);
+
+            // Write to commit log before finalizing (for durability)
+            let lsn = self
+                .clog_service
+                .write_batch(txn_id, &storage_batch, commit_ts, true)?;
+
+            // Phase 3: Finalize all pending nodes with commit_ts
+            self.storage
+                .finalize_pending(&locked_keys, start_ts, commit_ts);
+
+            // Mark as committed
+            ctx.state = TxnState::Committed { commit_ts };
+
+            Ok(CommitInfo {
+                txn_id,
+                commit_ts,
+                lsn,
+            })
         }
-
-        // Acquire in-memory locks BEFORE getting commit_ts.
-        // This prevents the "time-travel" anomaly where a reader with start_ts > commit_ts
-        // could miss data that commits after they started reading.
-        //
-        // By acquiring locks first:
-        // 1. Any concurrent reader will see the lock and be blocked
-        // 2. We then get commit_ts which is guaranteed > any concurrent reader's start_ts
-        //    because: each begin() calls get_ts() which updates max_ts, so
-        //    max_ts >= any_concurrent_reader.start_ts, and commit_ts = max(max_ts + 1, tso_ts)
-
-        // Select primary key deterministically: lexicographically smallest key.
-        // This is important for future 2PC/lock resolution:
-        // - Primary key must be stable and deterministic across retries
-        // - TiDB uses the first key in sorted order as primary
-        // - Once selected, the primary should not change for the transaction
-        //
-        // WriteBatch uses BTreeMap, so keys().next() gives the smallest key in O(1).
-        let primary_key: Arc<[u8]> = ctx
-            .write_buffer
-            .keys()
-            .next()
-            .map(|k| Arc::from(k.as_slice()))
-            .unwrap_or_else(|| Arc::from(&[][..]));
-
-        // Lock uses transaction's start_ts, not a fresh timestamp.
-        // This is critical for lock resolution in 2PC:
-        // - Readers use lock.ts to determine if the lock is from an old/stale txn
-        // - Lock resolvers check if txn with start_ts is still alive
-        // - Using start_ts ensures consistent behavior across all keys in the txn
-        let lock = Lock {
-            ts: ctx.start_ts,
-            primary: primary_key,
-        };
-
-        // lock_keys takes an iterator - no need to clone keys into a Vec
-        let _guards = self
-            .concurrency_manager
-            .lock_keys(ctx.write_buffer.keys(), lock)?;
-
-        // FAILPOINT: After locks acquired, before commit_ts computation
-        #[cfg(feature = "failpoints")]
-        fail_point!("txn_after_lock_before_commit_ts");
-
-        // Get commit_ts AFTER acquiring locks to ensure commit_ts > concurrent reader's start_ts
-        let max_ts = self.concurrency_manager.max_ts();
-        let tso_ts = self.get_ts();
-        let commit_ts = std::cmp::max(max_ts + 1, tso_ts);
-        let txn_id = ctx.txn_id;
-
-        // Take ownership of write buffer (swap with empty)
-        let mut storage_batch = std::mem::take(&mut ctx.write_buffer);
-
-        // Write to commit log directly from batch references (zero-copy).
-        // The clog serializes directly from &storage_batch without cloning key/value data.
-        let lsn = self
-            .clog_service
-            .write_batch(txn_id, &storage_batch, commit_ts, true)?;
-
-        // Apply to storage with commit_ts AND clog LSN for proper recovery ordering.
-        // Now we consume the batch (move ownership to storage).
-        storage_batch.set_commit_ts(commit_ts);
-        storage_batch.set_clog_lsn(lsn);
-        self.storage.write_batch(storage_batch)?;
-
-        // Mark as committed (guards will be dropped, releasing locks)
-        ctx.state = TxnState::Committed;
-
-        Ok(CommitInfo {
-            txn_id,
-            commit_ts,
-            lsn,
-        })
     }
 
     fn rollback(&self, mut ctx: TxnCtx) -> Result<()> {
         Self::check_active(&ctx)?;
 
-        // Clear write buffer
-        ctx.write_buffer.clear();
+        if ctx.is_explicit() {
+            // =================================================================
+            // Explicit Transaction Rollback (Pessimistic Locking)
+            // =================================================================
+            // Pending writes are in storage. We need to:
+            // 1. Abort pending nodes (mark as aborted so readers skip them)
+            // 2. Update txn state cache
 
-        // Mark as aborted
-        ctx.state = TxnState::Aborted;
+            let locked_keys = std::mem::take(&mut ctx.locked_keys);
+
+            // Abort all pending nodes in storage
+            if !locked_keys.is_empty() {
+                self.storage.abort_pending(&locked_keys, ctx.start_ts);
+            }
+
+            // Update state cache: Running -> Aborted, then remove
+            self.concurrency_manager.abort_txn(ctx.start_ts)?;
+            self.concurrency_manager.remove_txn(ctx.start_ts);
+
+            // Mark context as aborted
+            ctx.state = TxnState::Aborted;
+        } else {
+            // =================================================================
+            // Implicit Transaction Rollback (Optimistic Locking)
+            // =================================================================
+            // Writes are only in the buffer, not in storage
+
+            // Clear write buffer
+            ctx.write_buffer.clear();
+
+            // Mark as aborted
+            ctx.state = TxnState::Aborted;
+        }
 
         Ok(())
     }
@@ -702,25 +835,6 @@ mod tests {
         assert_eq!(v1, Some(b"value1".to_vec()));
         let v2 = get_for_test(&*storage, b"key2");
         assert_eq!(v2, Some(b"value2".to_vec()));
-    }
-
-    #[test]
-    fn test_autocommit_with_locking() {
-        let (storage, txn_service, _dir) = create_test_service();
-        let cm = txn_service.concurrency_manager();
-
-        // Before write, no locks
-        assert_eq!(cm.lock_count(), 0);
-
-        // Execute write
-        txn_service.autocommit_put(b"key1", b"value1").unwrap();
-
-        // After write, locks should be released
-        assert_eq!(cm.lock_count(), 0);
-
-        // Data should be there
-        let v = get_for_test(&*storage, b"key1");
-        assert_eq!(v, Some(b"value1".to_vec()));
     }
 
     #[test]
@@ -1293,72 +1407,187 @@ mod tests {
     }
 
     // ========================================================================
-    // Regression Test: Unbounded scan must check locks
+    // Explicit Transaction Tests (Pessimistic Locking)
     // ========================================================================
 
     #[test]
-    fn test_scan_unbounded_end_checks_locks() {
-        // Regression test for: Range::is_empty() returns true for unbounded end
-        // (vec![] is lexicographically smallest, so start >= [] is true),
-        // which caused lock checks to be skipped.
+    fn test_explicit_txn_begin() {
         let (_storage, txn_service, _dir) = create_test_service();
 
-        // Write some data
-        txn_service.autocommit_put(b"a", b"1").unwrap();
-        txn_service.autocommit_put(b"b", b"2").unwrap();
-        txn_service.autocommit_put(b"c", b"3").unwrap();
+        let ctx = txn_service.begin_explicit(false).unwrap();
 
-        // Directly acquire a lock using ConcurrencyManager to simulate a concurrent writer.
-        // This bypasses the transaction flow where locks are only held briefly during commit.
-        let cm = txn_service.concurrency_manager();
-        let lock = Lock {
-            ts: 100, // Lock timestamp
-            primary: Arc::from(&b"b"[..]),
-        };
-        let _guard = cm.lock_key(&b"b".to_vec(), &lock).unwrap();
+        assert!(ctx.start_ts() > 0);
+        assert!(ctx.is_valid());
+        assert!(!ctx.is_read_only());
+        assert!(ctx.is_explicit());
+    }
 
-        // Start a reader transaction with start_ts >= lock.ts (so it should be blocked)
-        // We need to advance the TSO past the lock timestamp
-        while txn_service.tso().last_ts() < 100 {
-            let _ = txn_service.tso().get_ts();
-        }
-        let read_ctx = txn_service.begin(true).unwrap();
-        assert!(
-            read_ctx.start_ts() >= 100,
-            "reader must have snapshot at or after lock.ts"
-        );
+    #[test]
+    fn test_explicit_txn_put_commit() {
+        let (storage, txn_service, _dir) = create_test_service();
 
-        // Unbounded end scan (empty vec) should check locks and fail
-        let result = txn_service.scan_iter(&read_ctx, b"a".to_vec()..vec![]);
-        match result {
-            Err(TiSqlError::KeyIsLocked { key, .. }) => {
-                assert_eq!(key, b"b", "should be locked on key 'b'");
-            }
-            Err(e) => panic!("expected KeyIsLocked, got {e:?}"),
-            Ok(_) => panic!("unbounded scan should be blocked by lock"),
-        }
+        // Start explicit transaction
+        let mut ctx = txn_service.begin_explicit(false).unwrap();
 
-        // Bounded scan containing the locked key should also fail
-        let result = txn_service.scan_iter(&read_ctx, b"a".to_vec()..b"d".to_vec());
-        match result {
-            Err(TiSqlError::KeyIsLocked { .. }) => {}
-            Err(e) => panic!("expected KeyIsLocked, got {e:?}"),
-            Ok(_) => panic!("bounded scan should also be blocked by lock"),
-        }
+        // Put via explicit transaction (pessimistic: writes go to storage immediately)
+        txn_service
+            .put(&mut ctx, b"key1".to_vec(), b"value1".to_vec())
+            .unwrap();
 
-        // Bounded scan NOT containing the locked key should succeed
-        let result = txn_service.scan_iter(&read_ctx, b"c".to_vec()..b"d".to_vec());
-        assert!(
-            result.is_ok(),
-            "scan not containing locked key should succeed"
-        );
+        // Key should be tracked
+        assert_eq!(ctx.locked_keys.len(), 1);
+        assert_eq!(ctx.locked_keys[0], b"key1".to_vec());
 
-        // Drop the lock guard to release the lock
-        drop(_guard);
+        // Commit
+        let info = txn_service.commit(ctx).unwrap();
+        assert!(info.commit_ts > 0);
 
-        // Now the scan should succeed
-        let new_read_ctx = txn_service.begin(true).unwrap();
-        let result = txn_service.scan_iter(&new_read_ctx, b"a".to_vec()..vec![]);
-        assert!(result.is_ok(), "scan should succeed after lock released");
+        // Data should be visible in storage
+        let value = get_for_test(&*storage, b"key1");
+        assert_eq!(value, Some(b"value1".to_vec()));
+    }
+
+    #[test]
+    fn test_explicit_txn_put_rollback() {
+        let (storage, txn_service, _dir) = create_test_service();
+
+        // Start explicit transaction
+        let mut ctx = txn_service.begin_explicit(false).unwrap();
+
+        // Put via explicit transaction
+        txn_service
+            .put(&mut ctx, b"key1".to_vec(), b"value1".to_vec())
+            .unwrap();
+
+        // Rollback
+        txn_service.rollback(ctx).unwrap();
+
+        // Data should NOT be visible in storage (pending node is aborted)
+        let value = get_for_test(&*storage, b"key1");
+        assert!(value.is_none());
+    }
+
+    #[test]
+    fn test_explicit_txn_delete_commit() {
+        let (storage, txn_service, _dir) = create_test_service();
+
+        // First commit a value (via implicit txn)
+        txn_service.autocommit_put(b"key1", b"value1").unwrap();
+        assert_eq!(get_for_test(&*storage, b"key1"), Some(b"value1".to_vec()));
+
+        // Start explicit transaction
+        let mut ctx = txn_service.begin_explicit(false).unwrap();
+
+        // Delete via explicit transaction
+        txn_service.delete(&mut ctx, b"key1".to_vec()).unwrap();
+
+        // Commit
+        txn_service.commit(ctx).unwrap();
+
+        // Data should be deleted
+        let value = get_for_test(&*storage, b"key1");
+        assert!(value.is_none());
+    }
+
+    #[test]
+    fn test_explicit_txn_multiple_writes() {
+        let (storage, txn_service, _dir) = create_test_service();
+
+        // Start explicit transaction
+        let mut ctx = txn_service.begin_explicit(false).unwrap();
+
+        // Multiple puts
+        txn_service
+            .put(&mut ctx, b"key1".to_vec(), b"value1".to_vec())
+            .unwrap();
+        txn_service
+            .put(&mut ctx, b"key2".to_vec(), b"value2".to_vec())
+            .unwrap();
+        txn_service
+            .put(&mut ctx, b"key3".to_vec(), b"value3".to_vec())
+            .unwrap();
+
+        // All keys should be tracked
+        assert_eq!(ctx.locked_keys.len(), 3);
+
+        // Commit
+        txn_service.commit(ctx).unwrap();
+
+        // All data should be visible
+        assert_eq!(get_for_test(&*storage, b"key1"), Some(b"value1".to_vec()));
+        assert_eq!(get_for_test(&*storage, b"key2"), Some(b"value2".to_vec()));
+        assert_eq!(get_for_test(&*storage, b"key3"), Some(b"value3".to_vec()));
+    }
+
+    #[test]
+    fn test_explicit_txn_update_same_key() {
+        let (storage, txn_service, _dir) = create_test_service();
+
+        // Start explicit transaction
+        let mut ctx = txn_service.begin_explicit(false).unwrap();
+
+        // Write key twice within same transaction
+        txn_service
+            .put(&mut ctx, b"key1".to_vec(), b"v1".to_vec())
+            .unwrap();
+        txn_service
+            .put(&mut ctx, b"key1".to_vec(), b"v2".to_vec())
+            .unwrap();
+
+        // Key should only be tracked once
+        assert_eq!(ctx.locked_keys.len(), 1);
+
+        // Commit
+        txn_service.commit(ctx).unwrap();
+
+        // Should see latest value
+        let value = get_for_test(&*storage, b"key1");
+        assert_eq!(value, Some(b"v2".to_vec()));
+    }
+
+    #[test]
+    fn test_explicit_txn_read_only_rejects_writes() {
+        let (_storage, txn_service, _dir) = create_test_service();
+
+        let mut ctx = txn_service.begin_explicit(true).unwrap();
+
+        // Put should error for read-only explicit transaction
+        let result = txn_service.put(&mut ctx, b"key1".to_vec(), b"value1".to_vec());
+        assert!(result.is_err());
+        assert!(matches!(
+            result.unwrap_err(),
+            TiSqlError::ReadOnlyTransaction
+        ));
+
+        // No keys should be locked
+        assert!(ctx.locked_keys.is_empty());
+
+        // Commit should succeed (no-op for read-only)
+        let info = txn_service.commit(ctx).unwrap();
+        assert_eq!(info.lsn, 0);
+    }
+
+    #[test]
+    fn test_explicit_txn_empty_commit() {
+        let (_storage, txn_service, _dir) = create_test_service();
+
+        // Start explicit transaction but don't write anything
+        let ctx = txn_service.begin_explicit(false).unwrap();
+        assert!(ctx.locked_keys.is_empty());
+
+        // Commit should succeed (no-op)
+        let info = txn_service.commit(ctx).unwrap();
+        assert_eq!(info.lsn, 0);
+    }
+
+    #[test]
+    fn test_explicit_txn_empty_rollback() {
+        let (_storage, txn_service, _dir) = create_test_service();
+
+        // Start explicit transaction but don't write anything
+        let ctx = txn_service.begin_explicit(false).unwrap();
+
+        // Rollback should succeed (no-op)
+        txn_service.rollback(ctx).unwrap();
     }
 }

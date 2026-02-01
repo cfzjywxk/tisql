@@ -17,7 +17,8 @@
 //! This module provides transaction management with durability guarantees.
 //! Concurrency control is handled by:
 //! - `TsoService` (separate module) - timestamp allocation
-//! - `ConcurrencyManager` - in-memory lock table and max_ts tracking
+//! - `ConcurrencyManager` - max_ts tracking and transaction state management
+//! - `PessimisticStorage` - lock management via pending nodes in storage
 //!
 //! ## Design Pattern
 //!
@@ -31,7 +32,7 @@
 //! - [`TxnCtx`]: Transaction context holding state (passed to operations)
 //! - [`CommitInfo`]: Information returned after successful commit
 //! - `TsoService` (in `tso` module): Timestamp allocation (start_ts, commit_ts)
-//! - `ConcurrencyManager`: In-memory lock table for 1PC atomicity
+//! - `ConcurrencyManager`: max_ts tracking and TxnStateCache
 //!
 //! ## Design Principles
 //!
@@ -39,7 +40,7 @@
 //! 2. **Context-based**: Transaction state is in `TxnCtx`, passed to operations
 //! 3. **No read-only distinction at API level**: Even "reads" may write in
 //!    distributed transactions (lock resolution, min_commit_ts push)
-//! 4. **Separated concerns**: TSO is a standalone service, ConcurrencyManager only tracks locks
+//! 4. **Separated concerns**: TSO allocates timestamps, storage handles locks
 //!
 //! ## Example
 //!
@@ -60,11 +61,12 @@
 mod api;
 mod concurrency;
 mod service;
+mod txn_state_cache;
 
 // Public API - only expose traits and types needed by consumers
 pub use api::{CommitInfo, IsolationLevel, TxnCtx, TxnService, TxnState};
 
 // Implementation types - not re-exported from lib.rs main API
 // Available via testkit for integration tests
-pub use concurrency::{ConcurrencyManager, Lock};
+pub use concurrency::ConcurrencyManager;
 pub use service::TransactionService;

@@ -1876,6 +1876,7 @@ dependencies = [
  "criterion",
  "crossbeam-epoch",
  "crossbeam-skiplist",
+ "dashmap",
  "fail",
  "num_cpus",
  "opensrv-mysql",

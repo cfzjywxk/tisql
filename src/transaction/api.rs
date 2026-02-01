@@ -46,13 +46,39 @@ use crate::error::Result;
 use crate::storage::{MvccIterator, WriteBatch};
 use crate::types::{Key, Lsn, RawValue, Timestamp, TxnId};
 
-/// Transaction state machine.
+/// Transaction state machine for OceanBase-style pessimistic locking.
+///
+/// State transitions:
+/// ```text
+///            BEGIN ───────► Running
+///                              │
+///                   PREPARE    │   (prepared_ts = max(max_ts, tso_ts))
+///                              ▼
+///                          Prepared ◄─── Readers with read_ts > prepared_ts
+///                              │         must wait (KeyIsLocked)
+///              ┌───────────────┼───────────────┐
+///              │               │               │
+///     COMMIT   │               │               │  ROLLBACK
+///              ▼               │               ▼
+///         Committed            │           Aborted
+/// ```
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum TxnState {
-    /// Transaction is active and can perform operations.
-    Active,
+    /// Transaction is actively executing (can perform reads and writes).
+    Running,
+    /// Transaction has prepared, waiting for commit.
+    /// The prepared_ts ensures atomic visibility: readers with read_ts > prepared_ts
+    /// must wait because they cannot determine if commit_ts will be <= read_ts.
+    Prepared {
+        /// prepared_ts = max(current_max_ts, tso_ts)
+        prepared_ts: crate::types::Timestamp,
+    },
     /// Transaction has been committed.
-    Committed,
+    /// commit_ts = prepared_ts for single-server 1PC.
+    Committed {
+        /// The commit timestamp at which all writes became visible.
+        commit_ts: crate::types::Timestamp,
+    },
     /// Transaction has been aborted/rolled back.
     Aborted,
 }
@@ -64,6 +90,13 @@ pub enum TxnState {
 ///
 /// The context is created by `TxnService::begin()` and consumed by
 /// `commit()` or `rollback()`.
+///
+/// ## Explicit vs Implicit Transactions
+///
+/// - **Explicit**: Started with BEGIN/START TRANSACTION, ended with COMMIT/ROLLBACK.
+///   Uses pessimistic locking - writes acquire locks immediately.
+/// - **Implicit**: Auto-commit mode (default). Each statement is a transaction.
+///   Uses optimistic approach - locks acquired only at commit time.
 #[derive(Debug)]
 pub struct TxnCtx {
     /// Unique transaction ID.
@@ -74,19 +107,60 @@ pub struct TxnCtx {
     pub(crate) state: TxnState,
     /// Whether this is a read-only transaction.
     pub(crate) read_only: bool,
-    /// Buffered writes (for read-write transactions).
+    /// Whether this is an explicit transaction (started with BEGIN).
+    /// Explicit transactions use pessimistic locking.
+    pub(crate) explicit: bool,
+    /// Buffered writes (for optimistic/implicit transactions).
+    /// For pessimistic transactions, writes go directly to storage with pending status.
     pub(crate) write_buffer: WriteBatch,
+    /// Keys that have been locked by this transaction (for pessimistic transactions).
+    /// Used for commit (finalize) and rollback (abort) operations.
+    pub(crate) locked_keys: Vec<Key>,
 }
 
 impl TxnCtx {
-    /// Create a new transaction context.
+    /// Create a new implicit (auto-commit) transaction context.
+    ///
+    /// Implicit transactions use optimistic locking - writes are buffered
+    /// and locks are acquired only at commit time.
     pub(crate) fn new(txn_id: TxnId, start_ts: Timestamp, read_only: bool) -> Self {
         Self {
             txn_id,
             start_ts,
-            state: TxnState::Active,
+            state: TxnState::Running,
             read_only,
+            explicit: false,
             write_buffer: WriteBatch::new(),
+            locked_keys: Vec::new(),
+        }
+    }
+
+    /// Create a new explicit transaction context.
+    ///
+    /// Explicit transactions use pessimistic locking - writes acquire locks
+    /// immediately and go directly to storage with pending status.
+    pub(crate) fn new_explicit(txn_id: TxnId, start_ts: Timestamp, read_only: bool) -> Self {
+        Self {
+            txn_id,
+            start_ts,
+            state: TxnState::Running,
+            read_only,
+            explicit: true,
+            write_buffer: WriteBatch::new(),
+            locked_keys: Vec::new(),
+        }
+    }
+
+    /// Check if this is an explicit transaction (started with BEGIN).
+    #[inline]
+    pub fn is_explicit(&self) -> bool {
+        self.explicit
+    }
+
+    /// Add a key to the list of locked keys (for pessimistic transactions).
+    pub(crate) fn add_locked_key(&mut self, key: Key) {
+        if !self.locked_keys.contains(&key) {
+            self.locked_keys.push(key);
         }
     }
 
@@ -111,7 +185,7 @@ impl TxnCtx {
     /// Check if the transaction is still valid (active).
     #[inline]
     pub fn is_valid(&self) -> bool {
-        self.state == TxnState::Active
+        matches!(self.state, TxnState::Running | TxnState::Prepared { .. })
     }
 
     /// Get the current state.
@@ -181,11 +255,23 @@ pub trait TxnService: Send + Sync {
 
     // === Factory ===
 
-    /// Begin a new transaction.
+    /// Begin a new implicit (auto-commit) transaction.
     ///
     /// Allocates a `start_ts` from TSO and returns a transaction context.
     /// If `read_only` is true, write operations will error.
+    ///
+    /// Implicit transactions use optimistic locking - writes are buffered
+    /// and locks are only acquired at commit time.
     fn begin(&self, read_only: bool) -> Result<TxnCtx>;
+
+    /// Begin a new explicit transaction (BEGIN/START TRANSACTION).
+    ///
+    /// Allocates a `start_ts` from TSO and returns a transaction context
+    /// marked as explicit. If `read_only` is true, write operations will error.
+    ///
+    /// Explicit transactions use pessimistic locking - writes acquire locks
+    /// immediately and are written to storage as pending entries.
+    fn begin_explicit(&self, read_only: bool) -> Result<TxnCtx>;
 
     // === Data Operations ===
 
@@ -288,7 +374,7 @@ mod tests {
         assert_eq!(ctx.start_ts(), 100);
         assert!(!ctx.is_read_only());
         assert!(ctx.is_valid());
-        assert_eq!(ctx.state(), TxnState::Active);
+        assert_eq!(ctx.state(), TxnState::Running);
     }
 
     #[test]
