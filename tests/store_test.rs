@@ -68,6 +68,25 @@ mod crud {
     }
 
     #[test]
+    fn test_update_with_expression() {
+        let tk = TestKit::new();
+
+        tk.must_exec("CREATE TABLE t (a INT PRIMARY KEY, b INT)");
+        tk.must_exec("INSERT INTO t VALUES (1, 11)");
+        tk.must_exec("INSERT INTO t VALUES (2, 22)");
+
+        // Update using column reference in expression (e.g., b = b + 1)
+        tk.must_exec("UPDATE t SET b = b + 1").check_affected(2);
+        tk.must_query("SELECT a, b FROM t ORDER BY a")
+            .check(rows![["1", "12"], ["2", "23"]]);
+
+        // Update primary key column with expression
+        tk.must_exec("UPDATE t SET a = a + 10").check_affected(2);
+        tk.must_query("SELECT a, b FROM t ORDER BY a")
+            .check(rows![["11", "12"], ["12", "23"]]);
+    }
+
+    #[test]
     fn test_delete() {
         let tk = TestKit::new();
 

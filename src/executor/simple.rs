@@ -805,14 +805,24 @@ impl SimpleExecutor {
         let r = self.value_to_f64(right)?;
         let result = op(l, r);
 
-        match (left, right) {
-            (Value::BigInt(_), Value::BigInt(_)) if result.fract() == 0.0 => {
-                Ok(Value::BigInt(result as i64))
-            }
-            (Value::Int(_), Value::Int(_)) if result.fract() == 0.0 => {
-                Ok(Value::Int(result as i32))
-            }
-            _ => Ok(Value::Double(result)),
+        // Check if both operands are integer types (any combination)
+        let left_is_int = matches!(
+            left,
+            Value::TinyInt(_) | Value::SmallInt(_) | Value::Int(_) | Value::BigInt(_)
+        );
+        let right_is_int = matches!(
+            right,
+            Value::TinyInt(_) | Value::SmallInt(_) | Value::Int(_) | Value::BigInt(_)
+        );
+
+        if left_is_int && right_is_int && result.fract() == 0.0 {
+            // Both are integers and result has no fractional part - return BigInt
+            // (BigInt can represent all integer types without loss)
+            Ok(Value::BigInt(result as i64))
+        } else if matches!((left, right), (Value::Float(_), _) | (_, Value::Float(_))) {
+            Ok(Value::Float(result as f32))
+        } else {
+            Ok(Value::Double(result))
         }
     }
 
