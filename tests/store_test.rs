@@ -910,4 +910,30 @@ mod duplicate_key {
             "Expected PRIMARY KEY required error, got: {err}"
         );
     }
+
+    #[test]
+    fn test_update_all_rows_pk_increment_collision() {
+        // Reproduces the scenario from the user bug report:
+        // When UPDATE SET a = a + 1 is run on a table with rows (a=1, a=2),
+        // updating a=1 to a=2 should fail because a=2 already exists.
+        let tk = TestKit::new();
+
+        tk.must_exec("CREATE TABLE t (a INT PRIMARY KEY, b INT)");
+        tk.must_exec("INSERT INTO t VALUES (1, 11)");
+        tk.must_exec("INSERT INTO t VALUES (2, 22)");
+
+        tk.must_query("SELECT a, b FROM t ORDER BY a")
+            .check(rows![["1", "11"], ["2", "22"]]);
+
+        // This should fail: a=1 → a=2 conflicts with existing a=2
+        let err = tk.must_exec_err("UPDATE t SET a = a + 1");
+        assert!(
+            err.contains("Duplicate") || err.contains("duplicate"),
+            "Expected duplicate key error, got: {err}"
+        );
+
+        // Data should be unchanged
+        tk.must_query("SELECT a, b FROM t ORDER BY a")
+            .check(rows![["1", "11"], ["2", "22"]]);
+    }
 }

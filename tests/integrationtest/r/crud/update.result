@@ -27,5 +27,5 @@ UPDATE t_update SET val = val + 1 WHERE id = 1
 AFFECTED 1
 SELECT id, val, name FROM t_update WHERE id = 1
 id	val	name
-1	0	first
+1	151	first
 DROP TABLE t_update
