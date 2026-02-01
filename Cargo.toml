@@ -82,3 +82,24 @@ path = "tests/store_test.rs"
 [[test]]
 name = "concurrency_test"
 path = "tests/concurrency_test.rs"
+
+# ============================================================================
+# Profile settings for debugging
+# ============================================================================
+
+[profile.dev]
+# Full debug info (level 2) - includes all symbols, line numbers, variable names
+debug = 2
+# No optimization - makes debugging much easier (variables won't be optimized out)
+opt-level = 0
+# Disable LTO for faster builds and better debugging
+lto = false
+# Include debug assertions
+debug-assertions = true
+# Overflow checks
+overflow-checks = true
+
+# Release profile with debug info (useful for profiling)
+[profile.release-with-debug]
+inherits = "release"
+debug = 2

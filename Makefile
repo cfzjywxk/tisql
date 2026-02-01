@@ -44,9 +44,9 @@ fmt-check:
 clippy:
 	cargo clippy --all-targets -- -D warnings
 
-# Format and lint - run before pushing to pass CI
+# Format, lint, and test - run before pushing to pass CI
 prepare:
-	cargo fmt && cargo clippy --all-targets -- -D warnings
+	cargo fmt && cargo clippy --all-targets -- -D warnings && $(MAKE) e2e-test
 
 # Run all CI checks locally
 ci: fmt-check clippy test
@@ -80,7 +80,7 @@ help:
 	@echo "  fmt          Format code"
 	@echo "  fmt-check    Check code formatting"
 	@echo "  clippy       Run clippy linter"
-	@echo "  prepare      Format and lint (run before push)"
+	@echo "  prepare      Format, lint, and E2E test (run before push)"
 	@echo "  ci           Run all CI checks locally"
 	@echo "  clean        Clean build artifacts"
 	@echo "  run          Run the server (debug)"
