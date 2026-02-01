@@ -19,6 +19,7 @@ pub(crate) use simple::SimpleExecutor;
 
 use crate::catalog::Catalog;
 use crate::error::Result;
+use crate::session::Session;
 use crate::sql::LogicalPlan;
 use crate::transaction::TxnService;
 use crate::types::{Row, Schema};
@@ -38,6 +39,7 @@ pub enum ExecutionResult {
 /// All statement execution goes through the transaction service:
 /// - Read statements: TxnService.begin(true) creates read-only transaction
 /// - Write statements: TxnService.begin(false) + commit() with durability
+/// - Transaction control: BEGIN/COMMIT/ROLLBACK managed via Session
 pub trait Executor {
     /// Execute a logical plan through the transaction service.
     ///
@@ -54,5 +56,22 @@ pub trait Executor {
         plan: LogicalPlan,
         txn_service: &T,
         catalog: &C,
+    ) -> Result<ExecutionResult>;
+
+    /// Execute a logical plan with session context for explicit transactions.
+    ///
+    /// This method is used when a Session is available to manage transaction state
+    /// across multiple statements. It handles:
+    /// - BEGIN: Creates explicit transaction, stores in session
+    /// - COMMIT: Commits session's active transaction
+    /// - ROLLBACK: Rolls back session's active transaction
+    /// - Other statements: Uses session's active transaction if present,
+    ///   otherwise creates implicit transaction
+    fn execute_with_session<T: TxnService, C: Catalog>(
+        &self,
+        plan: LogicalPlan,
+        txn_service: &T,
+        catalog: &C,
+        session: &mut Session,
     ) -> Result<ExecutionResult>;
 }

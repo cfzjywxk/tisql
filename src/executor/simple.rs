@@ -20,6 +20,7 @@
 
 use crate::catalog::Catalog;
 use crate::error::{Result, TiSqlError};
+use crate::session::Session;
 use crate::sql::{AggFunc, BinaryOp, Expr, LogicalPlan, UnaryOp};
 use crate::storage::{
     decode_row_to_values, encode_int_key, encode_key, encode_pk, encode_row, MvccIterator,
@@ -58,9 +59,130 @@ impl Executor for SimpleExecutor {
             self.execute_read(plan, txn_service, catalog)
         }
     }
+
+    fn execute_with_session<T: TxnService, C: Catalog>(
+        &self,
+        plan: LogicalPlan,
+        txn_service: &T,
+        catalog: &C,
+        session: &mut Session,
+    ) -> Result<ExecutionResult> {
+        // Handle transaction control statements
+        if plan.is_transaction_control() {
+            return self.execute_transaction_control(plan, txn_service, session);
+        }
+
+        // Handle session-level commands (USE database is handled at protocol layer)
+        if let LogicalPlan::UseDatabase { .. } = &plan {
+            return Ok(ExecutionResult::Ok);
+        }
+
+        // Check if there's an active explicit transaction
+        if session.has_active_txn() {
+            // Execute within the existing transaction
+            if plan.is_write() {
+                self.execute_write_in_txn(plan, txn_service, catalog, session)
+            } else {
+                // For reads in explicit transaction, use the session's transaction context
+                let ctx = session.current_txn().unwrap();
+                self.execute_with_ctx(plan, ctx, txn_service, catalog)
+            }
+        } else {
+            // No active transaction - use auto-commit mode (implicit transactions)
+            self.execute(plan, txn_service, catalog)
+        }
+    }
 }
 
 impl SimpleExecutor {
+    // ========================================================================
+    // Transaction Control Methods
+    // ========================================================================
+
+    /// Execute transaction control statements (BEGIN, COMMIT, ROLLBACK).
+    fn execute_transaction_control<T: TxnService>(
+        &self,
+        plan: LogicalPlan,
+        txn_service: &T,
+        session: &mut Session,
+    ) -> Result<ExecutionResult> {
+        match plan {
+            LogicalPlan::Begin { read_only } => {
+                // Check if there's already an active transaction
+                if session.has_active_txn() {
+                    // MySQL implicitly commits when BEGIN is issued with active transaction
+                    // For now, we just error out - can change to implicit commit later
+                    return Err(TiSqlError::Internal(
+                        "Nested transactions are not supported. Use COMMIT or ROLLBACK first."
+                            .into(),
+                    ));
+                }
+
+                // Start an explicit transaction
+                let ctx = txn_service.begin_explicit(read_only)?;
+                session.set_current_txn(ctx);
+                Ok(ExecutionResult::Ok)
+            }
+
+            LogicalPlan::Commit => {
+                // Take the transaction from the session
+                if let Some(ctx) = session.take_current_txn() {
+                    // Commit the transaction
+                    txn_service.commit(ctx)?;
+                }
+                // If no active transaction, COMMIT is a no-op (MySQL behavior)
+                Ok(ExecutionResult::Ok)
+            }
+
+            LogicalPlan::Rollback => {
+                // Take the transaction from the session
+                if let Some(ctx) = session.take_current_txn() {
+                    // Rollback the transaction
+                    txn_service.rollback(ctx)?;
+                }
+                // If no active transaction, ROLLBACK is a no-op (MySQL behavior)
+                Ok(ExecutionResult::Ok)
+            }
+
+            _ => Err(TiSqlError::Execution(
+                "Not a transaction control statement".into(),
+            )),
+        }
+    }
+
+    /// Execute a write operation within an existing explicit transaction.
+    ///
+    /// Unlike `execute_write`, this method does NOT commit after the operation.
+    /// The transaction remains open for more statements until COMMIT or ROLLBACK.
+    fn execute_write_in_txn<T: TxnService, C: Catalog>(
+        &self,
+        plan: LogicalPlan,
+        txn_service: &T,
+        catalog: &C,
+        session: &mut Session,
+    ) -> Result<ExecutionResult> {
+        // DDL operations should commit current transaction first (MySQL behavior)
+        // For now, we just error out
+        if plan.is_ddl() {
+            return Err(TiSqlError::Internal(
+                "DDL statements are not allowed within explicit transactions. Use COMMIT first."
+                    .into(),
+            ));
+        }
+
+        // Get mutable reference to the transaction context
+        let ctx = session
+            .current_txn_mut()
+            .ok_or_else(|| TiSqlError::Internal("No active transaction".into()))?;
+
+        // Execute the write operation (buffered in transaction, not committed)
+        self.execute_write_with_ctx(plan, ctx, txn_service, catalog)
+    }
+
+    // ========================================================================
+    // Auto-Commit Mode Methods (Implicit Transactions)
+    // ========================================================================
+
     /// Execute a read-only plan using a read-only transaction.
     ///
     /// Creates a transaction with read_only=true, which allocates start_ts

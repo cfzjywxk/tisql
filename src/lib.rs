@@ -221,6 +221,30 @@ impl SQLEngine {
         // TODO: Use query_ctx for execution options (priority, isolation level, etc.)
         self.executor.execute(plan, txn_service, catalog)
     }
+
+    /// Execute SQL with session context for explicit transaction support.
+    ///
+    /// This method handles transaction control statements (BEGIN, COMMIT, ROLLBACK)
+    /// and uses the session's active transaction context when available.
+    fn handle_mp_query_with_session<T: TxnService, C: Catalog>(
+        &self,
+        sql: &str,
+        query_ctx: &session::QueryCtx,
+        txn_service: &T,
+        catalog: &C,
+        session: &mut session::Session,
+    ) -> Result<ExecutionResult> {
+        // Parse SQL text into AST
+        let stmt = self.parser.parse_one(sql)?;
+
+        // Bind to logical plan
+        let binder = Binder::new(catalog, &query_ctx.current_db);
+        let plan = binder.bind(stmt)?;
+
+        // Execute with session context for transaction control
+        self.executor
+            .execute_with_session(plan, txn_service, catalog, session)
+    }
 }
 
 // ============================================================================
@@ -339,10 +363,11 @@ impl Database {
         self.handle_mp_query_with_ctx(sql, &query_ctx)
     }
 
-    /// Handle MySQL protocol query text with a Session.
+    /// Handle MySQL protocol query text with a Session (immutable).
     ///
-    /// This is the preferred method - it creates a QueryCtx from the Session
-    /// before executing the statement.
+    /// This method creates a QueryCtx from the Session before executing.
+    /// For explicit transaction support (BEGIN/COMMIT/ROLLBACK), use
+    /// `handle_mp_query_with_session_mut` instead.
     pub fn handle_mp_query_with_session(
         &self,
         sql: &str,
@@ -350,6 +375,75 @@ impl Database {
     ) -> Result<QueryResult> {
         let query_ctx = session.new_query_ctx();
         self.handle_mp_query_with_ctx(sql, &query_ctx)
+    }
+
+    /// Handle MySQL protocol query text with mutable Session for transaction control.
+    ///
+    /// This is the preferred method for the protocol layer - it supports:
+    /// - BEGIN / START TRANSACTION: Starts explicit transaction
+    /// - COMMIT: Commits the current explicit transaction
+    /// - ROLLBACK: Rolls back the current explicit transaction
+    /// - Other statements: Uses session's active transaction or auto-commit mode
+    pub fn handle_mp_query_with_session_mut(
+        &self,
+        sql: &str,
+        session: &mut session::Session,
+    ) -> Result<QueryResult> {
+        let timer = Timer::new("query");
+        let query_ctx = session.new_query_ctx();
+
+        // Use session-aware execution for transaction control
+        let result = self.sql_engine.handle_mp_query_with_session(
+            sql,
+            &query_ctx,
+            self.txn_service.as_ref(),
+            &self.catalog,
+            session,
+        )?;
+
+        // Convert ExecutionResult to QueryResult
+        let query_result = match result {
+            ExecutionResult::Rows { schema, rows } => {
+                let row_count = rows.len();
+                let columns: Vec<String> = schema
+                    .columns()
+                    .iter()
+                    .map(|c| c.name().to_string())
+                    .collect();
+                let data: Vec<Vec<String>> = rows
+                    .iter()
+                    .map(|row| row.iter().map(value_to_string).collect())
+                    .collect();
+
+                log_trace!(
+                    "SQL: {} | elapsed={:.3}ms rows={}",
+                    truncate_sql(sql, 50),
+                    timer.elapsed_ms(),
+                    row_count
+                );
+
+                QueryResult::Rows { columns, data }
+            }
+            ExecutionResult::Affected { count } => {
+                log_trace!(
+                    "SQL: {} | elapsed={:.3}ms affected={}",
+                    truncate_sql(sql, 50),
+                    timer.elapsed_ms(),
+                    count
+                );
+                QueryResult::Affected(count)
+            }
+            ExecutionResult::Ok => {
+                log_trace!(
+                    "SQL: {} | elapsed={:.3}ms",
+                    truncate_sql(sql, 50),
+                    timer.elapsed_ms()
+                );
+                QueryResult::Ok
+            }
+        };
+
+        Ok(query_result)
     }
 
     /// Handle MySQL protocol query text with a QueryCtx.

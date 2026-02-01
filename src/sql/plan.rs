@@ -117,6 +117,27 @@ pub enum LogicalPlan {
 
     /// USE database (session-level command)
     UseDatabase { db_name: String },
+
+    // ========================================================================
+    // Transaction Control Statements
+    // ========================================================================
+    /// BEGIN / START TRANSACTION
+    ///
+    /// Starts an explicit transaction. If `read_only` is true, the transaction
+    /// cannot perform write operations.
+    Begin { read_only: bool },
+
+    /// COMMIT
+    ///
+    /// Commits the current explicit transaction. If no transaction is active,
+    /// this is a no-op (MySQL behavior).
+    Commit,
+
+    /// ROLLBACK
+    ///
+    /// Rolls back the current explicit transaction. If no transaction is active,
+    /// this is a no-op (MySQL behavior).
+    Rollback,
 }
 
 impl LogicalPlan {
@@ -137,6 +158,25 @@ impl LogicalPlan {
         matches!(
             self,
             LogicalPlan::CreateTable { .. } | LogicalPlan::DropTable { .. }
+        )
+    }
+
+    /// Check if this plan is a transaction control statement (BEGIN/COMMIT/ROLLBACK)
+    pub fn is_transaction_control(&self) -> bool {
+        matches!(
+            self,
+            LogicalPlan::Begin { .. } | LogicalPlan::Commit | LogicalPlan::Rollback
+        )
+    }
+
+    /// Check if this plan is a session-level command (USE, transaction control)
+    pub fn is_session_command(&self) -> bool {
+        matches!(
+            self,
+            LogicalPlan::UseDatabase { .. }
+                | LogicalPlan::Begin { .. }
+                | LogicalPlan::Commit
+                | LogicalPlan::Rollback
         )
     }
 }

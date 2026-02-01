@@ -34,16 +34,36 @@
 //!       │     ├── autocommit
 //!       │     └── timezone, sql_mode, etc.
 //!       │
+//!       ├── current_txn: Option<TxnCtx> (explicit transaction state)
+//!       │
 //!       └── For each SQL statement:
 //!             └── QueryCtx (statement lifetime)
 //!                   ├── statement_id
 //!                   ├── priority
 //!                   └── inherited from SessionVars
 //! ```
+//!
+//! ## Explicit Transaction Lifecycle
+//!
+//! ```text
+//! BEGIN ─────────► current_txn = Some(TxnCtx)
+//!                        │
+//!           ┌────────────┴────────────┐
+//!           │ (execute statements     │
+//!           │  using current_txn)     │
+//!           └────────────┬────────────┘
+//!                        │
+//!        ┌───────────────┼───────────────┐
+//!        │               │               │
+//!    COMMIT          (error)        ROLLBACK
+//!        │               │               │
+//!        ▼               ▼               ▼
+//!   current_txn = None  (keep txn)  current_txn = None
+//! ```
 
 use std::sync::atomic::{AtomicU64, Ordering};
 
-use crate::transaction::IsolationLevel;
+use crate::transaction::{IsolationLevel, TxnCtx};
 
 // ============================================================================
 // Session ID Generator
@@ -148,9 +168,17 @@ pub struct Session {
 
     /// Session-level variables
     vars: SessionVars,
+
+    /// Active transaction context for explicit transactions.
+    ///
+    /// - `None`: No explicit transaction active (auto-commit mode)
+    /// - `Some(ctx)`: Explicit transaction in progress (started with BEGIN)
+    ///
+    /// When `current_txn` is `Some`, all statements use this context
+    /// instead of creating implicit transactions.
+    current_txn: Option<TxnCtx>,
     // Future: Add more session state
     // - prepared_stmts: HashMap<u32, PreparedStmt>
-    // - txn_ctx: Option<TransactionContext>
     // - last_insert_id: u64
     // - found_rows: u64
     // - user: Option<UserIdentity>
@@ -162,6 +190,7 @@ impl Session {
         Self {
             id: alloc_session_id(),
             vars: SessionVars::new(),
+            current_txn: None,
         }
     }
 
@@ -170,6 +199,7 @@ impl Session {
         Self {
             id,
             vars: SessionVars::new(),
+            current_txn: None,
         }
     }
 
@@ -204,6 +234,50 @@ impl Session {
     /// The QueryCtx inherits relevant settings from SessionVars.
     pub fn new_query_ctx(&self) -> QueryCtx {
         QueryCtx::from_session(self)
+    }
+
+    // ========================================================================
+    // Transaction State Management
+    // ========================================================================
+
+    /// Check if there is an active explicit transaction.
+    #[inline]
+    pub fn has_active_txn(&self) -> bool {
+        self.current_txn.is_some()
+    }
+
+    /// Get a reference to the current transaction context, if any.
+    #[inline]
+    pub fn current_txn(&self) -> Option<&TxnCtx> {
+        self.current_txn.as_ref()
+    }
+
+    /// Get a mutable reference to the current transaction context, if any.
+    #[inline]
+    pub fn current_txn_mut(&mut self) -> Option<&mut TxnCtx> {
+        self.current_txn.as_mut()
+    }
+
+    /// Set the current transaction context.
+    ///
+    /// Called when BEGIN/START TRANSACTION is executed.
+    pub fn set_current_txn(&mut self, ctx: TxnCtx) {
+        self.current_txn = Some(ctx);
+    }
+
+    /// Take and clear the current transaction context.
+    ///
+    /// Called when COMMIT or ROLLBACK is executed.
+    /// Returns the transaction context so it can be committed or rolled back.
+    pub fn take_current_txn(&mut self) -> Option<TxnCtx> {
+        self.current_txn.take()
+    }
+
+    /// Clear the current transaction without returning it.
+    ///
+    /// Used when the transaction was already consumed (e.g., on error).
+    pub fn clear_current_txn(&mut self) {
+        self.current_txn = None;
     }
 }
 
@@ -430,5 +504,44 @@ mod tests {
         let ctx2 = QueryCtx::new();
 
         assert_ne!(ctx1.id(), ctx2.id());
+    }
+
+    #[test]
+    fn test_session_transaction_state() {
+        use crate::transaction::TxnState;
+
+        let mut session = Session::new();
+
+        // Initially no active transaction
+        assert!(!session.has_active_txn());
+        assert!(session.current_txn().is_none());
+
+        // Create a mock TxnCtx (using internal constructor for testing)
+        let ctx = TxnCtx::new_for_test(1, 100, false, true);
+        assert!(ctx.is_explicit());
+
+        // Set active transaction
+        session.set_current_txn(ctx);
+        assert!(session.has_active_txn());
+        assert!(session.current_txn().is_some());
+        assert_eq!(session.current_txn().unwrap().start_ts(), 100);
+
+        // Take transaction
+        let taken = session.take_current_txn();
+        assert!(taken.is_some());
+        assert!(!session.has_active_txn());
+        assert_eq!(taken.unwrap().state(), TxnState::Running);
+    }
+
+    #[test]
+    fn test_session_transaction_mutable_access() {
+        let mut session = Session::new();
+        let ctx = TxnCtx::new_for_test(2, 200, false, true);
+
+        session.set_current_txn(ctx);
+
+        // Mutable access
+        let ctx_mut = session.current_txn_mut().unwrap();
+        assert_eq!(ctx_mut.start_ts(), 200);
     }
 }

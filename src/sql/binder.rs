@@ -89,6 +89,22 @@ impl<'a> Binder<'a> {
             SqlStatement::Use { db_name } => Ok(LogicalPlan::UseDatabase {
                 db_name: db_name.value.clone(),
             }),
+
+            // Transaction control statements
+            // Note: MySQL's BEGIN is mapped to StartTransaction in sqlparser
+            SqlStatement::StartTransaction { modes, .. } => {
+                // Check for READ ONLY mode
+                let read_only = modes.iter().any(|m| {
+                    matches!(
+                        m,
+                        ast::TransactionMode::AccessMode(ast::TransactionAccessMode::ReadOnly)
+                    )
+                });
+                Ok(LogicalPlan::Begin { read_only })
+            }
+            SqlStatement::Commit { .. } => Ok(LogicalPlan::Commit),
+            SqlStatement::Rollback { .. } => Ok(LogicalPlan::Rollback),
+
             _ => Err(TiSqlError::Bind(format!(
                 "Unsupported statement type: {:?} for: {}",
                 std::mem::discriminant(&stmt),

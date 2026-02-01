@@ -151,6 +151,28 @@ impl TxnCtx {
         }
     }
 
+    /// Create a transaction context for testing purposes.
+    ///
+    /// This is a public constructor that allows tests to create TxnCtx
+    /// with specific parameters.
+    #[cfg(test)]
+    pub fn new_for_test(
+        txn_id: TxnId,
+        start_ts: Timestamp,
+        read_only: bool,
+        explicit: bool,
+    ) -> Self {
+        Self {
+            txn_id,
+            start_ts,
+            state: TxnState::Running,
+            read_only,
+            explicit,
+            write_buffer: WriteBatch::new(),
+            locked_keys: Vec::new(),
+        }
+    }
+
     /// Check if this is an explicit transaction (started with BEGIN).
     #[inline]
     pub fn is_explicit(&self) -> bool {
