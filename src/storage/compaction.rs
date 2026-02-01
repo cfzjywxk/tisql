@@ -774,4 +774,433 @@ mod tests {
         assert_eq!(delta.deleted_ssts.len(), 2);
         assert!(delta.new_ssts.iter().all(|sst| sst.level == 1));
     }
+
+    // ==================== MergeIterator Additional Coverage Tests ====================
+
+    #[test]
+    fn test_merge_iterator_empty_sources() {
+        let mut iter = MergeIterator::new(vec![]).unwrap();
+        iter.seek_to_first().unwrap();
+
+        assert!(!iter.valid());
+        assert!(iter.current().is_none());
+    }
+
+    #[test]
+    fn test_merge_iterator_single_empty_sst() {
+        let tmp = TempDir::new().unwrap();
+        let sst_path = tmp.path().join("empty.sst");
+
+        // Create empty SST
+        let builder = SstBuilder::new(&sst_path, SstBuilderOptions::default()).unwrap();
+        builder.finish(1, 0).unwrap();
+
+        let reader = SstReaderRef::open(&sst_path).unwrap();
+        let mut iter = MergeIterator::new(vec![reader]).unwrap();
+        iter.seek_to_first().unwrap();
+
+        assert!(!iter.valid());
+    }
+
+    #[test]
+    fn test_merge_iterator_not_positioned_after_new() {
+        let tmp = TempDir::new().unwrap();
+        let sst_path = tmp.path().join("test.sst");
+
+        let mut builder = SstBuilder::new(&sst_path, SstBuilderOptions::default()).unwrap();
+        builder.add(b"key", b"value").unwrap();
+        builder.finish(1, 0).unwrap();
+
+        let reader = SstReaderRef::open(&sst_path).unwrap();
+        let iter = MergeIterator::new(vec![reader]).unwrap();
+
+        // Iterator should not be valid until seek_to_first
+        assert!(!iter.valid());
+    }
+
+    #[test]
+    fn test_merge_iterator_advance_when_not_valid() {
+        let tmp = TempDir::new().unwrap();
+        let sst_path = tmp.path().join("test.sst");
+
+        let mut builder = SstBuilder::new(&sst_path, SstBuilderOptions::default()).unwrap();
+        builder.add(b"key", b"value").unwrap();
+        builder.finish(1, 0).unwrap();
+
+        let reader = SstReaderRef::open(&sst_path).unwrap();
+        let mut iter = MergeIterator::new(vec![reader]).unwrap();
+        iter.seek_to_first().unwrap();
+
+        // Exhaust iterator
+        iter.advance().unwrap();
+        assert!(!iter.valid());
+
+        // Advance on invalid should be no-op
+        iter.advance().unwrap();
+        assert!(!iter.valid());
+    }
+
+    #[test]
+    fn test_merge_iterator_tie_breaking_newer_first() {
+        let tmp = TempDir::new().unwrap();
+
+        // Create SST1 (newer, index 0)
+        let sst1_path = tmp.path().join("sst1.sst");
+        let mut builder = SstBuilder::new(&sst1_path, SstBuilderOptions::default()).unwrap();
+        builder.add(b"key", b"newer").unwrap();
+        builder.finish(1, 0).unwrap();
+
+        // Create SST2 (older, index 1)
+        let sst2_path = tmp.path().join("sst2.sst");
+        let mut builder = SstBuilder::new(&sst2_path, SstBuilderOptions::default()).unwrap();
+        builder.add(b"key", b"older").unwrap();
+        builder.finish(2, 0).unwrap();
+
+        let reader1 = SstReaderRef::open(&sst1_path).unwrap();
+        let reader2 = SstReaderRef::open(&sst2_path).unwrap();
+
+        // Newer file first
+        let mut iter = MergeIterator::new(vec![reader1, reader2]).unwrap();
+        iter.seek_to_first().unwrap();
+
+        // First entry should be from newer file (source_idx 0)
+        let (k, v) = iter.current().unwrap();
+        assert_eq!(k, b"key");
+        assert_eq!(v, b"newer");
+
+        // Second entry should be from older file (source_idx 1)
+        iter.advance().unwrap();
+        let (k, v) = iter.current().unwrap();
+        assert_eq!(k, b"key");
+        assert_eq!(v, b"older");
+
+        iter.advance().unwrap();
+        assert!(!iter.valid());
+    }
+
+    #[test]
+    fn test_merge_iterator_large_merge() {
+        let tmp = TempDir::new().unwrap();
+
+        // Create 10 SSTs with interleaved keys
+        let mut readers = Vec::new();
+        for sst_idx in 0..10u32 {
+            let sst_path = tmp.path().join(format!("sst{sst_idx}.sst"));
+            let mut builder = SstBuilder::new(&sst_path, SstBuilderOptions::default()).unwrap();
+
+            // Each SST has keys: sst_idx, sst_idx+10, sst_idx+20, ...
+            for key_idx in 0..10 {
+                let key = format!("key_{:05}", sst_idx as usize + key_idx * 10);
+                let value = format!("v{sst_idx}");
+                builder.add(key.as_bytes(), value.as_bytes()).unwrap();
+            }
+            builder.finish(sst_idx as u64 + 1, 0).unwrap();
+
+            readers.push(SstReaderRef::open(&sst_path).unwrap());
+        }
+
+        let mut iter = MergeIterator::new(readers).unwrap();
+        iter.seek_to_first().unwrap();
+
+        // Collect all keys
+        let mut keys = Vec::new();
+        while iter.valid() {
+            let (k, _) = iter.current().unwrap();
+            keys.push(String::from_utf8_lossy(&k).to_string());
+            iter.advance().unwrap();
+        }
+
+        // Should have 100 keys in sorted order
+        assert_eq!(keys.len(), 100);
+
+        // Verify sorted order
+        for i in 1..keys.len() {
+            assert!(keys[i - 1] <= keys[i], "Keys should be sorted");
+        }
+    }
+
+    #[test]
+    fn test_merge_iterator_skip_to_next_key_basic() {
+        let tmp = TempDir::new().unwrap();
+        let sst_path = tmp.path().join("mvcc.sst");
+
+        // Create MVCC key helper
+        fn mvcc(key: &[u8], ts: u64) -> Vec<u8> {
+            let mut result = key.to_vec();
+            result.extend_from_slice(&(!ts).to_be_bytes());
+            result
+        }
+
+        let mut builder = SstBuilder::new(&sst_path, SstBuilderOptions::default()).unwrap();
+        // key1 with versions 100, 50, 25
+        builder.add(&mvcc(b"key1", 100), b"v1_100").unwrap();
+        builder.add(&mvcc(b"key1", 50), b"v1_50").unwrap();
+        builder.add(&mvcc(b"key1", 25), b"v1_25").unwrap();
+        // key2 with versions 200, 100
+        builder.add(&mvcc(b"key2", 200), b"v2_200").unwrap();
+        builder.add(&mvcc(b"key2", 100), b"v2_100").unwrap();
+        builder.finish(1, 0).unwrap();
+
+        let reader = SstReaderRef::open(&sst_path).unwrap();
+        let mut iter = MergeIterator::new(vec![reader]).unwrap();
+        iter.seek_to_first().unwrap();
+
+        // First entry: key1@100
+        let (k, _) = iter.current().unwrap();
+        assert!(k.starts_with(b"key1"));
+
+        // Skip to next key should jump to key2
+        iter.advance().unwrap();
+        iter.skip_to_next_key().unwrap();
+
+        let (k, _) = iter.current().unwrap();
+        assert!(k.starts_with(b"key2"));
+    }
+
+    #[test]
+    fn test_merge_iterator_skip_to_next_key_at_last_key() {
+        let tmp = TempDir::new().unwrap();
+        let sst_path = tmp.path().join("mvcc.sst");
+
+        fn mvcc(key: &[u8], ts: u64) -> Vec<u8> {
+            let mut result = key.to_vec();
+            result.extend_from_slice(&(!ts).to_be_bytes());
+            result
+        }
+
+        let mut builder = SstBuilder::new(&sst_path, SstBuilderOptions::default()).unwrap();
+        builder.add(&mvcc(b"only_key", 100), b"v100").unwrap();
+        builder.add(&mvcc(b"only_key", 50), b"v50").unwrap();
+        builder.finish(1, 0).unwrap();
+
+        let reader = SstReaderRef::open(&sst_path).unwrap();
+        let mut iter = MergeIterator::new(vec![reader]).unwrap();
+        iter.seek_to_first().unwrap();
+
+        // First entry
+        iter.advance().unwrap();
+        // Skip should exhaust iterator (no more keys)
+        iter.skip_to_next_key().unwrap();
+        assert!(!iter.valid());
+    }
+
+    #[test]
+    fn test_merge_iterator_skip_to_next_key_short_key() {
+        let tmp = TempDir::new().unwrap();
+        let sst_path = tmp.path().join("test.sst");
+
+        let mut builder = SstBuilder::new(&sst_path, SstBuilderOptions::default()).unwrap();
+        // Keys shorter than 8 bytes (no MVCC timestamp)
+        builder.add(b"a", b"va").unwrap();
+        builder.add(b"b", b"vb").unwrap();
+        builder.finish(1, 0).unwrap();
+
+        let reader = SstReaderRef::open(&sst_path).unwrap();
+        let mut iter = MergeIterator::new(vec![reader]).unwrap();
+        iter.seek_to_first().unwrap();
+
+        // Skip to next key with short key should be no-op
+        iter.advance().unwrap();
+        iter.skip_to_next_key().unwrap();
+
+        // Should still be valid (skipping is based on key prefix comparison)
+        // For keys < 8 bytes, there's no timestamp to strip, so nothing is skipped
+        let (k, _) = iter.current().unwrap();
+        assert_eq!(k, b"b");
+    }
+
+    #[test]
+    fn test_merge_iterator_multiple_sources_with_overlap() {
+        let tmp = TempDir::new().unwrap();
+
+        // SST1: a, b, c
+        let sst1_path = tmp.path().join("sst1.sst");
+        let mut builder = SstBuilder::new(&sst1_path, SstBuilderOptions::default()).unwrap();
+        builder.add(b"a", b"a1").unwrap();
+        builder.add(b"b", b"b1").unwrap();
+        builder.add(b"c", b"c1").unwrap();
+        builder.finish(1, 0).unwrap();
+
+        // SST2: b, c, d (overlaps with SST1)
+        let sst2_path = tmp.path().join("sst2.sst");
+        let mut builder = SstBuilder::new(&sst2_path, SstBuilderOptions::default()).unwrap();
+        builder.add(b"b", b"b2").unwrap();
+        builder.add(b"c", b"c2").unwrap();
+        builder.add(b"d", b"d2").unwrap();
+        builder.finish(2, 0).unwrap();
+
+        let reader1 = SstReaderRef::open(&sst1_path).unwrap();
+        let reader2 = SstReaderRef::open(&sst2_path).unwrap();
+
+        let mut iter = MergeIterator::new(vec![reader1, reader2]).unwrap();
+        iter.seek_to_first().unwrap();
+
+        let mut entries = Vec::new();
+        while iter.valid() {
+            let (k, v) = iter.current().unwrap();
+            entries.push((k, v));
+            iter.advance().unwrap();
+        }
+
+        // Should have all entries, with duplicates
+        assert_eq!(entries.len(), 6); // a, b(x2), c(x2), d
+        assert_eq!(entries[0].0, b"a");
+        assert_eq!(entries[1].0, b"b");
+        assert_eq!(entries[1].1, b"b1"); // newer first
+        assert_eq!(entries[2].0, b"b");
+        assert_eq!(entries[2].1, b"b2"); // older second
+    }
+
+    #[test]
+    fn test_merge_iterator_current_none_when_invalid() {
+        let tmp = TempDir::new().unwrap();
+        let sst_path = tmp.path().join("test.sst");
+
+        let mut builder = SstBuilder::new(&sst_path, SstBuilderOptions::default()).unwrap();
+        builder.add(b"key", b"value").unwrap();
+        builder.finish(1, 0).unwrap();
+
+        let reader = SstReaderRef::open(&sst_path).unwrap();
+        let iter = MergeIterator::new(vec![reader]).unwrap();
+
+        // Before seek_to_first, current should be None
+        assert!(iter.current().is_none());
+    }
+
+    // ==================== MergeEntry Ordering Tests ====================
+
+    #[test]
+    fn test_merge_entry_ordering_by_key() {
+        use std::cmp::Ordering;
+
+        let entry_a = MergeEntry {
+            key: b"a".to_vec(),
+            value: b"va".to_vec(),
+            source_idx: 0,
+        };
+
+        let entry_b = MergeEntry {
+            key: b"b".to_vec(),
+            value: b"vb".to_vec(),
+            source_idx: 0,
+        };
+
+        // For min-heap, smaller key should have higher priority
+        // Ord is inverted for BinaryHeap
+        assert!(entry_a.cmp(&entry_b) == Ordering::Greater);
+    }
+
+    #[test]
+    fn test_merge_entry_ordering_by_source_idx() {
+        use std::cmp::Ordering;
+
+        let entry_newer = MergeEntry {
+            key: b"key".to_vec(),
+            value: b"newer".to_vec(),
+            source_idx: 0, // Newer source
+        };
+
+        let entry_older = MergeEntry {
+            key: b"key".to_vec(),
+            value: b"older".to_vec(),
+            source_idx: 1, // Older source
+        };
+
+        // Same key: smaller source_idx (newer) should come first
+        assert!(entry_newer.cmp(&entry_older) == Ordering::Greater);
+    }
+
+    // ==================== CompactionPicker Additional Tests ====================
+
+    #[test]
+    fn test_picker_respects_l0_trigger_threshold() {
+        let tmp = TempDir::new().unwrap();
+        let config = Arc::new(
+            LsmConfig::builder(tmp.path())
+                .l0_compaction_trigger(5) // Higher threshold
+                .build()
+                .unwrap(),
+        );
+        let picker = CompactionPicker::new(config);
+
+        // Only 3 L0 files (below threshold)
+        let version = Version::builder()
+            .add_sst(make_sst(1, 0, b"a", b"e"))
+            .add_sst(make_sst(2, 0, b"f", b"j"))
+            .add_sst(make_sst(3, 0, b"k", b"o"))
+            .build();
+
+        // Should NOT trigger compaction
+        assert!(picker.pick(&version).is_none());
+    }
+
+    #[test]
+    fn test_picker_l1_to_l2_compaction() {
+        let tmp = TempDir::new().unwrap();
+        let config = Arc::new(
+            LsmConfig::builder(tmp.path())
+                .l0_compaction_trigger(10) // High threshold to avoid L0 compaction
+                .l0_slowdown_trigger(12) // Must be >= l0_compaction_trigger
+                .l0_stop_trigger(14) // Must be >= l0_slowdown_trigger
+                .l1_max_size(100) // Very small L1 to trigger compaction
+                .build()
+                .unwrap(),
+        );
+        let picker = CompactionPicker::new(config);
+
+        // L1 exceeds limit, should compact to L2
+        let version = Version::builder()
+            .add_sst(make_sst(1, 1, b"a", b"m"))
+            .add_sst(make_sst(2, 1, b"n", b"z"))
+            .build();
+
+        let task = picker.pick(&version);
+        assert!(task.is_some());
+        let task = task.unwrap();
+        assert_eq!(task.output_level, 2);
+    }
+
+    #[test]
+    fn test_compaction_key_range_computation() {
+        let tmp = TempDir::new().unwrap();
+        let config = test_config(tmp.path());
+        let executor = CompactionExecutor::new(Arc::clone(&config));
+
+        // Create SSTs with specific key ranges
+        std::fs::create_dir_all(config.sst_dir()).unwrap();
+
+        let sst1_path = config.sst_dir().join("00000001.sst");
+        let mut builder = SstBuilder::new(&sst1_path, SstBuilderOptions::default()).unwrap();
+        builder.add(b"a", b"v1").unwrap();
+        builder.add(b"b", b"v1").unwrap();
+        let meta1 = builder.finish(1, 0).unwrap();
+
+        let sst2_path = config.sst_dir().join("00000002.sst");
+        let mut builder = SstBuilder::new(&sst2_path, SstBuilderOptions::default()).unwrap();
+        builder.add(b"c", b"v2").unwrap();
+        builder.add(b"d", b"v2").unwrap();
+        let meta2 = builder.finish(2, 0).unwrap();
+
+        let version = Version::builder()
+            .add_sst(meta1)
+            .add_sst(meta2)
+            .next_sst_id(3)
+            .build();
+
+        let task = CompactionTask {
+            inputs: vec![(0, 1), (0, 2)],
+            output_level: 1,
+            is_trivial_move: false,
+        };
+
+        let delta = executor
+            .execute(&task, &version, &config.sst_dir())
+            .unwrap();
+
+        // Output should span full key range
+        assert!(!delta.new_ssts.is_empty());
+        let output = &delta.new_ssts[0];
+        assert!(output.smallest_key.as_slice() <= b"a".as_slice());
+        assert!(output.largest_key.as_slice() >= b"d".as_slice());
+    }
 }

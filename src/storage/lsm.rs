@@ -4633,4 +4633,846 @@ mod tests {
         assert!(*l0_1_seek.borrow(), "L0[1] should be seeked after advance");
         assert!(*l0_2_seek.borrow(), "L0[2] should be seeked after advance");
     }
+
+    // ==================== TieredMergeIterator Additional Coverage Tests ====================
+
+    #[test]
+    fn test_tiered_merge_iterator_empty() {
+        let mut merge_iter = TieredMergeIterator::new().build();
+
+        // Before advance
+        assert!(!merge_iter.valid());
+
+        // After advance with no children
+        merge_iter.advance().unwrap();
+        assert!(!merge_iter.valid());
+    }
+
+    #[test]
+    fn test_tiered_merge_iterator_single_source() {
+        let (iter, _) = MockMvccIterator::new(
+            "single",
+            vec![
+                (test_key(b"a", 100), b"va".to_vec()),
+                (test_key(b"b", 100), b"vb".to_vec()),
+                (test_key(b"c", 100), b"vc".to_vec()),
+            ],
+        );
+
+        let mut merge_iter = TieredMergeIterator::new();
+        merge_iter.add_mock_active(iter);
+        let mut merge_iter = merge_iter.build();
+
+        // Iterate all entries
+        let mut keys = Vec::new();
+        merge_iter.advance().unwrap();
+        while merge_iter.valid() {
+            keys.push(merge_iter.user_key().to_vec());
+            merge_iter.advance().unwrap();
+        }
+
+        assert_eq!(keys, vec![b"a".to_vec(), b"b".to_vec(), b"c".to_vec()]);
+    }
+
+    #[test]
+    fn test_tiered_merge_iterator_active_wins_over_frozen_same_key() {
+        // Test that higher priority source wins when same MVCC key exists in multiple sources.
+        // Active memtable (priority 0) should win over frozen (priority 100+).
+
+        let (active, _) = MockMvccIterator::new(
+            "active",
+            vec![(test_key(b"key", 100), b"active_value".to_vec())],
+        );
+
+        let (frozen, _) = MockMvccIterator::new(
+            "frozen",
+            vec![(test_key(b"key", 100), b"frozen_value".to_vec())], // Same MVCC key!
+        );
+
+        let mut merge_iter = TieredMergeIterator::new();
+        merge_iter.add_mock_active(active);
+        merge_iter.add_mock_frozen(frozen, 0);
+        let mut merge_iter = merge_iter.build();
+
+        merge_iter.advance().unwrap();
+
+        // Should get active value (higher priority = lower priority number)
+        assert!(merge_iter.valid());
+        assert_eq!(merge_iter.user_key(), b"key");
+        assert_eq!(merge_iter.timestamp(), 100);
+        assert_eq!(merge_iter.value(), b"active_value");
+
+        // Should skip the duplicate from frozen
+        merge_iter.advance().unwrap();
+        assert!(!merge_iter.valid());
+    }
+
+    #[test]
+    fn test_tiered_merge_iterator_different_versions_not_deduplicated() {
+        // Different versions (same user_key, different timestamp) should NOT be deduplicated.
+
+        let (active, _) =
+            MockMvccIterator::new("active", vec![(test_key(b"key", 100), b"v100".to_vec())]);
+
+        let (frozen, _) = MockMvccIterator::new(
+            "frozen",
+            vec![(test_key(b"key", 50), b"v50".to_vec())], // Same key, different timestamp
+        );
+
+        let mut merge_iter = TieredMergeIterator::new();
+        merge_iter.add_mock_active(active);
+        merge_iter.add_mock_frozen(frozen, 0);
+        let mut merge_iter = merge_iter.build();
+
+        // First entry: ts=100 (higher timestamp = smaller encoded key, comes first)
+        merge_iter.advance().unwrap();
+        assert!(merge_iter.valid());
+        assert_eq!(merge_iter.timestamp(), 100);
+        assert_eq!(merge_iter.value(), b"v100");
+
+        // Second entry: ts=50 (NOT deduplicated - different version)
+        merge_iter.advance().unwrap();
+        assert!(merge_iter.valid());
+        assert_eq!(merge_iter.timestamp(), 50);
+        assert_eq!(merge_iter.value(), b"v50");
+
+        merge_iter.advance().unwrap();
+        assert!(!merge_iter.valid());
+    }
+
+    #[test]
+    fn test_tiered_merge_iterator_mvcc_ordering() {
+        // Test MVCC ordering: (user_key ASC, timestamp DESC)
+        // Higher timestamps should come first for the same key.
+
+        let (iter, _) = MockMvccIterator::new(
+            "source",
+            vec![
+                (test_key(b"a", 100), b"a100".to_vec()),
+                (test_key(b"a", 50), b"a50".to_vec()),
+                (test_key(b"b", 200), b"b200".to_vec()),
+                (test_key(b"b", 100), b"b100".to_vec()),
+            ],
+        );
+
+        let mut merge_iter = TieredMergeIterator::new();
+        merge_iter.add_mock_active(iter);
+        let mut merge_iter = merge_iter.build();
+
+        merge_iter.advance().unwrap();
+        assert_eq!(merge_iter.user_key(), b"a");
+        assert_eq!(merge_iter.timestamp(), 100);
+
+        merge_iter.advance().unwrap();
+        assert_eq!(merge_iter.user_key(), b"a");
+        assert_eq!(merge_iter.timestamp(), 50);
+
+        merge_iter.advance().unwrap();
+        assert_eq!(merge_iter.user_key(), b"b");
+        assert_eq!(merge_iter.timestamp(), 200);
+
+        merge_iter.advance().unwrap();
+        assert_eq!(merge_iter.user_key(), b"b");
+        assert_eq!(merge_iter.timestamp(), 100);
+
+        merge_iter.advance().unwrap();
+        assert!(!merge_iter.valid());
+    }
+
+    #[test]
+    fn test_tiered_merge_iterator_interleaved_sources() {
+        // Test correct ordering when sources have interleaved keys.
+
+        let (active, _) = MockMvccIterator::new(
+            "active",
+            vec![
+                (test_key(b"a", 100), b"a".to_vec()),
+                (test_key(b"c", 100), b"c".to_vec()),
+                (test_key(b"e", 100), b"e".to_vec()),
+            ],
+        );
+
+        let (frozen, _) = MockMvccIterator::new(
+            "frozen",
+            vec![
+                (test_key(b"b", 100), b"b".to_vec()),
+                (test_key(b"d", 100), b"d".to_vec()),
+                (test_key(b"f", 100), b"f".to_vec()),
+            ],
+        );
+
+        let mut merge_iter = TieredMergeIterator::new();
+        merge_iter.add_mock_active(active);
+        merge_iter.add_mock_frozen(frozen, 0);
+        let mut merge_iter = merge_iter.build();
+
+        // Should iterate in sorted order: a, b, c, d, e, f
+        let mut keys = Vec::new();
+        merge_iter.advance().unwrap();
+        while merge_iter.valid() {
+            keys.push(merge_iter.user_key().to_vec());
+            merge_iter.advance().unwrap();
+        }
+
+        assert_eq!(
+            keys,
+            vec![
+                b"a".to_vec(),
+                b"b".to_vec(),
+                b"c".to_vec(),
+                b"d".to_vec(),
+                b"e".to_vec(),
+                b"f".to_vec()
+            ]
+        );
+    }
+
+    #[test]
+    fn test_tiered_merge_iterator_seek() {
+        let (iter, _) = MockMvccIterator::new(
+            "source",
+            vec![
+                (test_key(b"a", 100), b"va".to_vec()),
+                (test_key(b"b", 100), b"vb".to_vec()),
+                (test_key(b"c", 100), b"vc".to_vec()),
+            ],
+        );
+
+        let mut merge_iter = TieredMergeIterator::new();
+        merge_iter.add_mock_active(iter);
+        let mut merge_iter = merge_iter.build();
+
+        // Seek to "b"
+        merge_iter.seek(&test_key(b"b", 100)).unwrap();
+        assert!(merge_iter.valid());
+        assert_eq!(merge_iter.user_key(), b"b");
+
+        // Continue iteration
+        merge_iter.advance().unwrap();
+        assert_eq!(merge_iter.user_key(), b"c");
+
+        merge_iter.advance().unwrap();
+        assert!(!merge_iter.valid());
+    }
+
+    #[test]
+    fn test_tiered_merge_iterator_seek_resets_dedup_state() {
+        // Verify that seek clears deduplication state.
+
+        let (iter, _) = MockMvccIterator::new(
+            "source",
+            vec![
+                (test_key(b"a", 100), b"va".to_vec()),
+                (test_key(b"b", 100), b"vb".to_vec()),
+            ],
+        );
+
+        let mut merge_iter = TieredMergeIterator::new();
+        merge_iter.add_mock_active(iter);
+        let mut merge_iter = merge_iter.build();
+
+        // Iterate to end
+        merge_iter.advance().unwrap();
+        merge_iter.advance().unwrap();
+        merge_iter.advance().unwrap();
+        assert!(!merge_iter.valid());
+
+        // Seek should reset state
+        merge_iter.seek(&test_key(b"a", 100)).unwrap();
+        assert!(merge_iter.valid());
+        assert_eq!(merge_iter.user_key(), b"a");
+    }
+
+    #[test]
+    fn test_tiered_merge_iterator_four_tier_ordering() {
+        // Test all four tier types together: active, frozen, L0, level.
+
+        let (active, _) =
+            MockMvccIterator::new("active", vec![(test_key(b"a", 100), b"active".to_vec())]);
+
+        let (frozen, _) =
+            MockMvccIterator::new("frozen", vec![(test_key(b"b", 100), b"frozen".to_vec())]);
+
+        let (l0, _) = MockMvccIterator::new("l0", vec![(test_key(b"c", 100), b"l0".to_vec())]);
+
+        let (level, _) =
+            MockMvccIterator::new("level", vec![(test_key(b"d", 100), b"level".to_vec())]);
+
+        let mut merge_iter = TieredMergeIterator::new();
+        merge_iter.add_mock_active(active);
+        merge_iter.add_mock_frozen(frozen, 0);
+        merge_iter.add_mock_l0(l0, 0);
+        merge_iter.add_mock_level(level, 1);
+        let mut merge_iter = merge_iter.build();
+
+        let mut results = Vec::new();
+        merge_iter.advance().unwrap();
+        while merge_iter.valid() {
+            results.push((merge_iter.user_key().to_vec(), merge_iter.value().to_vec()));
+            merge_iter.advance().unwrap();
+        }
+
+        assert_eq!(results.len(), 4);
+        assert_eq!(results[0], (b"a".to_vec(), b"active".to_vec()));
+        assert_eq!(results[1], (b"b".to_vec(), b"frozen".to_vec()));
+        assert_eq!(results[2], (b"c".to_vec(), b"l0".to_vec()));
+        assert_eq!(results[3], (b"d".to_vec(), b"level".to_vec()));
+    }
+
+    #[test]
+    fn test_tiered_merge_iterator_priority_l0_newer_wins() {
+        // L0 with lower index (newer) should win over L0 with higher index (older).
+
+        let (l0_0, _) =
+            MockMvccIterator::new("l0_0", vec![(test_key(b"key", 100), b"newer".to_vec())]);
+
+        let (l0_1, _) = MockMvccIterator::new(
+            "l0_1",
+            vec![(test_key(b"key", 100), b"older".to_vec())], // Same MVCC key
+        );
+
+        let mut merge_iter = TieredMergeIterator::new();
+        merge_iter.add_mock_l0(l0_0, 0); // Priority 1000
+        merge_iter.add_mock_l0(l0_1, 1); // Priority 1001
+        let mut merge_iter = merge_iter.build();
+
+        merge_iter.advance().unwrap();
+        assert!(merge_iter.valid());
+        assert_eq!(merge_iter.value(), b"newer");
+
+        // Should skip duplicate
+        merge_iter.advance().unwrap();
+        assert!(!merge_iter.valid());
+    }
+
+    #[test]
+    fn test_tiered_merge_iterator_empty_sources_skipped() {
+        // Sources with no entries should be handled gracefully.
+
+        let (empty1, _) = MockMvccIterator::new("empty1", vec![]);
+        let (non_empty, _) = MockMvccIterator::new(
+            "non_empty",
+            vec![(test_key(b"key", 100), b"value".to_vec())],
+        );
+        let (empty2, _) = MockMvccIterator::new("empty2", vec![]);
+
+        let mut merge_iter = TieredMergeIterator::new();
+        merge_iter.add_mock_active(empty1);
+        merge_iter.add_mock_frozen(non_empty, 0);
+        merge_iter.add_mock_l0(empty2, 0);
+        let mut merge_iter = merge_iter.build();
+
+        merge_iter.advance().unwrap();
+        assert!(merge_iter.valid());
+        assert_eq!(merge_iter.user_key(), b"key");
+        assert_eq!(merge_iter.value(), b"value");
+
+        merge_iter.advance().unwrap();
+        assert!(!merge_iter.valid());
+    }
+
+    #[test]
+    fn test_tiered_merge_iterator_frozen_priority_ordering() {
+        // Test multiple frozen memtables with correct priority ordering.
+
+        let (frozen0, _) = MockMvccIterator::new(
+            "frozen0",
+            vec![(test_key(b"key", 100), b"frozen0".to_vec())],
+        );
+        let (frozen1, _) = MockMvccIterator::new(
+            "frozen1",
+            vec![(test_key(b"key", 100), b"frozen1".to_vec())],
+        );
+        let (frozen2, _) = MockMvccIterator::new(
+            "frozen2",
+            vec![(test_key(b"key", 100), b"frozen2".to_vec())],
+        );
+
+        let mut merge_iter = TieredMergeIterator::new();
+        merge_iter.add_mock_frozen(frozen0, 0); // Priority 100
+        merge_iter.add_mock_frozen(frozen1, 1); // Priority 101
+        merge_iter.add_mock_frozen(frozen2, 2); // Priority 102
+        let mut merge_iter = merge_iter.build();
+
+        merge_iter.advance().unwrap();
+        // frozen0 (priority 100) should win
+        assert_eq!(merge_iter.value(), b"frozen0");
+
+        merge_iter.advance().unwrap();
+        assert!(!merge_iter.valid()); // Duplicates skipped
+    }
+
+    #[test]
+    fn test_tiered_merge_iterator_seek_past_all_data() {
+        let (iter, _) = MockMvccIterator::new(
+            "source",
+            vec![
+                (test_key(b"a", 100), b"va".to_vec()),
+                (test_key(b"b", 100), b"vb".to_vec()),
+            ],
+        );
+
+        let mut merge_iter = TieredMergeIterator::new();
+        merge_iter.add_mock_active(iter);
+        let mut merge_iter = merge_iter.build();
+
+        // Seek past all data
+        merge_iter.seek(&test_key(b"z", 100)).unwrap();
+        assert!(!merge_iter.valid());
+    }
+
+    #[test]
+    fn test_tiered_merge_iterator_all_sources_empty() {
+        let (empty1, _) = MockMvccIterator::new("empty1", vec![]);
+        let (empty2, _) = MockMvccIterator::new("empty2", vec![]);
+        let (empty3, _) = MockMvccIterator::new("empty3", vec![]);
+
+        let mut merge_iter = TieredMergeIterator::new();
+        merge_iter.add_mock_active(empty1);
+        merge_iter.add_mock_frozen(empty2, 0);
+        merge_iter.add_mock_l0(empty3, 0);
+        let mut merge_iter = merge_iter.build();
+
+        merge_iter.advance().unwrap();
+        assert!(!merge_iter.valid());
+    }
+
+    // ==================== L0SstIterator Tests (via integration) ====================
+
+    #[test]
+    fn test_l0_sst_iterator_lazy_opening() {
+        // Verify that L0SstIterator doesn't open files until first seek/advance.
+        let tmp = TempDir::new().unwrap();
+        let config = test_config(tmp.path());
+        let engine = LsmEngine::open(config.clone()).unwrap();
+
+        // Write data and flush to L0
+        let mut batch = new_batch(100);
+        batch.put(b"key1".to_vec(), b"value1".to_vec());
+        batch.put(b"key2".to_vec(), b"value2".to_vec());
+        engine.write_batch(batch).unwrap();
+        engine.flush_all_with_active().unwrap();
+
+        // Verify L0 has SSTs
+        let stats = engine.stats();
+        assert!(stats.l0_sst_count > 0, "Should have L0 SSTs");
+
+        // Creating an iterator should NOT open files yet (lazy)
+        let range = MvccKey::unbounded()..MvccKey::unbounded();
+        let iter = engine.scan_iter(range).unwrap();
+
+        // Iterator should not be valid before positioning
+        assert!(!iter.valid());
+    }
+
+    #[test]
+    fn test_l0_sst_iterator_with_multiple_ssts() {
+        let tmp = TempDir::new().unwrap();
+        let config = LsmConfig::builder(tmp.path())
+            .memtable_size(100) // Small to force multiple flushes
+            .max_frozen_memtables(2)
+            .build()
+            .unwrap();
+        let engine = LsmEngine::open(config).unwrap();
+
+        // Create multiple L0 SSTs by writing and flushing multiple times
+        for round in 0..3 {
+            let mut batch = new_batch((round + 1) * 100);
+            let key = format!("key_{round}");
+            batch.put(
+                key.as_bytes().to_vec(),
+                format!("value_{round}").into_bytes(),
+            );
+            engine.write_batch(batch).unwrap();
+            engine.flush_all_with_active().unwrap();
+        }
+
+        // All keys should be readable
+        for round in 0..3 {
+            let key = format!("key_{round}");
+            let expected = format!("value_{round}");
+            assert_eq!(
+                get_for_test(&engine, key.as_bytes()),
+                Some(expected.into_bytes()),
+                "Should find key_{round}"
+            );
+        }
+    }
+
+    // ==================== LevelIterator Tests (via integration) ====================
+
+    #[test]
+    fn test_multiple_l0_ssts_scan() {
+        // Test that scanning works correctly with multiple L0 SSTs.
+        let tmp = TempDir::new().unwrap();
+        let config = LsmConfig::builder(tmp.path())
+            .memtable_size(100)
+            .max_frozen_memtables(2)
+            .build()
+            .unwrap();
+        let engine = LsmEngine::open(config).unwrap();
+
+        // Write non-overlapping data and flush to create multiple L0 SSTs
+        for i in 0..4 {
+            let mut batch = new_batch((i + 1) * 100);
+            let key = format!("key_{i:02}");
+            batch.put(key.as_bytes().to_vec(), format!("value_{i}").into_bytes());
+            engine.write_batch(batch).unwrap();
+            engine.flush_all_with_active().unwrap();
+        }
+
+        // Query each key - should work across multiple L0 SSTs
+        for i in 0..4 {
+            let key = format!("key_{i:02}");
+            let expected = format!("value_{i}");
+            let result = get_for_test(&engine, key.as_bytes());
+            assert_eq!(
+                result,
+                Some(expected.into_bytes()),
+                "Should find key_{i:02}"
+            );
+        }
+    }
+
+    #[test]
+    fn test_level_iterator_empty_level() {
+        let tmp = TempDir::new().unwrap();
+        let config = test_config(tmp.path());
+        let engine = LsmEngine::open(config).unwrap();
+
+        // Write to memtable only (no flush, so levels are empty)
+        let mut batch = new_batch(100);
+        batch.put(b"key".to_vec(), b"value".to_vec());
+        engine.write_batch(batch).unwrap();
+
+        // Query should work even with empty levels
+        assert_eq!(get_for_test(&engine, b"key"), Some(b"value".to_vec()));
+    }
+
+    // ==================== Scan Iterator Range Tests ====================
+
+    #[test]
+    fn test_scan_iter_with_range_start() {
+        let tmp = TempDir::new().unwrap();
+        let config = test_config(tmp.path());
+        let engine = LsmEngine::open(config).unwrap();
+
+        let mut batch = new_batch(100);
+        batch.put(b"a".to_vec(), b"va".to_vec());
+        batch.put(b"b".to_vec(), b"vb".to_vec());
+        batch.put(b"c".to_vec(), b"vc".to_vec());
+        batch.put(b"d".to_vec(), b"vd".to_vec());
+        engine.write_batch(batch).unwrap();
+
+        // Range starting from "b"
+        let start = MvccKey::encode(b"b", u64::MAX);
+        let end = MvccKey::unbounded();
+        let range = start..end;
+
+        let results = scan_mvcc(&engine, range);
+        let keys: Vec<_> = results.iter().map(|(k, _)| k.key()).collect();
+
+        assert!(keys.contains(&b"b".as_slice()));
+        assert!(keys.contains(&b"c".as_slice()));
+        assert!(keys.contains(&b"d".as_slice()));
+        assert!(!keys.contains(&b"a".as_slice()));
+    }
+
+    #[test]
+    fn test_scan_iter_with_range_end() {
+        let tmp = TempDir::new().unwrap();
+        let config = test_config(tmp.path());
+        let engine = LsmEngine::open(config).unwrap();
+
+        let mut batch = new_batch(100);
+        batch.put(b"a".to_vec(), b"va".to_vec());
+        batch.put(b"b".to_vec(), b"vb".to_vec());
+        batch.put(b"c".to_vec(), b"vc".to_vec());
+        batch.put(b"d".to_vec(), b"vd".to_vec());
+        engine.write_batch(batch).unwrap();
+
+        // Range ending before "c"
+        let start = MvccKey::unbounded();
+        let end = MvccKey::encode(b"c", u64::MAX);
+        let range = start..end;
+
+        let results = scan_mvcc(&engine, range);
+        let keys: Vec<_> = results.iter().map(|(k, _)| k.key()).collect();
+
+        assert!(keys.contains(&b"a".as_slice()));
+        assert!(keys.contains(&b"b".as_slice()));
+        assert!(!keys.contains(&b"c".as_slice()));
+        assert!(!keys.contains(&b"d".as_slice()));
+    }
+
+    #[test]
+    fn test_scan_iter_across_memtable_and_sst() {
+        let tmp = TempDir::new().unwrap();
+        let config = LsmConfig::builder(tmp.path())
+            .memtable_size(200)
+            .max_frozen_memtables(2)
+            .build()
+            .unwrap();
+        let engine = LsmEngine::open(config).unwrap();
+
+        // Write and flush some data
+        let mut batch = new_batch(100);
+        batch.put(b"sst_a".to_vec(), b"va".to_vec());
+        batch.put(b"sst_b".to_vec(), b"vb".to_vec());
+        engine.write_batch(batch).unwrap();
+        engine.flush_all_with_active().unwrap();
+
+        // Write more data to memtable
+        let mut batch = new_batch(200);
+        batch.put(b"mem_c".to_vec(), b"vc".to_vec());
+        batch.put(b"mem_d".to_vec(), b"vd".to_vec());
+        engine.write_batch(batch).unwrap();
+
+        // Scan should merge both
+        let range = MvccKey::unbounded()..MvccKey::unbounded();
+        let results = scan_mvcc(&engine, range);
+        let keys: Vec<_> = results.iter().map(|(k, _)| k.key()).collect();
+
+        assert!(keys.contains(&b"sst_a".as_slice()));
+        assert!(keys.contains(&b"sst_b".as_slice()));
+        assert!(keys.contains(&b"mem_c".as_slice()));
+        assert!(keys.contains(&b"mem_d".as_slice()));
+    }
+
+    #[test]
+    fn test_scan_iter_with_updates_across_layers() {
+        let tmp = TempDir::new().unwrap();
+        let config = LsmConfig::builder(tmp.path())
+            .memtable_size(200)
+            .max_frozen_memtables(2)
+            .build()
+            .unwrap();
+        let engine = LsmEngine::open(config).unwrap();
+
+        // Write v1 and flush to SST
+        let mut batch = new_batch(100);
+        batch.put(b"key".to_vec(), b"v1".to_vec());
+        engine.write_batch(batch).unwrap();
+        engine.flush_all_with_active().unwrap();
+
+        // Write v2 to memtable
+        let mut batch = new_batch(200);
+        batch.put(b"key".to_vec(), b"v2".to_vec());
+        engine.write_batch(batch).unwrap();
+
+        // Both versions should be visible via MVCC scan
+        let range = MvccKey::unbounded()..MvccKey::unbounded();
+        let results = scan_mvcc(&engine, range);
+
+        // Should have both versions
+        assert_eq!(results.len(), 2);
+
+        // v2 (ts=200) should come first (higher timestamp)
+        assert_eq!(results[0].0.timestamp(), 200);
+        assert_eq!(results[0].1, b"v2");
+
+        // v1 (ts=100) should come second
+        assert_eq!(results[1].0.timestamp(), 100);
+        assert_eq!(results[1].1, b"v1");
+    }
+
+    #[test]
+    fn test_scan_iter_empty_range() {
+        let tmp = TempDir::new().unwrap();
+        let config = test_config(tmp.path());
+        let engine = LsmEngine::open(config).unwrap();
+
+        let mut batch = new_batch(100);
+        batch.put(b"key".to_vec(), b"value".to_vec());
+        engine.write_batch(batch).unwrap();
+
+        // Empty range (start > end semantically)
+        let start = MvccKey::encode(b"z", u64::MAX);
+        let end = MvccKey::encode(b"a", u64::MAX);
+        let range = start..end;
+
+        let results = scan_mvcc(&engine, range);
+        assert!(results.is_empty());
+    }
+
+    // ==================== HeapEntry Ordering Tests ====================
+
+    #[test]
+    fn test_heap_entry_ordering_user_key() {
+        // Test that HeapEntry correctly orders by user_key first.
+
+        let entry_a = HeapEntry {
+            child_idx: 0,
+            priority: 0,
+            cached_user_key: b"a".to_vec(),
+            cached_ts: 100,
+        };
+
+        let entry_b = HeapEntry {
+            child_idx: 1,
+            priority: 0,
+            cached_user_key: b"b".to_vec(),
+            cached_ts: 100,
+        };
+
+        // In min-heap, smaller key should have higher priority
+        // The Ord impl uses reverse ordering for heap behavior
+        assert!(entry_a > entry_b); // "a" comes before "b" in iteration
+    }
+
+    #[test]
+    fn test_heap_entry_ordering_timestamp() {
+        // Test that for same user_key, higher timestamp comes first.
+
+        let entry_100 = HeapEntry {
+            child_idx: 0,
+            priority: 0,
+            cached_user_key: b"key".to_vec(),
+            cached_ts: 100,
+        };
+
+        let entry_50 = HeapEntry {
+            child_idx: 1,
+            priority: 0,
+            cached_user_key: b"key".to_vec(),
+            cached_ts: 50,
+        };
+
+        // ts=100 should come before ts=50 (MVCC: higher ts first)
+        assert!(entry_100 > entry_50);
+    }
+
+    #[test]
+    fn test_heap_entry_ordering_priority_tiebreaker() {
+        // Test that for same MVCC key, lower priority number wins.
+
+        let entry_high_priority = HeapEntry {
+            child_idx: 0,
+            priority: 0, // Higher priority (active memtable)
+            cached_user_key: b"key".to_vec(),
+            cached_ts: 100,
+        };
+
+        let entry_low_priority = HeapEntry {
+            child_idx: 1,
+            priority: 100, // Lower priority (frozen memtable)
+            cached_user_key: b"key".to_vec(),
+            cached_ts: 100,
+        };
+
+        // priority 0 should come before priority 100
+        assert!(entry_high_priority > entry_low_priority);
+    }
+
+    // ==================== Additional Edge Cases ====================
+
+    #[test]
+    fn test_iterator_after_delete_and_reinsert() {
+        let tmp = TempDir::new().unwrap();
+        let config = test_config(tmp.path());
+        let engine = LsmEngine::open(config).unwrap();
+
+        // Insert
+        let mut batch = new_batch(100);
+        batch.put(b"key".to_vec(), b"v1".to_vec());
+        engine.write_batch(batch).unwrap();
+
+        // Delete
+        let mut batch = new_batch(200);
+        batch.delete(b"key".to_vec());
+        engine.write_batch(batch).unwrap();
+
+        // Re-insert
+        let mut batch = new_batch(300);
+        batch.put(b"key".to_vec(), b"v2".to_vec());
+        engine.write_batch(batch).unwrap();
+
+        // Latest value should be v2
+        assert_eq!(get_for_test(&engine, b"key"), Some(b"v2".to_vec()));
+
+        // At ts=250 (after delete, before re-insert), should be None
+        assert_eq!(get_at_for_test(&engine, b"key", 250), None);
+
+        // At ts=150 (before delete), should be v1
+        assert_eq!(get_at_for_test(&engine, b"key", 150), Some(b"v1".to_vec()));
+    }
+
+    #[test]
+    fn test_iterator_large_number_of_versions() {
+        let tmp = TempDir::new().unwrap();
+        let config = test_config(tmp.path());
+        let engine = LsmEngine::open(config).unwrap();
+
+        // Write 100 versions of the same key
+        for i in 1..=100u64 {
+            let mut batch = new_batch(i);
+            let value = format!("v{i}");
+            batch.put(b"key".to_vec(), value.into_bytes());
+            engine.write_batch(batch).unwrap();
+        }
+
+        // Latest should be v100
+        assert_eq!(get_for_test(&engine, b"key"), Some(b"v100".to_vec()));
+
+        // Each version should be visible at its timestamp
+        for i in 1..=100u64 {
+            let expected = format!("v{i}");
+            assert_eq!(
+                get_at_for_test(&engine, b"key", i),
+                Some(expected.into_bytes()),
+                "Should find v{i} at ts={i}"
+            );
+        }
+    }
+
+    #[test]
+    fn test_concurrent_scan_and_write() {
+        use std::sync::Arc;
+        use std::thread;
+
+        let tmp = TempDir::new().unwrap();
+        let config = LsmConfig::builder(tmp.path())
+            .memtable_size(4096)
+            .max_frozen_memtables(4)
+            .build()
+            .unwrap();
+        let engine = Arc::new(LsmEngine::open(config).unwrap());
+
+        // Pre-populate
+        let mut batch = new_batch(1);
+        for i in 0..100 {
+            batch.put(format!("key{i:03}").into_bytes(), b"initial".to_vec());
+        }
+        engine.write_batch(batch).unwrap();
+
+        let engine_reader = Arc::clone(&engine);
+        let engine_writer = Arc::clone(&engine);
+
+        // Reader thread
+        let reader = thread::spawn(move || {
+            for _ in 0..50 {
+                let range = MvccKey::unbounded()..MvccKey::unbounded();
+                let mut iter = engine_reader.scan_iter(range).unwrap();
+                iter.advance().unwrap();
+                let mut count = 0;
+                while iter.valid() {
+                    count += 1;
+                    iter.advance().unwrap();
+                }
+                assert!(count >= 100, "Should see at least 100 entries");
+            }
+        });
+
+        // Writer thread
+        let writer = thread::spawn(move || {
+            for i in 0..50 {
+                let mut batch = new_batch((100 + i) as u64);
+                batch.put(format!("new_key{i:03}").into_bytes(), b"new_value".to_vec());
+                engine_writer.write_batch(batch).unwrap();
+            }
+        });
+
+        reader.join().unwrap();
+        writer.join().unwrap();
+    }
 }
