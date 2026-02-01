@@ -1,0 +1,22 @@
+# USE database command test
+
+# Create a table in default database
+CREATE TABLE test_table (id INT PRIMARY KEY, value VARCHAR(100));
+
+# Insert data
+INSERT INTO test_table (id, value) VALUES (1, 'hello');
+
+# USE database (should not cause reconnection)
+USE test;
+
+# Verify table is still accessible after USE
+SELECT id, value FROM test_table;
+
+# USE with backticks
+USE `test`;
+
+# Verify still works
+SELECT id, value FROM test_table;
+
+# Clean up
+DROP TABLE test_table;

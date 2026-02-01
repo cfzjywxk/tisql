@@ -71,6 +71,13 @@ impl SimpleExecutor {
         txn_service: &T,
         catalog: &C,
     ) -> Result<ExecutionResult> {
+        // Handle USE database - session-level command, no transaction needed
+        // Note: The actual database change is handled at the protocol layer (Session).
+        // Here we just validate and return OK so the command doesn't error.
+        if let LogicalPlan::UseDatabase { db_name: _ } = &plan {
+            return Ok(ExecutionResult::Ok);
+        }
+
         // Begin a read-only transaction (allocates start_ts)
         let ctx = txn_service.begin(true)?;
 

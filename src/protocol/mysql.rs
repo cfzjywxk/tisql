@@ -122,6 +122,21 @@ impl<W: AsyncWrite + Send + Unpin> AsyncMysqlShim<W> for MySqlBackend {
             return results.completed(Self::make_ok_response(0, 0)).await;
         }
 
+        // Handle USE database statement (MySQL client may send as COM_QUERY instead of COM_INIT_DB)
+        if query_lower.starts_with("use ") {
+            // Parse database name: "use dbname" or "use `dbname`"
+            let db_name = query.trim()[4..].trim();
+            // Remove backticks if present
+            let db_name = db_name.trim_matches('`');
+            log_info!(
+                "Session {} selected database via USE query: {}",
+                self.session.id(),
+                db_name
+            );
+            self.session.set_current_db(db_name);
+            return results.completed(Self::make_ok_response(0, 0)).await;
+        }
+
         // Handle SHOW statements
         if query_lower.starts_with("show ") {
             return self.handle_show(query, results).await;

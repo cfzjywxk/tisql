@@ -86,9 +86,13 @@ impl<'a> Binder<'a> {
                 if_exists,
                 ..
             } => self.bind_drop(object_type, names, if_exists),
+            SqlStatement::Use { db_name } => Ok(LogicalPlan::UseDatabase {
+                db_name: db_name.value.clone(),
+            }),
             _ => Err(TiSqlError::Bind(format!(
-                "Unsupported statement type: {:?}",
-                std::mem::discriminant(&stmt)
+                "Unsupported statement type: {:?} for: {}",
+                std::mem::discriminant(&stmt),
+                stmt
             ))),
         }
     }

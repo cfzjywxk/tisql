@@ -114,6 +114,9 @@ pub enum LogicalPlan {
 
     /// Empty result (for internal use)
     Empty { schema: Schema },
+
+    /// USE database (session-level command)
+    UseDatabase { db_name: String },
 }
 
 impl LogicalPlan {

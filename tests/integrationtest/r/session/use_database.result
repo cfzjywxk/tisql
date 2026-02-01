@@ -1,0 +1,12 @@
+CREATE TABLE test_table (id INT PRIMARY KEY, value VARCHAR(100))
+INSERT INTO test_table (id, value) VALUES (1, 'hello')
+AFFECTED 1
+USE test
+SELECT id, value FROM test_table
+id	value
+1	hello
+USE `test`
+SELECT id, value FROM test_table
+id	value
+1	hello
+DROP TABLE test_table
