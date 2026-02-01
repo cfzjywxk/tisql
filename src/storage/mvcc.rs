@@ -437,12 +437,12 @@ use crate::error::Result;
 /// - Keys with the same user key are grouped together
 /// - Within a user key, newer versions (higher timestamps) come first
 ///
-/// ## Zero-Copy Guarantee
+/// ## Accessor Methods
 ///
 /// All accessor methods (`user_key()`, `timestamp()`, `value()`) return
-/// references to data stored in the underlying data structure. No memory
-/// allocation or copying occurs during iteration. If callers need to own
-/// the data, they must clone it explicitly.
+/// references rather than owned data. Callers who need ownership must
+/// clone explicitly. Note that some implementations (e.g., merge iterators)
+/// may cache data internally to support deduplication.
 ///
 /// ## Thread Safety
 ///
@@ -460,7 +460,6 @@ pub trait MvccIterator {
     /// Advance to the next entry.
     ///
     /// This advances the iterator to the next key in MVCC order.
-    /// No memory allocation occurs during this operation.
     ///
     /// Named `advance` instead of `next` to avoid conflict with `Iterator::next`.
     fn advance(&mut self) -> Result<()>;

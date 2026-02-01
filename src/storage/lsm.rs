@@ -622,11 +622,12 @@ impl MvccIterator for ArcMemTableIterator {
 // - Uses heap of indices (like RocksDB's pointer-based heap)
 // - Caches key in HeapEntry for efficient comparison (like IteratorWrapper)
 //
-// ## Zero-Copy Design
+// ## Memory Layout
 //
 // - `ChildIterator` enum provides concrete types without Box<dyn>
-// - `user_key()`, `value()` return references to internal data
-// - Only the "emitted" entry is cached for returning via trait methods
+// - Child iterators return references, but TieredMergeIterator caches the
+//   current entry (key + value) for deduplication and returning via trait
+// - HeapEntry caches keys for efficient heap comparison
 
 use std::cmp::Ordering;
 use std::path::PathBuf;
@@ -647,7 +648,7 @@ const PRIORITY_LEVEL_BASE: u32 = 10000; // L1 = 10000, L2 = 20000, etc.
 /// This enum provides:
 /// - No heap allocation for dynamic dispatch
 /// - Enum-based dispatch (predictable, branch-predicted)
-/// - Zero-copy: all methods return references to internal data
+/// - Child methods return references to internal data
 /// - All variants are internally lazy (no ChildSource wrapper needed)
 enum ChildIterator {
     /// Memtable iterator (active or frozen)
@@ -1126,12 +1127,15 @@ impl MvccIterator for LevelIterator {
 /// - Uses heap of indices (like RocksDB's pointer-based heap)
 /// - Caches key in HeapEntry for efficient comparison
 ///
-/// ## Zero-Copy Design
+/// ## Memory Layout
 ///
 /// - `ChildIterator` enum: concrete types, no `Box<dyn>`
-/// - `user_key()`, `value()` return references to internal data
-/// - Only the "emitted" entry is cached for returning via trait methods
-/// - Heap entries cache keys for comparison (like RocksDB's IteratorWrapper)
+/// - Current entry (key + value) is cached for deduplication and returning
+/// - Heap entries cache keys for efficient comparison (like RocksDB's IteratorWrapper)
+///
+/// Note: Each `advance()` copies key and value into owned storage. This is
+/// necessary for deduplication across sources. Callers get references to
+/// the cached data via `user_key()` and `value()`.
 ///
 /// ## Usage
 ///
@@ -1141,7 +1145,7 @@ impl MvccIterator for LevelIterator {
 /// iter.add_l0_sst(meta, sst_dir, range, idx);  // No I/O here!
 /// iter.advance()?;  // First I/O happens here
 /// while iter.valid() {
-///     let key = iter.user_key();  // Zero-copy reference
+///     let key = iter.user_key();  // Reference to cached data
 ///     iter.advance()?;
 /// }
 /// ```
@@ -1419,6 +1423,12 @@ impl TieredMergeIterator {
 
 impl MvccIterator for TieredMergeIterator {
     fn seek(&mut self, target: &MvccKey) -> Result<()> {
+        // Clear any pending error from previous advance() - seek resets iterator state
+        if let Some(e) = self.pending_error.take() {
+            // Log but don't return - seek should reset the iterator
+            tracing::debug!("clearing pending error on seek: {e:?}");
+        }
+
         // Clear current state
         self.current_user_key = None;
         self.current_value = None;
@@ -3164,12 +3174,12 @@ mod tests {
 
     // ==================== TieredMergeIterator Tests ====================
     //
-    // These tests verify the tiered lazy loading behavior of TieredMergeIterator:
-    // 1. Data is read in tier order: active -> frozen -> L0 -> L1+
-    // 2. SST iterators are only initialized when memtable tier is exhausted
-    // 3. All L0 SST files are considered (they can overlap/be unordered)
-    // 4. Priority-based deduplication works correctly
-    // 5. seek() initializes all pending iterators
+    // These tests verify the tiered merge behavior of TieredMergeIterator:
+    // 1. Data is merged in MVCC order: (user_key ASC, timestamp DESC)
+    // 2. All sources (memtable, L0, L1+) are initialized on first seek/advance
+    // 3. L0 SST files can overlap and are all considered
+    // 4. Priority-based deduplication: higher priority source wins for same MVCC key
+    // 5. Lazy file I/O: SST files are opened on first seek, not at construction
 
     use std::cell::RefCell;
     use std::rc::Rc;
