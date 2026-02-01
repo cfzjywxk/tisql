@@ -454,6 +454,13 @@ impl<S: StorageEngine + 'static, L: ClogService + 'static, T: TsoService> TxnSer
 ///
 /// Storage errors (I/O, corruption) are propagated through `advance()`.
 /// After an error, `valid()` returns false.
+///
+/// ## Zero-Copy Design
+///
+/// Uses lazy skipping to avoid value cloning: after finding a visible entry,
+/// the storage iterator stays positioned on it. Older versions are skipped
+/// at the start of the next `advance()` call. This allows `user_key()`,
+/// `timestamp()`, and `value()` to return references directly from storage.
 pub struct MvccScanIterator<I: MvccIterator> {
     /// Storage iterator producing MVCC key-value pairs
     storage_iter: I,
@@ -461,8 +468,11 @@ pub struct MvccScanIterator<I: MvccIterator> {
     read_ts: Timestamp,
     /// Key range for filtering
     range: Range<Key>,
-    /// Current entry (key, timestamp, value). None if not positioned on a valid entry.
-    current: Option<(Vec<u8>, Timestamp, Vec<u8>)>,
+    /// Key to skip on next advance (older versions of last returned key).
+    /// Also used for tombstone skipping within the same advance call.
+    last_returned_key: Option<Vec<u8>>,
+    /// Whether positioned on a valid entry (storage_iter points to it)
+    is_positioned: bool,
 }
 
 impl<I: MvccIterator> MvccScanIterator<I> {
@@ -481,20 +491,29 @@ impl<I: MvccIterator> MvccScanIterator<I> {
             storage_iter,
             read_ts,
             range,
-            current: None,
+            last_returned_key: None,
+            is_positioned: false,
         }
     }
 
     /// Find the next visible entry from storage.
     ///
-    /// Advances the storage iterator until we find an entry that:
-    /// - Is within the key range
-    /// - Has `ts <= read_ts` (MVCC visibility)
-    /// - Is not a tombstone
+    /// Uses lazy skipping: older versions of the previously returned key are
+    /// skipped at the start of this call (not at the end of the previous call).
+    /// This allows `user_key()`, `timestamp()`, and `value()` to return
+    /// references directly from the storage iterator without caching.
     ///
-    /// After finding a visible entry, skips all older versions of the same key.
+    /// After finding a visible entry, the storage iterator stays positioned on it.
+    /// The key is recorded in `last_returned_key` for skipping on the next call.
     fn find_next_visible(&mut self) -> crate::error::Result<()> {
-        self.current = None;
+        // Lazy skip: skip older versions of the previously returned key
+        if let Some(ref skip_key) = self.last_returned_key {
+            while self.storage_iter.valid() && self.storage_iter.user_key() == skip_key.as_slice() {
+                self.storage_iter.advance()?;
+            }
+        }
+        self.last_returned_key = None;
+        self.is_positioned = false;
 
         // Initialize storage iterator if needed
         if !self.storage_iter.valid() {
@@ -507,7 +526,7 @@ impl<I: MvccIterator> MvccScanIterator<I> {
 
             // Check if past end of range
             if !self.range.end.is_empty() && user_key >= self.range.end.as_slice() {
-                return Ok(()); // current stays None
+                return Ok(()); // is_positioned stays false
             }
 
             // Skip if before start of range
@@ -524,7 +543,8 @@ impl<I: MvccIterator> MvccScanIterator<I> {
 
             // Found a visible entry - check if tombstone
             if is_tombstone(self.storage_iter.value()) {
-                // Skip this key and all older versions
+                // Tombstone: skip this key and all older versions immediately
+                // (we don't return tombstones, so no lazy skip needed)
                 let skip_key = user_key.to_vec();
                 self.storage_iter.advance()?;
                 while self.storage_iter.valid()
@@ -535,22 +555,14 @@ impl<I: MvccIterator> MvccScanIterator<I> {
                 continue;
             }
 
-            // Found a visible, non-tombstone entry - cache it
-            let key = self.storage_iter.user_key().to_vec();
-            let timestamp = self.storage_iter.timestamp();
-            let value = self.storage_iter.value().to_vec();
-            self.current = Some((key.clone(), timestamp, value));
-
-            // Skip all older versions of this key
-            self.storage_iter.advance()?;
-            while self.storage_iter.valid() && self.storage_iter.user_key() == key.as_slice() {
-                self.storage_iter.advance()?;
-            }
-
+            // Found a visible, non-tombstone entry
+            // Record key for lazy skip on next advance, keep iterator positioned here
+            self.last_returned_key = Some(user_key.to_vec());
+            self.is_positioned = true;
             return Ok(());
         }
 
-        Ok(()) // current stays None - exhausted
+        Ok(()) // is_positioned stays false - exhausted
     }
 }
 
@@ -567,28 +579,22 @@ impl<I: MvccIterator> MvccIterator for MvccScanIterator<I> {
     }
 
     fn valid(&self) -> bool {
-        self.current.is_some()
+        self.is_positioned
     }
 
     fn user_key(&self) -> &[u8] {
-        self.current
-            .as_ref()
-            .map(|(k, _, _)| k.as_slice())
-            .expect("Iterator not valid")
+        debug_assert!(self.is_positioned, "user_key() called on invalid iterator");
+        self.storage_iter.user_key()
     }
 
     fn timestamp(&self) -> Timestamp {
-        self.current
-            .as_ref()
-            .map(|(_, ts, _)| *ts)
-            .expect("Iterator not valid")
+        debug_assert!(self.is_positioned, "timestamp() called on invalid iterator");
+        self.storage_iter.timestamp()
     }
 
     fn value(&self) -> &[u8] {
-        self.current
-            .as_ref()
-            .map(|(_, _, v)| v.as_slice())
-            .expect("Iterator not valid")
+        debug_assert!(self.is_positioned, "value() called on invalid iterator");
+        self.storage_iter.value()
     }
 }
 
@@ -1166,13 +1172,13 @@ mod tests {
             (MvccKey::encode(b"c", 5), b"value_c".to_vec()),
         ];
 
-        // Error after 2 successful advance() calls on mock.
-        // Caching iterator behavior:
-        // - Cache "a", skip "a" (advance #1, ok), return "a"
-        // - Cache "b", skip "b" (advance #2, ok), return "b"
-        // - Cache "c", skip "c" (advance #3, position=2 > 1, ERROR!)
+        // Error after 1 successful advance() call on mock.
+        // Lazy skip design:
+        // - First find_next_visible: position=0, return "a" (no advance needed to read first entry)
+        // - Second find_next_visible: lazy skip "a" (advance 0→1, ok), return "b"
+        // - Third find_next_visible: lazy skip "b" (advance 1→2, 2>1=ERROR!)
         // Result: 2 Ok entries + 1 Err
-        let mock_iter = ErrorInjectingIterator::new(entries, 2);
+        let mock_iter = ErrorInjectingIterator::new(entries, 1);
 
         let scan_iter = MvccScanIterator::new(
             mock_iter,
@@ -1206,12 +1212,12 @@ mod tests {
             (MvccKey::encode(b"b", 5), b"value_b".to_vec()),
         ];
 
-        // Error after 1 successful advance() call on mock.
-        // Caching iterator behavior:
-        // - Cache "a", skip "a" (advance #1, ok), return "a"
-        // - Cache "b", skip "b" (advance #2, position=1 > 0, ERROR!)
+        // Error after 0 successful advance() calls on mock.
+        // Lazy skip design:
+        // - First find_next_visible: position=0, return "a" (no advance needed)
+        // - Second find_next_visible: lazy skip "a" (advance 0→1, 1>0=ERROR!)
         // Result: 1 Ok entry + 1 Err
-        let mock_iter = ErrorInjectingIterator::new(entries, 1);
+        let mock_iter = ErrorInjectingIterator::new(entries, 0);
 
         let scan_iter = MvccScanIterator::new(mock_iter, 10, b"a".to_vec()..b"z".to_vec());
 
@@ -1256,11 +1262,11 @@ mod tests {
             (MvccKey::encode(b"c", 5), b"value_c".to_vec()),
         ];
 
-        // Error after 2 successful advance() calls on mock.
-        // Caching: cache & skip "a" (advance #1 ok), cache & skip "b" (advance #2 ok),
-        //          cache & skip "c" (advance #3, 2>1=true, ERROR)
+        // Error after 1 successful advance() call on mock.
+        // Lazy skip: return "a" (no advance), lazy skip "a" (advance #1 ok) return "b",
+        //            lazy skip "b" (advance #2, 2>1=ERROR)
         // Result: 2 successful entries before error
-        let mock_iter = ErrorInjectingIterator::new(entries.clone(), 2);
+        let mock_iter = ErrorInjectingIterator::new(entries.clone(), 1);
 
         let scan_iter = MvccScanIterator::new(mock_iter, 10, b"a".to_vec()..b"z".to_vec());
 

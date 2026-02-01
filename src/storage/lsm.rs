@@ -648,11 +648,12 @@ const PRIORITY_LEVEL_BASE: u32 = 10000; // L1 = 10000, L2 = 20000, etc.
 /// - No heap allocation for dynamic dispatch
 /// - Enum-based dispatch (predictable, branch-predicted)
 /// - Zero-copy: all methods return references to internal data
+/// - All variants are internally lazy (no ChildSource wrapper needed)
 enum ChildIterator {
     /// Memtable iterator (active or frozen)
     Memtable(ArcMemTableIterator),
-    /// L0 SST iterator
-    L0Sst(SstMvccIterator),
+    /// L0 SST iterator - internally lazy (opens file on first seek)
+    L0Sst(L0SstIterator),
     /// Level iterator (L1+) - internally lazy
     Level(LevelIterator),
     /// Mock iterator for testing (test-only)
@@ -729,61 +730,17 @@ impl ChildIterator {
 }
 
 // ============================================================================
-// ChildSource - Lazy/Ready state for child iterators
+// ChildHandle - Stores iterator + priority
 // ============================================================================
 
-/// Source for a child iterator - may be lazy (pending) or ready.
+/// Handle for a child iterator with its priority.
 ///
-/// This enables RocksDB-style lazy initialization:
-/// - Memtables: created immediately (in-memory, no I/O)
-/// - L0 SSTs: stored as metadata, opened on first seek
-/// - Levels: LevelIterator created, internally lazy
-enum ChildSource {
-    /// Ready iterator - can be used immediately (boxed to reduce enum size)
-    Ready(Box<ChildIterator>),
-    /// Pending L0 SST - opened lazily on first seek
-    L0Pending {
-        meta: Arc<SstMeta>,
-        sst_dir: PathBuf,
-        range: SharedMvccRange,
-    },
-}
-
-impl ChildSource {
-    /// Materialize this source into a ready iterator.
-    /// For Ready sources, this is a no-op. For Pending, opens the SST file.
-    fn materialize(&mut self) -> Result<()> {
-        if let Self::L0Pending {
-            meta,
-            sst_dir,
-            range,
-        } = self
-        {
-            let path = sst_dir.join(format!("{:08}.sst", meta.id));
-            let reader = SstReaderRef::open(&path)?;
-            let iter = SstMvccIterator::new(reader, Arc::clone(range))?;
-            *self = Self::Ready(Box::new(ChildIterator::L0Sst(iter)));
-        }
-        Ok(())
-    }
-
-    /// Get mutable iterator, panics if not ready.
-    #[inline]
-    fn iter_mut(&mut self) -> &mut ChildIterator {
-        match self {
-            Self::Ready(iter) => iter,
-            Self::L0Pending { .. } => panic!("ChildSource not materialized"),
-        }
-    }
-}
-
-// ============================================================================
-// ChildHandle - Stores source + priority
-// ============================================================================
-
-/// Handle for a child iterator source with its priority.
+/// All child iterators are internally lazy:
+/// - Memtables: in-memory, no I/O needed
+/// - L0Sst: L0SstIterator opens file on first seek
+/// - Level: LevelIterator opens files on demand
 struct ChildHandle {
-    source: ChildSource,
+    iter: ChildIterator,
     priority: u32,
 }
 
@@ -856,6 +813,118 @@ impl Ord for HeapEntry {
             }
             ord => ord,
         }
+    }
+}
+
+/// Iterator for a single L0 SST file with lazy opening.
+///
+/// L0 files can overlap with each other and with other levels, so each
+/// needs its own iterator. This wrapper defers file I/O until first seek.
+struct L0SstIterator {
+    /// SST metadata
+    meta: Arc<SstMeta>,
+    /// Base path for SST files
+    sst_dir: PathBuf,
+    /// Shared query range
+    range: SharedMvccRange,
+    /// Inner iterator (lazy loaded on first seek)
+    inner: Option<SstMvccIterator>,
+    /// Pending error
+    pending_error: Option<TiSqlError>,
+}
+
+impl L0SstIterator {
+    /// Create a new L0 SST iterator (lazy - no I/O during construction).
+    fn new(meta: Arc<SstMeta>, sst_dir: PathBuf, range: SharedMvccRange) -> Self {
+        Self {
+            meta,
+            sst_dir,
+            range,
+            inner: None,
+            pending_error: None,
+        }
+    }
+
+    /// Open the SST file if not already open.
+    fn ensure_open(&mut self) -> Result<()> {
+        if self.inner.is_some() {
+            return Ok(());
+        }
+
+        let path = self.sst_dir.join(format!("{:08}.sst", self.meta.id));
+        if !path.exists() {
+            return Err(TiSqlError::Storage(format!(
+                "SST file missing: {} (id={}, level={})",
+                path.display(),
+                self.meta.id,
+                self.meta.level
+            )));
+        }
+
+        let reader = SstReaderRef::open(&path)?;
+        let iter = SstMvccIterator::new(reader, Arc::clone(&self.range))?;
+        self.inner = Some(iter);
+        Ok(())
+    }
+}
+
+impl MvccIterator for L0SstIterator {
+    fn seek(&mut self, target: &MvccKey) -> Result<()> {
+        if let Some(e) = self.pending_error.take() {
+            return Err(e);
+        }
+
+        self.ensure_open()?;
+        if let Some(ref mut iter) = self.inner {
+            iter.seek(target)?;
+        }
+        Ok(())
+    }
+
+    fn advance(&mut self) -> Result<()> {
+        if let Some(e) = self.pending_error.take() {
+            return Err(e);
+        }
+
+        // If not yet opened, open and position at start of range
+        if self.inner.is_none() {
+            self.ensure_open()?;
+            // SstMvccIterator::new positions at range start, just advance
+            if let Some(ref mut iter) = self.inner {
+                iter.advance()?;
+            }
+            return Ok(());
+        }
+
+        if let Some(ref mut iter) = self.inner {
+            iter.advance()?;
+        }
+        Ok(())
+    }
+
+    fn valid(&self) -> bool {
+        self.inner.as_ref().is_some_and(|iter| iter.valid())
+    }
+
+    fn user_key(&self) -> &[u8] {
+        self.inner
+            .as_ref()
+            .expect("L0SstIterator not positioned")
+            .user_key()
+    }
+
+    fn timestamp(&self) -> Timestamp {
+        self.inner
+            .as_ref()
+            .expect("L0SstIterator not positioned")
+            .timestamp()
+    }
+
+    fn value(&self) -> &[u8] {
+        self.inner
+            .as_ref()
+            .expect("L0SstIterator not positioned")
+            .value()
     }
 }
 
@@ -1069,7 +1138,7 @@ impl MvccIterator for LevelIterator {
 /// ```ignore
 /// let mut iter = TieredMergeIterator::new();
 /// iter.add_active_memtable(memtable, range);
-/// iter.add_l0_pending(meta, sst_dir, range, idx);  // No I/O here!
+/// iter.add_l0_sst(meta, sst_dir, range, idx);  // No I/O here!
 /// iter.advance()?;  // First I/O happens here
 /// while iter.valid() {
 ///     let key = iter.user_key();  // Zero-copy reference
@@ -1120,30 +1189,25 @@ impl TieredMergeIterator {
     }
 
     /// Add the active memtable iterator (highest priority).
-    ///
-    /// Memtable iterators are cheap (in-memory), so we create them immediately.
     fn add_active_memtable(&mut self, iter: ArcMemTableIterator) {
         self.children.push(ChildHandle {
-            source: ChildSource::Ready(Box::new(ChildIterator::Memtable(iter))),
+            iter: ChildIterator::Memtable(iter),
             priority: PRIORITY_ACTIVE,
         });
     }
 
     /// Add a frozen memtable iterator.
-    ///
-    /// Memtable iterators are cheap (in-memory), so we create them immediately.
     fn add_frozen_memtable(&mut self, iter: ArcMemTableIterator, index: usize) {
         self.children.push(ChildHandle {
-            source: ChildSource::Ready(Box::new(ChildIterator::Memtable(iter))),
+            iter: ChildIterator::Memtable(iter),
             priority: PRIORITY_FROZEN_BASE + index as u32,
         });
     }
 
-    /// Add a pending L0 SST (lazy - no I/O until first seek).
+    /// Add an L0 SST (lazy - no I/O until first seek).
     ///
-    /// This is the key optimization: L0 SST files are NOT opened at
-    /// construction time. The file is opened lazily on first `seek()`.
-    fn add_l0_pending(
+    /// L0SstIterator opens the file lazily on first `seek()`.
+    fn add_l0_sst(
         &mut self,
         meta: Arc<SstMeta>,
         sst_dir: PathBuf,
@@ -1151,33 +1215,17 @@ impl TieredMergeIterator {
         index: usize,
     ) {
         self.children.push(ChildHandle {
-            source: ChildSource::L0Pending {
-                meta,
-                sst_dir,
-                range,
-            },
-            priority: PRIORITY_L0_BASE + index as u32,
-        });
-    }
-
-    /// Add an L0 SST iterator (already opened).
-    ///
-    /// Use this when you already have an open SST iterator.
-    #[allow(dead_code)] // Useful for testing
-    fn add_l0_sst(&mut self, iter: SstMvccIterator, index: usize) {
-        self.children.push(ChildHandle {
-            source: ChildSource::Ready(Box::new(ChildIterator::L0Sst(iter))),
+            iter: ChildIterator::L0Sst(L0SstIterator::new(meta, sst_dir, range)),
             priority: PRIORITY_L0_BASE + index as u32,
         });
     }
 
     /// Add a level iterator for L1+.
     ///
-    /// LevelIterator is internally lazy (opens files on seek), so we
-    /// create it immediately but no I/O happens until iteration.
+    /// LevelIterator is internally lazy (opens files on seek).
     fn add_level(&mut self, iter: LevelIterator, level: usize) {
         self.children.push(ChildHandle {
-            source: ChildSource::Ready(Box::new(ChildIterator::Level(iter))),
+            iter: ChildIterator::Level(iter),
             priority: PRIORITY_LEVEL_BASE * level as u32,
         });
     }
@@ -1190,7 +1238,7 @@ impl TieredMergeIterator {
     /// ```ignore
     /// let mut iter = TieredMergeIterator::new();
     /// iter.add_active_memtable(mem);
-    /// iter.add_l0_pending(meta, dir, range, 0);  // No I/O!
+    /// iter.add_l0_sst(meta, dir, range, 0);  // No I/O!
     /// iter.advance()?;  // First I/O happens here
     /// while iter.valid() {
     ///     // process...
@@ -1294,7 +1342,7 @@ impl TieredMergeIterator {
     /// Add a mock iterator as active memtable (test-only).
     fn add_mock_active(&mut self, iter: MockMvccIterator) {
         self.children.push(ChildHandle {
-            source: ChildSource::Ready(Box::new(ChildIterator::Mock(iter))),
+            iter: ChildIterator::Mock(iter),
             priority: PRIORITY_ACTIVE,
         });
     }
@@ -1302,7 +1350,7 @@ impl TieredMergeIterator {
     /// Add a mock iterator as frozen memtable (test-only).
     fn add_mock_frozen(&mut self, iter: MockMvccIterator, index: usize) {
         self.children.push(ChildHandle {
-            source: ChildSource::Ready(Box::new(ChildIterator::Mock(iter))),
+            iter: ChildIterator::Mock(iter),
             priority: PRIORITY_FROZEN_BASE + index as u32,
         });
     }
@@ -1310,7 +1358,7 @@ impl TieredMergeIterator {
     /// Add a mock iterator as L0 SST (test-only).
     fn add_mock_l0(&mut self, iter: MockMvccIterator, index: usize) {
         self.children.push(ChildHandle {
-            source: ChildSource::Ready(Box::new(ChildIterator::Mock(iter))),
+            iter: ChildIterator::Mock(iter),
             priority: PRIORITY_L0_BASE + index as u32,
         });
     }
@@ -1318,7 +1366,7 @@ impl TieredMergeIterator {
     /// Add a mock iterator as level (test-only).
     fn add_mock_level(&mut self, iter: MockMvccIterator, level: usize) {
         self.children.push(ChildHandle {
-            source: ChildSource::Ready(Box::new(ChildIterator::Mock(iter))),
+            iter: ChildIterator::Mock(iter),
             priority: PRIORITY_LEVEL_BASE * level as u32,
         });
     }
@@ -1328,9 +1376,8 @@ impl TieredMergeIterator {
     /// Initialize all children and populate the heap.
     ///
     /// This is called on first `seek()` or `advance()`. It:
-    /// 1. Materializes all pending (lazy) sources
-    /// 2. Seeks all children to the target
-    /// 3. Adds valid children to the heap with cached keys
+    /// 1. Seeks all children to the target (lazy iterators open files on demand)
+    /// 2. Adds valid children to the heap with cached keys
     fn initialize(&mut self, target: &MvccKey) -> Result<()> {
         if self.initialized {
             return Ok(());
@@ -1339,16 +1386,13 @@ impl TieredMergeIterator {
         self.heap.clear();
 
         for (idx, child) in self.children.iter_mut().enumerate() {
-            // Materialize lazy sources (L0 SSTs)
-            child.source.materialize()?;
-
-            // Seek the iterator
-            let iter = child.source.iter_mut();
-            iter.seek(target)?;
+            // Seek the iterator (lazy iterators open files on first seek)
+            child.iter.seek(target)?;
 
             // Add to heap if valid (with cached key for comparison)
-            if iter.valid() {
-                self.heap.push(HeapEntry::new(idx, iter, child.priority));
+            if child.iter.valid() {
+                self.heap
+                    .push(HeapEntry::new(idx, &child.iter, child.priority));
             }
         }
 
@@ -1361,14 +1405,11 @@ impl TieredMergeIterator {
         self.heap.clear();
 
         for (idx, child) in self.children.iter_mut().enumerate() {
-            // Materialize if still pending
-            child.source.materialize()?;
+            child.iter.seek(target)?;
 
-            let iter = child.source.iter_mut();
-            iter.seek(target)?;
-
-            if iter.valid() {
-                self.heap.push(HeapEntry::new(idx, iter, child.priority));
+            if child.iter.valid() {
+                self.heap
+                    .push(HeapEntry::new(idx, &child.iter, child.priority));
             }
         }
 
@@ -1441,21 +1482,20 @@ impl TieredMergeIterator {
 
             // Get the iterator for this child
             let child = &mut self.children[child_idx];
-            let iter = child.source.iter_mut();
 
             // Cache the current entry for returning
-            let user_key = iter.user_key().to_vec();
-            let timestamp = iter.timestamp();
-            let value = iter.value().to_vec();
+            let user_key = child.iter.user_key().to_vec();
+            let timestamp = child.iter.timestamp();
+            let value = child.iter.value().to_vec();
 
             // Advance the iterator
-            if let Err(e) = iter.advance() {
+            if let Err(e) = child.iter.advance() {
                 self.pending_error = Some(e);
             }
 
             // Re-add to heap if still valid (update cached key)
-            if iter.valid() {
-                entry.update_cache(iter);
+            if child.iter.valid() {
+                entry.update_cache(&child.iter);
                 self.heap.push(entry);
             }
 
@@ -1522,8 +1562,8 @@ impl StorageEngine for LsmEngine {
         l0_ssts.sort_by(|a, b| b.id.cmp(&a.id)); // Newest first
 
         for (idx, sst_meta) in l0_ssts.into_iter().enumerate() {
-            // LAZY: Store metadata only, no file I/O here!
-            merge_iter.add_l0_pending(sst_meta, sst_dir.clone(), Arc::clone(&range), idx);
+            // LAZY: L0SstIterator opens file on first seek
+            merge_iter.add_l0_sst(sst_meta, sst_dir.clone(), Arc::clone(&range), idx);
         }
 
         // 4. Add L1+ level iterators (internally lazy for file opening)
