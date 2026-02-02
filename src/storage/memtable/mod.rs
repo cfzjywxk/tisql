@@ -71,3 +71,41 @@ impl GetResult {
         matches!(self, GetResult::Found(_) | GetResult::FoundTombstone)
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_get_result_found_into_option() {
+        let result = GetResult::Found(b"value".to_vec());
+        assert_eq!(result.into_option(), Some(b"value".to_vec()));
+    }
+
+    #[test]
+    fn test_get_result_tombstone_into_option() {
+        let result = GetResult::FoundTombstone;
+        assert_eq!(result.into_option(), None);
+    }
+
+    #[test]
+    fn test_get_result_not_found_into_option() {
+        let result = GetResult::NotFound;
+        assert_eq!(result.into_option(), None);
+    }
+
+    #[test]
+    fn test_get_result_is_found() {
+        assert!(GetResult::Found(b"v".to_vec()).is_found());
+        assert!(GetResult::FoundTombstone.is_found());
+        assert!(!GetResult::NotFound.is_found());
+    }
+
+    #[test]
+    fn test_get_result_debug_and_clone() {
+        let result = GetResult::Found(b"test".to_vec());
+        let cloned = result.clone();
+        assert_eq!(result, cloned);
+        let _ = format!("{result:?}");
+    }
+}
