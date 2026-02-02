@@ -24,10 +24,62 @@ use opensrv_mysql::{
 };
 use tokio::io::AsyncWrite;
 
-use crate::session::Session;
+use crate::session::{ExecutionCtx, Session};
 use crate::types::DataType;
 use crate::worker::WorkerPool;
-use crate::{log_debug, log_info, Database, QueryResult};
+use crate::{log_debug, log_info, log_warn, Database, QueryResult};
+
+// ============================================================================
+// Statement Classification
+// ============================================================================
+
+/// Classifies SQL statements for protocol-level handling.
+///
+/// Transaction control statements (BEGIN/COMMIT/ROLLBACK) and USE DATABASE
+/// are handled directly at the protocol layer rather than being dispatched
+/// to the worker pool. This ensures proper session state management.
+#[derive(Debug)]
+enum StatementType {
+    /// BEGIN or START TRANSACTION
+    Begin { read_only: bool },
+    /// COMMIT
+    Commit,
+    /// ROLLBACK
+    Rollback,
+    /// USE database_name
+    UseDatabase(String),
+    /// All other statements - dispatch to worker pool
+    Other,
+}
+
+/// Classifies a SQL statement for protocol-level handling.
+///
+/// This is a quick syntactic check, not a full parse. It handles:
+/// - BEGIN / START TRANSACTION [READ ONLY]
+/// - COMMIT
+/// - ROLLBACK
+/// - USE database_name
+fn classify_statement(sql: &str) -> StatementType {
+    let sql_trimmed = sql.trim();
+    let sql_upper = sql_trimmed.to_uppercase();
+
+    if sql_upper.starts_with("BEGIN") || sql_upper.starts_with("START TRANSACTION") {
+        let read_only = sql_upper.contains("READ ONLY");
+        StatementType::Begin { read_only }
+    } else if sql_upper.starts_with("COMMIT") {
+        StatementType::Commit
+    } else if sql_upper.starts_with("ROLLBACK") {
+        StatementType::Rollback
+    } else if sql_upper.starts_with("USE ") {
+        // Extract database name: "USE dbname" or "USE `dbname`"
+        let db_name = sql_trimmed[4..].trim();
+        // Remove backticks and semicolon if present
+        let db_name = db_name.trim_matches('`').trim_end_matches(';').trim();
+        StatementType::UseDatabase(db_name.to_string())
+    } else {
+        StatementType::Other
+    }
+}
 
 /// MySQL protocol backend that wraps our Database.
 ///
@@ -105,8 +157,10 @@ impl<W: AsyncWrite + Send + Unpin> AsyncMysqlShim<W> for MySqlBackend {
 
     /// Called on COM_QUERY - direct SQL query.
     ///
-    /// Creates a QueryCtx from the session before executing the query.
-    /// The QueryCtx inherits session settings (current_db, isolation_level, etc.).
+    /// Transaction control statements (BEGIN/COMMIT/ROLLBACK) are handled
+    /// directly at the protocol layer to ensure proper session state management.
+    /// Other statements are dispatched to the worker pool with the current
+    /// database and optional transaction context.
     async fn on_query<'a>(
         &'a mut self,
         query: &'a str,
@@ -114,26 +168,11 @@ impl<W: AsyncWrite + Send + Unpin> AsyncMysqlShim<W> for MySqlBackend {
     ) -> io::Result<()> {
         log_debug!("Session {} query: {}", self.session.id(), query);
 
-        // Handle some special MySQL client queries
+        // Handle some special MySQL client queries first
         let query_lower = query.trim().to_lowercase();
 
         // Handle SET statements (MySQL client sends these on connect)
         if query_lower.starts_with("set ") {
-            return results.completed(Self::make_ok_response(0, 0)).await;
-        }
-
-        // Handle USE database statement (MySQL client may send as COM_QUERY instead of COM_INIT_DB)
-        if query_lower.starts_with("use ") {
-            // Parse database name: "use dbname" or "use `dbname`"
-            let db_name = query.trim()[4..].trim();
-            // Remove backticks if present
-            let db_name = db_name.trim_matches('`');
-            log_info!(
-                "Session {} selected database via USE query: {}",
-                self.session.id(),
-                db_name
-            );
-            self.session.set_current_db(db_name);
             return results.completed(Self::make_ok_response(0, 0)).await;
         }
 
@@ -147,21 +186,23 @@ impl<W: AsyncWrite + Send + Unpin> AsyncMysqlShim<W> for MySqlBackend {
             return self.handle_system_variable(query, results).await;
         }
 
-        // Create QueryCtx from session for this statement
-        let query_ctx = self.session.new_query_ctx();
-
-        // Execute the query through the worker pool (off the network IO thread)
-        let db = Arc::clone(&self.db);
-        match self
-            .worker_pool
-            .handle_mp_query(db, query.to_string(), query_ctx)
-            .await
-        {
-            Ok(result) => self.write_result(result, results).await,
-            Err(e) => {
-                results
-                    .error(ErrorKind::ER_UNKNOWN_ERROR, e.to_string().as_bytes())
-                    .await
+        // Classify the statement for protocol-level handling
+        match classify_statement(query) {
+            StatementType::Begin { read_only } => self.handle_begin(read_only, results).await,
+            StatementType::Commit => self.handle_commit(results).await,
+            StatementType::Rollback => self.handle_rollback(results).await,
+            StatementType::UseDatabase(db_name) => {
+                log_info!(
+                    "Session {} selected database via USE query: {}",
+                    self.session.id(),
+                    db_name
+                );
+                self.session.set_current_db(&db_name);
+                results.completed(Self::make_ok_response(0, 0)).await
+            }
+            StatementType::Other => {
+                // Dispatch to worker pool with current_db and optional TxnCtx
+                self.dispatch_to_worker(query, results).await
             }
         }
     }
@@ -200,6 +241,178 @@ impl<W: AsyncWrite + Send + Unpin> AsyncMysqlShim<W> for MySqlBackend {
 }
 
 impl MySqlBackend {
+    // ========================================================================
+    // Transaction Control (Protocol-Level)
+    // ========================================================================
+
+    /// Handle BEGIN / START TRANSACTION.
+    ///
+    /// Starts an explicit transaction and stores it in the session.
+    async fn handle_begin<W: AsyncWrite + Send + Unpin>(
+        &mut self,
+        read_only: bool,
+        results: QueryResultWriter<'_, W>,
+    ) -> io::Result<()> {
+        // Check if there's already an active transaction
+        if self.session.has_active_txn() {
+            // MySQL implicitly commits when BEGIN is issued with active transaction.
+            // For now, we just error out - can change to implicit commit later.
+            return results
+                .error(
+                    ErrorKind::ER_UNKNOWN_ERROR,
+                    b"Nested transactions are not supported. Use COMMIT or ROLLBACK first.",
+                )
+                .await;
+        }
+
+        // Start an explicit transaction via the database's transaction service
+        match self.db.begin_explicit(read_only) {
+            Ok(ctx) => {
+                log_debug!(
+                    "Session {} started explicit transaction (txn_id={}, read_only={})",
+                    self.session.id(),
+                    ctx.txn_id(),
+                    read_only
+                );
+                self.session.set_current_txn(ctx);
+                results.completed(Self::make_ok_response(0, 0)).await
+            }
+            Err(e) => {
+                results
+                    .error(ErrorKind::ER_UNKNOWN_ERROR, e.to_string().as_bytes())
+                    .await
+            }
+        }
+    }
+
+    /// Handle COMMIT.
+    ///
+    /// Commits the session's active transaction, if any.
+    async fn handle_commit<W: AsyncWrite + Send + Unpin>(
+        &mut self,
+        results: QueryResultWriter<'_, W>,
+    ) -> io::Result<()> {
+        // Take the transaction from the session (if any)
+        if let Some(ctx) = self.session.take_current_txn() {
+            let txn_id = ctx.txn_id();
+            match self.db.commit(ctx) {
+                Ok(info) => {
+                    log_debug!(
+                        "Session {} committed transaction (txn_id={}, commit_ts={})",
+                        self.session.id(),
+                        info.txn_id,
+                        info.commit_ts
+                    );
+                    results.completed(Self::make_ok_response(0, 0)).await
+                }
+                Err(e) => {
+                    log_warn!(
+                        "Session {} failed to commit transaction (txn_id={}): {}",
+                        self.session.id(),
+                        txn_id,
+                        e
+                    );
+                    results
+                        .error(ErrorKind::ER_UNKNOWN_ERROR, e.to_string().as_bytes())
+                        .await
+                }
+            }
+        } else {
+            // No active transaction - COMMIT is a no-op (MySQL behavior)
+            results.completed(Self::make_ok_response(0, 0)).await
+        }
+    }
+
+    /// Handle ROLLBACK.
+    ///
+    /// Rolls back the session's active transaction, if any.
+    async fn handle_rollback<W: AsyncWrite + Send + Unpin>(
+        &mut self,
+        results: QueryResultWriter<'_, W>,
+    ) -> io::Result<()> {
+        // Take the transaction from the session (if any)
+        if let Some(ctx) = self.session.take_current_txn() {
+            let txn_id = ctx.txn_id();
+            match self.db.rollback(ctx) {
+                Ok(()) => {
+                    log_debug!(
+                        "Session {} rolled back transaction (txn_id={})",
+                        self.session.id(),
+                        txn_id
+                    );
+                    results.completed(Self::make_ok_response(0, 0)).await
+                }
+                Err(e) => {
+                    log_warn!(
+                        "Session {} failed to rollback transaction (txn_id={}): {}",
+                        self.session.id(),
+                        txn_id,
+                        e
+                    );
+                    results
+                        .error(ErrorKind::ER_UNKNOWN_ERROR, e.to_string().as_bytes())
+                        .await
+                }
+            }
+        } else {
+            // No active transaction - ROLLBACK is a no-op (MySQL behavior)
+            results.completed(Self::make_ok_response(0, 0)).await
+        }
+    }
+
+    // ========================================================================
+    // Worker Pool Dispatch
+    // ========================================================================
+
+    /// Dispatch a query to the worker pool.
+    ///
+    /// For explicit transactions, the TxnCtx is taken from the session,
+    /// passed to the worker, and returned (potentially updated) after execution.
+    ///
+    /// Session variables are extracted into ExecutionCtx which provides
+    /// read-only access during execution.
+    async fn dispatch_to_worker<W: AsyncWrite + Send + Unpin>(
+        &mut self,
+        query: &str,
+        results: QueryResultWriter<'_, W>,
+    ) -> io::Result<()> {
+        let db = Arc::clone(&self.db);
+
+        // Create execution context from session (read-only snapshot of session vars)
+        let exec_ctx = ExecutionCtx::from_session(&self.session);
+
+        // Take TxnCtx from session if there's an active explicit transaction
+        let txn_ctx = self.session.take_current_txn();
+
+        // Execute the query through the worker pool
+        match self
+            .worker_pool
+            .handle_query(db, query.to_string(), exec_ctx, txn_ctx)
+            .await
+        {
+            Ok((result, returned_txn_ctx)) => {
+                // Put the TxnCtx back in session if it was returned
+                if let Some(ctx) = returned_txn_ctx {
+                    self.session.set_current_txn(ctx);
+                }
+                self.write_result(result, results).await
+            }
+            Err((e, returned_txn_ctx)) => {
+                // On error, put the TxnCtx back in session (MySQL behavior: keep txn active)
+                if let Some(ctx) = returned_txn_ctx {
+                    self.session.set_current_txn(ctx);
+                }
+                results
+                    .error(ErrorKind::ER_UNKNOWN_ERROR, e.to_string().as_bytes())
+                    .await
+            }
+        }
+    }
+
+    // ========================================================================
+    // Result Writing
+    // ========================================================================
+
     /// Write query result to MySQL protocol
     async fn write_result<W: AsyncWrite + Send + Unpin>(
         &self,

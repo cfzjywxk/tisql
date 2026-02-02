@@ -62,6 +62,7 @@ criterion = "0.5"
 tempfile = "3"
 fail = "0.5"
 parking_lot = "0.12"
+mysql_async = "0.34"
 
 [features]
 default = ["jemalloc"]
@@ -83,6 +84,10 @@ path = "tests/store_test.rs"
 [[test]]
 name = "concurrency_test"
 path = "tests/concurrency_test.rs"
+
+[[test]]
+name = "mysql_protocol_test"
+path = "tests/mysql_protocol_test.rs"
 
 # ============================================================================
 # Profile settings for debugging

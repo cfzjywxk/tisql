@@ -19,9 +19,9 @@ pub(crate) use simple::SimpleExecutor;
 
 use crate::catalog::Catalog;
 use crate::error::Result;
-use crate::session::Session;
+use crate::session::{ExecutionCtx, Session};
 use crate::sql::LogicalPlan;
-use crate::transaction::TxnService;
+use crate::transaction::{TxnCtx, TxnService};
 use crate::types::{Row, Schema};
 
 /// Query execution result
@@ -74,4 +74,30 @@ pub trait Executor {
         catalog: &C,
         session: &mut Session,
     ) -> Result<ExecutionResult>;
+
+    /// Execute a logical plan with optional TxnCtx (unified entry point).
+    ///
+    /// This is the new unified execution method that:
+    /// - Takes ExecutionCtx with session variables
+    /// - Takes optional TxnCtx for explicit transactions
+    /// - Returns the (potentially updated) TxnCtx along with the result
+    /// - Transaction control (BEGIN/COMMIT/ROLLBACK) is handled at protocol layer
+    ///
+    /// ## Arguments
+    /// - `plan`: The logical plan to execute
+    /// - `exec_ctx`: Execution context with session variables
+    /// - `txn_service`: Transaction service for data access
+    /// - `catalog`: Schema catalog
+    /// - `txn_ctx`: Optional TxnCtx for explicit transactions
+    ///
+    /// ## Returns
+    /// - `(ExecutionResult, Option<TxnCtx>)`: Result and returned TxnCtx (if still active)
+    fn execute_unified<T: TxnService, C: Catalog>(
+        &self,
+        plan: LogicalPlan,
+        exec_ctx: &ExecutionCtx,
+        txn_service: &T,
+        catalog: &C,
+        txn_ctx: Option<TxnCtx>,
+    ) -> Result<(ExecutionResult, Option<TxnCtx>)>;
 }

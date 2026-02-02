@@ -54,7 +54,7 @@ pub use catalog::Catalog;
 pub use clog::ClogService;
 pub use lsn::{new_lsn_provider, LsnProvider, SharedLsnProvider};
 pub use protocol::{MySqlServer, MYSQL_DEFAULT_PORT};
-pub use session::{Priority, QueryCtx, Session, SessionVars};
+pub use session::{ExecutionCtx, Priority, QueryCtx, Session, SessionVars};
 pub use storage::{PessimisticStorage, StorageEngine};
 pub use transaction::{CommitInfo, TxnCtx, TxnService, TxnState};
 pub use tso::TsoService;
@@ -244,6 +244,36 @@ impl SQLEngine {
         // Execute with session context for transaction control
         self.executor
             .execute_with_session(plan, txn_service, catalog, session)
+    }
+
+    /// Execute SQL with optional TxnCtx (unified entry point).
+    ///
+    /// This is the new unified execution method that:
+    /// - Takes ExecutionCtx with session variables
+    /// - Takes optional TxnCtx for explicit transactions
+    /// - Returns the (potentially updated) TxnCtx along with the result
+    /// - Handles transaction control at the protocol layer (not here)
+    ///
+    /// Transaction control statements (BEGIN/COMMIT/ROLLBACK) should be
+    /// handled at the protocol layer, not dispatched here.
+    fn execute<T: TxnService, C: Catalog>(
+        &self,
+        sql: &str,
+        exec_ctx: &session::ExecutionCtx,
+        txn_service: &T,
+        catalog: &C,
+        txn_ctx: Option<transaction::TxnCtx>,
+    ) -> Result<(ExecutionResult, Option<transaction::TxnCtx>)> {
+        // Parse SQL text into AST
+        let stmt = self.parser.parse_one(sql)?;
+
+        // Bind to logical plan
+        let binder = Binder::new(catalog, &exec_ctx.current_db);
+        let plan = binder.bind(stmt)?;
+
+        // Execute with the unified executor method
+        self.executor
+            .execute_unified(plan, exec_ctx, txn_service, catalog, txn_ctx)
     }
 }
 
@@ -518,6 +548,107 @@ impl Database {
     pub fn list_tables(&self, schema: &str) -> Result<Vec<String>> {
         let tables = self.catalog.list_tables(schema)?;
         Ok(tables.into_iter().map(|t| t.name().to_string()).collect())
+    }
+
+    // ========================================================================
+    // Transaction Control (for Protocol Layer)
+    // ========================================================================
+
+    /// Begin an explicit transaction.
+    ///
+    /// This is called by the protocol layer when handling BEGIN/START TRANSACTION.
+    /// Returns a TxnCtx that should be stored in the Session.
+    pub fn begin_explicit(&self, read_only: bool) -> Result<transaction::TxnCtx> {
+        self.txn_service.begin_explicit(read_only)
+    }
+
+    /// Commit a transaction.
+    ///
+    /// This is called by the protocol layer when handling COMMIT.
+    /// Takes ownership of the TxnCtx from the Session.
+    pub fn commit(&self, ctx: transaction::TxnCtx) -> Result<CommitInfo> {
+        self.txn_service.commit(ctx)
+    }
+
+    /// Rollback a transaction.
+    ///
+    /// This is called by the protocol layer when handling ROLLBACK.
+    /// Takes ownership of the TxnCtx from the Session.
+    pub fn rollback(&self, ctx: transaction::TxnCtx) -> Result<()> {
+        self.txn_service.rollback(ctx)
+    }
+
+    // ========================================================================
+    // Unified Query Execution (for Worker Pool)
+    // ========================================================================
+
+    /// Handle a query with execution context and optional transaction context.
+    ///
+    /// This is the new unified entry point for the worker pool.
+    /// Returns the query result and the (potentially updated) TxnCtx.
+    ///
+    /// The `exec_ctx` provides read-only access to session variables (current_db,
+    /// isolation_level, etc.) during execution.
+    pub fn handle_query(
+        &self,
+        sql: &str,
+        exec_ctx: &session::ExecutionCtx,
+        txn_ctx: Option<transaction::TxnCtx>,
+    ) -> Result<(QueryResult, Option<transaction::TxnCtx>)> {
+        let timer = Timer::new("query");
+
+        // Execute through SQL engine with the new unified interface
+        let (result, returned_ctx) = self.sql_engine.execute(
+            sql,
+            exec_ctx,
+            self.txn_service.as_ref(),
+            &self.catalog,
+            txn_ctx,
+        )?;
+
+        // Convert ExecutionResult to QueryResult
+        let query_result = match result {
+            ExecutionResult::Rows { schema, rows } => {
+                let row_count = rows.len();
+                let columns: Vec<String> = schema
+                    .columns()
+                    .iter()
+                    .map(|c| c.name().to_string())
+                    .collect();
+                let data: Vec<Vec<String>> = rows
+                    .iter()
+                    .map(|row| row.iter().map(value_to_string).collect())
+                    .collect();
+
+                log_trace!(
+                    "SQL: {} | elapsed={:.3}ms rows={}",
+                    truncate_sql(sql, 50),
+                    timer.elapsed_ms(),
+                    row_count
+                );
+
+                QueryResult::Rows { columns, data }
+            }
+            ExecutionResult::Affected { count } => {
+                log_trace!(
+                    "SQL: {} | elapsed={:.3}ms affected={}",
+                    truncate_sql(sql, 50),
+                    timer.elapsed_ms(),
+                    count
+                );
+                QueryResult::Affected(count)
+            }
+            ExecutionResult::Ok => {
+                log_trace!(
+                    "SQL: {} | elapsed={:.3}ms",
+                    truncate_sql(sql, 50),
+                    timer.elapsed_ms()
+                );
+                QueryResult::Ok
+            }
+        };
+
+        Ok((query_result, returned_ctx))
     }
 
     /// Close the database (flush memtables and sync logs).

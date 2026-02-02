@@ -86,6 +86,68 @@ fn alloc_stmt_ctx_id() -> u64 {
 }
 
 // ============================================================================
+// Execution Context (Read-Only Session Snapshot)
+// ============================================================================
+
+/// Read-only execution context extracted from Session.
+///
+/// Contains session variables needed during query execution. This is a snapshot
+/// of session state at the time of extraction - changes to session after
+/// extraction won't be reflected.
+///
+/// This struct is passed through the execution path (WorkerPool -> Database ->
+/// SQLEngine -> Executor) to provide access to session variables without
+/// passing the mutable Session itself.
+#[derive(Clone, Debug)]
+pub struct ExecutionCtx {
+    /// Current database for SQL binding
+    pub current_db: String,
+
+    /// Transaction isolation level
+    pub isolation_level: IsolationLevel,
+
+    /// Autocommit mode
+    pub autocommit: bool,
+    // Future: Add more session variables as needed
+    // - timezone
+    // - sql_mode
+    // - max_execution_time
+    // - etc.
+}
+
+impl ExecutionCtx {
+    /// Create an ExecutionCtx from a Session.
+    ///
+    /// This extracts the relevant session variables as a read-only snapshot.
+    pub fn from_session(session: &Session) -> Self {
+        Self {
+            current_db: session.vars.current_db.clone(),
+            isolation_level: session.vars.isolation_level,
+            autocommit: session.vars.autocommit,
+        }
+    }
+
+    /// Create an ExecutionCtx with just a database name (for backward compat).
+    pub fn with_db(current_db: impl Into<String>) -> Self {
+        Self {
+            current_db: current_db.into(),
+            isolation_level: IsolationLevel::default(),
+            autocommit: true,
+        }
+    }
+}
+
+impl Default for ExecutionCtx {
+    fn default() -> Self {
+        Self {
+            current_db: "default".to_string(),
+            isolation_level: IsolationLevel::default(),
+            autocommit: true,
+        }
+    }
+}
+
+// ============================================================================
 // Session Variables
 // ============================================================================
 

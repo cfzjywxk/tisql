@@ -20,7 +20,7 @@
 
 use crate::catalog::Catalog;
 use crate::error::{Result, TiSqlError};
-use crate::session::Session;
+use crate::session::{ExecutionCtx, Session};
 use crate::sql::{AggFunc, BinaryOp, Expr, LogicalPlan, UnaryOp};
 use crate::storage::{
     decode_row_to_values, encode_int_key, encode_key, encode_pk, encode_row, MvccIterator,
@@ -90,6 +90,61 @@ impl Executor for SimpleExecutor {
         } else {
             // No active transaction - use auto-commit mode (implicit transactions)
             self.execute(plan, txn_service, catalog)
+        }
+    }
+
+    fn execute_unified<T: TxnService, C: Catalog>(
+        &self,
+        plan: LogicalPlan,
+        _exec_ctx: &ExecutionCtx,
+        txn_service: &T,
+        catalog: &C,
+        txn_ctx: Option<TxnCtx>,
+    ) -> Result<(ExecutionResult, Option<TxnCtx>)> {
+        // Handle session-level commands (USE database is handled at protocol layer)
+        if let LogicalPlan::UseDatabase { .. } = &plan {
+            return Ok((ExecutionResult::Ok, txn_ctx));
+        }
+
+        // Transaction control statements should NOT be dispatched here.
+        // They are handled at the protocol layer.
+        if plan.is_transaction_control() {
+            return Err(TiSqlError::Internal(
+                "Transaction control statements should be handled at protocol layer".into(),
+            ));
+        }
+
+        // Note: exec_ctx provides access to session variables like isolation_level.
+        // Currently unused, but available for future use (e.g., implementing
+        // different isolation levels, timeout handling, etc.)
+
+        match txn_ctx {
+            Some(mut ctx) => {
+                // Execute within the provided explicit transaction
+                if plan.is_write() {
+                    // DDL operations should commit current transaction first (MySQL behavior)
+                    if plan.is_ddl() {
+                        return Err(TiSqlError::Internal(
+                            "DDL statements are not allowed within explicit transactions. Use COMMIT first."
+                                .into(),
+                        ));
+                    }
+
+                    // Execute write within the transaction (no auto-commit)
+                    let result =
+                        self.execute_write_with_ctx(plan, &mut ctx, txn_service, catalog)?;
+                    Ok((result, Some(ctx)))
+                } else {
+                    // Execute read using the transaction's snapshot
+                    let result = self.execute_with_ctx(plan, &ctx, txn_service, catalog)?;
+                    Ok((result, Some(ctx)))
+                }
+            }
+            None => {
+                // No explicit transaction - use auto-commit mode
+                let result = self.execute(plan, txn_service, catalog)?;
+                Ok((result, None))
+            }
         }
     }
 }
