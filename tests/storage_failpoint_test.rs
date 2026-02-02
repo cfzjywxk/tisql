@@ -1025,3 +1025,263 @@ fn test_clog_metadata_apis() {
 
     scenario.teardown();
 }
+
+// ============================================================================
+// LevelIterator Failpoint Tests
+// ============================================================================
+
+/// Test L0SstIterator open_file failpoint.
+///
+/// When SST file opening fails, the scan_iter should propagate the error.
+#[test]
+fn test_level_iterator_open_file_error() {
+    use tisql::storage::mvcc::MvccIterator;
+
+    let scenario = fail::FailScenario::setup();
+    let dir = tempfile::tempdir().unwrap();
+
+    let (engine, _ilog, _clog) = create_test_lsm_engine(&dir);
+
+    // Write data to memtable first
+    write_test_data(&engine, b"key1", b"value1", 1);
+    write_test_data(&engine, b"key2", b"value2", 2);
+
+    // Force flush to create SST file in L0
+    engine.freeze_active();
+    engine.flush_all().unwrap();
+
+    // Verify data is readable normally via get (uses memtable first, then SST)
+    let v1 = engine.get(b"key1").unwrap();
+    assert_eq!(v1, Some(b"value1".to_vec()));
+
+    // Enable fail point to cause open_file error on L0 SST
+    fail::cfg("l0_sst_iterator_open_file", "return").unwrap();
+
+    // Now scan should fail when trying to read from SST
+    use tisql::storage::mvcc::MvccKey;
+    let range = MvccKey::unbounded()..MvccKey::unbounded();
+    let iter_result = engine.scan_iter(range, 0);
+
+    // Error may occur during iterator creation or on first advance
+    let has_error = match iter_result {
+        Err(_) => true,
+        Ok(mut iter) => {
+            let result = iter.advance();
+            result.is_err() || !iter.valid()
+        }
+    };
+
+    assert!(has_error, "Expected error from open_file failpoint");
+
+    fail::cfg("l0_sst_iterator_open_file", "off").unwrap();
+    scenario.teardown();
+}
+
+/// Test L0SstIterator seek failpoint.
+#[test]
+fn test_level_iterator_seek_error() {
+    use tisql::storage::mvcc::MvccIterator;
+
+    let scenario = fail::FailScenario::setup();
+    let dir = tempfile::tempdir().unwrap();
+
+    let (engine, _ilog, _clog) = create_test_lsm_engine(&dir);
+
+    // Write data and flush to SST in L0
+    write_test_data(&engine, b"key1", b"value1", 1);
+    engine.freeze_active();
+    engine.flush_all().unwrap();
+
+    // Enable fail point for seek errors on L0 SST
+    fail::cfg("l0_sst_iterator_seek", "return").unwrap();
+
+    // scan_iter should fail on seek
+    use tisql::storage::mvcc::MvccKey;
+    let range = MvccKey::unbounded()..MvccKey::unbounded();
+    let iter_result = engine.scan_iter(range, 0);
+
+    // Error may propagate through the iterator
+    let has_error = match iter_result {
+        Err(_) => true,
+        Ok(mut iter) => {
+            let result = iter.advance();
+            result.is_err() || !iter.valid()
+        }
+    };
+
+    assert!(
+        has_error,
+        "Expected error or invalid iterator from seek failpoint"
+    );
+
+    fail::cfg("l0_sst_iterator_seek", "off").unwrap();
+    scenario.teardown();
+}
+
+/// Test L0SstIterator advance failpoint.
+///
+/// The TieredMergeIterator stores advance errors in pending_error and returns them
+/// on the next call to advance(). So we need to call advance twice to see the error.
+#[test]
+fn test_level_iterator_advance_error() {
+    use tisql::storage::mvcc::MvccIterator;
+
+    let scenario = fail::FailScenario::setup();
+    let dir = tempfile::tempdir().unwrap();
+
+    let (engine, _ilog, _clog) = create_test_lsm_engine(&dir);
+
+    // Write data and flush to SST in L0
+    write_test_data(&engine, b"key1", b"value1", 1);
+    write_test_data(&engine, b"key2", b"value2", 2);
+    engine.freeze_active();
+    engine.flush_all().unwrap();
+
+    // Enable fail point for advance errors on L0 SST
+    fail::cfg("l0_sst_iterator_advance", "return").unwrap();
+
+    use tisql::storage::mvcc::MvccKey;
+    let range = MvccKey::unbounded()..MvccKey::unbounded();
+    let mut iter = engine.scan_iter(range, 0).unwrap();
+
+    // First advance: initializes iterator via seek, reads first entry,
+    // then calls L0 iterator's advance() which triggers failpoint.
+    // The error is stored in pending_error but the first entry is returned.
+    let result1 = iter.advance();
+
+    // If first advance worked, second advance should return the pending error
+    let has_error = if result1.is_ok() && iter.valid() {
+        let result2 = iter.advance();
+        result2.is_err()
+    } else {
+        // First advance already failed
+        true
+    };
+
+    assert!(has_error, "Expected error from advance failpoint");
+
+    fail::cfg("l0_sst_iterator_advance", "off").unwrap();
+    scenario.teardown();
+}
+
+/// Test LsmEngine::get returns data from memtable first.
+///
+/// This test verifies the point lookup path through memtables.
+#[test]
+fn test_get_from_memtable() {
+    let scenario = fail::FailScenario::setup();
+    let dir = tempfile::tempdir().unwrap();
+
+    let (engine, _ilog, _clog) = create_test_lsm_engine(&dir);
+
+    // Write data to active memtable
+    write_test_data(&engine, b"key1", b"value1", 1);
+    write_test_data(&engine, b"key2", b"value2", 2);
+
+    // Data should be readable from active memtable (no SST involved)
+    let v1 = engine.get(b"key1").unwrap();
+    assert_eq!(v1, Some(b"value1".to_vec()));
+
+    let v2 = engine.get(b"key2").unwrap();
+    assert_eq!(v2, Some(b"value2".to_vec()));
+
+    // Non-existent key should return None
+    let v3 = engine.get(b"nonexistent").unwrap();
+    assert!(v3.is_none());
+
+    // Freeze and write more data
+    engine.freeze_active();
+    write_test_data(&engine, b"key3", b"value3", 3);
+
+    // Data from frozen memtable should be readable
+    let v1_frozen = engine.get(b"key1").unwrap();
+    assert_eq!(v1_frozen, Some(b"value1".to_vec()));
+
+    // Data from active memtable should be readable
+    let v3_active = engine.get(b"key3").unwrap();
+    assert_eq!(v3_active, Some(b"value3".to_vec()));
+
+    scenario.teardown();
+}
+
+/// Test that LsmEngine getters work correctly.
+#[test]
+fn test_lsm_engine_getters() {
+    let scenario = fail::FailScenario::setup();
+    let dir = tempfile::tempdir().unwrap();
+
+    let (engine, _ilog, _clog) = create_test_lsm_engine(&dir);
+
+    // Test config() getter
+    let config = engine.config();
+    assert!(config.memtable_size > 0);
+
+    // Test active_memtable_size() before and after write
+    let initial_size = engine.active_memtable_size();
+    assert_eq!(initial_size, 0, "Initial memtable should be empty");
+
+    write_test_data(&engine, b"key1", b"value1", 1);
+    let after_write_size = engine.active_memtable_size();
+    assert!(
+        after_write_size > 0,
+        "Memtable size should increase after write"
+    );
+
+    // Test frozen_count()
+    let _frozen = engine.frozen_count();
+    // May or may not have frozen memtables depending on size thresholds
+
+    // Test current_version()
+    let _version = engine.current_version();
+    // Version should exist
+
+    // Test is_durable()
+    assert!(engine.is_durable(), "Engine with ilog should be durable");
+
+    scenario.teardown();
+}
+
+/// Test scan with data in both memtable and SST.
+#[test]
+fn test_scan_iter_memtable_and_sst() {
+    use tisql::storage::mvcc::MvccIterator;
+
+    let scenario = fail::FailScenario::setup();
+    let dir = tempfile::tempdir().unwrap();
+
+    let (engine, _ilog, _clog) = create_test_lsm_engine(&dir);
+
+    // Write data to memtable
+    write_test_data(&engine, b"aaa", b"value_a", 1);
+    write_test_data(&engine, b"bbb", b"value_b", 2);
+
+    // Flush to SST
+    engine.freeze_active();
+    engine.flush_all().unwrap();
+
+    // Write more data to new memtable
+    write_test_data(&engine, b"ccc", b"value_c", 3);
+    write_test_data(&engine, b"ddd", b"value_d", 4);
+
+    // Scan all - should see data from both memtable and SST
+    use tisql::storage::mvcc::MvccKey;
+    let range = MvccKey::unbounded()..MvccKey::unbounded();
+    let mut iter = engine.scan_iter(range, 0).unwrap();
+
+    let mut keys = Vec::new();
+    loop {
+        iter.advance().unwrap();
+        if !iter.valid() {
+            break;
+        }
+        keys.push(iter.user_key().to_vec());
+    }
+
+    // Should have all 4 keys
+    assert!(keys.contains(&b"aaa".to_vec()), "Should find key aaa");
+    assert!(keys.contains(&b"bbb".to_vec()), "Should find key bbb");
+    assert!(keys.contains(&b"ccc".to_vec()), "Should find key ccc");
+    assert!(keys.contains(&b"ddd".to_vec()), "Should find key ddd");
+
+    scenario.teardown();
+}

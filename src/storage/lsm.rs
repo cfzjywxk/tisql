@@ -374,7 +374,6 @@ impl LsmEngine {
     /// 1. Scan for entries matching the key
     /// 2. Find the latest version with entry_ts <= ts
     /// 3. Return None if that version is a tombstone
-    #[allow(dead_code)]
     fn get_from_sst(&self, key: &[u8], ts: Timestamp) -> Result<Option<RawValue>> {
         let version = self.current_version();
 
@@ -523,6 +522,57 @@ impl LsmEngine {
             version_num: version.version_num(),
             flushed_lsn: version.flushed_lsn(),
         }
+    }
+
+    /// Get a value by key using snapshot read at the latest timestamp.
+    ///
+    /// This is a convenience method for point lookups. It:
+    /// 1. Checks the active memtable
+    /// 2. Checks frozen memtables (newest first)
+    /// 3. Checks SST files via `get_from_sst`
+    ///
+    /// Returns `Ok(Some(value))` if found, `Ok(None)` if not found or deleted.
+    pub fn get(&self, key: &[u8]) -> Result<Option<RawValue>> {
+        self.get_at(key, Timestamp::MAX)
+    }
+
+    /// Get a value by key at a specific MVCC timestamp.
+    ///
+    /// This performs a point lookup at the given timestamp:
+    /// 1. Checks the active memtable
+    /// 2. Checks frozen memtables (newest first)
+    /// 3. Checks SST files
+    ///
+    /// Returns `Ok(Some(value))` if found, `Ok(None)` if not found or deleted.
+    pub fn get_at(&self, key: &[u8], ts: Timestamp) -> Result<Option<RawValue>> {
+        let state = self.state.read().unwrap();
+
+        // Check active memtable first
+        // owner_start_ts = 0 means don't see pending writes from any transaction
+        if let Some(value) = state.active.get_with_owner(key, ts, 0) {
+            return if is_tombstone(&value) {
+                Ok(None)
+            } else {
+                Ok(Some(value))
+            };
+        }
+
+        // Check frozen memtables (newest first)
+        for frozen in &state.frozen {
+            if let Some(value) = frozen.get_with_owner(key, ts, 0) {
+                return if is_tombstone(&value) {
+                    Ok(None)
+                } else {
+                    Ok(Some(value))
+                };
+            }
+        }
+
+        // Drop the lock before reading SSTs
+        drop(state);
+
+        // Check SSTs
+        self.get_from_sst(key, ts)
     }
 }
 
@@ -860,6 +910,11 @@ impl L0SstIterator {
             return Ok(());
         }
 
+        #[cfg(feature = "failpoints")]
+        fail_point!("l0_sst_iterator_open_file", |_| {
+            Err(TiSqlError::Storage("injected L0 open_file error".into()))
+        });
+
         let path = self.sst_dir.join(format!("{:08}.sst", self.meta.id));
         if !path.exists() {
             return Err(TiSqlError::Storage(format!(
@@ -879,6 +934,11 @@ impl L0SstIterator {
 
 impl MvccIterator for L0SstIterator {
     fn seek(&mut self, target: &MvccKey) -> Result<()> {
+        #[cfg(feature = "failpoints")]
+        fail_point!("l0_sst_iterator_seek", |_| {
+            Err(TiSqlError::Storage("injected L0 seek error".into()))
+        });
+
         if let Some(e) = self.pending_error.take() {
             return Err(e);
         }
@@ -891,6 +951,11 @@ impl MvccIterator for L0SstIterator {
     }
 
     fn advance(&mut self) -> Result<()> {
+        #[cfg(feature = "failpoints")]
+        fail_point!("l0_sst_iterator_advance", |_| {
+            Err(TiSqlError::Storage("injected L0 advance error".into()))
+        });
+
         if let Some(e) = self.pending_error.take() {
             return Err(e);
         }
@@ -974,6 +1039,11 @@ impl LevelIterator {
             return Ok(());
         }
 
+        #[cfg(feature = "failpoints")]
+        fail_point!("level_iterator_open_file", |_| {
+            Err(TiSqlError::Storage("injected open_file error".into()))
+        });
+
         let sst = &self.sst_metas[idx];
         let path = self.sst_dir.join(format!("{:08}.sst", sst.id));
 
@@ -998,6 +1068,13 @@ impl LevelIterator {
     /// If the current iterator is not positioned, positions it first (via advance).
     /// Then skips to the next file if the current file has no entries in range.
     fn skip_empty_files(&mut self) -> Result<()> {
+        #[cfg(feature = "failpoints")]
+        fail_point!("level_iterator_skip_empty_files", |_| {
+            Err(TiSqlError::Storage(
+                "injected skip_empty_files error".into(),
+            ))
+        });
+
         loop {
             // Position the iterator if not already positioned
             if let Some(ref mut iter) = self.current_iter {
@@ -1030,6 +1107,11 @@ impl LevelIterator {
 
 impl MvccIterator for LevelIterator {
     fn seek(&mut self, target: &MvccKey) -> Result<()> {
+        #[cfg(feature = "failpoints")]
+        fail_point!("level_iterator_seek", |_| {
+            Err(TiSqlError::Storage("injected seek error".into()))
+        });
+
         if let Some(e) = self.pending_error.take() {
             return Err(e);
         }
@@ -1075,6 +1157,11 @@ impl MvccIterator for LevelIterator {
     }
 
     fn advance(&mut self) -> Result<()> {
+        #[cfg(feature = "failpoints")]
+        fail_point!("level_iterator_advance", |_| {
+            Err(TiSqlError::Storage("injected advance error".into()))
+        });
+
         if let Some(e) = self.pending_error.take() {
             return Err(e);
         }
