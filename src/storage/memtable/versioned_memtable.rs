@@ -3455,4 +3455,316 @@ mod tests {
         owner_iter.advance().unwrap();
         assert!(!owner_iter.valid()); // LOCK is skipped, no other version
     }
+
+    // ==================== Additional Coverage Tests ====================
+
+    #[test]
+    fn test_delete_nonexistent_key() {
+        let engine = VersionedMemTableEngine::new();
+
+        // Delete on nonexistent key should return Ok(false)
+        let result = engine.delete_pending(b"nonexistent", 100);
+        assert!(result.is_ok());
+        assert!(!result.unwrap()); // False means nothing was deleted
+    }
+
+    #[test]
+    fn test_abort_nonexistent_key() {
+        let engine = VersionedMemTableEngine::new();
+
+        // Abort on nonexistent key should complete without error
+        engine.abort_pending(&[b"nonexistent".to_vec()], 100);
+        // No error expected
+    }
+
+    #[test]
+    fn test_finalize_nonexistent_key() {
+        let engine = VersionedMemTableEngine::new();
+
+        // Finalize on nonexistent key should complete without error
+        engine.finalize_pending(&[b"nonexistent".to_vec()], 100, 200);
+        // No error expected
+    }
+
+    #[test]
+    fn test_get_lock_owner_nonexistent_key() {
+        let engine = VersionedMemTableEngine::new();
+
+        // get_lock_owner on nonexistent key should return None
+        let result = engine.get_lock_owner(b"nonexistent");
+        assert!(result.is_none());
+    }
+
+    #[test]
+    fn test_get_lock_owner_committed_key() {
+        let engine = VersionedMemTableEngine::new();
+
+        // Committed key has no lock owner
+        engine.put_internal(b"key", b"value".to_vec(), 100);
+        let result = engine.get_lock_owner(b"key");
+        assert!(result.is_none());
+    }
+
+    #[test]
+    fn test_get_lock_owner_pending_key() {
+        let engine = VersionedMemTableEngine::new();
+
+        // Pending key has lock owner
+        engine.put_pending(b"key", b"value".to_vec(), 200).unwrap();
+        let result = engine.get_lock_owner(b"key");
+        assert_eq!(result, Some(200));
+    }
+
+    #[test]
+    fn test_delete_already_tombstone() {
+        let engine = VersionedMemTableEngine::new();
+
+        // Write then delete (commit) using write batch
+        engine.put_internal(b"key", b"value".to_vec(), 100);
+        let mut del_batch = WriteBatch::new();
+        del_batch.delete(b"key".to_vec());
+        del_batch.set_commit_ts(200);
+        engine.write_batch(del_batch).unwrap();
+
+        // Try to delete again with pending
+        let result = engine.delete_pending(b"key", 300);
+        // Should return Ok(false) since already deleted
+        assert!(result.is_ok());
+        assert!(!result.unwrap());
+    }
+
+    #[test]
+    fn test_finalize_on_committed_key() {
+        let engine = VersionedMemTableEngine::new();
+
+        // Write committed data
+        engine.put_internal(b"key", b"value".to_vec(), 100);
+
+        // Finalize on committed key (no pending) - should be no-op
+        engine.finalize_pending(&[b"key".to_vec()], 200, 300);
+        // No error expected
+    }
+
+    #[test]
+    fn test_abort_on_committed_key() {
+        let engine = VersionedMemTableEngine::new();
+
+        // Write committed data
+        engine.put_internal(b"key", b"value".to_vec(), 100);
+
+        // Abort on committed key (no pending) - should be no-op
+        engine.abort_pending(&[b"key".to_vec()], 200);
+        // No error expected
+    }
+
+    #[test]
+    fn test_finalize_wrong_owner() {
+        let engine = VersionedMemTableEngine::new();
+
+        // Write pending with owner 100
+        engine.put_pending(b"key", b"value".to_vec(), 100).unwrap();
+
+        // Finalize with wrong owner - should be no-op for that key
+        engine.finalize_pending(&[b"key".to_vec()], 200, 300);
+
+        // Key should still be pending with owner 100
+        assert_eq!(engine.get_lock_owner(b"key"), Some(100));
+    }
+
+    #[test]
+    fn test_abort_wrong_owner() {
+        let engine = VersionedMemTableEngine::new();
+
+        // Write pending with owner 100
+        engine.put_pending(b"key", b"value".to_vec(), 100).unwrap();
+
+        // Abort with wrong owner - should be no-op
+        engine.abort_pending(&[b"key".to_vec()], 200);
+
+        // Key should still be pending with owner 100
+        assert_eq!(engine.get_lock_owner(b"key"), Some(100));
+    }
+
+    #[test]
+    fn test_get_with_owner_tombstone_filtering() {
+        let engine = VersionedMemTableEngine::new();
+
+        // Write then delete (pending tombstone)
+        engine.put_pending(b"key", b"value".to_vec(), 100).unwrap();
+        engine.delete_pending(b"key", 100).unwrap();
+
+        // get_with_owner should see LOCK and return it
+        let result = engine.get_with_owner(b"key", Timestamp::MAX, 100);
+        // LOCK is converted to None by the transaction layer, but here we see raw value
+        assert!(result.is_none() || result.as_ref().is_some_and(|v| is_lock(v)));
+    }
+
+    #[test]
+    fn test_put_pending_then_finalize_then_read() {
+        let engine = VersionedMemTableEngine::new();
+
+        // Put pending
+        engine.put_pending(b"key", b"value".to_vec(), 100).unwrap();
+
+        // Finalize
+        engine.finalize_pending(&[b"key".to_vec()], 100, 200);
+
+        // Read at commit_ts should see value
+        let result = get_for_test(&engine, b"key");
+        assert_eq!(result, Some(b"value".to_vec()));
+    }
+
+    #[test]
+    fn test_put_pending_then_abort_then_read() {
+        let engine = VersionedMemTableEngine::new();
+
+        // Put pending
+        engine.put_pending(b"key", b"value".to_vec(), 100).unwrap();
+
+        // Abort
+        engine.abort_pending(&[b"key".to_vec()], 100);
+
+        // Read should see None (aborted)
+        let result = get_for_test(&engine, b"key");
+        assert!(result.is_none());
+    }
+
+    #[test]
+    fn test_multiple_abort_same_key() {
+        let engine = VersionedMemTableEngine::new();
+
+        // Write committed base
+        engine.put_internal(b"key", b"v1".to_vec(), 100);
+
+        // Multiple pending writes that get aborted
+        engine.put_pending(b"key", b"v2".to_vec(), 200).unwrap();
+        engine.abort_pending(&[b"key".to_vec()], 200);
+
+        // After abort, new transaction should be able to write
+        engine.put_pending(b"key", b"v3".to_vec(), 300).unwrap();
+        engine.finalize_pending(&[b"key".to_vec()], 300, 400);
+
+        // Should see v3
+        let result = get_for_test(&engine, b"key");
+        assert_eq!(result, Some(b"v3".to_vec()));
+    }
+
+    #[test]
+    fn test_engine_default() {
+        // Test Default trait implementation
+        let engine1 = VersionedMemTableEngine::new();
+        let engine2 = VersionedMemTableEngine::default();
+
+        // Both should be empty
+        assert!(engine1.is_empty());
+        assert!(engine2.is_empty());
+        assert_eq!(engine1.len(), 0);
+        assert_eq!(engine2.len(), 0);
+    }
+
+    #[test]
+    fn test_write_batch_empty() {
+        let engine = VersionedMemTableEngine::new();
+
+        // Empty write batch (with commit_ts set) should work
+        let mut batch = WriteBatch::new();
+        batch.set_commit_ts(100);
+        let result = engine.write_batch(batch);
+        assert!(result.is_ok());
+        assert!(engine.is_empty());
+    }
+
+    #[test]
+    fn test_write_batch_delete_only() {
+        let engine = VersionedMemTableEngine::new();
+
+        // First put a value
+        let mut put_batch = WriteBatch::new();
+        put_batch.put(b"key".to_vec(), b"value".to_vec());
+        put_batch.set_commit_ts(100);
+        engine.write_batch(put_batch).unwrap();
+
+        // Delete batch only
+        let mut del_batch = WriteBatch::new();
+        del_batch.delete(b"key".to_vec());
+        del_batch.set_commit_ts(200);
+        engine.write_batch(del_batch).unwrap();
+
+        // Should see None (deleted)
+        let result = get_for_test(&engine, b"key");
+        assert!(result.is_none());
+    }
+
+    #[test]
+    fn test_scan_iter_with_range_boundaries() {
+        use crate::storage::StorageEngine;
+
+        let engine = VersionedMemTableEngine::new();
+
+        // Write some data
+        put_at(&engine, b"aaa", b"1", 100);
+        put_at(&engine, b"bbb", b"2", 100);
+        put_at(&engine, b"ccc", b"3", 100);
+        put_at(&engine, b"ddd", b"4", 100);
+
+        // Scan all - should get all 4 keys
+        let range = MvccKey::unbounded()..MvccKey::unbounded();
+        let mut iter = engine.scan_iter(range, 0).unwrap();
+        iter.advance().unwrap();
+
+        let mut keys = Vec::new();
+        while iter.valid() {
+            keys.push(iter.user_key().to_vec());
+            iter.advance().unwrap();
+        }
+
+        assert_eq!(keys.len(), 4);
+        assert_eq!(keys[0], b"aaa");
+        assert_eq!(keys[1], b"bbb");
+        assert_eq!(keys[2], b"ccc");
+        assert_eq!(keys[3], b"ddd");
+    }
+
+    #[test]
+    fn test_concurrent_put_and_read() {
+        use std::sync::Arc;
+        use std::thread;
+
+        let engine = Arc::new(VersionedMemTableEngine::new());
+
+        // Write initial data
+        for i in 0..100 {
+            put_at(&engine, format!("key{i:03}").as_bytes(), b"initial", 1);
+        }
+
+        let engine_reader = Arc::clone(&engine);
+        let engine_writer = Arc::clone(&engine);
+
+        // Reader thread
+        let reader = thread::spawn(move || {
+            for _ in 0..100 {
+                for i in 0..100 {
+                    let key = format!("key{i:03}");
+                    let value = get_for_test(&engine_reader, key.as_bytes());
+                    // Value should always exist
+                    assert!(value.is_some());
+                }
+            }
+        });
+
+        // Writer thread
+        let writer = thread::spawn(move || {
+            for i in 0..100 {
+                put_at(
+                    &engine_writer,
+                    format!("key{i:03}").as_bytes(),
+                    format!("updated{i}").as_bytes(),
+                    (i + 2) as u64,
+                );
+            }
+        });
+
+        reader.join().unwrap();
+        writer.join().unwrap();
+    }
 }

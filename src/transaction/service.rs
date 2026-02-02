@@ -1802,4 +1802,440 @@ mod tests {
         // Clean up
         txn_service.rollback(ctx).unwrap();
     }
+
+    // ========================================================================
+    // Additional coverage tests for edge cases
+    // ========================================================================
+
+    #[test]
+    fn test_concurrency_manager_getter() {
+        let (_storage, txn_service, _dir) = create_test_service();
+
+        // Test that concurrency_manager() getter works
+        let cm = txn_service.concurrency_manager();
+        assert_eq!(cm.max_ts(), 0);
+
+        // After begin, max_ts should be updated
+        let _ctx = txn_service.begin(false).unwrap();
+        assert!(cm.max_ts() > 0);
+    }
+
+    #[test]
+    fn test_clog_service_getter() {
+        let (_storage, txn_service, _dir) = create_test_service();
+
+        // Test that clog_service() getter works
+        let clog = txn_service.clog_service();
+
+        // Write something to test the getter works
+        txn_service.autocommit_put(b"test", b"value").unwrap();
+
+        // After write, clog should have entries
+        assert!(clog.max_lsn().unwrap() >= 1);
+    }
+
+    #[test]
+    fn test_put_on_committed_transaction() {
+        let (_storage, txn_service, _dir) = create_test_service();
+
+        // Begin and commit a transaction
+        let mut ctx = txn_service.begin(false).unwrap();
+        txn_service
+            .put(&mut ctx, b"key1".to_vec(), b"value1".to_vec())
+            .unwrap();
+        let commit_info = txn_service.commit(ctx).unwrap();
+
+        // Manually create a committed context
+        let mut committed_ctx =
+            TxnCtx::new(commit_info.txn_id + 1, commit_info.commit_ts + 1, false);
+        committed_ctx.state = TxnState::Committed {
+            commit_ts: commit_info.commit_ts,
+        };
+
+        // Try to put on committed transaction - should fail
+        let result = txn_service.put(&mut committed_ctx, b"key2".to_vec(), b"value2".to_vec());
+        assert!(result.is_err());
+        assert!(matches!(
+            result.unwrap_err(),
+            TiSqlError::TransactionNotActive(_)
+        ));
+    }
+
+    #[test]
+    fn test_delete_on_committed_transaction() {
+        let (_storage, txn_service, _dir) = create_test_service();
+
+        let ctx = txn_service.begin(false).unwrap();
+        let commit_info = txn_service.commit(ctx).unwrap();
+
+        // Create committed context
+        let mut committed_ctx =
+            TxnCtx::new(commit_info.txn_id + 1, commit_info.commit_ts + 1, false);
+        committed_ctx.state = TxnState::Committed {
+            commit_ts: commit_info.commit_ts,
+        };
+
+        // Try to delete on committed transaction - should fail
+        let result = txn_service.delete(&mut committed_ctx, b"key1".to_vec());
+        assert!(result.is_err());
+        assert!(matches!(
+            result.unwrap_err(),
+            TiSqlError::TransactionNotActive(_)
+        ));
+    }
+
+    #[test]
+    fn test_put_on_aborted_transaction() {
+        let (_storage, txn_service, _dir) = create_test_service();
+
+        // Create an aborted context
+        let mut aborted_ctx = TxnCtx::new(1, 1, false);
+        aborted_ctx.state = TxnState::Aborted;
+
+        // Try to put on aborted transaction - should fail
+        let result = txn_service.put(&mut aborted_ctx, b"key1".to_vec(), b"value1".to_vec());
+        assert!(result.is_err());
+        assert!(matches!(
+            result.unwrap_err(),
+            TiSqlError::TransactionNotActive(_)
+        ));
+    }
+
+    #[test]
+    fn test_delete_on_aborted_transaction() {
+        let (_storage, txn_service, _dir) = create_test_service();
+
+        // Create an aborted context
+        let mut aborted_ctx = TxnCtx::new(1, 1, false);
+        aborted_ctx.state = TxnState::Aborted;
+
+        // Try to delete on aborted transaction - should fail
+        let result = txn_service.delete(&mut aborted_ctx, b"key1".to_vec());
+        assert!(result.is_err());
+        assert!(matches!(
+            result.unwrap_err(),
+            TiSqlError::TransactionNotActive(_)
+        ));
+    }
+
+    #[test]
+    fn test_commit_on_aborted_transaction() {
+        let (_storage, txn_service, _dir) = create_test_service();
+
+        // Create an aborted context
+        let mut aborted_ctx = TxnCtx::new(1, 1, false);
+        aborted_ctx.state = TxnState::Aborted;
+
+        // Try to commit aborted transaction - should fail
+        let result = txn_service.commit(aborted_ctx);
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_commit_on_already_committed() {
+        let (_storage, txn_service, _dir) = create_test_service();
+
+        // Create a committed context
+        let mut committed_ctx = TxnCtx::new(1, 1, false);
+        committed_ctx.state = TxnState::Committed { commit_ts: 10 };
+
+        // Try to commit again - should fail
+        let result = txn_service.commit(committed_ctx);
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_recover_with_uncommitted_entries() {
+        // Test recovery where some transactions are not committed (rolled back)
+        let dir = tempdir().unwrap();
+        let config = FileClogConfig::with_dir(dir.path());
+
+        {
+            let clog_service = Arc::new(FileClogService::open(config.clone()).unwrap());
+
+            // Write entries directly to clog without commit record
+            // This simulates a crash before commit
+            clog_service
+                .append(
+                    ClogEntry {
+                        txn_id: 100,
+                        lsn: 1,
+                        op: ClogOp::Put {
+                            key: b"uncommitted_key".to_vec(),
+                            value: b"uncommitted_value".to_vec(),
+                        },
+                    },
+                    true,
+                )
+                .unwrap();
+
+            // Write a committed transaction
+            clog_service
+                .append(
+                    ClogEntry {
+                        txn_id: 101,
+                        lsn: 2,
+                        op: ClogOp::Put {
+                            key: b"committed_key".to_vec(),
+                            value: b"committed_value".to_vec(),
+                        },
+                    },
+                    true,
+                )
+                .unwrap();
+            clog_service
+                .append(
+                    ClogEntry {
+                        txn_id: 101,
+                        lsn: 3,
+                        op: ClogOp::Commit { commit_ts: 200 },
+                    },
+                    true,
+                )
+                .unwrap();
+
+            clog_service.close().unwrap();
+        }
+
+        // Recover
+        let (clog_service, entries) = FileClogService::recover(config).unwrap();
+        let clog_service = Arc::new(clog_service);
+        let tso = Arc::new(LocalTso::new(1));
+        let cm = Arc::new(ConcurrencyManager::new(0));
+        let storage = Arc::new(MemTableEngine::new());
+        let txn_service = TransactionService::new(Arc::clone(&storage), clog_service, tso, cm);
+
+        let stats = txn_service.recover(&entries).unwrap();
+
+        // Should have 1 committed txn, 1 rolled back entry
+        assert_eq!(stats.committed_txns, 1);
+        assert_eq!(stats.rolled_back_entries, 1);
+        assert_eq!(stats.applied_puts, 1);
+
+        // Only committed key should be present
+        assert!(get_for_test(&*storage, b"uncommitted_key").is_none());
+        assert_eq!(
+            get_for_test(&*storage, b"committed_key"),
+            Some(b"committed_value".to_vec())
+        );
+    }
+
+    #[test]
+    fn test_scan_with_unbounded_end() {
+        let (_storage, txn_service, _dir) = create_test_service();
+
+        // Write some data
+        txn_service.autocommit_put(b"key1", b"value1").unwrap();
+        txn_service.autocommit_put(b"key2", b"value2").unwrap();
+        txn_service.autocommit_put(b"key3", b"value3").unwrap();
+
+        let ctx = txn_service.begin(true).unwrap();
+
+        // Scan with empty end (unbounded)
+        let mut iter = txn_service
+            .scan_iter(&ctx, b"key1".to_vec()..vec![])
+            .unwrap();
+        let mut results = Vec::new();
+        iter.advance().unwrap();
+        while iter.valid() {
+            results.push(iter.user_key().to_vec());
+            iter.advance().unwrap();
+        }
+
+        // Should see all keys starting from key1
+        assert_eq!(results.len(), 3);
+        assert_eq!(results[0], b"key1");
+        assert_eq!(results[1], b"key2");
+        assert_eq!(results[2], b"key3");
+    }
+
+    #[test]
+    fn test_get_iterates_through_versions() {
+        let (_storage, txn_service, _dir) = create_test_service();
+
+        // Write multiple versions of same key
+        let info1 = txn_service.autocommit_put(b"key", b"v1").unwrap();
+        let info2 = txn_service.autocommit_put(b"key", b"v2").unwrap();
+        let info3 = txn_service.autocommit_put(b"key", b"v3").unwrap();
+
+        // Read at different timestamps
+        let ctx1 = TxnCtx::new(0, info1.commit_ts, true);
+        let value1 = txn_service.get(&ctx1, b"key").unwrap();
+        assert_eq!(value1, Some(b"v1".to_vec()));
+
+        let ctx2 = TxnCtx::new(0, info2.commit_ts, true);
+        let value2 = txn_service.get(&ctx2, b"key").unwrap();
+        assert_eq!(value2, Some(b"v2".to_vec()));
+
+        let ctx3 = TxnCtx::new(0, info3.commit_ts, true);
+        let value3 = txn_service.get(&ctx3, b"key").unwrap();
+        assert_eq!(value3, Some(b"v3".to_vec()));
+    }
+
+    #[test]
+    fn test_get_with_tombstone_in_middle() {
+        let (_storage, txn_service, _dir) = create_test_service();
+
+        // Write, delete, write again
+        let _info1 = txn_service.autocommit_put(b"key", b"v1").unwrap();
+        let info2 = txn_service.autocommit_delete(b"key").unwrap();
+        let info3 = txn_service.autocommit_put(b"key", b"v3").unwrap();
+
+        // At delete timestamp, should see None
+        let ctx2 = TxnCtx::new(0, info2.commit_ts, true);
+        let value2 = txn_service.get(&ctx2, b"key").unwrap();
+        assert_eq!(value2, None);
+
+        // At v3 timestamp, should see v3
+        let ctx3 = TxnCtx::new(0, info3.commit_ts, true);
+        let value3 = txn_service.get(&ctx3, b"key").unwrap();
+        assert_eq!(value3, Some(b"v3".to_vec()));
+    }
+
+    #[test]
+    fn test_explicit_txn_write_conflict() {
+        let (_storage, txn_service, _dir) = create_test_service();
+
+        // Transaction 1: Lock key
+        let mut ctx1 = txn_service.begin_explicit(false).unwrap();
+        txn_service
+            .put(&mut ctx1, b"conflict_key".to_vec(), b"value1".to_vec())
+            .unwrap();
+
+        // Transaction 2: Try to write same key - should fail
+        let mut ctx2 = txn_service.begin_explicit(false).unwrap();
+        let result = txn_service.put(&mut ctx2, b"conflict_key".to_vec(), b"value2".to_vec());
+
+        assert!(result.is_err());
+        match result.unwrap_err() {
+            TiSqlError::KeyIsLocked { key, lock_ts, .. } => {
+                assert_eq!(key, b"conflict_key".to_vec());
+                assert_eq!(lock_ts, ctx1.start_ts);
+            }
+            other => panic!("Expected KeyIsLocked error, got: {other:?}"),
+        }
+
+        // Cleanup
+        txn_service.rollback(ctx1).unwrap();
+        txn_service.rollback(ctx2).unwrap();
+    }
+
+    #[test]
+    fn test_explicit_txn_delete_conflict() {
+        let (_storage, txn_service, _dir) = create_test_service();
+
+        // Commit initial value
+        txn_service.autocommit_put(b"delete_key", b"value").unwrap();
+
+        // Transaction 1: Lock key with delete
+        let mut ctx1 = txn_service.begin_explicit(false).unwrap();
+        txn_service
+            .delete(&mut ctx1, b"delete_key".to_vec())
+            .unwrap();
+
+        // Transaction 2: Try to delete same key - should fail
+        let mut ctx2 = txn_service.begin_explicit(false).unwrap();
+        let result = txn_service.delete(&mut ctx2, b"delete_key".to_vec());
+
+        assert!(result.is_err());
+        match result.unwrap_err() {
+            TiSqlError::KeyIsLocked { key, lock_ts, .. } => {
+                assert_eq!(key, b"delete_key".to_vec());
+                assert_eq!(lock_ts, ctx1.start_ts);
+            }
+            other => panic!("Expected KeyIsLocked error, got: {other:?}"),
+        }
+
+        // Cleanup
+        txn_service.rollback(ctx1).unwrap();
+        txn_service.rollback(ctx2).unwrap();
+    }
+
+    #[test]
+    fn test_recover_with_delete_operation() {
+        let dir = tempdir().unwrap();
+        let config = FileClogConfig::with_dir(dir.path());
+
+        {
+            let clog_service = Arc::new(FileClogService::open(config.clone()).unwrap());
+            let tso = Arc::new(LocalTso::new(1));
+            let cm = Arc::new(ConcurrencyManager::new(0));
+            let storage = Arc::new(MemTableEngine::new());
+            let txn_service = TransactionService::new(storage, clog_service.clone(), tso, cm);
+
+            // Put then delete
+            txn_service.autocommit_put(b"del_key", b"value").unwrap();
+            txn_service.autocommit_delete(b"del_key").unwrap();
+
+            clog_service.close().unwrap();
+        }
+
+        // Recover
+        let (clog_service, entries) = FileClogService::recover(config).unwrap();
+        let clog_service = Arc::new(clog_service);
+        let tso = Arc::new(LocalTso::new(1));
+        let cm = Arc::new(ConcurrencyManager::new(0));
+        let storage = Arc::new(MemTableEngine::new());
+        let txn_service = TransactionService::new(Arc::clone(&storage), clog_service, tso, cm);
+
+        let stats = txn_service.recover(&entries).unwrap();
+
+        assert_eq!(stats.committed_txns, 2);
+        assert_eq!(stats.applied_puts, 1);
+        assert_eq!(stats.applied_deletes, 1);
+
+        // Key should be deleted
+        assert!(get_for_test(&*storage, b"del_key").is_none());
+    }
+
+    #[test]
+    fn test_recover_empty_entries() {
+        let dir = tempdir().unwrap();
+        let config = FileClogConfig::with_dir(dir.path());
+        let clog_service = Arc::new(FileClogService::open(config).unwrap());
+        let tso = Arc::new(LocalTso::new(1));
+        let cm = Arc::new(ConcurrencyManager::new(0));
+        let storage = Arc::new(MemTableEngine::new());
+        let txn_service = TransactionService::new(Arc::clone(&storage), clog_service, tso, cm);
+
+        // Recover with empty entries
+        let stats = txn_service.recover(&[]).unwrap();
+
+        assert_eq!(stats.committed_txns, 0);
+        assert_eq!(stats.applied_puts, 0);
+        assert_eq!(stats.applied_deletes, 0);
+        assert_eq!(stats.rolled_back_entries, 0);
+    }
+
+    #[test]
+    fn test_storage_getter() {
+        let (storage, txn_service, _dir) = create_test_service();
+
+        // Test storage() getter returns the same storage
+        let storage_ref = txn_service.storage();
+        txn_service
+            .autocommit_put(b"test_key", b"test_value")
+            .unwrap();
+
+        // Should be able to read from both references
+        let value1 = get_for_test(&*storage, b"test_key");
+        let value2 = get_for_test(storage_ref, b"test_key");
+        assert_eq!(value1, value2);
+        assert_eq!(value1, Some(b"test_value".to_vec()));
+    }
+
+    #[test]
+    fn test_tso_getter() {
+        let (_storage, txn_service, _dir) = create_test_service();
+
+        // Test tso() getter
+        let tso = txn_service.tso();
+        let ts1 = tso.last_ts();
+
+        // After begin, TSO should advance
+        let _ctx = txn_service.begin(false).unwrap();
+        let ts2 = tso.last_ts();
+
+        assert!(ts2 > ts1);
+    }
 }

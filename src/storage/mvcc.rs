@@ -1045,4 +1045,170 @@ mod tests {
 
         assert_eq!(mvcc_key.len(), key.len() + TIMESTAMP_SIZE);
     }
+
+    // ==================== Additional Coverage Tests ====================
+
+    #[test]
+    fn test_mvcc_key_from_bytes_unchecked() {
+        let key = b"key";
+        let mvcc_bytes = encode_mvcc_key(key, 100);
+
+        // from_bytes_unchecked should work with valid bytes
+        let mvcc_key = MvccKey::from_bytes_unchecked(mvcc_bytes.clone());
+        assert_eq!(mvcc_key.key(), key);
+        assert_eq!(mvcc_key.timestamp(), 100);
+    }
+
+    #[test]
+    fn test_mvcc_key_len_method() {
+        let mvcc_key = MvccKey::encode(b"test_key", 100);
+
+        // Test len() method on MvccKey
+        assert_eq!(mvcc_key.len(), b"test_key".len() + TIMESTAMP_SIZE);
+    }
+
+    #[test]
+    fn test_mvcc_key_is_empty() {
+        // Normal key is not empty
+        let mvcc_key = MvccKey::encode(b"key", 100);
+        assert!(!mvcc_key.is_empty());
+
+        // Unbounded key is empty
+        let unbounded = MvccKey::unbounded();
+        assert!(unbounded.is_empty());
+    }
+
+    #[test]
+    fn test_mvcc_key_is_unbounded() {
+        // Normal key is not unbounded
+        let mvcc_key = MvccKey::encode(b"key", 100);
+        assert!(!mvcc_key.is_unbounded());
+
+        // Unbounded key is unbounded
+        let unbounded = MvccKey::unbounded();
+        assert!(unbounded.is_unbounded());
+    }
+
+    #[test]
+    fn test_mvcc_key_next_key_overflow() {
+        // Test next_key with max bytes (overflow case)
+        let mvcc_key = MvccKey::encode(&[255u8; 4], u64::MAX);
+        let next = mvcc_key.next_key();
+        // When overflow occurs, returns None
+        assert!(next.is_none());
+    }
+
+    #[test]
+    fn test_mvcc_key_next_key_normal() {
+        let mvcc_key = MvccKey::encode(b"abc", 100);
+        let next = mvcc_key.next_key();
+        assert!(next.is_some());
+
+        let next_key = next.unwrap();
+        // Next key should be greater
+        assert!(next_key > mvcc_key);
+    }
+
+    #[test]
+    fn test_mvcc_key_clone() {
+        let mvcc_key = MvccKey::encode(b"key", 100);
+        let cloned = mvcc_key.clone();
+
+        assert_eq!(cloned.key(), mvcc_key.key());
+        assert_eq!(cloned.timestamp(), mvcc_key.timestamp());
+    }
+
+    #[test]
+    fn test_mvcc_key_debug() {
+        let mvcc_key = MvccKey::encode(b"key", 100);
+        let debug_str = format!("{mvcc_key:?}");
+        // Debug should contain MvccKey
+        assert!(debug_str.contains("MvccKey"));
+    }
+
+    #[test]
+    fn test_mvcc_key_hash() {
+        use std::collections::HashSet;
+
+        let key1 = MvccKey::encode(b"key", 100);
+        let key2 = MvccKey::encode(b"key", 100);
+        let key3 = MvccKey::encode(b"key", 200);
+
+        let mut set = HashSet::new();
+        set.insert(key1.clone());
+
+        // Same key should already be in set
+        assert!(set.contains(&key2));
+
+        // Different key should not be in set
+        assert!(!set.contains(&key3));
+    }
+
+    #[test]
+    fn test_mvcc_key_ord() {
+        let key1 = MvccKey::encode(b"aaa", 100);
+        let key2 = MvccKey::encode(b"bbb", 100);
+        let key3 = MvccKey::encode(b"aaa", 50);
+
+        // Different user keys
+        assert!(key1 < key2);
+
+        // Same user key, different timestamps (higher ts comes first)
+        assert!(key1 < key3);
+    }
+
+    #[test]
+    fn test_shared_mvcc_range_clone() {
+        use std::sync::Arc;
+
+        let range = MvccKey::encode(b"start", 100)..MvccKey::encode(b"end", 0);
+        let shared: SharedMvccRange = Arc::new(range.clone());
+        let cloned = Arc::clone(&shared);
+
+        assert_eq!(shared.start.key(), cloned.start.key());
+        assert_eq!(shared.end.key(), cloned.end.key());
+    }
+
+    #[test]
+    fn test_is_tombstone_with_vec() {
+        assert!(is_tombstone(TOMBSTONE));
+        assert!(is_tombstone(TOMBSTONE));
+        assert!(!is_tombstone(b"normal_value"));
+        assert!(!is_tombstone(&[])); // Empty is not tombstone
+    }
+
+    #[test]
+    fn test_is_lock_with_vec() {
+        assert!(is_lock(LOCK));
+        assert!(is_lock(LOCK));
+        assert!(!is_lock(b"normal_value"));
+        assert!(!is_lock(&[])); // Empty is not lock
+    }
+
+    #[test]
+    fn test_lock_and_tombstone_distinct() {
+        // LOCK and TOMBSTONE should be different
+        assert_ne!(LOCK, TOMBSTONE);
+        assert!(!is_lock(TOMBSTONE));
+        assert!(!is_tombstone(LOCK));
+    }
+
+    #[test]
+    fn test_mvcc_key_empty_user_key() {
+        // Test with empty user key
+        let mvcc_key = MvccKey::encode(b"", 100);
+        assert_eq!(mvcc_key.key(), b"");
+        assert_eq!(mvcc_key.timestamp(), 100);
+        assert_eq!(mvcc_key.len(), TIMESTAMP_SIZE);
+    }
+
+    #[test]
+    fn test_mvcc_key_large_user_key() {
+        // Test with large user key
+        let large_key = vec![b'x'; 1000];
+        let mvcc_key = MvccKey::encode(&large_key, 100);
+        assert_eq!(mvcc_key.key(), &large_key[..]);
+        assert_eq!(mvcc_key.timestamp(), 100);
+        assert_eq!(mvcc_key.len(), 1000 + TIMESTAMP_SIZE);
+    }
 }
