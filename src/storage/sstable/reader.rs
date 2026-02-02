@@ -705,4 +705,205 @@ mod tests {
         let result = reader.get(&key).unwrap();
         assert_eq!(result, Some(value));
     }
+
+    // ------------------------------------------------------------------------
+    // Corruption Detection Tests
+    // ------------------------------------------------------------------------
+
+    #[test]
+    fn test_reader_corrupted_index_offset_too_large() {
+        use crate::storage::sstable::builder::{FOOTER_SIZE, SST_MAGIC};
+
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("corrupt_offset.sst");
+
+        // Create a valid SST
+        let key = mvcc_key(b"key", 100);
+        create_test_sst(&path, &[(&key, b"value")]).unwrap();
+
+        // Read file and corrupt the footer
+        let mut data = std::fs::read(&path).unwrap();
+        let file_size = data.len();
+
+        // Create a corrupted footer with index_offset > data region
+        let corrupt_offset = (file_size * 2) as u64; // Way past end of file
+        data[file_size - FOOTER_SIZE..file_size - FOOTER_SIZE + 8]
+            .copy_from_slice(&corrupt_offset.to_le_bytes());
+
+        // Keep magic valid so we pass footer decode
+        data[file_size - 4..].copy_from_slice(&SST_MAGIC.to_le_bytes());
+
+        std::fs::write(&path, &data).unwrap();
+
+        let result = SstReader::open(&path);
+        assert!(result.is_err());
+        let err = result.unwrap_err().to_string();
+        assert!(err.contains("index_offset") || err.contains("corrupted"));
+    }
+
+    #[test]
+    fn test_reader_corrupted_index_size_overflow() {
+        use crate::storage::sstable::builder::{FOOTER_SIZE, SST_MAGIC};
+
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("corrupt_size_overflow.sst");
+
+        // Create a valid SST
+        let key = mvcc_key(b"key", 100);
+        create_test_sst(&path, &[(&key, b"value")]).unwrap();
+
+        // Read file and corrupt the footer
+        let mut data = std::fs::read(&path).unwrap();
+        let file_size = data.len();
+
+        // Set index_offset to near end and index_size to u32::MAX to cause overflow
+        let data_end = (file_size - FOOTER_SIZE) as u64;
+        let corrupt_offset = data_end - 1; // Valid offset
+        let corrupt_size = u32::MAX; // Will overflow when added
+
+        data[file_size - FOOTER_SIZE..file_size - FOOTER_SIZE + 8]
+            .copy_from_slice(&corrupt_offset.to_le_bytes());
+        data[file_size - FOOTER_SIZE + 8..file_size - FOOTER_SIZE + 12]
+            .copy_from_slice(&corrupt_size.to_le_bytes());
+
+        // Keep magic valid
+        data[file_size - 4..].copy_from_slice(&SST_MAGIC.to_le_bytes());
+
+        std::fs::write(&path, &data).unwrap();
+
+        let result = SstReader::open(&path);
+        assert!(result.is_err());
+        let err = result.unwrap_err().to_string();
+        assert!(err.contains("overflow") || err.contains("corrupted"));
+    }
+
+    #[test]
+    fn test_reader_corrupted_index_end_exceeds_data() {
+        use crate::storage::sstable::builder::{FOOTER_SIZE, SST_MAGIC};
+
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("corrupt_index_end.sst");
+
+        // Create a valid SST
+        let key = mvcc_key(b"key", 100);
+        create_test_sst(&path, &[(&key, b"value")]).unwrap();
+
+        // Read file and corrupt the footer
+        let mut data = std::fs::read(&path).unwrap();
+        let file_size = data.len();
+
+        // Set index_offset to 0 and index_size larger than data region
+        let corrupt_offset: u64 = 0;
+        let corrupt_size: u32 = file_size as u32; // Larger than data region
+
+        data[file_size - FOOTER_SIZE..file_size - FOOTER_SIZE + 8]
+            .copy_from_slice(&corrupt_offset.to_le_bytes());
+        data[file_size - FOOTER_SIZE + 8..file_size - FOOTER_SIZE + 12]
+            .copy_from_slice(&corrupt_size.to_le_bytes());
+
+        // Keep magic valid
+        data[file_size - 4..].copy_from_slice(&SST_MAGIC.to_le_bytes());
+
+        std::fs::write(&path, &data).unwrap();
+
+        let result = SstReader::open(&path);
+        assert!(result.is_err());
+        let err = result.unwrap_err().to_string();
+        assert!(err.contains("exceeds") || err.contains("corrupted"));
+    }
+
+    #[test]
+    fn test_reader_corrupted_index_size_exceeds_max() {
+        use crate::storage::sstable::builder::{FOOTER_SIZE, SST_MAGIC};
+
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("corrupt_max_size.sst");
+
+        // Create a file with fake large data to make index_size validation trigger
+        // We need a file large enough that the index_size check fires before bounds check
+        let data_len = 300 * 1024 * 1024 + FOOTER_SIZE; // 300MB + footer
+        let mut data = vec![0u8; data_len];
+
+        // Create footer with huge index_size (> 256MB max)
+        let corrupt_offset: u64 = 0;
+        let corrupt_size: u32 = 300 * 1024 * 1024; // 300MB > 256MB max
+
+        let footer_start = data_len - FOOTER_SIZE;
+        data[footer_start..footer_start + 8].copy_from_slice(&corrupt_offset.to_le_bytes());
+        data[footer_start + 8..footer_start + 12].copy_from_slice(&corrupt_size.to_le_bytes());
+
+        // Set magic
+        let magic_start = data_len - 4;
+        data[magic_start..].copy_from_slice(&SST_MAGIC.to_le_bytes());
+
+        std::fs::write(&path, &data).unwrap();
+
+        let result = SstReader::open(&path);
+        assert!(result.is_err());
+        let err = result.unwrap_err().to_string();
+        assert!(err.contains("exceeds maximum") || err.contains("index_size"));
+
+        // Cleanup large file
+        std::fs::remove_file(&path).ok();
+    }
+
+    #[test]
+    fn test_reader_file_size_getter() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("size_test.sst");
+
+        let key = mvcc_key(b"key", 100);
+        create_test_sst(&path, &[(&key, b"value")]).unwrap();
+
+        let reader = SstReader::open(&path).unwrap();
+        assert!(reader.file_size() > 0);
+        assert!(reader.file_size() >= FOOTER_SIZE as u64);
+    }
+
+    #[test]
+    fn test_reader_path_getter() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("path_test.sst");
+
+        let key = mvcc_key(b"key", 100);
+        create_test_sst(&path, &[(&key, b"value")]).unwrap();
+
+        let reader = SstReader::open(&path).unwrap();
+        assert_eq!(reader.path(), path);
+    }
+
+    #[test]
+    fn test_reader_footer_and_index_getters() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("getters.sst");
+
+        let key = mvcc_key(b"key", 100);
+        create_test_sst(&path, &[(&key, b"value")]).unwrap();
+
+        let reader = SstReader::open(&path).unwrap();
+
+        // Test footer getter
+        let footer = reader.footer();
+        assert_eq!(footer.num_entries, 1);
+
+        // Test index getter
+        let index = reader.index();
+        assert!(!index.entries().is_empty() || reader.num_blocks() == 0);
+    }
+
+    #[test]
+    fn test_reader_min_max_ts() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("ts_test.sst");
+
+        // Create SST with specific timestamps
+        let mut builder = SstBuilder::new(&path, SstBuilderOptions::default()).unwrap();
+        builder.add(&mvcc_key(b"key1", 100), b"v1").unwrap();
+        builder.add(&mvcc_key(b"key2", 200), b"v2").unwrap();
+        builder.finish(1, 0).unwrap();
+
+        let reader = SstReader::open(&path).unwrap();
+        // min_ts and max_ts depend on the MVCC key encoding
+        assert!(reader.min_ts() <= reader.max_ts());
+    }
 }
