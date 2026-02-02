@@ -713,4 +713,127 @@ mod tests {
         // Min should be 1 (first thread, first write: 0 * 2 + 1 = 1)
         assert_eq!(min, 1);
     }
+
+    #[test]
+    fn test_memtable_created_at() {
+        let before = std::time::Instant::now();
+        let mt = MemTable::new(1);
+        let after = std::time::Instant::now();
+
+        // created_at should be between before and after
+        let created = mt.created_at();
+        assert!(created >= before);
+        assert!(created <= after);
+    }
+
+    #[test]
+    fn test_memtable_get_lock_owner() {
+        let mt = MemTable::new(1);
+
+        // No lock initially
+        assert!(mt.get_lock_owner(b"key").is_none());
+
+        // Add pending write
+        mt.put_pending(b"key", b"value".to_vec(), 100).unwrap();
+
+        // Now has lock owner
+        assert_eq!(mt.get_lock_owner(b"key"), Some(100));
+    }
+
+    #[test]
+    fn test_memtable_finalize_pending() {
+        let mt = MemTable::new(1);
+
+        // Add pending write
+        mt.put_pending(b"key", b"value".to_vec(), 100).unwrap();
+
+        // Finalize it
+        mt.finalize_pending(&[b"key".to_vec()], 100, 200);
+
+        // Should no longer have lock
+        assert!(mt.get_lock_owner(b"key").is_none());
+
+        // Value should be visible
+        let result = get_for_test(&mt, b"key");
+        assert_eq!(result, Some(b"value".to_vec()));
+    }
+
+    #[test]
+    fn test_memtable_abort_pending() {
+        let mt = MemTable::new(1);
+
+        // Add pending write
+        mt.put_pending(b"key", b"value".to_vec(), 100).unwrap();
+
+        // Abort it
+        mt.abort_pending(&[b"key".to_vec()], 100);
+
+        // Should no longer have lock
+        assert!(mt.get_lock_owner(b"key").is_none());
+
+        // Value should not be visible
+        let result = get_for_test(&mt, b"key");
+        assert!(result.is_none());
+    }
+
+    #[test]
+    fn test_memtable_delete_pending() {
+        let mt = MemTable::new(1);
+
+        // First write a committed value
+        let mut batch = new_batch(100);
+        batch.put(b"key".to_vec(), b"value".to_vec());
+        mt.write_batch_with_lsn(batch, 1).unwrap();
+
+        // Delete with pending
+        let result = mt.delete_pending(b"key", 200);
+        assert!(result.is_ok());
+        assert!(result.unwrap()); // true = deleted
+
+        // Finalize the delete
+        mt.finalize_pending(&[b"key".to_vec()], 200, 300);
+
+        // Value should not be visible
+        let result = get_for_test(&mt, b"key");
+        assert!(result.is_none());
+    }
+
+    #[test]
+    fn test_memtable_get_with_owner() {
+        let mt = MemTable::new(1);
+
+        // Add pending write
+        mt.put_pending(b"key", b"value".to_vec(), 100).unwrap();
+
+        // get_with_owner should see pending value for owner
+        let result = mt.get_with_owner(b"key", Timestamp::MAX, 100);
+        assert_eq!(result, Some(b"value".to_vec()));
+
+        // Non-owner should not see pending value (returns LOCK sentinel or None)
+        let result = mt.get_with_owner(b"key", Timestamp::MAX, 200);
+        // The raw result may be LOCK sentinel, which filtering removes
+        assert!(result.is_none() || crate::storage::mvcc::is_lock(&result.unwrap()));
+    }
+
+    #[test]
+    fn test_memtable_put_pending_frozen() {
+        let mt = MemTable::new(1);
+        mt.freeze();
+
+        // Should return Err(0) for frozen memtable
+        let result = mt.put_pending(b"key", b"value".to_vec(), 100);
+        assert!(result.is_err());
+        assert_eq!(result.unwrap_err(), 0);
+    }
+
+    #[test]
+    fn test_memtable_delete_pending_frozen() {
+        let mt = MemTable::new(1);
+        mt.freeze();
+
+        // Should return Err(0) for frozen memtable
+        let result = mt.delete_pending(b"key", 100);
+        assert!(result.is_err());
+        assert_eq!(result.unwrap_err(), 0);
+    }
 }
