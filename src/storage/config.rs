@@ -497,4 +497,122 @@ mod tests {
 
         assert_eq!(config.min_memtable_age, Some(Duration::from_secs(30)));
     }
+
+    #[test]
+    fn test_config_validation_max_frozen_memtables_zero() {
+        let config = LsmConfig::builder("./test")
+            .max_frozen_memtables(0)
+            .build_unchecked();
+
+        let result = config.validate();
+        assert!(result.is_err());
+        assert!(result.unwrap_err().contains("max_frozen_memtables"));
+    }
+
+    #[test]
+    fn test_config_validation_block_size_zero() {
+        let config = LsmConfig::builder("./test").block_size(0).build_unchecked();
+
+        let result = config.validate();
+        assert!(result.is_err());
+        assert!(result.unwrap_err().contains("block_size"));
+    }
+
+    #[test]
+    fn test_config_validation_l0_compaction_trigger_zero() {
+        let config = LsmConfig::builder("./test")
+            .l0_compaction_trigger(0)
+            .build_unchecked();
+
+        let result = config.validate();
+        assert!(result.is_err());
+        assert!(result.unwrap_err().contains("l0_compaction_trigger"));
+    }
+
+    #[test]
+    fn test_config_builder_block_size() {
+        let config = LsmConfig::builder("./test")
+            .block_size(8192)
+            .build()
+            .unwrap();
+
+        assert_eq!(config.block_size, 8192);
+    }
+
+    #[test]
+    fn test_config_builder_compression() {
+        let config = LsmConfig::builder("./test")
+            .compression(CompressionType::None)
+            .build()
+            .unwrap();
+
+        assert_eq!(config.compression, CompressionType::None);
+    }
+
+    #[test]
+    fn test_config_builder_max_levels() {
+        let config = LsmConfig::builder("./test").max_levels(5).build().unwrap();
+
+        assert_eq!(config.max_levels, 5);
+    }
+
+    #[test]
+    fn test_config_builder_compaction_threads() {
+        let config = LsmConfig::builder("./test")
+            .compaction_threads(8)
+            .build()
+            .unwrap();
+
+        assert_eq!(config.compaction_threads, 8);
+    }
+
+    #[test]
+    fn test_config_builder_flush_threads() {
+        let config = LsmConfig::builder("./test")
+            .flush_threads(4)
+            .build()
+            .unwrap();
+
+        assert_eq!(config.flush_threads, 4);
+    }
+
+    #[test]
+    fn test_config_builder_verify_checksums() {
+        let config = LsmConfig::builder("./test")
+            .verify_checksums(false)
+            .build()
+            .unwrap();
+
+        assert!(!config.verify_checksums);
+    }
+
+    #[test]
+    fn test_config_builder_sync_writes() {
+        let config = LsmConfig::builder("./test")
+            .sync_writes(false)
+            .build()
+            .unwrap();
+
+        assert!(!config.sync_writes);
+    }
+
+    #[test]
+    fn test_config_builder_target_file_size() {
+        let config = LsmConfig::builder("./test")
+            .target_file_size(128 * 1024 * 1024)
+            .build()
+            .unwrap();
+
+        assert_eq!(config.target_file_size, 128 * 1024 * 1024);
+    }
+
+    #[test]
+    fn test_config_builder_l1_max_size() {
+        let config = LsmConfig::builder("./test")
+            .l1_max_size(512 * 1024 * 1024)
+            .build()
+            .unwrap();
+
+        assert_eq!(config.l1_max_size, 512 * 1024 * 1024);
+    }
 }
