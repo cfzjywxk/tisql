@@ -680,7 +680,8 @@ mod failpoint_tests {
         // Phase 3: Resume writer
         fail::cfg("txn_after_lock_before_commit_ts", "off").unwrap();
 
-        let (_, writer_commit_ts, _) = writer.join().unwrap();
+        let writer_result = writer.join().unwrap();
+        let writer_commit_ts = writer_result.commit_ts;
 
         // THE KEY ASSERTION: commit_ts must be > reader's start_ts
         // This is the fix for the "commit in the past" anomaly.
@@ -742,7 +743,8 @@ mod failpoint_tests {
 
         // Resume writer
         fail::cfg("txn_after_lock_before_commit_ts", "off").unwrap();
-        let (_, writer_commit_ts, _) = writer.join().unwrap();
+        let writer_result = writer.join().unwrap();
+        let writer_commit_ts = writer_result.commit_ts;
 
         // ALL readers should have start_ts < commit_ts
         for (i, ctx) in reader_contexts.iter().enumerate() {
