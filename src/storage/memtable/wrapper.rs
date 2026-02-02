@@ -271,6 +271,34 @@ impl MemTable {
     ) {
         self.inner.abort_pending(keys, owner_start_ts)
     }
+
+    /// Delete a key with pessimistic locking.
+    ///
+    /// Returns `Ok(true)` if delete was performed, `Ok(false)` if key doesn't exist,
+    /// `Err(lock_owner)` if key is locked by another transaction.
+    pub fn delete_pending(
+        &self,
+        key: &[u8],
+        owner_start_ts: crate::types::Timestamp,
+    ) -> std::result::Result<bool, crate::types::Timestamp> {
+        if self.is_frozen() {
+            // Frozen memtables cannot accept new writes
+            return Err(0);
+        }
+        self.inner.delete_pending(key, owner_start_ts)
+    }
+
+    /// Get a value with read-your-writes support.
+    ///
+    /// If `owner_start_ts > 0`, returns pending writes owned by this transaction.
+    pub fn get_with_owner(
+        &self,
+        key: &[u8],
+        read_ts: crate::types::Timestamp,
+        owner_start_ts: crate::types::Timestamp,
+    ) -> Option<crate::types::RawValue> {
+        self.inner.get_with_owner(key, read_ts, owner_start_ts)
+    }
 }
 
 /// Estimate the memory size of a write batch.
@@ -314,7 +342,9 @@ mod tests {
     /// Scan MVCC keys in range using streaming iterator (test-only helper).
     fn scan_mvcc(mt: &MemTable, range: Range<MvccKey>) -> Vec<(MvccKey, RawValue)> {
         let mut results = Vec::new();
-        let mut iter = mt.inner().create_streaming_iter(std::sync::Arc::new(range));
+        let mut iter = mt
+            .inner()
+            .create_streaming_iter(std::sync::Arc::new(range), 0);
         iter.advance().unwrap();
         while iter.valid() {
             let key = MvccKey::encode(iter.user_key(), iter.timestamp());

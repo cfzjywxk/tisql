@@ -200,7 +200,7 @@ fn read_balances(
 
     // Scan all MVCC entries up to read_ts
     let range = MvccKey::unbounded()..MvccKey::unbounded();
-    let mut iter = engine.scan_iter(range).expect("scan should succeed");
+    let mut iter = engine.scan_iter(range, 0).expect("scan should succeed");
     iter.advance().expect("advance should succeed");
 
     while iter.valid() {
@@ -373,7 +373,9 @@ fn is_key_visible(engine: &VersionedMemTableEngine, key: &[u8], read_ts: Timesta
     let start = MvccKey::encode(key, Timestamp::MAX);
     let end = MvccKey::encode(key, 0);
 
-    let mut iter = engine.scan_iter(start..end).expect("scan should succeed");
+    let mut iter = engine
+        .scan_iter(start..end, 0)
+        .expect("scan should succeed");
     iter.advance().expect("advance should succeed");
 
     while iter.valid() {

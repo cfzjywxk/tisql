@@ -349,7 +349,7 @@ mod tests {
             .unwrap_or_else(MvccKey::unbounded);
         let range = start..end;
 
-        let mut iter = engine.scan_iter(range).unwrap();
+        let mut iter = engine.scan_iter(range, 0).unwrap();
         iter.advance().unwrap(); // Position on first entry
 
         while iter.valid() {

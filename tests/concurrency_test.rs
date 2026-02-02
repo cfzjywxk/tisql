@@ -47,7 +47,7 @@ fn get_at_for_test(storage: &MemTableEngine, key: &[u8], ts: Timestamp) -> Optio
     let range = start..end;
 
     // Use streaming scan_iter() - process one entry at a time
-    let mut iter = storage.scan_iter(range).unwrap();
+    let mut iter = storage.scan_iter(range, 0).unwrap();
     iter.advance().unwrap(); // Position on first entry
 
     while iter.valid() {
@@ -1209,7 +1209,7 @@ fn test_mvcc_iterator_ordering_invariant() {
     let end = MvccKey::encode(b"key_d", 0);
 
     let storage = txn_service.storage();
-    let mut iter = storage.scan_iter(start..end).unwrap();
+    let mut iter = storage.scan_iter(start..end, 0).unwrap();
     iter.advance().unwrap();
 
     let mut entries: Vec<(Vec<u8>, Timestamp)> = Vec::new();

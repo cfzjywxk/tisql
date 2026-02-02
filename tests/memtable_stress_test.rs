@@ -56,7 +56,7 @@ fn get_at(engine: &VersionedMemTableEngine, key: &[u8], ts: Timestamp) -> Option
     let range = Arc::new(start..end);
 
     let inner = engine.inner_arc();
-    let mut iter = ArcVersionedMemTableIterator::new(inner, range);
+    let mut iter = ArcVersionedMemTableIterator::new(inner, range, 0);
     iter.advance().unwrap();
 
     while iter.valid() {
@@ -167,7 +167,7 @@ fn test_many_unique_keys() {
     // Verify iteration order (sample first 100 keys)
     let range = Arc::new(MvccKey::unbounded()..MvccKey::unbounded());
     let inner = engine.inner_arc();
-    let mut iter = ArcVersionedMemTableIterator::new(inner, range);
+    let mut iter = ArcVersionedMemTableIterator::new(inner, range, 0);
     iter.advance().unwrap();
 
     let mut count = 0;

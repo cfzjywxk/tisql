@@ -103,8 +103,8 @@ pub use recovery::{LsmRecovery, RecoveryResult, RecoveryStats};
 
 // Re-export MVCC codec types
 pub use mvcc::{
-    decode_mvcc_key, encode_mvcc_key, extract_key, is_tombstone, next_key_bound, prev_key_bound,
-    MvccIterator, MvccKey, TIMESTAMP_SIZE, TOMBSTONE,
+    decode_mvcc_key, encode_mvcc_key, extract_key, is_lock, is_tombstone, next_key_bound,
+    prev_key_bound, MvccIterator, MvccKey, LOCK, TIMESTAMP_SIZE, TOMBSTONE,
 };
 
 // Re-export SST types for persistent storage
@@ -229,11 +229,14 @@ pub trait StorageEngine: Send + Sync + 'static {
     /// # Arguments
     ///
     /// * `range` - MVCC key range to scan. Use `MvccKey::encode(key, ts)` to build bounds.
+    /// * `owner_ts` - Transaction's start_ts for read-your-writes support. Pass 0 for
+    ///   autocommit reads (no pending writes visible). When > 0, pending writes owned
+    ///   by this transaction are visible (except LOCK nodes).
     ///
     /// # Returns
     ///
     /// An iterator that yields entries in MVCC key order.
-    fn scan_iter(&self, range: Range<MvccKey>) -> Result<Self::Iter>;
+    fn scan_iter(&self, range: Range<MvccKey>, owner_ts: Timestamp) -> Result<Self::Iter>;
 
     /// Apply a batch of writes atomically.
     ///
@@ -464,4 +467,45 @@ pub trait PessimisticStorage: StorageEngine {
     ///
     /// Only affects nodes where `owner_start_ts` matches.
     fn abort_pending(&self, keys: &[Key], owner_start_ts: Timestamp);
+
+    /// Delete a key with pessimistic locking.
+    ///
+    /// Behavior:
+    /// - If key has our pending write: Converts to LOCK (undo our write)
+    /// - If key is locked by another txn: Returns Err(lock_owner)
+    /// - If committed value exists: Writes pending TOMBSTONE
+    /// - If key doesn't exist: Does nothing, returns Ok(false)
+    ///
+    /// # Returns
+    ///
+    /// * `Ok(true)` - Delete was performed (LOCK or TOMBSTONE written)
+    /// * `Ok(false)` - Key doesn't exist or already deleted
+    /// * `Err(lock_owner)` - Key is locked by another transaction
+    fn delete_pending(
+        &self,
+        key: &[u8],
+        owner_start_ts: Timestamp,
+    ) -> std::result::Result<bool, Timestamp>;
+
+    /// Get a value with read-your-writes support.
+    ///
+    /// If `owner_start_ts > 0`, the caller is in an explicit transaction and
+    /// should see their own pending writes.
+    ///
+    /// # Arguments
+    ///
+    /// * `key` - The key to read
+    /// * `read_ts` - The read timestamp (for MVCC visibility)
+    /// * `owner_start_ts` - The transaction's start_ts (0 for non-explicit reads)
+    ///
+    /// # Returns
+    ///
+    /// * `Some(value)` - Value found (including pending value owned by this txn)
+    /// * `None` - Not found, deleted, or pending LOCK
+    fn get_with_owner(
+        &self,
+        key: &[u8],
+        read_ts: Timestamp,
+        owner_start_ts: Timestamp,
+    ) -> Option<RawValue>;
 }

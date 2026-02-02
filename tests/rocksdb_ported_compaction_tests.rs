@@ -44,7 +44,7 @@ fn get_at_for_test(engine: &LsmEngine, key: &[u8], ts: Timestamp) -> Option<RawV
     let range = start..end;
 
     // Use streaming scan_iter() - process one entry at a time
-    let mut iter = engine.scan_iter(range).unwrap();
+    let mut iter = engine.scan_iter(range, 0).unwrap();
     iter.advance().unwrap(); // Position on first entry
 
     while iter.valid() {
@@ -72,7 +72,7 @@ fn scan_for_test(engine: &LsmEngine, range: &std::ops::Range<Key>) -> Vec<(Key, 
     let mvcc_range = start..end;
 
     // Use streaming scan_iter() - process one entry at a time
-    let mut iter = engine.scan_iter(mvcc_range).unwrap();
+    let mut iter = engine.scan_iter(mvcc_range, 0).unwrap();
     iter.advance().unwrap(); // Position on first entry
 
     let mut seen_keys: std::collections::HashSet<Key> = std::collections::HashSet::new();

@@ -420,7 +420,8 @@ use crate::error::Result;
 /// ## Usage Pattern
 ///
 /// ```ignore
-/// let mut iter = storage.scan_iter(range)?;
+/// // owner_ts: 0 for autocommit reads, or start_ts for read-your-writes
+/// let mut iter = storage.scan_iter(range, owner_ts)?;
 /// iter.advance()?;  // Position on first entry
 /// while iter.valid() {
 ///     let user_key = iter.user_key();
@@ -538,6 +539,18 @@ impl MvccIterator for Box<dyn MvccIterator> {
 /// The probability of collision is ~2^-120 for random 16-byte values.
 pub const TOMBSTONE: &[u8] = b"\x00\x00\x00\x00TISQL_TOMBSTONE\x01";
 
+/// Lock marker for conflict detection without data change.
+///
+/// Used for:
+/// - SELECT FOR UPDATE (lock without modifying)
+/// - UPDATE with same value (lock without data change)
+/// - DELETE after INSERT/UPDATE in same txn (undo our write)
+///
+/// LOCK is NOT persisted to SST. At commit time, LOCK nodes are marked
+/// as aborted since the pessimistic lock already served its purpose.
+/// Reads skip LOCK and see the previous committed version.
+pub const LOCK: &[u8] = b"\x00\x00\x00\x00TISQL_LOCK\x01";
+
 /// Encode a key with timestamp for MVCC storage.
 ///
 /// Format: `key || !commit_ts` (descending order by timestamp)
@@ -620,6 +633,24 @@ pub fn extract_key(mvcc_key: &[u8]) -> &[u8] {
 #[inline]
 pub fn is_tombstone(value: &[u8]) -> bool {
     value == TOMBSTONE
+}
+
+/// Check if a value is a lock marker.
+///
+/// Lock markers indicate conflict detection without data change.
+/// They are used for SELECT FOR UPDATE, same-value UPDATE, and
+/// DELETE on pending writes (undo within same transaction).
+///
+/// # Arguments
+///
+/// * `value` - The value to check
+///
+/// # Returns
+///
+/// `true` if the value is a lock marker, `false` otherwise
+#[inline]
+pub fn is_lock(value: &[u8]) -> bool {
+    value == LOCK
 }
 
 /// Compute the "next" key for range bounds.
@@ -958,6 +989,16 @@ mod tests {
         assert!(is_tombstone(TOMBSTONE));
         assert!(!is_tombstone(b"regular_value"));
         assert!(!is_tombstone(b""));
+    }
+
+    #[test]
+    fn test_is_lock() {
+        assert!(is_lock(LOCK));
+        assert!(!is_lock(b"regular_value"));
+        assert!(!is_lock(b""));
+        // LOCK and TOMBSTONE are distinct
+        assert!(!is_lock(TOMBSTONE));
+        assert!(!is_tombstone(LOCK));
     }
 
     #[test]

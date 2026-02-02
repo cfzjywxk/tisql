@@ -64,7 +64,9 @@ use crossbeam_skiplist::map::Entry;
 use crossbeam_skiplist::SkipMap;
 
 use crate::error::{Result, TiSqlError};
-use crate::storage::mvcc::{MvccIterator, MvccKey, SharedMvccRange, TOMBSTONE};
+use crate::storage::mvcc::{
+    is_lock, is_tombstone, MvccIterator, MvccKey, SharedMvccRange, LOCK, TOMBSTONE,
+};
 use crate::storage::{PessimisticStorage, StorageEngine, WriteBatch, WriteOp};
 use crate::types::{Key, RawValue, Timestamp};
 
@@ -310,6 +312,71 @@ impl MvccRow {
         None
     }
 
+    /// Find the version visible at the given timestamp, considering owned pending writes.
+    ///
+    /// This method supports read-your-writes semantics for explicit transactions.
+    ///
+    /// ## Read behavior:
+    /// - Skip aborted nodes
+    /// - For pending nodes (owner > 0):
+    ///   - If owned by us and LOCK: skip to previous version (our write was "undone")
+    ///   - If owned by us and value: return value (read-your-writes)
+    ///   - If owned by others: skip (not visible to us)
+    /// - For committed nodes (owner == 0):
+    ///   - TOMBSTONE: return None (key deleted)
+    ///   - Value: return value if ts <= read_ts
+    ///
+    /// Note: Committed LOCK nodes don't exist - they're aborted at commit time.
+    fn get_at_with_owner(
+        &self,
+        read_ts: Timestamp,
+        owner_start_ts: Timestamp,
+    ) -> Option<&RawValue> {
+        let mut current = self.head.load(Ordering::Acquire);
+
+        // Safety: We hold a reference to MvccRow, and nodes are never deallocated
+        // while the row exists (deallocation happens when the memtable is dropped).
+        while !current.is_null() {
+            let node = unsafe { &*current };
+
+            // Skip aborted nodes (includes LOCK after commit)
+            if node.is_aborted() {
+                current = node.next;
+                continue;
+            }
+
+            let node_owner = node.get_owner();
+
+            // Pending write (owner > 0)
+            if node_owner > 0 {
+                if node_owner == owner_start_ts {
+                    // Our pending write
+                    if is_lock(&node.value) {
+                        // LOCK = "undo our write", skip to previous version
+                        current = node.next;
+                        continue;
+                    }
+                    return Some(&node.value);
+                }
+                // Someone else's pending write - skip
+                current = node.next;
+                continue;
+            }
+
+            // Committed node (owner == 0)
+            let node_ts = node.get_ts();
+            if node_ts <= read_ts {
+                if is_tombstone(&node.value) {
+                    return None; // Key was deleted
+                }
+                return Some(&node.value);
+            }
+            current = node.next;
+        }
+
+        None
+    }
+
     // ========================================================================
     // Pessimistic Locking Methods
     // ========================================================================
@@ -411,9 +478,131 @@ impl MvccRow {
         }
     }
 
+    /// Delete for pessimistic transactions.
+    ///
+    /// Behavior:
+    /// - If head is our pending write: Update value to LOCK (undo our write)
+    /// - If head is another's pending write: Return Err(lock_owner)
+    /// - If committed value exists: Write pending TOMBSTONE
+    /// - If key doesn't exist or already deleted: Do nothing, return Ok(false)
+    ///
+    /// # Returns
+    /// - `Ok(true)` if delete was performed (LOCK or TOMBSTONE written)
+    /// - `Ok(false)` if key doesn't exist or already deleted
+    /// - `Err(lock_owner)` if key is locked by another transaction
+    fn delete_pending(&self, owner_start_ts: Timestamp) -> std::result::Result<bool, Timestamp> {
+        loop {
+            let current_head = self.head.load(Ordering::Acquire);
+
+            if current_head.is_null() {
+                // Key doesn't exist at all - do nothing
+                return Ok(false);
+            }
+
+            let head_node = unsafe { &*current_head };
+
+            // Skip aborted nodes - need to find actual head
+            if head_node.is_aborted() {
+                // Look for non-aborted node to determine state
+                let mut current = head_node.next;
+                while !current.is_null() {
+                    let node = unsafe { &*current };
+                    if !node.is_aborted() {
+                        break;
+                    }
+                    current = node.next;
+                }
+
+                if current.is_null() {
+                    // All nodes aborted - treat as empty
+                    return Ok(false);
+                }
+
+                let actual_node = unsafe { &*current };
+                if actual_node.get_owner() > 0 {
+                    // Pending node by someone else
+                    return Err(actual_node.get_owner());
+                }
+
+                // Committed node exists - write pending TOMBSTONE
+                if !is_tombstone(&actual_node.value) {
+                    let mut new_node = VersionNode::new_pending(owner_start_ts, TOMBSTONE.to_vec());
+                    new_node.next = current_head;
+
+                    let new_ptr = Box::into_raw(new_node);
+
+                    match self.head.compare_exchange_weak(
+                        current_head,
+                        new_ptr,
+                        Ordering::Release,
+                        Ordering::Relaxed,
+                    ) {
+                        Ok(_) => {
+                            self.version_count.fetch_add(1, Ordering::Relaxed);
+                            return Ok(true);
+                        }
+                        Err(_) => {
+                            let _ = unsafe { Box::from_raw(new_ptr) };
+                            continue; // Retry
+                        }
+                    }
+                }
+                return Ok(false); // Already deleted
+            }
+
+            let node_owner = head_node.get_owner();
+
+            if node_owner == owner_start_ts {
+                // Our pending write - convert to LOCK (undo our write)
+                // Safety: We own this node (same start_ts), so we can mutate it.
+                // Other readers see either old value or LOCK, both valid states.
+                let value_ptr = &head_node.value as *const RawValue as *mut RawValue;
+                let mut lock_value = LOCK.to_vec();
+                unsafe {
+                    std::ptr::swap(value_ptr, &mut lock_value);
+                }
+                return Ok(true);
+            }
+
+            if node_owner > 0 {
+                // Locked by another transaction
+                return Err(node_owner);
+            }
+
+            // Committed node - write pending TOMBSTONE to delete it
+            if !is_tombstone(&head_node.value) {
+                let mut new_node = VersionNode::new_pending(owner_start_ts, TOMBSTONE.to_vec());
+                new_node.next = current_head;
+
+                let new_ptr = Box::into_raw(new_node);
+
+                match self.head.compare_exchange_weak(
+                    current_head,
+                    new_ptr,
+                    Ordering::Release,
+                    Ordering::Relaxed,
+                ) {
+                    Ok(_) => {
+                        self.version_count.fetch_add(1, Ordering::Relaxed);
+                        return Ok(true);
+                    }
+                    Err(_) => {
+                        let _ = unsafe { Box::from_raw(new_ptr) };
+                        continue; // Retry
+                    }
+                }
+            }
+
+            // Key already deleted (committed tombstone) - do nothing
+            return Ok(false);
+        }
+    }
+
     /// Finalize all pending nodes owned by the given transaction.
     ///
-    /// Sets the commit_ts and clears owner_start_ts for each pending node.
+    /// For value and TOMBSTONE nodes: Sets commit_ts and clears owner_start_ts.
+    /// For LOCK nodes: Marks as aborted (not persisted - pessimistic lock served its purpose).
+    ///
     /// Called during transaction commit.
     fn finalize_pending(&self, owner_start_ts: Timestamp, commit_ts: Timestamp) {
         let mut current = self.head.load(Ordering::Acquire);
@@ -422,7 +611,14 @@ impl MvccRow {
             let node = unsafe { &*current };
 
             if node.get_owner() == owner_start_ts && !node.is_aborted() {
-                node.finalize(commit_ts);
+                if is_lock(&node.value) {
+                    // LOCK served its purpose (conflict detection via pessimistic lock)
+                    // Don't persist - mark as aborted so readers skip it
+                    node.mark_aborted();
+                } else {
+                    // Value or TOMBSTONE - finalize normally
+                    node.finalize(commit_ts);
+                }
             }
 
             current = node.next;
@@ -605,6 +801,65 @@ impl VersionedMemTableEngine {
         }
     }
 
+    /// Delete a key with pessimistic locking.
+    ///
+    /// Behavior:
+    /// - If key has our pending write: Converts to LOCK (undo our write)
+    /// - If key is locked by another txn: Returns Err(lock_owner)
+    /// - If committed value exists: Writes pending TOMBSTONE
+    /// - If key doesn't exist: Does nothing, returns Ok(false)
+    ///
+    /// Returns:
+    /// - `Ok(true)` if delete was performed
+    /// - `Ok(false)` if key doesn't exist or already deleted
+    /// - `Err(lock_owner)` if key is locked by another transaction
+    pub fn delete_pending(
+        &self,
+        key: &[u8],
+        owner_start_ts: Timestamp,
+    ) -> std::result::Result<bool, Timestamp> {
+        // If key doesn't exist, do nothing
+        let entry = match self.inner.index.get(key) {
+            Some(e) => e,
+            None => return Ok(false),
+        };
+
+        match entry.value().delete_pending(owner_start_ts) {
+            Ok(true) => {
+                // A TOMBSTONE node was added (delete on committed)
+                // or LOCK was set (delete on our pending)
+                // Note: entry_count not incremented here because:
+                // - LOCK update is in-place
+                // - TOMBSTONE add is counted when we check if entry existed
+                Ok(true)
+            }
+            Ok(false) => Ok(false),
+            Err(lock_owner) => Err(lock_owner),
+        }
+    }
+
+    /// Get a value with read-your-writes support.
+    ///
+    /// If `owner_start_ts > 0`, the caller is in an explicit transaction and
+    /// should see their own pending writes.
+    ///
+    /// Returns:
+    /// - `Some(value)` if found (including pending value owned by this txn)
+    /// - `None` if not found, deleted, or pending LOCK
+    pub fn get_with_owner(
+        &self,
+        key: &[u8],
+        read_ts: Timestamp,
+        owner_start_ts: Timestamp,
+    ) -> Option<RawValue> {
+        self.inner.index.get(key).and_then(|entry| {
+            entry
+                .value()
+                .get_at_with_owner(read_ts, owner_start_ts)
+                .cloned()
+        })
+    }
+
     /// Get the number of version entries in the memtable.
     pub fn len(&self) -> usize {
         self.inner.entry_count.load(Ordering::Relaxed)
@@ -658,18 +913,29 @@ impl VersionedMemTableEngine {
     /// The returned iterator is in an uninitialized state; call `next()` to
     /// position on the first entry.
     ///
-    /// Takes `SharedMvccRange` (Arc) to avoid cloning when creating multiple iterators.
-    pub fn create_streaming_iter(&self, range: SharedMvccRange) -> VersionedMemTableIterator<'_> {
-        VersionedMemTableIterator::new(self.inner.as_ref(), range)
+    /// # Arguments
+    ///
+    /// * `range` - MVCC key range (Arc for zero-copy sharing)
+    /// * `owner_ts` - Transaction's start_ts for read-your-writes
+    pub fn create_streaming_iter(
+        &self,
+        range: SharedMvccRange,
+        owner_ts: Timestamp,
+    ) -> VersionedMemTableIterator<'_> {
+        VersionedMemTableIterator::new(self.inner.as_ref(), range, owner_ts)
     }
 }
 
 impl StorageEngine for VersionedMemTableEngine {
     type Iter = ArcVersionedMemTableIterator;
 
-    fn scan_iter(&self, range: Range<MvccKey>) -> Result<ArcVersionedMemTableIterator> {
+    fn scan_iter(
+        &self,
+        range: Range<MvccKey>,
+        owner_ts: Timestamp,
+    ) -> Result<ArcVersionedMemTableIterator> {
         let range = Arc::new(range);
-        let iter = ArcVersionedMemTableIterator::new(self.inner_arc(), range);
+        let iter = ArcVersionedMemTableIterator::new(self.inner_arc(), range, owner_ts);
         Ok(iter)
     }
 
@@ -703,6 +969,25 @@ impl PessimisticStorage for VersionedMemTableEngine {
     fn abort_pending(&self, keys: &[Key], owner_start_ts: Timestamp) {
         // Delegate to the inherent method
         VersionedMemTableEngine::abort_pending(self, keys, owner_start_ts)
+    }
+
+    fn delete_pending(
+        &self,
+        key: &[u8],
+        owner_start_ts: Timestamp,
+    ) -> std::result::Result<bool, Timestamp> {
+        // Delegate to the inherent method
+        VersionedMemTableEngine::delete_pending(self, key, owner_start_ts)
+    }
+
+    fn get_with_owner(
+        &self,
+        key: &[u8],
+        read_ts: Timestamp,
+        owner_start_ts: Timestamp,
+    ) -> Option<RawValue> {
+        // Delegate to the inherent method
+        VersionedMemTableEngine::get_with_owner(self, key, read_ts, owner_start_ts)
     }
 }
 
@@ -782,6 +1067,9 @@ pub struct VersionedMemTableIterator<'a> {
     current_entry: Option<Entry<'a, Vec<u8>, MvccRow>>,
     /// Current position in version chain (null if at end of chain)
     current_version: *const VersionNode,
+    /// Owner's start_ts for read-your-writes support.
+    /// Pending nodes owned by this txn (where node.owner == owner_ts) are visible.
+    owner_ts: Timestamp,
 }
 
 // Note: This iterator is intentionally !Send and !Sync because:
@@ -798,18 +1086,27 @@ pub struct VersionedMemTableIterator<'a> {
 impl<'a> VersionedMemTableIterator<'a> {
     /// Create a new iterator over the given range.
     ///
-    /// The iterator is created in an uninitialized state. Call `next()` to position
+    /// The iterator is created in an uninitialized state. Call `advance()` to position
     /// on the first entry.
     ///
-    /// Takes `SharedMvccRange` (Arc) to avoid cloning range data when constructing
-    /// multiple iterators over the same range.
-    pub fn new(inner: &'a VersionedMemTableEngineInner, range: SharedMvccRange) -> Self {
+    /// # Arguments
+    ///
+    /// * `inner` - Reference to the memtable engine inner data
+    /// * `range` - MVCC key range to scan (Arc for zero-copy sharing)
+    /// * `owner_ts` - Transaction's start_ts for read-your-writes. Pending nodes
+    ///   owned by this transaction are visible (except LOCK nodes).
+    pub fn new(
+        inner: &'a VersionedMemTableEngineInner,
+        range: SharedMvccRange,
+        owner_ts: Timestamp,
+    ) -> Self {
         Self {
             inner,
             range,
             initialized: false,
             current_entry: None,
             current_version: std::ptr::null(),
+            owner_ts,
         }
     }
 
@@ -914,6 +1211,9 @@ impl<'a> VersionedMemTableIterator<'a> {
     ///
     /// If `ts_filter` is Some, only consider versions with ts <= ts_filter.
     /// Returns the pointer to the first valid version, or None if none found.
+    ///
+    /// If `owner_start_ts` is set on this iterator, pending nodes owned by that
+    /// transaction are visible (except LOCK nodes which represent "no value").
     fn find_first_valid_version(
         &self,
         user_key: &[u8],
@@ -930,15 +1230,18 @@ impl<'a> VersionedMemTableIterator<'a> {
                 continue;
             }
 
-            // Skip pending nodes (not committed yet)
-            // Readers should not see uncommitted writes from other transactions.
-            // Read-your-writes is handled separately by the transaction layer.
+            // Handle pending nodes - visible only if owned by this transaction
             if node.is_pending() {
+                if node.get_owner() == self.owner_ts && !is_lock(&node.value) {
+                    // Own pending node with value - visible
+                    return Some(version_ptr);
+                }
+                // Not our pending or is LOCK - skip
                 version_ptr = node.next;
                 continue;
             }
 
-            // Apply timestamp filter if specified
+            // Committed node - apply timestamp filter if specified
             if let Some(max_ts) = ts_filter {
                 if node.get_ts() > max_ts {
                     version_ptr = node.next;
@@ -1010,8 +1313,14 @@ impl<'a> VersionedMemTableIterator<'a> {
                     continue;
                 }
 
-                // Skip pending nodes (uncommitted)
+                // Handle pending nodes - visible only if owned by this transaction
                 if next_node.is_pending() {
+                    if next_node.get_owner() == self.owner_ts && !is_lock(&next_node.value) {
+                        // Own pending node with value - visible
+                        self.current_version = next_version;
+                        return;
+                    }
+                    // Not our pending or is LOCK - skip
                     next_version = next_node.next;
                     continue;
                 }
@@ -1158,8 +1467,16 @@ impl ArcVersionedMemTableIterator {
     /// `advance()` before accessing data. This follows the unified iterator pattern:
     /// `advance()` → `valid()` → `read()`.
     ///
-    /// Takes `SharedMvccRange` (Arc) to avoid cloning when creating multiple iterators.
-    pub fn new(inner: Arc<VersionedMemTableEngineInner>, range: SharedMvccRange) -> Self {
+    /// # Arguments
+    ///
+    /// * `inner` - Arc reference to memtable engine inner data
+    /// * `range` - MVCC key range (Arc for zero-copy sharing)
+    /// * `owner_ts` - Transaction's start_ts for read-your-writes
+    pub fn new(
+        inner: Arc<VersionedMemTableEngineInner>,
+        range: SharedMvccRange,
+        owner_ts: Timestamp,
+    ) -> Self {
         // Safety: We're extending the lifetime of the reference from the Arc's lifetime
         // to 'static. This is safe because:
         // 1. The Arc keeps the inner data alive for as long as this struct exists
@@ -1167,8 +1484,7 @@ impl ArcVersionedMemTableIterator {
         // 3. VersionedMemTableIterator doesn't access the inner in its Drop impl
         let inner_ref: &'static VersionedMemTableEngineInner =
             unsafe { std::mem::transmute(inner.as_ref()) };
-        let iter = VersionedMemTableIterator::new(inner_ref, range);
-        // Caller must call advance() to position on first entry
+        let iter = VersionedMemTableIterator::new(inner_ref, range, owner_ts);
         Self {
             iter,
             _inner: inner,
@@ -1235,7 +1551,7 @@ mod tests {
         range: Range<MvccKey>,
     ) -> Vec<(MvccKey, RawValue)> {
         let mut results = Vec::new();
-        let mut iter = engine.create_streaming_iter(std::sync::Arc::new(range));
+        let mut iter = engine.create_streaming_iter(std::sync::Arc::new(range), 0);
         iter.advance().unwrap();
         while iter.valid() {
             let key = MvccKey::encode(iter.user_key(), iter.timestamp());
@@ -1939,7 +2255,7 @@ mod tests {
         let engine = new_engine();
 
         let range = MvccKey::unbounded()..MvccKey::unbounded();
-        let mut iter = engine.create_streaming_iter(std::sync::Arc::new(range));
+        let mut iter = engine.create_streaming_iter(std::sync::Arc::new(range), 0);
 
         iter.advance().unwrap();
         assert!(
@@ -1955,7 +2271,7 @@ mod tests {
         put_at(&engine, b"only_key", b"only_value", 100);
 
         let range = MvccKey::unbounded()..MvccKey::unbounded();
-        let mut iter = engine.create_streaming_iter(std::sync::Arc::new(range));
+        let mut iter = engine.create_streaming_iter(std::sync::Arc::new(range), 0);
 
         iter.advance().unwrap();
         assert!(iter.valid());
@@ -2029,7 +2345,7 @@ mod tests {
 
         // Seek to "bbb" should position on "ccc"
         let range = MvccKey::encode(b"bbb", Timestamp::MAX)..MvccKey::unbounded();
-        let mut iter = engine.create_streaming_iter(std::sync::Arc::new(range));
+        let mut iter = engine.create_streaming_iter(std::sync::Arc::new(range), 0);
 
         iter.advance().unwrap();
         assert!(iter.valid());
@@ -2045,7 +2361,7 @@ mod tests {
         put_at(&engine, b"bbb", b"v2", 20);
 
         let range = MvccKey::encode(b"zzz", Timestamp::MAX)..MvccKey::unbounded();
-        let mut iter = engine.create_streaming_iter(std::sync::Arc::new(range));
+        let mut iter = engine.create_streaming_iter(std::sync::Arc::new(range), 0);
 
         iter.advance().unwrap();
         assert!(!iter.valid(), "Seek past all keys should be invalid");
@@ -2060,7 +2376,7 @@ mod tests {
 
         // Start from very beginning (before "mmm")
         let range = MvccKey::encode(b"aaa", Timestamp::MAX)..MvccKey::unbounded();
-        let mut iter = engine.create_streaming_iter(std::sync::Arc::new(range));
+        let mut iter = engine.create_streaming_iter(std::sync::Arc::new(range), 0);
 
         iter.advance().unwrap();
         assert!(iter.valid());
@@ -2077,7 +2393,7 @@ mod tests {
 
         // Seek to exactly (key, 20)
         let range = MvccKey::encode(b"key", 20)..MvccKey::unbounded();
-        let mut iter = engine.create_streaming_iter(std::sync::Arc::new(range));
+        let mut iter = engine.create_streaming_iter(std::sync::Arc::new(range), 0);
 
         iter.advance().unwrap();
         assert!(iter.valid());
@@ -2195,7 +2511,7 @@ mod tests {
         let range = std::sync::Arc::new(MvccKey::unbounded()..MvccKey::unbounded());
 
         // Create Arc iterator
-        let mut iter = ArcVersionedMemTableIterator::new(inner, range);
+        let mut iter = ArcVersionedMemTableIterator::new(inner, range, 0);
 
         // Drop the engine (but Arc keeps inner alive)
         drop(engine);
@@ -2224,7 +2540,7 @@ mod tests {
 
         let inner = engine.inner_arc();
         let range = std::sync::Arc::new(MvccKey::unbounded()..MvccKey::unbounded());
-        let mut iter = ArcVersionedMemTableIterator::new(inner, range);
+        let mut iter = ArcVersionedMemTableIterator::new(inner, range, 0);
 
         // Seek to middle
         let target = MvccKey::encode(b"key_05", Timestamp::MAX);
@@ -2487,5 +2803,656 @@ mod tests {
         assert_eq!(key.key(), b"key");
         assert_eq!(key.timestamp(), 150); // commit_ts
         assert_eq!(value, b"value");
+    }
+
+    // ==================== Read-Your-Writes Tests ====================
+
+    #[test]
+    fn test_get_at_with_owner_reads_own_pending() {
+        // Owner should see their own pending write
+        let row = MvccRow::new_empty();
+
+        // Write pending value owned by txn 100
+        row.prepend_pending(100, b"my_value".to_vec()).unwrap();
+
+        // Owner (start_ts=100) should see their pending write
+        let value = row.get_at_with_owner(100, 100);
+        assert_eq!(value, Some(&b"my_value".to_vec()));
+
+        // Non-owner (start_ts=200) should not see the pending write
+        let value = row.get_at_with_owner(200, 200);
+        assert!(value.is_none());
+    }
+
+    #[test]
+    fn test_get_at_with_owner_lock_skips_to_previous() {
+        use crate::storage::mvcc::LOCK;
+
+        let row = MvccRow::new_empty();
+
+        // First, add a committed value at ts=50
+        row.prepend(50, b"committed_value".to_vec());
+
+        // Then, add a pending LOCK owned by txn 100 (simulating DELETE after INSERT)
+        row.prepend_pending(100, LOCK.to_vec()).unwrap();
+
+        // Owner sees LOCK, skips to previous committed version
+        let value = row.get_at_with_owner(100, 100);
+        assert_eq!(value, Some(&b"committed_value".to_vec()));
+
+        // Non-owner also sees committed version (skips pending LOCK)
+        let value = row.get_at_with_owner(100, 200);
+        assert_eq!(value, Some(&b"committed_value".to_vec()));
+    }
+
+    #[test]
+    fn test_get_at_with_owner_lock_no_previous_returns_none() {
+        use crate::storage::mvcc::LOCK;
+
+        let row = MvccRow::new_empty();
+
+        // Add pending LOCK with no previous version (DELETE after INSERT on new key)
+        row.prepend_pending(100, LOCK.to_vec()).unwrap();
+
+        // Owner sees LOCK, no previous version -> None
+        let value = row.get_at_with_owner(100, 100);
+        assert!(value.is_none());
+    }
+
+    #[test]
+    fn test_get_at_with_owner_tombstone_returns_none() {
+        let row = MvccRow::new_empty();
+
+        // Add a committed tombstone at ts=50
+        row.prepend(50, TOMBSTONE.to_vec());
+
+        // Any reader sees tombstone -> None
+        let value = row.get_at_with_owner(100, 100);
+        assert!(value.is_none());
+
+        let value = row.get_at_with_owner(100, 200);
+        assert!(value.is_none());
+    }
+
+    #[test]
+    fn test_get_at_with_owner_pending_tombstone_for_owner() {
+        let row = MvccRow::new_empty();
+
+        // Add a committed value
+        row.prepend(50, b"old_value".to_vec());
+
+        // Add pending TOMBSTONE owned by txn 100 (DELETE on committed value)
+        row.prepend_pending(100, TOMBSTONE.to_vec()).unwrap();
+
+        // Owner sees their pending TOMBSTONE (not LOCK, so returns it as value)
+        // But TOMBSTONE is returned as the value, caller checks is_tombstone()
+        // Actually, let's check: get_at_with_owner returns the value, caller should check
+        // In our design, pending TOMBSTONE should mean "I'm deleting this"
+        // The owner should see the TOMBSTONE value
+        let value = row.get_at_with_owner(100, 100);
+        assert_eq!(value, Some(&TOMBSTONE.to_vec()));
+
+        // Non-owner skips pending, sees committed value
+        let value = row.get_at_with_owner(100, 200);
+        assert_eq!(value, Some(&b"old_value".to_vec()));
+    }
+
+    #[test]
+    fn test_get_at_with_owner_skips_aborted() {
+        let row = MvccRow::new_empty();
+
+        // Add committed value
+        row.prepend(50, b"committed".to_vec());
+
+        // Add pending value, then abort it
+        row.prepend_pending(100, b"aborted_value".to_vec()).unwrap();
+        row.abort_pending(100);
+
+        // Everyone should skip aborted and see committed value
+        let value = row.get_at_with_owner(100, 100);
+        assert_eq!(value, Some(&b"committed".to_vec()));
+
+        let value = row.get_at_with_owner(100, 200);
+        assert_eq!(value, Some(&b"committed".to_vec()));
+    }
+
+    #[test]
+    fn test_get_at_with_owner_multiple_pending_from_different_txns() {
+        // This shouldn't happen in practice (lock conflict), but test behavior
+        let row = MvccRow::new_empty();
+
+        // Add committed base
+        row.prepend(50, b"base".to_vec());
+
+        // Manually create scenario: txn 100 wrote, then txn 200 wrote (conflict in real scenario)
+        // In reality, txn 200 would be blocked. But test the traversal logic.
+        row.prepend_pending(100, b"txn100_value".to_vec()).unwrap();
+        // This would fail with lock conflict in real code, but MvccRow doesn't enforce that
+        // Let's simulate by directly adding (bypassing conflict check)
+        // Actually, prepend_pending checks conflicts, so we can't easily test this
+
+        // Instead, test that owner only sees their own
+        let value = row.get_at_with_owner(100, 100);
+        assert_eq!(value, Some(&b"txn100_value".to_vec()));
+
+        // Non-owner 200 skips txn 100's pending, sees base
+        let value = row.get_at_with_owner(100, 200);
+        assert_eq!(value, Some(&b"base".to_vec()));
+    }
+
+    #[test]
+    fn test_get_at_with_owner_insert_delete_insert_pattern() {
+        use crate::storage::mvcc::LOCK;
+
+        let row = MvccRow::new_empty();
+
+        // Committed base value
+        row.prepend(50, b"base".to_vec());
+
+        // Txn 100: INSERT (pending value)
+        row.prepend_pending(100, b"inserted".to_vec()).unwrap();
+
+        // Owner sees their insert
+        assert_eq!(row.get_at_with_owner(100, 100), Some(&b"inserted".to_vec()));
+
+        // Txn 100: DELETE (update pending to LOCK)
+        // Simulate by updating value in place (as prepend_pending does for same owner)
+        // In real code this is done via delete_pending, but we can test MvccRow directly
+        // by calling prepend_pending with LOCK
+        row.prepend_pending(100, LOCK.to_vec()).unwrap(); // Updates in place
+
+        // Owner sees LOCK, skips to base
+        assert_eq!(row.get_at_with_owner(100, 100), Some(&b"base".to_vec()));
+
+        // Txn 100: INSERT again (update LOCK back to value)
+        row.prepend_pending(100, b"reinserted".to_vec()).unwrap();
+
+        // Owner sees their reinsert
+        assert_eq!(
+            row.get_at_with_owner(100, 100),
+            Some(&b"reinserted".to_vec())
+        );
+    }
+
+    // ==================== delete_pending Tests ====================
+
+    #[test]
+    fn test_delete_pending_on_own_pending_write() {
+        let row = MvccRow::new_empty();
+
+        // Txn 100 writes a pending value
+        row.prepend_pending(100, b"my_value".to_vec()).unwrap();
+
+        // Txn 100 deletes their pending write (converts to LOCK)
+        let result = row.delete_pending(100);
+        assert_eq!(result, Ok(true));
+
+        // Owner should now see LOCK, skip to previous (none) -> None
+        let value = row.get_at_with_owner(100, 100);
+        assert!(value.is_none());
+    }
+
+    #[test]
+    fn test_delete_pending_on_own_pending_with_committed_base() {
+        let row = MvccRow::new_empty();
+
+        // Committed base value
+        row.prepend(50, b"base".to_vec());
+
+        // Txn 100 writes pending value
+        row.prepend_pending(100, b"updated".to_vec()).unwrap();
+
+        // Txn 100 deletes (converts to LOCK)
+        let result = row.delete_pending(100);
+        assert_eq!(result, Ok(true));
+
+        // Owner sees LOCK, skips to base
+        let value = row.get_at_with_owner(100, 100);
+        assert_eq!(value, Some(&b"base".to_vec()));
+    }
+
+    #[test]
+    fn test_delete_pending_on_committed_value() {
+        let row = MvccRow::new_empty();
+
+        // Committed value
+        row.prepend(50, b"committed".to_vec());
+
+        // Txn 100 deletes committed value (writes pending TOMBSTONE)
+        let result = row.delete_pending(100);
+        assert_eq!(result, Ok(true));
+
+        // Owner sees their pending TOMBSTONE
+        let value = row.get_at_with_owner(100, 100);
+        assert_eq!(value, Some(&TOMBSTONE.to_vec()));
+
+        // Non-owner sees committed value (skips pending)
+        let value = row.get_at_with_owner(100, 200);
+        assert_eq!(value, Some(&b"committed".to_vec()));
+    }
+
+    #[test]
+    fn test_delete_pending_conflict_with_other_txn() {
+        let row = MvccRow::new_empty();
+
+        // Txn 100 writes pending
+        row.prepend_pending(100, b"v1".to_vec()).unwrap();
+
+        // Txn 200 tries to delete - should fail with lock conflict
+        let result = row.delete_pending(200);
+        assert_eq!(result, Err(100));
+    }
+
+    #[test]
+    fn test_delete_pending_on_empty_row() {
+        let row = MvccRow::new_empty();
+
+        // Delete on non-existent key - should do nothing
+        let result = row.delete_pending(100);
+        assert_eq!(result, Ok(false));
+    }
+
+    #[test]
+    fn test_delete_pending_on_already_deleted() {
+        let row = MvccRow::new_empty();
+
+        // Committed tombstone
+        row.prepend(50, TOMBSTONE.to_vec());
+
+        // Delete on already deleted - should do nothing
+        let result = row.delete_pending(100);
+        assert_eq!(result, Ok(false));
+    }
+
+    #[test]
+    fn test_delete_pending_then_reinsert() {
+        let row = MvccRow::new_empty();
+
+        // Txn 100: INSERT
+        row.prepend_pending(100, b"first".to_vec()).unwrap();
+        assert_eq!(row.get_at_with_owner(100, 100), Some(&b"first".to_vec()));
+
+        // Txn 100: DELETE (-> LOCK)
+        row.delete_pending(100).unwrap();
+        assert!(row.get_at_with_owner(100, 100).is_none());
+
+        // Txn 100: RE-INSERT (LOCK -> value)
+        row.prepend_pending(100, b"second".to_vec()).unwrap();
+        assert_eq!(row.get_at_with_owner(100, 100), Some(&b"second".to_vec()));
+    }
+
+    #[test]
+    fn test_delete_pending_after_aborted_node() {
+        let row = MvccRow::new_empty();
+
+        // Committed base
+        row.prepend(50, b"base".to_vec());
+
+        // Txn 100 writes and aborts
+        row.prepend_pending(100, b"aborted".to_vec()).unwrap();
+        row.abort_pending(100);
+
+        // Txn 200 deletes - should write TOMBSTONE (committed value exists)
+        let result = row.delete_pending(200);
+        assert_eq!(result, Ok(true));
+
+        // Txn 200 sees their TOMBSTONE
+        let value = row.get_at_with_owner(200, 200);
+        assert_eq!(value, Some(&TOMBSTONE.to_vec()));
+    }
+
+    // ==================== finalize_pending with LOCK Tests ====================
+
+    #[test]
+    fn test_finalize_pending_aborts_lock_nodes() {
+        let row = MvccRow::new_empty();
+
+        // Committed base
+        row.prepend(50, b"base".to_vec());
+
+        // Txn 100: INSERT then DELETE (creates LOCK)
+        row.prepend_pending(100, b"value".to_vec()).unwrap();
+        row.delete_pending(100).unwrap();
+
+        // Before commit: owner sees LOCK, skips to base
+        assert_eq!(row.get_at_with_owner(100, 100), Some(&b"base".to_vec()));
+
+        // Commit: LOCK should be aborted, not finalized
+        row.finalize_pending(100, 150);
+
+        // After commit: everyone sees base (LOCK was aborted)
+        assert_eq!(row.get_at_with_owner(200, 200), Some(&b"base".to_vec()));
+
+        // No longer locked
+        assert!(row.get_head_pending_owner().is_none());
+    }
+
+    #[test]
+    fn test_finalize_pending_finalizes_value_nodes() {
+        let row = MvccRow::new_empty();
+
+        // Txn 100: INSERT
+        row.prepend_pending(100, b"value".to_vec()).unwrap();
+
+        // Before commit: non-owner doesn't see it
+        assert!(row.get_at_with_owner(100, 200).is_none());
+
+        // Commit
+        row.finalize_pending(100, 150);
+
+        // After commit: everyone sees the value at commit_ts
+        assert_eq!(row.get_at_with_owner(200, 200), Some(&b"value".to_vec()));
+
+        // Not visible to readers before commit_ts
+        assert!(row.get_at_with_owner(100, 200).is_none());
+    }
+
+    #[test]
+    fn test_finalize_pending_finalizes_tombstone_nodes() {
+        let row = MvccRow::new_empty();
+
+        // Committed value
+        row.prepend(50, b"old".to_vec());
+
+        // Txn 100: DELETE (writes pending TOMBSTONE)
+        row.delete_pending(100).unwrap();
+
+        // Before commit: non-owner sees old value
+        assert_eq!(row.get_at_with_owner(100, 200), Some(&b"old".to_vec()));
+
+        // Commit
+        row.finalize_pending(100, 150);
+
+        // After commit: everyone sees tombstone (deleted)
+        assert!(row.get_at_with_owner(200, 200).is_none());
+    }
+
+    #[test]
+    fn test_finalize_pending_mixed_nodes() {
+        let row = MvccRow::new_empty();
+
+        // Txn 100: Multiple operations
+        // First key-value pair is committed base
+        row.prepend(50, b"base".to_vec());
+
+        // Txn 100 writes, deletes (LOCK), then writes again
+        row.prepend_pending(100, b"v1".to_vec()).unwrap();
+        row.delete_pending(100).unwrap(); // LOCK
+        row.prepend_pending(100, b"v2".to_vec()).unwrap(); // Updates LOCK -> value
+
+        // Commit: LOCK (if still present) would be aborted, value is finalized
+        row.finalize_pending(100, 150);
+
+        // After commit: value is visible
+        assert_eq!(row.get_at_with_owner(200, 200), Some(&b"v2".to_vec()));
+    }
+
+    // ==================== Iterator with Owner Tests ====================
+
+    #[test]
+    fn test_iterator_with_owner_sees_pending_value() {
+        use crate::storage::mvcc::MvccKey;
+
+        let engine = VersionedMemTableEngine::new();
+
+        // Add committed value
+        engine.put_internal(b"key1", b"committed".to_vec(), 100);
+
+        // Add pending value from txn 200
+        engine
+            .put_pending(b"key1", b"pending".to_vec(), 200)
+            .unwrap();
+
+        // Non-owner iterator should see committed value
+        let range = Range {
+            start: MvccKey::unbounded(),
+            end: MvccKey::unbounded(),
+        };
+        let range_arc = Arc::new(range);
+
+        let mut iter =
+            VersionedMemTableIterator::new(engine.inner.as_ref(), Arc::clone(&range_arc), 0);
+        iter.advance().unwrap();
+        assert!(iter.valid());
+        assert_eq!(iter.user_key(), b"key1");
+        assert_eq!(iter.value(), b"committed");
+
+        // Owner iterator should see pending value
+        let range2 = Range {
+            start: MvccKey::unbounded(),
+            end: MvccKey::unbounded(),
+        };
+        let mut owner_iter =
+            VersionedMemTableIterator::new(engine.inner.as_ref(), Arc::new(range2), 200);
+        owner_iter.advance().unwrap();
+        assert!(owner_iter.valid());
+        assert_eq!(owner_iter.user_key(), b"key1");
+        assert_eq!(owner_iter.value(), b"pending");
+    }
+
+    #[test]
+    fn test_iterator_with_owner_skips_lock_node() {
+        use crate::storage::mvcc::MvccKey;
+
+        let engine = VersionedMemTableEngine::new();
+
+        // Add committed value
+        engine.put_internal(b"key1", b"committed".to_vec(), 100);
+
+        // Txn 200 writes then deletes (creates LOCK)
+        engine
+            .put_pending(b"key1", b"pending".to_vec(), 200)
+            .unwrap();
+        engine.delete_pending(b"key1", 200).unwrap();
+
+        // Owner iterator should skip LOCK and see committed value
+        let range = Range {
+            start: MvccKey::unbounded(),
+            end: MvccKey::unbounded(),
+        };
+        let mut owner_iter =
+            VersionedMemTableIterator::new(engine.inner.as_ref(), Arc::new(range), 200);
+        owner_iter.advance().unwrap();
+        assert!(owner_iter.valid());
+        assert_eq!(owner_iter.user_key(), b"key1");
+        assert_eq!(owner_iter.value(), b"committed");
+    }
+
+    #[test]
+    fn test_iterator_with_owner_multiple_keys() {
+        use crate::storage::mvcc::MvccKey;
+
+        let engine = VersionedMemTableEngine::new();
+
+        // key1: committed only
+        engine.put_internal(b"key1", b"k1_committed".to_vec(), 100);
+
+        // key2: committed + pending from owner
+        engine.put_internal(b"key2", b"k2_committed".to_vec(), 100);
+        engine
+            .put_pending(b"key2", b"k2_pending".to_vec(), 200)
+            .unwrap();
+
+        // key3: pending only from owner
+        engine
+            .put_pending(b"key3", b"k3_pending".to_vec(), 200)
+            .unwrap();
+
+        // Owner iterator (txn 200) should see:
+        // key1 -> committed (no pending)
+        // key2 -> pending (owned)
+        // key3 -> pending (owned)
+        let range = Range {
+            start: MvccKey::unbounded(),
+            end: MvccKey::unbounded(),
+        };
+        let mut owner_iter =
+            VersionedMemTableIterator::new(engine.inner.as_ref(), Arc::new(range), 200);
+
+        // key1: committed@100
+        owner_iter.advance().unwrap();
+        assert!(owner_iter.valid());
+        assert_eq!(owner_iter.user_key(), b"key1");
+        assert_eq!(owner_iter.value(), b"k1_committed");
+
+        // key2: pending@200 (owned - visible)
+        owner_iter.advance().unwrap();
+        assert!(owner_iter.valid());
+        assert_eq!(owner_iter.user_key(), b"key2");
+        assert_eq!(owner_iter.value(), b"k2_pending");
+
+        // key2: committed@100 (also visible - MVCC iterator returns all versions)
+        owner_iter.advance().unwrap();
+        assert!(owner_iter.valid());
+        assert_eq!(owner_iter.user_key(), b"key2");
+        assert_eq!(owner_iter.value(), b"k2_committed");
+
+        // key3: pending@200 (owned - visible)
+        owner_iter.advance().unwrap();
+        assert!(owner_iter.valid());
+        assert_eq!(owner_iter.user_key(), b"key3");
+        assert_eq!(owner_iter.value(), b"k3_pending");
+
+        // No more
+        owner_iter.advance().unwrap();
+        assert!(!owner_iter.valid());
+    }
+
+    #[test]
+    fn test_iterator_with_owner_does_not_see_other_txn_pending() {
+        use crate::storage::mvcc::MvccKey;
+
+        let engine = VersionedMemTableEngine::new();
+
+        // Committed base
+        engine.put_internal(b"key1", b"committed".to_vec(), 100);
+
+        // Txn 200 has pending write
+        engine
+            .put_pending(b"key1", b"txn200_pending".to_vec(), 200)
+            .unwrap();
+
+        // Txn 300 should NOT see txn 200's pending
+        let range = Range {
+            start: MvccKey::unbounded(),
+            end: MvccKey::unbounded(),
+        };
+        let mut iter_300 =
+            VersionedMemTableIterator::new(engine.inner.as_ref(), Arc::new(range), 300);
+        iter_300.advance().unwrap();
+        assert!(iter_300.valid());
+        assert_eq!(iter_300.user_key(), b"key1");
+        assert_eq!(iter_300.value(), b"committed"); // Sees committed, not 200's pending
+    }
+
+    #[test]
+    fn test_arc_iterator_with_owner() {
+        use crate::storage::mvcc::MvccKey;
+
+        let engine = VersionedMemTableEngine::new();
+
+        // Committed value
+        engine.put_internal(b"key1", b"committed".to_vec(), 100);
+
+        // Pending from txn 200
+        engine
+            .put_pending(b"key1", b"pending".to_vec(), 200)
+            .unwrap();
+
+        // Test ArcVersionedMemTableIterator with owner
+        let range = Range {
+            start: MvccKey::unbounded(),
+            end: MvccKey::unbounded(),
+        };
+        let mut arc_iter =
+            ArcVersionedMemTableIterator::new(engine.inner_arc(), Arc::new(range), 200);
+
+        arc_iter.advance().unwrap();
+        assert!(arc_iter.valid());
+        assert_eq!(arc_iter.user_key(), b"key1");
+        assert_eq!(arc_iter.value(), b"pending");
+    }
+
+    #[test]
+    fn test_scan_iter_with_owner_via_storage_engine() {
+        use crate::storage::mvcc::MvccKey;
+        use crate::storage::{MvccIterator, PessimisticStorage, StorageEngine};
+
+        let engine = VersionedMemTableEngine::new();
+
+        // Committed value
+        engine.put_internal(b"key1", b"committed".to_vec(), 100);
+
+        // Pending from txn 200
+        PessimisticStorage::put_pending(&engine, b"key1", b"pending".to_vec(), 200).unwrap();
+
+        // Use unified scan_iter with owner_ts for read-your-writes
+        let range = Range {
+            start: MvccKey::unbounded(),
+            end: MvccKey::unbounded(),
+        };
+        let mut iter = engine.scan_iter(range, 200).unwrap();
+
+        iter.advance().unwrap();
+        assert!(iter.valid());
+        assert_eq!(iter.user_key(), b"key1");
+        assert_eq!(iter.value(), b"pending");
+    }
+
+    #[test]
+    fn test_iterator_with_owner_pending_only_key() {
+        use crate::storage::mvcc::MvccKey;
+
+        let engine = VersionedMemTableEngine::new();
+
+        // Only pending, no committed
+        engine
+            .put_pending(b"key1", b"pending".to_vec(), 200)
+            .unwrap();
+
+        // Non-owner should not see it
+        let range = Range {
+            start: MvccKey::unbounded(),
+            end: MvccKey::unbounded(),
+        };
+        let mut non_owner_iter =
+            VersionedMemTableIterator::new(engine.inner.as_ref(), Arc::new(range), 0);
+        non_owner_iter.advance().unwrap();
+        assert!(!non_owner_iter.valid()); // No visible entries
+
+        // Owner should see it
+        let range2 = Range {
+            start: MvccKey::unbounded(),
+            end: MvccKey::unbounded(),
+        };
+        let mut owner_iter =
+            VersionedMemTableIterator::new(engine.inner.as_ref(), Arc::new(range2), 200);
+        owner_iter.advance().unwrap();
+        assert!(owner_iter.valid());
+        assert_eq!(owner_iter.user_key(), b"key1");
+        assert_eq!(owner_iter.value(), b"pending");
+    }
+
+    #[test]
+    fn test_iterator_with_owner_lock_only_key() {
+        use crate::storage::mvcc::MvccKey;
+
+        let engine = VersionedMemTableEngine::new();
+
+        // Write then delete (creates LOCK)
+        engine
+            .put_pending(b"key1", b"to_delete".to_vec(), 200)
+            .unwrap();
+        engine.delete_pending(b"key1", 200).unwrap();
+
+        // Owner should skip LOCK (no committed value to fall back to)
+        let range = Range {
+            start: MvccKey::unbounded(),
+            end: MvccKey::unbounded(),
+        };
+        let mut owner_iter =
+            VersionedMemTableIterator::new(engine.inner.as_ref(), Arc::new(range), 200);
+        owner_iter.advance().unwrap();
+        assert!(!owner_iter.valid()); // LOCK is skipped, no other version
     }
 }

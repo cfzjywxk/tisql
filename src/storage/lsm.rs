@@ -316,7 +316,8 @@ impl LsmEngine {
         // Use truly unbounded range - MvccKey::unbounded() creates empty placeholder
         // that signals "scan all entries" to the memtable.
         let range = Arc::new(MvccKey::unbounded()..MvccKey::unbounded());
-        let mut iter = memtable.inner().create_streaming_iter(range);
+        // Flush only committed data (owner_ts = 0 means no pending nodes visible)
+        let mut iter = memtable.inner().create_streaming_iter(range, 0);
         iter.advance()?; // Initialize iterator to first entry
 
         while iter.valid() {
@@ -561,7 +562,13 @@ impl ArcMemTableIterator {
     /// Create a new streaming iterator over the given memtable and range.
     ///
     /// Takes `SharedMvccRange` (Arc) to avoid cloning when creating multiple iterators.
-    fn new(memtable: Arc<MemTable>, range: SharedMvccRange) -> Self {
+    ///
+    /// # Arguments
+    ///
+    /// * `memtable` - The memtable to iterate over
+    /// * `range` - MVCC key range (Arc for zero-copy sharing)
+    /// * `owner_ts` - Transaction's start_ts for read-your-writes (0 for autocommit)
+    fn new(memtable: Arc<MemTable>, range: SharedMvccRange, owner_ts: Timestamp) -> Self {
         // Safety: We're extending the lifetime of the reference from the Arc's lifetime
         // to 'static. This is safe because:
         // 1. The Arc keeps the MemTable alive for as long as this struct exists
@@ -569,7 +576,7 @@ impl ArcMemTableIterator {
         // 3. VersionedMemTableIterator doesn't access the memtable in its Drop impl
         let engine_ref: &'static super::memtable::VersionedMemTableEngine =
             unsafe { std::mem::transmute(memtable.inner()) };
-        let iter = engine_ref.create_streaming_iter(range);
+        let iter = engine_ref.create_streaming_iter(range, owner_ts);
         Self {
             iter,
             _memtable: memtable,
@@ -1539,7 +1546,7 @@ impl TieredMergeIterator {
 impl StorageEngine for LsmEngine {
     type Iter = TieredMergeIterator;
 
-    fn scan_iter(&self, range: Range<MvccKey>) -> Result<TieredMergeIterator> {
+    fn scan_iter(&self, range: Range<MvccKey>, owner_ts: Timestamp) -> Result<TieredMergeIterator> {
         // Wrap range in Arc for zero-copy sharing across all iterators
         let range = Arc::new(range);
 
@@ -1558,19 +1565,19 @@ impl StorageEngine for LsmEngine {
         let mut merge_iter = TieredMergeIterator::new();
 
         // 1. Add active memtable iterator (highest priority)
-        // Memtable iterators are created immediately (in-memory, no I/O)
-        let active_iter = ArcMemTableIterator::new(active, Arc::clone(&range));
+        // owner_ts enables read-your-writes for explicit transactions (0 for autocommit)
+        let active_iter = ArcMemTableIterator::new(active, Arc::clone(&range), owner_ts);
         merge_iter.add_active_memtable(active_iter);
 
         // 2. Add frozen memtable iterators (newest to oldest)
-        // Memtable iterators are created immediately (in-memory, no I/O)
         for (idx, memtable) in frozen.iter().enumerate() {
-            let mem_iter = ArcMemTableIterator::new(Arc::clone(memtable), Arc::clone(&range));
+            let mem_iter =
+                ArcMemTableIterator::new(Arc::clone(memtable), Arc::clone(&range), owner_ts);
             merge_iter.add_frozen_memtable(mem_iter, idx);
         }
 
         // 3. Add L0 SST sources (LAZY - no I/O until first seek!)
-        // L0 files are added in newest-to-oldest order (by ID descending)
+        // SSTs only contain committed data, so no owner_ts needed
         let mut l0_ssts: Vec<Arc<SstMeta>> = version
             .ssts_at_level(0)
             .iter()
@@ -1674,6 +1681,66 @@ impl PessimisticStorage for LsmEngine {
             frozen.abort_pending(keys, owner_start_ts);
         }
     }
+
+    fn delete_pending(
+        &self,
+        key: &[u8],
+        owner_start_ts: Timestamp,
+    ) -> std::result::Result<bool, Timestamp> {
+        // Check for lock conflicts across all memtables first
+        let state = self.state.read().unwrap();
+
+        // Check frozen memtables for conflicts (newest to oldest)
+        for frozen in &state.frozen {
+            if let Some(owner) = frozen.get_lock_owner(key) {
+                if owner != owner_start_ts {
+                    return Err(owner);
+                }
+            }
+        }
+
+        // Forward delete to active memtable
+        // The active memtable will handle:
+        // - Our pending write -> convert to LOCK
+        // - Committed value -> write pending TOMBSTONE
+        // - No value -> return Ok(false)
+        state.active.delete_pending(key, owner_start_ts)
+    }
+
+    fn get_with_owner(
+        &self,
+        key: &[u8],
+        read_ts: Timestamp,
+        owner_start_ts: Timestamp,
+    ) -> Option<RawValue> {
+        let state = self.state.read().unwrap();
+
+        // Check active memtable first
+        if let Some(value) = state.active.get_with_owner(key, read_ts, owner_start_ts) {
+            // Check if it's a tombstone
+            if is_tombstone(&value) {
+                return None;
+            }
+            return Some(value);
+        }
+
+        // Check frozen memtables (newest to oldest)
+        for frozen in &state.frozen {
+            if let Some(value) = frozen.get_with_owner(key, read_ts, owner_start_ts) {
+                if is_tombstone(&value) {
+                    return None;
+                }
+                return Some(value);
+            }
+        }
+
+        // Check SST files via scan (point lookup)
+        // For SST files, pending nodes don't exist, so we just do normal MVCC read
+        drop(state); // Release lock before I/O
+
+        // get_from_sst uses current_version() internally
+        self.get_from_sst(key, read_ts).ok().flatten()
+    }
 }
 
 /// Statistics about the LSM engine.
@@ -1759,7 +1826,7 @@ mod tests {
     /// Scan MVCC keys in range using streaming iterator (test-only helper).
     fn scan_mvcc(engine: &LsmEngine, range: Range<MvccKey>) -> Vec<(MvccKey, RawValue)> {
         let mut results = Vec::new();
-        let mut iter = engine.scan_iter(range).unwrap();
+        let mut iter = engine.scan_iter(range, 0).unwrap();
         iter.advance().unwrap(); // Position on first entry
         while iter.valid() {
             let key = MvccKey::encode(iter.user_key(), iter.timestamp());
@@ -3915,7 +3982,7 @@ mod tests {
 
         // Use scan_iter (streaming) to read
         let range = MvccKey::encode(b"key1", Timestamp::MAX)..MvccKey::encode(b"key3", 0);
-        let mut iter = engine.scan_iter(range).unwrap();
+        let mut iter = engine.scan_iter(range, 0).unwrap();
 
         // Position on first entry
         iter.advance().unwrap();
@@ -3964,7 +4031,7 @@ mod tests {
 
         // Scan for the new key first (should hit memtable only)
         let range = MvccKey::encode(b"new_key", Timestamp::MAX)..MvccKey::encode(b"new_key\xff", 0);
-        let mut iter = engine.scan_iter(range).unwrap();
+        let mut iter = engine.scan_iter(range, 0).unwrap();
 
         iter.advance().unwrap();
         assert!(iter.valid());
@@ -3975,7 +4042,7 @@ mod tests {
 
         // Scan for old keys (will need SST)
         let range = MvccKey::encode(b"old_key", Timestamp::MAX)..MvccKey::encode(b"old_key\xff", 0);
-        let mut iter = engine.scan_iter(range).unwrap();
+        let mut iter = engine.scan_iter(range, 0).unwrap();
 
         // Should find all old keys from SST
         iter.advance().unwrap();
@@ -4025,7 +4092,7 @@ mod tests {
 
         // Scan a..d - must output a, b, c in order
         let range = MvccKey::encode(b"a", Timestamp::MAX)..MvccKey::encode(b"d", 0);
-        let mut iter = engine.scan_iter(range).unwrap();
+        let mut iter = engine.scan_iter(range, 0).unwrap();
 
         iter.advance().unwrap();
         assert!(iter.valid(), "Should have first entry");
@@ -4087,7 +4154,7 @@ mod tests {
 
         // Scan all - must be in sorted order: 10, 15, 20, 30, 35, 40, 50
         let range = MvccKey::encode(b"key_", Timestamp::MAX)..MvccKey::encode(b"key_\xff", 0);
-        let mut iter = engine.scan_iter(range).unwrap();
+        let mut iter = engine.scan_iter(range, 0).unwrap();
 
         let expected_order = [
             b"key_10".as_slice(),
@@ -4145,7 +4212,7 @@ mod tests {
         // - start: MvccKey::encode(b"b", Timestamp::MAX) = smallest MVCC key for "b"
         // - end: MvccKey::encode(b"d", Timestamp::MAX) = smallest MVCC key for "d"
         let range = MvccKey::encode(b"b", Timestamp::MAX)..MvccKey::encode(b"d", Timestamp::MAX);
-        let mut iter = engine.scan_iter(range).unwrap();
+        let mut iter = engine.scan_iter(range, 0).unwrap();
 
         iter.advance().unwrap();
         assert!(iter.valid());
@@ -4197,7 +4264,7 @@ mod tests {
         // Scan with range starting at ts=25 - should skip version at ts=30
         // Range: (k, ts=25) .. (k+1, ts=0)
         let range = MvccKey::encode(b"k", 25)..MvccKey::encode(b"l", 0);
-        let mut iter = engine.scan_iter(range).unwrap();
+        let mut iter = engine.scan_iter(range, 0).unwrap();
 
         iter.advance().unwrap();
         assert!(iter.valid());
@@ -4282,7 +4349,7 @@ mod tests {
 
         // Scan should return both versions in order (ts=20 first, then ts=10)
         let range = MvccKey::encode(b"key", Timestamp::MAX)..MvccKey::encode(b"key\xff", 0);
-        let mut iter = engine.scan_iter(range).unwrap();
+        let mut iter = engine.scan_iter(range, 0).unwrap();
 
         iter.advance().unwrap();
         assert!(iter.valid());
@@ -4338,7 +4405,7 @@ mod tests {
 
         // Scan all - should be perfectly sorted
         let range = MvccKey::encode(b"key_", Timestamp::MAX)..MvccKey::encode(b"key_\xff", 0);
-        let mut iter = engine.scan_iter(range).unwrap();
+        let mut iter = engine.scan_iter(range, 0).unwrap();
 
         iter.advance().unwrap();
         let mut prev_key: Option<Vec<u8>> = None;
@@ -4589,7 +4656,7 @@ mod tests {
 
         // Create iterator - NO file IO should happen here (lazy)
         let range = MvccKey::encode(b"", Timestamp::MAX)..MvccKey::encode(b"\xff", 0);
-        let mut iter = engine.scan_iter(range).unwrap();
+        let mut iter = engine.scan_iter(range, 0).unwrap();
 
         // At this point, SST files should NOT be opened yet
         // (We can't directly verify this without instrumenting the code,
@@ -5109,7 +5176,7 @@ mod tests {
 
         // Creating an iterator should NOT open files yet (lazy)
         let range = MvccKey::unbounded()..MvccKey::unbounded();
-        let iter = engine.scan_iter(range).unwrap();
+        let iter = engine.scan_iter(range, 0).unwrap();
 
         // Iterator should not be valid before positioning
         assert!(!iter.valid());
@@ -5502,7 +5569,7 @@ mod tests {
         let reader = thread::spawn(move || {
             for _ in 0..50 {
                 let range = MvccKey::unbounded()..MvccKey::unbounded();
-                let mut iter = engine_reader.scan_iter(range).unwrap();
+                let mut iter = engine_reader.scan_iter(range, 0).unwrap();
                 iter.advance().unwrap();
                 let mut count = 0;
                 while iter.valid() {

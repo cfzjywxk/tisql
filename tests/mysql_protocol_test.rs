@@ -648,3 +648,651 @@ async fn test_select_in_transaction() {
 
     exec(&mut conn, "COMMIT").await;
 }
+
+// ============================================================================
+// Read-Your-Writes Tests (Explicit Transaction)
+// ============================================================================
+
+/// Test that explicit transaction can read its own uncommitted INSERT.
+#[tokio::test]
+async fn test_read_your_writes_insert() {
+    let ctx = TestContext::new().await;
+    let mut conn = ctx.conn().await;
+
+    exec(
+        &mut conn,
+        "CREATE TABLE ryw_insert (id INT PRIMARY KEY, val VARCHAR(100))",
+    )
+    .await;
+
+    // Begin explicit transaction
+    exec(&mut conn, "BEGIN").await;
+
+    // Insert within transaction
+    exec(
+        &mut conn,
+        "INSERT INTO ryw_insert VALUES (1, 'uncommitted')",
+    )
+    .await;
+
+    // Same connection should see its own uncommitted write
+    let val = query_one(&mut conn, "SELECT val FROM ryw_insert WHERE id = 1").await;
+    assert_eq!(val, "uncommitted", "Transaction should see its own INSERT");
+
+    exec(&mut conn, "COMMIT").await;
+
+    // After commit, still visible
+    let val = query_one(&mut conn, "SELECT val FROM ryw_insert WHERE id = 1").await;
+    assert_eq!(val, "uncommitted", "Committed data should be visible");
+}
+
+/// Test that explicit transaction can read its own uncommitted UPDATE.
+#[tokio::test]
+async fn test_read_your_writes_update() {
+    let ctx = TestContext::new().await;
+    let mut conn = ctx.conn().await;
+
+    exec(
+        &mut conn,
+        "CREATE TABLE ryw_update (id INT PRIMARY KEY, val VARCHAR(100))",
+    )
+    .await;
+    exec(&mut conn, "INSERT INTO ryw_update VALUES (1, 'original')").await;
+
+    // Begin explicit transaction
+    exec(&mut conn, "BEGIN").await;
+
+    // Update within transaction
+    exec(
+        &mut conn,
+        "UPDATE ryw_update SET val = 'modified' WHERE id = 1",
+    )
+    .await;
+
+    // Same connection should see its own uncommitted update
+    let val = query_one(&mut conn, "SELECT val FROM ryw_update WHERE id = 1").await;
+    assert_eq!(val, "modified", "Transaction should see its own UPDATE");
+
+    exec(&mut conn, "COMMIT").await;
+}
+
+/// Test that explicit transaction sees DELETE hides the row.
+#[tokio::test]
+async fn test_read_your_writes_delete() {
+    let ctx = TestContext::new().await;
+    let mut conn = ctx.conn().await;
+
+    exec(
+        &mut conn,
+        "CREATE TABLE ryw_delete (id INT PRIMARY KEY, val VARCHAR(100))",
+    )
+    .await;
+    exec(&mut conn, "INSERT INTO ryw_delete VALUES (1, 'to_delete')").await;
+    exec(&mut conn, "INSERT INTO ryw_delete VALUES (2, 'keep')").await;
+
+    // Begin explicit transaction
+    exec(&mut conn, "BEGIN").await;
+
+    // Delete within transaction
+    exec(&mut conn, "DELETE FROM ryw_delete WHERE id = 1").await;
+
+    // Same connection should NOT see deleted row
+    let rows = query_all(&mut conn, "SELECT id, val FROM ryw_delete ORDER BY id").await;
+    assert_eq!(
+        rows.len(),
+        1,
+        "Deleted row should not be visible to same txn"
+    );
+    assert_eq!(rows[0][0], "2", "Only non-deleted row should be visible");
+
+    exec(&mut conn, "COMMIT").await;
+
+    // After commit, still gone
+    let rows = query_all(&mut conn, "SELECT id FROM ryw_delete").await;
+    assert_eq!(rows.len(), 1, "Deleted row should stay gone after commit");
+}
+
+/// Test multiple operations on same key within explicit transaction.
+#[tokio::test]
+async fn test_read_your_writes_multiple_updates() {
+    let ctx = TestContext::new().await;
+    let mut conn = ctx.conn().await;
+
+    exec(
+        &mut conn,
+        "CREATE TABLE ryw_multi (id INT PRIMARY KEY, counter INT)",
+    )
+    .await;
+    exec(&mut conn, "INSERT INTO ryw_multi VALUES (1, 0)").await;
+
+    // Begin explicit transaction
+    exec(&mut conn, "BEGIN").await;
+
+    // Multiple updates - each should see the previous update
+    exec(
+        &mut conn,
+        "UPDATE ryw_multi SET counter = counter + 1 WHERE id = 1",
+    )
+    .await;
+    let val = query_one(&mut conn, "SELECT counter FROM ryw_multi WHERE id = 1").await;
+    assert_eq!(val, "1", "First update should set counter to 1");
+
+    exec(
+        &mut conn,
+        "UPDATE ryw_multi SET counter = counter + 1 WHERE id = 1",
+    )
+    .await;
+    let val = query_one(&mut conn, "SELECT counter FROM ryw_multi WHERE id = 1").await;
+    assert_eq!(val, "2", "Second update should set counter to 2");
+
+    exec(
+        &mut conn,
+        "UPDATE ryw_multi SET counter = counter + 1 WHERE id = 1",
+    )
+    .await;
+    let val = query_one(&mut conn, "SELECT counter FROM ryw_multi WHERE id = 1").await;
+    assert_eq!(val, "3", "Third update should set counter to 3");
+
+    exec(&mut conn, "COMMIT").await;
+
+    // Final value should be 3
+    let val = query_one(&mut conn, "SELECT counter FROM ryw_multi WHERE id = 1").await;
+    assert_eq!(val, "3", "Final committed value should be 3");
+}
+
+/// Test INSERT then UPDATE on same key within explicit transaction.
+#[tokio::test]
+async fn test_read_your_writes_insert_then_update() {
+    let ctx = TestContext::new().await;
+    let mut conn = ctx.conn().await;
+
+    exec(
+        &mut conn,
+        "CREATE TABLE ryw_ins_upd (id INT PRIMARY KEY, val VARCHAR(100))",
+    )
+    .await;
+
+    // Begin explicit transaction
+    exec(&mut conn, "BEGIN").await;
+
+    // Insert new row
+    exec(&mut conn, "INSERT INTO ryw_ins_upd VALUES (1, 'initial')").await;
+
+    // Verify we see the insert
+    let val = query_one(&mut conn, "SELECT val FROM ryw_ins_upd WHERE id = 1").await;
+    assert_eq!(val, "initial", "Should see INSERT");
+
+    // Update the just-inserted row
+    exec(
+        &mut conn,
+        "UPDATE ryw_ins_upd SET val = 'updated' WHERE id = 1",
+    )
+    .await;
+
+    // Verify we see the update
+    let val = query_one(&mut conn, "SELECT val FROM ryw_ins_upd WHERE id = 1").await;
+    assert_eq!(val, "updated", "Should see UPDATE after INSERT");
+
+    exec(&mut conn, "COMMIT").await;
+
+    // Final value
+    let val = query_one(&mut conn, "SELECT val FROM ryw_ins_upd WHERE id = 1").await;
+    assert_eq!(val, "updated", "Committed value should be 'updated'");
+}
+
+/// Test INSERT then DELETE on same key within explicit transaction.
+#[tokio::test]
+async fn test_read_your_writes_insert_then_delete() {
+    let ctx = TestContext::new().await;
+    let mut conn = ctx.conn().await;
+
+    exec(
+        &mut conn,
+        "CREATE TABLE ryw_ins_del (id INT PRIMARY KEY, val VARCHAR(100))",
+    )
+    .await;
+
+    // Begin explicit transaction
+    exec(&mut conn, "BEGIN").await;
+
+    // Insert new row
+    exec(&mut conn, "INSERT INTO ryw_ins_del VALUES (1, 'temp')").await;
+
+    // Verify we see the insert
+    let rows = query_all(&mut conn, "SELECT id FROM ryw_ins_del").await;
+    assert_eq!(rows.len(), 1, "Should see INSERT");
+
+    // Delete the just-inserted row
+    exec(&mut conn, "DELETE FROM ryw_ins_del WHERE id = 1").await;
+
+    // Verify it's gone
+    let rows = query_all(&mut conn, "SELECT id FROM ryw_ins_del").await;
+    assert_eq!(rows.len(), 0, "Should not see deleted row");
+
+    exec(&mut conn, "COMMIT").await;
+
+    // Still gone after commit
+    let rows = query_all(&mut conn, "SELECT id FROM ryw_ins_del").await;
+    assert_eq!(rows.len(), 0, "Row should stay deleted after commit");
+}
+
+/// Test scan sees mix of committed and uncommitted data correctly.
+#[tokio::test]
+async fn test_read_your_writes_scan_mixed() {
+    let ctx = TestContext::new().await;
+    let mut conn = ctx.conn().await;
+
+    exec(
+        &mut conn,
+        "CREATE TABLE ryw_scan (id INT PRIMARY KEY, val VARCHAR(100))",
+    )
+    .await;
+
+    // Insert some committed data
+    exec(&mut conn, "INSERT INTO ryw_scan VALUES (1, 'committed1')").await;
+    exec(&mut conn, "INSERT INTO ryw_scan VALUES (3, 'committed3')").await;
+    exec(&mut conn, "INSERT INTO ryw_scan VALUES (5, 'committed5')").await;
+
+    // Begin explicit transaction
+    exec(&mut conn, "BEGIN").await;
+
+    // Add uncommitted rows interleaved with committed ones
+    exec(&mut conn, "INSERT INTO ryw_scan VALUES (2, 'uncommitted2')").await;
+    exec(&mut conn, "INSERT INTO ryw_scan VALUES (4, 'uncommitted4')").await;
+
+    // Modify a committed row
+    exec(
+        &mut conn,
+        "UPDATE ryw_scan SET val = 'modified1' WHERE id = 1",
+    )
+    .await;
+
+    // Delete a committed row
+    exec(&mut conn, "DELETE FROM ryw_scan WHERE id = 5").await;
+
+    // Scan should see: modified1, uncommitted2, committed3, uncommitted4
+    let rows = query_all(&mut conn, "SELECT id, val FROM ryw_scan ORDER BY id").await;
+    assert_eq!(rows.len(), 4, "Should see 4 rows (1 deleted, 4 visible)");
+    assert_eq!(rows[0], vec!["1", "modified1"], "Row 1 should be modified");
+    assert_eq!(rows[1], vec!["2", "uncommitted2"], "Row 2 uncommitted");
+    assert_eq!(rows[2], vec!["3", "committed3"], "Row 3 committed");
+    assert_eq!(rows[3], vec!["4", "uncommitted4"], "Row 4 uncommitted");
+
+    exec(&mut conn, "COMMIT").await;
+}
+
+// ============================================================================
+// Write-Write Conflict Tests
+// ============================================================================
+
+/// Test that concurrent writes to the same key result in lock conflict.
+#[tokio::test]
+async fn test_write_write_conflict_insert() {
+    let ctx = TestContext::new().await;
+    let mut conn1 = ctx.conn().await;
+    let mut conn2 = ctx.conn().await;
+
+    exec(
+        &mut conn1,
+        "CREATE TABLE ww_conflict (id INT PRIMARY KEY, val VARCHAR(100))",
+    )
+    .await;
+
+    // Connection 1: Begin transaction and insert
+    exec(&mut conn1, "BEGIN").await;
+    exec(
+        &mut conn1,
+        "INSERT INTO ww_conflict VALUES (1, 'from_conn1')",
+    )
+    .await;
+
+    // Connection 2: Try to insert same key - should get conflict error
+    exec(&mut conn2, "BEGIN").await;
+    let result = conn2
+        .query_drop("INSERT INTO ww_conflict VALUES (1, 'from_conn2')")
+        .await;
+
+    // Should fail with lock conflict
+    assert!(
+        result.is_err(),
+        "Second insert to locked key should fail with conflict"
+    );
+    let err_msg = format!("{:?}", result.unwrap_err());
+    assert!(
+        err_msg.contains("locked") || err_msg.contains("conflict") || err_msg.contains("Lock"),
+        "Error should indicate lock conflict: {err_msg}"
+    );
+
+    // Connection 1: Commit
+    exec(&mut conn1, "COMMIT").await;
+
+    // Connection 2: Rollback (cleanup)
+    exec(&mut conn2, "ROLLBACK").await;
+
+    // Verify conn1's value won
+    let val = query_one(&mut conn1, "SELECT val FROM ww_conflict WHERE id = 1").await;
+    assert_eq!(val, "from_conn1");
+}
+
+/// Test that concurrent UPDATE to the same key results in lock conflict.
+#[tokio::test]
+async fn test_write_write_conflict_update() {
+    let ctx = TestContext::new().await;
+    let mut conn1 = ctx.conn().await;
+    let mut conn2 = ctx.conn().await;
+
+    exec(
+        &mut conn1,
+        "CREATE TABLE ww_update (id INT PRIMARY KEY, val VARCHAR(100))",
+    )
+    .await;
+    exec(&mut conn1, "INSERT INTO ww_update VALUES (1, 'original')").await;
+
+    // Connection 1: Begin transaction and update
+    exec(&mut conn1, "BEGIN").await;
+    exec(
+        &mut conn1,
+        "UPDATE ww_update SET val = 'updated_conn1' WHERE id = 1",
+    )
+    .await;
+
+    // Connection 2: Try to update same key - should get conflict
+    exec(&mut conn2, "BEGIN").await;
+    let result = conn2
+        .query_drop("UPDATE ww_update SET val = 'updated_conn2' WHERE id = 1")
+        .await;
+
+    assert!(
+        result.is_err(),
+        "Second update to locked key should fail with conflict"
+    );
+
+    // Connection 1: Commit
+    exec(&mut conn1, "COMMIT").await;
+    exec(&mut conn2, "ROLLBACK").await;
+
+    // Verify conn1's value won
+    let val = query_one(&mut conn1, "SELECT val FROM ww_update WHERE id = 1").await;
+    assert_eq!(val, "updated_conn1");
+}
+
+/// Test that concurrent DELETE to the same key results in lock conflict.
+#[tokio::test]
+async fn test_write_write_conflict_delete() {
+    let ctx = TestContext::new().await;
+    let mut conn1 = ctx.conn().await;
+    let mut conn2 = ctx.conn().await;
+
+    exec(
+        &mut conn1,
+        "CREATE TABLE ww_delete (id INT PRIMARY KEY, val VARCHAR(100))",
+    )
+    .await;
+    exec(&mut conn1, "INSERT INTO ww_delete VALUES (1, 'to_delete')").await;
+
+    // Connection 1: Begin transaction and delete
+    exec(&mut conn1, "BEGIN").await;
+    exec(&mut conn1, "DELETE FROM ww_delete WHERE id = 1").await;
+
+    // Connection 2: Try to delete same key - should get conflict
+    exec(&mut conn2, "BEGIN").await;
+    let result = conn2.query_drop("DELETE FROM ww_delete WHERE id = 1").await;
+
+    assert!(
+        result.is_err(),
+        "Second delete to locked key should fail with conflict"
+    );
+
+    // Connection 1: Commit
+    exec(&mut conn1, "COMMIT").await;
+    exec(&mut conn2, "ROLLBACK").await;
+
+    // Verify row is deleted
+    let rows = query_all(&mut conn1, "SELECT id FROM ww_delete").await;
+    assert_eq!(rows.len(), 0, "Row should be deleted");
+}
+
+// ============================================================================
+// Read-Write Conflict Tests (Autocommit vs Explicit)
+// ============================================================================
+
+/// Test that autocommit read sees committed data, not locked pending data.
+#[tokio::test]
+async fn test_autocommit_read_vs_explicit_write() {
+    let ctx = TestContext::new().await;
+    let mut conn1 = ctx.conn().await;
+    let mut conn2 = ctx.conn().await;
+
+    exec(
+        &mut conn1,
+        "CREATE TABLE rw_auto (id INT PRIMARY KEY, val VARCHAR(100))",
+    )
+    .await;
+    exec(&mut conn1, "INSERT INTO rw_auto VALUES (1, 'original')").await;
+
+    // Connection 1: Begin explicit transaction and update
+    exec(&mut conn1, "BEGIN").await;
+    exec(
+        &mut conn1,
+        "UPDATE rw_auto SET val = 'modified' WHERE id = 1",
+    )
+    .await;
+
+    // Connection 2: Autocommit read should see original (committed) value
+    let val = query_one(&mut conn2, "SELECT val FROM rw_auto WHERE id = 1").await;
+    assert_eq!(
+        val, "original",
+        "Autocommit read should see committed data, not pending"
+    );
+
+    // Connection 1: Commit
+    exec(&mut conn1, "COMMIT").await;
+
+    // Connection 2: Now should see the committed update
+    let val = query_one(&mut conn2, "SELECT val FROM rw_auto WHERE id = 1").await;
+    assert_eq!(val, "modified", "Should see committed update");
+}
+
+/// Test that explicit read transaction sees snapshot, not pending writes.
+#[tokio::test]
+async fn test_explicit_read_vs_explicit_write() {
+    let ctx = TestContext::new().await;
+    let mut conn1 = ctx.conn().await;
+    let mut conn2 = ctx.conn().await;
+
+    exec(
+        &mut conn1,
+        "CREATE TABLE rw_explicit (id INT PRIMARY KEY, val VARCHAR(100))",
+    )
+    .await;
+    exec(&mut conn1, "INSERT INTO rw_explicit VALUES (1, 'original')").await;
+
+    // Connection 1: Begin explicit write transaction
+    exec(&mut conn1, "BEGIN").await;
+    exec(
+        &mut conn1,
+        "UPDATE rw_explicit SET val = 'modified' WHERE id = 1",
+    )
+    .await;
+
+    // Connection 2: Begin explicit read transaction
+    exec(&mut conn2, "BEGIN").await;
+    let val = query_one(&mut conn2, "SELECT val FROM rw_explicit WHERE id = 1").await;
+    assert_eq!(
+        val, "original",
+        "Explicit read should see snapshot, not pending"
+    );
+
+    // Connection 1: Commit
+    exec(&mut conn1, "COMMIT").await;
+
+    // Connection 2: Still in transaction, should see old snapshot
+    // (Note: This depends on snapshot isolation level - current impl may vary)
+    let val = query_one(&mut conn2, "SELECT val FROM rw_explicit WHERE id = 1").await;
+    // After conn1 commits, conn2's subsequent reads may see the new value
+    // depending on isolation implementation
+    assert!(
+        val == "original" || val == "modified",
+        "Value should be either original (strict SI) or modified (read committed)"
+    );
+
+    exec(&mut conn2, "COMMIT").await;
+}
+
+/// Test autocommit write while explicit transaction holds lock fails.
+#[tokio::test]
+async fn test_autocommit_write_vs_explicit_lock() {
+    let ctx = TestContext::new().await;
+    let mut conn1 = ctx.conn().await;
+    let mut conn2 = ctx.conn().await;
+
+    exec(
+        &mut conn1,
+        "CREATE TABLE aw_lock (id INT PRIMARY KEY, val VARCHAR(100))",
+    )
+    .await;
+    exec(&mut conn1, "INSERT INTO aw_lock VALUES (1, 'original')").await;
+
+    // Connection 1: Begin explicit transaction and lock row
+    exec(&mut conn1, "BEGIN").await;
+    exec(
+        &mut conn1,
+        "UPDATE aw_lock SET val = 'locked_by_txn' WHERE id = 1",
+    )
+    .await;
+
+    // Connection 2: Autocommit write should fail due to lock
+    let result = conn2
+        .query_drop("UPDATE aw_lock SET val = 'autocommit_attempt' WHERE id = 1")
+        .await;
+
+    assert!(
+        result.is_err(),
+        "Autocommit write to locked key should fail"
+    );
+
+    // Connection 1: Commit releases lock
+    exec(&mut conn1, "COMMIT").await;
+
+    // Connection 2: Now autocommit write should succeed
+    exec(
+        &mut conn2,
+        "UPDATE aw_lock SET val = 'autocommit_success' WHERE id = 1",
+    )
+    .await;
+
+    let val = query_one(&mut conn2, "SELECT val FROM aw_lock WHERE id = 1").await;
+    assert_eq!(val, "autocommit_success");
+}
+
+// ============================================================================
+// Rollback and Lock Release Tests
+// ============================================================================
+
+/// Test that rollback releases locks, allowing other transactions to proceed.
+#[tokio::test]
+async fn test_rollback_releases_locks() {
+    let ctx = TestContext::new().await;
+    let mut conn1 = ctx.conn().await;
+    let mut conn2 = ctx.conn().await;
+
+    exec(
+        &mut conn1,
+        "CREATE TABLE rb_lock (id INT PRIMARY KEY, val VARCHAR(100))",
+    )
+    .await;
+    exec(&mut conn1, "INSERT INTO rb_lock VALUES (1, 'original')").await;
+
+    // Connection 1: Begin transaction and lock
+    exec(&mut conn1, "BEGIN").await;
+    exec(
+        &mut conn1,
+        "UPDATE rb_lock SET val = 'will_rollback' WHERE id = 1",
+    )
+    .await;
+
+    // Connection 2: Try to update - should fail
+    exec(&mut conn2, "BEGIN").await;
+    let result = conn2
+        .query_drop("UPDATE rb_lock SET val = 'conn2_attempt' WHERE id = 1")
+        .await;
+    assert!(result.is_err(), "Should fail while conn1 holds lock");
+    exec(&mut conn2, "ROLLBACK").await;
+
+    // Connection 1: Rollback releases lock
+    exec(&mut conn1, "ROLLBACK").await;
+
+    // Connection 2: Now should succeed
+    exec(&mut conn2, "BEGIN").await;
+    exec(
+        &mut conn2,
+        "UPDATE rb_lock SET val = 'conn2_success' WHERE id = 1",
+    )
+    .await;
+    exec(&mut conn2, "COMMIT").await;
+
+    let val = query_one(&mut conn1, "SELECT val FROM rb_lock WHERE id = 1").await;
+    assert_eq!(
+        val, "conn2_success",
+        "conn2 should have updated after rollback"
+    );
+}
+
+/// Test multiple keys locked in same transaction.
+#[tokio::test]
+async fn test_multiple_keys_lock_release() {
+    let ctx = TestContext::new().await;
+    let mut conn1 = ctx.conn().await;
+    let mut conn2 = ctx.conn().await;
+
+    exec(
+        &mut conn1,
+        "CREATE TABLE multi_lock (id INT PRIMARY KEY, val VARCHAR(100))",
+    )
+    .await;
+    exec(
+        &mut conn1,
+        "INSERT INTO multi_lock VALUES (1, 'a'), (2, 'b'), (3, 'c')",
+    )
+    .await;
+
+    // Connection 1: Lock multiple keys
+    exec(&mut conn1, "BEGIN").await;
+    exec(
+        &mut conn1,
+        "UPDATE multi_lock SET val = 'locked1' WHERE id = 1",
+    )
+    .await;
+    exec(
+        &mut conn1,
+        "UPDATE multi_lock SET val = 'locked2' WHERE id = 2",
+    )
+    .await;
+
+    // Connection 2: Can update unlocked key
+    exec(
+        &mut conn2,
+        "UPDATE multi_lock SET val = 'free3' WHERE id = 3",
+    )
+    .await;
+
+    // Connection 2: Cannot update locked keys
+    let result = conn2
+        .query_drop("UPDATE multi_lock SET val = 'try1' WHERE id = 1")
+        .await;
+    assert!(result.is_err(), "Key 1 should be locked");
+
+    let result = conn2
+        .query_drop("UPDATE multi_lock SET val = 'try2' WHERE id = 2")
+        .await;
+    assert!(result.is_err(), "Key 2 should be locked");
+
+    // Connection 1: Commit
+    exec(&mut conn1, "COMMIT").await;
+
+    // Verify final state
+    let rows = query_all(&mut conn1, "SELECT id, val FROM multi_lock ORDER BY id").await;
+    assert_eq!(rows[0], vec!["1", "locked1"]);
+    assert_eq!(rows[1], vec!["2", "locked2"]);
+    assert_eq!(rows[2], vec!["3", "free3"]);
+}

@@ -238,6 +238,14 @@ impl<S: PessimisticStorage + 'static, L: ClogService + 'static, T: TsoService> T
     }
 
     fn get(&self, ctx: &TxnCtx, key: &[u8]) -> Result<Option<RawValue>> {
+        // For explicit transactions, use get_with_owner for read-your-writes support.
+        // This allows the transaction to see its own pending writes.
+        if ctx.is_explicit() {
+            let value = self.storage.get_with_owner(key, ctx.start_ts, ctx.start_ts);
+            // Filter out tombstones (deleted keys)
+            return Ok(value.filter(|v| !is_tombstone(v)));
+        }
+
         // MVCC read: find the latest version with commit_ts <= start_ts
         // Note: Pending/aborted nodes are skipped by the iterator (pessimistic locking in storage)
         //
@@ -258,7 +266,9 @@ impl<S: PessimisticStorage + 'static, L: ClogService + 'static, T: TsoService> T
 
         // Use streaming iterator to avoid materializing all entries.
         // We only need the first visible version.
-        let mut iter = self.storage.scan_iter(scan_range)?;
+        // For non-explicit transactions, pass 0 as owner_ts (no read-your-writes needed here
+        // since explicit transactions use get_with_owner directly above)
+        let mut iter = self.storage.scan_iter(scan_range, 0)?;
         iter.advance()?; // Position on first entry
 
         // Find the first entry matching our key with ts <= start_ts.
@@ -283,7 +293,6 @@ impl<S: PessimisticStorage + 'static, L: ClogService + 'static, T: TsoService> T
 
     fn scan_iter(&self, ctx: &TxnCtx, range: Range<Key>) -> Result<MvccScanIterator<S::Iter>> {
         // MVCC scan: find the latest version of each key with commit_ts <= start_ts
-        // Note: Pending/aborted nodes are skipped by the iterator (pessimistic locking in storage)
         //
         // Build MVCC key range:
         // - Start: MvccKey::encode(range.start, MAX) - smallest MVCC key with this prefix
@@ -299,9 +308,13 @@ impl<S: PessimisticStorage + 'static, L: ClogService + 'static, T: TsoService> T
             // Use ts=0 to get the largest MVCC key for range.end (exclusive)
             MvccKey::encode(&range.end, 0)
         };
+        let mvcc_range = start_mvcc..end_mvcc;
 
-        // Create streaming iterator over storage
-        let storage_iter = self.storage.scan_iter(start_mvcc..end_mvcc)?;
+        // Create storage iterator with owner_ts for read-your-writes support.
+        // For explicit transactions, pass start_ts as owner_ts to see pending writes.
+        // For implicit transactions, pass 0 (no pending writes to see).
+        let owner_ts = if ctx.is_explicit() { ctx.start_ts } else { 0 };
+        let storage_iter = self.storage.scan_iter(mvcc_range, owner_ts)?;
 
         // Create streaming scan iterator that wraps storage with MVCC filtering
         Ok(MvccScanIterator::new(storage_iter, ctx.start_ts, range))
@@ -793,7 +806,7 @@ mod tests {
             .unwrap_or_else(MvccKey::unbounded);
         let range = seek_key..end_key;
 
-        let mut iter = storage.scan_iter(range).unwrap();
+        let mut iter = storage.scan_iter(range, 0).unwrap();
         iter.advance().unwrap(); // Position on first entry
 
         while iter.valid() {
@@ -1588,6 +1601,205 @@ mod tests {
         let ctx = txn_service.begin_explicit(false).unwrap();
 
         // Rollback should succeed (no-op)
+        txn_service.rollback(ctx).unwrap();
+    }
+
+    // ==================== Read-Your-Writes Tests ====================
+
+    #[test]
+    fn test_read_your_writes_get() {
+        let (_storage, txn_service, _dir) = create_test_service();
+
+        // Start explicit transaction
+        let mut ctx = txn_service.begin_explicit(false).unwrap();
+
+        // Write a value
+        txn_service
+            .put(&mut ctx, b"key1".to_vec(), b"value1".to_vec())
+            .unwrap();
+
+        // Read it back (read-your-writes)
+        let value = txn_service.get(&ctx, b"key1").unwrap();
+        assert_eq!(value, Some(b"value1".to_vec()));
+
+        // Clean up
+        txn_service.rollback(ctx).unwrap();
+    }
+
+    #[test]
+    fn test_read_your_writes_update() {
+        let (_storage, txn_service, _dir) = create_test_service();
+
+        // Start explicit transaction
+        let mut ctx = txn_service.begin_explicit(false).unwrap();
+
+        // Write initial value
+        txn_service
+            .put(&mut ctx, b"key1".to_vec(), b"v1".to_vec())
+            .unwrap();
+
+        // Update it
+        txn_service
+            .put(&mut ctx, b"key1".to_vec(), b"v2".to_vec())
+            .unwrap();
+
+        // Read should return the updated value
+        let value = txn_service.get(&ctx, b"key1").unwrap();
+        assert_eq!(value, Some(b"v2".to_vec()));
+
+        // Clean up
+        txn_service.rollback(ctx).unwrap();
+    }
+
+    #[test]
+    fn test_read_your_writes_delete() {
+        let (_storage, txn_service, _dir) = create_test_service();
+
+        // First, commit an initial value
+        let mut setup_ctx = txn_service.begin_explicit(false).unwrap();
+        txn_service
+            .put(&mut setup_ctx, b"key1".to_vec(), b"initial".to_vec())
+            .unwrap();
+        txn_service.commit(setup_ctx).unwrap();
+
+        // Start new transaction
+        let mut ctx = txn_service.begin_explicit(false).unwrap();
+
+        // Delete the key
+        txn_service.delete(&mut ctx, b"key1".to_vec()).unwrap();
+
+        // Read should return None (deleted)
+        let value = txn_service.get(&ctx, b"key1").unwrap();
+        assert_eq!(value, None);
+
+        // Clean up
+        txn_service.rollback(ctx).unwrap();
+    }
+
+    #[test]
+    fn test_read_your_writes_scan() {
+        let (_storage, txn_service, _dir) = create_test_service();
+
+        // Start explicit transaction
+        let mut ctx = txn_service.begin_explicit(false).unwrap();
+
+        // Write multiple values
+        txn_service
+            .put(&mut ctx, b"key1".to_vec(), b"value1".to_vec())
+            .unwrap();
+        txn_service
+            .put(&mut ctx, b"key2".to_vec(), b"value2".to_vec())
+            .unwrap();
+        txn_service
+            .put(&mut ctx, b"key3".to_vec(), b"value3".to_vec())
+            .unwrap();
+
+        // Scan should see all pending writes
+        let mut scan_iter = txn_service
+            .scan_iter(&ctx, b"key".to_vec()..b"key~".to_vec())
+            .unwrap();
+
+        // Collect results
+        let mut results = vec![];
+        scan_iter.advance().unwrap();
+        while scan_iter.valid() {
+            results.push((scan_iter.user_key().to_vec(), scan_iter.value().to_vec()));
+            scan_iter.advance().unwrap();
+        }
+
+        assert_eq!(results.len(), 3);
+        assert_eq!(results[0], (b"key1".to_vec(), b"value1".to_vec()));
+        assert_eq!(results[1], (b"key2".to_vec(), b"value2".to_vec()));
+        assert_eq!(results[2], (b"key3".to_vec(), b"value3".to_vec()));
+
+        // Clean up
+        txn_service.rollback(ctx).unwrap();
+    }
+
+    #[test]
+    fn test_read_your_writes_isolation() {
+        let (_storage, txn_service, _dir) = create_test_service();
+
+        // Start two explicit transactions
+        let mut ctx1 = txn_service.begin_explicit(false).unwrap();
+        let ctx2 = txn_service.begin_explicit(false).unwrap();
+
+        // Txn1 writes a value
+        txn_service
+            .put(&mut ctx1, b"key1".to_vec(), b"from_txn1".to_vec())
+            .unwrap();
+
+        // Txn1 should see its own write
+        let value1 = txn_service.get(&ctx1, b"key1").unwrap();
+        assert_eq!(value1, Some(b"from_txn1".to_vec()));
+
+        // Txn2 should NOT see txn1's pending write
+        let value2 = txn_service.get(&ctx2, b"key1").unwrap();
+        assert_eq!(value2, None);
+
+        // Clean up
+        txn_service.rollback(ctx1).unwrap();
+        txn_service.rollback(ctx2).unwrap();
+    }
+
+    #[test]
+    fn test_read_your_writes_with_committed_base() {
+        let (_storage, txn_service, _dir) = create_test_service();
+
+        // First, commit a base value
+        let mut setup_ctx = txn_service.begin_explicit(false).unwrap();
+        txn_service
+            .put(&mut setup_ctx, b"key1".to_vec(), b"committed".to_vec())
+            .unwrap();
+        txn_service.commit(setup_ctx).unwrap();
+
+        // Start new transaction
+        let mut ctx = txn_service.begin_explicit(false).unwrap();
+
+        // Update the key
+        txn_service
+            .put(&mut ctx, b"key1".to_vec(), b"pending".to_vec())
+            .unwrap();
+
+        // Read should return the pending value, not the committed one
+        let value = txn_service.get(&ctx, b"key1").unwrap();
+        assert_eq!(value, Some(b"pending".to_vec()));
+
+        // Clean up
+        txn_service.rollback(ctx).unwrap();
+    }
+
+    #[test]
+    fn test_read_your_writes_delete_then_insert() {
+        let (_storage, txn_service, _dir) = create_test_service();
+
+        // First, commit a base value
+        let mut setup_ctx = txn_service.begin_explicit(false).unwrap();
+        txn_service
+            .put(&mut setup_ctx, b"key1".to_vec(), b"original".to_vec())
+            .unwrap();
+        txn_service.commit(setup_ctx).unwrap();
+
+        // Start new transaction
+        let mut ctx = txn_service.begin_explicit(false).unwrap();
+
+        // Delete
+        txn_service.delete(&mut ctx, b"key1".to_vec()).unwrap();
+
+        // Should see None
+        let value = txn_service.get(&ctx, b"key1").unwrap();
+        assert_eq!(value, None);
+
+        // Re-insert with new value
+        txn_service
+            .put(&mut ctx, b"key1".to_vec(), b"reinserted".to_vec())
+            .unwrap();
+
+        // Should see the new value
+        let value = txn_service.get(&ctx, b"key1").unwrap();
+        assert_eq!(value, Some(b"reinserted".to_vec()));
+
+        // Clean up
         txn_service.rollback(ctx).unwrap();
     }
 }

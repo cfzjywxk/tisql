@@ -304,7 +304,7 @@ fn worker_thread<E: StorageEngine>(
             let end_key = MvccKey::encode(&key, 0)
                 .next_key()
                 .unwrap_or_else(MvccKey::unbounded);
-            let mut iter = engine.scan_iter(seek_key..end_key).unwrap();
+            let mut iter = engine.scan_iter(seek_key..end_key, 0).unwrap();
             // Find the first visible entry
             let mut _found = false;
             while iter.valid() {
