@@ -1054,4 +1054,382 @@ mod tests {
 
         assert!(service.needs_checkpoint());
     }
+
+    #[test]
+    fn test_ilog_record_lsn_all_variants() {
+        // Test IlogRecord::lsn() for all record types
+        let flush_intent = IlogRecord::FlushIntent {
+            lsn: 100,
+            sst_id: 1,
+            memtable_id: 1,
+            max_memtable_lsn: 50,
+        };
+        assert_eq!(flush_intent.lsn(), 100);
+
+        let flush_commit = IlogRecord::FlushCommit {
+            lsn: 200,
+            sst_meta: test_sst_meta(1, 0),
+            flushed_lsn: 50,
+        };
+        assert_eq!(flush_commit.lsn(), 200);
+
+        let compact_intent = IlogRecord::CompactIntent {
+            lsn: 300,
+            input_sst_ids: vec![1, 2],
+            output_sst_ids: vec![3],
+            target_level: 1,
+        };
+        assert_eq!(compact_intent.lsn(), 300);
+
+        let compact_commit = IlogRecord::CompactCommit {
+            lsn: 400,
+            deleted_ssts: vec![(0, 1), (0, 2)],
+            new_ssts: vec![test_sst_meta(3, 1)],
+        };
+        assert_eq!(compact_commit.lsn(), 400);
+
+        let checkpoint = IlogRecord::Checkpoint {
+            lsn: 500,
+            version: VersionSnapshot {
+                levels: vec![],
+                next_sst_id: 1,
+                version_num: 1,
+                flushed_lsn: 50,
+            },
+            checkpoint_seq: 1,
+        };
+        assert_eq!(checkpoint.lsn(), 500);
+    }
+
+    #[test]
+    fn test_version_snapshot_from_version() {
+        use super::super::version::VersionBuilder;
+
+        // Create a version with some SSTs
+        let meta1 = Arc::new(test_sst_meta(1, 0));
+        let meta2 = Arc::new(test_sst_meta(2, 0));
+        let meta3 = Arc::new(test_sst_meta(3, 1));
+
+        let version = VersionBuilder::new()
+            .add_sst_at_level(0, meta1)
+            .add_sst_at_level(0, meta2)
+            .add_sst_at_level(1, meta3)
+            .next_sst_id(4)
+            .version_num(5)
+            .flushed_lsn(100)
+            .build();
+
+        let snapshot = VersionSnapshot::from(&version);
+
+        assert_eq!(snapshot.next_sst_id, 4);
+        assert_eq!(snapshot.version_num, 5);
+        assert_eq!(snapshot.flushed_lsn, 100);
+        assert_eq!(snapshot.levels[0].len(), 2);
+        assert_eq!(snapshot.levels[1].len(), 1);
+    }
+
+    #[test]
+    fn test_ilog_corrupted_header_magic() {
+        let tmp = TempDir::new().unwrap();
+        let config = test_config(tmp.path());
+
+        // Create a file with invalid magic
+        std::fs::create_dir_all(&config.ilog_dir).unwrap();
+        let path = config.ilog_path();
+        std::fs::write(
+            &path,
+            b"BADM\x01\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00",
+        )
+        .unwrap();
+
+        let lsn_provider = new_lsn_provider();
+        let result = IlogService::open(config, lsn_provider);
+
+        match result {
+            Ok(_) => panic!("Expected error for invalid magic"),
+            Err(e) => assert!(
+                e.to_string().contains("Invalid ilog file magic"),
+                "Error should mention invalid magic: {e}"
+            ),
+        }
+    }
+
+    #[test]
+    fn test_ilog_corrupted_header_version() {
+        let tmp = TempDir::new().unwrap();
+        let config = test_config(tmp.path());
+
+        // Create a file with unsupported version
+        std::fs::create_dir_all(&config.ilog_dir).unwrap();
+        let path = config.ilog_path();
+        std::fs::write(
+            &path,
+            b"ILOG\x99\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00",
+        )
+        .unwrap();
+
+        let lsn_provider = new_lsn_provider();
+        let result = IlogService::open(config, lsn_provider);
+
+        match result {
+            Ok(_) => panic!("Expected error for unsupported version"),
+            Err(e) => assert!(
+                e.to_string().contains("Unsupported ilog version"),
+                "Error should mention unsupported version: {e}"
+            ),
+        }
+    }
+
+    #[test]
+    fn test_ilog_checksum_mismatch() {
+        let tmp = TempDir::new().unwrap();
+        let config = test_config(tmp.path());
+        let lsn_provider = new_lsn_provider();
+
+        // First write a valid record
+        let service = IlogService::open(config.clone(), Arc::clone(&lsn_provider)).unwrap();
+        service.write_flush_intent(1, 100, 50).unwrap();
+        service.sync().unwrap();
+        drop(service);
+
+        // Corrupt the checksum in the file
+        let path = config.ilog_path();
+        let mut data = std::fs::read(&path).unwrap();
+        // The checksum is at offset FILE_HEADER_SIZE + 8 (after type and length)
+        let checksum_offset = FILE_HEADER_SIZE + 8;
+        if data.len() > checksum_offset + 4 {
+            data[checksum_offset] ^= 0xFF; // Flip bits
+            std::fs::write(&path, &data).unwrap();
+        }
+
+        // Recovery should handle the corrupted record
+        let lsn_provider2 = new_lsn_provider();
+        let (_, version, _) = IlogService::recover(config, lsn_provider2).unwrap();
+
+        // Version should be empty since the record was corrupted
+        assert_eq!(version.level_size(0), 0);
+    }
+
+    #[test]
+    fn test_ilog_truncated_record() {
+        let tmp = TempDir::new().unwrap();
+        let config = test_config(tmp.path());
+        let lsn_provider = new_lsn_provider();
+
+        // Write a valid record
+        let service = IlogService::open(config.clone(), Arc::clone(&lsn_provider)).unwrap();
+        service.write_flush_intent(1, 100, 50).unwrap();
+        let meta = test_sst_meta(1, 0);
+        service.write_flush_commit(meta, 50).unwrap();
+        service.sync().unwrap();
+        drop(service);
+
+        // Truncate the file mid-record (remove last few bytes)
+        let path = config.ilog_path();
+        let data = std::fs::read(&path).unwrap();
+        let truncated_len = data.len() - 10; // Truncate 10 bytes
+        std::fs::write(&path, &data[..truncated_len]).unwrap();
+
+        // Recovery should handle truncation gracefully
+        let lsn_provider2 = new_lsn_provider();
+        let (_, version, orphans) = IlogService::recover(config, lsn_provider2).unwrap();
+
+        // First record (flush intent) might be recovered, second (commit) likely corrupted
+        // Either way, should not crash
+        assert!(
+            version.level_size(0) == 0 || orphans.contains(&1),
+            "Should either have no SST or orphan for incomplete flush"
+        );
+    }
+
+    #[test]
+    fn test_ilog_multiple_checkpoints_recovery() {
+        let tmp = TempDir::new().unwrap();
+        let config = test_config(tmp.path());
+        let lsn_provider = new_lsn_provider();
+
+        // Write records with multiple checkpoints
+        let service = IlogService::open(config.clone(), Arc::clone(&lsn_provider)).unwrap();
+
+        // First batch of flushes
+        for i in 1..=3 {
+            let meta = test_sst_meta(i, 0);
+            service.write_flush_intent(i, 100 + i, i * 10).unwrap();
+            service.write_flush_commit(meta, i * 10).unwrap();
+        }
+
+        // First checkpoint
+        let lsn_provider2 = new_lsn_provider();
+        let (_, version1, _) = IlogService::recover(config.clone(), lsn_provider2).unwrap();
+        let lsn_provider3 = new_lsn_provider();
+        let service2 = IlogService::open(config.clone(), lsn_provider3).unwrap();
+        service2.write_checkpoint(&version1).unwrap();
+        drop(service2);
+
+        // Second batch of flushes
+        let lsn_provider4 = new_lsn_provider();
+        let service3 = IlogService::open(config.clone(), lsn_provider4).unwrap();
+        for i in 4..=6 {
+            let meta = test_sst_meta(i, 0);
+            service3.write_flush_intent(i, 100 + i, i * 10).unwrap();
+            service3.write_flush_commit(meta, i * 10).unwrap();
+        }
+
+        // Second checkpoint
+        let lsn_provider5 = new_lsn_provider();
+        let (_, version2, _) = IlogService::recover(config.clone(), lsn_provider5).unwrap();
+        let lsn_provider6 = new_lsn_provider();
+        let service4 = IlogService::open(config.clone(), lsn_provider6).unwrap();
+        service4.write_checkpoint(&version2).unwrap();
+        drop(service4);
+
+        // Final recovery should have all 6 SSTs
+        let lsn_provider7 = new_lsn_provider();
+        let (_, final_version, _) = IlogService::recover(config, lsn_provider7).unwrap();
+
+        assert_eq!(
+            final_version.level_size(0),
+            6,
+            "Should recover all 6 SSTs from last checkpoint"
+        );
+    }
+
+    #[test]
+    fn test_ilog_crc32_function() {
+        // Test the crc32 function with known values
+        assert_eq!(crc32(b""), 0x00000000);
+        assert_eq!(crc32(b"hello"), 0x3610A686);
+        assert_eq!(crc32(b"test"), 0xD87F7E0C);
+
+        // Verify different inputs produce different checksums
+        let crc1 = crc32(b"input1");
+        let crc2 = crc32(b"input2");
+        assert_ne!(crc1, crc2);
+    }
+
+    #[test]
+    fn test_ilog_config_paths() {
+        let config = IlogConfig::new("/data/test");
+
+        assert_eq!(config.ilog_dir, std::path::PathBuf::from("/data/test/ilog"));
+        assert_eq!(config.ilog_file, "tisql.ilog");
+        assert_eq!(config.sst_dir, std::path::PathBuf::from("/data/test/sst"));
+        assert_eq!(
+            config.ilog_path(),
+            std::path::PathBuf::from("/data/test/ilog/tisql.ilog")
+        );
+    }
+
+    #[test]
+    fn test_ilog_close() {
+        let tmp = TempDir::new().unwrap();
+        let config = test_config(tmp.path());
+        let lsn_provider = new_lsn_provider();
+
+        let service = IlogService::open(config.clone(), Arc::clone(&lsn_provider)).unwrap();
+        service.write_flush_intent(1, 100, 50).unwrap();
+
+        // Close should succeed
+        service.close().unwrap();
+
+        // File should still be valid after close
+        let lsn_provider2 = new_lsn_provider();
+        let (_, _, orphans) = IlogService::recover(config, lsn_provider2).unwrap();
+        assert!(orphans.contains(&1)); // Incomplete flush intent
+    }
+
+    #[test]
+    fn test_ilog_multiple_incomplete_compacts() {
+        let tmp = TempDir::new().unwrap();
+        let config = test_config(tmp.path());
+        let lsn_provider = new_lsn_provider();
+
+        let service = IlogService::open(config.clone(), Arc::clone(&lsn_provider)).unwrap();
+
+        // Multiple incomplete compact intents
+        service.write_compact_intent(vec![1], vec![10], 1).unwrap();
+        service
+            .write_compact_intent(vec![2, 3], vec![20, 21], 1)
+            .unwrap();
+        service.sync().unwrap();
+
+        let lsn_provider2 = new_lsn_provider();
+        let (_, _, orphans) = IlogService::recover(config, lsn_provider2).unwrap();
+
+        // All output SST IDs should be orphans
+        assert!(orphans.contains(&10));
+        assert!(orphans.contains(&20));
+        assert!(orphans.contains(&21));
+    }
+
+    #[test]
+    fn test_ilog_reopen_and_append() {
+        let tmp = TempDir::new().unwrap();
+        let config = test_config(tmp.path());
+        let lsn_provider = new_lsn_provider();
+
+        // First session
+        {
+            let service = IlogService::open(config.clone(), Arc::clone(&lsn_provider)).unwrap();
+            service.write_flush_intent(1, 100, 50).unwrap();
+            let meta = test_sst_meta(1, 0);
+            service.write_flush_commit(meta, 50).unwrap();
+            service.sync().unwrap();
+        }
+
+        // Second session - append more
+        {
+            let lsn_provider2 = new_lsn_provider();
+            let (service, _, _) = IlogService::recover(config.clone(), lsn_provider2).unwrap();
+            service.write_flush_intent(2, 101, 100).unwrap();
+            let meta = test_sst_meta(2, 0);
+            service.write_flush_commit(meta, 100).unwrap();
+            service.sync().unwrap();
+        }
+
+        // Verify both records are present
+        let lsn_provider3 = new_lsn_provider();
+        let (_, version, _) = IlogService::recover(config, lsn_provider3).unwrap();
+
+        assert_eq!(version.level_size(0), 2);
+    }
+
+    #[test]
+    fn test_ilog_empty_file_recovery() {
+        let tmp = TempDir::new().unwrap();
+        let config = test_config(tmp.path());
+
+        // Create just the header (empty ilog)
+        std::fs::create_dir_all(&config.ilog_dir).unwrap();
+        let mut header = Vec::new();
+        header.extend_from_slice(FILE_MAGIC);
+        header.extend_from_slice(&FILE_VERSION.to_le_bytes());
+        header.extend_from_slice(&[0u8; 8]); // reserved
+        std::fs::write(config.ilog_path(), &header).unwrap();
+
+        let lsn_provider = new_lsn_provider();
+        let (_, version, orphans) = IlogService::recover(config, lsn_provider).unwrap();
+
+        assert!(orphans.is_empty());
+        assert_eq!(version.level_size(0), 0);
+    }
+
+    #[test]
+    fn test_ilog_version_snapshot_equality() {
+        let snapshot1 = VersionSnapshot {
+            levels: vec![vec![test_sst_meta(1, 0)]],
+            next_sst_id: 2,
+            version_num: 1,
+            flushed_lsn: 100,
+        };
+
+        let snapshot2 = VersionSnapshot {
+            levels: vec![vec![test_sst_meta(1, 0)]],
+            next_sst_id: 2,
+            version_num: 1,
+            flushed_lsn: 100,
+        };
+
+        assert_eq!(snapshot1, snapshot2);
+    }
 }

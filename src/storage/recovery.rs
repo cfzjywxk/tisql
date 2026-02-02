@@ -333,7 +333,8 @@ struct ReplayResult {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::clog::{ClogBatch, ClogService};
+    use crate::clog::{ClogBatch, ClogEntry, ClogOp, ClogService};
+    use crate::storage::ilog::IlogService;
     use crate::storage::mvcc::{is_tombstone, MvccIterator, MvccKey};
     use crate::storage::version::Version;
     use crate::storage::StorageEngine;
@@ -782,6 +783,397 @@ mod tests {
                 result.stats.clog_entries <= 10,
                 "Should replay at most 10 clog entries (2 per transaction * 5 transactions)"
             );
+        }
+    }
+
+    #[test]
+    fn test_recovery_with_custom_configs() {
+        // Test LsmRecovery::with_configs() constructor
+        let tmp = TempDir::new().unwrap();
+
+        let lsm_config = LsmConfig::builder(tmp.path())
+            .memtable_size(1024)
+            .max_frozen_memtables(2)
+            .build()
+            .unwrap();
+        let clog_config = FileClogConfig::with_dir(tmp.path());
+        let ilog_config = IlogConfig::new(tmp.path());
+
+        let recovery = LsmRecovery::with_configs(lsm_config, clog_config, ilog_config);
+        let result = recovery.recover().unwrap();
+
+        assert_eq!(result.stats.clog_entries, 0);
+        assert_eq!(result.stats.txn_count, 0);
+    }
+
+    #[test]
+    fn test_recovery_with_delete_operations() {
+        let tmp = TempDir::new().unwrap();
+
+        // First session: write data and then delete some
+        {
+            let clog_config = FileClogConfig::with_dir(tmp.path());
+            let clog = FileClogService::open(clog_config).unwrap();
+
+            // Insert key1
+            let mut batch = ClogBatch::new();
+            batch.add_put(1, b"key1".to_vec(), b"value1".to_vec());
+            batch.add_commit(1, 100);
+            clog.write(&mut batch, true).unwrap();
+
+            // Insert key2
+            let mut batch = ClogBatch::new();
+            batch.add_put(2, b"key2".to_vec(), b"value2".to_vec());
+            batch.add_commit(2, 200);
+            clog.write(&mut batch, true).unwrap();
+
+            // Delete key1
+            let mut batch = ClogBatch::new();
+            batch.add_delete(3, b"key1".to_vec());
+            batch.add_commit(3, 300);
+            clog.write(&mut batch, true).unwrap();
+
+            clog.close().unwrap();
+        }
+
+        // Second session: recover and verify
+        {
+            let recovery = LsmRecovery::new(tmp.path());
+            let result = recovery.recover().unwrap();
+
+            // key1 should be deleted (tombstone)
+            assert_eq!(
+                get_for_test(&result.engine, b"key1"),
+                None,
+                "key1 should be deleted"
+            );
+
+            // key2 should still exist
+            assert_eq!(
+                get_for_test(&result.engine, b"key2"),
+                Some(b"value2".to_vec()),
+                "key2 should exist"
+            );
+
+            assert_eq!(result.stats.txn_count, 3);
+        }
+    }
+
+    #[test]
+    fn test_recovery_with_rollback_operations() {
+        let tmp = TempDir::new().unwrap();
+
+        // First session: write data and rollback some
+        {
+            let clog_config = FileClogConfig::with_dir(tmp.path());
+            let clog = FileClogService::open(clog_config).unwrap();
+
+            // Transaction 1: committed
+            let mut batch = ClogBatch::new();
+            batch.add_put(1, b"committed_key".to_vec(), b"value".to_vec());
+            batch.add_commit(1, 100);
+            clog.write(&mut batch, true).unwrap();
+
+            // Transaction 2: rolled back
+            let mut batch = ClogBatch::new();
+            batch.add_put(2, b"rolled_back_key".to_vec(), b"value".to_vec());
+            clog.write(&mut batch, true).unwrap();
+
+            let mut batch = ClogBatch::new();
+            batch.add(ClogEntry {
+                lsn: 0,
+                txn_id: 2,
+                op: ClogOp::Rollback,
+            });
+            clog.write(&mut batch, true).unwrap();
+
+            clog.close().unwrap();
+        }
+
+        // Second session: recover and verify
+        {
+            let recovery = LsmRecovery::new(tmp.path());
+            let result = recovery.recover().unwrap();
+
+            // Committed transaction should be recovered
+            assert_eq!(
+                get_for_test(&result.engine, b"committed_key"),
+                Some(b"value".to_vec()),
+                "Committed data should be recovered"
+            );
+
+            // Rolled back transaction should not appear
+            assert_eq!(
+                get_for_test(&result.engine, b"rolled_back_key"),
+                None,
+                "Rolled back data should not appear"
+            );
+
+            // Only 1 transaction should be replayed (the committed one)
+            assert_eq!(result.stats.txn_count, 1);
+        }
+    }
+
+    #[test]
+    fn test_recovery_stats_max_commit_ts() {
+        let tmp = TempDir::new().unwrap();
+
+        // First session: write data with various commit timestamps
+        {
+            let clog_config = FileClogConfig::with_dir(tmp.path());
+            let clog = FileClogService::open(clog_config).unwrap();
+
+            // Commit at ts=100
+            let mut batch = ClogBatch::new();
+            batch.add_put(1, b"key1".to_vec(), b"v1".to_vec());
+            batch.add_commit(1, 100);
+            clog.write(&mut batch, true).unwrap();
+
+            // Commit at ts=500 (highest)
+            let mut batch = ClogBatch::new();
+            batch.add_put(2, b"key2".to_vec(), b"v2".to_vec());
+            batch.add_commit(2, 500);
+            clog.write(&mut batch, true).unwrap();
+
+            // Commit at ts=300
+            let mut batch = ClogBatch::new();
+            batch.add_put(3, b"key3".to_vec(), b"v3".to_vec());
+            batch.add_commit(3, 300);
+            clog.write(&mut batch, true).unwrap();
+
+            clog.close().unwrap();
+        }
+
+        // Second session: verify max_commit_ts
+        {
+            let recovery = LsmRecovery::new(tmp.path());
+            let result = recovery.recover().unwrap();
+
+            assert_eq!(
+                result.stats.max_commit_ts, 500,
+                "max_commit_ts should be 500"
+            );
+        }
+    }
+
+    #[test]
+    fn test_recovery_interleaved_transactions() {
+        let tmp = TempDir::new().unwrap();
+
+        // First session: interleaved transaction writes
+        {
+            let clog_config = FileClogConfig::with_dir(tmp.path());
+            let clog = FileClogService::open(clog_config).unwrap();
+
+            // Start both transactions
+            let mut batch = ClogBatch::new();
+            batch.add_put(1, b"txn1_key".to_vec(), b"txn1_value".to_vec());
+            clog.write(&mut batch, true).unwrap();
+
+            let mut batch = ClogBatch::new();
+            batch.add_put(2, b"txn2_key".to_vec(), b"txn2_value".to_vec());
+            clog.write(&mut batch, true).unwrap();
+
+            // Commit txn2 first (out of order)
+            let mut batch = ClogBatch::new();
+            batch.add_commit(2, 200);
+            clog.write(&mut batch, true).unwrap();
+
+            // Then commit txn1
+            let mut batch = ClogBatch::new();
+            batch.add_commit(1, 100);
+            clog.write(&mut batch, true).unwrap();
+
+            clog.close().unwrap();
+        }
+
+        // Second session: both should be recovered
+        {
+            let recovery = LsmRecovery::new(tmp.path());
+            let result = recovery.recover().unwrap();
+
+            assert_eq!(
+                get_for_test(&result.engine, b"txn1_key"),
+                Some(b"txn1_value".to_vec())
+            );
+            assert_eq!(
+                get_for_test(&result.engine, b"txn2_key"),
+                Some(b"txn2_value".to_vec())
+            );
+
+            assert_eq!(result.stats.txn_count, 2);
+        }
+    }
+
+    #[test]
+    fn test_recovery_multi_key_transaction() {
+        let tmp = TempDir::new().unwrap();
+
+        // First session: transaction with multiple keys
+        {
+            let clog_config = FileClogConfig::with_dir(tmp.path());
+            let clog = FileClogService::open(clog_config).unwrap();
+
+            // Single transaction writing multiple keys
+            let mut batch = ClogBatch::new();
+            batch.add_put(1, b"key_a".to_vec(), b"value_a".to_vec());
+            batch.add_put(1, b"key_b".to_vec(), b"value_b".to_vec());
+            batch.add_put(1, b"key_c".to_vec(), b"value_c".to_vec());
+            batch.add_commit(1, 100);
+            clog.write(&mut batch, true).unwrap();
+
+            clog.close().unwrap();
+        }
+
+        // Second session: all keys should be recovered
+        {
+            let recovery = LsmRecovery::new(tmp.path());
+            let result = recovery.recover().unwrap();
+
+            assert_eq!(
+                get_for_test(&result.engine, b"key_a"),
+                Some(b"value_a".to_vec())
+            );
+            assert_eq!(
+                get_for_test(&result.engine, b"key_b"),
+                Some(b"value_b".to_vec())
+            );
+            assert_eq!(
+                get_for_test(&result.engine, b"key_c"),
+                Some(b"value_c".to_vec())
+            );
+
+            assert_eq!(result.stats.txn_count, 1);
+        }
+    }
+
+    #[test]
+    fn test_recovery_max_commit_ts_from_sst() {
+        // Test that max_commit_ts is taken from SST metadata when clog is truncated
+        let tmp = TempDir::new().unwrap();
+
+        // First session: write and flush data with high timestamp
+        {
+            let lsm_config = LsmConfig::builder(tmp.path())
+                .memtable_size(50)
+                .max_frozen_memtables(4)
+                .build()
+                .unwrap();
+
+            let lsn_provider = new_lsn_provider();
+            let ilog_config = IlogConfig::new(tmp.path());
+            let ilog = Arc::new(IlogService::open(ilog_config, Arc::clone(&lsn_provider)).unwrap());
+
+            let engine = LsmEngine::open_with_recovery(
+                lsm_config,
+                Arc::clone(&lsn_provider),
+                Arc::clone(&ilog),
+                Version::new(),
+            )
+            .unwrap();
+
+            let clog_config = FileClogConfig::with_dir(tmp.path());
+            let clog =
+                FileClogService::open_with_lsn_provider(clog_config, Arc::clone(&lsn_provider))
+                    .unwrap();
+
+            // Write data with high timestamp
+            let key = b"high_ts_key".to_vec();
+            let value = b"high_ts_value".to_vec();
+
+            let mut batch = ClogBatch::new();
+            batch.add_put(1, key.clone(), value.clone());
+            batch.add_commit(1, 9999);
+            let clog_lsn = clog.write(&mut batch, true).unwrap();
+
+            let mut wb = WriteBatch::new();
+            wb.set_commit_ts(9999);
+            wb.set_clog_lsn(clog_lsn);
+            wb.put(key, value);
+            engine.write_batch(wb).unwrap();
+
+            // Flush to SST
+            engine.flush_all_with_active().unwrap();
+
+            clog.close().unwrap();
+        }
+
+        // Second session: verify max_commit_ts is recovered from SST
+        {
+            let recovery = LsmRecovery::new(tmp.path());
+            let result = recovery.recover().unwrap();
+
+            // max_commit_ts should be at least 9999 (from SST metadata)
+            assert!(
+                result.stats.max_commit_ts >= 9999,
+                "max_commit_ts should be recovered from SST metadata, got {}",
+                result.stats.max_commit_ts
+            );
+        }
+    }
+
+    #[test]
+    fn test_recovery_empty_transaction() {
+        // Transaction with no writes followed by commit should be ignored
+        let tmp = TempDir::new().unwrap();
+
+        {
+            let clog_config = FileClogConfig::with_dir(tmp.path());
+            let clog = FileClogService::open(clog_config).unwrap();
+
+            // Empty transaction (commit without any puts)
+            let mut batch = ClogBatch::new();
+            batch.add_commit(1, 100);
+            clog.write(&mut batch, true).unwrap();
+
+            // Normal transaction
+            let mut batch = ClogBatch::new();
+            batch.add_put(2, b"key".to_vec(), b"value".to_vec());
+            batch.add_commit(2, 200);
+            clog.write(&mut batch, true).unwrap();
+
+            clog.close().unwrap();
+        }
+
+        {
+            let recovery = LsmRecovery::new(tmp.path());
+            let result = recovery.recover().unwrap();
+
+            // Only 1 transaction with data should be counted
+            assert_eq!(result.stats.txn_count, 1);
+            assert_eq!(
+                get_for_test(&result.engine, b"key"),
+                Some(b"value".to_vec())
+            );
+        }
+    }
+
+    #[test]
+    fn test_recovery_orphan_ssts_cleaned_stat() {
+        let tmp = TempDir::new().unwrap();
+
+        // First create an incomplete flush intent (which creates an orphan)
+        {
+            let lsn_provider = new_lsn_provider();
+            let ilog_config = IlogConfig::new(tmp.path());
+            let ilog = IlogService::open(ilog_config, Arc::clone(&lsn_provider)).unwrap();
+
+            // Write flush intent but no commit (simulating crash before SST creation)
+            ilog.write_flush_intent(99, 100, 50).unwrap();
+            ilog.sync().unwrap();
+        }
+
+        // Now create the orphan SST file that matches the intent
+        let sst_dir = tmp.path().join("sst");
+        std::fs::create_dir_all(&sst_dir).unwrap();
+        std::fs::write(sst_dir.join("00000099.sst"), b"orphan").unwrap();
+
+        {
+            let recovery = LsmRecovery::new(tmp.path());
+            let result = recovery.recover().unwrap();
+
+            // Should have cleaned up the orphan (from incomplete intent)
+            assert_eq!(result.stats.orphan_ssts_cleaned, 1);
         }
     }
 }
