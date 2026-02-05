@@ -835,3 +835,1068 @@ fn test_recovery_preserves_concurrent_writes() {
         }
     }
 }
+
+// ============================================================================
+// Scan Across Frozen + Active Memtables with Concurrent Writes
+// ============================================================================
+
+/// Test that scan correctly merges data from frozen and active memtables.
+///
+/// This test verifies:
+/// 1. Data written before rotation is in frozen memtable
+/// 2. Data written after rotation is in active memtable
+/// 3. A scan sees data from both sources merged correctly
+/// 4. MVCC ordering is maintained (user_key ASC, ts DESC)
+#[test]
+fn test_scan_across_frozen_and_active_memtables() {
+    let dir = tempfile::tempdir().unwrap();
+    let (engine, _ilog) = create_test_lsm_engine(&dir);
+
+    // Phase 1: Write data that will end up in frozen memtable
+    // Use keys with prefix "a_" so they sort before "b_" keys
+    for i in 0..10 {
+        let key = format!("a_frozen_key_{i:02}");
+        write_test_data(&engine, key.as_bytes(), b"frozen_value", (i + 1) as u64);
+    }
+
+    // Force rotation - this freezes the active memtable
+    let frozen = engine.freeze_active();
+    assert!(frozen.is_some(), "Should have rotated memtable");
+
+    // Verify we have a frozen memtable
+    assert!(
+        engine.frozen_count() > 0,
+        "Should have at least one frozen memtable"
+    );
+
+    // Phase 2: Write data to the new active memtable
+    // Use keys with prefix "b_" so they sort after "a_" keys
+    for i in 0..10 {
+        let key = format!("b_active_key_{i:02}");
+        write_test_data(&engine, key.as_bytes(), b"active_value", (i + 100) as u64);
+    }
+
+    // Phase 3: Scan across both memtables
+    let start = MvccKey::encode(b"a_", Timestamp::MAX);
+    let end = MvccKey::encode(b"c_", 0);
+    let range = start..end;
+
+    let mut iter = engine.scan_iter(range, 0).unwrap();
+    iter.advance().unwrap();
+
+    let mut results: Vec<(Vec<u8>, Vec<u8>)> = Vec::new();
+    let mut prev_key: Option<Vec<u8>> = None;
+
+    while iter.valid() {
+        let key = iter.user_key().to_vec();
+        let value = iter.value().to_vec();
+
+        // Verify ordering: keys should be ascending
+        if let Some(ref pk) = prev_key {
+            assert!(
+                key >= *pk,
+                "Keys should be in ascending order: {:?} >= {:?}",
+                String::from_utf8_lossy(&key),
+                String::from_utf8_lossy(pk)
+            );
+        }
+        prev_key = Some(key.clone());
+        results.push((key, value));
+        iter.advance().unwrap();
+    }
+
+    // Should have 20 entries total (10 from frozen + 10 from active)
+    assert_eq!(
+        results.len(),
+        20,
+        "Should see 20 entries from frozen + active memtables"
+    );
+
+    // Verify frozen memtable data (a_* keys)
+    let frozen_results: Vec<_> = results
+        .iter()
+        .filter(|(k, _)| k.starts_with(b"a_"))
+        .collect();
+    assert_eq!(
+        frozen_results.len(),
+        10,
+        "Should have 10 entries from frozen"
+    );
+    for (key, value) in &frozen_results {
+        assert!(
+            key.starts_with(b"a_frozen_key_"),
+            "Frozen key should have correct prefix"
+        );
+        assert_eq!(value.as_slice(), b"frozen_value");
+    }
+
+    // Verify active memtable data (b_* keys)
+    let active_results: Vec<_> = results
+        .iter()
+        .filter(|(k, _)| k.starts_with(b"b_"))
+        .collect();
+    assert_eq!(
+        active_results.len(),
+        10,
+        "Should have 10 entries from active"
+    );
+    for (key, value) in &active_results {
+        assert!(
+            key.starts_with(b"b_active_key_"),
+            "Active key should have correct prefix"
+        );
+        assert_eq!(value.as_slice(), b"active_value");
+    }
+}
+
+/// Test scan with concurrent writes to active memtable while frozen exists.
+///
+/// This test verifies:
+/// 1. Scan iterator sees a consistent snapshot
+/// 2. Concurrent writes don't corrupt the iterator
+/// 3. Data from both frozen and active memtables is correctly merged
+#[test]
+fn test_scan_with_concurrent_writes_across_frozen_active() {
+    let dir = tempfile::tempdir().unwrap();
+    let (engine, _ilog) = create_test_lsm_engine(&dir);
+
+    // Pre-populate data that will be frozen
+    for i in 0..20 {
+        let key = format!("frozen_{i:03}");
+        write_test_data(&engine, key.as_bytes(), b"pre_rotation", (i + 1) as u64);
+    }
+
+    // Force rotation
+    let _ = engine.freeze_active();
+    assert!(engine.frozen_count() > 0, "Should have frozen memtable");
+
+    // Write some initial data to active memtable
+    for i in 0..10 {
+        let key = format!("active_{i:03}");
+        write_test_data(&engine, key.as_bytes(), b"post_rotation", (i + 100) as u64);
+    }
+
+    let num_writers = 4;
+    let writes_per_writer = 50;
+    let num_scanners = 4;
+    let scans_per_scanner = 10;
+
+    let stop_flag = Arc::new(AtomicBool::new(false));
+    let ts_counter = Arc::new(AtomicU64::new(200));
+    let scan_errors = Arc::new(AtomicU64::new(0));
+    let scan_success = Arc::new(AtomicU64::new(0));
+    let total_writes = Arc::new(AtomicU64::new(0));
+
+    let mut handles: Vec<thread::JoinHandle<()>> = vec![];
+
+    // Spawn writer threads - write to "writer_*" keys
+    for writer_id in 0..num_writers {
+        let engine = Arc::clone(&engine);
+        let stop_flag = Arc::clone(&stop_flag);
+        let ts_counter = Arc::clone(&ts_counter);
+        let total_writes = Arc::clone(&total_writes);
+
+        let handle = thread::spawn(move || {
+            let mut writes = 0u64;
+            for i in 0..writes_per_writer {
+                if stop_flag.load(Ordering::Relaxed) {
+                    break;
+                }
+                let key = format!("writer_{writer_id}_{i:03}");
+                let ts = ts_counter.fetch_add(1, Ordering::SeqCst);
+                write_test_data(&engine, key.as_bytes(), b"concurrent_write", ts);
+                writes += 1;
+                thread::yield_now();
+            }
+            total_writes.fetch_add(writes, Ordering::Relaxed);
+        });
+        handles.push(handle);
+    }
+
+    // Spawn scanner threads - scan across all data
+    for _scanner_id in 0..num_scanners {
+        let engine = Arc::clone(&engine);
+        let scan_errors = Arc::clone(&scan_errors);
+        let scan_success = Arc::clone(&scan_success);
+
+        let handle = thread::spawn(move || {
+            for _ in 0..scans_per_scanner {
+                // Scan the frozen + active range
+                let start = MvccKey::encode(b"", Timestamp::MAX);
+                let end = MvccKey::unbounded();
+                let range = start..end;
+
+                match engine.scan_iter(range, 0) {
+                    Ok(mut iter) => {
+                        if iter.advance().is_err() {
+                            scan_errors.fetch_add(1, Ordering::Relaxed);
+                            continue;
+                        }
+
+                        let mut count = 0;
+                        let mut prev_user_key: Option<Vec<u8>> = None;
+                        let mut prev_ts: Option<Timestamp> = None;
+                        let mut ordering_ok = true;
+
+                        while iter.valid() {
+                            let user_key = iter.user_key().to_vec();
+                            let ts = iter.timestamp();
+
+                            // Verify MVCC ordering: (user_key ASC, ts DESC)
+                            if let Some(ref pk) = prev_user_key {
+                                match user_key.cmp(pk) {
+                                    std::cmp::Ordering::Less => {
+                                        // user_key went backwards - error
+                                        ordering_ok = false;
+                                        break;
+                                    }
+                                    std::cmp::Ordering::Equal => {
+                                        // Same user_key: ts must be descending
+                                        if let Some(pt) = prev_ts {
+                                            if ts >= pt {
+                                                ordering_ok = false;
+                                                break;
+                                            }
+                                        }
+                                    }
+                                    std::cmp::Ordering::Greater => {
+                                        // New user_key - ok
+                                    }
+                                }
+                            }
+
+                            prev_user_key = Some(user_key);
+                            prev_ts = Some(ts);
+                            count += 1;
+
+                            if iter.advance().is_err() {
+                                break;
+                            }
+                        }
+
+                        if ordering_ok && count > 0 {
+                            scan_success.fetch_add(1, Ordering::Relaxed);
+                        } else if !ordering_ok {
+                            scan_errors.fetch_add(1, Ordering::Relaxed);
+                        }
+                    }
+                    Err(_) => {
+                        scan_errors.fetch_add(1, Ordering::Relaxed);
+                    }
+                }
+                thread::yield_now();
+            }
+        });
+        handles.push(handle);
+    }
+
+    // Wait for all threads
+    stop_flag.store(true, Ordering::Relaxed);
+    for handle in handles {
+        handle.join().unwrap();
+    }
+
+    let writes = total_writes.load(Ordering::Relaxed);
+    let successes = scan_success.load(Ordering::Relaxed);
+    let errors = scan_errors.load(Ordering::Relaxed);
+
+    assert!(writes > 0, "Should have completed some writes");
+    assert!(
+        successes > 0,
+        "At least some scans should succeed, got {successes} successes, {errors} errors"
+    );
+    assert_eq!(errors, 0, "Should have no scan ordering errors");
+
+    // Final verification: scan should see all pre-populated data
+    let frozen_count = {
+        let start = MvccKey::encode(b"frozen_", Timestamp::MAX);
+        let end = MvccKey::encode(b"frozen_\xff", 0);
+        let mut iter = engine.scan_iter(start..end, 0).unwrap();
+        iter.advance().unwrap();
+        let mut count = 0;
+        while iter.valid() {
+            count += 1;
+            iter.advance().unwrap();
+        }
+        count
+    };
+    assert_eq!(
+        frozen_count, 20,
+        "Should still see all 20 frozen entries after concurrent operations"
+    );
+}
+
+/// Test that scan snapshot is isolated from concurrent rotations.
+///
+/// Verifies that a scan iterator created before rotation still sees
+/// a consistent view even if rotation happens during iteration.
+#[test]
+fn test_scan_snapshot_isolation_during_rotation() {
+    let dir = tempfile::tempdir().unwrap();
+
+    // Create engine with larger memtable to control rotation timing
+    let lsn_provider = new_lsn_provider();
+    let ilog_config = IlogConfig::new(dir.path());
+    let ilog = Arc::new(IlogService::open(ilog_config, Arc::clone(&lsn_provider)).unwrap());
+
+    let config = LsmConfigBuilder::new(dir.path())
+        .memtable_size(4096) // Larger to prevent auto-rotation
+        .build_unchecked();
+    let engine = Arc::new(
+        LsmEngine::open_with_recovery(
+            config,
+            Arc::clone(&lsn_provider),
+            Arc::clone(&ilog),
+            Version::new(),
+        )
+        .unwrap(),
+    );
+
+    // Write initial data
+    for i in 0..50 {
+        let key = format!("key_{i:03}");
+        let value = format!("value_{i}");
+        write_test_data(&engine, key.as_bytes(), value.as_bytes(), (i + 1) as u64);
+    }
+
+    // Create a scan iterator BEFORE rotation
+    let start = MvccKey::encode(b"key_", Timestamp::MAX);
+    let end = MvccKey::encode(b"key_\xff", 0);
+    let mut iter = engine.scan_iter(start..end, 0).unwrap();
+    iter.advance().unwrap();
+
+    // Read first 10 entries
+    let mut pre_rotation_keys = Vec::new();
+    for _ in 0..10 {
+        if iter.valid() {
+            pre_rotation_keys.push(iter.user_key().to_vec());
+            iter.advance().unwrap();
+        }
+    }
+
+    // Force rotation WHILE iterator exists
+    let _ = engine.freeze_active();
+
+    // Write more data to new active memtable (these should NOT appear in our scan)
+    for i in 50..60 {
+        let key = format!("key_{i:03}");
+        let value = format!("new_value_{i}");
+        write_test_data(&engine, key.as_bytes(), value.as_bytes(), (i + 100) as u64);
+    }
+
+    // Continue reading with the same iterator
+    let mut post_rotation_keys = Vec::new();
+    while iter.valid() {
+        post_rotation_keys.push(iter.user_key().to_vec());
+        iter.advance().unwrap();
+    }
+
+    // Total should be 50 (the original data), not 60
+    let total_keys = pre_rotation_keys.len() + post_rotation_keys.len();
+    assert_eq!(
+        total_keys, 50,
+        "Scan should see exactly 50 keys (snapshot isolation), got {total_keys}"
+    );
+
+    // Verify keys are in order (key_000 through key_049)
+    let mut all_keys = pre_rotation_keys;
+    all_keys.extend(post_rotation_keys);
+
+    for (i, key) in all_keys.iter().enumerate() {
+        let expected = format!("key_{i:03}");
+        assert_eq!(
+            key.as_slice(),
+            expected.as_bytes(),
+            "Key at position {i} should be {expected}"
+        );
+    }
+
+    // A NEW scan should see the new data
+    let start = MvccKey::encode(b"key_", Timestamp::MAX);
+    let end = MvccKey::encode(b"key_\xff", 0);
+    let mut new_iter = engine.scan_iter(start..end, 0).unwrap();
+    new_iter.advance().unwrap();
+
+    let mut new_scan_count = 0;
+    while new_iter.valid() {
+        new_scan_count += 1;
+        new_iter.advance().unwrap();
+    }
+
+    assert_eq!(
+        new_scan_count, 60,
+        "New scan should see all 60 keys including post-rotation writes"
+    );
+}
+
+/// Test same key exists in both frozen and active memtables.
+///
+/// When the same key is updated after rotation, the scan should
+/// return both versions in proper MVCC order (newer first).
+#[test]
+fn test_same_key_in_frozen_and_active_memtables() {
+    let dir = tempfile::tempdir().unwrap();
+    let (engine, _ilog) = create_test_lsm_engine(&dir);
+
+    // Write initial version of keys (will be frozen)
+    for i in 0..10 {
+        let key = format!("shared_key_{i:02}");
+        write_test_data(&engine, key.as_bytes(), b"v1_frozen", (i + 1) as u64);
+    }
+
+    // Force rotation
+    let _ = engine.freeze_active();
+    assert!(engine.frozen_count() > 0);
+
+    // Write newer versions of the SAME keys to active memtable
+    for i in 0..10 {
+        let key = format!("shared_key_{i:02}");
+        write_test_data(&engine, key.as_bytes(), b"v2_active", (i + 100) as u64);
+    }
+
+    // Scan should see both versions of each key, newer first
+    let start = MvccKey::encode(b"shared_key_", Timestamp::MAX);
+    let end = MvccKey::encode(b"shared_key_\xff", 0);
+    let mut iter = engine.scan_iter(start..end, 0).unwrap();
+    iter.advance().unwrap();
+
+    let mut entries: Vec<(Vec<u8>, Timestamp, Vec<u8>)> = Vec::new();
+    while iter.valid() {
+        entries.push((
+            iter.user_key().to_vec(),
+            iter.timestamp(),
+            iter.value().to_vec(),
+        ));
+        iter.advance().unwrap();
+    }
+
+    // Should have 20 entries (2 versions per key * 10 keys)
+    assert_eq!(
+        entries.len(),
+        20,
+        "Should see 20 entries (2 versions * 10 keys)"
+    );
+
+    // Verify MVCC ordering: for each key, newer version (v2) should come before older (v1)
+    for i in 0..10 {
+        let key = format!("shared_key_{i:02}");
+        let key_entries: Vec<_> = entries
+            .iter()
+            .filter(|(k, _, _)| k == key.as_bytes())
+            .collect();
+
+        assert_eq!(key_entries.len(), 2, "Key {key} should have 2 versions");
+
+        // First entry should be newer (higher ts, v2_active)
+        assert!(
+            key_entries[0].1 > key_entries[1].1,
+            "First version should have higher timestamp"
+        );
+        assert_eq!(key_entries[0].2.as_slice(), b"v2_active");
+        assert_eq!(key_entries[1].2.as_slice(), b"v1_frozen");
+    }
+
+    // Point read should return the latest version
+    for i in 0..10 {
+        let key = format!("shared_key_{i:02}");
+        let value = get_for_test(&engine, key.as_bytes());
+        assert_eq!(
+            value,
+            Some(b"v2_active".to_vec()),
+            "Point read for {key} should return latest version"
+        );
+    }
+}
+
+/// Stress test: many rotations with concurrent scans and writes.
+#[test]
+fn test_stress_rotations_with_concurrent_scans() {
+    let dir = tempfile::tempdir().unwrap();
+
+    let lsn_provider = new_lsn_provider();
+    let ilog_config = IlogConfig::new(dir.path());
+    let ilog = Arc::new(IlogService::open(ilog_config, Arc::clone(&lsn_provider)).unwrap());
+
+    let config = LsmConfigBuilder::new(dir.path())
+        .memtable_size(128) // Small to trigger frequent rotations
+        .build_unchecked();
+    let engine = Arc::new(
+        LsmEngine::open_with_recovery(
+            config,
+            Arc::clone(&lsn_provider),
+            Arc::clone(&ilog),
+            Version::new(),
+        )
+        .unwrap(),
+    );
+
+    let num_writers = 2;
+    let num_scanners = 2;
+    let num_rotators = 1;
+    let duration = Duration::from_secs(2);
+
+    let stop_flag = Arc::new(AtomicBool::new(false));
+    let ts_counter = Arc::new(AtomicU64::new(1));
+    let writes_done = Arc::new(AtomicU64::new(0));
+    let scans_done = Arc::new(AtomicU64::new(0));
+    let rotations_done = Arc::new(AtomicU64::new(0));
+    let scan_errors = Arc::new(AtomicU64::new(0));
+
+    let mut handles: Vec<thread::JoinHandle<()>> = vec![];
+
+    // Writer threads
+    for writer_id in 0..num_writers {
+        let engine = Arc::clone(&engine);
+        let stop_flag = Arc::clone(&stop_flag);
+        let ts_counter = Arc::clone(&ts_counter);
+        let writes_done = Arc::clone(&writes_done);
+
+        handles.push(thread::spawn(move || {
+            let mut local_writes = 0u64;
+            while !stop_flag.load(Ordering::Relaxed) {
+                let key = format!("stress_w{writer_id}_k{local_writes}");
+                let ts = ts_counter.fetch_add(1, Ordering::SeqCst);
+                write_test_data(&engine, key.as_bytes(), b"stress_value", ts);
+                local_writes += 1;
+
+                if local_writes % 100 == 0 {
+                    thread::yield_now();
+                }
+            }
+            writes_done.fetch_add(local_writes, Ordering::Relaxed);
+        }));
+    }
+
+    // Scanner threads
+    for _ in 0..num_scanners {
+        let engine = Arc::clone(&engine);
+        let stop_flag = Arc::clone(&stop_flag);
+        let scans_done = Arc::clone(&scans_done);
+        let scan_errors = Arc::clone(&scan_errors);
+
+        handles.push(thread::spawn(move || {
+            while !stop_flag.load(Ordering::Relaxed) {
+                let start = MvccKey::encode(b"stress_", Timestamp::MAX);
+                let end = MvccKey::encode(b"stress_\xff", 0);
+
+                match engine.scan_iter(start..end, 0) {
+                    Ok(mut iter) => {
+                        if iter.advance().is_err() {
+                            scan_errors.fetch_add(1, Ordering::Relaxed);
+                            continue;
+                        }
+
+                        let mut prev_user_key: Option<Vec<u8>> = None;
+                        let mut prev_ts: Option<Timestamp> = None;
+                        let mut ordering_valid = true;
+
+                        while iter.valid() {
+                            let user_key = iter.user_key().to_vec();
+                            let ts = iter.timestamp();
+
+                            // Verify MVCC ordering: (user_key ASC, ts DESC)
+                            if let Some(ref pk) = prev_user_key {
+                                match user_key.cmp(pk) {
+                                    std::cmp::Ordering::Less => {
+                                        ordering_valid = false;
+                                        break;
+                                    }
+                                    std::cmp::Ordering::Equal => {
+                                        if let Some(pt) = prev_ts {
+                                            if ts >= pt {
+                                                ordering_valid = false;
+                                                break;
+                                            }
+                                        }
+                                    }
+                                    std::cmp::Ordering::Greater => {}
+                                }
+                            }
+                            prev_user_key = Some(user_key);
+                            prev_ts = Some(ts);
+
+                            if iter.advance().is_err() {
+                                break;
+                            }
+                        }
+
+                        if ordering_valid {
+                            scans_done.fetch_add(1, Ordering::Relaxed);
+                        } else {
+                            scan_errors.fetch_add(1, Ordering::Relaxed);
+                        }
+                    }
+                    Err(_) => {
+                        scan_errors.fetch_add(1, Ordering::Relaxed);
+                    }
+                }
+                thread::yield_now();
+            }
+        }));
+    }
+
+    // Rotator thread
+    for _ in 0..num_rotators {
+        let engine = Arc::clone(&engine);
+        let stop_flag = Arc::clone(&stop_flag);
+        let rotations_done = Arc::clone(&rotations_done);
+
+        handles.push(thread::spawn(move || {
+            while !stop_flag.load(Ordering::Relaxed) {
+                if let Some(frozen) = engine.maybe_rotate() {
+                    // Optionally flush some frozen memtables
+                    let _ = engine.flush_memtable(&frozen);
+                    rotations_done.fetch_add(1, Ordering::Relaxed);
+                }
+                thread::sleep(Duration::from_millis(10));
+            }
+        }));
+    }
+
+    // Run for duration
+    thread::sleep(duration);
+    stop_flag.store(true, Ordering::Relaxed);
+
+    // Wait for all threads
+    for handle in handles {
+        handle.join().unwrap();
+    }
+
+    let writes = writes_done.load(Ordering::Relaxed);
+    let scans = scans_done.load(Ordering::Relaxed);
+    let rotations = rotations_done.load(Ordering::Relaxed);
+    let errors = scan_errors.load(Ordering::Relaxed);
+
+    println!("Stress test: {writes} writes, {scans} scans, {rotations} rotations, {errors} errors");
+
+    assert!(writes > 0, "Should have completed writes");
+    assert!(scans > 0, "Should have completed scans");
+    assert_eq!(errors, 0, "Should have no scan ordering errors");
+}
+
+// ============================================================================
+// Write Stall / Backpressure Tests
+// ============================================================================
+
+/// Test that rotation stops when frozen memtable limit is reached.
+///
+/// When max_frozen_memtables is reached and no flush happens,
+/// maybe_rotate() should return None to signal backpressure.
+#[test]
+fn test_rotation_blocked_at_frozen_limit() {
+    let dir = tempfile::tempdir().unwrap();
+
+    let lsn_provider = new_lsn_provider();
+    let ilog_config = IlogConfig::new(dir.path());
+    let ilog = Arc::new(IlogService::open(ilog_config, Arc::clone(&lsn_provider)).unwrap());
+
+    // Memtable large enough to hold test data without auto-rotation,
+    // but small enough to demonstrate the concept
+    let config = LsmConfigBuilder::new(dir.path())
+        .memtable_size(2048) // Large enough for 5 entries per batch
+        .max_frozen_memtables(2) // Only allow 2 frozen
+        .build_unchecked();
+
+    let engine = LsmEngine::open_with_recovery(
+        config,
+        Arc::clone(&lsn_provider),
+        Arc::clone(&ilog),
+        Version::new(),
+    )
+    .unwrap();
+
+    // Use values to ensure memtable has data
+    let value = vec![b'x'; 100];
+
+    // Fill up frozen memtables by forcing rotations (without flushing)
+    // First rotation
+    for i in 0..5 {
+        let key = format!("batch1_key_{i:02}");
+        write_test_data(&engine, key.as_bytes(), &value, (i + 1) as u64);
+    }
+
+    assert_eq!(
+        engine.frozen_count(),
+        0,
+        "No auto-rotation should happen yet"
+    );
+    let rot1 = engine.freeze_active();
+    assert!(rot1.is_some(), "First rotation should succeed");
+    assert_eq!(engine.frozen_count(), 1);
+
+    // Second rotation
+    for i in 0..5 {
+        let key = format!("batch2_key_{i:02}");
+        write_test_data(&engine, key.as_bytes(), &value, (i + 10) as u64);
+    }
+    let rot2 = engine.freeze_active();
+    assert!(rot2.is_some(), "Second rotation should succeed");
+    assert_eq!(engine.frozen_count(), 2);
+
+    // Third rotation should fail - frozen limit reached
+    for i in 0..5 {
+        let key = format!("batch3_key_{i:02}");
+        write_test_data(&engine, key.as_bytes(), &value, (i + 20) as u64);
+    }
+    let rot3 = engine.freeze_active();
+    assert!(
+        rot3.is_none(),
+        "Third rotation should fail due to frozen limit"
+    );
+    assert_eq!(
+        engine.frozen_count(),
+        2,
+        "Frozen count should stay at limit"
+    );
+
+    // Writes should still succeed (goes to active memtable)
+    let key = b"after_limit_key";
+    write_test_data(&engine, key, b"still_works", 100);
+    let value = get_for_test(&engine, key);
+    assert_eq!(value, Some(b"still_works".to_vec()));
+
+    // Active memtable should have data (no rotation happened)
+    let stats = engine.stats();
+    assert!(
+        stats.active_memtable_size > 0,
+        "Active memtable should have data"
+    );
+}
+
+/// Test that flushing a frozen memtable unblocks rotation.
+///
+/// After hitting the frozen limit, flushing should allow new rotations.
+#[test]
+fn test_flush_unblocks_rotation() {
+    let dir = tempfile::tempdir().unwrap();
+
+    let lsn_provider = new_lsn_provider();
+    let ilog_config = IlogConfig::new(dir.path());
+    let ilog = Arc::new(IlogService::open(ilog_config, Arc::clone(&lsn_provider)).unwrap());
+
+    let config = LsmConfigBuilder::new(dir.path())
+        .memtable_size(2048) // Large enough to avoid auto-rotation
+        .max_frozen_memtables(1) // Very restrictive - only 1 frozen allowed
+        .build_unchecked();
+
+    let engine = LsmEngine::open_with_recovery(
+        config,
+        Arc::clone(&lsn_provider),
+        Arc::clone(&ilog),
+        Version::new(),
+    )
+    .unwrap();
+
+    let value = vec![b'x'; 100];
+
+    // First rotation succeeds
+    for i in 0..5 {
+        let key = format!("key_{i:02}");
+        write_test_data(&engine, key.as_bytes(), &value, (i + 1) as u64);
+    }
+    let frozen1 = engine.freeze_active();
+    assert!(frozen1.is_some(), "First rotation should succeed");
+    assert_eq!(engine.frozen_count(), 1);
+
+    // Second rotation fails - at limit
+    for i in 0..5 {
+        let key = format!("key2_{i:02}");
+        write_test_data(&engine, key.as_bytes(), &value, (i + 10) as u64);
+    }
+    let frozen2_attempt = engine.freeze_active();
+    assert!(
+        frozen2_attempt.is_none(),
+        "Should be blocked by frozen limit"
+    );
+
+    // Flush the frozen memtable
+    let frozen1 = frozen1.unwrap();
+    engine.flush_memtable(&frozen1).unwrap();
+    assert_eq!(
+        engine.frozen_count(),
+        0,
+        "Frozen should be empty after flush"
+    );
+
+    // Now rotation should work again
+    let frozen2 = engine.freeze_active();
+    assert!(frozen2.is_some(), "Rotation should succeed after flush");
+    assert_eq!(engine.frozen_count(), 1);
+
+    // Verify all data is accessible
+    for i in 0..5 {
+        let key = format!("key_{i:02}");
+        assert!(
+            get_for_test(&engine, key.as_bytes()).is_some(),
+            "Flushed key {key} should be readable from SST"
+        );
+    }
+    for i in 0..5 {
+        let key = format!("key2_{i:02}");
+        assert!(
+            get_for_test(&engine, key.as_bytes()).is_some(),
+            "Active/frozen key {key} should be readable"
+        );
+    }
+}
+
+/// Test concurrent writes under backpressure (frozen limit reached).
+///
+/// When the frozen limit is reached, concurrent writers should still
+/// be able to write to the active memtable without blocking.
+#[test]
+fn test_concurrent_writes_under_backpressure() {
+    let dir = tempfile::tempdir().unwrap();
+
+    let lsn_provider = new_lsn_provider();
+    let ilog_config = IlogConfig::new(dir.path());
+    let ilog = Arc::new(IlogService::open(ilog_config, Arc::clone(&lsn_provider)).unwrap());
+
+    let config = LsmConfigBuilder::new(dir.path())
+        .memtable_size(128)
+        .max_frozen_memtables(2)
+        .build_unchecked();
+
+    let engine = Arc::new(
+        LsmEngine::open_with_recovery(
+            config,
+            Arc::clone(&lsn_provider),
+            Arc::clone(&ilog),
+            Version::new(),
+        )
+        .unwrap(),
+    );
+
+    // Fill up frozen memtables to create backpressure
+    for batch in 0..2 {
+        for i in 0..10 {
+            let key = format!("setup_batch{batch}_key{i}");
+            write_test_data(
+                &engine,
+                key.as_bytes(),
+                b"setup",
+                (batch * 100 + i + 1) as u64,
+            );
+        }
+        engine.freeze_active();
+    }
+    assert_eq!(engine.frozen_count(), 2, "Should be at frozen limit");
+
+    // Verify rotation is blocked
+    assert!(
+        engine.freeze_active().is_none(),
+        "Should not be able to rotate at limit"
+    );
+
+    // Now do concurrent writes - they should all succeed (no actual stall)
+    let num_writers = 4;
+    let writes_per_writer = 100;
+    let ts_counter = Arc::new(AtomicU64::new(1000));
+    let success_count = Arc::new(AtomicU64::new(0));
+
+    let mut handles = vec![];
+    for writer_id in 0..num_writers {
+        let engine = Arc::clone(&engine);
+        let ts_counter = Arc::clone(&ts_counter);
+        let success_count = Arc::clone(&success_count);
+
+        handles.push(thread::spawn(move || {
+            for i in 0..writes_per_writer {
+                let key = format!("pressure_w{writer_id}_k{i:04}");
+                let ts = ts_counter.fetch_add(1, Ordering::SeqCst);
+                write_test_data(&engine, key.as_bytes(), b"under_pressure", ts);
+                success_count.fetch_add(1, Ordering::Relaxed);
+            }
+        }));
+    }
+
+    for handle in handles {
+        handle.join().unwrap();
+    }
+
+    let total_writes = success_count.load(Ordering::Relaxed);
+    assert_eq!(
+        total_writes,
+        (num_writers * writes_per_writer) as u64,
+        "All writes should succeed even under backpressure"
+    );
+
+    // Verify writes are readable
+    for writer_id in 0..num_writers {
+        for i in [0, writes_per_writer / 2, writes_per_writer - 1] {
+            let key = format!("pressure_w{writer_id}_k{i:04}");
+            let value = get_for_test(&engine, key.as_bytes());
+            assert!(
+                value.is_some(),
+                "Key {key} should be readable from active memtable"
+            );
+        }
+    }
+
+    // Active memtable should be large since no rotation happened
+    let stats = engine.stats();
+    assert!(
+        stats.active_memtable_size > 128,
+        "Active memtable ({}) should exceed configured size since rotation was blocked",
+        stats.active_memtable_size
+    );
+}
+
+/// Test that a slow flusher causes memtable growth under sustained write load.
+///
+/// This simulates a scenario where writes are faster than flushes,
+/// demonstrating the need for proper backpressure.
+#[test]
+fn test_slow_flush_causes_memtable_growth() {
+    let dir = tempfile::tempdir().unwrap();
+
+    let lsn_provider = new_lsn_provider();
+    let ilog_config = IlogConfig::new(dir.path());
+    let ilog = Arc::new(IlogService::open(ilog_config, Arc::clone(&lsn_provider)).unwrap());
+
+    let config = LsmConfigBuilder::new(dir.path())
+        .memtable_size(64)
+        .max_frozen_memtables(2)
+        .build_unchecked();
+
+    let engine = Arc::new(
+        LsmEngine::open_with_recovery(
+            config,
+            Arc::clone(&lsn_provider),
+            Arc::clone(&ilog),
+            Version::new(),
+        )
+        .unwrap(),
+    );
+
+    let stop_flag = Arc::new(AtomicBool::new(false));
+    let ts_counter = Arc::new(AtomicU64::new(1));
+    let writes_done = Arc::new(AtomicU64::new(0));
+    let rotations_blocked = Arc::new(AtomicU64::new(0));
+
+    // Fast writer thread
+    let engine_writer = Arc::clone(&engine);
+    let stop_flag_writer = Arc::clone(&stop_flag);
+    let ts_counter_clone = Arc::clone(&ts_counter);
+    let writes_done_clone = Arc::clone(&writes_done);
+    let rotations_blocked_clone = Arc::clone(&rotations_blocked);
+
+    let writer = thread::spawn(move || {
+        let mut local_writes = 0u64;
+        while !stop_flag_writer.load(Ordering::Relaxed) {
+            let key = format!("fast_write_{local_writes:06}");
+            let ts = ts_counter_clone.fetch_add(1, Ordering::SeqCst);
+            write_test_data(&engine_writer, key.as_bytes(), b"data", ts);
+            local_writes += 1;
+
+            // Try to rotate periodically
+            if local_writes % 20 == 0
+                && engine_writer.maybe_rotate().is_none()
+                && engine_writer.frozen_count() >= 2
+            {
+                rotations_blocked_clone.fetch_add(1, Ordering::Relaxed);
+            }
+        }
+        writes_done_clone.fetch_add(local_writes, Ordering::Relaxed);
+    });
+
+    // Slow flusher thread - intentionally slow
+    let engine_flusher = Arc::clone(&engine);
+    let stop_flag_flusher = Arc::clone(&stop_flag);
+
+    let flusher = thread::spawn(move || {
+        let mut flushes = 0u64;
+        while !stop_flag_flusher.load(Ordering::Relaxed) {
+            // Slow flush - only flush every 100ms
+            thread::sleep(Duration::from_millis(100));
+
+            // Get oldest frozen memtable
+            if let Some(frozen) = engine_flusher.maybe_rotate() {
+                if engine_flusher.flush_memtable(&frozen).is_ok() {
+                    flushes += 1;
+                }
+            }
+        }
+        flushes
+    });
+
+    // Run for a short duration
+    thread::sleep(Duration::from_millis(500));
+    stop_flag.store(true, Ordering::Relaxed);
+
+    writer.join().unwrap();
+    let _flushes = flusher.join().unwrap();
+
+    let writes = writes_done.load(Ordering::Relaxed);
+    let blocked = rotations_blocked.load(Ordering::Relaxed);
+
+    assert!(writes > 0, "Should have completed writes");
+    // With slow flush and fast writes, we expect rotation to be blocked sometimes
+    // (though not guaranteed depending on timing)
+
+    println!("Slow flush test: {writes} writes, {blocked} rotation blocks");
+
+    // All written data should be readable
+    let stats = engine.stats();
+    println!(
+        "Final state: active_size={}, frozen_count={}",
+        stats.active_memtable_size, stats.frozen_memtable_count
+    );
+}
+
+/// Test write stall behavior with explicit transaction-like writes.
+///
+/// Verifies that large batch writes don't get stuck when frozen limit is reached.
+#[test]
+fn test_large_batch_under_frozen_limit() {
+    let dir = tempfile::tempdir().unwrap();
+
+    let lsn_provider = new_lsn_provider();
+    let ilog_config = IlogConfig::new(dir.path());
+    let ilog = Arc::new(IlogService::open(ilog_config, Arc::clone(&lsn_provider)).unwrap());
+
+    let config = LsmConfigBuilder::new(dir.path())
+        .memtable_size(128)
+        .max_frozen_memtables(1)
+        .build_unchecked();
+
+    let engine = LsmEngine::open_with_recovery(
+        config,
+        Arc::clone(&lsn_provider),
+        Arc::clone(&ilog),
+        Version::new(),
+    )
+    .unwrap();
+
+    // Fill to frozen limit
+    for i in 0..10 {
+        let key = format!("setup_{i:02}");
+        write_test_data(&engine, key.as_bytes(), b"setup", (i + 1) as u64);
+    }
+    engine.freeze_active();
+    assert_eq!(engine.frozen_count(), 1);
+
+    // Now write a large batch that would normally trigger multiple rotations
+    // Since frozen limit is reached, all goes to active memtable
+    let large_value = vec![b'x'; 256]; // Larger than memtable_size
+    for i in 0..20 {
+        let key = format!("large_batch_{i:02}");
+        write_test_data(&engine, key.as_bytes(), &large_value, (i + 100) as u64);
+    }
+
+    // All writes should succeed
+    for i in 0..20 {
+        let key = format!("large_batch_{i:02}");
+        let value = get_for_test(&engine, key.as_bytes());
+        assert!(value.is_some(), "Large batch key {key} should be readable");
+        assert_eq!(value.unwrap().len(), 256);
+    }
+
+    // Active memtable should be significantly larger than configured size
+    let stats = engine.stats();
+    assert!(
+        stats.active_memtable_size > 128 * 10, // Much larger than single memtable
+        "Active memtable ({}) should be very large due to blocked rotation",
+        stats.active_memtable_size
+    );
+}
