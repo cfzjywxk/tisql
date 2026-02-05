@@ -44,7 +44,7 @@
 
 use std::ops::Range;
 use std::sync::atomic::{AtomicU64, Ordering as AtomicOrdering};
-use std::sync::{Arc, RwLock};
+use std::sync::{Arc, RwLock, RwLockWriteGuard};
 
 #[cfg(feature = "failpoints")]
 use fail::fail_point;
@@ -142,6 +142,16 @@ pub struct LsmEngine {
 
     /// Optional ilog service for durable SST metadata.
     ilog: Option<Arc<IlogService>>,
+
+    /// Cached SuperVersion for atomic snapshot access.
+    ///
+    /// Readers call `get_super_version()` which clones this Arc.
+    /// Writers call `install_super_version()` after any state change
+    /// (rotate, flush, compact) to atomically update the snapshot.
+    ///
+    /// This ensures readers always get a consistent view of
+    /// (active, frozen, version) without race conditions.
+    current_sv: RwLock<Arc<SuperVersion>>,
 }
 
 impl LsmEngine {
@@ -165,16 +175,29 @@ impl LsmEngine {
         // Initialize next_sst_id from recovered version's max SST ID + 1
         let recovered_max_sst_id = version.next_sst_id();
 
+        // Create initial state and version_set
+        let initial_state = LsmState::new(1);
+        let version_set = VersionSet::new(version);
+
+        // Create initial SuperVersion
+        let initial_sv = Arc::new(SuperVersion::new(
+            Arc::clone(&initial_state.active),
+            initial_state.frozen.clone(),
+            version_set.current(),
+            0, // Initial sv_number
+        ));
+
         Ok(Self {
             config: Arc::new(config),
-            state: RwLock::new(LsmState::new(1)),
-            version_set: VersionSet::new(version),
+            state: RwLock::new(initial_state),
+            version_set,
             next_memtable_id: AtomicU64::new(2),
             next_sst_id: AtomicU64::new(recovered_max_sst_id),
             next_lsn: AtomicU64::new(1),
             sv_number: AtomicU64::new(1),
             lsn_provider: Some(lsn_provider),
             ilog: Some(ilog),
+            current_sv: RwLock::new(initial_sv),
         })
     }
 
@@ -244,27 +267,49 @@ impl LsmEngine {
     /// // sv provides consistent view for reading
     /// // Drop sv when done to allow GC
     /// ```
-    pub fn get_super_version(&self) -> SuperVersion {
-        // Atomically increment and get the new sv_number
-        let sv_num = self.sv_number.fetch_add(1, AtomicOrdering::Relaxed);
-
-        // Take snapshot of memtable state
-        let (active, frozen) = {
-            let state = self.state.read().unwrap();
-            (Arc::clone(&state.active), state.frozen.clone())
-        };
-
-        // Take snapshot of version (separate from memtable state)
-        let version = self.version_set.current();
-
-        SuperVersion::new(active, frozen, version, sv_num)
+    pub fn get_super_version(&self) -> Arc<SuperVersion> {
+        // Just clone the cached SuperVersion - always consistent
+        Arc::clone(&self.current_sv.read().unwrap())
     }
 
     /// Get the current SuperVersion number.
     ///
+    /// Returns the sv_number of the currently installed SuperVersion.
     /// Useful for checking if a SuperVersion is stale.
     pub fn current_sv_number(&self) -> u64 {
-        self.sv_number.load(AtomicOrdering::Relaxed)
+        self.current_sv.read().unwrap().sv_number
+    }
+
+    /// Install a new SuperVersion after state changes.
+    ///
+    /// Takes `RwLockWriteGuard` to **enforce at compile time** that the caller
+    /// holds the write lock. This prevents accidental calls without proper
+    /// synchronization.
+    ///
+    /// # Why Guard Instead of &LsmState?
+    ///
+    /// Using `&LsmState` would allow calling with a read lock reference,
+    /// which could cause race conditions. The guard type ensures:
+    /// 1. Caller holds exclusive access to state
+    /// 2. State modifications are complete before SV installation
+    /// 3. No other thread can see partial state
+    ///
+    /// Call this after:
+    /// - Memtable rotation (freeze_active)
+    /// - Flush completion
+    /// - Compaction completion
+    fn install_super_version(&self, state: &RwLockWriteGuard<'_, LsmState>) {
+        let sv_num = self.sv_number.fetch_add(1, AtomicOrdering::Relaxed);
+        let version = self.version_set.current();
+
+        let new_sv = Arc::new(SuperVersion::new(
+            Arc::clone(&state.active),
+            state.frozen.clone(),
+            version,
+            sv_num,
+        ));
+
+        *self.current_sv.write().unwrap() = new_sv;
     }
 
     /// Check if the active memtable should be rotated.
@@ -316,6 +361,9 @@ impl LsmEngine {
 
         // Add to frozen list (newest first)
         state.frozen.insert(0, Arc::clone(&old_active));
+
+        // Install new SuperVersion to reflect the rotation
+        self.install_super_version(&state);
 
         Some(old_active)
     }
@@ -387,15 +435,26 @@ impl LsmEngine {
         #[cfg(feature = "failpoints")]
         fail_point!("lsm_flush_after_ilog_commit");
 
-        // Phase 4: Update in-memory version (separate from memtable state)
-        let delta = ManifestDelta::flush(meta.clone(), max_memtable_lsn);
-        let new_version = self.version_set.apply_delta(&delta);
-
-        // Remove flushed memtable from frozen list (separate lock)
-        {
+        // Phase 4: Atomically update version + frozen + SuperVersion
+        //
+        // We hold state write lock during all three operations to ensure
+        // readers always get a consistent snapshot (no race between
+        // version update and frozen removal).
+        let new_version = {
             let mut state = self.state.write().unwrap();
+
+            // Update version
+            let delta = ManifestDelta::flush(meta.clone(), max_memtable_lsn);
+            let new_version = self.version_set.apply_delta(&delta);
+
+            // Remove flushed memtable from frozen list
             state.frozen.retain(|m| m.id() != memtable.id());
-        }
+
+            // Install new SuperVersion while still holding lock
+            self.install_super_version(&state);
+
+            new_version
+        };
 
         // Failpoint: crash after version update
         #[cfg(feature = "failpoints")]
@@ -512,6 +571,9 @@ impl LsmEngine {
 
         // Add to frozen list (newest first)
         state.frozen.insert(0, Arc::clone(&old_active));
+
+        // Install new SuperVersion to reflect the freeze
+        self.install_super_version(&state);
 
         Some(old_active)
     }
@@ -1920,16 +1982,29 @@ mod tests {
                 std::fs::create_dir_all(&sst_dir)?;
             }
 
+            // Create initial state and version_set
+            let initial_state = LsmState::new(1);
+            let version_set = VersionSet::new(Version::new());
+
+            // Create initial SuperVersion
+            let initial_sv = Arc::new(SuperVersion::new(
+                Arc::clone(&initial_state.active),
+                initial_state.frozen.clone(),
+                version_set.current(),
+                0, // Initial sv_number
+            ));
+
             Ok(Self {
                 config: Arc::new(config),
-                state: RwLock::new(LsmState::new(1)),
-                version_set: VersionSet::new(Version::new()),
+                state: RwLock::new(initial_state),
+                version_set,
                 next_memtable_id: AtomicU64::new(2),
                 next_sst_id: AtomicU64::new(1),
                 next_lsn: AtomicU64::new(1),
                 sv_number: AtomicU64::new(1),
                 lsn_provider: None,
                 ilog: None,
+                current_sv: RwLock::new(initial_sv),
             })
         }
     }
@@ -5751,7 +5826,8 @@ mod tests {
     fn test_super_version_snapshot_isolation() {
         let tmp = TempDir::new().unwrap();
         let config = LsmConfig::builder(tmp.path())
-            .memtable_size(1024 * 1024) // Large to prevent rotation
+            .memtable_size(100) // Small to trigger rotation
+            .max_frozen_memtables(4)
             .build()
             .unwrap();
         let engine = LsmEngine::open(config).unwrap();
@@ -5765,20 +5841,24 @@ mod tests {
         let sv1 = engine.get_super_version();
         let sv1_num = sv1.sv_number;
 
-        // Write more data AFTER sv1
-        let mut batch = new_batch(200);
-        batch.put(b"key2".to_vec(), b"value2".to_vec());
-        engine.write_batch(batch).unwrap();
+        // Write enough data to trigger rotation (state change)
+        for i in 0..5 {
+            let mut batch = new_batch((200 + i) as u64);
+            let key = format!("key_{i:04}");
+            let value = vec![b'x'; 50];
+            batch.put(key.into_bytes(), value);
+            engine.write_batch(batch).unwrap();
+        }
 
-        // Take snapshot sv2
+        // Take snapshot sv2 (after rotation)
         let sv2 = engine.get_super_version();
         let sv2_num = sv2.sv_number;
 
-        // sv2 should have a different number than sv1
-        assert_ne!(sv1_num, sv2_num);
+        // sv2 should have a different number than sv1 (rotation happened)
+        assert_ne!(sv1_num, sv2_num, "sv_number should change after rotation");
 
-        // Both snapshots point to same active memtable (no rotation)
-        assert_eq!(sv1.active.id(), sv2.active.id());
+        // sv1 references old active memtable, sv2 references new one
+        assert_ne!(sv1.active.id(), sv2.active.id());
 
         // sv1 is now stale relative to current
         assert!(!sv1.is_current(engine.current_sv_number()));
@@ -5927,39 +6007,63 @@ mod tests {
 
         assert_eq!(snapshot_count.load(Ordering::Relaxed), 1000);
 
-        // Current sv_number should be >= 1000 (we started at 1, incremented 1000 times)
+        // With atomic SuperVersion installation, sv_number only increments on state changes.
+        // Since no rotation/flush happened, sv_number should still be 0 (initial).
+        // This test verifies concurrent access is safe, not sv_number counting.
         let final_sv_num = engine.current_sv_number();
-        assert!(final_sv_num >= 1000, "sv_number={final_sv_num}");
+        assert_eq!(
+            final_sv_num, 0,
+            "sv_number should still be 0 (no state changes)"
+        );
     }
 
     #[test]
     fn test_super_version_staleness() {
         let tmp = TempDir::new().unwrap();
-        let config = test_config(tmp.path());
+        let config = LsmConfig::builder(tmp.path())
+            .memtable_size(100) // Small to trigger rotation
+            .max_frozen_memtables(4)
+            .build()
+            .unwrap();
         let engine = LsmEngine::open(config).unwrap();
 
         // Take first snapshot
         let sv1 = engine.get_super_version();
 
-        // sv1 is not current (because get_super_version increments before checking)
-        // Actually, sv1.sv_number < current because we incremented
-        let current = engine.current_sv_number();
+        // With atomic SuperVersion installation, sv1 IS current until state changes
         assert!(
-            !sv1.is_current(current),
-            "sv1 should be stale immediately after get"
+            sv1.is_current(engine.current_sv_number()),
+            "sv1 should be current (no state changes yet)"
         );
 
-        // Take another snapshot
+        // Take another snapshot without state change - should be same
         let sv2 = engine.get_super_version();
+        assert_eq!(
+            sv1.sv_number, sv2.sv_number,
+            "same sv_number without state change"
+        );
 
-        // sv1 is still stale
+        // Trigger rotation by writing enough data
+        for i in 0..5 {
+            let mut batch = new_batch((100 + i) as u64);
+            let key = format!("key_{i:04}");
+            let value = vec![b'x'; 50];
+            batch.put(key.into_bytes(), value);
+            engine.write_batch(batch).unwrap();
+        }
+
+        // Now take another snapshot - should have new sv_number
+        let sv3 = engine.get_super_version();
+
+        // sv1 and sv2 are now stale (rotation happened)
         assert!(!sv1.is_current(engine.current_sv_number()));
-
-        // sv2 is also stale (same reason)
         assert!(!sv2.is_current(engine.current_sv_number()));
 
-        // But sv2 has a higher number than sv1
-        assert!(sv2.sv_number > sv1.sv_number);
+        // sv3 is current
+        assert!(sv3.is_current(engine.current_sv_number()));
+
+        // sv3 has a higher number than sv1
+        assert!(sv3.sv_number > sv1.sv_number);
     }
 
     #[test]
