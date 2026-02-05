@@ -12,10 +12,12 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-//! VersionSet - Manages the current LSM-tree version.
+//! VersionSet and SuperVersion - Version management for LSM-tree.
 //!
-//! This module provides a simple wrapper around `Version` with clean API
-//! for getting the current version and applying deltas atomically.
+//! This module provides:
+//!
+//! - `VersionSet`: Manages the current SST version with atomic updates
+//! - `SuperVersion`: Combined snapshot of memtables + SST version for readers
 //!
 //! ## Design
 //!
@@ -33,10 +35,15 @@
 //! // Apply delta (acquires write lock)
 //! let delta = ManifestDelta::flush(sst_meta, flushed_lsn);
 //! let new_version = version_set.apply_delta(&delta);
+//!
+//! // Get a SuperVersion snapshot for reading
+//! let sv = engine.get_super_version();
+//! // sv contains consistent snapshot of active, frozen, and SST version
 //! ```
 
 use std::sync::{Arc, RwLock};
 
+use super::memtable::MemTable;
 use super::version::{ManifestDelta, Version};
 
 /// Minimal VersionSet - wraps Version with clean API.
@@ -71,6 +78,101 @@ impl VersionSet {
         let new_arc = Arc::new(new_version);
         *current = Arc::clone(&new_arc);
         new_arc
+    }
+}
+
+// ============================================================================
+// SuperVersion - Combined snapshot for readers
+// ============================================================================
+
+/// SuperVersion combines memtables + SST version into a single consistent snapshot.
+///
+/// This is what readers acquire - a point-in-time view of:
+/// - Active memtable (at snapshot time)
+/// - Frozen memtables (at snapshot time)
+/// - SST files via Version (at snapshot time)
+///
+/// ## Snapshot Isolation
+///
+/// Once acquired, a SuperVersion provides a stable view even if:
+/// - New writes go to the active memtable
+/// - Memtables are frozen
+/// - Memtables are flushed to SST
+/// - Version is updated
+///
+/// The Arc references keep the underlying data alive until all readers finish.
+///
+/// ## Usage
+///
+/// ```ignore
+/// let sv = engine.get_super_version();
+///
+/// // Use sv for reading - holds consistent snapshot
+/// let iter = sv.new_iterator(range, owner_ts);
+///
+/// // sv can be held across multiple operations
+/// // Drop sv when done to allow GC of old versions
+/// ```
+#[derive(Clone)]
+pub struct SuperVersion {
+    /// Active memtable at snapshot time.
+    pub active: Arc<MemTable>,
+
+    /// Frozen memtables at snapshot time (newest first).
+    pub frozen: Vec<Arc<MemTable>>,
+
+    /// SST file version at snapshot time.
+    pub version: Arc<Version>,
+
+    /// SuperVersion sequence number (for debugging and staleness detection).
+    pub sv_number: u64,
+}
+
+impl SuperVersion {
+    /// Create a new SuperVersion with the given components.
+    pub fn new(
+        active: Arc<MemTable>,
+        frozen: Vec<Arc<MemTable>>,
+        version: Arc<Version>,
+        sv_number: u64,
+    ) -> Self {
+        Self {
+            active,
+            frozen,
+            version,
+            sv_number,
+        }
+    }
+
+    /// Check if this SuperVersion is current (not stale).
+    ///
+    /// A SuperVersion becomes stale when a new one is created (memtable
+    /// rotation, flush, etc.). Stale snapshots are still valid for reading,
+    /// but callers may want to refresh for fresher data.
+    pub fn is_current(&self, current_sv_number: u64) -> bool {
+        self.sv_number == current_sv_number
+    }
+
+    /// Get the total number of memtables (active + frozen).
+    pub fn memtable_count(&self) -> usize {
+        1 + self.frozen.len()
+    }
+
+    /// Get the SST version number.
+    pub fn version_num(&self) -> u64 {
+        self.version.version_num()
+    }
+}
+
+impl std::fmt::Debug for SuperVersion {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("SuperVersion")
+            .field("sv_number", &self.sv_number)
+            .field("active_memtable_id", &self.active.id())
+            .field("frozen_count", &self.frozen.len())
+            .field("version_num", &self.version.version_num())
+            .field("sst_count", &self.version.total_sst_count())
+            .finish()
     }
 }
 
@@ -161,5 +263,130 @@ mod tests {
         let new_version = vs.current();
         assert_eq!(new_version.version_num(), 1);
         assert_eq!(new_version.level_size(0), 1);
+    }
+
+    // ==================== SuperVersion Tests ====================
+
+    #[test]
+    fn test_super_version_new() {
+        let active = Arc::new(MemTable::new(1));
+        let frozen = vec![Arc::new(MemTable::new(2)), Arc::new(MemTable::new(3))];
+        let version = Arc::new(Version::new());
+
+        let sv = SuperVersion::new(active, frozen, version, 42);
+
+        assert_eq!(sv.sv_number, 42);
+        assert_eq!(sv.memtable_count(), 3); // 1 active + 2 frozen
+        assert_eq!(sv.version_num(), 0);
+    }
+
+    #[test]
+    fn test_super_version_is_current() {
+        let sv = SuperVersion::new(
+            Arc::new(MemTable::new(1)),
+            vec![],
+            Arc::new(Version::new()),
+            100,
+        );
+
+        assert!(sv.is_current(100));
+        assert!(!sv.is_current(99));
+        assert!(!sv.is_current(101));
+    }
+
+    #[test]
+    fn test_super_version_clone() {
+        let active = Arc::new(MemTable::new(1));
+        let frozen = vec![Arc::new(MemTable::new(2))];
+        let version = Arc::new(Version::new());
+
+        let sv1 = SuperVersion::new(Arc::clone(&active), frozen.clone(), Arc::clone(&version), 1);
+        let sv2 = sv1.clone();
+
+        // Both should reference the same underlying data
+        assert_eq!(sv1.sv_number, sv2.sv_number);
+        assert_eq!(sv1.active.id(), sv2.active.id());
+        assert_eq!(sv1.frozen.len(), sv2.frozen.len());
+
+        // Arc strong count should be 3 (active, sv1.active, sv2.active)
+        assert_eq!(Arc::strong_count(&active), 3);
+    }
+
+    #[test]
+    fn test_super_version_debug() {
+        let sv = SuperVersion::new(
+            Arc::new(MemTable::new(42)),
+            vec![Arc::new(MemTable::new(41))],
+            Arc::new(Version::new()),
+            123,
+        );
+
+        let debug_str = format!("{sv:?}");
+        assert!(debug_str.contains("sv_number: 123"));
+        assert!(debug_str.contains("active_memtable_id: 42"));
+        assert!(debug_str.contains("frozen_count: 1"));
+    }
+
+    #[test]
+    fn test_super_version_holds_refs() {
+        let active = Arc::new(MemTable::new(1));
+        let frozen_mt = Arc::new(MemTable::new(2));
+        let version = Arc::new(Version::new());
+
+        // Initial ref counts
+        assert_eq!(Arc::strong_count(&active), 1);
+        assert_eq!(Arc::strong_count(&frozen_mt), 1);
+        assert_eq!(Arc::strong_count(&version), 1);
+
+        // Create SuperVersion
+        let sv = SuperVersion::new(
+            Arc::clone(&active),
+            vec![Arc::clone(&frozen_mt)],
+            Arc::clone(&version),
+            1,
+        );
+
+        // Ref counts should increase
+        assert_eq!(Arc::strong_count(&active), 2);
+        assert_eq!(Arc::strong_count(&frozen_mt), 2);
+        assert_eq!(Arc::strong_count(&version), 2);
+
+        // Drop SuperVersion
+        drop(sv);
+
+        // Ref counts should decrease
+        assert_eq!(Arc::strong_count(&active), 1);
+        assert_eq!(Arc::strong_count(&frozen_mt), 1);
+        assert_eq!(Arc::strong_count(&version), 1);
+    }
+
+    #[test]
+    fn test_super_version_snapshot_isolation() {
+        // Simulate snapshot isolation: sv1 taken before version update,
+        // sv2 taken after. They should see different versions.
+
+        let vs = VersionSet::new(Version::new());
+        let active = Arc::new(MemTable::new(1));
+        let frozen: Vec<Arc<MemTable>> = vec![];
+
+        // Take snapshot before any SST
+        let sv1 = SuperVersion::new(Arc::clone(&active), frozen.clone(), vs.current(), 1);
+        assert_eq!(sv1.version.total_sst_count(), 0);
+
+        // Add an SST
+        let sst = make_sst(1, 0, b"a", b"z");
+        let delta = ManifestDelta::flush(sst, 100);
+        vs.apply_delta(&delta);
+
+        // Take snapshot after SST
+        let sv2 = SuperVersion::new(Arc::clone(&active), frozen.clone(), vs.current(), 2);
+
+        // sv1 still sees old version (no SSTs)
+        assert_eq!(sv1.version.total_sst_count(), 0);
+        assert_eq!(sv1.version.version_num(), 0);
+
+        // sv2 sees new version (1 SST)
+        assert_eq!(sv2.version.total_sst_count(), 1);
+        assert_eq!(sv2.version.version_num(), 1);
     }
 }

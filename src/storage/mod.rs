@@ -89,7 +89,7 @@ pub use config::{
 
 // Re-export version management
 pub use version::{ManifestDelta, Version, VersionBuilder, MAX_LEVELS};
-pub use version_set::VersionSet;
+pub use version_set::{SuperVersion, VersionSet};
 
 // Re-export LSM engine
 pub use lsm::{LsmEngine, LsmStats, TieredMergeIterator};

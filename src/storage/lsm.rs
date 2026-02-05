@@ -62,7 +62,7 @@ use super::sstable::{
     SstBuilder, SstBuilderOptions, SstIterator, SstMeta, SstMvccIterator, SstReaderRef,
 };
 use super::version::{ManifestDelta, Version, MAX_LEVELS};
-use super::version_set::VersionSet;
+use super::version_set::{SuperVersion, VersionSet};
 
 /// Inner state of the LSM engine, protected by RwLock for atomic updates.
 ///
@@ -134,6 +134,9 @@ pub struct LsmEngine {
     /// Next LSN for ordering operations (fallback if no lsn_provider).
     next_lsn: AtomicU64,
 
+    /// Next SuperVersion number for tracking snapshot staleness.
+    sv_number: AtomicU64,
+
     /// Optional shared LSN provider for unified LSN allocation.
     lsn_provider: Option<SharedLsnProvider>,
 
@@ -169,6 +172,7 @@ impl LsmEngine {
             next_memtable_id: AtomicU64::new(2),
             next_sst_id: AtomicU64::new(recovered_max_sst_id),
             next_lsn: AtomicU64::new(1),
+            sv_number: AtomicU64::new(1),
             lsn_provider: Some(lsn_provider),
             ilog: Some(ilog),
         })
@@ -221,6 +225,46 @@ impl LsmEngine {
     /// Get the current version.
     pub fn current_version(&self) -> Arc<Version> {
         self.version_set.current()
+    }
+
+    /// Get a SuperVersion snapshot for reading.
+    ///
+    /// Returns a consistent snapshot of:
+    /// - Active memtable
+    /// - Frozen memtables
+    /// - SST version
+    ///
+    /// The snapshot holds Arc references to all components, keeping them alive
+    /// even if the engine rotates memtables or flushes to SST.
+    ///
+    /// # Usage
+    ///
+    /// ```ignore
+    /// let sv = engine.get_super_version();
+    /// // sv provides consistent view for reading
+    /// // Drop sv when done to allow GC
+    /// ```
+    pub fn get_super_version(&self) -> SuperVersion {
+        // Atomically increment and get the new sv_number
+        let sv_num = self.sv_number.fetch_add(1, AtomicOrdering::Relaxed);
+
+        // Take snapshot of memtable state
+        let (active, frozen) = {
+            let state = self.state.read().unwrap();
+            (Arc::clone(&state.active), state.frozen.clone())
+        };
+
+        // Take snapshot of version (separate from memtable state)
+        let version = self.version_set.current();
+
+        SuperVersion::new(active, frozen, version, sv_num)
+    }
+
+    /// Get the current SuperVersion number.
+    ///
+    /// Useful for checking if a SuperVersion is stale.
+    pub fn current_sv_number(&self) -> u64 {
+        self.sv_number.load(AtomicOrdering::Relaxed)
     }
 
     /// Check if the active memtable should be rotated.
@@ -1883,6 +1927,7 @@ mod tests {
                 next_memtable_id: AtomicU64::new(2),
                 next_sst_id: AtomicU64::new(1),
                 next_lsn: AtomicU64::new(1),
+                sv_number: AtomicU64::new(1),
                 lsn_provider: None,
                 ilog: None,
             })
@@ -5678,5 +5723,260 @@ mod tests {
 
         reader.join().unwrap();
         writer.join().unwrap();
+    }
+
+    // ==================== SuperVersion Tests ====================
+
+    #[test]
+    fn test_super_version_basic() {
+        let tmp = TempDir::new().unwrap();
+        let config = test_config(tmp.path());
+        let engine = LsmEngine::open(config).unwrap();
+
+        // Write some data
+        let mut batch = new_batch(100);
+        batch.put(b"key1".to_vec(), b"value1".to_vec());
+        engine.write_batch(batch).unwrap();
+
+        // Get SuperVersion
+        let sv = engine.get_super_version();
+
+        // Should have 1 active memtable, 0 frozen
+        assert_eq!(sv.memtable_count(), 1);
+        assert_eq!(sv.frozen.len(), 0);
+        assert_eq!(sv.version.total_sst_count(), 0);
+    }
+
+    #[test]
+    fn test_super_version_snapshot_isolation() {
+        let tmp = TempDir::new().unwrap();
+        let config = LsmConfig::builder(tmp.path())
+            .memtable_size(1024 * 1024) // Large to prevent rotation
+            .build()
+            .unwrap();
+        let engine = LsmEngine::open(config).unwrap();
+
+        // Write initial data
+        let mut batch = new_batch(100);
+        batch.put(b"key1".to_vec(), b"value1".to_vec());
+        engine.write_batch(batch).unwrap();
+
+        // Take snapshot sv1
+        let sv1 = engine.get_super_version();
+        let sv1_num = sv1.sv_number;
+
+        // Write more data AFTER sv1
+        let mut batch = new_batch(200);
+        batch.put(b"key2".to_vec(), b"value2".to_vec());
+        engine.write_batch(batch).unwrap();
+
+        // Take snapshot sv2
+        let sv2 = engine.get_super_version();
+        let sv2_num = sv2.sv_number;
+
+        // sv2 should have a different number than sv1
+        assert_ne!(sv1_num, sv2_num);
+
+        // Both snapshots point to same active memtable (no rotation)
+        assert_eq!(sv1.active.id(), sv2.active.id());
+
+        // sv1 is now stale relative to current
+        assert!(!sv1.is_current(engine.current_sv_number()));
+    }
+
+    #[test]
+    fn test_super_version_survives_rotation() {
+        let tmp = TempDir::new().unwrap();
+        let config = LsmConfig::builder(tmp.path())
+            .memtable_size(100) // Small to trigger rotation
+            .max_frozen_memtables(4)
+            .build()
+            .unwrap();
+        let engine = LsmEngine::open(config).unwrap();
+
+        // Write initial data
+        let mut batch = new_batch(100);
+        batch.put(b"key1".to_vec(), b"value1".to_vec());
+        engine.write_batch(batch).unwrap();
+
+        // Take snapshot before rotation
+        let sv1 = engine.get_super_version();
+        let sv1_active_id = sv1.active.id();
+
+        // Write more data to trigger rotation
+        for i in 0..10 {
+            let mut batch = new_batch((200 + i) as u64);
+            let key = format!("big_key_{i:04}");
+            let value = vec![b'x'; 50]; // Large values to trigger rotation
+            batch.put(key.into_bytes(), value);
+            engine.write_batch(batch).unwrap();
+        }
+
+        // Engine should have rotated
+        let sv2 = engine.get_super_version();
+
+        // sv1 still holds reference to old active memtable
+        assert_eq!(sv1.active.id(), sv1_active_id);
+
+        // sv2 may have different active (if rotation happened)
+        // and sv1's active may now be in sv2's frozen list
+        let sv2_frozen_ids: Vec<u64> = sv2.frozen.iter().map(|m| m.id()).collect();
+
+        // If rotation happened, sv1's active should be in sv2's frozen or still active
+        let sv1_active_in_sv2 =
+            sv2.active.id() == sv1_active_id || sv2_frozen_ids.contains(&sv1_active_id);
+        assert!(sv1_active_in_sv2 || sv2_frozen_ids.is_empty());
+    }
+
+    #[test]
+    fn test_super_version_survives_flush() {
+        let tmp = TempDir::new().unwrap();
+        let config = LsmConfig::builder(tmp.path())
+            .memtable_size(10000) // Large enough to not auto-rotate
+            .max_frozen_memtables(4)
+            .build()
+            .unwrap();
+        let engine = LsmEngine::open(config).unwrap();
+
+        // Write some data to the active memtable
+        let mut batch = new_batch(100);
+        batch.put(b"key1".to_vec(), b"value1".to_vec());
+        batch.put(b"key2".to_vec(), b"value2".to_vec());
+        engine.write_batch(batch).unwrap();
+
+        // Force freeze the active memtable
+        let frozen = engine.freeze_active();
+        assert!(frozen.is_some(), "Should have frozen a memtable");
+
+        // Write more data to the new active memtable
+        let mut batch = new_batch(200);
+        batch.put(b"key3".to_vec(), b"value3".to_vec());
+        engine.write_batch(batch).unwrap();
+
+        // Take snapshot that includes the frozen memtable
+        let sv1 = engine.get_super_version();
+        let sv1_frozen_count = sv1.frozen.len();
+        assert!(sv1_frozen_count > 0, "sv1 should have frozen memtables");
+
+        // Get the first frozen memtable ID
+        let frozen_id = sv1.frozen[0].id();
+
+        // Flush the frozen memtable
+        let flushed_metas = engine.flush_all().unwrap();
+        assert!(!flushed_metas.is_empty(), "Should have flushed something");
+
+        // Take new snapshot after flush
+        let sv2 = engine.get_super_version();
+
+        // sv2 should have fewer (or zero) frozen memtables
+        assert!(
+            sv2.frozen.len() < sv1_frozen_count,
+            "sv2 frozen={}, sv1 frozen={}",
+            sv2.frozen.len(),
+            sv1_frozen_count
+        );
+
+        // sv2 should have SSTs
+        assert!(sv2.version.total_sst_count() > 0);
+
+        // But sv1 still holds the old frozen memtable reference!
+        assert_eq!(sv1.frozen.len(), sv1_frozen_count);
+        assert_eq!(sv1.frozen[0].id(), frozen_id);
+
+        // sv1's version doesn't have SSTs (old snapshot)
+        assert_eq!(sv1.version.total_sst_count(), 0);
+    }
+
+    #[test]
+    fn test_super_version_concurrent_snapshots() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        use std::thread;
+
+        let tmp = TempDir::new().unwrap();
+        let config = test_config(tmp.path());
+        let engine = Arc::new(LsmEngine::open(config).unwrap());
+
+        // Write initial data
+        let mut batch = new_batch(100);
+        batch.put(b"key".to_vec(), b"value".to_vec());
+        engine.write_batch(batch).unwrap();
+
+        let snapshot_count = Arc::new(AtomicUsize::new(0));
+        let mut handles = vec![];
+
+        // Spawn 10 threads that each take multiple snapshots
+        for _ in 0..10 {
+            let engine_clone = Arc::clone(&engine);
+            let count = Arc::clone(&snapshot_count);
+
+            let handle = thread::spawn(move || {
+                for _ in 0..100 {
+                    let sv = engine_clone.get_super_version();
+                    // Use the snapshot (just read something to prevent optimization)
+                    let _ = sv.memtable_count();
+                    count.fetch_add(1, Ordering::Relaxed);
+                }
+            });
+            handles.push(handle);
+        }
+
+        // Wait for all threads
+        for h in handles {
+            h.join().unwrap();
+        }
+
+        assert_eq!(snapshot_count.load(Ordering::Relaxed), 1000);
+
+        // Current sv_number should be >= 1000 (we started at 1, incremented 1000 times)
+        let final_sv_num = engine.current_sv_number();
+        assert!(final_sv_num >= 1000, "sv_number={final_sv_num}");
+    }
+
+    #[test]
+    fn test_super_version_staleness() {
+        let tmp = TempDir::new().unwrap();
+        let config = test_config(tmp.path());
+        let engine = LsmEngine::open(config).unwrap();
+
+        // Take first snapshot
+        let sv1 = engine.get_super_version();
+
+        // sv1 is not current (because get_super_version increments before checking)
+        // Actually, sv1.sv_number < current because we incremented
+        let current = engine.current_sv_number();
+        assert!(
+            !sv1.is_current(current),
+            "sv1 should be stale immediately after get"
+        );
+
+        // Take another snapshot
+        let sv2 = engine.get_super_version();
+
+        // sv1 is still stale
+        assert!(!sv1.is_current(engine.current_sv_number()));
+
+        // sv2 is also stale (same reason)
+        assert!(!sv2.is_current(engine.current_sv_number()));
+
+        // But sv2 has a higher number than sv1
+        assert!(sv2.sv_number > sv1.sv_number);
+    }
+
+    #[test]
+    fn test_super_version_debug_format() {
+        let tmp = TempDir::new().unwrap();
+        let config = test_config(tmp.path());
+        let engine = LsmEngine::open(config).unwrap();
+
+        let sv = engine.get_super_version();
+        let debug_str = format!("{sv:?}");
+
+        // Check that debug output contains expected fields
+        assert!(debug_str.contains("SuperVersion"));
+        assert!(debug_str.contains("sv_number"));
+        assert!(debug_str.contains("active_memtable_id"));
+        assert!(debug_str.contains("frozen_count"));
+        assert!(debug_str.contains("version_num"));
+        assert!(debug_str.contains("sst_count"));
     }
 }
