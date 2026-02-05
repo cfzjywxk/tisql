@@ -52,6 +52,7 @@
 
 pub mod compaction;
 pub mod config;
+pub mod flush_scheduler;
 pub mod ilog;
 pub mod lsm;
 pub mod memtable;
@@ -93,6 +94,9 @@ pub use version_set::{SuperVersion, VersionSet};
 
 // Re-export LSM engine
 pub use lsm::{LsmEngine, LsmStats, TieredMergeIterator};
+
+// Re-export flush scheduler
+pub use flush_scheduler::FlushScheduler;
 
 // Re-export compaction types
 pub use compaction::{CompactionExecutor, CompactionPicker, CompactionTask, MergeIterator};
