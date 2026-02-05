@@ -59,6 +59,7 @@ pub mod mvcc;
 pub mod recovery;
 pub mod sstable;
 pub mod version;
+pub mod version_set;
 
 // ============================================================================
 // Storage Implementation
@@ -88,6 +89,7 @@ pub use config::{
 
 // Re-export version management
 pub use version::{ManifestDelta, Version, VersionBuilder, MAX_LEVELS};
+pub use version_set::VersionSet;
 
 // Re-export LSM engine
 pub use lsm::{LsmEngine, LsmStats, TieredMergeIterator};

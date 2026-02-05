@@ -62,17 +62,18 @@ use super::sstable::{
     SstBuilder, SstBuilderOptions, SstIterator, SstMeta, SstMvccIterator, SstReaderRef,
 };
 use super::version::{ManifestDelta, Version, MAX_LEVELS};
+use super::version_set::VersionSet;
 
 /// Inner state of the LSM engine, protected by RwLock for atomic updates.
+///
+/// Note: Version is managed separately via `LsmEngine::version_set` to allow
+/// independent locking of memtable state and version state.
 struct LsmState {
     /// Active memtable accepting writes.
     active: Arc<MemTable>,
 
     /// Frozen memtables awaiting flush, ordered newest first.
     frozen: Vec<Arc<MemTable>>,
-
-    /// Current version with SST metadata.
-    version: Arc<Version>,
 }
 
 impl LsmState {
@@ -80,7 +81,6 @@ impl LsmState {
         Self {
             active: Arc::new(MemTable::new(memtable_id)),
             frozen: Vec::new(),
-            version: Arc::new(Version::new()),
         }
     }
 }
@@ -118,8 +118,11 @@ pub struct LsmEngine {
     /// Configuration.
     config: Arc<LsmConfig>,
 
-    /// Engine state (active/frozen memtables, version).
+    /// Engine state (active/frozen memtables).
     state: RwLock<LsmState>,
+
+    /// Version management (separate from memtable state).
+    version_set: VersionSet,
 
     /// Next memtable ID.
     next_memtable_id: AtomicU64,
@@ -156,15 +159,13 @@ impl LsmEngine {
             std::fs::create_dir_all(&sst_dir)?;
         }
 
-        // Start with recovered version
-        let mut state = LsmState::new(1);
         // Initialize next_sst_id from recovered version's max SST ID + 1
         let recovered_max_sst_id = version.next_sst_id();
-        state.version = Arc::new(version);
 
         Ok(Self {
             config: Arc::new(config),
-            state: RwLock::new(state),
+            state: RwLock::new(LsmState::new(1)),
+            version_set: VersionSet::new(version),
             next_memtable_id: AtomicU64::new(2),
             next_sst_id: AtomicU64::new(recovered_max_sst_id),
             next_lsn: AtomicU64::new(1),
@@ -219,8 +220,7 @@ impl LsmEngine {
 
     /// Get the current version.
     pub fn current_version(&self) -> Arc<Version> {
-        let state = self.state.read().unwrap();
-        Arc::clone(&state.version)
+        self.version_set.current()
     }
 
     /// Check if the active memtable should be rotated.
@@ -343,15 +343,15 @@ impl LsmEngine {
         #[cfg(feature = "failpoints")]
         fail_point!("lsm_flush_after_ilog_commit");
 
-        // Phase 4: Update in-memory version
+        // Phase 4: Update in-memory version (separate from memtable state)
         let delta = ManifestDelta::flush(meta.clone(), max_memtable_lsn);
+        let new_version = self.version_set.apply_delta(&delta);
 
-        let mut state = self.state.write().unwrap();
-        let new_version = state.version.apply(&delta);
-        state.version = Arc::new(new_version);
-
-        // Remove flushed memtable from frozen list
-        state.frozen.retain(|m| m.id() != memtable.id());
+        // Remove flushed memtable from frozen list (separate lock)
+        {
+            let mut state = self.state.write().unwrap();
+            state.frozen.retain(|m| m.id() != memtable.id());
+        }
 
         // Failpoint: crash after version update
         #[cfg(feature = "failpoints")]
@@ -360,7 +360,7 @@ impl LsmEngine {
         // Check if checkpoint needed
         if let Some(ref ilog) = self.ilog {
             if ilog.needs_checkpoint() {
-                ilog.write_checkpoint(&state.version)?;
+                ilog.write_checkpoint(&new_version)?;
             }
         }
 
@@ -511,7 +511,7 @@ impl LsmEngine {
     /// Get statistics about the engine.
     pub fn stats(&self) -> LsmStats {
         let state = self.state.read().unwrap();
-        let version = &state.version;
+        let version = self.version_set.current();
 
         LsmStats {
             active_memtable_size: state.active.approximate_size(),
@@ -1639,14 +1639,13 @@ impl StorageEngine for LsmEngine {
 
         // Snapshot the state under read lock, then release the lock.
         // We clone Arc references so iterators can outlive the lock.
-        let (active, frozen, version) = {
+        let (active, frozen) = {
             let state = self.state.read().unwrap();
-            (
-                Arc::clone(&state.active),
-                state.frozen.clone(),
-                Arc::clone(&state.version),
-            )
+            (Arc::clone(&state.active), state.frozen.clone())
         };
+
+        // Get version snapshot (separate from memtable state)
+        let version = self.version_set.current();
 
         let sst_dir = self.config.sst_dir();
         let mut merge_iter = TieredMergeIterator::new();
@@ -1880,6 +1879,7 @@ mod tests {
             Ok(Self {
                 config: Arc::new(config),
                 state: RwLock::new(LsmState::new(1)),
+                version_set: VersionSet::new(Version::new()),
                 next_memtable_id: AtomicU64::new(2),
                 next_sst_id: AtomicU64::new(1),
                 next_lsn: AtomicU64::new(1),
