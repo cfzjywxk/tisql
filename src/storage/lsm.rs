@@ -42,6 +42,7 @@
 //! - Flush and compaction run in background threads
 //! - Version changes are atomic (swap pointer)
 
+use std::collections::VecDeque;
 use std::ops::Range;
 use std::sync::atomic::{AtomicU64, Ordering as AtomicOrdering};
 use std::sync::{Arc, RwLock, RwLockWriteGuard};
@@ -72,15 +73,15 @@ struct LsmState {
     /// Active memtable accepting writes.
     active: Arc<MemTable>,
 
-    /// Frozen memtables awaiting flush, ordered newest first.
-    frozen: Vec<Arc<MemTable>>,
+    /// Frozen memtables awaiting flush, ordered oldest first (newest at back).
+    frozen: VecDeque<Arc<MemTable>>,
 }
 
 impl LsmState {
     fn new(memtable_id: u64) -> Self {
         Self {
             active: Arc::new(MemTable::new(memtable_id)),
-            frozen: Vec::new(),
+            frozen: VecDeque::new(),
         }
     }
 }
@@ -359,8 +360,8 @@ impl LsmEngine {
         let new_id = self.alloc_memtable_id();
         state.active = Arc::new(MemTable::new(new_id));
 
-        // Add to frozen list (newest first)
-        state.frozen.insert(0, Arc::clone(&old_active));
+        // Add to frozen list (newest at back)
+        state.frozen.push_back(Arc::clone(&old_active));
 
         // Install new SuperVersion to reflect the rotation
         self.install_super_version(&state);
@@ -435,25 +436,28 @@ impl LsmEngine {
         #[cfg(feature = "failpoints")]
         fail_point!("lsm_flush_after_ilog_commit");
 
-        // Phase 4: Atomically update version + frozen + SuperVersion
+        // Phase 4: Update version, then atomically update frozen + SuperVersion.
         //
-        // We hold state write lock during all three operations to ensure
-        // readers always get a consistent snapshot (no race between
-        // version update and frozen removal).
-        let new_version = {
-            let mut state = self.state.write().unwrap();
+        // apply_delta is done outside the state write lock to reduce contention.
+        // This is safe because readers that snapshot state and version separately
+        // may momentarily see the flushed memtable AND the new SST (redundant but
+        // correct — get_at short-circuits on memtable hit, merge iterator deduplicates).
+        // The dangerous direction (data in neither) cannot happen since version is
+        // updated before the memtable is removed from frozen.
+        //
+        // install_super_version reads version_set.current() inside the state lock,
+        // so SV readers always get a consistent (frozen, version) pair.
+        let delta = ManifestDelta::flush(meta.clone(), max_memtable_lsn);
+        let new_version = self.version_set.apply_delta(&delta);
 
-            // Update version
-            let delta = ManifestDelta::flush(meta.clone(), max_memtable_lsn);
-            let new_version = self.version_set.apply_delta(&delta);
+        {
+            let mut state = self.state.write().unwrap();
 
             // Remove flushed memtable from frozen list
             state.frozen.retain(|m| m.id() != memtable.id());
 
             // Install new SuperVersion while still holding lock
             self.install_super_version(&state);
-
-            new_version
         };
 
         // Failpoint: crash after version update
@@ -569,8 +573,8 @@ impl LsmEngine {
         let new_id = self.alloc_memtable_id();
         state.active = Arc::new(MemTable::new(new_id));
 
-        // Add to frozen list (newest first)
-        state.frozen.insert(0, Arc::clone(&old_active));
+        // Add to frozen list (newest at back)
+        state.frozen.push_back(Arc::clone(&old_active));
 
         // Install new SuperVersion to reflect the freeze
         self.install_super_version(&state);
@@ -588,7 +592,7 @@ impl LsmEngine {
             // Get next frozen memtable to flush
             let frozen = {
                 let state = self.state.read().unwrap();
-                state.frozen.last().cloned() // Oldest first
+                state.frozen.front().cloned() // Oldest first
             };
 
             match frozen {
@@ -663,8 +667,8 @@ impl LsmEngine {
             };
         }
 
-        // Check frozen memtables (newest first)
-        for frozen in &state.frozen {
+        // Check frozen memtables (newest first = iterate from back)
+        for frozen in state.frozen.iter().rev() {
             if let Some(value) = frozen.get_with_owner(key, ts, 0) {
                 return if is_tombstone(&value) {
                     Ok(None)
@@ -1761,8 +1765,8 @@ impl StorageEngine for LsmEngine {
         let active_iter = ArcMemTableIterator::new(active, Arc::clone(&range), owner_ts);
         merge_iter.add_active_memtable(active_iter);
 
-        // 2. Add frozen memtable iterators (newest to oldest)
-        for (idx, memtable) in frozen.iter().enumerate() {
+        // 2. Add frozen memtable iterators (newest to oldest = iterate from back)
+        for (idx, memtable) in frozen.iter().rev().enumerate() {
             let mem_iter =
                 ArcMemTableIterator::new(Arc::clone(memtable), Arc::clone(&range), owner_ts);
             merge_iter.add_frozen_memtable(mem_iter, idx);
@@ -1843,8 +1847,8 @@ impl PessimisticStorage for LsmEngine {
         if let Some(owner) = state.active.get_lock_owner(key) {
             return Some(owner);
         }
-        // Check frozen memtables (newest to oldest)
-        for frozen in &state.frozen {
+        // Check frozen memtables (newest to oldest = iterate from back)
+        for frozen in state.frozen.iter().rev() {
             if let Some(owner) = frozen.get_lock_owner(key) {
                 return Some(owner);
             }
@@ -1882,8 +1886,8 @@ impl PessimisticStorage for LsmEngine {
         // Check for lock conflicts across all memtables first
         let state = self.state.read().unwrap();
 
-        // Check frozen memtables for conflicts (newest to oldest)
-        for frozen in &state.frozen {
+        // Check frozen memtables for conflicts (newest to oldest = iterate from back)
+        for frozen in state.frozen.iter().rev() {
             if let Some(owner) = frozen.get_lock_owner(key) {
                 if owner != owner_start_ts {
                     return Err(owner);
@@ -1916,8 +1920,8 @@ impl PessimisticStorage for LsmEngine {
             return Some(value);
         }
 
-        // Check frozen memtables (newest to oldest)
-        for frozen in &state.frozen {
+        // Check frozen memtables (newest to oldest = iterate from back)
+        for frozen in state.frozen.iter().rev() {
             if let Some(value) = frozen.get_with_owner(key, read_ts, owner_start_ts) {
                 if is_tombstone(&value) {
                     return None;
@@ -3377,7 +3381,7 @@ mod tests {
                 // Flush one frozen memtable
                 let frozen = {
                     let state = engine.state.read().unwrap();
-                    state.frozen.last().cloned()
+                    state.frozen.front().cloned()
                 };
                 if let Some(mt) = frozen {
                     engine.flush_memtable(&mt).unwrap();

@@ -41,6 +41,7 @@
 //! // sv contains consistent snapshot of active, frozen, and SST version
 //! ```
 
+use std::collections::VecDeque;
 use std::sync::{Arc, RwLock};
 
 use super::memtable::MemTable;
@@ -118,8 +119,8 @@ pub struct SuperVersion {
     /// Active memtable at snapshot time.
     pub active: Arc<MemTable>,
 
-    /// Frozen memtables at snapshot time (newest first).
-    pub frozen: Vec<Arc<MemTable>>,
+    /// Frozen memtables at snapshot time (oldest first, newest at back).
+    pub frozen: VecDeque<Arc<MemTable>>,
 
     /// SST file version at snapshot time.
     pub version: Arc<Version>,
@@ -132,7 +133,7 @@ impl SuperVersion {
     /// Create a new SuperVersion with the given components.
     pub fn new(
         active: Arc<MemTable>,
-        frozen: Vec<Arc<MemTable>>,
+        frozen: VecDeque<Arc<MemTable>>,
         version: Arc<Version>,
         sv_number: u64,
     ) -> Self {
@@ -270,7 +271,7 @@ mod tests {
     #[test]
     fn test_super_version_new() {
         let active = Arc::new(MemTable::new(1));
-        let frozen = vec![Arc::new(MemTable::new(2)), Arc::new(MemTable::new(3))];
+        let frozen = VecDeque::from([Arc::new(MemTable::new(2)), Arc::new(MemTable::new(3))]);
         let version = Arc::new(Version::new());
 
         let sv = SuperVersion::new(active, frozen, version, 42);
@@ -284,7 +285,7 @@ mod tests {
     fn test_super_version_is_current() {
         let sv = SuperVersion::new(
             Arc::new(MemTable::new(1)),
-            vec![],
+            VecDeque::new(),
             Arc::new(Version::new()),
             100,
         );
@@ -297,7 +298,7 @@ mod tests {
     #[test]
     fn test_super_version_clone() {
         let active = Arc::new(MemTable::new(1));
-        let frozen = vec![Arc::new(MemTable::new(2))];
+        let frozen = VecDeque::from([Arc::new(MemTable::new(2))]);
         let version = Arc::new(Version::new());
 
         let sv1 = SuperVersion::new(Arc::clone(&active), frozen.clone(), Arc::clone(&version), 1);
@@ -316,7 +317,7 @@ mod tests {
     fn test_super_version_debug() {
         let sv = SuperVersion::new(
             Arc::new(MemTable::new(42)),
-            vec![Arc::new(MemTable::new(41))],
+            VecDeque::from([Arc::new(MemTable::new(41))]),
             Arc::new(Version::new()),
             123,
         );
@@ -341,7 +342,7 @@ mod tests {
         // Create SuperVersion
         let sv = SuperVersion::new(
             Arc::clone(&active),
-            vec![Arc::clone(&frozen_mt)],
+            VecDeque::from([Arc::clone(&frozen_mt)]),
             Arc::clone(&version),
             1,
         );
@@ -367,7 +368,7 @@ mod tests {
 
         let vs = VersionSet::new(Version::new());
         let active = Arc::new(MemTable::new(1));
-        let frozen: Vec<Arc<MemTable>> = vec![];
+        let frozen: VecDeque<Arc<MemTable>> = VecDeque::new();
 
         // Take snapshot before any SST
         let sv1 = SuperVersion::new(Arc::clone(&active), frozen.clone(), vs.current(), 1);
