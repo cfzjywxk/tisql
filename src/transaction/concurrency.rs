@@ -128,7 +128,15 @@ impl ConcurrencyManager {
         self.txn_states.get(start_ts)
     }
 
-    /// Transition a transaction from Running to Prepared.
+    /// Transition a transaction from Running to Preparing.
+    ///
+    /// Called before computing commit_ts. Readers encountering pending nodes
+    /// from this transaction will spin-wait until the state transitions to Prepared.
+    pub fn set_preparing_txn(&self, start_ts: Timestamp) -> Result<()> {
+        self.txn_states.set_preparing(start_ts)
+    }
+
+    /// Transition a transaction from Running or Preparing to Prepared.
     ///
     /// The `prepared_ts` ensures atomic visibility:
     /// - Readers with `read_ts <= prepared_ts` can safely skip

@@ -499,6 +499,22 @@ pub trait MvccIterator {
     ///
     /// Panics if `!self.valid()`. Always check `valid()` first.
     fn value(&self) -> &[u8];
+
+    /// Whether the current entry is a pending (uncommitted) write.
+    ///
+    /// Default: false (SST entries are always committed).
+    /// Memtable iterators override this to report non-owner pending nodes.
+    fn is_pending(&self) -> bool {
+        false
+    }
+
+    /// Get the owner transaction's start_ts for pending entries.
+    ///
+    /// Only meaningful when `is_pending()` returns true.
+    /// Default: 0 (no owner).
+    fn pending_owner(&self) -> Timestamp {
+        0
+    }
 }
 
 // ============================================================================
@@ -529,6 +545,14 @@ impl MvccIterator for Box<dyn MvccIterator> {
 
     fn value(&self) -> &[u8] {
         (**self).value()
+    }
+
+    fn is_pending(&self) -> bool {
+        (**self).is_pending()
+    }
+
+    fn pending_owner(&self) -> Timestamp {
+        (**self).pending_owner()
     }
 }
 

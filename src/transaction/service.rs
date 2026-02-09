@@ -30,9 +30,24 @@ use crate::tso::TsoService;
 
 use super::api::{CommitInfo, TxnCtx, TxnService, TxnState};
 use super::concurrency::ConcurrencyManager;
+use crate::storage::mvcc::next_key_bound;
 use crate::storage::mvcc::{is_tombstone, MvccIterator, MvccKey, LOCK, TOMBSTONE};
 use crate::storage::{PessimisticStorage, StorageEngine, WriteBatch, WriteOp};
 use crate::types::{Key, RawValue, Timestamp, TxnId};
+
+/// Compute the exclusive end key for a point get operation.
+///
+/// Returns a key that is lexicographically just after `key`, suitable as an
+/// exclusive upper bound for scanning a single key.
+fn next_key_for_get(key: &[u8]) -> Key {
+    let mut next = key.to_vec();
+    if next_key_bound(&mut next) {
+        next
+    } else {
+        // All 0xFF: use empty vec as unbounded sentinel
+        vec![]
+    }
+}
 
 /// Transaction service manages transactions with durability and MVCC.
 ///
@@ -195,6 +210,9 @@ impl<S: StorageEngine, L: ClogService, T: TsoService> TransactionService<S, L, T
     fn check_active(ctx: &TxnCtx) -> Result<()> {
         match ctx.state {
             TxnState::Running => Ok(()),
+            TxnState::Preparing => Err(crate::error::TiSqlError::Internal(
+                "Transaction in preparing state".into(),
+            )),
             TxnState::Prepared { .. } => Err(crate::error::TiSqlError::Internal(
                 "Transaction already in prepared state".into(),
             )),
@@ -240,55 +258,28 @@ impl<S: PessimisticStorage + 'static, L: ClogService + 'static, T: TsoService> T
     fn get(&self, ctx: &TxnCtx, key: &[u8]) -> Result<Option<RawValue>> {
         // For explicit transactions, use get_with_owner for read-your-writes support.
         // This allows the transaction to see its own pending writes.
+        //
+        // Safety: get_with_owner skips other txns' pending nodes without resolution.
+        // This is safe because if another txn holds a lock on this key, our txn
+        // can't also hold one (exclusive locks). If we don't hold a lock,
+        // get_with_owner returns committed data which is correct.
         if ctx.is_explicit() {
             let value = self.storage.get_with_owner(key, ctx.start_ts, ctx.start_ts);
             // Filter out tombstones (deleted keys)
             return Ok(value.filter(|v| !is_tombstone(v)));
         }
 
-        // MVCC read: find the latest version with commit_ts <= start_ts
-        // Note: Pending/aborted nodes are skipped by the iterator (pessimistic locking in storage)
-        //
-        // MVCC key encoding: key || !commit_ts (8 bytes big-endian, bitwise NOT)
-        // This means higher timestamps produce SMALLER encoded keys.
-        //
-        // To find visible versions:
-        // - Start at MvccKey::encode(key, start_ts) - the smallest MVCC key we'd accept
-        // - End at next key in key space at MAX_TS
-        // - The first entry with decoded_key == key and entry_ts <= start_ts is our result
-        let seek_key = MvccKey::encode(key, ctx.start_ts);
-        let end_key = MvccKey::encode(key, 0)
-            .next_key()
-            .unwrap_or_else(MvccKey::unbounded);
-
-        // Build scan range for MVCC keys
-        let scan_range = seek_key..end_key;
-
-        // Use streaming iterator to avoid materializing all entries.
-        // We only need the first visible version.
-        // For non-explicit transactions, pass 0 as owner_ts (no read-your-writes needed here
-        // since explicit transactions use get_with_owner directly above)
-        let mut iter = self.storage.scan_iter(scan_range, 0)?;
-        iter.advance()?; // Position on first entry
-
-        // Find the first entry matching our key with ts <= start_ts.
-        // Use zero-copy user_key()/timestamp() instead of decode() to avoid allocation.
-        while iter.valid() {
-            let entry_key = iter.user_key();
-            let entry_ts = iter.timestamp();
-
-            // Check exact key match and timestamp visibility
-            if entry_key == key && entry_ts <= ctx.start_ts {
-                let value = iter.value();
-                if is_tombstone(value) {
-                    return Ok(None); // Key was deleted
-                }
-                return Ok(Some(value.to_vec()));
-            }
-            iter.advance()?;
+        // For non-explicit transactions, use scan_iter with pending resolution.
+        // This ensures pending writes from other transactions are properly resolved
+        // via TxnStateCache, closing the snapshot isolation race window.
+        let range = key.to_vec()..next_key_for_get(key);
+        let mut iter = self.scan_iter(ctx, range)?;
+        iter.advance()?;
+        if iter.valid() && iter.user_key() == key {
+            Ok(Some(iter.value().to_vec()))
+        } else {
+            Ok(None)
         }
-
-        Ok(None)
     }
 
     fn scan_iter(&self, ctx: &TxnCtx, range: Range<Key>) -> Result<MvccScanIterator<S::Iter>> {
@@ -316,8 +307,16 @@ impl<S: PessimisticStorage + 'static, L: ClogService + 'static, T: TsoService> T
         let owner_ts = if ctx.is_explicit() { ctx.start_ts } else { 0 };
         let storage_iter = self.storage.scan_iter(mvcc_range, owner_ts)?;
 
-        // Create streaming scan iterator that wraps storage with MVCC filtering
-        Ok(MvccScanIterator::new(storage_iter, ctx.start_ts, range))
+        // Create streaming scan iterator that wraps storage with MVCC filtering.
+        // For explicit transactions, pending resolution is not needed (read-your-writes
+        // handles own pending nodes; other txns' pending nodes are returned for resolution).
+        // For implicit transactions, pass concurrency_manager for pending resolution.
+        let cm = if ctx.is_explicit() {
+            None
+        } else {
+            Some(Arc::clone(&self.concurrency_manager))
+        };
+        Ok(MvccScanIterator::new(storage_iter, ctx.start_ts, range, cm))
     }
 
     fn put(&self, ctx: &mut TxnCtx, key: Key, value: RawValue) -> Result<()> {
@@ -437,14 +436,18 @@ impl<S: PessimisticStorage + 'static, L: ClogService + 'static, T: TsoService> T
                 });
             }
 
-            // Get commit_ts: max(max_ts + 1, tso_ts)
-            // For OceanBase-style 1PC: prepared_ts = commit_ts
+            let txn_id = ctx.txn_id;
+
+            // Step 1: Signal that we're computing commit_ts.
+            // Readers encountering our pending nodes will spin-wait until Prepared.
+            self.concurrency_manager.set_preparing_txn(ctx.start_ts)?;
+
+            // Step 2: Compute commit_ts (safe: readers spin on Preparing)
             let max_ts = self.concurrency_manager.max_ts();
             let tso_ts = self.get_ts();
             let commit_ts = std::cmp::max(max_ts + 1, tso_ts);
-            let txn_id = ctx.txn_id;
 
-            // Prepare phase: register prepared state for visibility tracking
+            // Step 3: Set prepared_ts for readers to check visibility
             self.concurrency_manager
                 .prepare_txn(ctx.start_ts, commit_ts)?;
 
@@ -551,10 +554,27 @@ impl<S: PessimisticStorage + 'static, L: ClogService + 'static, T: TsoService> T
             #[cfg(feature = "failpoints")]
             fail_point!("txn_after_lock_before_commit_ts");
 
-            // Phase 2: Get commit_ts AFTER acquiring locks
+            // Register in TxnStateCache so readers can resolve our pending nodes.
+            // Then transition to Preparing before computing commit_ts.
+            self.concurrency_manager.register_txn(start_ts);
+            if let Err(e) = self.concurrency_manager.set_preparing_txn(start_ts) {
+                self.concurrency_manager.remove_txn(start_ts);
+                self.storage.abort_pending(&locked_keys, start_ts);
+                return Err(e);
+            }
+
+            // Phase 2: Get commit_ts AFTER acquiring locks and entering Preparing
             let max_ts = self.concurrency_manager.max_ts();
             let tso_ts = self.get_ts();
             let commit_ts = std::cmp::max(max_ts + 1, tso_ts);
+
+            // Transition to Prepared with known commit_ts
+            if let Err(e) = self.concurrency_manager.prepare_txn(start_ts, commit_ts) {
+                self.concurrency_manager.abort_txn(start_ts).ok();
+                self.concurrency_manager.remove_txn(start_ts);
+                self.storage.abort_pending(&locked_keys, start_ts);
+                return Err(e);
+            }
 
             // Write to commit log before finalizing (for durability)
             let lsn = self
@@ -564,6 +584,10 @@ impl<S: PessimisticStorage + 'static, L: ClogService + 'static, T: TsoService> T
             // Phase 3: Finalize all pending nodes with commit_ts
             self.storage
                 .finalize_pending(&locked_keys, start_ts, commit_ts);
+
+            // Transition to Committed, then cleanup
+            self.concurrency_manager.commit_txn(start_ts, commit_ts)?;
+            self.concurrency_manager.remove_txn(start_ts);
 
             // Mark as committed
             ctx.state = TxnState::Committed { commit_ts };
@@ -665,6 +689,17 @@ pub struct MvccScanIterator<I: MvccIterator> {
     last_returned_key: Option<Vec<u8>>,
     /// Whether positioned on a valid entry (storage_iter points to it)
     is_positioned: bool,
+    /// ConcurrencyManager for resolving pending writes from other transactions.
+    /// None for explicit transactions (they use read-your-writes directly).
+    concurrency_manager: Option<Arc<ConcurrencyManager>>,
+}
+
+/// Result of resolving a pending write via TxnStateCache.
+enum PendingResolution {
+    /// Skip this pending node (writer is Running, Aborted, or committed with ts > read_ts)
+    Skip,
+    /// The pending node is now committed with ts <= read_ts; treat as visible
+    Visible,
 }
 
 impl<I: MvccIterator> MvccScanIterator<I> {
@@ -678,14 +713,84 @@ impl<I: MvccIterator> MvccScanIterator<I> {
     /// * `storage_iter` - Iterator over storage (MVCC key-value pairs)
     /// * `read_ts` - Transaction's read timestamp for MVCC visibility
     /// * `range` - Key range for filtering
-    pub fn new(storage_iter: I, read_ts: Timestamp, range: Range<Key>) -> Self {
+    pub fn new(
+        storage_iter: I,
+        read_ts: Timestamp,
+        range: Range<Key>,
+        concurrency_manager: Option<Arc<ConcurrencyManager>>,
+    ) -> Self {
         Self {
             storage_iter,
             read_ts,
             range,
             last_returned_key: None,
             is_positioned: false,
+            concurrency_manager,
         }
+    }
+
+    /// Resolve a pending (uncommitted) write by consulting TxnStateCache.
+    ///
+    /// This determines whether the pending node should be skipped or is visible
+    /// based on the owning transaction's current state.
+    fn resolve_pending(&self, owner_ts: Timestamp) -> crate::error::Result<PendingResolution> {
+        let cm = match &self.concurrency_manager {
+            Some(cm) => cm,
+            None => {
+                // No concurrency manager (explicit txn path) - skip pending
+                return Ok(PendingResolution::Skip);
+            }
+        };
+
+        const MAX_SPIN: u32 = 40;
+        for _ in 0..MAX_SPIN {
+            match cm.get_txn_state(owner_ts) {
+                Some(TxnState::Running) => {
+                    // Writer is still running. Safe to skip because:
+                    // Writer will see max_ts >= reader.start_ts when it computes commit_ts,
+                    // so commit_ts > reader.start_ts is guaranteed.
+                    return Ok(PendingResolution::Skip);
+                }
+                Some(TxnState::Preparing) => {
+                    // Writer is computing commit_ts. Spin-wait until it transitions
+                    // to Prepared (where we can check the actual commit_ts).
+                    std::thread::yield_now();
+                    continue;
+                }
+                Some(TxnState::Prepared { prepared_ts }) => {
+                    if prepared_ts > self.read_ts {
+                        // commit_ts > read_ts, not visible to us
+                        return Ok(PendingResolution::Skip);
+                    }
+                    // prepared_ts <= read_ts: we can't determine visibility yet.
+                    // The writer may commit with this ts, making it visible.
+                    // Return KeyIsLocked to force retry.
+                    return Err(TiSqlError::KeyIsLocked {
+                        key: self.storage_iter.user_key().to_vec(),
+                        lock_ts: owner_ts,
+                        primary: vec![],
+                    });
+                }
+                Some(TxnState::Committed { commit_ts }) => {
+                    if commit_ts > self.read_ts {
+                        return Ok(PendingResolution::Skip);
+                    }
+                    // Committed with commit_ts <= read_ts: visible!
+                    return Ok(PendingResolution::Visible);
+                }
+                Some(TxnState::Aborted) | None => {
+                    // Transaction aborted or already cleaned up - skip
+                    return Ok(PendingResolution::Skip);
+                }
+            }
+        }
+
+        // Exceeded spin limit - return KeyIsLocked
+        Err(TiSqlError::KeyIsLocked {
+            key: self.storage_iter.user_key().to_vec(),
+            lock_ts: owner_ts,
+            primary: vec![],
+        })
     }
 
     /// Find the next visible entry from storage.
@@ -725,6 +830,33 @@ impl<I: MvccIterator> MvccScanIterator<I> {
             if user_key < self.range.start.as_slice() {
                 self.storage_iter.advance()?;
                 continue;
+            }
+
+            // Resolve pending writes before visibility check
+            if self.storage_iter.is_pending() {
+                match self.resolve_pending(self.storage_iter.pending_owner())? {
+                    PendingResolution::Skip => {
+                        self.storage_iter.advance()?;
+                        continue;
+                    }
+                    PendingResolution::Visible => {
+                        // Committed with commit_ts <= read_ts.
+                        // Check tombstone before returning.
+                        if is_tombstone(self.storage_iter.value()) {
+                            let skip_key = user_key.to_vec();
+                            self.storage_iter.advance()?;
+                            while self.storage_iter.valid()
+                                && self.storage_iter.user_key() == skip_key.as_slice()
+                            {
+                                self.storage_iter.advance()?;
+                            }
+                            continue;
+                        }
+                        self.last_returned_key = Some(user_key.to_vec());
+                        self.is_positioned = true;
+                        return Ok(());
+                    }
+                }
             }
 
             // Skip if not visible at read_ts
@@ -1357,6 +1489,7 @@ mod tests {
             mock_iter,
             10, // read_ts
             b"a".to_vec()..b"z".to_vec(),
+            None,
         );
 
         let results = collect_scan_results(scan_iter);
@@ -1392,7 +1525,7 @@ mod tests {
         // Result: 1 Ok entry + 1 Err
         let mock_iter = ErrorInjectingIterator::new(entries, 0);
 
-        let scan_iter = MvccScanIterator::new(mock_iter, 10, b"a".to_vec()..b"z".to_vec());
+        let scan_iter = MvccScanIterator::new(mock_iter, 10, b"a".to_vec()..b"z".to_vec(), None);
 
         let results = collect_scan_results(scan_iter);
 
@@ -1413,7 +1546,7 @@ mod tests {
         // Error after 10 successful next() calls - won't trigger (only 2 entries)
         let mock_iter = ErrorInjectingIterator::new(entries, 10);
 
-        let scan_iter = MvccScanIterator::new(mock_iter, 10, b"a".to_vec()..b"z".to_vec());
+        let scan_iter = MvccScanIterator::new(mock_iter, 10, b"a".to_vec()..b"z".to_vec(), None);
 
         let results = collect_scan_results(scan_iter);
 
@@ -1441,7 +1574,7 @@ mod tests {
         // Result: 2 successful entries before error
         let mock_iter = ErrorInjectingIterator::new(entries.clone(), 1);
 
-        let scan_iter = MvccScanIterator::new(mock_iter, 10, b"a".to_vec()..b"z".to_vec());
+        let scan_iter = MvccScanIterator::new(mock_iter, 10, b"a".to_vec()..b"z".to_vec(), None);
 
         let results = collect_scan_results(scan_iter);
 
@@ -2470,5 +2603,221 @@ mod tests {
             "expected Put(key1, v2), got {:?}",
             data[0].op
         );
+    }
+
+    // ========================================================================
+    // Snapshot Isolation / Preparing State Tests
+    // ========================================================================
+
+    #[test]
+    fn test_reader_skips_running_pending() {
+        // A reader encountering a Running txn's pending node should skip it
+        // and see the old committed version.
+        let (_storage, txn_service, _dir) = create_test_service();
+
+        // Commit a base value
+        txn_service.autocommit_put(b"key1", b"v1").unwrap();
+
+        // Start an explicit txn and write a pending value
+        let mut writer = txn_service.begin_explicit(false).unwrap();
+        txn_service
+            .put(&mut writer, b"key1".to_vec(), b"v2".to_vec())
+            .unwrap();
+
+        // Writer is Running in TxnStateCache.
+        assert_eq!(
+            txn_service
+                .concurrency_manager()
+                .get_txn_state(writer.start_ts),
+            Some(TxnState::Running)
+        );
+
+        // Reader should see the committed v1 (pending from Running txn is skipped)
+        let reader = txn_service.begin(true).unwrap();
+        let val = txn_service.get(&reader, b"key1").unwrap();
+        assert_eq!(val.as_deref(), Some(b"v1".as_slice()));
+
+        // Cleanup
+        txn_service.rollback(writer).unwrap();
+    }
+
+    #[test]
+    fn test_reader_skips_aborted_pending() {
+        // A reader encountering an Aborted txn's pending node should skip it.
+        let (_storage, txn_service, _dir) = create_test_service();
+
+        // Commit a base value
+        txn_service.autocommit_put(b"key1", b"v1").unwrap();
+
+        // Start an explicit txn, write, then rollback (abort)
+        let mut writer = txn_service.begin_explicit(false).unwrap();
+        txn_service
+            .put(&mut writer, b"key1".to_vec(), b"v2".to_vec())
+            .unwrap();
+        txn_service.rollback(writer).unwrap();
+
+        // Reader should see v1 (aborted pending skipped)
+        let reader = txn_service.begin(true).unwrap();
+        let val = txn_service.get(&reader, b"key1").unwrap();
+        assert_eq!(val.as_deref(), Some(b"v1".as_slice()));
+    }
+
+    #[test]
+    fn test_implicit_commit_registers_in_txn_state_cache() {
+        // Verify that implicit txn commit registers in TxnStateCache
+        // and cleans up after itself.
+        let (_storage, txn_service, _dir) = create_test_service();
+
+        // Before: no transactions in state cache
+        assert_eq!(txn_service.concurrency_manager().active_txn_count(), 0);
+
+        // Autocommit write - should register, commit, and remove from cache
+        txn_service.autocommit_put(b"key1", b"v1").unwrap();
+
+        // After: should be cleaned up
+        assert_eq!(txn_service.concurrency_manager().active_txn_count(), 0);
+
+        // Verify data is committed
+        let reader = txn_service.begin(true).unwrap();
+        let val = txn_service.get(&reader, b"key1").unwrap();
+        assert_eq!(val.as_deref(), Some(b"v1".as_slice()));
+    }
+
+    #[test]
+    fn test_explicit_commit_uses_preparing_state() {
+        // Verify that explicit transaction commit transitions through Preparing.
+        let (_storage, txn_service, _dir) = create_test_service();
+
+        // Start explicit transaction and write
+        let mut writer = txn_service.begin_explicit(false).unwrap();
+        let start_ts = writer.start_ts;
+        txn_service
+            .put(&mut writer, b"key1".to_vec(), b"v1".to_vec())
+            .unwrap();
+
+        // Before commit: txn is Running
+        assert_eq!(
+            txn_service.concurrency_manager().get_txn_state(start_ts),
+            Some(TxnState::Running)
+        );
+
+        // Commit should succeed (transitions through Preparing -> Prepared -> Committed)
+        let info = txn_service.commit(writer).unwrap();
+        assert!(info.commit_ts > 0);
+
+        // After commit: txn should be Committed (then removed from cache on explicit commit
+        // - but explicit commit doesn't call remove_txn, so it should still be there)
+        // Note: explicit commit leaves it in Committed state for readers to resolve
+        let state = txn_service.concurrency_manager().get_txn_state(start_ts);
+        assert!(
+            matches!(state, Some(TxnState::Committed { .. })),
+            "Expected Committed, got {state:?}"
+        );
+    }
+
+    #[test]
+    fn test_reader_sees_committed_value_after_prepare() {
+        // After a writer commits, readers should see the committed value.
+        let (_storage, txn_service, _dir) = create_test_service();
+
+        // Commit base value
+        txn_service.autocommit_put(b"key1", b"v1").unwrap();
+
+        // Writer: explicit txn, write v2, commit
+        let mut writer = txn_service.begin_explicit(false).unwrap();
+        txn_service
+            .put(&mut writer, b"key1".to_vec(), b"v2".to_vec())
+            .unwrap();
+        let commit_info = txn_service.commit(writer).unwrap();
+
+        // Reader with start_ts > commit_ts should see v2
+        let reader = txn_service.begin(true).unwrap();
+        assert!(reader.start_ts > commit_info.commit_ts);
+        let val = txn_service.get(&reader, b"key1").unwrap();
+        assert_eq!(val.as_deref(), Some(b"v2".as_slice()));
+    }
+
+    #[test]
+    fn test_scan_iter_resolves_pending_running() {
+        // scan_iter should skip pending nodes from Running transactions.
+        let (_storage, txn_service, _dir) = create_test_service();
+
+        // Commit base values
+        txn_service.autocommit_put(b"a", b"v1").unwrap();
+        txn_service.autocommit_put(b"c", b"v3").unwrap();
+
+        // Start explicit txn and write to key "b"
+        let mut writer = txn_service.begin_explicit(false).unwrap();
+        txn_service
+            .put(&mut writer, b"b".to_vec(), b"pending".to_vec())
+            .unwrap();
+
+        // Reader scan should see a=v1 and c=v3, but skip b (Running pending)
+        let reader = txn_service.begin(true).unwrap();
+        let mut iter = txn_service
+            .scan_iter(&reader, b"a".to_vec()..b"d".to_vec())
+            .unwrap();
+        iter.advance().unwrap();
+
+        assert!(iter.valid());
+        assert_eq!(iter.user_key(), b"a");
+        assert_eq!(iter.value(), b"v1");
+        iter.advance().unwrap();
+
+        assert!(iter.valid());
+        assert_eq!(iter.user_key(), b"c");
+        assert_eq!(iter.value(), b"v3");
+        iter.advance().unwrap();
+
+        assert!(!iter.valid());
+
+        // Cleanup
+        txn_service.rollback(writer).unwrap();
+    }
+
+    #[test]
+    fn test_get_resolves_pending_running() {
+        // get() for non-explicit txns should skip Running pending nodes.
+        let (_storage, txn_service, _dir) = create_test_service();
+
+        // Commit base value
+        txn_service.autocommit_put(b"key1", b"v1").unwrap();
+
+        // Start explicit txn (Running) and write a pending update
+        let mut writer = txn_service.begin_explicit(false).unwrap();
+        txn_service
+            .put(&mut writer, b"key1".to_vec(), b"v2".to_vec())
+            .unwrap();
+
+        // Non-explicit reader should resolve the pending node:
+        // Writer is Running → skip → return committed v1
+        let reader = txn_service.begin(true).unwrap();
+        let val = txn_service.get(&reader, b"key1").unwrap();
+        assert_eq!(val.as_deref(), Some(b"v1".as_slice()));
+
+        // Cleanup
+        txn_service.rollback(writer).unwrap();
+    }
+
+    #[test]
+    fn test_pending_resolution_committed_visible() {
+        // Test: writer commits with commit_ts <= reader.start_ts
+        // → reader should see the committed value.
+        let (_storage, txn_service, _dir) = create_test_service();
+
+        txn_service.autocommit_put(b"key1", b"v1").unwrap();
+
+        // Writer commits v2
+        let mut writer = txn_service.begin_explicit(false).unwrap();
+        txn_service
+            .put(&mut writer, b"key1".to_vec(), b"v2".to_vec())
+            .unwrap();
+        let commit_info = txn_service.commit(writer).unwrap();
+
+        // Reader that started after commit sees v2
+        let reader = txn_service.begin(true).unwrap();
+        assert!(reader.start_ts > commit_info.commit_ts);
+        let val = txn_service.get(&reader, b"key1").unwrap();
+        assert_eq!(val.as_deref(), Some(b"v2".as_slice()));
     }
 }

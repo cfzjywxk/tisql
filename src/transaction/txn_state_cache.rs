@@ -29,6 +29,10 @@
 //! ```text
 //! register() ─────► Running
 //!                      │
+//!     set_preparing()  │
+//!                      ▼
+//!                  Preparing  (commit_ts being computed; readers spin-wait)
+//!                      │
 //!          prepare()   │   (prepared_ts = max(max_ts, tso_ts))
 //!                      ▼
 //!                  Prepared
@@ -86,7 +90,33 @@ impl TxnStateCache {
         self.states.get(&start_ts).map(|v| *v)
     }
 
-    /// Transition a transaction from Running to Prepared.
+    /// Transition a transaction from Running to Preparing.
+    ///
+    /// Called before computing commit_ts. Readers encountering pending nodes
+    /// from this transaction will spin-wait until the state transitions to Prepared.
+    ///
+    /// # Errors
+    ///
+    /// Returns error if the transaction is not in `Running` state.
+    pub fn set_preparing(&self, start_ts: Timestamp) -> Result<()> {
+        let mut entry = self.states.get_mut(&start_ts).ok_or_else(|| {
+            TiSqlError::Internal(format!(
+                "Cannot set preparing: transaction {start_ts} not found in state cache"
+            ))
+        })?;
+
+        match *entry {
+            TxnState::Running => {
+                *entry = TxnState::Preparing;
+                Ok(())
+            }
+            ref state => Err(TiSqlError::Internal(format!(
+                "Cannot set preparing for transaction {start_ts}: expected Running, found {state:?}"
+            ))),
+        }
+    }
+
+    /// Transition a transaction from Running or Preparing to Prepared.
     ///
     /// The `prepared_ts` ensures atomic visibility:
     /// - Readers with `read_ts <= prepared_ts` can safely skip (commit_ts > read_ts guaranteed)
@@ -94,7 +124,7 @@ impl TxnStateCache {
     ///
     /// # Errors
     ///
-    /// Returns error if the transaction is not in `Running` state.
+    /// Returns error if the transaction is not in `Running` or `Preparing` state.
     pub fn prepare(&self, start_ts: Timestamp, prepared_ts: Timestamp) -> Result<()> {
         let mut entry = self.states.get_mut(&start_ts).ok_or_else(|| {
             TiSqlError::Internal(format!(
@@ -103,12 +133,12 @@ impl TxnStateCache {
         })?;
 
         match *entry {
-            TxnState::Running => {
+            TxnState::Running | TxnState::Preparing => {
                 *entry = TxnState::Prepared { prepared_ts };
                 Ok(())
             }
             ref state => Err(TiSqlError::Internal(format!(
-                "Cannot prepare transaction {start_ts}: expected Running, found {state:?}"
+                "Cannot prepare transaction {start_ts}: expected Running or Preparing, found {state:?}"
             ))),
         }
     }
@@ -153,7 +183,7 @@ impl TxnStateCache {
         })?;
 
         match *entry {
-            TxnState::Running | TxnState::Prepared { .. } => {
+            TxnState::Running | TxnState::Preparing | TxnState::Prepared { .. } => {
                 *entry = TxnState::Aborted;
                 Ok(())
             }
@@ -344,5 +374,72 @@ mod tests {
         }
 
         assert_eq!(cache.len(), 1000);
+    }
+
+    #[test]
+    fn test_set_preparing() {
+        let cache = TxnStateCache::new();
+
+        cache.register(100);
+        cache.set_preparing(100).unwrap();
+        assert_eq!(cache.get(100), Some(TxnState::Preparing));
+    }
+
+    #[test]
+    fn test_set_preparing_not_running_fails() {
+        let cache = TxnStateCache::new();
+
+        cache.register(100);
+        cache.set_preparing(100).unwrap();
+
+        // Cannot set_preparing twice
+        let result = cache.set_preparing(100);
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_preparing_to_prepared() {
+        let cache = TxnStateCache::new();
+
+        cache.register(100);
+        cache.set_preparing(100).unwrap();
+        cache.prepare(100, 150).unwrap();
+
+        assert_eq!(
+            cache.get(100),
+            Some(TxnState::Prepared { prepared_ts: 150 })
+        );
+    }
+
+    #[test]
+    fn test_preparing_full_lifecycle() {
+        let cache = TxnStateCache::new();
+
+        // register -> set_preparing -> prepare -> commit
+        cache.register(100);
+        assert_eq!(cache.get(100), Some(TxnState::Running));
+
+        cache.set_preparing(100).unwrap();
+        assert_eq!(cache.get(100), Some(TxnState::Preparing));
+
+        cache.prepare(100, 150).unwrap();
+        assert_eq!(
+            cache.get(100),
+            Some(TxnState::Prepared { prepared_ts: 150 })
+        );
+
+        cache.commit(100, 150).unwrap();
+        assert_eq!(cache.get(100), Some(TxnState::Committed { commit_ts: 150 }));
+    }
+
+    #[test]
+    fn test_abort_from_preparing() {
+        let cache = TxnStateCache::new();
+
+        cache.register(100);
+        cache.set_preparing(100).unwrap();
+        cache.abort(100).unwrap();
+
+        assert_eq!(cache.get(100), Some(TxnState::Aborted));
     }
 }

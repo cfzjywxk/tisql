@@ -1070,6 +1070,11 @@ pub struct VersionedMemTableIterator<'a> {
     /// Owner's start_ts for read-your-writes support.
     /// Pending nodes owned by this txn (where node.owner == owner_ts) are visible.
     owner_ts: Timestamp,
+    /// Whether the current entry is a non-owner pending node.
+    /// Used by the transaction layer to resolve pending writes via TxnStateCache.
+    current_is_pending: bool,
+    /// Owner start_ts of the current pending node (only meaningful when current_is_pending).
+    current_pending_owner: Timestamp,
 }
 
 // Note: This iterator is intentionally !Send and !Sync because:
@@ -1107,6 +1112,8 @@ impl<'a> VersionedMemTableIterator<'a> {
             current_entry: None,
             current_version: std::ptr::null(),
             owner_ts,
+            current_is_pending: false,
+            current_pending_owner: 0,
         }
     }
 
@@ -1152,9 +1159,13 @@ impl<'a> VersionedMemTableIterator<'a> {
                     None
                 };
 
-            if let Some(version_ptr) = self.find_first_valid_version(user_key, head, ts_filter) {
+            if let Some((version_ptr, is_pending, pending_owner)) =
+                self.find_first_valid_version(user_key, head, ts_filter)
+            {
                 self.current_entry = Some(entry);
                 self.current_version = version_ptr;
+                self.current_is_pending = is_pending;
+                self.current_pending_owner = pending_owner;
                 return;
             }
         }
@@ -1162,6 +1173,8 @@ impl<'a> VersionedMemTableIterator<'a> {
         // No entry found
         self.current_entry = None;
         self.current_version = std::ptr::null();
+        self.current_is_pending = false;
+        self.current_pending_owner = 0;
     }
 
     /// Seek to first valid entry starting from the given user key.
@@ -1195,9 +1208,13 @@ impl<'a> VersionedMemTableIterator<'a> {
                 None
             };
 
-            if let Some(version_ptr) = self.find_first_valid_version(user_key, head, ts_filter) {
+            if let Some((version_ptr, is_pending, pending_owner)) =
+                self.find_first_valid_version(user_key, head, ts_filter)
+            {
                 self.current_entry = Some(entry);
                 self.current_version = version_ptr;
+                self.current_is_pending = is_pending;
+                self.current_pending_owner = pending_owner;
                 return;
             }
         }
@@ -1205,21 +1222,25 @@ impl<'a> VersionedMemTableIterator<'a> {
         // No entry found
         self.current_entry = None;
         self.current_version = std::ptr::null();
+        self.current_is_pending = false;
+        self.current_pending_owner = 0;
     }
 
     /// Find the first valid version in a version chain.
     ///
     /// If `ts_filter` is Some, only consider versions with ts <= ts_filter.
-    /// Returns the pointer to the first valid version, or None if none found.
+    /// Returns (version_ptr, is_pending, pending_owner) or None if none found.
     ///
     /// If `owner_start_ts` is set on this iterator, pending nodes owned by that
     /// transaction are visible (except LOCK nodes which represent "no value").
+    /// Non-owner pending nodes are returned with pending info for resolution by
+    /// the transaction layer via TxnStateCache.
     fn find_first_valid_version(
         &self,
         user_key: &[u8],
         head: *mut VersionNode,
         ts_filter: Option<Timestamp>,
-    ) -> Option<*const VersionNode> {
+    ) -> Option<(*const VersionNode, bool, Timestamp)> {
         let mut version_ptr = head;
         while !version_ptr.is_null() {
             let node = unsafe { &*version_ptr };
@@ -1230,13 +1251,17 @@ impl<'a> VersionedMemTableIterator<'a> {
                 continue;
             }
 
-            // Handle pending nodes - visible only if owned by this transaction
+            // Handle pending nodes
             if node.is_pending() {
                 if node.get_owner() == self.owner_ts && !is_lock(&node.value) {
-                    // Own pending node with value - visible
-                    return Some(version_ptr);
+                    // Own pending node with value - visible (read-your-writes)
+                    return Some((version_ptr, false, 0));
                 }
-                // Not our pending or is LOCK - skip
+                if node.get_owner() != self.owner_ts {
+                    // Other txn's pending - return for resolution by transaction layer
+                    return Some((version_ptr, true, node.get_owner()));
+                }
+                // LOCK from our own txn - skip
                 version_ptr = node.next;
                 continue;
             }
@@ -1250,7 +1275,7 @@ impl<'a> VersionedMemTableIterator<'a> {
             }
 
             if self.is_version_in_range(user_key, node.get_ts()) {
-                return Some(version_ptr);
+                return Some((version_ptr, false, 0));
             }
             version_ptr = node.next;
         }
@@ -1313,20 +1338,31 @@ impl<'a> VersionedMemTableIterator<'a> {
                     continue;
                 }
 
-                // Handle pending nodes - visible only if owned by this transaction
+                // Handle pending nodes
                 if next_node.is_pending() {
                     if next_node.get_owner() == self.owner_ts && !is_lock(&next_node.value) {
-                        // Own pending node with value - visible
+                        // Own pending node with value - visible (read-your-writes)
                         self.current_version = next_version;
+                        self.current_is_pending = false;
+                        self.current_pending_owner = 0;
                         return;
                     }
-                    // Not our pending or is LOCK - skip
+                    if next_node.get_owner() != self.owner_ts {
+                        // Other txn's pending - return for resolution by transaction layer
+                        self.current_version = next_version;
+                        self.current_is_pending = true;
+                        self.current_pending_owner = next_node.get_owner();
+                        return;
+                    }
+                    // LOCK from our own txn - skip
                     next_version = next_node.next;
                     continue;
                 }
 
                 if self.is_version_in_range(current_user_key, next_node.get_ts()) {
                     self.current_version = next_version;
+                    self.current_is_pending = false;
+                    self.current_pending_owner = 0;
                     return;
                 }
                 next_version = next_node.next;
@@ -1369,9 +1405,13 @@ impl<'a> VersionedMemTableIterator<'a> {
                     }
 
                     // Find first version in range
-                    if let Some(version_ptr) = self.find_first_valid_version(user_key, head, None) {
+                    if let Some((version_ptr, is_pending, pending_owner)) =
+                        self.find_first_valid_version(user_key, head, None)
+                    {
                         self.current_version = version_ptr;
                         self.current_entry = Some(entry);
+                        self.current_is_pending = is_pending;
+                        self.current_pending_owner = pending_owner;
                         return;
                     }
 
@@ -1434,6 +1474,14 @@ impl<'a> MvccIterator for VersionedMemTableIterator<'a> {
     fn value(&self) -> &[u8] {
         debug_assert!(!self.current_version.is_null(), "Iterator not valid");
         unsafe { &(*self.current_version).value }
+    }
+
+    fn is_pending(&self) -> bool {
+        self.current_is_pending
+    }
+
+    fn pending_owner(&self) -> Timestamp {
+        self.current_pending_owner
     }
 }
 
@@ -1515,6 +1563,14 @@ impl MvccIterator for ArcVersionedMemTableIterator {
 
     fn value(&self) -> &[u8] {
         self.iter.value()
+    }
+
+    fn is_pending(&self) -> bool {
+        self.iter.is_pending()
+    }
+
+    fn pending_owner(&self) -> Timestamp {
+        self.iter.pending_owner()
     }
 }
 
@@ -2772,17 +2828,32 @@ mod tests {
         // Write another committed value
         put_at(&engine, b"c", b"committed2", 20);
 
-        // Scan should only see committed values
-        let range = MvccKey::unbounded()..MvccKey::unbounded();
-        let results = scan_mvcc(&engine, range);
+        // Non-owner scan now returns pending nodes (with is_pending=true)
+        // for resolution by the transaction layer.
+        let range = Arc::new(MvccKey::unbounded()..MvccKey::unbounded());
+        let mut iter = engine.create_streaming_iter(range, 0);
+        iter.advance().unwrap();
 
-        // Should have 2 entries (committed ones only)
-        assert_eq!(results.len(), 2);
+        // First: "a" committed
+        assert!(iter.valid());
+        assert_eq!(iter.user_key(), b"a");
+        assert!(!iter.is_pending());
+        iter.advance().unwrap();
 
-        let keys: Vec<_> = results.iter().map(|(k, _)| k.key().to_vec()).collect();
-        assert!(keys.contains(&b"a".to_vec()));
-        assert!(keys.contains(&b"c".to_vec()));
-        assert!(!keys.iter().any(|k| k == b"b"));
+        // Second: "b" pending (returned for resolution)
+        assert!(iter.valid());
+        assert_eq!(iter.user_key(), b"b");
+        assert!(iter.is_pending());
+        assert_eq!(iter.pending_owner(), 100);
+        iter.advance().unwrap();
+
+        // Third: "c" committed
+        assert!(iter.valid());
+        assert_eq!(iter.user_key(), b"c");
+        assert!(!iter.is_pending());
+        iter.advance().unwrap();
+
+        assert!(!iter.valid());
     }
 
     #[test]
@@ -3203,7 +3274,7 @@ mod tests {
             .put_pending(b"key1", b"pending".to_vec(), 200)
             .unwrap();
 
-        // Non-owner iterator should see committed value
+        // Non-owner iterator returns the pending node (for resolution by txn layer)
         let range = Range {
             start: MvccKey::unbounded(),
             end: MvccKey::unbounded(),
@@ -3215,9 +3286,11 @@ mod tests {
         iter.advance().unwrap();
         assert!(iter.valid());
         assert_eq!(iter.user_key(), b"key1");
-        assert_eq!(iter.value(), b"committed");
+        assert!(iter.is_pending());
+        assert_eq!(iter.pending_owner(), 200);
+        assert_eq!(iter.value(), b"pending");
 
-        // Owner iterator should see pending value
+        // Owner iterator should see pending value (read-your-writes, not marked as pending)
         let range2 = Range {
             start: MvccKey::unbounded(),
             end: MvccKey::unbounded(),
@@ -3228,6 +3301,7 @@ mod tests {
         assert!(owner_iter.valid());
         assert_eq!(owner_iter.user_key(), b"key1");
         assert_eq!(owner_iter.value(), b"pending");
+        assert!(!owner_iter.is_pending()); // Own pending not reported as pending
     }
 
     #[test]
@@ -3332,7 +3406,7 @@ mod tests {
             .put_pending(b"key1", b"txn200_pending".to_vec(), 200)
             .unwrap();
 
-        // Txn 300 should NOT see txn 200's pending
+        // Txn 300 sees txn 200's pending node first (marked as pending for resolution)
         let range = Range {
             start: MvccKey::unbounded(),
             end: MvccKey::unbounded(),
@@ -3342,7 +3416,8 @@ mod tests {
         iter_300.advance().unwrap();
         assert!(iter_300.valid());
         assert_eq!(iter_300.user_key(), b"key1");
-        assert_eq!(iter_300.value(), b"committed"); // Sees committed, not 200's pending
+        assert!(iter_300.is_pending());
+        assert_eq!(iter_300.pending_owner(), 200);
     }
 
     #[test]
@@ -3410,7 +3485,7 @@ mod tests {
             .put_pending(b"key1", b"pending".to_vec(), 200)
             .unwrap();
 
-        // Non-owner should not see it
+        // Non-owner sees the pending node (marked for resolution)
         let range = Range {
             start: MvccKey::unbounded(),
             end: MvccKey::unbounded(),
@@ -3418,9 +3493,11 @@ mod tests {
         let mut non_owner_iter =
             VersionedMemTableIterator::new(engine.inner.as_ref(), Arc::new(range), 0);
         non_owner_iter.advance().unwrap();
-        assert!(!non_owner_iter.valid()); // No visible entries
+        assert!(non_owner_iter.valid());
+        assert!(non_owner_iter.is_pending());
+        assert_eq!(non_owner_iter.pending_owner(), 200);
 
-        // Owner should see it
+        // Owner should see it (not marked as pending)
         let range2 = Range {
             start: MvccKey::unbounded(),
             end: MvccKey::unbounded(),
@@ -3431,6 +3508,7 @@ mod tests {
         assert!(owner_iter.valid());
         assert_eq!(owner_iter.user_key(), b"key1");
         assert_eq!(owner_iter.value(), b"pending");
+        assert!(!owner_iter.is_pending());
     }
 
     #[test]

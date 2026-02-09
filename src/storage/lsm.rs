@@ -917,6 +917,14 @@ impl MvccIterator for ArcMemTableIterator {
     fn value(&self) -> &[u8] {
         self.iter.value()
     }
+
+    fn is_pending(&self) -> bool {
+        self.iter.is_pending()
+    }
+
+    fn pending_owner(&self) -> Timestamp {
+        self.iter.pending_owner()
+    }
 }
 
 // ============================================================================
@@ -1043,6 +1051,28 @@ impl ChildIterator {
             Self::Level(iter) => iter.value(),
             #[cfg(test)]
             Self::Mock(iter) => iter.value(),
+        }
+    }
+
+    #[inline]
+    fn is_pending(&self) -> bool {
+        match self {
+            Self::Memtable(iter) => iter.is_pending(),
+            // SST entries are always committed
+            Self::L0Sst(_) | Self::Level(_) => false,
+            #[cfg(test)]
+            Self::Mock(_) => false,
+        }
+    }
+
+    #[inline]
+    fn pending_owner(&self) -> Timestamp {
+        match self {
+            Self::Memtable(iter) => iter.pending_owner(),
+            // SST entries are always committed
+            Self::L0Sst(_) | Self::Level(_) => 0,
+            #[cfg(test)]
+            Self::Mock(_) => 0,
         }
     }
 }
@@ -1527,6 +1557,10 @@ pub struct TieredMergeIterator {
     last_emitted_key: Option<(Vec<u8>, Timestamp)>,
     /// Pending error from iterator operations
     pending_error: Option<TiSqlError>,
+    /// Whether the current entry is a pending (uncommitted) write
+    current_is_pending: bool,
+    /// Owner start_ts of the current pending entry
+    current_pending_owner: Timestamp,
 }
 
 impl Default for TieredMergeIterator {
@@ -1550,6 +1584,8 @@ impl TieredMergeIterator {
             current_value: None,
             last_emitted_key: None,
             pending_error: None,
+            current_is_pending: false,
+            current_pending_owner: 0,
         }
     }
 
@@ -1794,6 +1830,8 @@ impl MvccIterator for TieredMergeIterator {
         self.current_user_key = None;
         self.current_value = None;
         self.last_emitted_key = None;
+        self.current_is_pending = false;
+        self.current_pending_owner = 0;
 
         if !self.initialized {
             // First seek: initialize all children
@@ -1835,6 +1873,14 @@ impl MvccIterator for TieredMergeIterator {
     fn value(&self) -> &[u8] {
         self.current_value.as_ref().expect("Iterator not valid")
     }
+
+    fn is_pending(&self) -> bool {
+        self.current_is_pending
+    }
+
+    fn pending_owner(&self) -> Timestamp {
+        self.current_pending_owner
+    }
 }
 
 impl TieredMergeIterator {
@@ -1844,6 +1890,8 @@ impl TieredMergeIterator {
             if self.heap.is_empty() {
                 self.current_user_key = None;
                 self.current_value = None;
+                self.current_is_pending = false;
+                self.current_pending_owner = 0;
                 return Ok(());
             }
 
@@ -1854,10 +1902,12 @@ impl TieredMergeIterator {
             // Get the iterator for this child
             let child = &mut self.children[child_idx];
 
-            // Cache the current entry for returning
+            // Cache the current entry for returning (including pending info)
             let user_key = child.iter.user_key().to_vec();
             let timestamp = child.iter.timestamp();
             let value = child.iter.value().to_vec();
+            let is_pending = child.iter.is_pending();
+            let pending_owner = child.iter.pending_owner();
 
             // Advance the iterator
             if let Err(e) = child.iter.advance() {
@@ -1883,6 +1933,8 @@ impl TieredMergeIterator {
             self.current_user_key = Some(user_key.clone());
             self.current_timestamp = timestamp;
             self.current_value = Some(value);
+            self.current_is_pending = is_pending;
+            self.current_pending_owner = pending_owner;
             self.last_emitted_key = Some((user_key, timestamp));
             return Ok(());
         }
@@ -6294,9 +6346,20 @@ mod tests {
             "LOCK should be invisible to owner scan, got {entries:?}"
         );
 
-        // Non-owner should see nothing
-        let entries = scan_raw_for_key(&engine, b"key1", 0);
-        assert!(entries.is_empty(), "LOCK invisible to non-owner");
+        // Non-owner sees the LOCK as a pending node (for txn layer resolution).
+        // At storage level, the LOCK is returned with is_pending=true.
+        {
+            let start = MvccKey::encode(b"key1", Timestamp::MAX);
+            let end = MvccKey::encode(b"key1", 0)
+                .next_key()
+                .unwrap_or_else(MvccKey::unbounded);
+            let mut iter = engine.scan_iter(start..end, 0).unwrap();
+            iter.advance().unwrap();
+            if iter.valid() && iter.user_key() == b"key1" {
+                assert!(iter.is_pending());
+                assert_eq!(iter.pending_owner(), owner_ts);
+            }
+        }
 
         // After finalize, LOCK is marked aborted — still invisible
         engine.finalize_pending(&[b"key1".to_vec()], owner_ts, 200);
@@ -6660,7 +6723,8 @@ mod tests {
 
     #[test]
     fn test_lock_skipped_in_read_before_finalize() {
-        // LOCK nodes should be invisible to reads even before finalization
+        // LOCK nodes should be invisible to owner reads.
+        // Non-owner reads return the LOCK as a pending node for txn layer resolution.
         let tmp = TempDir::new().unwrap();
         let config = test_config(tmp.path());
         let engine = LsmEngine::open(config).unwrap();
@@ -6676,16 +6740,24 @@ mod tests {
         let val = engine.get_with_owner(b"key1", owner_ts, owner_ts);
         assert!(val.is_none(), "LOCK should be invisible to owner get");
 
-        // Non-owner should NOT see it either
+        // Non-owner should NOT see it via get_with_owner
         let val = engine.get_with_owner(b"key1", Timestamp::MAX, 0);
         assert!(val.is_none(), "LOCK invisible to non-owner get");
 
-        // Scan should not return it
+        // Owner scan should not return it (own LOCKs are skipped)
         let entries = scan_raw_for_key(&engine, b"key1", owner_ts);
         assert!(entries.is_empty(), "LOCK invisible in owner scan");
 
-        let entries = scan_raw_for_key(&engine, b"key1", 0);
-        assert!(entries.is_empty(), "LOCK invisible in non-owner scan");
+        // Non-owner scan returns it as pending (for txn layer resolution)
+        let start = MvccKey::encode(b"key1", Timestamp::MAX);
+        let end = MvccKey::encode(b"key1", 0)
+            .next_key()
+            .unwrap_or_else(MvccKey::unbounded);
+        let mut iter = engine.scan_iter(start..end, 0).unwrap();
+        iter.advance().unwrap();
+        assert!(iter.valid());
+        assert!(iter.is_pending());
+        assert_eq!(iter.pending_owner(), owner_ts);
     }
 
     #[test]

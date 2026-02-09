@@ -66,6 +66,10 @@ use crate::types::{Key, Lsn, RawValue, Timestamp, TxnId};
 pub enum TxnState {
     /// Transaction is actively executing (can perform reads and writes).
     Running,
+    /// Transaction is computing commit_ts.
+    /// Readers encountering pending nodes from this transaction must spin-wait
+    /// until the state transitions to Prepared (with a known commit_ts).
+    Preparing,
     /// Transaction has prepared, waiting for commit.
     /// The prepared_ts ensures atomic visibility: readers with read_ts > prepared_ts
     /// must wait because they cannot determine if commit_ts will be <= read_ts.
@@ -213,7 +217,10 @@ impl TxnCtx {
     /// Check if the transaction is still valid (active).
     #[inline]
     pub fn is_valid(&self) -> bool {
-        matches!(self.state, TxnState::Running | TxnState::Prepared { .. })
+        matches!(
+            self.state,
+            TxnState::Running | TxnState::Preparing | TxnState::Prepared { .. }
+        )
     }
 
     /// Get the current state.
