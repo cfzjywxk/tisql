@@ -331,8 +331,11 @@ impl<S: PessimisticStorage + 'static, L: ClogService + 'static, T: TsoService> T
         if ctx.is_explicit() {
             // Explicit transaction: write pending node directly to storage
             // This acquires the lock immediately (pessimistic locking)
+            let value_for_clog = value.clone();
             match self.storage.put_pending(&key, value, ctx.start_ts) {
                 Ok(()) => {
+                    // Buffer for clog write at commit time (durability)
+                    ctx.write_buffer.put(key.clone(), value_for_clog);
                     // Track key for commit/rollback
                     ctx.add_locked_key(key);
                     Ok(())
@@ -369,6 +372,8 @@ impl<S: PessimisticStorage + 'static, L: ClogService + 'static, T: TsoService> T
                 .put_pending(&key, TOMBSTONE.to_vec(), ctx.start_ts)
             {
                 Ok(()) => {
+                    // Buffer for clog write at commit time (durability)
+                    ctx.write_buffer.delete(key.clone());
                     // Track key for commit/rollback
                     ctx.add_locked_key(key);
                     Ok(())
@@ -427,6 +432,14 @@ impl<S: PessimisticStorage + 'static, L: ClogService + 'static, T: TsoService> T
             self.concurrency_manager
                 .prepare_txn(ctx.start_ts, commit_ts)?;
 
+            // Write to clog for durability before finalizing.
+            // If we crash after clog write but before finalize, recovery
+            // replays the clog entry to reconstruct the committed data.
+            let storage_batch = std::mem::take(&mut ctx.write_buffer);
+            let lsn = self
+                .clog_service
+                .write_batch(txn_id, &storage_batch, commit_ts, true)?;
+
             // Finalize all pending nodes by setting their commit_ts
             // This makes the writes visible to readers with read_ts >= commit_ts
             self.storage
@@ -439,12 +452,10 @@ impl<S: PessimisticStorage + 'static, L: ClogService + 'static, T: TsoService> T
             // Mark context as committed
             ctx.state = TxnState::Committed { commit_ts };
 
-            // Note: For now, explicit transactions don't write to clog.
-            // TODO: Add clog support for explicit transactions
             Ok(CommitInfo {
                 txn_id,
                 commit_ts,
-                lsn: 0,
+                lsn,
             })
         } else {
             // =================================================================
