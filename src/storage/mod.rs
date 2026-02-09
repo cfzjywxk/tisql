@@ -51,6 +51,7 @@
 //! The storage layer is agnostic to key structure - it just stores bytes.
 
 pub mod compaction;
+pub mod compaction_scheduler;
 pub mod config;
 pub mod flush_scheduler;
 pub mod ilog;
@@ -97,6 +98,9 @@ pub use lsm::{LsmEngine, LsmStats, TieredMergeIterator};
 
 // Re-export flush scheduler
 pub use flush_scheduler::FlushScheduler;
+
+// Re-export compaction scheduler
+pub use compaction_scheduler::CompactionScheduler;
 
 // Re-export compaction types
 pub use compaction::{CompactionExecutor, CompactionPicker, CompactionTask, MergeIterator};

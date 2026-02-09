@@ -153,6 +153,12 @@ pub struct LsmEngine {
     /// This ensures readers always get a consistent view of
     /// (active, frozen, version) without race conditions.
     current_sv: RwLock<Arc<SuperVersion>>,
+
+    /// Optional callback invoked after flush completes.
+    ///
+    /// Used to notify the CompactionScheduler that new L0 SSTs are available,
+    /// triggering compaction if thresholds are met.
+    compaction_notify: RwLock<Option<Arc<dyn Fn() + Send + Sync>>>,
 }
 
 impl LsmEngine {
@@ -199,6 +205,7 @@ impl LsmEngine {
             lsn_provider: Some(lsn_provider),
             ilog: Some(ilog),
             current_sv: RwLock::new(initial_sv),
+            compaction_notify: RwLock::new(None),
         })
     }
 
@@ -471,6 +478,11 @@ impl LsmEngine {
             }
         }
 
+        // Notify compaction scheduler that new L0 SSTs are available
+        if let Some(ref notify) = *self.compaction_notify.read().unwrap() {
+            notify();
+        }
+
         Ok(meta)
     }
 
@@ -616,6 +628,143 @@ impl LsmEngine {
 
         // Then flush all frozen
         self.flush_all()
+    }
+
+    /// Set a callback to be invoked after flush completes.
+    ///
+    /// Used to wire flush completion → compaction scheduler notification.
+    pub fn set_compaction_notify(&self, notify: Arc<dyn Fn() + Send + Sync>) {
+        *self.compaction_notify.write().unwrap() = Some(notify);
+    }
+
+    /// Perform one round of compaction.
+    ///
+    /// Uses a crash-safe protocol:
+    /// 1. Pick compaction task
+    /// 2. Pre-allocate SST IDs
+    /// 3. Write CompactIntent (if durable)
+    /// 4. Execute compaction (merge + write SSTs)
+    /// 5. Write CompactCommit (if durable)
+    /// 6. Apply ManifestDelta to VersionSet
+    /// 7. Install new SuperVersion
+    /// 8. Delete obsolete SST files
+    /// 9. Checkpoint if needed
+    ///
+    /// Returns `Ok(true)` if compaction was performed, `Ok(false)` if no work needed.
+    pub fn do_compaction(&self) -> Result<bool> {
+        use super::compaction::{CompactionExecutor, CompactionPicker};
+
+        let version = self.current_version();
+        let picker = CompactionPicker::new(Arc::clone(&self.config));
+
+        // Phase 0: Pick
+        let task = match picker.pick(&version) {
+            Some(task) => task,
+            None => return Ok(false),
+        };
+
+        // Handle trivial move separately (no SST I/O needed)
+        if task.is_trivial_move {
+            let executor = CompactionExecutor::new(Arc::clone(&self.config));
+            // Trivial move doesn't use pre-allocated IDs
+            let delta = executor.execute(&task, &version, &self.config.sst_dir(), &[])?;
+
+            // Apply delta
+            let new_version = self.version_set.apply_delta(&delta);
+
+            // Install new SuperVersion (write lock required by install_super_version signature)
+            {
+                #[allow(clippy::readonly_write_lock)]
+                let state = self.state.write().unwrap();
+                self.install_super_version(&state);
+            }
+
+            // Checkpoint if needed
+            if let Some(ref ilog) = self.ilog {
+                if ilog.needs_checkpoint() {
+                    ilog.write_checkpoint(&new_version)?;
+                }
+            }
+
+            return Ok(true);
+        }
+
+        // Phase 1: Pre-allocate SST IDs
+        let estimated_count = self.estimate_compaction_output_count(&task, &version);
+        let pre_allocated_ids: Vec<u64> =
+            (0..estimated_count).map(|_| self.alloc_sst_id()).collect();
+
+        // Phase 2: Write CompactIntent (if durable)
+        let input_sst_ids: Vec<u64> = task.inputs.iter().map(|(_, id)| *id).collect();
+        if let Some(ref ilog) = self.ilog {
+            ilog.write_compact_intent(input_sst_ids, pre_allocated_ids.clone(), task.output_level)?;
+        }
+
+        // Phase 3: Execute compaction
+        let executor = CompactionExecutor::new(Arc::clone(&self.config));
+        let delta =
+            executor.execute(&task, &version, &self.config.sst_dir(), &pre_allocated_ids)?;
+
+        // Phase 4: Write CompactCommit (if durable)
+        if let Some(ref ilog) = self.ilog {
+            let new_ssts: Vec<SstMeta> = delta.new_ssts.iter().map(|m| (**m).clone()).collect();
+            ilog.write_compact_commit(delta.deleted_ssts.clone(), new_ssts)?;
+        }
+
+        // Phase 5: Apply ManifestDelta to VersionSet
+        let new_version = self.version_set.apply_delta(&delta);
+
+        // Phase 6: Install new SuperVersion (write lock required by install_super_version signature)
+        {
+            #[allow(clippy::readonly_write_lock)]
+            let state = self.state.write().unwrap();
+            self.install_super_version(&state);
+        }
+
+        // Phase 7: Delete obsolete SST files
+        self.delete_obsolete_ssts(&delta)?;
+
+        // Phase 8: Checkpoint if needed
+        if let Some(ref ilog) = self.ilog {
+            if ilog.needs_checkpoint() {
+                ilog.write_checkpoint(&new_version)?;
+            }
+        }
+
+        Ok(true)
+    }
+
+    /// Delete SST files that were removed by compaction.
+    fn delete_obsolete_ssts(&self, delta: &ManifestDelta) -> Result<()> {
+        for (_, sst_id) in &delta.deleted_ssts {
+            let path = self.config.sst_dir().join(format!("{sst_id:08}.sst"));
+            if path.exists() {
+                std::fs::remove_file(&path)?;
+            }
+        }
+        Ok(())
+    }
+
+    /// Estimate number of output SSTs for a compaction task.
+    fn estimate_compaction_output_count(
+        &self,
+        task: &super::compaction::CompactionTask,
+        version: &Version,
+    ) -> usize {
+        let total_bytes: u64 = task
+            .inputs
+            .iter()
+            .filter_map(|(level, id)| {
+                version
+                    .level(*level as usize)
+                    .iter()
+                    .find(|sst| sst.id == *id)
+                    .map(|sst| sst.file_size)
+            })
+            .sum();
+        let estimate = (total_bytes / self.config.target_file_size as u64) + 1;
+        // Add 1 extra for safety margin
+        (estimate as usize + 1).max(2)
     }
 
     /// Get statistics about the engine.
@@ -1808,6 +1957,14 @@ impl StorageEngine for LsmEngine {
     }
 
     fn write_batch(&self, batch: WriteBatch) -> Result<()> {
+        // L0 write backpressure: reject writes when too many L0 files accumulate
+        let l0_count = self.current_version().level_size(0);
+        if self.config.should_stop_writes(l0_count) {
+            return Err(TiSqlError::Storage(
+                "Too many L0 files, writes temporarily stopped for compaction".into(),
+            ));
+        }
+
         // Use CLOG LSN if provided, otherwise allocate locally.
         // Using the CLOG LSN ensures proper recovery ordering: when we flush
         // the memtable to SST, the flushed_lsn in SST metadata matches the
@@ -2009,6 +2166,7 @@ mod tests {
                 lsn_provider: None,
                 ilog: None,
                 current_sv: RwLock::new(initial_sv),
+                compaction_notify: RwLock::new(None),
             })
         }
     }

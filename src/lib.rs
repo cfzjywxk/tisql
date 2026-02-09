@@ -82,11 +82,14 @@ pub mod testkit {
 
     // LSM storage engine for testing
     pub use crate::storage::{
-        CompactionExecutor, CompactionPicker, CompactionTask, IlogConfig, IlogService, LsmConfig,
-        LsmConfigBuilder, LsmEngine, LsmRecovery, LsmStats, ManifestDelta, MemTable,
-        RecoveryResult, SstBuilder, SstBuilderOptions, SstIterator, SstMeta, SstReader,
+        CompactionExecutor, CompactionPicker, CompactionScheduler, CompactionTask, IlogConfig,
+        IlogService, LsmConfig, LsmConfigBuilder, LsmEngine, LsmRecovery, LsmStats, ManifestDelta,
+        MemTable, RecoveryResult, SstBuilder, SstBuilderOptions, SstIterator, SstMeta, SstReader,
         SstReaderRef, Version,
     };
+
+    // Re-export FlushScheduler for testing
+    pub use crate::storage::FlushScheduler;
 
     pub use crate::transaction::{ConcurrencyManager, TransactionService};
     pub use crate::tso::LocalTso;
@@ -133,7 +136,7 @@ use clog::FileClogService;
 use error::Result;
 use executor::{ExecutionResult, Executor, SimpleExecutor};
 use sql::{Binder, Parser};
-use storage::{IlogService, LsmEngine, LsmRecovery};
+use storage::{CompactionScheduler, FlushScheduler, IlogService, LsmEngine, LsmRecovery};
 use transaction::{ConcurrencyManager, TransactionService};
 use tso::LocalTso;
 use types::Value;
@@ -319,6 +322,11 @@ pub struct Database {
     ilog: Arc<IlogService>,
     /// LSM storage engine (kept for flush on shutdown)
     storage: Arc<LsmEngine>,
+    /// Background flush scheduler (Drop stops the worker)
+    /// Declared before compaction_scheduler so it's dropped first (Rust drops in declaration order).
+    flush_scheduler: FlushScheduler,
+    /// Background compaction scheduler (Drop stops the worker)
+    compaction_scheduler: CompactionScheduler,
 }
 
 impl Database {
@@ -343,6 +351,17 @@ impl Database {
 
         // Wrap storage in Arc
         let storage = Arc::new(recovery_result.engine);
+
+        // Start background flush scheduler
+        let flush_scheduler = FlushScheduler::new(Arc::clone(&storage));
+        flush_scheduler.start();
+
+        // Start background compaction scheduler
+        let compaction_scheduler = CompactionScheduler::new(Arc::clone(&storage));
+        compaction_scheduler.start();
+
+        // Wire: flush completion → notify compaction scheduler
+        storage.set_compaction_notify(compaction_scheduler.notifier());
 
         // Create TSO service, starting from recovered max_commit_ts + 1
         let tso = Arc::new(LocalTso::new(recovery_result.stats.max_commit_ts + 1));
@@ -377,6 +396,8 @@ impl Database {
             catalog,
             ilog: recovery_result.ilog,
             storage,
+            flush_scheduler,
+            compaction_scheduler,
         })
     }
 
@@ -671,6 +692,10 @@ impl Database {
 
 impl Drop for Database {
     fn drop(&mut self) {
+        // Stop background schedulers first (flush before compaction)
+        self.flush_scheduler.stop();
+        self.compaction_scheduler.stop();
+
         // Best-effort flush on drop
         let _ = self.storage.flush_all_with_active();
         let _ = self.txn_service.clog_service().close();

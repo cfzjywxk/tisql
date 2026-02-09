@@ -80,24 +80,69 @@ impl CompactionPicker {
 
     /// Pick the next compaction task based on current version state.
     ///
-    /// Returns None if no compaction is needed.
+    /// Uses RocksDB-style score-based prioritization: computes a score for each
+    /// level, sorts by score descending, and picks the highest-scoring level
+    /// with score >= 1.0. This ensures the most urgent compaction runs first.
+    ///
+    /// Returns None if no compaction is needed (all scores < 1.0).
     pub fn pick(&self, version: &Version) -> Option<CompactionTask> {
-        // Priority 1: L0 compaction if too many files
-        if version.level_size(0) >= self.config.l0_compaction_trigger {
-            return self.pick_l0_compaction(version);
-        }
+        let scores = self.compute_compaction_scores(version);
 
-        // Priority 2: Level compaction for oversized levels
-        for level in 1..self.config.max_levels - 1 {
-            let level_size = version.level_size_bytes(level);
-            let max_size = self.config.level_max_size(level) as u64;
-
-            if level_size > max_size {
-                return self.pick_level_compaction(version, level);
+        // Find highest-scoring level with score >= 1.0
+        for (level, score) in &scores {
+            if *score < 1.0 {
+                break; // Sorted descending, so no more candidates
+            }
+            if *level == 0 {
+                if let Some(task) = self.pick_l0_compaction(version) {
+                    return Some(task);
+                }
+            } else if let Some(task) = self.pick_level_compaction(version, *level) {
+                return Some(task);
             }
         }
 
         None
+    }
+
+    /// Compute compaction scores for all levels.
+    ///
+    /// Returns a list of (level, score) sorted by score descending.
+    /// Score >= 1.0 means compaction is needed. Higher score = more urgent.
+    ///
+    /// - L0: `score = max(file_count / trigger, total_bytes / l1_max_size)`
+    /// - Ln (n>=1): `score = level_size_bytes / level_max_size(n)`
+    pub fn compute_compaction_scores(&self, version: &Version) -> Vec<(usize, f64)> {
+        let mut scores = Vec::new();
+
+        // L0 score: based on file count and size
+        let l0_count = version.level_size(0);
+        let file_score = l0_count as f64 / self.config.l0_compaction_trigger as f64;
+        let l0_bytes = version.level_size_bytes(0);
+        let size_score = if self.config.l1_max_size > 0 {
+            l0_bytes as f64 / self.config.l1_max_size as f64
+        } else {
+            0.0
+        };
+        let l0_score = file_score.max(size_score);
+        scores.push((0, l0_score));
+
+        // Ln scores (n >= 1): based on level size vs max size
+        for level in 1..self.config.max_levels - 1 {
+            let level_bytes = version.level_size_bytes(level);
+            let max_bytes = self.config.level_max_size(level) as u64;
+            let score = if max_bytes > 0 {
+                level_bytes as f64 / max_bytes as f64
+            } else {
+                0.0
+            };
+            scores.push((level, score));
+        }
+
+        // Sort by score descending
+        scores.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
+
+        scores
     }
 
     /// Pick L0 -> L1 compaction.
@@ -361,16 +406,27 @@ impl CompactionExecutor {
 
     /// Execute a compaction task.
     ///
+    /// `pre_allocated_ids` contains SST IDs allocated by the caller (LsmEngine)
+    /// for crash-safe compaction. These IDs are recorded in CompactIntent before
+    /// execution begins, enabling orphan cleanup on crash recovery.
+    ///
     /// Returns the manifest delta to apply on success.
     pub fn execute(
         &self,
         task: &CompactionTask,
         version: &Version,
         sst_dir: &Path,
+        pre_allocated_ids: &[u64],
     ) -> Result<ManifestDelta> {
         // Handle trivial move (just update metadata, no I/O)
         if task.is_trivial_move {
             return self.execute_trivial_move(task, version);
+        }
+
+        if pre_allocated_ids.is_empty() {
+            return Err(crate::error::TiSqlError::Storage(
+                "pre_allocated_ids must not be empty for non-trivial compaction".to_string(),
+            ));
         }
 
         // Collect input SST readers
@@ -389,9 +445,10 @@ impl CompactionExecutor {
         let mut merge_iter = MergeIterator::new(readers)?;
         merge_iter.seek_to_first()?;
 
-        // Create output SST builder
-        let next_sst_id = version.next_sst_id();
-        let output_path = sst_dir.join(format!("{next_sst_id:08}.sst"));
+        // Create output SST builder using pre-allocated IDs
+        let mut id_idx = 0;
+        let first_id = pre_allocated_ids[id_idx];
+        let output_path = sst_dir.join(format!("{first_id:08}.sst"));
         let options = SstBuilderOptions {
             block_size: self.config.block_size,
             compression: self.config.compression,
@@ -413,12 +470,18 @@ impl CompactionExecutor {
 
                 // Check if we should split to a new SST
                 if current_size >= self.config.target_file_size {
-                    let meta = builder
-                        .finish(next_sst_id + output_ssts.len() as u64, task.output_level)?;
+                    let sst_id = pre_allocated_ids[id_idx];
+                    let meta = builder.finish(sst_id, task.output_level)?;
                     output_ssts.push(meta);
+                    id_idx += 1;
 
                     // Start new output file
-                    let new_id = next_sst_id + output_ssts.len() as u64;
+                    if id_idx >= pre_allocated_ids.len() {
+                        return Err(crate::error::TiSqlError::Storage(
+                            "Ran out of pre-allocated SST IDs during compaction".to_string(),
+                        ));
+                    }
+                    let new_id = pre_allocated_ids[id_idx];
                     let new_path = sst_dir.join(format!("{new_id:08}.sst"));
                     builder = SstBuilder::new(&new_path, options.clone())?;
                     current_size = 0;
@@ -429,7 +492,8 @@ impl CompactionExecutor {
 
         // Finish last output file
         if current_size > 0 || output_ssts.is_empty() {
-            let meta = builder.finish(next_sst_id + output_ssts.len() as u64, task.output_level)?;
+            let sst_id = pre_allocated_ids[id_idx];
+            let meta = builder.finish(sst_id, task.output_level)?;
             output_ssts.push(meta);
         } else {
             builder.abort()?;
@@ -764,9 +828,10 @@ mod tests {
             is_trivial_move: false,
         };
 
-        // Execute compaction
+        // Execute compaction with pre-allocated IDs
+        let pre_allocated_ids = vec![3, 4]; // Over-allocate for safety
         let delta = executor
-            .execute(&task, &version, &config.sst_dir())
+            .execute(&task, &version, &config.sst_dir(), &pre_allocated_ids)
             .unwrap();
 
         // Verify delta
@@ -1193,8 +1258,9 @@ mod tests {
             is_trivial_move: false,
         };
 
+        let pre_allocated_ids = vec![3, 4];
         let delta = executor
-            .execute(&task, &version, &config.sst_dir())
+            .execute(&task, &version, &config.sst_dir(), &pre_allocated_ids)
             .unwrap();
 
         // Output should span full key range
@@ -1202,5 +1268,159 @@ mod tests {
         let output = &delta.new_ssts[0];
         assert!(output.smallest_key.as_slice() <= b"a".as_slice());
         assert!(output.largest_key.as_slice() >= b"d".as_slice());
+    }
+
+    // ==================== CompactionPicker Score Tests ====================
+
+    #[test]
+    fn test_picker_score_l0_by_file_count() {
+        let tmp = TempDir::new().unwrap();
+        let config = Arc::new(
+            LsmConfig::builder(tmp.path())
+                .l0_compaction_trigger(4)
+                .build()
+                .unwrap(),
+        );
+        let picker = CompactionPicker::new(config);
+
+        // 2 L0 files out of 4 trigger => score = 0.5
+        let version = Version::builder()
+            .add_sst(make_sst(1, 0, b"a", b"m"))
+            .add_sst(make_sst(2, 0, b"n", b"z"))
+            .build();
+
+        let scores = picker.compute_compaction_scores(&version);
+        let l0_score = scores.iter().find(|(level, _)| *level == 0).unwrap().1;
+        assert!(
+            (l0_score - 0.5).abs() < 0.01,
+            "L0 score should be ~0.5, got {l0_score}"
+        );
+
+        // 4 L0 files out of 4 trigger => score = 1.0
+        let version = Version::builder()
+            .add_sst(make_sst(1, 0, b"a", b"g"))
+            .add_sst(make_sst(2, 0, b"h", b"m"))
+            .add_sst(make_sst(3, 0, b"n", b"s"))
+            .add_sst(make_sst(4, 0, b"t", b"z"))
+            .build();
+
+        let scores = picker.compute_compaction_scores(&version);
+        let l0_score = scores.iter().find(|(level, _)| *level == 0).unwrap().1;
+        assert!(
+            l0_score >= 1.0,
+            "L0 score should be >= 1.0 with 4 files and trigger=4, got {l0_score}"
+        );
+    }
+
+    #[test]
+    fn test_picker_score_level_by_bytes() {
+        let tmp = TempDir::new().unwrap();
+        let config = Arc::new(
+            LsmConfig::builder(tmp.path())
+                .l0_compaction_trigger(10) // High to avoid L0 triggering
+                .l0_slowdown_trigger(12)
+                .l0_stop_trigger(14)
+                .l1_max_size(2000) // L1 max = 2000 bytes
+                .build()
+                .unwrap(),
+        );
+        let picker = CompactionPicker::new(config);
+
+        // L1 has 2 files of 1000 bytes each = 2000 bytes total
+        // score = 2000 / 2000 = 1.0
+        let version = Version::builder()
+            .add_sst(make_sst(1, 1, b"a", b"m")) // file_size = 1000
+            .add_sst(make_sst(2, 1, b"n", b"z")) // file_size = 1000
+            .build();
+
+        let scores = picker.compute_compaction_scores(&version);
+        let l1_score = scores.iter().find(|(level, _)| *level == 1).unwrap().1;
+        assert!(
+            (l1_score - 1.0).abs() < 0.01,
+            "L1 score should be ~1.0, got {l1_score}"
+        );
+    }
+
+    #[test]
+    fn test_picker_highest_score_wins() {
+        let tmp = TempDir::new().unwrap();
+        let config = Arc::new(
+            LsmConfig::builder(tmp.path())
+                .l0_compaction_trigger(10) // High to avoid L0 triggering
+                .l0_slowdown_trigger(12)
+                .l0_stop_trigger(14)
+                .l1_max_size(5000) // L1 max = 5000
+                .build()
+                .unwrap(),
+        );
+        let picker = CompactionPicker::new(config);
+
+        // L1 has 1000 bytes (score = 1000/5000 = 0.2)
+        // L2 max = 5000 * 10 = 50000, we put 80000 bytes (score = 80000/50000 = 1.6)
+        let mut big_sst = make_sst(10, 2, b"a", b"z");
+        big_sst.file_size = 80000;
+
+        let version = Version::builder()
+            .add_sst(make_sst(1, 1, b"a", b"m")) // 1000 bytes in L1
+            .add_sst(big_sst) // 80000 bytes in L2
+            .build();
+
+        let scores = picker.compute_compaction_scores(&version);
+
+        // Scores should be sorted descending
+        assert!(
+            scores[0].1 >= scores[1].1,
+            "Scores should be sorted descending"
+        );
+
+        // L2 should be the highest scoring level
+        assert_eq!(scores[0].0, 2, "L2 should have the highest score");
+    }
+
+    #[test]
+    fn test_picker_no_compaction_all_scores_below_one() {
+        let tmp = TempDir::new().unwrap();
+        let config = Arc::new(
+            LsmConfig::builder(tmp.path())
+                .l0_compaction_trigger(10)
+                .l0_slowdown_trigger(12)
+                .l0_stop_trigger(14)
+                .l1_max_size(100_000) // Very large L1 max
+                .build()
+                .unwrap(),
+        );
+        let picker = CompactionPicker::new(config);
+
+        // 1 L0 file (score = 1/10 = 0.1), 1 L1 file (1000 bytes, score = 0.01)
+        let version = Version::builder()
+            .add_sst(make_sst(1, 0, b"a", b"z"))
+            .add_sst(make_sst(2, 1, b"a", b"z"))
+            .build();
+
+        let scores = picker.compute_compaction_scores(&version);
+        for (_level, score) in &scores {
+            assert!(*score < 1.0, "All scores should be below 1.0");
+        }
+
+        // pick() should return None
+        assert!(picker.pick(&version).is_none());
+    }
+
+    #[test]
+    fn test_picker_empty_version_scores() {
+        let tmp = TempDir::new().unwrap();
+        let config = test_config(tmp.path());
+        let picker = CompactionPicker::new(config);
+
+        let version = Version::new();
+        let scores = picker.compute_compaction_scores(&version);
+
+        // All scores should be 0
+        for (_level, score) in &scores {
+            assert!(
+                *score == 0.0,
+                "Empty version should have score 0.0 for all levels"
+            );
+        }
     }
 }
