@@ -2124,7 +2124,7 @@ pub struct LsmStats {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::storage::mvcc::is_tombstone;
+    use crate::storage::mvcc::{is_tombstone, LOCK, TOMBSTONE};
     use std::path::Path;
     use tempfile::TempDir;
 
@@ -6244,5 +6244,539 @@ mod tests {
         assert!(debug_str.contains("frozen_count"));
         assert!(debug_str.contains("version_num"));
         assert!(debug_str.contains("sst_count"));
+    }
+
+    // ========================================================================
+    // Record Type Tests: Verify pending node types for delete semantics
+    // ========================================================================
+
+    /// Helper: scan all raw MVCC entries for a key, including tombstones and LOCKs.
+    /// Uses owner_ts to see pending nodes owned by that transaction.
+    fn scan_raw_for_key(
+        engine: &LsmEngine,
+        key: &[u8],
+        owner_ts: Timestamp,
+    ) -> Vec<(Timestamp, RawValue)> {
+        let start = MvccKey::encode(key, Timestamp::MAX);
+        let end = MvccKey::encode(key, 0)
+            .next_key()
+            .unwrap_or_else(MvccKey::unbounded);
+        let range = start..end;
+
+        let mut results = Vec::new();
+        let mut iter = engine.scan_iter(range, owner_ts).unwrap();
+        iter.advance().unwrap();
+        while iter.valid() {
+            if iter.user_key() == key {
+                results.push((iter.timestamp(), iter.value().to_vec()));
+            }
+            iter.advance().unwrap();
+        }
+        results
+    }
+
+    #[test]
+    fn test_record_type_delete_nonexistent() {
+        // Delete a key that was never written → should produce a LOCK node
+        let tmp = TempDir::new().unwrap();
+        let config = test_config(tmp.path());
+        let engine = LsmEngine::open(config).unwrap();
+
+        let owner_ts: Timestamp = 100;
+        engine
+            .put_pending(b"key1", LOCK.to_vec(), owner_ts)
+            .unwrap();
+
+        // Owner should see nothing useful (LOCK is skipped by iterator)
+        let entries = scan_raw_for_key(&engine, b"key1", owner_ts);
+        assert!(
+            entries.is_empty(),
+            "LOCK should be invisible to owner scan, got {entries:?}"
+        );
+
+        // Non-owner should see nothing
+        let entries = scan_raw_for_key(&engine, b"key1", 0);
+        assert!(entries.is_empty(), "LOCK invisible to non-owner");
+
+        // After finalize, LOCK is marked aborted — still invisible
+        engine.finalize_pending(&[b"key1".to_vec()], owner_ts, 200);
+        let value = get_for_test(&engine, b"key1");
+        assert!(value.is_none(), "LOCK after finalize should be invisible");
+    }
+
+    #[test]
+    fn test_record_type_delete_your_write() {
+        // PUT then DELETE same key (no committed base) → second node should be LOCK
+        let tmp = TempDir::new().unwrap();
+        let config = test_config(tmp.path());
+        let engine = LsmEngine::open(config).unwrap();
+
+        let owner_ts: Timestamp = 100;
+
+        // PUT a value
+        engine
+            .put_pending(b"key1", b"value1".to_vec(), owner_ts)
+            .unwrap();
+
+        // Owner should see the value
+        let val = engine.get_with_owner(b"key1", owner_ts, owner_ts);
+        assert_eq!(val, Some(b"value1".to_vec()));
+
+        // DELETE (replaces value with LOCK since no committed base)
+        engine
+            .put_pending(b"key1", LOCK.to_vec(), owner_ts)
+            .unwrap();
+
+        // Owner should now see nothing (LOCK = "undo our write")
+        let val = engine.get_with_owner(b"key1", owner_ts, owner_ts);
+        assert!(val.is_none(), "LOCK should undo the pending PUT");
+
+        // After finalize + commit, key should not exist
+        engine.finalize_pending(&[b"key1".to_vec()], owner_ts, 200);
+        let value = get_for_test(&engine, b"key1");
+        assert!(value.is_none(), "LOCK finalized → key should not exist");
+    }
+
+    #[test]
+    fn test_record_type_delete_existing_key() {
+        // Commit a value, then DELETE in explicit txn → should produce TOMBSTONE
+        let tmp = TempDir::new().unwrap();
+        let config = test_config(tmp.path());
+        let engine = LsmEngine::open(config).unwrap();
+
+        // Commit key1=value1 at ts=10
+        let mut batch = new_batch(10);
+        batch.put(b"key1".to_vec(), b"value1".to_vec());
+        engine.write_batch(batch).unwrap();
+        assert_eq!(get_for_test(&engine, b"key1"), Some(b"value1".to_vec()));
+
+        // Delete via pending TOMBSTONE (explicit txn pattern)
+        let owner_ts: Timestamp = 100;
+        engine
+            .put_pending(b"key1", TOMBSTONE.to_vec(), owner_ts)
+            .unwrap();
+
+        // Owner should see None (tombstone)
+        let val = engine.get_with_owner(b"key1", owner_ts, owner_ts);
+        assert!(
+            val.is_none(),
+            "TOMBSTONE should make key invisible to owner"
+        );
+
+        // Non-owner should still see committed value
+        let val = engine.get_with_owner(b"key1", Timestamp::MAX, 0);
+        assert_eq!(val, Some(b"value1".to_vec()), "non-owner sees committed");
+
+        // After finalize, TOMBSTONE is committed — key is deleted for all
+        engine.finalize_pending(&[b"key1".to_vec()], owner_ts, 200);
+        let value = get_for_test(&engine, b"key1");
+        assert!(value.is_none(), "TOMBSTONE committed → key deleted");
+    }
+
+    #[test]
+    fn test_record_type_insert_after_delete() {
+        // Commit value, DELETE (TOMBSTONE), then PUT new value
+        let tmp = TempDir::new().unwrap();
+        let config = test_config(tmp.path());
+        let engine = LsmEngine::open(config).unwrap();
+
+        // Commit key1=original at ts=10
+        let mut batch = new_batch(10);
+        batch.put(b"key1".to_vec(), b"original".to_vec());
+        engine.write_batch(batch).unwrap();
+
+        let owner_ts: Timestamp = 100;
+
+        // DELETE → TOMBSTONE (committed value exists)
+        engine
+            .put_pending(b"key1", TOMBSTONE.to_vec(), owner_ts)
+            .unwrap();
+
+        // Owner sees None
+        let val = engine.get_with_owner(b"key1", owner_ts, owner_ts);
+        assert!(val.is_none());
+
+        // PUT new value → replaces TOMBSTONE with real value
+        engine
+            .put_pending(b"key1", b"reinserted".to_vec(), owner_ts)
+            .unwrap();
+
+        // Owner sees the new value
+        let val = engine.get_with_owner(b"key1", owner_ts, owner_ts);
+        assert_eq!(val, Some(b"reinserted".to_vec()));
+
+        // Finalize and verify
+        engine.finalize_pending(&[b"key1".to_vec()], owner_ts, 200);
+        let value = get_at_for_test(&engine, b"key1", 200);
+        assert_eq!(value, Some(b"reinserted".to_vec()));
+    }
+
+    #[test]
+    fn test_record_type_insert_update_delete_sequence() {
+        // Full sequence: INSERT → UPDATE → DELETE on same key within one txn
+        let tmp = TempDir::new().unwrap();
+        let config = test_config(tmp.path());
+        let engine = LsmEngine::open(config).unwrap();
+
+        let owner_ts: Timestamp = 100;
+
+        // INSERT
+        engine
+            .put_pending(b"key1", b"v1".to_vec(), owner_ts)
+            .unwrap();
+        assert_eq!(
+            engine.get_with_owner(b"key1", owner_ts, owner_ts),
+            Some(b"v1".to_vec())
+        );
+
+        // UPDATE
+        engine
+            .put_pending(b"key1", b"v2".to_vec(), owner_ts)
+            .unwrap();
+        assert_eq!(
+            engine.get_with_owner(b"key1", owner_ts, owner_ts),
+            Some(b"v2".to_vec())
+        );
+
+        // DELETE (no committed base → LOCK)
+        engine
+            .put_pending(b"key1", LOCK.to_vec(), owner_ts)
+            .unwrap();
+        assert!(engine.get_with_owner(b"key1", owner_ts, owner_ts).is_none());
+
+        // After finalize, LOCK is aborted → key doesn't exist
+        engine.finalize_pending(&[b"key1".to_vec()], owner_ts, 200);
+        assert!(get_for_test(&engine, b"key1").is_none());
+    }
+
+    // ========================================================================
+    // Tombstone Preservation: Flush and Compaction
+    // ========================================================================
+
+    #[test]
+    fn test_tombstone_preserved_through_flush() {
+        // Write key, delete key (tombstone), flush, verify tombstone in SST
+        let tmp = TempDir::new().unwrap();
+        let config = LsmConfig::builder(tmp.path())
+            .memtable_size(100) // Small to trigger rotation
+            .max_frozen_memtables(4)
+            .build()
+            .unwrap();
+        let engine = LsmEngine::open(config).unwrap();
+
+        // Write key1=v1 at ts=10
+        let mut batch = new_batch(10);
+        batch.put(b"key1".to_vec(), b"v1".to_vec());
+        engine.write_batch(batch).unwrap();
+
+        // Delete key1 at ts=20 (tombstone)
+        let mut batch = new_batch(20);
+        batch.delete(b"key1".to_vec());
+        engine.write_batch(batch).unwrap();
+
+        // Verify pre-flush: key1 is deleted
+        assert!(get_for_test(&engine, b"key1").is_none());
+        assert_eq!(
+            get_at_for_test(&engine, b"key1", 10),
+            Some(b"v1".to_vec()),
+            "key1 visible at ts=10"
+        );
+
+        // Flush all to SST
+        engine.flush_all_with_active().unwrap();
+
+        // Verify post-flush: key1 still deleted at latest ts
+        assert!(
+            get_for_test(&engine, b"key1").is_none(),
+            "tombstone must survive flush"
+        );
+
+        // Verify post-flush: key1 still visible at ts=10 (MVCC)
+        assert_eq!(
+            get_at_for_test(&engine, b"key1", 10),
+            Some(b"v1".to_vec()),
+            "old version must survive flush"
+        );
+
+        // Verify the tombstone entry exists in raw SST scan
+        let start = MvccKey::encode(b"key1", Timestamp::MAX);
+        let end = MvccKey::encode(b"key1", 0)
+            .next_key()
+            .unwrap_or_else(MvccKey::unbounded);
+        let results = scan_mvcc(&engine, start..end);
+
+        // Should have 2 entries: tombstone at ts=20 and value at ts=10
+        assert_eq!(
+            results.len(),
+            2,
+            "expected 2 MVCC entries (tombstone + value), got {results:?}"
+        );
+        let (_, ref ts20_val) = results[0]; // Higher ts comes first in MVCC order
+        assert!(
+            is_tombstone(ts20_val),
+            "first entry should be tombstone, got {ts20_val:?}"
+        );
+        let (_, ref ts10_val) = results[1];
+        assert_eq!(ts10_val, b"v1", "second entry should be the original value");
+    }
+
+    #[test]
+    fn test_tombstone_preserved_through_compaction() {
+        // Write to multiple SSTs, compact, verify tombstone still works
+        let tmp = TempDir::new().unwrap();
+        let config = LsmConfig::builder(tmp.path())
+            .memtable_size(100) // Very small to trigger rotation
+            .max_frozen_memtables(1)
+            .l0_compaction_trigger(2) // Compact after 2 L0 files
+            .build()
+            .unwrap();
+        let engine = LsmEngine::open(config).unwrap();
+
+        // SST 1: key1=v1 at ts=10
+        let mut batch = new_batch(10);
+        batch.put(b"key1".to_vec(), b"v1".to_vec());
+        engine.write_batch(batch).unwrap();
+        engine.flush_all_with_active().unwrap();
+
+        // SST 2: tombstone for key1 at ts=20
+        let mut batch = new_batch(20);
+        batch.delete(b"key1".to_vec());
+        engine.write_batch(batch).unwrap();
+        engine.flush_all_with_active().unwrap();
+
+        // Before compaction: key1 deleted at latest
+        assert!(get_for_test(&engine, b"key1").is_none());
+        assert_eq!(get_at_for_test(&engine, b"key1", 10), Some(b"v1".to_vec()));
+
+        // Trigger compaction
+        let compacted = engine.do_compaction().unwrap();
+        assert!(compacted, "compaction should have run");
+
+        // After compaction: tombstone + old value should still be correct
+        assert!(
+            get_for_test(&engine, b"key1").is_none(),
+            "tombstone must survive compaction"
+        );
+        assert_eq!(
+            get_at_for_test(&engine, b"key1", 10),
+            Some(b"v1".to_vec()),
+            "old version must survive compaction"
+        );
+    }
+
+    #[test]
+    fn test_tombstone_read_visibility_across_layers() {
+        // Tombstone in memtable hides value in SST
+        let tmp = TempDir::new().unwrap();
+        let config = LsmConfig::builder(tmp.path())
+            .memtable_size(1 << 20) // Large enough to not auto-rotate
+            .build()
+            .unwrap();
+        let engine = LsmEngine::open(config).unwrap();
+
+        // Write key1=v1 and flush to SST
+        let mut batch = new_batch(10);
+        batch.put(b"key1".to_vec(), b"v1".to_vec());
+        engine.write_batch(batch).unwrap();
+        engine.flush_all_with_active().unwrap();
+
+        // key1 should be in SST
+        assert_eq!(get_for_test(&engine, b"key1"), Some(b"v1".to_vec()));
+
+        // Delete key1 (tombstone now in memtable, value in SST)
+        let mut batch = new_batch(20);
+        batch.delete(b"key1".to_vec());
+        engine.write_batch(batch).unwrap();
+
+        // Tombstone in memtable should hide value in SST
+        assert!(
+            get_for_test(&engine, b"key1").is_none(),
+            "memtable tombstone should hide SST value"
+        );
+
+        // But old snapshot should still see the value
+        assert_eq!(
+            get_at_for_test(&engine, b"key1", 10),
+            Some(b"v1".to_vec()),
+            "snapshot at ts=10 should see the value before tombstone"
+        );
+    }
+
+    // ========================================================================
+    // LOCK Ignored in Flush, Skipped in Read
+    // ========================================================================
+
+    #[test]
+    fn test_lock_not_flushed_to_sst() {
+        // LOCK nodes should be invisible in flush (only committed data is flushed)
+        let tmp = TempDir::new().unwrap();
+        let config = LsmConfig::builder(tmp.path())
+            .memtable_size(100)
+            .max_frozen_memtables(4)
+            .build()
+            .unwrap();
+        let engine = LsmEngine::open(config).unwrap();
+
+        // Write a committed value for key1
+        let mut batch = new_batch(10);
+        batch.put(b"key1".to_vec(), b"v1".to_vec());
+        engine.write_batch(batch).unwrap();
+
+        // Write a LOCK node as pending (simulates explicit txn delete-nonexistent)
+        let owner_ts: Timestamp = 100;
+        engine
+            .put_pending(b"key2", LOCK.to_vec(), owner_ts)
+            .unwrap();
+
+        // Finalize: LOCK nodes are marked aborted (not committed)
+        engine.finalize_pending(&[b"key2".to_vec()], owner_ts, 200);
+
+        // Flush everything to SST
+        engine.flush_all_with_active().unwrap();
+
+        // Scan all raw MVCC entries in SST
+        let all_entries = scan_mvcc(
+            &engine,
+            MvccKey::encode(b"", Timestamp::MAX)..MvccKey::unbounded(),
+        );
+
+        // Should only have key1's entry, NOT key2's LOCK
+        let key2_entries: Vec<_> = all_entries
+            .iter()
+            .filter(|(k, _)| k.key() == b"key2")
+            .collect();
+        assert!(
+            key2_entries.is_empty(),
+            "LOCK should not be flushed to SST, found {key2_entries:?}"
+        );
+
+        // key1 should be present
+        let key1_entries: Vec<_> = all_entries
+            .iter()
+            .filter(|(k, _)| k.key() == b"key1")
+            .collect();
+        assert_eq!(key1_entries.len(), 1, "key1 should be in SST");
+    }
+
+    #[test]
+    fn test_lock_skipped_in_read_before_finalize() {
+        // LOCK nodes should be invisible to reads even before finalization
+        let tmp = TempDir::new().unwrap();
+        let config = test_config(tmp.path());
+        let engine = LsmEngine::open(config).unwrap();
+
+        let owner_ts: Timestamp = 100;
+
+        // Write a LOCK node
+        engine
+            .put_pending(b"key1", LOCK.to_vec(), owner_ts)
+            .unwrap();
+
+        // Owner should NOT see the LOCK (it's invisible)
+        let val = engine.get_with_owner(b"key1", owner_ts, owner_ts);
+        assert!(val.is_none(), "LOCK should be invisible to owner get");
+
+        // Non-owner should NOT see it either
+        let val = engine.get_with_owner(b"key1", Timestamp::MAX, 0);
+        assert!(val.is_none(), "LOCK invisible to non-owner get");
+
+        // Scan should not return it
+        let entries = scan_raw_for_key(&engine, b"key1", owner_ts);
+        assert!(entries.is_empty(), "LOCK invisible in owner scan");
+
+        let entries = scan_raw_for_key(&engine, b"key1", 0);
+        assert!(entries.is_empty(), "LOCK invisible in non-owner scan");
+    }
+
+    #[test]
+    fn test_lock_does_not_hide_committed_value() {
+        // LOCK should not hide a committed value underneath
+        let tmp = TempDir::new().unwrap();
+        let config = test_config(tmp.path());
+        let engine = LsmEngine::open(config).unwrap();
+
+        // Commit key1=v1 at ts=10
+        let mut batch = new_batch(10);
+        batch.put(b"key1".to_vec(), b"v1".to_vec());
+        engine.write_batch(batch).unwrap();
+
+        // Write a LOCK on top (simulates explicit txn: delete-your-write scenario
+        // where someone PUT then DELETE, and DELETE finds no committed base below
+        // their own write, so it writes LOCK to undo the write)
+        let owner_ts: Timestamp = 100;
+
+        // First write a pending PUT
+        engine
+            .put_pending(b"key1", b"v2".to_vec(), owner_ts)
+            .unwrap();
+
+        // Then replace with LOCK (undo the PUT)
+        engine
+            .put_pending(b"key1", LOCK.to_vec(), owner_ts)
+            .unwrap();
+
+        // Owner should see the committed value (LOCK skips, falls through to committed)
+        let val = engine.get_with_owner(b"key1", owner_ts, owner_ts);
+        assert_eq!(
+            val,
+            Some(b"v1".to_vec()),
+            "LOCK should not hide committed value; owner sees committed v1"
+        );
+
+        // Non-owner should also see committed value (pending LOCK invisible)
+        let val = engine.get_with_owner(b"key1", Timestamp::MAX, 0);
+        assert_eq!(val, Some(b"v1".to_vec()));
+    }
+
+    #[test]
+    fn test_lock_aborted_after_finalize_not_in_flush() {
+        // After finalize_pending, LOCK is marked aborted.
+        // Verify it doesn't appear in flush output.
+        let tmp = TempDir::new().unwrap();
+        let config = LsmConfig::builder(tmp.path())
+            .memtable_size(100)
+            .max_frozen_memtables(4)
+            .build()
+            .unwrap();
+        let engine = LsmEngine::open(config).unwrap();
+
+        let owner_ts: Timestamp = 100;
+
+        // Write LOCK + a real value for another key
+        engine
+            .put_pending(b"lock_key", LOCK.to_vec(), owner_ts)
+            .unwrap();
+        engine
+            .put_pending(b"real_key", b"real_value".to_vec(), owner_ts)
+            .unwrap();
+
+        // Finalize both: LOCK → aborted, real_key → committed at ts=200
+        engine.finalize_pending(&[b"lock_key".to_vec(), b"real_key".to_vec()], owner_ts, 200);
+
+        // Flush to SST
+        engine.flush_all_with_active().unwrap();
+
+        // Verify: lock_key should NOT be in SST
+        let all_entries = scan_mvcc(
+            &engine,
+            MvccKey::encode(b"", Timestamp::MAX)..MvccKey::unbounded(),
+        );
+
+        let lock_entries: Vec<_> = all_entries
+            .iter()
+            .filter(|(k, _)| k.key() == b"lock_key")
+            .collect();
+        assert!(
+            lock_entries.is_empty(),
+            "LOCK (aborted) should not be in SST"
+        );
+
+        // real_key should be in SST
+        let real_entries: Vec<_> = all_entries
+            .iter()
+            .filter(|(k, _)| k.key() == b"real_key")
+            .collect();
+        assert_eq!(real_entries.len(), 1, "real_key should be in SST");
+        assert_eq!(real_entries[0].1, b"real_value");
     }
 }

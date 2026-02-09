@@ -116,6 +116,9 @@ pub struct TxnCtx {
     /// Keys that have been locked by this transaction (for pessimistic transactions).
     /// Used for commit (finalize) and rollback (abort) operations.
     pub(crate) locked_keys: Vec<Key>,
+    /// Keys holding LOCK-type nodes (pessimistic locks without data change).
+    /// These are skipped during clog write at commit time.
+    pub(crate) lock_keys: Vec<Key>,
 }
 
 impl TxnCtx {
@@ -132,6 +135,7 @@ impl TxnCtx {
             explicit: false,
             write_buffer: WriteBatch::new(),
             locked_keys: Vec::new(),
+            lock_keys: Vec::new(),
         }
     }
 
@@ -148,6 +152,7 @@ impl TxnCtx {
             explicit: true,
             write_buffer: WriteBatch::new(),
             locked_keys: Vec::new(),
+            lock_keys: Vec::new(),
         }
     }
 
@@ -170,6 +175,7 @@ impl TxnCtx {
             explicit,
             write_buffer: WriteBatch::new(),
             locked_keys: Vec::new(),
+            lock_keys: Vec::new(),
         }
     }
 

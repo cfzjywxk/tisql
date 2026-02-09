@@ -30,7 +30,7 @@ use crate::tso::TsoService;
 
 use super::api::{CommitInfo, TxnCtx, TxnService, TxnState};
 use super::concurrency::ConcurrencyManager;
-use crate::storage::mvcc::{is_tombstone, MvccIterator, MvccKey, TOMBSTONE};
+use crate::storage::mvcc::{is_tombstone, MvccIterator, MvccKey, LOCK, TOMBSTONE};
 use crate::storage::{PessimisticStorage, StorageEngine, WriteBatch, WriteOp};
 use crate::types::{Key, RawValue, Timestamp, TxnId};
 
@@ -329,14 +329,13 @@ impl<S: PessimisticStorage + 'static, L: ClogService + 'static, T: TsoService> T
         }
 
         if ctx.is_explicit() {
-            // Explicit transaction: write pending node directly to storage
-            // This acquires the lock immediately (pessimistic locking)
-            let value_for_clog = value.clone();
+            // Explicit transaction: write pending node directly to storage.
+            // Value is moved into storage (no clone). At commit, we read it back lazily.
             match self.storage.put_pending(&key, value, ctx.start_ts) {
                 Ok(()) => {
-                    // Buffer for clog write at commit time (durability)
-                    ctx.write_buffer.put(key.clone(), value_for_clog);
-                    // Track key for commit/rollback
+                    // If this key was a LOCK (from prior delete), it's now a real value.
+                    // put_pending does in-place swap, so the LOCK is replaced.
+                    ctx.lock_keys.retain(|k| k != &key);
                     ctx.add_locked_key(key);
                     Ok(())
                 }
@@ -345,7 +344,7 @@ impl<S: PessimisticStorage + 'static, L: ClogService + 'static, T: TsoService> T
                     Err(TiSqlError::KeyIsLocked {
                         key,
                         lock_ts: lock_owner,
-                        primary: vec![], // Unknown for now
+                        primary: vec![],
                     })
                 }
             }
@@ -365,26 +364,43 @@ impl<S: PessimisticStorage + 'static, L: ClogService + 'static, T: TsoService> T
         }
 
         if ctx.is_explicit() {
-            // Explicit transaction: write pending tombstone directly to storage
-            // This acquires the lock immediately (pessimistic locking)
-            match self
-                .storage
-                .put_pending(&key, TOMBSTONE.to_vec(), ctx.start_ts)
-            {
-                Ok(()) => {
-                    // Buffer for clog write at commit time (durability)
-                    ctx.write_buffer.delete(key.clone());
-                    // Track key for commit/rollback
-                    ctx.add_locked_key(key);
-                    Ok(())
-                }
-                Err(lock_owner) => {
-                    // Key is locked by another transaction
-                    Err(TiSqlError::KeyIsLocked {
+            // Explicit transaction: decide TOMBSTONE vs LOCK based on committed state.
+            // get_with_owner(key, start_ts, 0) skips all pending nodes → only committed visible.
+            let committed_exists = self.storage.get_with_owner(&key, ctx.start_ts, 0).is_some();
+
+            if committed_exists {
+                // Case 1: committed value exists → TOMBSTONE (covers the existing record)
+                match self
+                    .storage
+                    .put_pending(&key, TOMBSTONE.to_vec(), ctx.start_ts)
+                {
+                    Ok(()) => {
+                        // No longer a LOCK key (if it was one from a prior delete)
+                        ctx.lock_keys.retain(|k| k != &key);
+                        ctx.add_locked_key(key);
+                        Ok(())
+                    }
+                    Err(lock_owner) => Err(TiSqlError::KeyIsLocked {
                         key,
                         lock_ts: lock_owner,
                         primary: vec![],
-                    })
+                    }),
+                }
+            } else {
+                // Case 2/3: no committed value → LOCK (pessimistic lock only, not persisted to clog)
+                match self.storage.put_pending(&key, LOCK.to_vec(), ctx.start_ts) {
+                    Ok(()) => {
+                        if !ctx.lock_keys.contains(&key) {
+                            ctx.lock_keys.push(key.clone());
+                        }
+                        ctx.add_locked_key(key);
+                        Ok(())
+                    }
+                    Err(lock_owner) => Err(TiSqlError::KeyIsLocked {
+                        key,
+                        lock_ts: lock_owner,
+                        primary: vec![],
+                    }),
                 }
             }
         } else {
@@ -432,10 +448,29 @@ impl<S: PessimisticStorage + 'static, L: ClogService + 'static, T: TsoService> T
             self.concurrency_manager
                 .prepare_txn(ctx.start_ts, commit_ts)?;
 
+            // Build WriteBatch by reading pending values from storage.
+            // This defers value cloning to commit time — zero cost on rollback.
+            let lock_keys = std::mem::take(&mut ctx.lock_keys);
+            let mut storage_batch = WriteBatch::new();
+            for key in &locked_keys {
+                if lock_keys.contains(key) {
+                    continue; // LOCK key — nothing to persist in clog
+                }
+                match self.storage.get_with_owner(key, ctx.start_ts, ctx.start_ts) {
+                    Some(value) if !is_tombstone(&value) => {
+                        storage_batch.put(key.clone(), value);
+                    }
+                    _ => {
+                        // TOMBSTONE: MemTableEngine returns Some(TOMBSTONE),
+                        // LsmEngine returns None. Both handled here as Delete.
+                        storage_batch.delete(key.clone());
+                    }
+                }
+            }
+
             // Write to clog for durability before finalizing.
             // If we crash after clog write but before finalize, recovery
             // replays the clog entry to reconstruct the committed data.
-            let storage_batch = std::mem::take(&mut ctx.write_buffer);
             let lsn = self
                 .clog_service
                 .write_batch(txn_id, &storage_batch, commit_ts, true)?;
@@ -2248,5 +2283,192 @@ mod tests {
         let ts2 = tso.last_ts();
 
         assert!(ts2 > ts1);
+    }
+
+    // ========================================================================
+    // Clog Durability Tests
+    // ========================================================================
+
+    /// Helper: collect clog entries for a given txn_id, excluding Commit/Rollback records.
+    fn clog_data_entries(entries: &[ClogEntry], txn_id: TxnId) -> Vec<&ClogEntry> {
+        entries
+            .iter()
+            .filter(|e| {
+                e.txn_id == txn_id && !matches!(e.op, ClogOp::Commit { .. } | ClogOp::Rollback)
+            })
+            .collect()
+    }
+
+    #[test]
+    fn test_implicit_txn_commit_writes_clog() {
+        let (_storage, txn_service, _dir) = create_test_service();
+
+        let info = txn_service.autocommit_put(b"key1", b"value1").unwrap();
+        assert!(info.lsn > 0, "implicit txn should produce non-zero LSN");
+
+        // Verify clog contains Put + Commit entries
+        let entries = txn_service.clog_service().read_all().unwrap();
+        let data = clog_data_entries(&entries, info.txn_id);
+        assert_eq!(data.len(), 1, "should have 1 Put entry");
+        assert!(matches!(&data[0].op, ClogOp::Put { key, value }
+            if key == b"key1" && value == b"value1"));
+
+        let commits: Vec<_> = entries
+            .iter()
+            .filter(|e| e.txn_id == info.txn_id && matches!(e.op, ClogOp::Commit { .. }))
+            .collect();
+        assert_eq!(commits.len(), 1, "should have 1 Commit entry");
+    }
+
+    #[test]
+    fn test_explicit_txn_commit_writes_clog() {
+        let (_storage, txn_service, _dir) = create_test_service();
+
+        let mut ctx = txn_service.begin_explicit(false).unwrap();
+        let txn_id = ctx.txn_id();
+        txn_service
+            .put(&mut ctx, b"key1".to_vec(), b"value1".to_vec())
+            .unwrap();
+        let info = txn_service.commit(ctx).unwrap();
+        assert!(info.lsn > 0, "explicit txn should produce non-zero LSN");
+
+        // Verify clog contains Put + Commit entries
+        let entries = txn_service.clog_service().read_all().unwrap();
+        let data = clog_data_entries(&entries, txn_id);
+        assert_eq!(data.len(), 1, "should have 1 Put entry");
+        assert!(matches!(&data[0].op, ClogOp::Put { key, value }
+            if key == b"key1" && value == b"value1"));
+
+        let commits: Vec<_> = entries
+            .iter()
+            .filter(|e| e.txn_id == txn_id && matches!(e.op, ClogOp::Commit { .. }))
+            .collect();
+        assert_eq!(commits.len(), 1, "should have 1 Commit entry");
+    }
+
+    #[test]
+    fn test_explicit_txn_delete_existing_writes_clog() {
+        let (_storage, txn_service, _dir) = create_test_service();
+
+        // First, commit a value via autocommit
+        txn_service.autocommit_put(b"key1", b"value1").unwrap();
+
+        // Now delete it via explicit transaction
+        let mut ctx = txn_service.begin_explicit(false).unwrap();
+        let txn_id = ctx.txn_id();
+        txn_service.delete(&mut ctx, b"key1".to_vec()).unwrap();
+        let info = txn_service.commit(ctx).unwrap();
+        assert!(info.lsn > 0);
+
+        // Verify clog contains Delete entry (not LOCK)
+        let entries = txn_service.clog_service().read_all().unwrap();
+        let data = clog_data_entries(&entries, txn_id);
+        assert_eq!(data.len(), 1, "should have 1 Delete entry");
+        assert!(
+            matches!(&data[0].op, ClogOp::Delete { key } if key == b"key1"),
+            "expected Delete entry for key1, got {:?}",
+            data[0].op
+        );
+    }
+
+    #[test]
+    fn test_explicit_txn_multiple_writes_clog() {
+        let (_storage, txn_service, _dir) = create_test_service();
+
+        let mut ctx = txn_service.begin_explicit(false).unwrap();
+        let txn_id = ctx.txn_id();
+        txn_service
+            .put(&mut ctx, b"key1".to_vec(), b"v1".to_vec())
+            .unwrap();
+        txn_service
+            .put(&mut ctx, b"key2".to_vec(), b"v2".to_vec())
+            .unwrap();
+        txn_service
+            .put(&mut ctx, b"key3".to_vec(), b"v3".to_vec())
+            .unwrap();
+        txn_service.commit(ctx).unwrap();
+
+        let entries = txn_service.clog_service().read_all().unwrap();
+        let data = clog_data_entries(&entries, txn_id);
+        assert_eq!(data.len(), 3, "should have 3 Put entries");
+
+        let commits: Vec<_> = entries
+            .iter()
+            .filter(|e| e.txn_id == txn_id && matches!(e.op, ClogOp::Commit { .. }))
+            .collect();
+        assert_eq!(commits.len(), 1, "should have 1 Commit entry");
+    }
+
+    #[test]
+    fn test_explicit_txn_delete_nonexistent_no_clog() {
+        let (_storage, txn_service, _dir) = create_test_service();
+
+        // Delete a key that was never written
+        let mut ctx = txn_service.begin_explicit(false).unwrap();
+        let txn_id = ctx.txn_id();
+        txn_service
+            .delete(&mut ctx, b"nonexistent".to_vec())
+            .unwrap();
+        txn_service.commit(ctx).unwrap();
+
+        // Verify NO data entries in clog (LOCK keys are skipped)
+        let entries = txn_service.clog_service().read_all().unwrap();
+        let data = clog_data_entries(&entries, txn_id);
+        assert!(
+            data.is_empty(),
+            "LOCK-only delete should produce no data entries, got {} entries",
+            data.len()
+        );
+    }
+
+    #[test]
+    fn test_explicit_txn_delete_your_write_no_clog() {
+        let (_storage, txn_service, _dir) = create_test_service();
+
+        // PUT then DELETE same key within explicit txn (no committed value underneath)
+        let mut ctx = txn_service.begin_explicit(false).unwrap();
+        let txn_id = ctx.txn_id();
+        txn_service
+            .put(&mut ctx, b"key1".to_vec(), b"value1".to_vec())
+            .unwrap();
+        txn_service.delete(&mut ctx, b"key1".to_vec()).unwrap();
+        txn_service.commit(ctx).unwrap();
+
+        // DELETE of own write (no committed base) → LOCK → no data entries in clog
+        let entries = txn_service.clog_service().read_all().unwrap();
+        let data = clog_data_entries(&entries, txn_id);
+        assert!(
+            data.is_empty(),
+            "PUT then DELETE (no committed base) should produce no data entries, got {:?}",
+            data.iter().map(|e| &e.op).collect::<Vec<_>>()
+        );
+    }
+
+    #[test]
+    fn test_explicit_txn_put_delete_put_writes_clog() {
+        let (_storage, txn_service, _dir) = create_test_service();
+
+        // PUT → DELETE → PUT sequence (no committed base)
+        let mut ctx = txn_service.begin_explicit(false).unwrap();
+        let txn_id = ctx.txn_id();
+        txn_service
+            .put(&mut ctx, b"key1".to_vec(), b"v1".to_vec())
+            .unwrap();
+        txn_service.delete(&mut ctx, b"key1".to_vec()).unwrap();
+        txn_service
+            .put(&mut ctx, b"key1".to_vec(), b"v2".to_vec())
+            .unwrap();
+        txn_service.commit(ctx).unwrap();
+
+        // Final state is PUT v2, so clog should have 1 Put entry
+        let entries = txn_service.clog_service().read_all().unwrap();
+        let data = clog_data_entries(&entries, txn_id);
+        assert_eq!(data.len(), 1, "should have 1 Put entry for final value");
+        assert!(
+            matches!(&data[0].op, ClogOp::Put { key, value }
+                if key == b"key1" && value == b"v2"),
+            "expected Put(key1, v2), got {:?}",
+            data[0].op
+        );
     }
 }
