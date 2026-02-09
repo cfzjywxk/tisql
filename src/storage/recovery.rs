@@ -57,9 +57,7 @@ struct TxnReplayState {
     writes: Vec<(Vec<u8>, Option<Vec<u8>>)>, // (key, value) - None means delete
     /// Commit timestamp (if committed)
     commit_ts: Option<Timestamp>,
-    /// Max LSN of this transaction's writes (including commit record)
-    max_lsn: Lsn,
-    /// LSN of the commit record (for proper clog_lsn threading)
+    /// LSN of the commit record (for replay ordering and flushed_lsn tracking)
     commit_lsn: Option<Lsn>,
 }
 
@@ -256,20 +254,15 @@ impl LsmRecovery {
                 ClogOp::Put { key, value } => {
                     let state = txn_states.entry(entry.txn_id).or_default();
                     state.writes.push((key.clone(), Some(value.clone())));
-                    state.max_lsn = state.max_lsn.max(entry.lsn);
                 }
                 ClogOp::Delete { key } => {
                     let state = txn_states.entry(entry.txn_id).or_default();
                     state.writes.push((key.clone(), None));
-                    state.max_lsn = state.max_lsn.max(entry.lsn);
                 }
                 ClogOp::Commit { commit_ts } => {
                     if let Some(state) = txn_states.get_mut(&entry.txn_id) {
                         state.commit_ts = Some(*commit_ts);
-                        // Track commit record LSN - this is critical for correct flushed_lsn tracking
                         state.commit_lsn = Some(entry.lsn);
-                        // Include commit record LSN in max_lsn
-                        state.max_lsn = state.max_lsn.max(entry.lsn);
                     }
                 }
                 ClogOp::Rollback => {
@@ -279,16 +272,17 @@ impl LsmRecovery {
             }
         }
 
-        // Collect committed transactions and sort by max_lsn to ensure
-        // memtable age ordering matches LSN ordering during replay.
-        // This is critical for correct flushed_lsn tracking after recovery.
+        // Collect committed transactions and sort by commit_lsn to ensure
+        // replay order matches commit order. This is critical for correct
+        // flushed_lsn tracking: the last replayed batch must have the highest
+        // clog_lsn so the memtable's max LSN reflects the true recovery point.
         let mut committed_txns: Vec<(TxnId, TxnReplayState)> = txn_states
             .into_iter()
             .filter(|(_, state)| state.commit_ts.is_some() && !state.writes.is_empty())
             .collect();
 
-        // Sort by max_lsn (ascending) so older transactions are applied first
-        committed_txns.sort_by_key(|(_, state)| state.max_lsn);
+        // Sort by commit_lsn (ascending) so older transactions are applied first
+        committed_txns.sort_by_key(|(_, state)| state.commit_lsn);
 
         // Apply committed transactions in LSN order
         for (_txn_id, state) in committed_txns {
@@ -297,10 +291,9 @@ impl LsmRecovery {
             batch.set_commit_ts(commit_ts);
 
             // Critical: Set clog_lsn so that flush correctly tracks flushed_lsn.
-            // Use the commit record's LSN as it's the final LSN for this transaction.
-            // Fall back to max_lsn if commit_lsn not tracked (shouldn't happen).
-            let clog_lsn = state.commit_lsn.unwrap_or(state.max_lsn);
-            batch.set_clog_lsn(clog_lsn);
+            // commit_lsn is guaranteed Some here: the filter above requires
+            // commit_ts.is_some(), which is only set alongside commit_lsn.
+            batch.set_clog_lsn(state.commit_lsn.unwrap());
 
             for (key, value) in state.writes {
                 match value {
