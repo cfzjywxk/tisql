@@ -226,6 +226,132 @@ impl<S: StorageEngine, L: ClogService, T: TsoService> TransactionService<S, L, T
     }
 }
 
+// Private helpers for the commit protocol.
+//
+// These require PessimisticStorage since they interact with pending nodes.
+impl<S: PessimisticStorage + 'static, L: ClogService + 'static, T: TsoService>
+    TransactionService<S, L, T>
+{
+    /// Build locked_keys and WriteBatch for an explicit transaction commit.
+    ///
+    /// Explicit transactions have pending writes already in storage.
+    /// This reads them back to build the clog WriteBatch.
+    fn prepare_explicit_batch(&self, ctx: &mut TxnCtx) -> Result<(Vec<Key>, WriteBatch)> {
+        let locked_keys = std::mem::take(&mut ctx.locked_keys);
+        if locked_keys.is_empty() {
+            return Ok((vec![], WriteBatch::new()));
+        }
+
+        let lock_keys = std::mem::take(&mut ctx.lock_keys);
+        let mut batch = WriteBatch::new();
+        for key in &locked_keys {
+            if lock_keys.contains(key) {
+                continue; // LOCK key — nothing to persist in clog
+            }
+            match self.storage.get_with_owner(key, ctx.start_ts, ctx.start_ts) {
+                Some(value) if !is_tombstone(&value) => {
+                    batch.put(key.clone(), value);
+                }
+                _ => {
+                    // TOMBSTONE: MemTableEngine returns Some(TOMBSTONE),
+                    // LsmEngine returns None. Both handled here as Delete.
+                    batch.delete(key.clone());
+                }
+            }
+        }
+        Ok((locked_keys, batch))
+    }
+
+    /// Build locked_keys and WriteBatch for an implicit transaction commit.
+    ///
+    /// Implicit transactions have buffered writes. This acquires locks by
+    /// writing pending nodes to storage, then returns the locked keys and batch.
+    fn prepare_implicit_batch(&self, ctx: &mut TxnCtx) -> Result<(Vec<Key>, WriteBatch)> {
+        let batch = std::mem::take(&mut ctx.write_buffer);
+        if batch.is_empty() {
+            return Ok((vec![], WriteBatch::new()));
+        }
+
+        let start_ts = ctx.start_ts;
+        let mut locked_keys: Vec<Key> = Vec::with_capacity(batch.len());
+
+        for (key, op) in batch.iter() {
+            let value = match op {
+                WriteOp::Put { value } => value.clone(),
+                WriteOp::Delete => TOMBSTONE.to_vec(),
+            };
+
+            match self.storage.put_pending(key, value, start_ts) {
+                Ok(()) => {
+                    locked_keys.push(key.clone());
+                }
+                Err(lock_owner) => {
+                    // Conflict - abort all pending writes we made
+                    if !locked_keys.is_empty() {
+                        self.storage.abort_pending(&locked_keys, start_ts);
+                    }
+                    return Err(TiSqlError::KeyIsLocked {
+                        key: key.clone(),
+                        lock_ts: lock_owner,
+                        primary: vec![],
+                    });
+                }
+            }
+        }
+
+        // FAILPOINT: After locks acquired, before commit_ts computation
+        #[cfg(feature = "failpoints")]
+        fail_point!("txn_after_lock_before_commit_ts");
+
+        Ok((locked_keys, batch))
+    }
+
+    /// Execute the common commit protocol after locks are acquired.
+    ///
+    /// Steps: Preparing → commit_ts → Prepared → clog → finalize → Committed.
+    ///
+    /// On success, returns (commit_ts, lsn). On failure, the caller is responsible
+    /// for cleanup (abort_pending, abort_txn, remove_txn).
+    fn run_commit_protocol(
+        &self,
+        txn_id: TxnId,
+        start_ts: Timestamp,
+        locked_keys: &[Key],
+        storage_batch: &WriteBatch,
+    ) -> Result<(Timestamp, u64)> {
+        // Step 1: Signal that we're computing commit_ts.
+        // Readers encountering our pending nodes will spin-wait until Prepared.
+        self.concurrency_manager.set_preparing_txn(start_ts)?;
+
+        // Step 2: Compute commit_ts (safe: readers spin on Preparing)
+        let max_ts = self.concurrency_manager.max_ts();
+        let tso_ts = self.get_ts();
+        let commit_ts = std::cmp::max(max_ts + 1, tso_ts);
+
+        // Step 3: Set prepared_ts for readers to check visibility
+        self.concurrency_manager
+            .prepare_txn(start_ts, commit_ts)?;
+
+        // Step 4: Write to clog for durability before finalizing.
+        // If we crash after clog write but before finalize, recovery
+        // replays the clog entry to reconstruct the committed data.
+        let lsn = self
+            .clog_service
+            .write_batch(txn_id, storage_batch, commit_ts, true)?;
+
+        // Step 5: Finalize all pending nodes by setting their commit_ts.
+        // This makes the writes visible to readers with read_ts >= commit_ts.
+        self.storage
+            .finalize_pending(locked_keys, start_ts, commit_ts);
+
+        // Step 6: Transition to Committed in state cache
+        self.concurrency_manager
+            .commit_txn(start_ts, commit_ts)?;
+
+        Ok((commit_ts, lsn))
+    }
+}
+
 /// Implement TxnService trait for TransactionService
 ///
 /// Note: `S: PessimisticStorage` is required to support explicit transactions
@@ -412,191 +538,57 @@ impl<S: PessimisticStorage + 'static, L: ClogService + 'static, T: TsoService> T
     fn commit(&self, mut ctx: TxnCtx) -> Result<CommitInfo> {
         Self::check_active(&ctx)?;
 
-        if ctx.is_explicit() {
-            // =================================================================
-            // Explicit Transaction Commit (Pessimistic Locking)
-            // =================================================================
-            // Pending writes are already in storage. We just need to:
-            // 1. Prepare (compute commit_ts)
-            // 2. Finalize pending nodes (set their ts to commit_ts)
-            // 3. Update txn state
+        let txn_id = ctx.txn_id;
+        let start_ts = ctx.start_ts;
+        let is_explicit = ctx.is_explicit();
 
-            let locked_keys = std::mem::take(&mut ctx.locked_keys);
-
-            if locked_keys.is_empty() {
-                // No writes - just mark as committed
-                self.concurrency_manager.remove_txn(ctx.start_ts);
-                ctx.state = TxnState::Committed {
-                    commit_ts: ctx.start_ts,
-                };
-                return Ok(CommitInfo {
-                    txn_id: ctx.txn_id,
-                    commit_ts: ctx.start_ts,
-                    lsn: 0,
-                });
-            }
-
-            let txn_id = ctx.txn_id;
-
-            // Step 1: Signal that we're computing commit_ts.
-            // Readers encountering our pending nodes will spin-wait until Prepared.
-            self.concurrency_manager.set_preparing_txn(ctx.start_ts)?;
-
-            // Step 2: Compute commit_ts (safe: readers spin on Preparing)
-            let max_ts = self.concurrency_manager.max_ts();
-            let tso_ts = self.get_ts();
-            let commit_ts = std::cmp::max(max_ts + 1, tso_ts);
-
-            // Step 3: Set prepared_ts for readers to check visibility
-            self.concurrency_manager
-                .prepare_txn(ctx.start_ts, commit_ts)?;
-
-            // Build WriteBatch by reading pending values from storage.
-            // This defers value cloning to commit time — zero cost on rollback.
-            let lock_keys = std::mem::take(&mut ctx.lock_keys);
-            let mut storage_batch = WriteBatch::new();
-            for key in &locked_keys {
-                if lock_keys.contains(key) {
-                    continue; // LOCK key — nothing to persist in clog
-                }
-                match self.storage.get_with_owner(key, ctx.start_ts, ctx.start_ts) {
-                    Some(value) if !is_tombstone(&value) => {
-                        storage_batch.put(key.clone(), value);
-                    }
-                    _ => {
-                        // TOMBSTONE: MemTableEngine returns Some(TOMBSTONE),
-                        // LsmEngine returns None. Both handled here as Delete.
-                        storage_batch.delete(key.clone());
-                    }
-                }
-            }
-
-            // Write to clog for durability before finalizing.
-            // If we crash after clog write but before finalize, recovery
-            // replays the clog entry to reconstruct the committed data.
-            let lsn = self
-                .clog_service
-                .write_batch(txn_id, &storage_batch, commit_ts, true)?;
-
-            // Finalize all pending nodes by setting their commit_ts
-            // This makes the writes visible to readers with read_ts >= commit_ts
-            self.storage
-                .finalize_pending(&locked_keys, ctx.start_ts, commit_ts);
-
-            // Update state cache: Prepared -> Committed
-            self.concurrency_manager
-                .commit_txn(ctx.start_ts, commit_ts)?;
-
-            // Mark context as committed
-            ctx.state = TxnState::Committed { commit_ts };
-
-            Ok(CommitInfo {
-                txn_id,
-                commit_ts,
-                lsn,
-            })
+        // Phase 1: Build locked_keys and storage_batch.
+        // Explicit: reads pending values from storage (locks already held).
+        // Implicit: acquires locks by writing pending nodes to storage.
+        let (locked_keys, storage_batch) = if is_explicit {
+            self.prepare_explicit_batch(&mut ctx)?
         } else {
-            // =================================================================
-            // Implicit Transaction Commit (Optimistic Locking)
-            // =================================================================
-            // Writes are buffered. We need to:
-            // 1. Acquire in-memory locks
-            // 2. Write to clog
-            // 3. Apply to storage
+            self.prepare_implicit_batch(&mut ctx)?
+        };
 
-            if ctx.write_buffer.is_empty() {
-                // No writes - just mark as committed
-                ctx.state = TxnState::Committed {
-                    commit_ts: ctx.start_ts,
-                };
-                return Ok(CommitInfo {
-                    txn_id: ctx.txn_id,
-                    commit_ts: ctx.start_ts,
-                    lsn: 0,
-                });
-            }
-
-            let txn_id = ctx.txn_id;
-            let start_ts = ctx.start_ts;
-
-            // Take ownership of write buffer (swap with empty)
-            let storage_batch = std::mem::take(&mut ctx.write_buffer);
-
-            // Phase 1: Acquire locks by writing pending nodes to storage.
-            // This prevents concurrent writers from conflicting.
-            let mut locked_keys: Vec<Key> = Vec::with_capacity(storage_batch.len());
-
-            for (key, op) in storage_batch.iter() {
-                let value = match op {
-                    WriteOp::Put { value } => value.clone(),
-                    WriteOp::Delete => TOMBSTONE.to_vec(),
-                };
-
-                match self.storage.put_pending(key, value, start_ts) {
-                    Ok(()) => {
-                        locked_keys.push(key.clone());
-                    }
-                    Err(lock_owner) => {
-                        // Conflict - abort all pending writes we made
-                        if !locked_keys.is_empty() {
-                            self.storage.abort_pending(&locked_keys, start_ts);
-                        }
-                        return Err(TiSqlError::KeyIsLocked {
-                            key: key.clone(),
-                            lock_ts: lock_owner,
-                            primary: vec![],
-                        });
-                    }
-                }
-            }
-
-            // FAILPOINT: After locks acquired, before commit_ts computation
-            #[cfg(feature = "failpoints")]
-            fail_point!("txn_after_lock_before_commit_ts");
-
-            // Register in TxnStateCache so readers can resolve our pending nodes.
-            // Then transition to Preparing before computing commit_ts.
-            self.concurrency_manager.register_txn(start_ts);
-            if let Err(e) = self.concurrency_manager.set_preparing_txn(start_ts) {
+        // No-write transaction: clean up and return
+        if locked_keys.is_empty() {
+            if is_explicit {
                 self.concurrency_manager.remove_txn(start_ts);
-                self.storage.abort_pending(&locked_keys, start_ts);
-                return Err(e);
             }
+            ctx.state = TxnState::Committed {
+                commit_ts: start_ts,
+            };
+            return Ok(CommitInfo {
+                txn_id,
+                commit_ts: start_ts,
+                lsn: 0,
+            });
+        }
 
-            // Phase 2: Get commit_ts AFTER acquiring locks and entering Preparing
-            let max_ts = self.concurrency_manager.max_ts();
-            let tso_ts = self.get_ts();
-            let commit_ts = std::cmp::max(max_ts + 1, tso_ts);
+        // For implicit txns, register in state cache now.
+        // Explicit txns were registered at begin_explicit().
+        if !is_explicit {
+            self.concurrency_manager.register_txn(start_ts);
+        }
 
-            // Transition to Prepared with known commit_ts
-            if let Err(e) = self.concurrency_manager.prepare_txn(start_ts, commit_ts) {
+        // Phase 2: Common commit protocol (Preparing → Prepared → clog → finalize → Committed)
+        match self.run_commit_protocol(txn_id, start_ts, &locked_keys, &storage_batch) {
+            Ok((commit_ts, lsn)) => {
+                self.concurrency_manager.remove_txn(start_ts);
+                ctx.state = TxnState::Committed { commit_ts };
+                Ok(CommitInfo {
+                    txn_id,
+                    commit_ts,
+                    lsn,
+                })
+            }
+            Err(e) => {
+                self.storage.abort_pending(&locked_keys, start_ts);
                 self.concurrency_manager.abort_txn(start_ts).ok();
                 self.concurrency_manager.remove_txn(start_ts);
-                self.storage.abort_pending(&locked_keys, start_ts);
-                return Err(e);
+                Err(e)
             }
-
-            // Write to commit log before finalizing (for durability)
-            let lsn = self
-                .clog_service
-                .write_batch(txn_id, &storage_batch, commit_ts, true)?;
-
-            // Phase 3: Finalize all pending nodes with commit_ts
-            self.storage
-                .finalize_pending(&locked_keys, start_ts, commit_ts);
-
-            // Transition to Committed, then cleanup
-            self.concurrency_manager.commit_txn(start_ts, commit_ts)?;
-            self.concurrency_manager.remove_txn(start_ts);
-
-            // Mark as committed
-            ctx.state = TxnState::Committed { commit_ts };
-
-            Ok(CommitInfo {
-                txn_id,
-                commit_ts,
-                lsn,
-            })
         }
     }
 
@@ -2705,13 +2697,12 @@ mod tests {
         let info = txn_service.commit(writer).unwrap();
         assert!(info.commit_ts > 0);
 
-        // After commit: txn should be Committed (then removed from cache on explicit commit
-        // - but explicit commit doesn't call remove_txn, so it should still be there)
-        // Note: explicit commit leaves it in Committed state for readers to resolve
-        let state = txn_service.concurrency_manager().get_txn_state(start_ts);
-        assert!(
-            matches!(state, Some(TxnState::Committed { .. })),
-            "Expected Committed, got {state:?}"
+        // After commit: txn is removed from state cache (cleaned up).
+        // This is safe because finalize_pending already committed the nodes in storage,
+        // so readers won't encounter pending nodes that need resolution.
+        assert_eq!(
+            txn_service.concurrency_manager().get_txn_state(start_ts),
+            None
         );
     }
 
