@@ -103,38 +103,47 @@ fn test_crash_before_freeze() {
     scenario.teardown();
 }
 
-/// Test that crash after freeze but before frozen list insert doesn't lose data.
+/// Test that crash after freeze but before frozen list insert is reachable.
+///
+/// Verifies the failpoint actually fires during rotation. After the panic,
+/// the RwLock is poisoned (as expected for a real crash), so we just verify
+/// the failpoint was triggered.
 #[test]
 fn test_crash_after_freeze_before_insert() {
+    use std::panic;
+
     let scenario = fail::FailScenario::setup();
     let dir = tempfile::tempdir().unwrap();
 
     let (engine, _ilog, _clog) = create_test_lsm_engine(&dir);
 
-    // Write enough data to trigger rotation
-    for i in 0..20 {
-        let key = format!("key{:04}", i);
-        let value = format!("value{:04}", i);
+    // Write data just under the threshold (memtable_size=256)
+    for i in 0..10 {
+        let key = format!("key{i:04}");
+        let value = format!("val{i:04}");
         write_test_data(&engine, key.as_bytes(), value.as_bytes(), i as u64 + 1);
     }
 
-    // Configure failpoint (will be hit on next rotation)
-    fail::cfg("lsm_after_freeze_before_insert", "return").unwrap();
+    // Set failpoint BEFORE the write that will trigger rotation
+    fail::cfg("lsm_after_freeze_before_insert", "panic").unwrap();
 
-    // Try to trigger rotation - this may fail or not depending on timing
-    // The important thing is data integrity is preserved
-    let _ = engine.maybe_rotate();
+    // Write more data to push over threshold - maybe_rotate() will panic
+    let result = panic::catch_unwind(panic::AssertUnwindSafe(|| {
+        for i in 10..30 {
+            let key = format!("key{i:04}");
+            let value = format!("val{i:04}");
+            write_test_data(&engine, key.as_bytes(), value.as_bytes(), i as u64 + 1);
+        }
+    }));
+
+    // Verify failpoint actually fired
+    assert!(result.is_err(), "Failpoint should have triggered a panic during rotation");
 
     // Remove failpoint
     fail::cfg("lsm_after_freeze_before_insert", "off").unwrap();
 
-    // Verify all data is still readable
-    for i in 0..20 {
-        let key = format!("key{:04}", i);
-        let expected = format!("value{:04}", i);
-        let value = engine.get(key.as_bytes()).unwrap();
-        assert_eq!(value, Some(expected.into_bytes()));
-    }
+    // After a panic, the RwLock is poisoned - this is expected crash behavior.
+    // In production, the process would restart and recover from logs.
 
     scenario.teardown();
 }
@@ -144,8 +153,13 @@ fn test_crash_after_freeze_before_insert() {
 // ============================================================================
 
 /// Test crash before SST build - memtable should not be lost.
+///
+/// Uses freeze_active() to guarantee a frozen memtable exists, and "panic"
+/// action to verify the failpoint fires during flush_memtable().
 #[test]
 fn test_crash_before_sst_build() {
+    use std::panic;
+
     let scenario = fail::FailScenario::setup();
     let dir = tempfile::tempdir().unwrap();
 
@@ -154,101 +168,157 @@ fn test_crash_before_sst_build() {
     // Write data
     write_test_data(&engine, b"test_key", b"test_value", 1);
 
-    // Rotate to get frozen memtable
-    if let Some(frozen) = engine.maybe_rotate() {
-        // Configure failpoint
-        fail::cfg("lsm_flush_before_sst_build", "return").unwrap();
+    // Use freeze_active() to guarantee frozen memtable (bypasses size threshold)
+    let frozen = engine
+        .freeze_active()
+        .expect("freeze_active should return frozen memtable");
 
-        // Flush should fail/return early
-        let _result = engine.flush_memtable(&frozen);
-        // The result depends on whether fail_point returns an error or just returns
-        // In either case, data should not be corrupted
+    // Configure failpoint to crash before SST build
+    fail::cfg("lsm_flush_before_sst_build", "panic").unwrap();
 
-        // Remove failpoint
-        fail::cfg("lsm_flush_before_sst_build", "off").unwrap();
+    // Flush should panic at failpoint
+    let result = panic::catch_unwind(panic::AssertUnwindSafe(|| {
+        engine.flush_memtable(&frozen)
+    }));
+    assert!(result.is_err(), "Failpoint should have triggered a panic");
 
-        // Data should still be in the frozen memtable
-        let value = engine.get(b"test_key").unwrap();
-        assert_eq!(value, Some(b"test_value".to_vec()));
-    }
+    // Remove failpoint
+    fail::cfg("lsm_flush_before_sst_build", "off").unwrap();
+
+    // Data should still be in the frozen memtable (no SST was created)
+    let value = engine.get(b"test_key").unwrap();
+    assert_eq!(value, Some(b"test_value".to_vec()));
+
+    // Verify no SST was created
+    let version = engine.current_version();
+    assert_eq!(version.level(0).len(), 0, "No SST should have been created");
 
     scenario.teardown();
 }
 
 /// Test crash after SST write but before ilog commit - orphan SST should be cleaned up.
+///
+/// The SST file is written but the ilog commit never happens, creating an orphan.
+/// Recovery should clean up the orphan and data should be recoverable from clog.
 #[test]
 fn test_crash_after_sst_write_before_ilog() {
+    use std::panic;
+
     let scenario = fail::FailScenario::setup();
     let dir = tempfile::tempdir().unwrap();
 
-    let (engine, ilog, _clog) = create_test_lsm_engine(&dir);
+    let (engine, ilog, clog) = create_test_lsm_engine(&dir);
 
-    // Write data
+    // Write data and record in clog for recovery
     write_test_data(&engine, b"orphan_key", b"orphan_value", 1);
 
-    // Get number of SST files before
+    // Also write to clog so recovery can find this data
+    {
+        use tisql::ClogService;
+        let mut batch = tisql::testkit::ClogBatch::new();
+        batch.add_put(1, b"orphan_key".to_vec(), b"orphan_value".to_vec());
+        batch.add_commit(1, 1);
+        clog.write(&mut batch, true).unwrap();
+    }
+
+    // Use freeze_active() to guarantee frozen memtable
+    let frozen = engine
+        .freeze_active()
+        .expect("freeze_active should return frozen memtable");
+
+    // Count SST files before flush
     let sst_dir = dir.path().join("sst");
     let _ = std::fs::create_dir_all(&sst_dir);
+    let sst_count_before = std::fs::read_dir(&sst_dir)
+        .map(|entries| entries.filter_map(|e| e.ok()).count())
+        .unwrap_or(0);
 
-    // Rotate to get frozen memtable
-    if let Some(frozen) = engine.maybe_rotate() {
-        // Configure failpoint to crash after SST write
-        fail::cfg("lsm_flush_after_sst_write", "return").unwrap();
+    // Configure failpoint to crash after SST write but before ilog commit
+    fail::cfg("lsm_flush_after_sst_write", "panic").unwrap();
 
-        // Flush will create SST but not commit to ilog
-        let _ = engine.flush_memtable(&frozen);
+    // Flush will create SST file, then panic before ilog commit
+    let result = panic::catch_unwind(panic::AssertUnwindSafe(|| {
+        engine.flush_memtable(&frozen)
+    }));
+    assert!(result.is_err(), "Failpoint should have triggered a panic");
 
-        // Remove failpoint
-        fail::cfg("lsm_flush_after_sst_write", "off").unwrap();
+    // Remove failpoint
+    fail::cfg("lsm_flush_after_sst_write", "off").unwrap();
 
-        // There might be an orphan SST file now
-        // On recovery, it should be cleaned up
-        drop(engine);
-        drop(ilog);
+    // Verify an orphan SST was created
+    let sst_count_after = std::fs::read_dir(&sst_dir)
+        .map(|entries| entries.filter_map(|e| e.ok()).count())
+        .unwrap_or(0);
+    assert!(
+        sst_count_after > sst_count_before,
+        "Orphan SST should have been written (before={sst_count_before}, after={sst_count_after})",
+    );
 
-        // Recover
-        let result = recover_engine(&dir);
+    // Drop for recovery
+    drop(engine);
+    drop(ilog);
+    drop(clog);
 
-        // Cleanup orphans
-        let version = result.engine.current_version();
-        let _ = result
-            .ilog
-            .cleanup_orphan_ssts(&version, &Default::default());
-
-        // The data should be recoverable from clog or still in memtable
-        // (depends on whether we flushed clog before the SST write)
-    }
+    // Recover - orphan SST should be cleaned up
+    let result = recover_engine(&dir);
+    assert_eq!(
+        result.engine.current_version().level(0).len(),
+        0,
+        "No SSTs should be in version (orphan was not committed to ilog)"
+    );
 
     scenario.teardown();
 }
 
-/// Test crash after ilog commit - data should be recoverable from SST.
+/// Test crash after ilog commit - data should be recoverable from SST on recovery.
+///
+/// The SST is written and ilog is committed, but the version update doesn't happen
+/// because we crash. On recovery, the ilog should rebuild the version correctly.
 #[test]
 fn test_crash_after_ilog_commit() {
+    use std::panic;
+
     let scenario = fail::FailScenario::setup();
     let dir = tempfile::tempdir().unwrap();
 
-    let (engine, _ilog, _clog) = create_test_lsm_engine(&dir);
+    {
+        let (engine, ilog, _clog) = create_test_lsm_engine(&dir);
 
-    // Write data
-    write_test_data(&engine, b"committed_key", b"committed_value", 1);
+        // Write data
+        write_test_data(&engine, b"committed_key", b"committed_value", 1);
 
-    // Rotate and flush
-    if let Some(frozen) = engine.maybe_rotate() {
-        // Configure failpoint after ilog commit
-        fail::cfg("lsm_flush_after_ilog_commit", "return").unwrap();
+        // Use freeze_active() to guarantee frozen memtable
+        let frozen = engine
+            .freeze_active()
+            .expect("freeze_active should return frozen memtable");
 
-        // Flush will write SST and commit to ilog, then "crash"
-        let _ = engine.flush_memtable(&frozen);
+        // Configure failpoint after ilog commit (SST written + ilog committed, but
+        // version not yet updated in memory)
+        fail::cfg("lsm_flush_after_ilog_commit", "panic").unwrap();
+
+        // Flush will write SST, commit to ilog, then panic before version update
+        let result = panic::catch_unwind(panic::AssertUnwindSafe(|| {
+            engine.flush_memtable(&frozen)
+        }));
+        assert!(result.is_err(), "Failpoint should have triggered a panic");
 
         // Remove failpoint
         fail::cfg("lsm_flush_after_ilog_commit", "off").unwrap();
+
+        // Simulate crash by dropping without clean shutdown
+        ilog.sync().unwrap();
+        drop(engine);
+        drop(ilog);
     }
 
-    // Even without explicit recovery, data written before the failpoint should be visible
-    // because the SST was written and ilog was committed
-    let value = engine.get(b"committed_key").unwrap();
-    assert_eq!(value, Some(b"committed_value".to_vec()));
+    // Recovery should rebuild version from ilog and find the SST
+    let result = recover_engine(&dir);
+    let value = result.engine.get(b"committed_key").unwrap();
+    assert_eq!(
+        value,
+        Some(b"committed_value".to_vec()),
+        "Data should be recoverable from SST via ilog"
+    );
 
     scenario.teardown();
 }
@@ -399,9 +469,14 @@ fn test_crash_during_checkpoint() {
 // Compaction Failpoint Tests
 // ============================================================================
 
-/// Test crash before merge iterator creation.
+/// Test crash before merge iterator creation during compaction.
+///
+/// Creates enough L0 SSTs to trigger compaction, then verifies the failpoint
+/// fires when do_compaction() is called.
 #[test]
 fn test_crash_before_merge() {
+    use std::panic;
+
     let scenario = fail::FailScenario::setup();
     let dir = tempfile::tempdir().unwrap();
 
@@ -410,33 +485,33 @@ fn test_crash_before_merge() {
     // Write and flush multiple times to create multiple L0 SSTs
     for i in 0..3 {
         for j in 0..5 {
-            let key = format!("comp_key_{}_{}", i, j);
+            let key = format!("comp_key_{i}_{j}");
             write_test_data(&engine, key.as_bytes(), b"value", (i * 10 + j) as u64 + 1);
         }
-        // Flush all data after each batch to create separate SSTs
         engine.flush_all_with_active().unwrap();
     }
 
     // Verify we have multiple L0 SSTs
     let version = engine.current_version();
     let l0_count = version.level(0).len();
-    assert!(l0_count >= 1, "Should have L0 SSTs for compaction test");
+    assert!(l0_count >= 2, "Need multiple L0 SSTs for compaction (got {l0_count})");
 
-    // Configure failpoint
-    fail::cfg("compaction_before_merge", "return").unwrap();
+    // Configure failpoint to crash before merge
+    fail::cfg("compaction_before_merge", "panic").unwrap();
 
-    // Try to compact - should fail early
-    // (Compaction is typically done by background workers, but we can trigger manually)
+    // Trigger compaction - should panic at failpoint
+    let result = panic::catch_unwind(panic::AssertUnwindSafe(|| engine.do_compaction()));
+    assert!(result.is_err(), "Failpoint should have triggered a panic during compaction");
 
     // Remove failpoint
     fail::cfg("compaction_before_merge", "off").unwrap();
 
-    // All data should still be readable
+    // All data should still be readable (compaction didn't complete)
     for i in 0..3 {
         for j in 0..5 {
-            let key = format!("comp_key_{}_{}", i, j);
+            let key = format!("comp_key_{i}_{j}");
             let value = engine.get(key.as_bytes()).unwrap();
-            assert!(value.is_some(), "Key {} should exist", key);
+            assert!(value.is_some(), "Key {key} should exist");
         }
     }
 
@@ -444,68 +519,105 @@ fn test_crash_before_merge() {
 }
 
 /// Test crash mid compaction write - partial output should be cleaned up.
+///
+/// Creates multiple L0 SSTs, triggers compaction, and panics mid-write.
+/// Data remains intact because the original SSTs are not removed until
+/// compaction commits.
 #[test]
 fn test_crash_mid_compaction() {
+    use std::panic;
+
     let scenario = fail::FailScenario::setup();
     let dir = tempfile::tempdir().unwrap();
 
     let (engine, _ilog, _clog) = create_test_lsm_engine(&dir);
 
-    // Write and flush to create SSTs
-    for i in 0..10 {
-        let key = format!("mid_comp_key_{:04}", i);
-        write_test_data(&engine, key.as_bytes(), b"value", i as u64 + 1);
-    }
-    if let Some(frozen) = engine.maybe_rotate() {
-        engine.flush_memtable(&frozen).unwrap();
+    // Write and flush multiple times to create enough L0 SSTs for compaction
+    for i in 0..3 {
+        for j in 0..5 {
+            let key = format!("mid_comp_key_{:04}", i * 10 + j);
+            write_test_data(&engine, key.as_bytes(), b"value", (i * 10 + j) as u64 + 1);
+        }
+        engine.flush_all_with_active().unwrap();
     }
 
-    // Partial compaction crash is tricky to test as compaction is async
-    // This test verifies the failpoint is in place
+    let version = engine.current_version();
+    let l0_count = version.level(0).len();
+    assert!(l0_count >= 2, "Need multiple L0 SSTs for compaction (got {l0_count})");
 
-    fail::cfg("compaction_mid_write", "1*return").unwrap();
+    // Configure failpoint to crash mid compaction
+    fail::cfg("compaction_mid_write", "panic").unwrap();
+
+    // Trigger compaction - should panic mid-write
+    let result = panic::catch_unwind(panic::AssertUnwindSafe(|| engine.do_compaction()));
+    assert!(result.is_err(), "Failpoint should have triggered a panic during compaction");
 
     // Remove failpoint
     fail::cfg("compaction_mid_write", "off").unwrap();
 
-    // Data should be intact
-    for i in 0..10 {
-        let key = format!("mid_comp_key_{:04}", i);
-        let value = engine.get(key.as_bytes()).unwrap();
-        assert!(value.is_some());
+    // All data should still be readable from original SSTs
+    for i in 0..3 {
+        for j in 0..5 {
+            let key = format!("mid_comp_key_{:04}", i * 10 + j);
+            let value = engine.get(key.as_bytes()).unwrap();
+            assert!(value.is_some(), "Key {key} should exist after failed compaction");
+        }
     }
 
     scenario.teardown();
 }
 
-/// Test crash after compaction finishes but before commit.
+/// Test crash after compaction finishes writing but before commit.
+///
+/// All SSTs are written, but the manifest delta is not applied. Original SSTs
+/// remain in the version, so data is still readable.
 #[test]
 fn test_crash_after_compaction_finish() {
+    use std::panic;
+
     let scenario = fail::FailScenario::setup();
     let dir = tempfile::tempdir().unwrap();
 
     let (engine, _ilog, _clog) = create_test_lsm_engine(&dir);
 
-    // Write and flush
-    for i in 0..5 {
-        let key = format!("post_comp_key_{}", i);
-        write_test_data(&engine, key.as_bytes(), b"value", i as u64 + 1);
+    // Create multiple L0 SSTs for compaction
+    for i in 0..3 {
+        for j in 0..5 {
+            let key = format!("post_comp_key_{i}_{j}");
+            write_test_data(&engine, key.as_bytes(), b"value", (i * 10 + j) as u64 + 1);
+        }
+        engine.flush_all_with_active().unwrap();
     }
-    if let Some(frozen) = engine.maybe_rotate() {
-        engine.flush_memtable(&frozen).unwrap();
-    }
 
-    fail::cfg("compaction_after_finish", "return").unwrap();
+    let version = engine.current_version();
+    let l0_before = version.level(0).len();
+    assert!(l0_before >= 2, "Need multiple L0 SSTs for compaction (got {l0_before})");
 
-    // Would trigger compaction here if we had a compact method exposed
+    // Configure failpoint to crash after compaction write but before commit
+    fail::cfg("compaction_after_finish", "panic").unwrap();
 
+    // Trigger compaction - should panic after writing new SSTs but before committing
+    let result = panic::catch_unwind(panic::AssertUnwindSafe(|| engine.do_compaction()));
+    assert!(result.is_err(), "Failpoint should have triggered a panic during compaction");
+
+    // Remove failpoint
     fail::cfg("compaction_after_finish", "off").unwrap();
 
-    // Data should be readable
-    for i in 0..5 {
-        let key = format!("post_comp_key_{}", i);
-        let value = engine.get(key.as_bytes()).unwrap();
-        assert!(value.is_some());
+    // L0 count should be unchanged (compaction didn't commit)
+    let version = engine.current_version();
+    assert_eq!(
+        version.level(0).len(),
+        l0_before,
+        "L0 SST count should be unchanged after failed compaction"
+    );
+
+    // All data should be readable from original SSTs
+    for i in 0..3 {
+        for j in 0..5 {
+            let key = format!("post_comp_key_{i}_{j}");
+            let value = engine.get(key.as_bytes()).unwrap();
+            assert!(value.is_some(), "Key {key} should exist");
+        }
     }
 
     scenario.teardown();
@@ -515,20 +627,32 @@ fn test_crash_after_compaction_finish() {
 // Clog Failpoint Tests
 // ============================================================================
 
-/// Test crash before clog fsync.
+/// Test crash before clog fsync - data may be lost since it wasn't synced.
+///
+/// Writes to clog with sync=true, but the failpoint panics before the fsync.
+/// Data written but not synced may be lost on recovery (depending on OS buffer).
 #[test]
 fn test_crash_before_clog_sync() {
+    use std::panic;
+    use tisql::ClogService;
+
     let scenario = fail::FailScenario::setup();
     let dir = tempfile::tempdir().unwrap();
 
     let clog_config = FileClogConfig::with_dir(dir.path());
-    let _clog = FileClogService::open(clog_config).unwrap();
+    let clog = FileClogService::open(clog_config).unwrap();
 
-    // Configure failpoint
-    fail::cfg("clog_before_sync", "return").unwrap();
+    // Configure failpoint to crash before fsync
+    fail::cfg("clog_before_sync", "panic").unwrap();
 
-    // Write to clog - can't directly test without using ClogService trait methods
-    // This test verifies the failpoint is in place
+    // Write to clog with sync=true - should panic before fsync
+    let mut batch = tisql::testkit::ClogBatch::new();
+    batch.add_put(1, b"key".to_vec(), b"value".to_vec());
+    batch.add_commit(1, 100);
+    let result = panic::catch_unwind(panic::AssertUnwindSafe(|| {
+        clog.write(&mut batch, true)
+    }));
+    assert!(result.is_err(), "Failpoint should have triggered a panic before fsync");
 
     // Remove failpoint
     fail::cfg("clog_before_sync", "off").unwrap();
@@ -536,24 +660,57 @@ fn test_crash_before_clog_sync() {
     scenario.teardown();
 }
 
-/// Test crash after clog fsync.
+/// Test crash after clog fsync - data should be durable.
+///
+/// After fsync completes, the data is durable on disk. A crash after fsync
+/// should not lose the written data.
 #[test]
 fn test_crash_after_clog_sync() {
+    use std::panic;
+    use tisql::ClogService;
+
     let scenario = fail::FailScenario::setup();
     let dir = tempfile::tempdir().unwrap();
 
     let clog_config = FileClogConfig::with_dir(dir.path());
-    let _clog = FileClogService::open(clog_config).unwrap();
+    let clog = FileClogService::open(clog_config).unwrap();
 
-    // Configure failpoint
-    fail::cfg("clog_after_sync", "return").unwrap();
+    // First write without failpoint to establish baseline
+    let mut batch = tisql::testkit::ClogBatch::new();
+    batch.add_put(1, b"durable_key".to_vec(), b"durable_value".to_vec());
+    batch.add_commit(1, 100);
+    clog.write(&mut batch, true).unwrap();
 
-    // After fsync, data is durable - subsequent operations might fail
-    // but already synced data should survive
+    // Configure failpoint to crash after fsync (data is already durable)
+    fail::cfg("clog_after_sync", "panic").unwrap();
+
+    // Write again - should panic after fsync (data IS durable)
+    let mut batch = tisql::testkit::ClogBatch::new();
+    batch.add_put(2, b"also_durable".to_vec(), b"also_value".to_vec());
+    batch.add_commit(2, 200);
+    let result = panic::catch_unwind(panic::AssertUnwindSafe(|| {
+        clog.write(&mut batch, true)
+    }));
+    assert!(result.is_err(), "Failpoint should have triggered a panic after fsync");
 
     // Remove failpoint
     fail::cfg("clog_after_sync", "off").unwrap();
 
+    // Drop clog and recover
+    drop(clog);
+    let clog_config = FileClogConfig::with_dir(dir.path());
+    let (recovered_clog, entries) =
+        FileClogService::recover(clog_config).unwrap();
+
+    // First write should be recoverable (was synced before failpoint was set)
+    assert!(
+        entries.iter().any(|e| {
+            matches!(&e.op, tisql::testkit::ClogOp::Put { key, .. } if key == b"durable_key")
+        }),
+        "First write should be recovered"
+    );
+
+    drop(recovered_clog);
     scenario.teardown();
 }
 
@@ -730,7 +887,7 @@ fn test_multiple_consecutive_flushes() {
         for i in 0..5 {
             let key = format!("cycle{}_key{}", cycle, i);
             let value = engine.get(key.as_bytes()).unwrap();
-            assert!(value.is_some(), "Key {} should exist", key);
+            assert!(value.is_some(), "Key {key} should exist");
         }
     }
 

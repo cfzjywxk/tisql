@@ -1748,11 +1748,9 @@ mod explicit_transaction_tests {
 
     /// Test read-your-writes within a transaction.
     ///
-    /// NOTE: Read-your-writes is NOT YET SUPPORTED. This test is ignored until
-    /// the storage layer is enhanced to include pending nodes owned by the current
-    /// transaction in scan results.
+    /// The storage layer passes owner_ts for explicit transactions, making pending
+    /// nodes owned by the current transaction visible to its own reads.
     #[test]
-    #[ignore = "Read-your-writes not yet supported - pending nodes are invisible to owner"]
     fn test_read_your_writes_in_transaction() {
         let dir = tempdir().unwrap();
         let config = DatabaseConfig::with_data_dir(dir.path());

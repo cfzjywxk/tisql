@@ -402,6 +402,34 @@ mod tests {
         assert_eq!(result.stats.clog_entries, 0);
         assert_eq!(result.stats.txn_count, 0);
         assert_eq!(result.stats.orphan_ssts_cleaned, 0);
+        assert_eq!(result.stats.flushed_lsn, 0);
+        assert_eq!(result.stats.max_commit_ts, 0);
+
+        // Verify the recovered engine is actually usable: write, read, flush
+        let key = b"post_recovery_key".to_vec();
+        let value = b"post_recovery_value".to_vec();
+
+        let mut wb = WriteBatch::new();
+        wb.set_commit_ts(100);
+        wb.put(key.clone(), value.clone());
+        result.engine.write_batch(wb).unwrap();
+
+        // Verify we can read back what we wrote
+        assert_eq!(
+            get_for_test(&result.engine, &key),
+            Some(value.clone()),
+            "Engine should be usable after empty recovery"
+        );
+
+        // Verify flush works
+        result.engine.flush_all_with_active().unwrap();
+
+        // Verify data survives flush
+        assert_eq!(
+            get_for_test(&result.engine, &key),
+            Some(value),
+            "Data should survive flush after empty recovery"
+        );
     }
 
     #[test]
@@ -1137,6 +1165,131 @@ mod tests {
             assert_eq!(
                 get_for_test(&result.engine, b"key"),
                 Some(b"value".to_vec())
+            );
+        }
+    }
+
+    /// Test that recovery correctly handles the flushed_lsn boundary.
+    ///
+    /// Entries with lsn <= flushed_lsn are already in SSTs and should be skipped.
+    /// Entries with lsn > flushed_lsn must be replayed from clog.
+    /// This test verifies the exact boundary: writes before flush are in SST,
+    /// writes after flush are replayed from clog.
+    #[test]
+    fn test_recovery_flushed_lsn_boundary() {
+        let tmp = TempDir::new().unwrap();
+
+        let flushed_lsn;
+
+        // First session: write some data, flush, write more, then "crash"
+        {
+            let lsm_config = LsmConfig::builder(tmp.path())
+                .memtable_size(50)
+                .max_frozen_memtables(4)
+                .build()
+                .unwrap();
+
+            let lsn_provider = new_lsn_provider();
+            let ilog_config = IlogConfig::new(tmp.path());
+            let ilog =
+                Arc::new(IlogService::open(ilog_config, Arc::clone(&lsn_provider)).unwrap());
+
+            let engine = LsmEngine::open_with_recovery(
+                lsm_config,
+                Arc::clone(&lsn_provider),
+                Arc::clone(&ilog),
+                Version::new(),
+            )
+            .unwrap();
+
+            let clog_config = FileClogConfig::with_dir(tmp.path());
+            let clog =
+                FileClogService::open_with_lsn_provider(clog_config, Arc::clone(&lsn_provider))
+                    .unwrap();
+
+            // Write first batch (will be flushed to SST)
+            for i in 0..3 {
+                let key = format!("flushed_key_{i}").into_bytes();
+                let value = format!("flushed_val_{i}").into_bytes();
+
+                let mut batch = ClogBatch::new();
+                batch.add_put(i as u64 + 1, key.clone(), value.clone());
+                batch.add_commit(i as u64 + 1, i as Timestamp + 100);
+                let clog_lsn = clog.write(&mut batch, true).unwrap();
+
+                let mut wb = WriteBatch::new();
+                wb.set_commit_ts(i as Timestamp + 100);
+                wb.set_clog_lsn(clog_lsn);
+                wb.put(key, value);
+                engine.write_batch(wb).unwrap();
+            }
+
+            // Flush to SST
+            engine.flush_all_with_active().unwrap();
+            flushed_lsn = engine.current_version().flushed_lsn();
+            assert!(flushed_lsn > 0, "flushed_lsn should be > 0 after flush");
+
+            // Write second batch (NOT flushed - will need clog replay)
+            for i in 0..3 {
+                let key = format!("unflushed_key_{i}").into_bytes();
+                let value = format!("unflushed_val_{i}").into_bytes();
+
+                let mut batch = ClogBatch::new();
+                batch.add_put(i as u64 + 100, key.clone(), value.clone());
+                batch.add_commit(i as u64 + 100, i as Timestamp + 200);
+                let clog_lsn = clog.write(&mut batch, true).unwrap();
+
+                // Verify these clog entries have LSN > flushed_lsn
+                assert!(
+                    clog_lsn > flushed_lsn,
+                    "Unflushed clog entry LSN ({clog_lsn}) should be > flushed_lsn ({flushed_lsn})",
+                );
+
+                let mut wb = WriteBatch::new();
+                wb.set_commit_ts(i as Timestamp + 200);
+                wb.set_clog_lsn(clog_lsn);
+                wb.put(key, value);
+                engine.write_batch(wb).unwrap();
+            }
+
+            clog.close().unwrap();
+        }
+
+        // Second session: recover and verify boundary
+        {
+            let recovery = LsmRecovery::new(tmp.path());
+            let result = recovery.recover().unwrap();
+
+            // Flushed data should be in SSTs (recovered from ilog)
+            for i in 0..3 {
+                let key = format!("flushed_key_{i}").into_bytes();
+                let expected = format!("flushed_val_{i}").into_bytes();
+                assert_eq!(
+                    get_for_test(&result.engine, &key),
+                    Some(expected),
+                    "Flushed key {i} should be recovered from SST"
+                );
+            }
+
+            // Unflushed data should be recovered from clog replay
+            for i in 0..3 {
+                let key = format!("unflushed_key_{i}").into_bytes();
+                let expected = format!("unflushed_val_{i}").into_bytes();
+                assert_eq!(
+                    get_for_test(&result.engine, &key),
+                    Some(expected),
+                    "Unflushed key {i} should be recovered from clog"
+                );
+            }
+
+            // Verify only unflushed entries were replayed
+            assert_eq!(
+                result.stats.flushed_lsn, flushed_lsn,
+                "Recovered flushed_lsn should match"
+            );
+            assert_eq!(
+                result.stats.txn_count, 3,
+                "Exactly 3 unflushed transactions should be replayed"
             );
         }
     }
