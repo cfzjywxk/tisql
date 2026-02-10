@@ -45,7 +45,9 @@
 use std::collections::VecDeque;
 use std::ops::Range;
 use std::sync::atomic::{AtomicU64, Ordering as AtomicOrdering};
-use std::sync::{Arc, RwLock, RwLockWriteGuard};
+use std::sync::Arc;
+
+use parking_lot::{RwLock, RwLockWriteGuard};
 use std::time::Duration;
 
 #[cfg(feature = "failpoints")]
@@ -244,13 +246,13 @@ impl LsmEngine {
 
     /// Get the number of frozen memtables.
     pub fn frozen_count(&self) -> usize {
-        let state = self.state.read().unwrap();
+        let state = self.state.read();
         state.frozen.len()
     }
 
     /// Get the approximate size of the active memtable.
     pub fn active_memtable_size(&self) -> usize {
-        let state = self.state.read().unwrap();
+        let state = self.state.read();
         state.active.approximate_size()
     }
 
@@ -278,7 +280,7 @@ impl LsmEngine {
     /// ```
     pub fn get_super_version(&self) -> Arc<SuperVersion> {
         // Just clone the cached SuperVersion - always consistent
-        Arc::clone(&self.current_sv.read().unwrap())
+        Arc::clone(&self.current_sv.read())
     }
 
     /// Get the current SuperVersion number.
@@ -286,7 +288,7 @@ impl LsmEngine {
     /// Returns the sv_number of the currently installed SuperVersion.
     /// Useful for checking if a SuperVersion is stale.
     pub fn current_sv_number(&self) -> u64 {
-        self.current_sv.read().unwrap().sv_number
+        self.current_sv.read().sv_number
     }
 
     /// Install a new SuperVersion after state changes.
@@ -318,12 +320,12 @@ impl LsmEngine {
             sv_num,
         ));
 
-        *self.current_sv.write().unwrap() = new_sv;
+        *self.current_sv.write() = new_sv;
     }
 
     /// Check if the active memtable should be rotated.
     fn should_rotate(&self) -> bool {
-        let state = self.state.read().unwrap();
+        let state = self.state.read();
         state.active.approximate_size() >= self.config.memtable_size
     }
 
@@ -335,7 +337,7 @@ impl LsmEngine {
             return None;
         }
 
-        let mut state = self.state.write().unwrap();
+        let mut state = self.state.write();
 
         // Double-check under write lock
         if state.active.approximate_size() < self.config.memtable_size {
@@ -457,7 +459,7 @@ impl LsmEngine {
         let new_version = self.version_set.apply_delta(&delta);
 
         {
-            let mut state = self.state.write().unwrap();
+            let mut state = self.state.write();
 
             // Remove flushed memtable from frozen list
             state.frozen.retain(|m| m.id() != memtable.id());
@@ -478,7 +480,7 @@ impl LsmEngine {
         }
 
         // Notify compaction scheduler that new L0 SSTs are available
-        if let Some(ref notify) = *self.compaction_notify.read().unwrap() {
+        if let Some(ref notify) = *self.compaction_notify.read() {
             notify();
         }
 
@@ -564,7 +566,7 @@ impl LsmEngine {
     ///
     /// Used for shutdown to ensure all data is flushed.
     pub fn freeze_active(&self) -> Option<Arc<MemTable>> {
-        let mut state = self.state.write().unwrap();
+        let mut state = self.state.write();
 
         // Only freeze if there's data
         if state.active.approximate_size() == 0 {
@@ -602,7 +604,7 @@ impl LsmEngine {
         loop {
             // Get next frozen memtable to flush
             let frozen = {
-                let state = self.state.read().unwrap();
+                let state = self.state.read();
                 state.frozen.front().cloned() // Oldest first
             };
 
@@ -633,7 +635,7 @@ impl LsmEngine {
     ///
     /// Used to wire flush completion → compaction scheduler notification.
     pub fn set_compaction_notify(&self, notify: Arc<dyn Fn() + Send + Sync>) {
-        *self.compaction_notify.write().unwrap() = Some(notify);
+        *self.compaction_notify.write() = Some(notify);
     }
 
     /// Check write backpressure conditions and return error or sleep briefly.
@@ -653,7 +655,7 @@ impl LsmEngine {
         }
 
         // Frozen memtable stall: reject immediately
-        let state = self.state.read().unwrap();
+        let state = self.state.read();
         if state.active.approximate_size() >= self.config.memtable_size
             && state.frozen.len() >= self.config.max_frozen_memtables
         {
@@ -717,7 +719,7 @@ impl LsmEngine {
             // Install new SuperVersion (write lock required by install_super_version signature)
             {
                 #[allow(clippy::readonly_write_lock)]
-                let state = self.state.write().unwrap();
+                let state = self.state.write();
                 self.install_super_version(&state);
             }
 
@@ -759,7 +761,7 @@ impl LsmEngine {
         // Phase 6: Install new SuperVersion (write lock required by install_super_version signature)
         {
             #[allow(clippy::readonly_write_lock)]
-            let state = self.state.write().unwrap();
+            let state = self.state.write();
             self.install_super_version(&state);
         }
 
@@ -811,7 +813,7 @@ impl LsmEngine {
 
     /// Get statistics about the engine.
     pub fn stats(&self) -> LsmStats {
-        let state = self.state.read().unwrap();
+        let state = self.state.read();
         let version = self.version_set.current();
 
         LsmStats {
@@ -846,7 +848,7 @@ impl LsmEngine {
     ///
     /// Returns `Ok(Some(value))` if found, `Ok(None)` if not found or deleted.
     pub fn get_at(&self, key: &[u8], ts: Timestamp) -> Result<Option<RawValue>> {
-        let state = self.state.read().unwrap();
+        let state = self.state.read();
 
         // Check active memtable first
         // owner_start_ts = 0 means don't see pending writes from any transaction
@@ -1993,7 +1995,7 @@ impl StorageEngine for LsmEngine {
         // Snapshot the state under read lock, then release the lock.
         // We clone Arc references so iterators can outlive the lock.
         let (active, frozen) = {
-            let state = self.state.read().unwrap();
+            let state = self.state.read();
             (Arc::clone(&state.active), state.frozen.clone())
         };
 
@@ -2071,7 +2073,7 @@ impl StorageEngine for LsmEngine {
 
         // Write to active memtable
         {
-            let state = self.state.read().unwrap();
+            let state = self.state.read();
             state.active.write_batch_with_lsn(batch, lsn)?;
         }
 
@@ -2091,13 +2093,13 @@ impl PessimisticStorage for LsmEngine {
         owner_start_ts: Timestamp,
     ) -> std::result::Result<(), Timestamp> {
         // Forward to active memtable
-        let state = self.state.read().unwrap();
+        let state = self.state.read();
         state.active.put_pending(key, value, owner_start_ts)
     }
 
     fn get_lock_owner(&self, key: &[u8]) -> Option<Timestamp> {
         // Check active memtable first
-        let state = self.state.read().unwrap();
+        let state = self.state.read();
         if let Some(owner) = state.active.get_lock_owner(key) {
             return Some(owner);
         }
@@ -2112,7 +2114,7 @@ impl PessimisticStorage for LsmEngine {
 
     fn finalize_pending(&self, keys: &[Key], owner_start_ts: Timestamp, commit_ts: Timestamp) {
         // Finalize in active memtable
-        let state = self.state.read().unwrap();
+        let state = self.state.read();
         state
             .active
             .finalize_pending(keys, owner_start_ts, commit_ts);
@@ -2124,7 +2126,7 @@ impl PessimisticStorage for LsmEngine {
 
     fn abort_pending(&self, keys: &[Key], owner_start_ts: Timestamp) {
         // Abort in active memtable
-        let state = self.state.read().unwrap();
+        let state = self.state.read();
         state.active.abort_pending(keys, owner_start_ts);
         // Also abort in frozen memtables in case writes happened before rotation
         for frozen in &state.frozen {
@@ -2138,7 +2140,7 @@ impl PessimisticStorage for LsmEngine {
         owner_start_ts: Timestamp,
     ) -> std::result::Result<bool, Timestamp> {
         // Check for lock conflicts across all memtables first
-        let state = self.state.read().unwrap();
+        let state = self.state.read();
 
         // Check frozen memtables for conflicts (newest to oldest = iterate from back)
         for frozen in state.frozen.iter().rev() {
@@ -2163,7 +2165,7 @@ impl PessimisticStorage for LsmEngine {
         read_ts: Timestamp,
         owner_start_ts: Timestamp,
     ) -> Option<RawValue> {
-        let state = self.state.read().unwrap();
+        let state = self.state.read();
 
         // Check active memtable first
         if let Some(value) = state.active.get_with_owner(key, read_ts, owner_start_ts) {
@@ -2961,7 +2963,7 @@ mod tests {
         engine.write_batch(batch).unwrap();
 
         // Check that the memtable has the correct LSN
-        let state = engine.state.read().unwrap();
+        let state = engine.state.read();
         assert_eq!(
             state.active.max_lsn(),
             Some(42),
@@ -3049,7 +3051,7 @@ mod tests {
 
         // Verify memtable has the CLOG LSN
         {
-            let state = engine.state.read().unwrap();
+            let state = engine.state.read();
             assert_eq!(state.active.max_lsn(), Some(clog_lsn));
         }
 
@@ -3635,7 +3637,7 @@ mod tests {
             if engine.frozen_count() > 0 {
                 // Flush one frozen memtable
                 let frozen = {
-                    let state = engine.state.read().unwrap();
+                    let state = engine.state.read();
                     state.frozen.front().cloned()
                 };
                 if let Some(mt) = frozen {

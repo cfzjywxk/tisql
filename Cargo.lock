@@ -2372,6 +2372,7 @@ dependencies = [
  "bytes",
  "clap",
  "criterion",
+ "crossbeam-channel",
  "crossbeam-epoch",
  "crossbeam-skiplist",
  "dashmap",

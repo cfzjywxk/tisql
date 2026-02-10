@@ -581,6 +581,11 @@ impl Database {
         Ok(tables.into_iter().map(|t| t.name().to_string()).collect())
     }
 
+    /// List all schemas (databases).
+    pub fn list_schemas(&self) -> Result<Vec<String>> {
+        self.catalog.list_schemas()
+    }
+
     // ========================================================================
     // Transaction Control (for Protocol Layer)
     // ========================================================================

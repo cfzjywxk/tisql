@@ -26,7 +26,7 @@ use tokio::io::AsyncWrite;
 
 use crate::session::{ExecutionCtx, Session};
 use crate::types::DataType;
-use crate::worker::WorkerPool;
+use crate::worker::{WorkerCommand, WorkerPool, WorkerResult};
 use crate::{log_debug, log_info, log_warn, Database, QueryResult};
 
 // ============================================================================
@@ -247,7 +247,7 @@ impl MySqlBackend {
 
     /// Handle BEGIN / START TRANSACTION.
     ///
-    /// Starts an explicit transaction and stores it in the session.
+    /// Dispatched to the worker pool to keep tokio threads free.
     async fn handle_begin<W: AsyncWrite + Send + Unpin>(
         &mut self,
         read_only: bool,
@@ -255,8 +255,6 @@ impl MySqlBackend {
     ) -> io::Result<()> {
         // Check if there's already an active transaction
         if self.session.has_active_txn() {
-            // MySQL implicitly commits when BEGIN is issued with active transaction.
-            // For now, we just error out - can change to implicit commit later.
             return results
                 .error(
                     ErrorKind::ER_UNKNOWN_ERROR,
@@ -265,21 +263,26 @@ impl MySqlBackend {
                 .await;
         }
 
-        // Start an explicit transaction via the database's transaction service
-        match self.db.begin_explicit(read_only) {
-            Ok(ctx) => {
+        let cmd = WorkerCommand::Begin { read_only };
+        match self.worker_pool.dispatch(Arc::clone(&self.db), cmd).await {
+            WorkerResult::Begin { txn_ctx } => {
                 log_debug!(
                     "Session {} started explicit transaction (txn_id={}, read_only={})",
                     self.session.id(),
-                    ctx.txn_id(),
+                    txn_ctx.txn_id(),
                     read_only
                 );
-                self.session.set_current_txn(ctx);
+                self.session.set_current_txn(txn_ctx);
                 results.completed(Self::make_ok_response(0, 0)).await
             }
-            Err(e) => {
+            WorkerResult::Error { error, .. } => {
                 results
-                    .error(ErrorKind::ER_UNKNOWN_ERROR, e.to_string().as_bytes())
+                    .error(ErrorKind::ER_UNKNOWN_ERROR, error.to_string().as_bytes())
+                    .await
+            }
+            _ => {
+                results
+                    .error(ErrorKind::ER_UNKNOWN_ERROR, b"Unexpected worker result")
                     .await
             }
         }
@@ -287,16 +290,16 @@ impl MySqlBackend {
 
     /// Handle COMMIT.
     ///
-    /// Commits the session's active transaction, if any.
+    /// Dispatched to the worker pool to keep tokio threads free.
     async fn handle_commit<W: AsyncWrite + Send + Unpin>(
         &mut self,
         results: QueryResultWriter<'_, W>,
     ) -> io::Result<()> {
-        // Take the transaction from the session (if any)
         if let Some(ctx) = self.session.take_current_txn() {
             let txn_id = ctx.txn_id();
-            match self.db.commit(ctx) {
-                Ok(info) => {
+            let cmd = WorkerCommand::Commit { txn_ctx: ctx };
+            match self.worker_pool.dispatch(Arc::clone(&self.db), cmd).await {
+                WorkerResult::Committed { info } => {
                     log_debug!(
                         "Session {} committed transaction (txn_id={}, commit_ts={})",
                         self.session.id(),
@@ -305,15 +308,20 @@ impl MySqlBackend {
                     );
                     results.completed(Self::make_ok_response(0, 0)).await
                 }
-                Err(e) => {
+                WorkerResult::Error { error, .. } => {
                     log_warn!(
                         "Session {} failed to commit transaction (txn_id={}): {}",
                         self.session.id(),
                         txn_id,
-                        e
+                        error
                     );
                     results
-                        .error(ErrorKind::ER_UNKNOWN_ERROR, e.to_string().as_bytes())
+                        .error(ErrorKind::ER_UNKNOWN_ERROR, error.to_string().as_bytes())
+                        .await
+                }
+                _ => {
+                    results
+                        .error(ErrorKind::ER_UNKNOWN_ERROR, b"Unexpected worker result")
                         .await
                 }
             }
@@ -325,16 +333,16 @@ impl MySqlBackend {
 
     /// Handle ROLLBACK.
     ///
-    /// Rolls back the session's active transaction, if any.
+    /// Dispatched to the worker pool to keep tokio threads free.
     async fn handle_rollback<W: AsyncWrite + Send + Unpin>(
         &mut self,
         results: QueryResultWriter<'_, W>,
     ) -> io::Result<()> {
-        // Take the transaction from the session (if any)
         if let Some(ctx) = self.session.take_current_txn() {
             let txn_id = ctx.txn_id();
-            match self.db.rollback(ctx) {
-                Ok(()) => {
+            let cmd = WorkerCommand::Rollback { txn_ctx: ctx };
+            match self.worker_pool.dispatch(Arc::clone(&self.db), cmd).await {
+                WorkerResult::RolledBack => {
                     log_debug!(
                         "Session {} rolled back transaction (txn_id={})",
                         self.session.id(),
@@ -342,15 +350,20 @@ impl MySqlBackend {
                     );
                     results.completed(Self::make_ok_response(0, 0)).await
                 }
-                Err(e) => {
+                WorkerResult::Error { error, .. } => {
                     log_warn!(
                         "Session {} failed to rollback transaction (txn_id={}): {}",
                         self.session.id(),
                         txn_id,
-                        e
+                        error
                     );
                     results
-                        .error(ErrorKind::ER_UNKNOWN_ERROR, e.to_string().as_bytes())
+                        .error(ErrorKind::ER_UNKNOWN_ERROR, error.to_string().as_bytes())
+                        .await
+                }
+                _ => {
+                    results
+                        .error(ErrorKind::ER_UNKNOWN_ERROR, b"Unexpected worker result")
                         .await
                 }
             }
@@ -461,37 +474,68 @@ impl MySqlBackend {
         let query_lower = query.trim().to_lowercase();
 
         if query_lower.contains("databases") {
-            let cols = vec![Column {
-                table: String::new(),
-                column: "Database".to_string(),
-                coltype: ColumnType::MYSQL_TYPE_VAR_STRING,
-                colflags: ColumnFlags::empty(),
-            }];
+            // Dispatch to worker pool to avoid catalog lock on tokio thread
+            let cmd = WorkerCommand::ShowDatabases;
+            match self.worker_pool.dispatch(Arc::clone(&self.db), cmd).await {
+                WorkerResult::Databases(databases) => {
+                    let cols = vec![Column {
+                        table: String::new(),
+                        column: "Database".to_string(),
+                        coltype: ColumnType::MYSQL_TYPE_VAR_STRING,
+                        colflags: ColumnFlags::empty(),
+                    }];
 
-            let mut rw = results.start(&cols).await?;
-            rw.write_col("test")?;
-            rw.end_row().await?;
-            rw.write_col("information_schema")?;
-            rw.end_row().await?;
-            rw.finish().await
-        } else if query_lower.contains("tables") {
-            // Show tables in current database
-            let cols = vec![Column {
-                table: String::new(),
-                column: format!("Tables_in_{}", self.session.current_db()),
-                coltype: ColumnType::MYSQL_TYPE_VAR_STRING,
-                colflags: ColumnFlags::empty(),
-            }];
-
-            let mut rw = results.start(&cols).await?;
-            // Get tables from catalog using session's current database
-            if let Ok(tables) = self.db.list_tables(self.session.current_db()) {
-                for table in tables {
-                    rw.write_col(table.as_str())?;
-                    rw.end_row().await?;
+                    let mut rw = results.start(&cols).await?;
+                    for db in databases {
+                        rw.write_col(db.as_str())?;
+                        rw.end_row().await?;
+                    }
+                    rw.finish().await
+                }
+                WorkerResult::Error { error, .. } => {
+                    results
+                        .error(ErrorKind::ER_UNKNOWN_ERROR, error.to_string().as_bytes())
+                        .await
+                }
+                _ => {
+                    results
+                        .error(ErrorKind::ER_UNKNOWN_ERROR, b"Unexpected worker result")
+                        .await
                 }
             }
-            rw.finish().await
+        } else if query_lower.contains("tables") {
+            // Dispatch to worker pool to avoid catalog lock on tokio thread
+            let cmd = WorkerCommand::ShowTables {
+                database: self.session.current_db().to_string(),
+            };
+            let col_name = format!("Tables_in_{}", self.session.current_db());
+            match self.worker_pool.dispatch(Arc::clone(&self.db), cmd).await {
+                WorkerResult::Tables(tables) => {
+                    let cols = vec![Column {
+                        table: String::new(),
+                        column: col_name,
+                        coltype: ColumnType::MYSQL_TYPE_VAR_STRING,
+                        colflags: ColumnFlags::empty(),
+                    }];
+
+                    let mut rw = results.start(&cols).await?;
+                    for table in tables {
+                        rw.write_col(table.as_str())?;
+                        rw.end_row().await?;
+                    }
+                    rw.finish().await
+                }
+                WorkerResult::Error { error, .. } => {
+                    results
+                        .error(ErrorKind::ER_UNKNOWN_ERROR, error.to_string().as_bytes())
+                        .await
+                }
+                _ => {
+                    results
+                        .error(ErrorKind::ER_UNKNOWN_ERROR, b"Unexpected worker result")
+                        .await
+                }
+            }
         } else if query_lower.contains("warnings") {
             // Return empty warnings
             let cols = vec![

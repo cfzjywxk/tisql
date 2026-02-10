@@ -45,7 +45,9 @@ use std::fs::{self, File, OpenOptions};
 use std::io::{BufReader, BufWriter, Read, Seek, SeekFrom, Write};
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::{Arc, Mutex};
+use std::sync::Arc;
+
+use parking_lot::Mutex;
 
 #[cfg(feature = "failpoints")]
 use fail::fail_point;
@@ -237,8 +239,11 @@ pub struct IlogService {
     config: IlogConfig,
     /// Shared LSN provider
     lsn_provider: SharedLsnProvider,
-    /// Log file writer
-    writer: Mutex<BufWriter<File>>,
+    /// Group commit writer for batched fsync.
+    ///
+    /// Wrapped in Mutex so the writer can be replaced if needed.
+    /// The mutex is only held briefly to call `submit()` (channel send).
+    group_writer: Mutex<crate::clog::GroupCommitWriter>,
     /// Number of records since last checkpoint
     records_since_checkpoint: AtomicU64,
     /// Last checkpoint sequence
@@ -307,10 +312,12 @@ impl IlogService {
 
         log_info!("Opened ilog file: {:?}", ilog_path);
 
+        let group_writer = crate::clog::GroupCommitWriter::new(BufWriter::new(file_for_write));
+
         Ok(Self {
             config,
             lsn_provider,
-            writer: Mutex::new(BufWriter::new(file_for_write)),
+            group_writer: Mutex::new(group_writer),
             records_since_checkpoint: AtomicU64::new(0),
             last_checkpoint_seq: AtomicU64::new(0),
         })
@@ -470,9 +477,10 @@ impl IlogService {
 
     /// Sync the log to disk.
     pub fn sync(&self) -> Result<()> {
-        let mut writer = self.writer.lock().unwrap();
-        writer.flush()?;
-        writer.get_ref().sync_data()?;
+        self.group_writer
+            .lock()
+            .submit_with_sync(Vec::new(), true)
+            .map_err(|e| TiSqlError::Internal(format!("Ilog group commit sync failed: {e}")))?;
         Ok(())
     }
 
@@ -523,10 +531,7 @@ impl IlogService {
 
     /// Close the ilog service, flushing any pending writes.
     pub fn close(&self) -> Result<()> {
-        let mut writer = self.writer.lock().unwrap();
-        writer.flush()?;
-        writer.get_ref().sync_data()?;
-        Ok(())
+        self.sync()
     }
 
     // ========== Private methods ==========
@@ -546,16 +551,19 @@ impl IlogService {
 
         let checksum = crc32(&data);
 
-        let mut writer = self.writer.lock().unwrap();
-
-        // Write header: record_type (4) + length (4) + checksum (4)
+        // Build framed record: header (type + length + checksum) + data
         let record_type: u32 = 1; // Entry record
-        writer.write_all(&record_type.to_le_bytes())?;
-        writer.write_all(&(data.len() as u32).to_le_bytes())?;
-        writer.write_all(&checksum.to_le_bytes())?;
-        writer.write_all(&data)?;
-        writer.flush()?;
-        writer.get_ref().sync_data()?;
+        let mut buf = Vec::with_capacity(RECORD_HEADER_SIZE + data.len());
+        buf.extend_from_slice(&record_type.to_le_bytes());
+        buf.extend_from_slice(&(data.len() as u32).to_le_bytes());
+        buf.extend_from_slice(&checksum.to_le_bytes());
+        buf.extend_from_slice(&data);
+
+        // Submit to group commit writer (batches fsync with concurrent writers)
+        self.group_writer
+            .lock()
+            .submit_with_sync(buf, true)
+            .map_err(|e| TiSqlError::Internal(format!("Ilog group commit failed: {e}")))?;
 
         // Failpoint: crash after fsync
         #[cfg(feature = "failpoints")]

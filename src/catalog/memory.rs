@@ -14,9 +14,9 @@
 
 //! In-memory catalog implementation.
 
+use parking_lot::RwLock;
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::RwLock;
 
 use crate::error::{Result, TiSqlError};
 use crate::types::{IndexId, TableId};
@@ -64,7 +64,7 @@ impl Default for MemoryCatalog {
 
 impl Catalog for MemoryCatalog {
     fn create_schema(&self, name: &str) -> Result<()> {
-        let mut schemas = self.schemas.write().unwrap();
+        let mut schemas = self.schemas.write();
         if schemas.contains_key(name) {
             return Err(TiSqlError::Catalog(format!(
                 "Schema '{name}' already exists"
@@ -75,8 +75,8 @@ impl Catalog for MemoryCatalog {
     }
 
     fn drop_schema(&self, name: &str) -> Result<()> {
-        let mut schemas = self.schemas.write().unwrap();
-        let mut tables_by_id = self.tables_by_id.write().unwrap();
+        let mut schemas = self.schemas.write();
+        let mut tables_by_id = self.tables_by_id.write();
 
         if let Some(tables) = schemas.remove(name) {
             // Remove all tables from tables_by_id
@@ -90,18 +90,18 @@ impl Catalog for MemoryCatalog {
     }
 
     fn list_schemas(&self) -> Result<Vec<String>> {
-        let schemas = self.schemas.read().unwrap();
+        let schemas = self.schemas.read();
         Ok(schemas.keys().cloned().collect())
     }
 
     fn schema_exists(&self, name: &str) -> Result<bool> {
-        let schemas = self.schemas.read().unwrap();
+        let schemas = self.schemas.read();
         Ok(schemas.contains_key(name))
     }
 
     fn create_table(&self, table: TableDef) -> Result<TableId> {
-        let mut schemas = self.schemas.write().unwrap();
-        let mut tables_by_id = self.tables_by_id.write().unwrap();
+        let mut schemas = self.schemas.write();
+        let mut tables_by_id = self.tables_by_id.write();
 
         let schema_tables = schemas
             .get_mut(table.schema())
@@ -126,8 +126,8 @@ impl Catalog for MemoryCatalog {
     }
 
     fn drop_table(&self, schema: &str, table: &str) -> Result<()> {
-        let mut schemas = self.schemas.write().unwrap();
-        let mut tables_by_id = self.tables_by_id.write().unwrap();
+        let mut schemas = self.schemas.write();
+        let mut tables_by_id = self.tables_by_id.write();
 
         let schema_tables = schemas
             .get_mut(schema)
@@ -142,15 +142,15 @@ impl Catalog for MemoryCatalog {
     }
 
     fn get_table(&self, schema: &str, table: &str) -> Result<Option<TableDef>> {
-        let schemas = self.schemas.read().unwrap();
+        let schemas = self.schemas.read();
         Ok(schemas
             .get(schema)
             .and_then(|tables| tables.get(table).cloned()))
     }
 
     fn get_table_by_id(&self, id: TableId) -> Result<Option<TableDef>> {
-        let tables_by_id = self.tables_by_id.read().unwrap();
-        let schemas = self.schemas.read().unwrap();
+        let tables_by_id = self.tables_by_id.read();
+        let schemas = self.schemas.read();
 
         if let Some((schema, table_name)) = tables_by_id.get(&id) {
             Ok(schemas
@@ -162,7 +162,7 @@ impl Catalog for MemoryCatalog {
     }
 
     fn list_tables(&self, schema: &str) -> Result<Vec<TableDef>> {
-        let schemas = self.schemas.read().unwrap();
+        let schemas = self.schemas.read();
         Ok(schemas
             .get(schema)
             .map(|tables| tables.values().cloned().collect())
@@ -170,8 +170,8 @@ impl Catalog for MemoryCatalog {
     }
 
     fn create_index(&self, table_id: TableId, index: IndexDef) -> Result<IndexId> {
-        let tables_by_id = self.tables_by_id.read().unwrap();
-        let mut schemas = self.schemas.write().unwrap();
+        let tables_by_id = self.tables_by_id.read();
+        let mut schemas = self.schemas.write();
 
         let (schema, table_name) = tables_by_id
             .get(&table_id)
@@ -198,8 +198,8 @@ impl Catalog for MemoryCatalog {
     }
 
     fn drop_index(&self, table_id: TableId, index_name: &str) -> Result<()> {
-        let tables_by_id = self.tables_by_id.read().unwrap();
-        let mut schemas = self.schemas.write().unwrap();
+        let tables_by_id = self.tables_by_id.read();
+        let mut schemas = self.schemas.write();
 
         let (schema, table_name) = tables_by_id
             .get(&table_id)
@@ -219,8 +219,8 @@ impl Catalog for MemoryCatalog {
     }
 
     fn next_auto_increment(&self, table_id: TableId) -> Result<u64> {
-        let tables_by_id = self.tables_by_id.read().unwrap();
-        let mut schemas = self.schemas.write().unwrap();
+        let tables_by_id = self.tables_by_id.read();
+        let mut schemas = self.schemas.write();
 
         let (schema, table_name) = tables_by_id
             .get(&table_id)

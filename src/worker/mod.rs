@@ -18,6 +18,9 @@
 // - Tokio runtime handles network IO (TCP accept, MySQL protocol)
 // - yatp FuturePool handles CPU-bound database work (parse, bind, execute)
 // - Communication via tokio::sync::oneshot channels
+//
+// All DB-accessing commands (queries, BEGIN, COMMIT, ROLLBACK, SHOW) are
+// dispatched to the worker pool to keep tokio threads free for network I/O.
 
 use std::sync::Arc;
 
@@ -27,7 +30,7 @@ use yatp::task::future::TaskCell;
 
 use crate::error::TiSqlError;
 use crate::session::ExecutionCtx;
-use crate::transaction::TxnCtx;
+use crate::transaction::{CommitInfo, TxnCtx};
 use crate::{Database, QueryResult};
 
 /// Configuration for the worker thread pool
@@ -64,6 +67,53 @@ pub struct WorkerPool {
 /// On error: (TiSqlError, Option<TxnCtx>) - the TxnCtx is returned to keep the transaction active.
 pub type QueryResultWithCtx = Result<(QueryResult, Option<TxnCtx>), (TiSqlError, Option<TxnCtx>)>;
 
+/// Commands that can be dispatched to the worker pool.
+///
+/// Each variant represents a database operation that should run off the
+/// tokio network thread to avoid blocking the event loop.
+pub enum WorkerCommand {
+    /// Execute a SQL query with optional transaction context.
+    Query {
+        sql: String,
+        exec_ctx: ExecutionCtx,
+        txn_ctx: Option<TxnCtx>,
+    },
+    /// BEGIN / START TRANSACTION.
+    Begin { read_only: bool },
+    /// COMMIT an explicit transaction.
+    Commit { txn_ctx: TxnCtx },
+    /// ROLLBACK an explicit transaction.
+    Rollback { txn_ctx: TxnCtx },
+    /// SHOW TABLES in a database.
+    ShowTables { database: String },
+    /// SHOW DATABASES.
+    ShowDatabases,
+}
+
+/// Results returned from the worker pool.
+pub enum WorkerResult {
+    /// Query execution result with optional returned TxnCtx.
+    Query {
+        result: QueryResult,
+        txn_ctx: Option<TxnCtx>,
+    },
+    /// A new transaction was started.
+    Begin { txn_ctx: TxnCtx },
+    /// Transaction committed successfully.
+    Committed { info: CommitInfo },
+    /// Transaction rolled back successfully.
+    RolledBack,
+    /// List of table names.
+    Tables(Vec<String>),
+    /// List of database/schema names.
+    Databases(Vec<String>),
+    /// An error occurred, with optional TxnCtx returned for session recovery.
+    Error {
+        error: TiSqlError,
+        txn_ctx: Option<TxnCtx>,
+    },
+}
+
 impl WorkerPool {
     /// Create a new worker pool with the given configuration
     pub fn new(config: WorkerPoolConfig) -> Self {
@@ -80,25 +130,84 @@ impl WorkerPool {
         }
     }
 
+    /// Dispatch a command to the worker pool and await the result.
+    ///
+    /// This is the unified entry point for all DB-accessing operations.
+    /// The command is executed on a yatp worker thread, keeping the
+    /// tokio network thread free for I/O.
+    pub async fn dispatch(&self, db: Arc<Database>, cmd: WorkerCommand) -> WorkerResult {
+        let (tx, rx) = oneshot::channel();
+
+        self.remote.spawn(async move {
+            let result = Self::execute_command(&db, cmd);
+            let _ = tx.send(result);
+        });
+
+        rx.await.unwrap_or_else(|_| WorkerResult::Error {
+            error: TiSqlError::Internal("Worker task dropped".into()),
+            txn_ctx: None,
+        })
+    }
+
+    /// Execute a command synchronously on the worker thread.
+    fn execute_command(db: &Database, cmd: WorkerCommand) -> WorkerResult {
+        match cmd {
+            WorkerCommand::Query {
+                sql,
+                exec_ctx,
+                txn_ctx,
+            } => match db.handle_query(&sql, &exec_ctx, txn_ctx) {
+                Ok((result, returned_ctx)) => WorkerResult::Query {
+                    result,
+                    txn_ctx: returned_ctx,
+                },
+                Err(e) => WorkerResult::Error {
+                    error: e,
+                    txn_ctx: None,
+                },
+            },
+            WorkerCommand::Begin { read_only } => match db.begin_explicit(read_only) {
+                Ok(ctx) => WorkerResult::Begin { txn_ctx: ctx },
+                Err(e) => WorkerResult::Error {
+                    error: e,
+                    txn_ctx: None,
+                },
+            },
+            WorkerCommand::Commit { txn_ctx } => match db.commit(txn_ctx) {
+                Ok(info) => WorkerResult::Committed { info },
+                Err(e) => WorkerResult::Error {
+                    error: e,
+                    txn_ctx: None,
+                },
+            },
+            WorkerCommand::Rollback { txn_ctx } => match db.rollback(txn_ctx) {
+                Ok(()) => WorkerResult::RolledBack,
+                Err(e) => WorkerResult::Error {
+                    error: e,
+                    txn_ctx: None,
+                },
+            },
+            WorkerCommand::ShowTables { database } => match db.list_tables(&database) {
+                Ok(tables) => WorkerResult::Tables(tables),
+                Err(e) => WorkerResult::Error {
+                    error: e,
+                    txn_ctx: None,
+                },
+            },
+            WorkerCommand::ShowDatabases => match db.list_schemas() {
+                Ok(schemas) => WorkerResult::Databases(schemas),
+                Err(e) => WorkerResult::Error {
+                    error: e,
+                    txn_ctx: None,
+                },
+            },
+        }
+    }
+
     /// Handle a query on a worker thread with TxnCtx ownership transfer.
     ///
-    /// This is the unified entry point for query execution from the protocol layer.
-    ///
-    /// ## Arguments
-    /// - `db`: Reference to the database
-    /// - `sql`: The SQL query string
-    /// - `exec_ctx`: Execution context with session variables (current_db, isolation_level, etc.)
-    /// - `txn_ctx`: Optional TxnCtx for explicit transactions (ownership transferred)
-    ///
-    /// ## Returns
-    /// - On success: (QueryResult, Option<TxnCtx>) - result and returned TxnCtx (if still active)
-    /// - On error: (TiSqlError, Option<TxnCtx>) - error and returned TxnCtx (keep txn active on error)
-    ///
-    /// ## Ownership Semantics
-    ///
-    /// The TxnCtx is taken from the session by the caller, passed to this method,
-    /// and returned in the result. The caller is responsible for putting it back
-    /// in the session if it's still active.
+    /// This is the legacy entry point kept for backward compatibility.
+    /// New code should use `dispatch()` with `WorkerCommand::Query`.
     pub async fn handle_query(
         &self,
         db: Arc<Database>,
@@ -106,26 +215,18 @@ impl WorkerPool {
         exec_ctx: ExecutionCtx,
         txn_ctx: Option<TxnCtx>,
     ) -> QueryResultWithCtx {
-        let (tx, rx) = oneshot::channel();
-
-        self.remote.spawn(async move {
-            let result = db.handle_query(&sql, &exec_ctx, txn_ctx);
-
-            // Convert Result<(QueryResult, Option<TxnCtx>), TiSqlError> to QueryResultWithCtx
-            // Note: On error, we don't have the TxnCtx back because it was moved into
-            // handle_query. In a real implementation, we'd need to handle this differently.
-            // For now, errors consume the TxnCtx.
-            let result = match result {
-                Ok((query_result, returned_ctx)) => Ok((query_result, returned_ctx)),
-                Err(e) => Err((e, None)), // TxnCtx consumed on error
-            };
-
-            // Ignore send error - receiver may have been dropped if connection closed
-            let _ = tx.send(result);
-        });
-
-        // Await the result from the worker thread
-        rx.await
-            .unwrap_or_else(|_| Err((TiSqlError::Internal("Worker task dropped".into()), None)))
+        let cmd = WorkerCommand::Query {
+            sql,
+            exec_ctx,
+            txn_ctx,
+        };
+        match self.dispatch(db, cmd).await {
+            WorkerResult::Query { result, txn_ctx } => Ok((result, txn_ctx)),
+            WorkerResult::Error { error, txn_ctx } => Err((error, txn_ctx)),
+            _ => Err((
+                TiSqlError::Internal("Unexpected worker result for query".into()),
+                None,
+            )),
+        }
     }
 }

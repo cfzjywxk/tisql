@@ -46,7 +46,11 @@ num_cpus = "1"
 # Concurrent data structures for MVCC
 crossbeam-skiplist = "0.1"
 crossbeam-epoch = "0.9"
+crossbeam-channel = "0.5"
 dashmap = "5"
+
+# Fast synchronous locks (spin-then-park, no poisoning)
+parking_lot = "0.12"
 
 # Memory allocator (jemalloc for production, like TiKV)
 [target.'cfg(unix)'.dependencies]

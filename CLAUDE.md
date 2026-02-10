@@ -15,6 +15,7 @@
 ## Coding Guidelines
 
 - **Prefer async over sync primitives** - TiSQL uses Rust async programming (tokio). Do NOT use synchronous utilities like `std::sync::Mutex`, `std::sync::Condvar`, or `std::thread::sleep` for coordination. Use their async equivalents (`tokio::sync::Mutex`, `tokio::sync::Notify`, `tokio::time::sleep`, etc.) instead
+- **Use `parking_lot` for synchronous locks** - When synchronous locks are needed (storage engine, clog, ilog), use `parking_lot::{Mutex, RwLock, Condvar}` instead of `std::sync`. Never use `std::sync::Mutex` or `std::sync::RwLock`
 - **Minimize contention** - Avoid introducing lock contention in code. Prefer lock-free patterns (atomics, `Arc`), fine-grained locking, or message passing over coarse-grained mutexes. When locks are necessary, hold them for the shortest duration possible and never across `.await` points
 
 ---
@@ -147,25 +148,26 @@ Persistent LSM-tree storage engine with crash recovery. **Now integrated as defa
 | 5 | Durability (ilog, intent/commit, recovery) | ✅ Complete |
 | 6 | Unified LSN (clog + ilog share LsnProvider) | ✅ Complete |
 | 7 | Integration with TxnService | ✅ Complete |
-| 8 | Background flush/compaction workers + write flow control | 🔶 Partial (flush + write stall done, compaction workers pending) |
+| 8 | Background flush/compaction workers + write flow control | 🔶 Partial (flush + write flow control done, background compaction workers pending) |
 | 9 | Block cache for read performance | ⏳ Pending |
 | 10 | Bloom filters for SST | ⏳ Pending |
 
 **Storage Module Structure:**
 ```
 src/storage/
-├── mod.rs            # Public exports, StorageEngine trait
-├── config.rs         # LsmConfig with builder pattern
-├── version.rs        # Version management, ManifestDelta
-├── version_set.rs    # VersionSet + SuperVersion for atomic snapshots
-├── lsm.rs            # LsmEngine - main entry point
-├── flush_scheduler.rs # Background flush worker
-├── compaction.rs     # CompactionPicker, MergeIterator, CompactionExecutor
-├── ilog.rs           # IlogService - SST metadata persistence
-├── recovery.rs       # LsmRecovery - coordinated ilog+clog recovery
-├── mvcc.rs           # MvccKey encoding, MvccIterator trait
-├── memtable/         # VersionedMemTableEngine + MemTable wrapper
-└── sstable/          # SST format (block, builder, reader, iterator)
+├── mod.rs               # Public exports, StorageEngine trait
+├── config.rs            # LsmConfig with builder pattern
+├── version.rs           # Version management, ManifestDelta
+├── version_set.rs       # VersionSet + SuperVersion for atomic snapshots
+├── lsm.rs               # LsmEngine - main entry point (includes write flow control)
+├── flush_scheduler.rs   # Background flush worker
+├── compaction.rs        # CompactionPicker, MergeIterator, CompactionExecutor
+├── compaction_scheduler.rs # Background compaction worker
+├── ilog.rs              # IlogService - SST metadata persistence
+├── recovery.rs          # LsmRecovery - coordinated ilog+clog recovery
+├── mvcc.rs              # MvccKey encoding, MvccIterator trait
+├── memtable/            # VersionedMemTableEngine + MemTable wrapper
+└── sstable/             # SST format (block, builder, reader, iterator)
 ```
 
 **Recovery Sequence:**
@@ -186,13 +188,22 @@ src/storage/
 
 ### Recent Changes
 
+**Async Refactoring: yatp Routing + parking_lot + Group Commit (Feb 2026)**
+- **yatp routing**: All DB-accessing MySQL commands (BEGIN, COMMIT, ROLLBACK, SHOW TABLES/DATABASES) now dispatched to yatp worker pool via `WorkerCommand`/`WorkerResult` enums, keeping tokio threads free for network I/O
+- **parking_lot locks**: Replaced all `std::sync::{Mutex, RwLock, Condvar}` with `parking_lot` equivalents across 8 files (lsm.rs, file.rs, ilog.rs, reader.rs, memory.rs, flush_scheduler.rs, compaction_scheduler.rs). Faster spin-then-park, no poisoning
+- **Group commit**: Dedicated writer thread batches multiple clog/ilog writes into a single fsync, amortizing I/O cost across concurrent transactions. Both `FileClogService` and `IlogService` now use `GroupCommitWriter` backed by `crossbeam_channel`
+- Note: User (yatp worker) threads still block synchronously waiting for fsync completion. Group commit improves throughput but not per-transaction latency. Truly async I/O (io_uring) would be the next step
+- Total: 777 library tests, all integration tests pass
+
 **Write Flow Control: L0 Slowdown + Frozen Memtable Stall (Feb 2026)**
-- Added `Condvar`-based write stall mechanism to `LsmEngine`
-- Three tiers of backpressure: L0 slowdown (linear delay 1ms→100ms), frozen memtable stall (Condvar block with 5s timeout), L0 stop (hard reject)
-- `wait_if_stalled()` called from `write_batch()`, `put_pending()`, `delete_pending()`
-- `notify_write_stall()` called from `flush_memtable()` and `do_compaction()` to wake stalled writers
-- `finalize_pending`/`abort_pending` exempt from stalling (cleanup must not be delayed)
-- Unit tests for delay interpolation, stall/unblock, timeout safety
+- Added `check_write_stall()` to `LsmEngine` — returns error immediately (no blocking/Condvar)
+- Three tiers of write backpressure:
+  1. **L0 slowdown** (`slowdown_trigger..stop_trigger`): brief `thread::sleep` with linear delay 1ms→100ms via `compute_write_delay()`
+  2. **Frozen memtable stall**: returns `Err` when `active.approximate_size() >= memtable_size AND frozen.len() >= max_frozen_memtables`
+  3. **L0 stop** (`>= stop_trigger`): returns `Err` (pre-existing behavior in `write_batch`)
+- Only `write_batch()` calls `check_write_stall()` — pessimistic ops (`put_pending`/`delete_pending`) and cleanup ops (`finalize_pending`/`abort_pending`) are not stalled
+- Callers handle stall errors by retrying with backoff or propagating to the user
+- Unit tests for delay interpolation, stall error return, stall clears after flush
 - Integration test (`test_write_stall_e2e`) with concurrent writers + flush scheduler
 
 **Atomic SuperVersion Installation (Feb 2026)**
@@ -218,7 +229,7 @@ src/storage/
   - `l0_sst_iterator_seek` - Seek errors
   - `l0_sst_iterator_advance` - Advance errors
 - Added 6 new fail point tests in `tests/storage_failpoint_test.rs`
-- Total: 30 fail point tests, 700 library tests
+- Total: 31 fail point tests, 773 library tests
 - Coverage results:
   - `src/storage/lsm.rs`: 61.9% (314/507 lines)
   - `src/storage/config.rs`: 100% (92/92 lines)
@@ -275,16 +286,21 @@ src/storage/
 - [ ] Aggregations, JOINs, subqueries
 - [ ] Log rotation and compaction
 - [x] Background flush workers (FlushScheduler)
+- [x] Write flow control (L0 slowdown + frozen memtable stall error)
+- [x] Group commit for clog/ilog (batched fsync via dedicated writer thread)
+- [x] parking_lot locks (replaced std::sync across all modules)
+- [x] yatp routing for all DB commands (BEGIN/COMMIT/ROLLBACK/SHOW off tokio threads)
 - [ ] Background compaction workers
 - [ ] Block cache for SST read performance
 - [ ] Bloom filters for SST point lookups
+- [ ] Async I/O (io_uring) for non-blocking clog/ilog writes
 
 ---
 
 ## Key Invariants
 
 1. **commit_ts > any concurrent reader's start_ts** - Prevents "commit in the past" anomaly
-2. **LSN ordering** - Clog records committed in ascending LSN order for recovery
+2. **LSN ordering** - Clog LSNs are unique and contiguous; file order may differ from LSN order due to group commit batching (recovery uses filter/sort, not file order)
 3. **Lock before commit_ts** - Acquire locks before computing commit_ts
 4. **max_ts tracking** - ConcurrencyManager updates max_ts on every read to ensure visibility
 5. **Unified LSN** - Clog and ilog share the same LsnProvider for consistent recovery ordering
@@ -299,5 +315,7 @@ src/storage/
 | tokio | Async runtime |
 | opensrv-mysql | MySQL protocol |
 | yatp | Thread pool (TiKV) |
+| parking_lot | Fast synchronous locks (spin-then-park, no poisoning) |
+| crossbeam-channel | Lock-free MPMC channels (group commit) |
 | tikv-jemallocator | jemalloc allocator (default) |
 | fail | Fail point injection |

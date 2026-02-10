@@ -40,7 +40,9 @@
 //! ```
 
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{Arc, Condvar, Mutex};
+use std::sync::Arc;
+
+use parking_lot::{Condvar, Mutex};
 use std::thread::{self, JoinHandle};
 use std::time::Duration;
 
@@ -98,7 +100,7 @@ impl CompactionScheduler {
     ///
     /// Does nothing if already started.
     pub fn start(&self) {
-        let mut handle = self.worker_handle.lock().unwrap();
+        let mut handle = self.worker_handle.lock();
         if handle.is_some() {
             return; // Already started
         }
@@ -120,7 +122,7 @@ impl CompactionScheduler {
         self.inner.notify_cv.notify_all();
 
         // Wait for worker to finish
-        let mut handle = self.worker_handle.lock().unwrap();
+        let mut handle = self.worker_handle.lock();
         if let Some(h) = handle.take() {
             if h.join().is_err() {
                 tracing::warn!("Compaction worker thread panicked");
@@ -147,7 +149,7 @@ impl CompactionScheduler {
 
     /// Check if the scheduler is running.
     pub fn is_running(&self) -> bool {
-        let handle = self.worker_handle.lock().unwrap();
+        let handle = self.worker_handle.lock();
         handle.is_some() && !self.inner.shutdown.load(Ordering::Relaxed)
     }
 
@@ -196,8 +198,8 @@ impl CompactionSchedulerInner {
                 }
                 Ok(false) => {
                     // No work - wait for notification or timeout
-                    let guard = self.notify_mutex.lock().unwrap();
-                    let _ = self.notify_cv.wait_timeout(guard, Duration::from_secs(1));
+                    let mut guard = self.notify_mutex.lock();
+                    self.notify_cv.wait_for(&mut guard, Duration::from_secs(1));
                 }
                 Err(e) => {
                     tracing::error!("Compaction failed: {e}");

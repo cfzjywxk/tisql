@@ -25,10 +25,12 @@
 //! confusion with application logging.
 
 mod file;
+pub(crate) mod group_commit;
 
 // Implementation types - not re-exported from main API
 // Available via testkit for integration tests
 pub use file::{FileClogConfig, FileClogService, TruncateStats};
+pub(crate) use group_commit::GroupCommitWriter;
 
 use crate::error::Result;
 use crate::storage::WriteBatch;

@@ -235,14 +235,14 @@ impl SstReader {
 /// or threads (with interior mutability for file access).
 #[derive(Clone)]
 pub struct SstReaderRef {
-    inner: Arc<std::sync::Mutex<SstReader>>,
+    inner: Arc<parking_lot::Mutex<SstReader>>,
 }
 
 impl SstReaderRef {
     /// Create a new shared reader.
     pub fn new(reader: SstReader) -> Self {
         Self {
-            inner: Arc::new(std::sync::Mutex::new(reader)),
+            inner: Arc::new(parking_lot::Mutex::new(reader)),
         }
     }
 
@@ -254,55 +254,32 @@ impl SstReaderRef {
 
     /// Read a data block by index.
     pub fn read_block(&self, block_idx: usize) -> Result<DataBlock> {
-        self.inner
-            .lock()
-            .map_err(|e| TiSqlError::Storage(format!("Lock poisoned: {e}")))?
-            .read_block(block_idx)
+        self.inner.lock().read_block(block_idx)
     }
 
     /// Point lookup for a key.
     pub fn get(&self, key: &[u8]) -> Result<Option<Vec<u8>>> {
-        self.inner
-            .lock()
-            .map_err(|e| TiSqlError::Storage(format!("Lock poisoned: {e}")))?
-            .get(key)
+        self.inner.lock().get(key)
     }
 
     /// Get the number of blocks.
     pub fn num_blocks(&self) -> Result<u32> {
-        Ok(self
-            .inner
-            .lock()
-            .map_err(|e| TiSqlError::Storage(format!("Lock poisoned: {e}")))?
-            .num_blocks())
+        Ok(self.inner.lock().num_blocks())
     }
 
     /// Get the number of entries.
     pub fn num_entries(&self) -> Result<u64> {
-        Ok(self
-            .inner
-            .lock()
-            .map_err(|e| TiSqlError::Storage(format!("Lock poisoned: {e}")))?
-            .num_entries())
+        Ok(self.inner.lock().num_entries())
     }
 
     /// Find the block that may contain the given key.
     pub fn find_block(&self, key: &[u8]) -> Result<usize> {
-        Ok(self
-            .inner
-            .lock()
-            .map_err(|e| TiSqlError::Storage(format!("Lock poisoned: {e}")))?
-            .find_block(key))
+        Ok(self.inner.lock().find_block(key))
     }
 
     /// Get the footer.
     pub fn footer(&self) -> Result<Footer> {
-        Ok(self
-            .inner
-            .lock()
-            .map_err(|e| TiSqlError::Storage(format!("Lock poisoned: {e}")))?
-            .footer()
-            .clone())
+        Ok(self.inner.lock().footer().clone())
     }
 }
 
