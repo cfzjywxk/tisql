@@ -362,14 +362,18 @@ impl<S: PessimisticStorage + 'static, L: ClogService + 'static, T: TsoService> T
             return Err(TiSqlError::ReadOnlyTransaction);
         }
 
+        // Register in state cache BEFORE writing pending node so concurrent readers
+        // can always resolve our pending writes via TxnStateCache. Without this,
+        // there's a gap between put_pending and register where get_txn_state returns
+        // None — currently safe due to max_ts, but fragile to reason about.
+        if !ctx.registered {
+            self.concurrency_manager.register_txn(ctx.start_ts);
+            ctx.registered = true;
+        }
+
         // Write pending node directly to storage.
         match self.storage.put_pending(&key, value, ctx.start_ts) {
             Ok(()) => {
-                // Register in state cache on first write so readers can resolve our pending nodes.
-                if !ctx.registered {
-                    self.concurrency_manager.register_txn(ctx.start_ts);
-                    ctx.registered = true;
-                }
                 // If this key was a LOCK (from prior delete), it's now a real value.
                 ctx.lock_keys.retain(|k| k != &key);
                 ctx.add_locked_key(key);
@@ -391,6 +395,12 @@ impl<S: PessimisticStorage + 'static, L: ClogService + 'static, T: TsoService> T
             return Err(TiSqlError::ReadOnlyTransaction);
         }
 
+        // Register before writing pending (same reason as put()).
+        if !ctx.registered {
+            self.concurrency_manager.register_txn(ctx.start_ts);
+            ctx.registered = true;
+        }
+
         // Check committed OR own pending value (owner_ts=start_ts sees own pending).
         // This fixes put(k)+delete(k) on non-existing key: sees own pending put → TOMBSTONE.
         let value_exists = self
@@ -405,10 +415,6 @@ impl<S: PessimisticStorage + 'static, L: ClogService + 'static, T: TsoService> T
                 .put_pending(&key, TOMBSTONE.to_vec(), ctx.start_ts)
             {
                 Ok(()) => {
-                    if !ctx.registered {
-                        self.concurrency_manager.register_txn(ctx.start_ts);
-                        ctx.registered = true;
-                    }
                     ctx.lock_keys.retain(|k| k != &key);
                     ctx.add_locked_key(key);
                     Ok(())
@@ -423,10 +429,6 @@ impl<S: PessimisticStorage + 'static, L: ClogService + 'static, T: TsoService> T
             // No value exists → LOCK (pessimistic lock only, not persisted to clog)
             match self.storage.put_pending(&key, LOCK.to_vec(), ctx.start_ts) {
                 Ok(()) => {
-                    if !ctx.registered {
-                        self.concurrency_manager.register_txn(ctx.start_ts);
-                        ctx.registered = true;
-                    }
                     if !ctx.lock_keys.contains(&key) {
                         ctx.lock_keys.push(key.clone());
                     }
