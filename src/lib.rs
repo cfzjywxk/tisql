@@ -118,14 +118,24 @@ pub mod testkit {
     {
         fn autocommit_put(&self, key: &[u8], value: &[u8]) -> Result<CommitInfo> {
             let mut ctx = self.begin(false)?;
-            self.put(&mut ctx, key.to_vec(), value.to_vec())?;
-            self.commit(ctx)
+            match self.put(&mut ctx, key.to_vec(), value.to_vec()) {
+                Ok(()) => self.commit(ctx),
+                Err(e) => {
+                    let _ = self.rollback(ctx);
+                    Err(e)
+                }
+            }
         }
 
         fn autocommit_delete(&self, key: &[u8]) -> Result<CommitInfo> {
             let mut ctx = self.begin(false)?;
-            self.delete(&mut ctx, key.to_vec())?;
-            self.commit(ctx)
+            match self.delete(&mut ctx, key.to_vec()) {
+                Ok(()) => self.commit(ctx),
+                Err(e) => {
+                    let _ = self.rollback(ctx);
+                    Err(e)
+                }
+            }
         }
     }
 }

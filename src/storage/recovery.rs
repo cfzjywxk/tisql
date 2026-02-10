@@ -1191,8 +1191,7 @@ mod tests {
 
             let lsn_provider = new_lsn_provider();
             let ilog_config = IlogConfig::new(tmp.path());
-            let ilog =
-                Arc::new(IlogService::open(ilog_config, Arc::clone(&lsn_provider)).unwrap());
+            let ilog = Arc::new(IlogService::open(ilog_config, Arc::clone(&lsn_provider)).unwrap());
 
             let engine = LsmEngine::open_with_recovery(
                 lsm_config,

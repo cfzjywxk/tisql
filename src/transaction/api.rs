@@ -43,7 +43,7 @@
 use std::ops::Range;
 
 use crate::error::Result;
-use crate::storage::{MvccIterator, WriteBatch};
+use crate::storage::MvccIterator;
 use crate::types::{Key, Lsn, RawValue, Timestamp, TxnId};
 
 /// Transaction state machine for OceanBase-style pessimistic locking.
@@ -97,10 +97,10 @@ pub enum TxnState {
 ///
 /// ## Explicit vs Implicit Transactions
 ///
+/// Both explicit and implicit transactions use pessimistic locking:
+/// writes go directly to storage as pending nodes, then are finalized at commit.
 /// - **Explicit**: Started with BEGIN/START TRANSACTION, ended with COMMIT/ROLLBACK.
-///   Uses pessimistic locking - writes acquire locks immediately.
 /// - **Implicit**: Auto-commit mode (default). Each statement is a transaction.
-///   Uses optimistic approach - locks acquired only at commit time.
 #[derive(Debug)]
 pub struct TxnCtx {
     /// Unique transaction ID.
@@ -114,22 +114,20 @@ pub struct TxnCtx {
     /// Whether this is an explicit transaction (started with BEGIN).
     /// Explicit transactions use pessimistic locking.
     pub(crate) explicit: bool,
-    /// Buffered writes (for optimistic/implicit transactions).
-    /// For pessimistic transactions, writes go directly to storage with pending status.
-    pub(crate) write_buffer: WriteBatch,
-    /// Keys that have been locked by this transaction (for pessimistic transactions).
+    /// Keys that have been locked by this transaction.
     /// Used for commit (finalize) and rollback (abort) operations.
     pub(crate) locked_keys: Vec<Key>,
     /// Keys holding LOCK-type nodes (pessimistic locks without data change).
     /// These are skipped during clog write at commit time.
     pub(crate) lock_keys: Vec<Key>,
+    /// Whether this transaction has been registered in the state cache.
+    /// Registration happens on first write (put/delete) for implicit txns,
+    /// or at begin_explicit() for explicit txns.
+    pub(crate) registered: bool,
 }
 
 impl TxnCtx {
     /// Create a new implicit (auto-commit) transaction context.
-    ///
-    /// Implicit transactions use optimistic locking - writes are buffered
-    /// and locks are acquired only at commit time.
     pub(crate) fn new(txn_id: TxnId, start_ts: Timestamp, read_only: bool) -> Self {
         Self {
             txn_id,
@@ -137,16 +135,16 @@ impl TxnCtx {
             state: TxnState::Running,
             read_only,
             explicit: false,
-            write_buffer: WriteBatch::new(),
             locked_keys: Vec::new(),
             lock_keys: Vec::new(),
+            registered: false,
         }
     }
 
     /// Create a new explicit transaction context.
     ///
-    /// Explicit transactions use pessimistic locking - writes acquire locks
-    /// immediately and go directly to storage with pending status.
+    /// Explicit transactions are started with BEGIN/START TRANSACTION
+    /// and ended with COMMIT/ROLLBACK.
     pub(crate) fn new_explicit(txn_id: TxnId, start_ts: Timestamp, read_only: bool) -> Self {
         Self {
             txn_id,
@@ -154,9 +152,9 @@ impl TxnCtx {
             state: TxnState::Running,
             read_only,
             explicit: true,
-            write_buffer: WriteBatch::new(),
             locked_keys: Vec::new(),
             lock_keys: Vec::new(),
+            registered: false,
         }
     }
 
@@ -177,9 +175,9 @@ impl TxnCtx {
             state: TxnState::Running,
             read_only,
             explicit,
-            write_buffer: WriteBatch::new(),
             locked_keys: Vec::new(),
             lock_keys: Vec::new(),
+            registered: false,
         }
     }
 
@@ -262,15 +260,11 @@ impl TxnCtx {
 /// 3. **Consistent Timestamps**: The `TxnCtx` carries `start_ts` for debugging
 ///    and ensures all operations in a transaction use the same snapshot.
 ///
-/// ## Note on Read-Your-Writes
+/// ## Read-Your-Writes
 ///
-/// Currently, read-your-writes is NOT supported. Reads always go to storage
-/// and do not see buffered (uncommitted) writes in the same transaction.
-/// This is because explicit transactions (BEGIN/COMMIT/ROLLBACK) are not yet
-/// supported - all writes are auto-committed.
-///
-/// In the future, with pessimistic locking, uncommitted writes will be written
-/// directly to storage with locks, making read-your-writes work naturally.
+/// Both implicit and explicit transactions write pending nodes to storage.
+/// Reads use `owner_ts=start_ts` to see own pending writes, providing
+/// read-your-writes semantics.
 ///
 /// ## Design Rationale
 ///
@@ -294,18 +288,12 @@ pub trait TxnService: Send + Sync {
     ///
     /// Allocates a `start_ts` from TSO and returns a transaction context.
     /// If `read_only` is true, write operations will error.
-    ///
-    /// Implicit transactions use optimistic locking - writes are buffered
-    /// and locks are only acquired at commit time.
     fn begin(&self, read_only: bool) -> Result<TxnCtx>;
 
     /// Begin a new explicit transaction (BEGIN/START TRANSACTION).
     ///
     /// Allocates a `start_ts` from TSO and returns a transaction context
     /// marked as explicit. If `read_only` is true, write operations will error.
-    ///
-    /// Explicit transactions use pessimistic locking - writes acquire locks
-    /// immediately and are written to storage as pending entries.
     fn begin_explicit(&self, read_only: bool) -> Result<TxnCtx>;
 
     // === Data Operations ===
@@ -314,8 +302,7 @@ pub trait TxnService: Send + Sync {
     ///
     /// Reads from storage at `start_ts`, returning the latest visible version.
     /// Returns `None` if the key doesn't exist or was deleted.
-    ///
-    /// Note: This does NOT see uncommitted writes in the transaction's buffer.
+    /// Sees own pending writes (read-your-writes).
     fn get(&self, ctx: &TxnCtx, key: &[u8]) -> Result<Option<RawValue>>;
 
     /// Scan a range of keys within the transaction (streaming).
@@ -323,13 +310,12 @@ pub trait TxnService: Send + Sync {
     /// Returns an iterator over key-value pairs visible at `start_ts`.
     /// Each item is wrapped in `Result` to propagate I/O or corruption errors
     /// that may occur during streaming iteration over storage.
-    ///
-    /// Note: This does NOT see uncommitted writes in the transaction's buffer.
+    /// For explicit transactions, sees own pending writes (read-your-writes).
     fn scan_iter(&self, ctx: &TxnCtx, range: Range<Key>) -> Result<Self::ScanIter>;
 
-    /// Buffer a put operation.
+    /// Write a pending put to storage.
     ///
-    /// The write is not visible until commit.
+    /// The write is not visible to other transactions until commit.
     ///
     /// # Errors
     ///
@@ -337,9 +323,9 @@ pub trait TxnService: Send + Sync {
     /// - `TransactionNotActive` if the transaction is not in `Active` state
     fn put(&self, ctx: &mut TxnCtx, key: Key, value: RawValue) -> Result<()>;
 
-    /// Buffer a delete operation.
+    /// Write a pending delete to storage.
     ///
-    /// The delete is not visible until commit.
+    /// The delete is not visible to other transactions until commit.
     ///
     /// # Errors
     ///
@@ -361,7 +347,7 @@ pub trait TxnService: Send + Sync {
 
     /// Rollback the transaction.
     ///
-    /// All buffered writes are discarded.
+    /// All pending writes are aborted.
     fn rollback(&self, ctx: TxnCtx) -> Result<()>;
 }
 

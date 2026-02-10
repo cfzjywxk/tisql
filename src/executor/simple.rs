@@ -287,7 +287,13 @@ impl SimpleExecutor {
         let mut ctx = txn_service.begin(false)?;
 
         // Execute the write plan and get the result
-        let result = self.execute_write_with_ctx(plan, &mut ctx, txn_service, catalog)?;
+        let result = match self.execute_write_with_ctx(plan, &mut ctx, txn_service, catalog) {
+            Ok(r) => r,
+            Err(e) => {
+                let _ = txn_service.rollback(ctx);
+                return Err(e);
+            }
+        };
 
         // Check schema version before commit (no IO - just atomic read)
         // This read lock will block if DDL is in the middle of committing

@@ -137,7 +137,10 @@ fn test_crash_after_freeze_before_insert() {
     }));
 
     // Verify failpoint actually fired
-    assert!(result.is_err(), "Failpoint should have triggered a panic during rotation");
+    assert!(
+        result.is_err(),
+        "Failpoint should have triggered a panic during rotation"
+    );
 
     // Remove failpoint
     fail::cfg("lsm_after_freeze_before_insert", "off").unwrap();
@@ -177,9 +180,7 @@ fn test_crash_before_sst_build() {
     fail::cfg("lsm_flush_before_sst_build", "panic").unwrap();
 
     // Flush should panic at failpoint
-    let result = panic::catch_unwind(panic::AssertUnwindSafe(|| {
-        engine.flush_memtable(&frozen)
-    }));
+    let result = panic::catch_unwind(panic::AssertUnwindSafe(|| engine.flush_memtable(&frozen)));
     assert!(result.is_err(), "Failpoint should have triggered a panic");
 
     // Remove failpoint
@@ -237,9 +238,7 @@ fn test_crash_after_sst_write_before_ilog() {
     fail::cfg("lsm_flush_after_sst_write", "panic").unwrap();
 
     // Flush will create SST file, then panic before ilog commit
-    let result = panic::catch_unwind(panic::AssertUnwindSafe(|| {
-        engine.flush_memtable(&frozen)
-    }));
+    let result = panic::catch_unwind(panic::AssertUnwindSafe(|| engine.flush_memtable(&frozen)));
     assert!(result.is_err(), "Failpoint should have triggered a panic");
 
     // Remove failpoint
@@ -297,9 +296,8 @@ fn test_crash_after_ilog_commit() {
         fail::cfg("lsm_flush_after_ilog_commit", "panic").unwrap();
 
         // Flush will write SST, commit to ilog, then panic before version update
-        let result = panic::catch_unwind(panic::AssertUnwindSafe(|| {
-            engine.flush_memtable(&frozen)
-        }));
+        let result =
+            panic::catch_unwind(panic::AssertUnwindSafe(|| engine.flush_memtable(&frozen)));
         assert!(result.is_err(), "Failpoint should have triggered a panic");
 
         // Remove failpoint
@@ -494,14 +492,20 @@ fn test_crash_before_merge() {
     // Verify we have multiple L0 SSTs
     let version = engine.current_version();
     let l0_count = version.level(0).len();
-    assert!(l0_count >= 2, "Need multiple L0 SSTs for compaction (got {l0_count})");
+    assert!(
+        l0_count >= 2,
+        "Need multiple L0 SSTs for compaction (got {l0_count})"
+    );
 
     // Configure failpoint to crash before merge
     fail::cfg("compaction_before_merge", "panic").unwrap();
 
     // Trigger compaction - should panic at failpoint
     let result = panic::catch_unwind(panic::AssertUnwindSafe(|| engine.do_compaction()));
-    assert!(result.is_err(), "Failpoint should have triggered a panic during compaction");
+    assert!(
+        result.is_err(),
+        "Failpoint should have triggered a panic during compaction"
+    );
 
     // Remove failpoint
     fail::cfg("compaction_before_merge", "off").unwrap();
@@ -543,14 +547,20 @@ fn test_crash_mid_compaction() {
 
     let version = engine.current_version();
     let l0_count = version.level(0).len();
-    assert!(l0_count >= 2, "Need multiple L0 SSTs for compaction (got {l0_count})");
+    assert!(
+        l0_count >= 2,
+        "Need multiple L0 SSTs for compaction (got {l0_count})"
+    );
 
     // Configure failpoint to crash mid compaction
     fail::cfg("compaction_mid_write", "panic").unwrap();
 
     // Trigger compaction - should panic mid-write
     let result = panic::catch_unwind(panic::AssertUnwindSafe(|| engine.do_compaction()));
-    assert!(result.is_err(), "Failpoint should have triggered a panic during compaction");
+    assert!(
+        result.is_err(),
+        "Failpoint should have triggered a panic during compaction"
+    );
 
     // Remove failpoint
     fail::cfg("compaction_mid_write", "off").unwrap();
@@ -560,7 +570,10 @@ fn test_crash_mid_compaction() {
         for j in 0..5 {
             let key = format!("mid_comp_key_{:04}", i * 10 + j);
             let value = engine.get(key.as_bytes()).unwrap();
-            assert!(value.is_some(), "Key {key} should exist after failed compaction");
+            assert!(
+                value.is_some(),
+                "Key {key} should exist after failed compaction"
+            );
         }
     }
 
@@ -591,14 +604,20 @@ fn test_crash_after_compaction_finish() {
 
     let version = engine.current_version();
     let l0_before = version.level(0).len();
-    assert!(l0_before >= 2, "Need multiple L0 SSTs for compaction (got {l0_before})");
+    assert!(
+        l0_before >= 2,
+        "Need multiple L0 SSTs for compaction (got {l0_before})"
+    );
 
     // Configure failpoint to crash after compaction write but before commit
     fail::cfg("compaction_after_finish", "panic").unwrap();
 
     // Trigger compaction - should panic after writing new SSTs but before committing
     let result = panic::catch_unwind(panic::AssertUnwindSafe(|| engine.do_compaction()));
-    assert!(result.is_err(), "Failpoint should have triggered a panic during compaction");
+    assert!(
+        result.is_err(),
+        "Failpoint should have triggered a panic during compaction"
+    );
 
     // Remove failpoint
     fail::cfg("compaction_after_finish", "off").unwrap();
@@ -649,10 +668,11 @@ fn test_crash_before_clog_sync() {
     let mut batch = tisql::testkit::ClogBatch::new();
     batch.add_put(1, b"key".to_vec(), b"value".to_vec());
     batch.add_commit(1, 100);
-    let result = panic::catch_unwind(panic::AssertUnwindSafe(|| {
-        clog.write(&mut batch, true)
-    }));
-    assert!(result.is_err(), "Failpoint should have triggered a panic before fsync");
+    let result = panic::catch_unwind(panic::AssertUnwindSafe(|| clog.write(&mut batch, true)));
+    assert!(
+        result.is_err(),
+        "Failpoint should have triggered a panic before fsync"
+    );
 
     // Remove failpoint
     fail::cfg("clog_before_sync", "off").unwrap();
@@ -688,10 +708,11 @@ fn test_crash_after_clog_sync() {
     let mut batch = tisql::testkit::ClogBatch::new();
     batch.add_put(2, b"also_durable".to_vec(), b"also_value".to_vec());
     batch.add_commit(2, 200);
-    let result = panic::catch_unwind(panic::AssertUnwindSafe(|| {
-        clog.write(&mut batch, true)
-    }));
-    assert!(result.is_err(), "Failpoint should have triggered a panic after fsync");
+    let result = panic::catch_unwind(panic::AssertUnwindSafe(|| clog.write(&mut batch, true)));
+    assert!(
+        result.is_err(),
+        "Failpoint should have triggered a panic after fsync"
+    );
 
     // Remove failpoint
     fail::cfg("clog_after_sync", "off").unwrap();
@@ -699,8 +720,7 @@ fn test_crash_after_clog_sync() {
     // Drop clog and recover
     drop(clog);
     let clog_config = FileClogConfig::with_dir(dir.path());
-    let (recovered_clog, entries) =
-        FileClogService::recover(clog_config).unwrap();
+    let (recovered_clog, entries) = FileClogService::recover(clog_config).unwrap();
 
     // First write should be recoverable (was synced before failpoint was set)
     assert!(

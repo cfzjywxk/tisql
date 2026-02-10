@@ -30,24 +30,9 @@ use crate::tso::TsoService;
 
 use super::api::{CommitInfo, TxnCtx, TxnService, TxnState};
 use super::concurrency::ConcurrencyManager;
-use crate::storage::mvcc::next_key_bound;
 use crate::storage::mvcc::{is_tombstone, MvccIterator, MvccKey, LOCK, TOMBSTONE};
-use crate::storage::{PessimisticStorage, StorageEngine, WriteBatch, WriteOp};
+use crate::storage::{PessimisticStorage, StorageEngine, WriteBatch};
 use crate::types::{Key, RawValue, Timestamp, TxnId};
-
-/// Compute the exclusive end key for a point get operation.
-///
-/// Returns a key that is lexicographically just after `key`, suitable as an
-/// exclusive upper bound for scanning a single key.
-fn next_key_for_get(key: &[u8]) -> Key {
-    let mut next = key.to_vec();
-    if next_key_bound(&mut next) {
-        next
-    } else {
-        // All 0xFF: use empty vec as unbounded sentinel
-        vec![]
-    }
-}
 
 /// Transaction service manages transactions with durability and MVCC.
 ///
@@ -232,10 +217,10 @@ impl<S: StorageEngine, L: ClogService, T: TsoService> TransactionService<S, L, T
 impl<S: PessimisticStorage + 'static, L: ClogService + 'static, T: TsoService>
     TransactionService<S, L, T>
 {
-    /// Build locked_keys and WriteBatch for an explicit transaction commit.
+    /// Build locked_keys and WriteBatch for commit.
     ///
-    /// Explicit transactions have pending writes already in storage.
-    /// This reads them back to build the clog WriteBatch.
+    /// Pending writes are already in storage. This reads them back to
+    /// build the clog WriteBatch.
     fn prepare_explicit_batch(&self, ctx: &mut TxnCtx) -> Result<(Vec<Key>, WriteBatch)> {
         let locked_keys = std::mem::take(&mut ctx.locked_keys);
         if locked_keys.is_empty() {
@@ -262,50 +247,6 @@ impl<S: PessimisticStorage + 'static, L: ClogService + 'static, T: TsoService>
         Ok((locked_keys, batch))
     }
 
-    /// Build locked_keys and WriteBatch for an implicit transaction commit.
-    ///
-    /// Implicit transactions have buffered writes. This acquires locks by
-    /// writing pending nodes to storage, then returns the locked keys and batch.
-    fn prepare_implicit_batch(&self, ctx: &mut TxnCtx) -> Result<(Vec<Key>, WriteBatch)> {
-        let batch = std::mem::take(&mut ctx.write_buffer);
-        if batch.is_empty() {
-            return Ok((vec![], WriteBatch::new()));
-        }
-
-        let start_ts = ctx.start_ts;
-        let mut locked_keys: Vec<Key> = Vec::with_capacity(batch.len());
-
-        for (key, op) in batch.iter() {
-            let value = match op {
-                WriteOp::Put { value } => value.clone(),
-                WriteOp::Delete => TOMBSTONE.to_vec(),
-            };
-
-            match self.storage.put_pending(key, value, start_ts) {
-                Ok(()) => {
-                    locked_keys.push(key.clone());
-                }
-                Err(lock_owner) => {
-                    // Conflict - abort all pending writes we made
-                    if !locked_keys.is_empty() {
-                        self.storage.abort_pending(&locked_keys, start_ts);
-                    }
-                    return Err(TiSqlError::KeyIsLocked {
-                        key: key.clone(),
-                        lock_ts: lock_owner,
-                        primary: vec![],
-                    });
-                }
-            }
-        }
-
-        // FAILPOINT: After locks acquired, before commit_ts computation
-        #[cfg(feature = "failpoints")]
-        fail_point!("txn_after_lock_before_commit_ts");
-
-        Ok((locked_keys, batch))
-    }
-
     /// Execute the common commit protocol after locks are acquired.
     ///
     /// Steps: Preparing → commit_ts → Prepared → clog → finalize → Committed.
@@ -319,6 +260,10 @@ impl<S: PessimisticStorage + 'static, L: ClogService + 'static, T: TsoService>
         locked_keys: &[Key],
         storage_batch: &WriteBatch,
     ) -> Result<(Timestamp, u64)> {
+        // FAILPOINT: After locks acquired (pending nodes written), before commit_ts computation
+        #[cfg(feature = "failpoints")]
+        fail_point!("txn_after_lock_before_commit_ts");
+
         // Step 1: Signal that we're computing commit_ts.
         // Readers encountering our pending nodes will spin-wait until Prepared.
         self.concurrency_manager.set_preparing_txn(start_ts)?;
@@ -329,8 +274,7 @@ impl<S: PessimisticStorage + 'static, L: ClogService + 'static, T: TsoService>
         let commit_ts = std::cmp::max(max_ts + 1, tso_ts);
 
         // Step 3: Set prepared_ts for readers to check visibility
-        self.concurrency_manager
-            .prepare_txn(start_ts, commit_ts)?;
+        self.concurrency_manager.prepare_txn(start_ts, commit_ts)?;
 
         // Step 4: Write to clog for durability before finalizing.
         // If we crash after clog write but before finalize, recovery
@@ -345,8 +289,7 @@ impl<S: PessimisticStorage + 'static, L: ClogService + 'static, T: TsoService>
             .finalize_pending(locked_keys, start_ts, commit_ts);
 
         // Step 6: Transition to Committed in state cache
-        self.concurrency_manager
-            .commit_txn(start_ts, commit_ts)?;
+        self.concurrency_manager.commit_txn(start_ts, commit_ts)?;
 
         Ok((commit_ts, lsn))
     }
@@ -354,94 +297,60 @@ impl<S: PessimisticStorage + 'static, L: ClogService + 'static, T: TsoService>
 
 /// Implement TxnService trait for TransactionService
 ///
-/// Note: `S: PessimisticStorage` is required to support explicit transactions
-/// with pessimistic locking. Since `PessimisticStorage: StorageEngine`, this
-/// is backwards compatible with code that only uses implicit transactions.
+/// Note: `S: PessimisticStorage` is required because both implicit and explicit
+/// transactions use pessimistic locking with pending nodes in storage.
 impl<S: PessimisticStorage + 'static, L: ClogService + 'static, T: TsoService> TxnService
     for TransactionService<S, L, T>
 {
     type ScanIter = MvccScanIterator<S::Iter>;
 
     fn begin(&self, read_only: bool) -> Result<TxnCtx> {
-        // Allocate txn_id and start_ts from TSO
         let txn_id = self.get_ts();
         let start_ts = self.get_ts();
-
         Ok(TxnCtx::new(txn_id, start_ts, read_only))
     }
 
     fn begin_explicit(&self, read_only: bool) -> Result<TxnCtx> {
-        // Allocate txn_id and start_ts from TSO
         let txn_id = self.get_ts();
         let start_ts = self.get_ts();
-
-        // Register transaction in state cache for visibility tracking
-        self.concurrency_manager.register_txn(start_ts);
-
-        Ok(TxnCtx::new_explicit(txn_id, start_ts, read_only))
+        let mut ctx = TxnCtx::new_explicit(txn_id, start_ts, read_only);
+        if !read_only {
+            self.concurrency_manager.register_txn(start_ts);
+            ctx.registered = true;
+        }
+        Ok(ctx)
     }
 
     fn get(&self, ctx: &TxnCtx, key: &[u8]) -> Result<Option<RawValue>> {
-        // For explicit transactions, use get_with_owner for read-your-writes support.
-        // This allows the transaction to see its own pending writes.
-        //
-        // Safety: get_with_owner skips other txns' pending nodes without resolution.
-        // This is safe because if another txn holds a lock on this key, our txn
-        // can't also hold one (exclusive locks). If we don't hold a lock,
-        // get_with_owner returns committed data which is correct.
-        if ctx.is_explicit() {
-            let value = self.storage.get_with_owner(key, ctx.start_ts, ctx.start_ts);
-            // Filter out tombstones (deleted keys)
-            return Ok(value.filter(|v| !is_tombstone(v)));
-        }
-
-        // For non-explicit transactions, use scan_iter with pending resolution.
-        // This ensures pending writes from other transactions are properly resolved
-        // via TxnStateCache, closing the snapshot isolation race window.
-        let range = key.to_vec()..next_key_for_get(key);
-        let mut iter = self.scan_iter(ctx, range)?;
-        iter.advance()?;
-        if iter.valid() && iter.user_key() == key {
-            Ok(Some(iter.value().to_vec()))
-        } else {
-            Ok(None)
-        }
+        // Use get_with_owner with owner_ts=start_ts for read-your-writes.
+        // This sees own pending writes and committed data at start_ts.
+        let value = self.storage.get_with_owner(key, ctx.start_ts, ctx.start_ts);
+        Ok(value.filter(|v| !is_tombstone(v)))
     }
 
     fn scan_iter(&self, ctx: &TxnCtx, range: Range<Key>) -> Result<MvccScanIterator<S::Iter>> {
-        // MVCC scan: find the latest version of each key with commit_ts <= start_ts
-        //
         // Build MVCC key range:
         // - Start: MvccKey::encode(range.start, MAX) - smallest MVCC key with this prefix
-        //   We use Timestamp::MAX because !MAX = 0, producing the smallest suffix.
-        //   This ensures we find all keys that start with range.start, even when
-        //   range.start is a prefix (like table scan without a specific row key).
-        //   Visibility filtering by start_ts happens in find_next_visible().
         // - End: MvccKey::encode(range.end, 0) - largest MVCC key for range.end (exclusive)
         let start_mvcc = MvccKey::encode(&range.start, Timestamp::MAX);
         let end_mvcc = if range.end.is_empty() {
             MvccKey::unbounded()
         } else {
-            // Use ts=0 to get the largest MVCC key for range.end (exclusive)
             MvccKey::encode(&range.end, 0)
         };
         let mvcc_range = start_mvcc..end_mvcc;
 
-        // Create storage iterator with owner_ts for read-your-writes support.
-        // For explicit transactions, pass start_ts as owner_ts to see pending writes.
-        // For implicit transactions, pass 0 (no pending writes to see).
+        // Explicit transactions use owner_ts=start_ts for read-your-writes
+        // (see pending writes from prior statements in the same txn).
+        // Implicit transactions use owner_ts=0 because writes within a single
+        // statement must not be visible to the ongoing scan (e.g., UPDATE SET a=a+10
+        // must not re-scan rows it just inserted). Pending resolution via
+        // concurrency_manager handles other txns' pending writes for both paths.
         let owner_ts = if ctx.is_explicit() { ctx.start_ts } else { 0 };
         let storage_iter = self.storage.scan_iter(mvcc_range, owner_ts)?;
 
-        // Create streaming scan iterator that wraps storage with MVCC filtering.
-        // For explicit transactions, pending resolution is not needed (read-your-writes
-        // handles own pending nodes; other txns' pending nodes are returned for resolution).
-        // For implicit transactions, pass concurrency_manager for pending resolution.
-        let cm = if ctx.is_explicit() {
-            None
-        } else {
-            Some(Arc::clone(&self.concurrency_manager))
-        };
+        // Always pass concurrency_manager for pending resolution of other txns.
+        let cm = Some(Arc::clone(&self.concurrency_manager));
         Ok(MvccScanIterator::new(storage_iter, ctx.start_ts, range, cm))
     }
 
@@ -453,30 +362,24 @@ impl<S: PessimisticStorage + 'static, L: ClogService + 'static, T: TsoService> T
             return Err(TiSqlError::ReadOnlyTransaction);
         }
 
-        if ctx.is_explicit() {
-            // Explicit transaction: write pending node directly to storage.
-            // Value is moved into storage (no clone). At commit, we read it back lazily.
-            match self.storage.put_pending(&key, value, ctx.start_ts) {
-                Ok(()) => {
-                    // If this key was a LOCK (from prior delete), it's now a real value.
-                    // put_pending does in-place swap, so the LOCK is replaced.
-                    ctx.lock_keys.retain(|k| k != &key);
-                    ctx.add_locked_key(key);
-                    Ok(())
+        // Write pending node directly to storage.
+        match self.storage.put_pending(&key, value, ctx.start_ts) {
+            Ok(()) => {
+                // Register in state cache on first write so readers can resolve our pending nodes.
+                if !ctx.registered {
+                    self.concurrency_manager.register_txn(ctx.start_ts);
+                    ctx.registered = true;
                 }
-                Err(lock_owner) => {
-                    // Key is locked by another transaction
-                    Err(TiSqlError::KeyIsLocked {
-                        key,
-                        lock_ts: lock_owner,
-                        primary: vec![],
-                    })
-                }
+                // If this key was a LOCK (from prior delete), it's now a real value.
+                ctx.lock_keys.retain(|k| k != &key);
+                ctx.add_locked_key(key);
+                Ok(())
             }
-        } else {
-            // Implicit transaction: buffer the write
-            ctx.write_buffer.put(key, value);
-            Ok(())
+            Err(lock_owner) => Err(TiSqlError::KeyIsLocked {
+                key,
+                lock_ts: lock_owner,
+                primary: vec![],
+            }),
         }
     }
 
@@ -488,50 +391,54 @@ impl<S: PessimisticStorage + 'static, L: ClogService + 'static, T: TsoService> T
             return Err(TiSqlError::ReadOnlyTransaction);
         }
 
-        if ctx.is_explicit() {
-            // Explicit transaction: decide TOMBSTONE vs LOCK based on committed state.
-            // get_with_owner(key, start_ts, 0) skips all pending nodes → only committed visible.
-            let committed_exists = self.storage.get_with_owner(&key, ctx.start_ts, 0).is_some();
+        // Check committed OR own pending value (owner_ts=start_ts sees own pending).
+        // This fixes put(k)+delete(k) on non-existing key: sees own pending put → TOMBSTONE.
+        let value_exists = self
+            .storage
+            .get_with_owner(&key, ctx.start_ts, ctx.start_ts)
+            .is_some();
 
-            if committed_exists {
-                // Case 1: committed value exists → TOMBSTONE (covers the existing record)
-                match self
-                    .storage
-                    .put_pending(&key, TOMBSTONE.to_vec(), ctx.start_ts)
-                {
-                    Ok(()) => {
-                        // No longer a LOCK key (if it was one from a prior delete)
-                        ctx.lock_keys.retain(|k| k != &key);
-                        ctx.add_locked_key(key);
-                        Ok(())
+        if value_exists {
+            // Value exists (committed or own pending) → TOMBSTONE
+            match self
+                .storage
+                .put_pending(&key, TOMBSTONE.to_vec(), ctx.start_ts)
+            {
+                Ok(()) => {
+                    if !ctx.registered {
+                        self.concurrency_manager.register_txn(ctx.start_ts);
+                        ctx.registered = true;
                     }
-                    Err(lock_owner) => Err(TiSqlError::KeyIsLocked {
-                        key,
-                        lock_ts: lock_owner,
-                        primary: vec![],
-                    }),
+                    ctx.lock_keys.retain(|k| k != &key);
+                    ctx.add_locked_key(key);
+                    Ok(())
                 }
-            } else {
-                // Case 2/3: no committed value → LOCK (pessimistic lock only, not persisted to clog)
-                match self.storage.put_pending(&key, LOCK.to_vec(), ctx.start_ts) {
-                    Ok(()) => {
-                        if !ctx.lock_keys.contains(&key) {
-                            ctx.lock_keys.push(key.clone());
-                        }
-                        ctx.add_locked_key(key);
-                        Ok(())
-                    }
-                    Err(lock_owner) => Err(TiSqlError::KeyIsLocked {
-                        key,
-                        lock_ts: lock_owner,
-                        primary: vec![],
-                    }),
-                }
+                Err(lock_owner) => Err(TiSqlError::KeyIsLocked {
+                    key,
+                    lock_ts: lock_owner,
+                    primary: vec![],
+                }),
             }
         } else {
-            // Implicit transaction: buffer the delete
-            ctx.write_buffer.delete(key);
-            Ok(())
+            // No value exists → LOCK (pessimistic lock only, not persisted to clog)
+            match self.storage.put_pending(&key, LOCK.to_vec(), ctx.start_ts) {
+                Ok(()) => {
+                    if !ctx.registered {
+                        self.concurrency_manager.register_txn(ctx.start_ts);
+                        ctx.registered = true;
+                    }
+                    if !ctx.lock_keys.contains(&key) {
+                        ctx.lock_keys.push(key.clone());
+                    }
+                    ctx.add_locked_key(key);
+                    Ok(())
+                }
+                Err(lock_owner) => Err(TiSqlError::KeyIsLocked {
+                    key,
+                    lock_ts: lock_owner,
+                    primary: vec![],
+                }),
+            }
         }
     }
 
@@ -540,20 +447,13 @@ impl<S: PessimisticStorage + 'static, L: ClogService + 'static, T: TsoService> T
 
         let txn_id = ctx.txn_id;
         let start_ts = ctx.start_ts;
-        let is_explicit = ctx.is_explicit();
 
-        // Phase 1: Build locked_keys and storage_batch.
-        // Explicit: reads pending values from storage (locks already held).
-        // Implicit: acquires locks by writing pending nodes to storage.
-        let (locked_keys, storage_batch) = if is_explicit {
-            self.prepare_explicit_batch(&mut ctx)?
-        } else {
-            self.prepare_implicit_batch(&mut ctx)?
-        };
+        // Build locked_keys and storage_batch from pending nodes in storage.
+        let (locked_keys, storage_batch) = self.prepare_explicit_batch(&mut ctx)?;
 
         // No-write transaction: clean up and return
         if locked_keys.is_empty() {
-            if is_explicit {
+            if ctx.registered {
                 self.concurrency_manager.remove_txn(start_ts);
             }
             ctx.state = TxnState::Committed {
@@ -566,13 +466,7 @@ impl<S: PessimisticStorage + 'static, L: ClogService + 'static, T: TsoService> T
             });
         }
 
-        // For implicit txns, register in state cache now.
-        // Explicit txns were registered at begin_explicit().
-        if !is_explicit {
-            self.concurrency_manager.register_txn(start_ts);
-        }
-
-        // Phase 2: Common commit protocol (Preparing → Prepared → clog → finalize → Committed)
+        // Common commit protocol (Preparing → Prepared → clog → finalize → Committed)
         match self.run_commit_protocol(txn_id, start_ts, &locked_keys, &storage_batch) {
             Ok((commit_ts, lsn)) => {
                 self.concurrency_manager.remove_txn(start_ts);
@@ -595,40 +489,20 @@ impl<S: PessimisticStorage + 'static, L: ClogService + 'static, T: TsoService> T
     fn rollback(&self, mut ctx: TxnCtx) -> Result<()> {
         Self::check_active(&ctx)?;
 
-        if ctx.is_explicit() {
-            // =================================================================
-            // Explicit Transaction Rollback (Pessimistic Locking)
-            // =================================================================
-            // Pending writes are in storage. We need to:
-            // 1. Abort pending nodes (mark as aborted so readers skip them)
-            // 2. Update txn state cache
+        let locked_keys = std::mem::take(&mut ctx.locked_keys);
 
-            let locked_keys = std::mem::take(&mut ctx.locked_keys);
-
-            // Abort all pending nodes in storage
-            if !locked_keys.is_empty() {
-                self.storage.abort_pending(&locked_keys, ctx.start_ts);
-            }
-
-            // Update state cache: Running -> Aborted, then remove
-            self.concurrency_manager.abort_txn(ctx.start_ts)?;
-            self.concurrency_manager.remove_txn(ctx.start_ts);
-
-            // Mark context as aborted
-            ctx.state = TxnState::Aborted;
-        } else {
-            // =================================================================
-            // Implicit Transaction Rollback (Optimistic Locking)
-            // =================================================================
-            // Writes are only in the buffer, not in storage
-
-            // Clear write buffer
-            ctx.write_buffer.clear();
-
-            // Mark as aborted
-            ctx.state = TxnState::Aborted;
+        // Abort all pending nodes in storage
+        if !locked_keys.is_empty() {
+            self.storage.abort_pending(&locked_keys, ctx.start_ts);
         }
 
+        // Update state cache
+        if ctx.registered {
+            self.concurrency_manager.abort_txn(ctx.start_ts)?;
+            self.concurrency_manager.remove_txn(ctx.start_ts);
+        }
+
+        ctx.state = TxnState::Aborted;
         Ok(())
     }
 }
@@ -1121,14 +995,10 @@ mod tests {
 
         let mut ctx = txn_service.begin(false).unwrap();
 
-        // Put via transaction
+        // Put via transaction — writes pending node directly to storage
         txn_service
             .put(&mut ctx, b"key1".to_vec(), b"value1".to_vec())
             .unwrap();
-
-        // Not yet in storage (buffered, uncommitted)
-        let storage_value = get_for_test(&*storage, b"key1");
-        assert!(storage_value.is_none());
 
         // Commit
         let info = txn_service.commit(ctx).unwrap();
@@ -1222,9 +1092,6 @@ mod tests {
             result.unwrap_err(),
             TiSqlError::ReadOnlyTransaction
         ));
-
-        // Buffer should be empty
-        assert!(ctx.write_buffer.is_empty());
 
         // Commit should succeed (no-op for read-only)
         let info = txn_service.commit(ctx).unwrap();
@@ -2547,10 +2414,11 @@ mod tests {
     }
 
     #[test]
-    fn test_explicit_txn_delete_your_write_no_clog() {
+    fn test_explicit_txn_put_then_delete_produces_tombstone() {
         let (_storage, txn_service, _dir) = create_test_service();
 
-        // PUT then DELETE same key within explicit txn (no committed value underneath)
+        // PUT then DELETE same key (no committed value underneath).
+        // delete sees own pending put (owner_ts=start_ts) → writes TOMBSTONE.
         let mut ctx = txn_service.begin_explicit(false).unwrap();
         let txn_id = ctx.txn_id();
         txn_service
@@ -2559,13 +2427,18 @@ mod tests {
         txn_service.delete(&mut ctx, b"key1".to_vec()).unwrap();
         txn_service.commit(ctx).unwrap();
 
-        // DELETE of own write (no committed base) → LOCK → no data entries in clog
+        // TOMBSTONE → Delete entry in clog
         let entries = txn_service.clog_service().read_all().unwrap();
         let data = clog_data_entries(&entries, txn_id);
-        assert!(
-            data.is_empty(),
-            "PUT then DELETE (no committed base) should produce no data entries, got {:?}",
+        assert_eq!(
+            data.len(),
+            1,
+            "PUT then DELETE should produce 1 Delete entry, got {:?}",
             data.iter().map(|e| &e.op).collect::<Vec<_>>()
+        );
+        assert!(
+            matches!(&data[0].op, ClogOp::Delete { key } if key == b"key1"),
+            "Should be a Delete for key1"
         );
     }
 

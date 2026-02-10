@@ -417,15 +417,14 @@ fn test_concurrent_read_after_delete() {
 }
 
 // ============================================================================
-// Write Buffer Deduplication Tests (commit behavior)
+// Implicit Transaction Multi-Op Tests (pending node behavior)
 // ============================================================================
 
 /// Test that multiple puts to the same key in one transaction commits only the last value.
 ///
-/// Regression test for: "Multiple ops on the same key in one commit are silently mishandled"
-/// Previously, put(k,v1); put(k,v2) would commit v1 instead of v2.
+/// Each put writes a pending node that replaces the previous pending node.
 #[test]
-fn test_write_buffer_last_put_wins() {
+fn test_implicit_multiple_puts_same_key() {
     use tisql::TxnService;
 
     let (_storage, txn_service, _tso, _cm, _dir) = create_test_service();
@@ -462,10 +461,9 @@ fn test_write_buffer_last_put_wins() {
 
 /// Test that put followed by delete in the same transaction commits as delete.
 ///
-/// Regression test for: "Multiple ops on the same key in one commit are silently mishandled"
-/// Previously, put(k,v); delete(k) would commit the put instead of the delete.
+/// Put writes a pending value node, then delete sees the pending value and writes TOMBSTONE.
 #[test]
-fn test_write_buffer_put_then_delete() {
+fn test_implicit_put_then_delete() {
     use tisql::TxnService;
 
     let (_storage, txn_service, _tso, _cm, _dir) = create_test_service();
@@ -490,8 +488,10 @@ fn test_write_buffer_put_then_delete() {
 }
 
 /// Test that delete followed by put in the same transaction commits the put.
+///
+/// Delete writes TOMBSTONE/LOCK, then put replaces it with a value pending node.
 #[test]
-fn test_write_buffer_delete_then_put() {
+fn test_implicit_delete_then_put() {
     use tisql::TxnService;
 
     let (_storage, txn_service, _tso, _cm, _dir) = create_test_service();
@@ -526,9 +526,9 @@ fn test_write_buffer_delete_then_put() {
     );
 }
 
-/// Test write buffer deduplication - only final ops are committed.
+/// Test that only the final state of each key is committed.
 #[test]
-fn test_write_buffer_dedup_commit() {
+fn test_implicit_dedup_commit() {
     use tisql::TxnService;
 
     let (_storage, txn_service, _tso, _cm, _dir) = create_test_service();
