@@ -19,7 +19,7 @@
 //!
 //! ## Design
 //!
-//! The `CompactionScheduler` runs a background thread that:
+//! The `CompactionScheduler` runs a tokio task that:
 //! 1. Waits for notification (from flush) or poll timeout
 //! 2. Calls `engine.do_compaction()` to perform one round
 //! 3. Loops on success for cascading compaction (L0→L1 then L1→L2)
@@ -39,26 +39,30 @@
 //! scheduler.stop();
 //! ```
 
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::Arc;
-
-use parking_lot::{Condvar, Mutex};
-use std::thread::{self, JoinHandle};
 use std::time::Duration;
+
+use tokio::sync::Notify;
 
 use super::lsm::LsmEngine;
 
+/// Handle for the worker — either a tokio task or a std thread.
+enum WorkerHandle {
+    Tokio(tokio::task::JoinHandle<()>),
+    Thread(std::thread::JoinHandle<()>),
+}
+
 /// Background compaction scheduler for LSM storage engine.
 ///
-/// Runs a worker thread that compacts SST files when level thresholds are met.
-/// Unlike `FlushScheduler`, the compaction worker loops on success to handle
-/// cascading compaction (e.g., L0→L1 triggers L1→L2).
+/// Runs a tokio task (preferred) or std::thread (fallback when no runtime)
+/// that compacts SST files when level thresholds are met.
 pub struct CompactionScheduler {
-    /// Shared state between main thread and worker.
+    /// Shared state between caller and worker task.
     inner: Arc<CompactionSchedulerInner>,
 
-    /// Worker thread handle (None if not started or already stopped).
-    worker_handle: Mutex<Option<JoinHandle<()>>>,
+    /// Worker handle (None if not started or already stopped).
+    worker_handle: parking_lot::Mutex<Option<WorkerHandle>>,
 }
 
 /// Shared state for the compaction scheduler.
@@ -69,14 +73,11 @@ struct CompactionSchedulerInner {
     /// Shutdown signal.
     shutdown: AtomicBool,
 
-    /// Condition variable for waking the worker.
-    notify_cv: Condvar,
-
-    /// Mutex for condition variable (protects nothing, just for Condvar).
-    notify_mutex: Mutex<()>,
+    /// Async notification for waking the worker.
+    notify: Notify,
 
     /// Number of compactions completed (for testing/monitoring).
-    compaction_count: std::sync::atomic::AtomicU64,
+    compaction_count: AtomicU64,
 }
 
 impl CompactionScheduler {
@@ -88,17 +89,17 @@ impl CompactionScheduler {
             inner: Arc::new(CompactionSchedulerInner {
                 engine,
                 shutdown: AtomicBool::new(false),
-                notify_cv: Condvar::new(),
-                notify_mutex: Mutex::new(()),
-                compaction_count: std::sync::atomic::AtomicU64::new(0),
+                notify: Notify::new(),
+                compaction_count: AtomicU64::new(0),
             }),
-            worker_handle: Mutex::new(None),
+            worker_handle: parking_lot::Mutex::new(None),
         }
     }
 
     /// Start the background compaction worker.
     ///
-    /// Does nothing if already started.
+    /// Uses `tokio::spawn` if a tokio runtime is available, otherwise falls
+    /// back to `std::thread::spawn`. Does nothing if already started.
     pub fn start(&self) {
         let mut handle = self.worker_handle.lock();
         if handle.is_some() {
@@ -106,9 +107,15 @@ impl CompactionScheduler {
         }
 
         let inner = Arc::clone(&self.inner);
-        *handle = Some(thread::spawn(move || {
-            inner.compaction_worker_loop();
-        }));
+        if let Ok(rt_handle) = tokio::runtime::Handle::try_current() {
+            *handle = Some(WorkerHandle::Tokio(rt_handle.spawn(async move {
+                inner.compaction_worker_loop().await;
+            })));
+        } else {
+            *handle = Some(WorkerHandle::Thread(std::thread::spawn(move || {
+                inner.compaction_worker_loop_sync();
+            })));
+        }
     }
 
     /// Stop the background compaction worker.
@@ -119,13 +126,18 @@ impl CompactionScheduler {
     pub fn stop(&self) {
         // Signal shutdown
         self.inner.shutdown.store(true, Ordering::SeqCst);
-        self.inner.notify_cv.notify_all();
+        self.inner.notify.notify_one();
 
-        // Wait for worker to finish
+        // Take the handle and abort/join
         let mut handle = self.worker_handle.lock();
         if let Some(h) = handle.take() {
-            if h.join().is_err() {
-                tracing::warn!("Compaction worker thread panicked");
+            match h {
+                WorkerHandle::Tokio(jh) => jh.abort(),
+                WorkerHandle::Thread(jh) => {
+                    if jh.join().is_err() {
+                        tracing::warn!("Compaction worker thread panicked");
+                    }
+                }
             }
         }
     }
@@ -134,7 +146,7 @@ impl CompactionScheduler {
     ///
     /// Call this after flushing memtables to wake the compaction worker.
     pub fn notify(&self) {
-        self.inner.notify_cv.notify_one();
+        self.inner.notify.notify_one();
     }
 
     /// Get a notifier callback for wiring to `LsmEngine::set_compaction_notify`.
@@ -143,7 +155,7 @@ impl CompactionScheduler {
     pub fn notifier(&self) -> Arc<dyn Fn() + Send + Sync> {
         let inner = Arc::clone(&self.inner);
         Arc::new(move || {
-            inner.notify_cv.notify_one();
+            inner.notify.notify_one();
         })
     }
 
@@ -167,7 +179,7 @@ impl CompactionScheduler {
             if start.elapsed() > timeout {
                 return false;
             }
-            thread::sleep(Duration::from_millis(10));
+            std::thread::sleep(Duration::from_millis(10));
         }
         true
     }
@@ -180,31 +192,52 @@ impl Drop for CompactionScheduler {
 }
 
 impl CompactionSchedulerInner {
-    /// Main loop for the compaction worker thread.
-    fn compaction_worker_loop(&self) {
-        tracing::info!("Compaction worker started");
+    /// Main loop for the compaction worker (async — tokio task).
+    async fn compaction_worker_loop(&self) {
+        tracing::info!("Compaction worker started (async)");
 
         while !self.shutdown.load(Ordering::Relaxed) {
             match self.engine.do_compaction() {
                 Ok(true) => {
-                    // Compaction succeeded - loop immediately for cascading compaction
                     self.compaction_count.fetch_add(1, Ordering::Relaxed);
                     tracing::debug!(
                         "Compaction completed, total: {}",
                         self.compaction_count.load(Ordering::Relaxed)
                     );
-                    // Continue looping without waiting (cascading)
                     continue;
                 }
                 Ok(false) => {
-                    // No work - wait for notification or timeout
-                    let mut guard = self.notify_mutex.lock();
-                    self.notify_cv.wait_for(&mut guard, Duration::from_secs(1));
+                    tokio::select! {
+                        _ = self.notify.notified() => {}
+                        _ = tokio::time::sleep(Duration::from_secs(1)) => {}
+                    }
                 }
                 Err(e) => {
                     tracing::error!("Compaction failed: {e}");
-                    // Sleep before retrying to avoid busy loop on persistent errors
-                    thread::sleep(Duration::from_millis(500));
+                    tokio::time::sleep(Duration::from_millis(500)).await;
+                }
+            }
+        }
+
+        tracing::info!("Compaction worker stopped");
+    }
+
+    /// Main loop for the compaction worker (sync — std::thread fallback).
+    fn compaction_worker_loop_sync(&self) {
+        tracing::info!("Compaction worker started (sync fallback)");
+
+        while !self.shutdown.load(Ordering::Relaxed) {
+            match self.engine.do_compaction() {
+                Ok(true) => {
+                    self.compaction_count.fetch_add(1, Ordering::Relaxed);
+                    continue;
+                }
+                Ok(false) => {
+                    std::thread::sleep(Duration::from_secs(1));
+                }
+                Err(e) => {
+                    tracing::error!("Compaction failed: {e}");
+                    std::thread::sleep(Duration::from_millis(500));
                 }
             }
         }
@@ -241,8 +274,8 @@ mod tests {
         assert_eq!(scheduler.compaction_count(), 0);
     }
 
-    #[test]
-    fn test_compaction_scheduler_start_stop() {
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn test_compaction_scheduler_start_stop() {
         let tmp = TempDir::new().unwrap();
         let config = test_config(tmp.path());
         let engine = Arc::new(LsmEngine::open(config).unwrap());
@@ -255,11 +288,12 @@ mod tests {
 
         // Stop
         scheduler.stop();
+        tokio::time::sleep(Duration::from_millis(50)).await;
         assert!(!scheduler.is_running());
     }
 
-    #[test]
-    fn test_compaction_scheduler_double_start() {
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn test_compaction_scheduler_double_start() {
         let tmp = TempDir::new().unwrap();
         let config = test_config(tmp.path());
         let engine = Arc::new(LsmEngine::open(config).unwrap());
@@ -274,8 +308,8 @@ mod tests {
         scheduler.stop();
     }
 
-    #[test]
-    fn test_compaction_scheduler_drop_stops_worker() {
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn test_compaction_scheduler_drop_stops_worker() {
         let tmp = TempDir::new().unwrap();
         let config = test_config(tmp.path());
         let engine = Arc::new(LsmEngine::open(config).unwrap());
@@ -290,8 +324,8 @@ mod tests {
         // Worker should have been stopped
     }
 
-    #[test]
-    fn test_compaction_scheduler_triggers_on_l0() {
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn test_compaction_scheduler_triggers_on_l0() {
         let tmp = TempDir::new().unwrap();
         let config = LsmConfig::builder(tmp.path())
             .memtable_size(100) // Very small

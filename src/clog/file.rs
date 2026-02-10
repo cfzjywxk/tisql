@@ -35,7 +35,7 @@ use crate::types::{Lsn, Timestamp, TxnId};
 use crate::util::fs::{rename_durable, sync_dir};
 use crate::{log_info, log_trace, log_warn};
 
-use super::{ClogBatch, ClogEntry, ClogEntryRef, ClogOpRef, ClogService};
+use super::{ClogBatch, ClogEntry, ClogEntryRef, ClogService};
 
 /// File header magic bytes: "CLOG"
 const FILE_MAGIC: &[u8; 4] = b"CLOG";
@@ -515,6 +515,68 @@ impl FileClogService {
     }
 }
 
+/// Result of preparing a write batch for clog: serialized bytes + end LSN.
+struct PreparedWriteBatch {
+    record_bytes: Vec<u8>,
+    end_lsn: Lsn,
+    entry_count: usize,
+}
+
+impl FileClogService {
+    /// Prepare a WriteBatch for clog writing: allocate LSNs, build entries, serialize.
+    ///
+    /// This is the shared logic between the sync `write_batch()` and async
+    /// `write_batch_async()` paths. No I/O is performed here.
+    fn prepare_write_batch(
+        &self,
+        txn_id: TxnId,
+        batch: &WriteBatch,
+        commit_ts: Timestamp,
+    ) -> Result<PreparedWriteBatch> {
+        // Allocate LSNs atomically
+        let start_lsn = self.lsn_provider.alloc_lsn();
+        let mut current_lsn = start_lsn;
+
+        // Build reference-based entries directly from WriteBatch
+        let entry_count = batch.len() + 1;
+        let mut entries: Vec<super::ClogEntryRef<'_>> = Vec::with_capacity(entry_count);
+
+        for (key, op) in batch.iter() {
+            let entry = match op {
+                WriteOp::Put { value } => super::ClogEntryRef {
+                    lsn: current_lsn,
+                    txn_id,
+                    op: super::ClogOpRef::Put { key, value },
+                },
+                WriteOp::Delete => super::ClogEntryRef {
+                    lsn: current_lsn,
+                    txn_id,
+                    op: super::ClogOpRef::Delete { key },
+                },
+            };
+            entries.push(entry);
+            current_lsn = self.lsn_provider.alloc_lsn();
+        }
+
+        // Add commit record
+        let end_lsn = current_lsn;
+        entries.push(super::ClogEntryRef {
+            lsn: end_lsn,
+            txn_id,
+            op: super::ClogOpRef::Commit { commit_ts },
+        });
+
+        // Serialize to bytes (zero-copy from borrowed data)
+        let record_bytes = Self::serialize_record_refs(&entries)?;
+
+        Ok(PreparedWriteBatch {
+            record_bytes,
+            end_lsn,
+            entry_count,
+        })
+    }
+}
+
 impl ClogService for FileClogService {
     fn write(&self, batch: &mut ClogBatch, sync: bool) -> Result<Lsn> {
         if batch.is_empty() {
@@ -570,41 +632,7 @@ impl ClogService for FileClogService {
             return Ok(self.lsn_provider.current_lsn());
         }
 
-        // Allocate LSNs atomically
-        let start_lsn = self.lsn_provider.alloc_lsn();
-        let mut current_lsn = start_lsn;
-
-        // Build reference-based entries directly from WriteBatch
-        let entry_count = batch.len() + 1;
-        let mut entries: Vec<ClogEntryRef<'_>> = Vec::with_capacity(entry_count);
-
-        for (key, op) in batch.iter() {
-            let entry = match op {
-                WriteOp::Put { value } => ClogEntryRef {
-                    lsn: current_lsn,
-                    txn_id,
-                    op: ClogOpRef::Put { key, value },
-                },
-                WriteOp::Delete => ClogEntryRef {
-                    lsn: current_lsn,
-                    txn_id,
-                    op: ClogOpRef::Delete { key },
-                },
-            };
-            entries.push(entry);
-            current_lsn = self.lsn_provider.alloc_lsn();
-        }
-
-        // Add commit record
-        let end_lsn = current_lsn;
-        entries.push(ClogEntryRef {
-            lsn: end_lsn,
-            txn_id,
-            op: ClogOpRef::Commit { commit_ts },
-        });
-
-        // Serialize to bytes (zero-copy from borrowed data)
-        let record_bytes = Self::serialize_record_refs(&entries)?;
+        let prepared = self.prepare_write_batch(txn_id, batch, commit_ts)?;
 
         #[cfg(feature = "failpoints")]
         fail_point!("clog_before_sync");
@@ -612,20 +640,19 @@ impl ClogService for FileClogService {
         // Submit to group commit writer (batches fsync with concurrent writers)
         self.group_writer
             .lock()
-            .submit_with_sync(record_bytes, sync)
+            .submit_with_sync(prepared.record_bytes, sync)
             .map_err(|e| TiSqlError::Internal(format!("Clog group commit failed: {e}")))?;
 
         #[cfg(feature = "failpoints")]
         fail_point!("clog_after_sync");
 
         log_trace!(
-            "Wrote {} entries to commit log (zero-copy), lsn={}-{}",
-            entry_count,
-            start_lsn,
-            end_lsn
+            "Wrote {} entries to commit log (zero-copy), lsn=...-{}",
+            prepared.entry_count,
+            prepared.end_lsn
         );
 
-        Ok(end_lsn)
+        Ok(prepared.end_lsn)
     }
 
     fn sync(&self) -> Result<()> {
@@ -653,6 +680,38 @@ impl ClogService for FileClogService {
         // Force a final sync through the group writer, then it will be
         // cleanly shut down when dropped.
         self.sync()
+    }
+}
+
+impl super::AsyncClogService for FileClogService {
+    fn write_batch_async(
+        &self,
+        txn_id: TxnId,
+        batch: &WriteBatch,
+        commit_ts: Timestamp,
+        sync: bool,
+    ) -> Result<super::ClogFsyncFuture> {
+        if batch.is_empty() {
+            // Empty batch: return an immediately-ready future.
+            let (tx, rx) = tokio::sync::oneshot::channel();
+            let _ = tx.send(Ok(()));
+            return Ok(super::ClogFsyncFuture::new(
+                self.lsn_provider.current_lsn(),
+                rx,
+            ));
+        }
+
+        let prepared = self.prepare_write_batch(txn_id, batch, commit_ts)?;
+        let end_lsn = prepared.end_lsn;
+
+        // Non-blocking submit — returns a oneshot receiver (Future)
+        let rx = self
+            .group_writer
+            .lock()
+            .submit_async(prepared.record_bytes, sync)
+            .map_err(|e| TiSqlError::Internal(format!("Clog group commit failed: {e}")))?;
+
+        Ok(super::ClogFsyncFuture::new(end_lsn, rx))
     }
 }
 

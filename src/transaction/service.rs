@@ -23,7 +23,7 @@ use std::sync::Arc;
 #[cfg(feature = "failpoints")]
 use fail::fail_point;
 
-use crate::clog::{ClogEntry, ClogOp, ClogService};
+use crate::clog::{AsyncClogService, ClogEntry, ClogFsyncFuture, ClogOp, ClogService};
 use crate::error::{Result, TiSqlError};
 use crate::log_warn;
 use crate::tso::TsoService;
@@ -292,6 +292,119 @@ impl<S: PessimisticStorage + 'static, L: ClogService + 'static, T: TsoService>
         self.concurrency_manager.commit_txn(start_ts, commit_ts)?;
 
         Ok((commit_ts, lsn))
+    }
+}
+
+// Async commit protocol — requires AsyncClogService for non-blocking clog writes.
+impl<S: PessimisticStorage + 'static, L: AsyncClogService + 'static, T: TsoService>
+    TransactionService<S, L, T>
+{
+    /// Phase 1 of async commit: prepare + serialize + submit clog (no I/O wait).
+    ///
+    /// Returns (commit_ts, ClogFsyncFuture). The caller awaits the future,
+    /// then calls `commit_protocol_finalize` to complete the commit.
+    ///
+    /// On failure, the caller is responsible for cleanup (abort_pending, abort_txn).
+    fn commit_protocol_submit(
+        &self,
+        txn_id: TxnId,
+        start_ts: Timestamp,
+        storage_batch: &WriteBatch,
+    ) -> Result<(Timestamp, ClogFsyncFuture)> {
+        #[cfg(feature = "failpoints")]
+        fail_point!("txn_after_lock_before_commit_ts");
+
+        // Step 1: Signal that we're computing commit_ts.
+        self.concurrency_manager.set_preparing_txn(start_ts)?;
+
+        // Step 2: Compute commit_ts
+        let max_ts = self.concurrency_manager.max_ts();
+        let tso_ts = self.get_ts();
+        let commit_ts = std::cmp::max(max_ts + 1, tso_ts);
+
+        // Step 3: Set prepared_ts for readers to check visibility
+        self.concurrency_manager.prepare_txn(start_ts, commit_ts)?;
+
+        // Step 4: Submit to clog (non-blocking — returns future)
+        let fsync_future = self
+            .clog_service
+            .write_batch_async(txn_id, storage_batch, commit_ts, true)?;
+
+        Ok((commit_ts, fsync_future))
+    }
+
+    /// Phase 2 of async commit: finalize in-memory state after fsync confirmed.
+    fn commit_protocol_finalize(
+        &self,
+        locked_keys: &[Key],
+        start_ts: Timestamp,
+        commit_ts: Timestamp,
+    ) -> Result<()> {
+        // Step 5: Finalize all pending nodes by setting their commit_ts.
+        self.storage
+            .finalize_pending(locked_keys, start_ts, commit_ts);
+
+        // Step 6: Transition to Committed in state cache
+        self.concurrency_manager.commit_txn(start_ts, commit_ts)?;
+
+        Ok(())
+    }
+
+    /// Commit an explicit transaction asynchronously.
+    ///
+    /// The clog write is submitted non-blocking and the caller `.await`s the
+    /// fsync future, yielding the thread while the I/O thread performs the
+    /// write + fsync. This frees the yatp worker thread for other work.
+    ///
+    /// The sync `commit()` (via TxnService trait) remains available for
+    /// autocommit, tests, and recovery.
+    pub async fn commit_async(&self, mut ctx: TxnCtx) -> Result<CommitInfo> {
+        Self::check_active(&ctx)?;
+
+        let txn_id = ctx.txn_id;
+        let start_ts = ctx.start_ts;
+
+        // Build locked_keys and storage_batch from pending nodes in storage.
+        let (locked_keys, storage_batch) = self.prepare_explicit_batch(&mut ctx)?;
+
+        // No-write transaction: clean up and return
+        if locked_keys.is_empty() {
+            if ctx.registered {
+                self.concurrency_manager.remove_txn(start_ts);
+            }
+            ctx.state = TxnState::Committed {
+                commit_ts: start_ts,
+            };
+            return Ok(CommitInfo {
+                txn_id,
+                commit_ts: start_ts,
+                lsn: 0,
+            });
+        }
+
+        // Phase 1: prepare + submit clog (no I/O wait)
+        match self.commit_protocol_submit(txn_id, start_ts, &storage_batch) {
+            Ok((commit_ts, fsync_future)) => {
+                // YIELD HERE — thread is free while fsync completes
+                let lsn = fsync_future.await?;
+
+                // Phase 2: finalize in-memory state
+                self.commit_protocol_finalize(&locked_keys, start_ts, commit_ts)?;
+                self.concurrency_manager.remove_txn(start_ts);
+                ctx.state = TxnState::Committed { commit_ts };
+                Ok(CommitInfo {
+                    txn_id,
+                    commit_ts,
+                    lsn,
+                })
+            }
+            Err(e) => {
+                self.storage.abort_pending(&locked_keys, start_ts);
+                self.concurrency_manager.abort_txn(start_ts).ok();
+                self.concurrency_manager.remove_txn(start_ts);
+                Err(e)
+            }
+        }
     }
 }
 

@@ -38,6 +38,16 @@ use std::thread::{self, JoinHandle};
 
 use crossbeam_channel::{Receiver, Sender};
 
+/// Reply channel supporting both synchronous (crossbeam) and asynchronous (tokio oneshot) callers.
+///
+/// The writer thread sends the result through whichever variant was provided.
+/// `tokio::sync::oneshot::Sender::send()` does NOT require a tokio runtime,
+/// so it's safe to call from the std::thread writer loop.
+enum ReplyChannel {
+    Sync(crossbeam_channel::Sender<Result<(), String>>),
+    Async(tokio::sync::oneshot::Sender<Result<(), String>>),
+}
+
 /// A request submitted to the group commit writer.
 struct GroupCommitRequest {
     /// Serialized record data to write.
@@ -45,7 +55,7 @@ struct GroupCommitRequest {
     /// Whether this request requires fsync.
     sync: bool,
     /// Channel to notify the caller when the write (+ optional fsync) is complete.
-    reply: crossbeam_channel::Sender<Result<(), String>>,
+    reply: ReplyChannel,
 }
 
 /// Group commit writer that batches fsync operations.
@@ -100,23 +110,48 @@ impl GroupCommitWriter {
         let request = GroupCommitRequest {
             data,
             sync,
-            reply: reply_tx,
+            reply: ReplyChannel::Sync(reply_tx),
         };
 
-        {
-            let guard = self.sender.lock();
-            let sender = guard
-                .as_ref()
-                .ok_or_else(|| "Group commit writer shut down".to_string())?;
-            sender
-                .send(request)
-                .map_err(|_| "Group commit writer shut down".to_string())?;
-        }
+        self.send_request(request)?;
 
         // Block until the write is complete
         reply_rx
             .recv()
             .map_err(|_| "Group commit writer dropped reply channel".to_string())?
+    }
+
+    /// Submit a serialized record for writing (async variant).
+    ///
+    /// Returns a `tokio::sync::oneshot::Receiver` that resolves when the write
+    /// (+ optional fsync) is complete. The caller `.await`s this receiver,
+    /// yielding the thread while the writer thread performs I/O.
+    pub fn submit_async(
+        &self,
+        data: Vec<u8>,
+        sync: bool,
+    ) -> std::result::Result<tokio::sync::oneshot::Receiver<Result<(), String>>, String> {
+        let (reply_tx, reply_rx) = tokio::sync::oneshot::channel();
+
+        let request = GroupCommitRequest {
+            data,
+            sync,
+            reply: ReplyChannel::Async(reply_tx),
+        };
+
+        self.send_request(request)?;
+        Ok(reply_rx)
+    }
+
+    /// Send a request to the writer thread via the channel.
+    fn send_request(&self, request: GroupCommitRequest) -> Result<(), String> {
+        let guard = self.sender.lock();
+        let sender = guard
+            .as_ref()
+            .ok_or_else(|| "Group commit writer shut down".to_string())?;
+        sender
+            .send(request)
+            .map_err(|_| "Group commit writer shut down".to_string())
     }
 
     /// The writer thread's main loop.
@@ -168,7 +203,14 @@ impl GroupCommitWriter {
             };
 
             for req in batch.drain(..) {
-                let _ = req.reply.send(result.clone());
+                match req.reply {
+                    ReplyChannel::Sync(tx) => {
+                        let _ = tx.send(result.clone());
+                    }
+                    ReplyChannel::Async(tx) => {
+                        let _ = tx.send(result.clone());
+                    }
+                }
             }
         }
     }
@@ -267,5 +309,39 @@ mod tests {
 
         let content = std::fs::read(tmp.path()).unwrap();
         assert_eq!(&content, b"data");
+    }
+
+    #[tokio::test]
+    async fn test_group_commit_submit_async() {
+        let (writer, tmp) = make_writer();
+        let gc = GroupCommitWriter::new(writer);
+
+        // submit_async returns immediately with a future
+        let rx = gc.submit_async(b"async_data".to_vec(), true).unwrap();
+
+        // Await the future — resolves when fsync completes
+        rx.await.unwrap().unwrap();
+        drop(gc);
+
+        let content = std::fs::read(tmp.path()).unwrap();
+        assert_eq!(&content, b"async_data");
+    }
+
+    #[tokio::test]
+    async fn test_group_commit_mixed_sync_async() {
+        let (writer, tmp) = make_writer();
+        let gc = Arc::new(GroupCommitWriter::new(writer));
+
+        // Sync write
+        gc.submit(b"sync".to_vec()).unwrap();
+
+        // Async write
+        let rx = gc.submit_async(b"_async".to_vec(), true).unwrap();
+        rx.await.unwrap().unwrap();
+
+        drop(gc);
+
+        let content = std::fs::read(tmp.path()).unwrap();
+        assert_eq!(&content, b"sync_async");
     }
 }

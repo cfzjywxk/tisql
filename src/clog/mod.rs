@@ -31,8 +31,13 @@ pub(crate) mod group_commit;
 // Available via testkit for integration tests
 pub use file::{FileClogConfig, FileClogService, TruncateStats};
 pub(crate) use group_commit::GroupCommitWriter;
+// Note: ClogFsyncFuture and AsyncClogService are defined below in this file
 
-use crate::error::Result;
+use std::future::Future;
+use std::pin::Pin;
+use std::task::{Context, Poll};
+
+use crate::error::{Result, TiSqlError};
 use crate::storage::WriteBatch;
 use crate::types::{Key, Lsn, RawValue, Timestamp, TxnId};
 use serde::{Deserialize, Serialize};
@@ -186,4 +191,62 @@ pub trait ClogService: Send + Sync {
 
     /// Close the commit log service
     fn close(&self) -> Result<()>;
+}
+
+/// Future that resolves when a clog fsync completes, yielding the assigned LSN.
+///
+/// This is a concrete Future type (no `Box<dyn Future>`, no `async_trait`).
+/// The serialization happens eagerly before this future is created, so it only
+/// holds a `Lsn` and a `tokio::sync::oneshot::Receiver` — both `Send + 'static`.
+pub struct ClogFsyncFuture {
+    lsn: Lsn,
+    rx: tokio::sync::oneshot::Receiver<std::result::Result<(), String>>,
+}
+
+impl ClogFsyncFuture {
+    pub(crate) fn new(
+        lsn: Lsn,
+        rx: tokio::sync::oneshot::Receiver<std::result::Result<(), String>>,
+    ) -> Self {
+        Self { lsn, rx }
+    }
+}
+
+impl Future for ClogFsyncFuture {
+    type Output = Result<Lsn>;
+
+    fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
+        // Safety: we only project to rx which is Unpin (oneshot::Receiver is Unpin).
+        let this = self.get_mut();
+        match Pin::new(&mut this.rx).poll(cx) {
+            Poll::Ready(Ok(Ok(()))) => Poll::Ready(Ok(this.lsn)),
+            Poll::Ready(Ok(Err(e))) => {
+                Poll::Ready(Err(TiSqlError::Internal(format!("Clog fsync error: {e}"))))
+            }
+            Poll::Ready(Err(_)) => Poll::Ready(Err(TiSqlError::Internal(
+                "Clog writer thread dropped".into(),
+            ))),
+            Poll::Pending => Poll::Pending,
+        }
+    }
+}
+
+/// Async extension for ClogService — non-blocking write path.
+///
+/// Callers get back a `ClogFsyncFuture` that they `.await`, yielding the
+/// thread while the group commit writer performs I/O. The synchronous
+/// `ClogService::write_batch()` remains available for callers that need
+/// blocking semantics (autocommit, recovery, tests).
+pub trait AsyncClogService: ClogService {
+    /// Write a transaction's WriteBatch to clog without blocking on fsync.
+    ///
+    /// Serialization happens eagerly (before returning). The returned future
+    /// resolves when fsync completes, yielding the assigned LSN.
+    fn write_batch_async(
+        &self,
+        txn_id: TxnId,
+        batch: &WriteBatch,
+        commit_ts: Timestamp,
+        sync: bool,
+    ) -> Result<ClogFsyncFuture>;
 }

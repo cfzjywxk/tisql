@@ -51,7 +51,7 @@ mod tso;
 
 // Re-export public interfaces (traits only) and commonly used types
 pub use catalog::Catalog;
-pub use clog::ClogService;
+pub use clog::{AsyncClogService, ClogFsyncFuture, ClogService};
 pub use lsn::{new_lsn_provider, LsnProvider, SharedLsnProvider};
 pub use protocol::{MySqlServer, MYSQL_DEFAULT_PORT};
 pub use session::{ExecutionCtx, Priority, QueryCtx, Session, SessionVars};
@@ -598,12 +598,20 @@ impl Database {
         self.txn_service.begin_explicit(read_only)
     }
 
-    /// Commit a transaction.
+    /// Commit a transaction (synchronous — blocks on fsync).
     ///
     /// This is called by the protocol layer when handling COMMIT.
     /// Takes ownership of the TxnCtx from the Session.
     pub fn commit(&self, ctx: transaction::TxnCtx) -> Result<CommitInfo> {
         self.txn_service.commit(ctx)
+    }
+
+    /// Commit a transaction asynchronously — yields while fsync completes.
+    ///
+    /// The clog write is submitted non-blocking and the caller `.await`s
+    /// the fsync future, freeing the worker thread for other tasks.
+    pub async fn commit_async(&self, ctx: transaction::TxnCtx) -> Result<CommitInfo> {
+        self.txn_service.commit_async(ctx).await
     }
 
     /// Rollback a transaction.

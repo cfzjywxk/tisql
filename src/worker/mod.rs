@@ -135,11 +135,15 @@ impl WorkerPool {
     /// This is the unified entry point for all DB-accessing operations.
     /// The command is executed on a yatp worker thread, keeping the
     /// tokio network thread free for I/O.
+    ///
+    /// The `Commit` variant uses `commit_async()` which yields during fsync,
+    /// freeing the yatp thread for other work. All other variants remain
+    /// synchronous (no I/O wait).
     pub async fn dispatch(&self, db: Arc<Database>, cmd: WorkerCommand) -> WorkerResult {
         let (tx, rx) = oneshot::channel();
 
         self.remote.spawn(async move {
-            let result = Self::execute_command(&db, cmd);
+            let result = Self::execute_command(&db, cmd).await;
             let _ = tx.send(result);
         });
 
@@ -149,8 +153,11 @@ impl WorkerPool {
         })
     }
 
-    /// Execute a command synchronously on the worker thread.
-    fn execute_command(db: &Database, cmd: WorkerCommand) -> WorkerResult {
+    /// Execute a command on the worker thread.
+    ///
+    /// Only `Commit` actually awaits (on clog fsync). All other variants
+    /// run synchronously — their CPU-bound work completes quickly.
+    async fn execute_command(db: &Database, cmd: WorkerCommand) -> WorkerResult {
         match cmd {
             WorkerCommand::Query {
                 sql,
@@ -173,7 +180,7 @@ impl WorkerPool {
                     txn_ctx: None,
                 },
             },
-            WorkerCommand::Commit { txn_ctx } => match db.commit(txn_ctx) {
+            WorkerCommand::Commit { txn_ctx } => match db.commit_async(txn_ctx).await {
                 Ok(info) => WorkerResult::Committed { info },
                 Err(e) => WorkerResult::Error {
                     error: e,

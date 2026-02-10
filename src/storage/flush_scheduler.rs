@@ -19,10 +19,10 @@
 //!
 //! ## Design
 //!
-//! The `FlushScheduler` runs a background thread that:
+//! The `FlushScheduler` runs a tokio task that:
 //! 1. Waits for notification of new frozen memtables
 //! 2. Flushes frozen memtables in order (oldest first)
-//! 3. Handles clean shutdown
+//! 3. Handles clean shutdown via `CancellationToken`
 //!
 //! ## Usage
 //!
@@ -38,26 +38,30 @@
 //! scheduler.stop();
 //! ```
 
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::Arc;
-
-use parking_lot::{Condvar, Mutex};
-use std::thread::{self, JoinHandle};
 use std::time::Duration;
+
+use tokio::sync::Notify;
 
 use super::lsm::LsmEngine;
 
+/// Handle for the worker — either a tokio task or a std thread.
+enum WorkerHandle {
+    Tokio(tokio::task::JoinHandle<()>),
+    Thread(std::thread::JoinHandle<()>),
+}
+
 /// Background flush scheduler for LSM storage engine.
 ///
-/// Runs a worker thread that flushes frozen memtables to SST files.
-/// The scheduler watches for new frozen memtables and flushes them
-/// in order (oldest first).
+/// Runs a tokio task (preferred) or std::thread (fallback when no runtime)
+/// that flushes frozen memtables to SST files.
 pub struct FlushScheduler {
-    /// Shared state between main thread and worker.
+    /// Shared state between caller and worker task.
     inner: Arc<FlushSchedulerInner>,
 
-    /// Worker thread handle (None if not started or already stopped).
-    worker_handle: Mutex<Option<JoinHandle<()>>>,
+    /// Worker handle (None if not started or already stopped).
+    worker_handle: parking_lot::Mutex<Option<WorkerHandle>>,
 }
 
 /// Shared state for the flush scheduler.
@@ -68,14 +72,11 @@ struct FlushSchedulerInner {
     /// Shutdown signal.
     shutdown: AtomicBool,
 
-    /// Condition variable for waking the worker.
-    notify_cv: Condvar,
-
-    /// Mutex for condition variable (protects nothing, just for Condvar).
-    notify_mutex: Mutex<()>,
+    /// Async notification for waking the worker.
+    notify: Notify,
 
     /// Number of flushes completed (for testing/monitoring).
-    flush_count: std::sync::atomic::AtomicU64,
+    flush_count: AtomicU64,
 }
 
 impl FlushScheduler {
@@ -87,17 +88,17 @@ impl FlushScheduler {
             inner: Arc::new(FlushSchedulerInner {
                 engine,
                 shutdown: AtomicBool::new(false),
-                notify_cv: Condvar::new(),
-                notify_mutex: Mutex::new(()),
-                flush_count: std::sync::atomic::AtomicU64::new(0),
+                notify: Notify::new(),
+                flush_count: AtomicU64::new(0),
             }),
-            worker_handle: Mutex::new(None),
+            worker_handle: parking_lot::Mutex::new(None),
         }
     }
 
     /// Start the background flush worker.
     ///
-    /// Does nothing if already started.
+    /// Uses `tokio::spawn` if a tokio runtime is available, otherwise falls
+    /// back to `std::thread::spawn`. Does nothing if already started.
     pub fn start(&self) {
         let mut handle = self.worker_handle.lock();
         if handle.is_some() {
@@ -105,9 +106,15 @@ impl FlushScheduler {
         }
 
         let inner = Arc::clone(&self.inner);
-        *handle = Some(thread::spawn(move || {
-            inner.flush_worker_loop();
-        }));
+        if let Ok(rt_handle) = tokio::runtime::Handle::try_current() {
+            *handle = Some(WorkerHandle::Tokio(rt_handle.spawn(async move {
+                inner.flush_worker_loop().await;
+            })));
+        } else {
+            *handle = Some(WorkerHandle::Thread(std::thread::spawn(move || {
+                inner.flush_worker_loop_sync();
+            })));
+        }
     }
 
     /// Stop the background flush worker.
@@ -117,14 +124,18 @@ impl FlushScheduler {
     pub fn stop(&self) {
         // Signal shutdown
         self.inner.shutdown.store(true, Ordering::SeqCst);
-        self.inner.notify_cv.notify_all();
+        self.inner.notify.notify_one();
 
-        // Wait for worker to finish
+        // Take the handle and abort/join
         let mut handle = self.worker_handle.lock();
         if let Some(h) = handle.take() {
-            // Don't panic if join fails - just log
-            if h.join().is_err() {
-                tracing::warn!("Flush worker thread panicked");
+            match h {
+                WorkerHandle::Tokio(jh) => jh.abort(),
+                WorkerHandle::Thread(jh) => {
+                    if jh.join().is_err() {
+                        tracing::warn!("Flush worker thread panicked");
+                    }
+                }
             }
         }
     }
@@ -133,7 +144,7 @@ impl FlushScheduler {
     ///
     /// Call this after rotating memtables to wake the flush worker.
     pub fn notify(&self) {
-        self.inner.notify_cv.notify_one();
+        self.inner.notify.notify_one();
     }
 
     /// Check if the scheduler is running.
@@ -156,7 +167,7 @@ impl FlushScheduler {
             if start.elapsed() > timeout {
                 return false;
             }
-            thread::sleep(Duration::from_millis(10));
+            std::thread::sleep(Duration::from_millis(10));
         }
         true
     }
@@ -169,16 +180,14 @@ impl Drop for FlushScheduler {
 }
 
 impl FlushSchedulerInner {
-    /// Main loop for the flush worker thread.
-    fn flush_worker_loop(&self) {
-        tracing::info!("Flush worker started");
+    /// Main loop for the flush worker (async — tokio task).
+    async fn flush_worker_loop(&self) {
+        tracing::info!("Flush worker started (async)");
 
         while !self.shutdown.load(Ordering::Relaxed) {
-            // Check for frozen memtables
             let frozen_count = self.engine.frozen_count();
 
             if frozen_count > 0 {
-                // Flush frozen memtables (engine.flush_all flushes oldest first)
                 match self.engine.flush_all() {
                     Ok(metas) => {
                         if !metas.is_empty() {
@@ -193,19 +202,52 @@ impl FlushSchedulerInner {
                     }
                     Err(e) => {
                         tracing::error!("Flush failed: {e}");
-                        // Sleep briefly before retrying to avoid busy loop on persistent errors
-                        thread::sleep(Duration::from_millis(100));
+                        tokio::time::sleep(Duration::from_millis(100)).await;
                     }
                 }
             } else {
-                // No work - wait for notification or timeout
-                let mut guard = self.notify_mutex.lock();
-                self.notify_cv
-                    .wait_for(&mut guard, Duration::from_millis(100));
+                tokio::select! {
+                    _ = self.notify.notified() => {}
+                    _ = tokio::time::sleep(Duration::from_millis(100)) => {}
+                }
             }
         }
 
-        // Final flush on shutdown - drain any remaining frozen memtables
+        self.final_flush();
+        tracing::info!("Flush worker stopped");
+    }
+
+    /// Main loop for the flush worker (sync — std::thread fallback).
+    fn flush_worker_loop_sync(&self) {
+        tracing::info!("Flush worker started (sync fallback)");
+
+        while !self.shutdown.load(Ordering::Relaxed) {
+            let frozen_count = self.engine.frozen_count();
+
+            if frozen_count > 0 {
+                match self.engine.flush_all() {
+                    Ok(metas) => {
+                        if !metas.is_empty() {
+                            self.flush_count
+                                .fetch_add(metas.len() as u64, Ordering::Relaxed);
+                        }
+                    }
+                    Err(e) => {
+                        tracing::error!("Flush failed: {e}");
+                        std::thread::sleep(Duration::from_millis(100));
+                    }
+                }
+            } else {
+                std::thread::sleep(Duration::from_millis(100));
+            }
+        }
+
+        self.final_flush();
+        tracing::info!("Flush worker stopped");
+    }
+
+    /// Final flush on shutdown — drain any remaining frozen memtables.
+    fn final_flush(&self) {
         let frozen_count = self.engine.frozen_count();
         if frozen_count > 0 {
             tracing::info!("Final flush of {frozen_count} frozen memtables on shutdown");
@@ -213,8 +255,6 @@ impl FlushSchedulerInner {
                 tracing::error!("Final flush failed: {e}");
             }
         }
-
-        tracing::info!("Flush worker stopped");
     }
 }
 
@@ -243,8 +283,8 @@ mod tests {
         assert_eq!(scheduler.flush_count(), 0);
     }
 
-    #[test]
-    fn test_flush_scheduler_start_stop() {
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn test_flush_scheduler_start_stop() {
         let tmp = TempDir::new().unwrap();
         let config = test_config(tmp.path());
         let engine = Arc::new(LsmEngine::open(config).unwrap());
@@ -257,11 +297,13 @@ mod tests {
 
         // Stop
         scheduler.stop();
+        // Give the task a moment to finish
+        tokio::time::sleep(Duration::from_millis(50)).await;
         assert!(!scheduler.is_running());
     }
 
-    #[test]
-    fn test_flush_scheduler_double_start() {
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn test_flush_scheduler_double_start() {
         let tmp = TempDir::new().unwrap();
         let config = test_config(tmp.path());
         let engine = Arc::new(LsmEngine::open(config).unwrap());
@@ -276,8 +318,8 @@ mod tests {
         scheduler.stop();
     }
 
-    #[test]
-    fn test_flush_scheduler_double_stop() {
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn test_flush_scheduler_double_stop() {
         let tmp = TempDir::new().unwrap();
         let config = test_config(tmp.path());
         let engine = Arc::new(LsmEngine::open(config).unwrap());
@@ -287,11 +329,12 @@ mod tests {
         scheduler.start();
         scheduler.stop();
         scheduler.stop(); // Should be safe
+        tokio::time::sleep(Duration::from_millis(50)).await;
         assert!(!scheduler.is_running());
     }
 
-    #[test]
-    fn test_flush_scheduler_triggers_on_frozen() {
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn test_flush_scheduler_triggers_on_frozen() {
         let tmp = TempDir::new().unwrap();
         let config = LsmConfig::builder(tmp.path())
             .memtable_size(100) // Very small
@@ -330,8 +373,8 @@ mod tests {
         scheduler.stop();
     }
 
-    #[test]
-    fn test_flush_scheduler_drop_stops_worker() {
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn test_flush_scheduler_drop_stops_worker() {
         let tmp = TempDir::new().unwrap();
         let config = test_config(tmp.path());
         let engine = Arc::new(LsmEngine::open(config).unwrap());
@@ -347,8 +390,8 @@ mod tests {
         // (we can't easily verify this, but at least it shouldn't hang)
     }
 
-    #[test]
-    fn test_flush_scheduler_concurrent_writes() {
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn test_flush_scheduler_concurrent_writes() {
         use std::sync::atomic::AtomicUsize;
 
         let tmp = TempDir::new().unwrap();
@@ -374,7 +417,7 @@ mod tests {
             let sched = Arc::clone(&scheduler);
             let count = Arc::clone(&write_count);
 
-            let handle = thread::spawn(move || {
+            let handle = std::thread::spawn(move || {
                 for i in 0..25 {
                     let mut batch = WriteBatch::new();
                     batch.set_commit_ts((t * 1000 + i + 1) as u64);
@@ -412,8 +455,8 @@ mod tests {
         }
     }
 
-    #[test]
-    fn test_flush_scheduler_notify_without_start() {
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn test_flush_scheduler_notify_without_start() {
         let tmp = TempDir::new().unwrap();
         let config = test_config(tmp.path());
         let engine = Arc::new(LsmEngine::open(config).unwrap());
