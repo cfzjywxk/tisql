@@ -28,9 +28,9 @@ use tisql::new_lsn_provider;
 use tisql::storage::mvcc::{is_tombstone, MvccIterator, MvccKey};
 use tisql::storage::WriteBatch;
 use tisql::testkit::{
-    CompactionExecutor, CompactionPicker, CompactionScheduler, CompactionTask, IlogConfig,
-    IlogService, LsmConfigBuilder, LsmEngine, ManifestDelta, SstBuilder, SstBuilderOptions,
-    SstMeta, SstReaderRef, Version,
+    CompactionExecutor, CompactionPicker, CompactionScheduler, CompactionTask, FlushScheduler,
+    IlogConfig, IlogService, LsmConfigBuilder, LsmEngine, ManifestDelta, SstBuilder,
+    SstBuilderOptions, SstMeta, SstReaderRef, Version,
 };
 use tisql::types::{Key, RawValue, Timestamp};
 use tisql::StorageEngine;
@@ -114,7 +114,7 @@ fn create_engine(dir: &TempDir) -> LsmEngine {
 
     let config = LsmConfigBuilder::new(dir.path())
         .memtable_size(4096)
-        .max_frozen_memtables(8)
+        .max_frozen_memtables(32)
         .build_unchecked();
     LsmEngine::open_with_recovery(config, lsn_provider, ilog, Version::new()).unwrap()
 }
@@ -126,10 +126,10 @@ fn create_durable_engine(dir: &TempDir) -> (LsmEngine, Arc<IlogService>) {
 
     let config = LsmConfigBuilder::new(dir.path())
         .memtable_size(256)
-        .max_frozen_memtables(16)
+        .max_frozen_memtables(32)
         .l0_compaction_trigger(4)
-        .l0_slowdown_trigger(20)
-        .l0_stop_trigger(30)
+        .l0_slowdown_trigger(100)
+        .l0_stop_trigger(200)
         .build_unchecked();
 
     let engine =
@@ -1184,10 +1184,10 @@ fn test_compaction_scheduler_automatic() {
 
     let config = LsmConfigBuilder::new(dir.path())
         .memtable_size(100) // Very small
-        .max_frozen_memtables(16)
+        .max_frozen_memtables(32) // High to avoid write stall
         .l0_compaction_trigger(4)
-        .l0_slowdown_trigger(20)
-        .l0_stop_trigger(30)
+        .l0_slowdown_trigger(100)
+        .l0_stop_trigger(200)
         .target_file_size(512)
         .l1_max_size(4096)
         .build_unchecked();
@@ -1397,4 +1397,85 @@ fn test_scan_after_compaction() {
             b"f".as_slice()
         ]
     );
+}
+
+// ==================== Write Flow Control Tests ====================
+
+/// End-to-end test: writes get stall errors, retry with flush scheduler draining,
+/// and all data is eventually written and readable.
+#[test]
+fn test_write_stall_e2e() {
+    let tmp = TempDir::new().unwrap();
+    let lsn_provider = new_lsn_provider();
+    let ilog_config = IlogConfig::new(tmp.path());
+    let ilog = Arc::new(IlogService::open(ilog_config, Arc::clone(&lsn_provider)).unwrap());
+
+    let config = LsmConfigBuilder::new(tmp.path())
+        .memtable_size(200) // Tiny to trigger frequent rotations
+        .max_frozen_memtables(2) // Low to trigger stall errors
+        .l0_compaction_trigger(100) // High — we don't want compaction interfering
+        .l0_slowdown_trigger(200)
+        .l0_stop_trigger(300)
+        .build()
+        .unwrap();
+    let engine = Arc::new(
+        LsmEngine::open_with_recovery(config, lsn_provider, ilog, Version::new()).unwrap(),
+    );
+
+    // Start flush scheduler so frozen memtables get drained
+    let scheduler = FlushScheduler::new(Arc::clone(&engine));
+    scheduler.start();
+
+    // Spawn 4 writer threads, each writing 50 entries with retry on stall
+    let mut handles = vec![];
+    for t in 0..4u64 {
+        let eng = Arc::clone(&engine);
+        let handle = std::thread::spawn(move || {
+            for i in 0..50u64 {
+                let ts = t * 1000 + i + 1;
+                let key = format!("t{t}_key_{i:04}");
+                let value = vec![b'v'; 80];
+                // Retry on write stall errors (flush scheduler will drain)
+                loop {
+                    let mut batch = WriteBatch::new();
+                    batch.set_commit_ts(ts);
+                    batch.put(key.clone().into_bytes(), value.clone());
+                    match eng.write_batch(batch) {
+                        Ok(()) => break,
+                        Err(e) if e.to_string().contains("frozen memtables") => {
+                            std::thread::sleep(Duration::from_millis(1));
+                        }
+                        Err(e) => panic!("Unexpected error: {e}"),
+                    }
+                }
+            }
+        });
+        handles.push(handle);
+    }
+
+    // Wait for all writers
+    for h in handles {
+        h.join().unwrap();
+    }
+
+    // Flush remaining frozen + active
+    scheduler.stop();
+    engine.flush_all_with_active().unwrap();
+
+    // Verify ALL 200 keys are readable
+    for t in 0..4u64 {
+        for i in 0..50u64 {
+            let key = format!("t{t}_key_{i:04}");
+            let val = engine.get(key.as_bytes()).unwrap();
+            assert!(
+                val.is_some(),
+                "Key {key} missing after write stall e2e test"
+            );
+            assert_eq!(val.unwrap(), vec![b'v'; 80]);
+        }
+    }
+
+    // Verify some flushes happened (L0 SSTs created)
+    let l0 = engine.current_version().level_size(0);
+    assert!(l0 > 0, "Should have flushed to L0 SSTs, got 0");
 }

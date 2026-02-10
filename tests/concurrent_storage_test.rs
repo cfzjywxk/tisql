@@ -82,7 +82,8 @@ fn create_test_lsm_engine(dir: &TempDir) -> (Arc<LsmEngine>, Arc<IlogService>) {
     let ilog = Arc::new(IlogService::open(ilog_config, Arc::clone(&lsn_provider)).unwrap());
 
     let config = LsmConfigBuilder::new(dir.path())
-        .memtable_size(256) // Very small for testing to trigger rotations
+        .memtable_size(4096) // Small but large enough to hold multiple entries per memtable
+        .max_frozen_memtables(64) // High to avoid write stall in concurrent tests
         .build_unchecked();
     let engine = LsmEngine::open_with_recovery(
         config,
@@ -1319,6 +1320,7 @@ fn test_stress_rotations_with_concurrent_scans() {
 
     let config = LsmConfigBuilder::new(dir.path())
         .memtable_size(128) // Small to trigger frequent rotations
+        .max_frozen_memtables(128) // High to avoid write stall (rotator thread drains)
         .build_unchecked();
     let engine = Arc::new(
         LsmEngine::open_with_recovery(
@@ -1356,8 +1358,17 @@ fn test_stress_rotations_with_concurrent_scans() {
             while !stop_flag.load(Ordering::Relaxed) {
                 let key = format!("stress_w{writer_id}_k{local_writes}");
                 let ts = ts_counter.fetch_add(1, Ordering::SeqCst);
-                write_test_data(&engine, key.as_bytes(), b"stress_value", ts);
-                local_writes += 1;
+                let mut batch = WriteBatch::new();
+                batch.put(key.into_bytes(), b"stress_value".to_vec());
+                batch.set_commit_ts(ts);
+                match engine.write_batch(batch) {
+                    Ok(()) => local_writes += 1,
+                    Err(e) if e.to_string().contains("frozen memtables") => {
+                        // Back off to let rotator/flusher catch up
+                        thread::sleep(Duration::from_millis(1));
+                    }
+                    Err(e) => panic!("Unexpected error: {e}"),
+                }
 
                 if local_writes % 100 == 0 {
                     thread::yield_now();
@@ -1667,19 +1678,12 @@ fn test_concurrent_writes_under_backpressure() {
         .unwrap(),
     );
 
-    // Fill up frozen memtables to create backpressure
-    for batch in 0..2 {
-        for i in 0..10 {
-            let key = format!("setup_batch{batch}_key{i}");
-            write_test_data(
-                &engine,
-                key.as_bytes(),
-                b"setup",
-                (batch * 100 + i + 1) as u64,
-            );
-        }
-        engine.freeze_active();
-    }
+    // Fill up frozen memtables to create backpressure.
+    // Write minimally and freeze explicitly to avoid auto-rotation filling frozen.
+    write_test_data(&engine, b"setup_0", b"s", 1);
+    engine.freeze_active();
+    write_test_data(&engine, b"setup_1", b"s", 2);
+    engine.freeze_active();
     assert_eq!(engine.frozen_count(), 2, "Should be at frozen limit");
 
     // Verify rotation is blocked
@@ -1688,24 +1692,37 @@ fn test_concurrent_writes_under_backpressure() {
         "Should not be able to rotate at limit"
     );
 
-    // Now do concurrent writes - they should all succeed (no actual stall)
+    // Concurrent writes should eventually hit write stall error
+    // since active memtable is full and frozen is at capacity
     let num_writers = 4;
     let writes_per_writer = 100;
     let ts_counter = Arc::new(AtomicU64::new(1000));
     let success_count = Arc::new(AtomicU64::new(0));
+    let stall_count = Arc::new(AtomicU64::new(0));
 
     let mut handles = vec![];
     for writer_id in 0..num_writers {
         let engine = Arc::clone(&engine);
         let ts_counter = Arc::clone(&ts_counter);
         let success_count = Arc::clone(&success_count);
+        let stall_count = Arc::clone(&stall_count);
 
         handles.push(thread::spawn(move || {
             for i in 0..writes_per_writer {
                 let key = format!("pressure_w{writer_id}_k{i:04}");
                 let ts = ts_counter.fetch_add(1, Ordering::SeqCst);
-                write_test_data(&engine, key.as_bytes(), b"under_pressure", ts);
-                success_count.fetch_add(1, Ordering::Relaxed);
+                let mut batch = WriteBatch::new();
+                batch.put(key.into_bytes(), b"under_pressure".to_vec());
+                batch.set_commit_ts(ts);
+                match engine.write_batch(batch) {
+                    Ok(()) => {
+                        success_count.fetch_add(1, Ordering::Relaxed);
+                    }
+                    Err(e) if e.to_string().contains("frozen memtables") => {
+                        stall_count.fetch_add(1, Ordering::Relaxed);
+                    }
+                    Err(e) => panic!("Unexpected error: {e}"),
+                }
             }
         }));
     }
@@ -1714,31 +1731,30 @@ fn test_concurrent_writes_under_backpressure() {
         handle.join().unwrap();
     }
 
-    let total_writes = success_count.load(Ordering::Relaxed);
+    let total_success = success_count.load(Ordering::Relaxed);
+    let total_stalls = stall_count.load(Ordering::Relaxed);
+
+    // Some writes should succeed (before active fills up), some should be stalled
+    assert!(total_success > 0, "Some writes should succeed");
+    assert!(
+        total_stalls > 0,
+        "Some writes should be stalled when frozen is at capacity and active is full"
+    );
     assert_eq!(
-        total_writes,
+        total_success + total_stalls,
         (num_writers * writes_per_writer) as u64,
-        "All writes should succeed even under backpressure"
+        "All writes should either succeed or return stall error"
     );
 
-    // Verify writes are readable
-    for writer_id in 0..num_writers {
-        for i in [0, writes_per_writer / 2, writes_per_writer - 1] {
-            let key = format!("pressure_w{writer_id}_k{i:04}");
-            let value = get_for_test(&engine, key.as_bytes());
-            assert!(
-                value.is_some(),
-                "Key {key} should be readable from active memtable"
-            );
-        }
-    }
+    // Flush frozen memtables and verify writes resume
+    engine.flush_all().unwrap();
 
-    // Active memtable should be large since no rotation happened
-    let stats = engine.stats();
+    let key = "after_flush_key";
+    write_test_data(&engine, key.as_bytes(), b"recovered", 9999);
+    let value = get_for_test(&engine, key.as_bytes());
     assert!(
-        stats.active_memtable_size > 128,
-        "Active memtable ({}) should exceed configured size since rotation was blocked",
-        stats.active_memtable_size
+        value.is_some(),
+        "Writes should succeed after flush drains frozen"
     );
 }
 
@@ -1772,32 +1788,35 @@ fn test_slow_flush_causes_memtable_growth() {
     let stop_flag = Arc::new(AtomicBool::new(false));
     let ts_counter = Arc::new(AtomicU64::new(1));
     let writes_done = Arc::new(AtomicU64::new(0));
-    let rotations_blocked = Arc::new(AtomicU64::new(0));
+    let stalls_hit = Arc::new(AtomicU64::new(0));
 
-    // Fast writer thread
+    // Fast writer thread — handles stall errors gracefully
     let engine_writer = Arc::clone(&engine);
     let stop_flag_writer = Arc::clone(&stop_flag);
     let ts_counter_clone = Arc::clone(&ts_counter);
     let writes_done_clone = Arc::clone(&writes_done);
-    let rotations_blocked_clone = Arc::clone(&rotations_blocked);
+    let stalls_hit_clone = Arc::clone(&stalls_hit);
 
     let writer = thread::spawn(move || {
-        let mut local_writes = 0u64;
         while !stop_flag_writer.load(Ordering::Relaxed) {
+            let local_writes = writes_done_clone.load(Ordering::Relaxed);
             let key = format!("fast_write_{local_writes:06}");
             let ts = ts_counter_clone.fetch_add(1, Ordering::SeqCst);
-            write_test_data(&engine_writer, key.as_bytes(), b"data", ts);
-            local_writes += 1;
-
-            // Try to rotate periodically
-            if local_writes % 20 == 0
-                && engine_writer.maybe_rotate().is_none()
-                && engine_writer.frozen_count() >= 2
-            {
-                rotations_blocked_clone.fetch_add(1, Ordering::Relaxed);
+            let mut batch = WriteBatch::new();
+            batch.put(key.into_bytes(), b"data".to_vec());
+            batch.set_commit_ts(ts);
+            match engine_writer.write_batch(batch) {
+                Ok(()) => {
+                    writes_done_clone.fetch_add(1, Ordering::Relaxed);
+                }
+                Err(e) if e.to_string().contains("frozen memtables") => {
+                    stalls_hit_clone.fetch_add(1, Ordering::Relaxed);
+                    // Back off briefly to let flusher catch up
+                    thread::sleep(Duration::from_millis(1));
+                }
+                Err(e) => panic!("Unexpected error: {e}"),
             }
         }
-        writes_done_clone.fetch_add(local_writes, Ordering::Relaxed);
     });
 
     // Slow flusher thread - intentionally slow
@@ -1807,10 +1826,7 @@ fn test_slow_flush_causes_memtable_growth() {
     let flusher = thread::spawn(move || {
         let mut flushes = 0u64;
         while !stop_flag_flusher.load(Ordering::Relaxed) {
-            // Slow flush - only flush every 100ms
             thread::sleep(Duration::from_millis(100));
-
-            // Get oldest frozen memtable
             if let Some(frozen) = engine_flusher.maybe_rotate() {
                 if engine_flusher.flush_memtable(&frozen).is_ok() {
                     flushes += 1;
@@ -1828,20 +1844,15 @@ fn test_slow_flush_causes_memtable_growth() {
     let _flushes = flusher.join().unwrap();
 
     let writes = writes_done.load(Ordering::Relaxed);
-    let blocked = rotations_blocked.load(Ordering::Relaxed);
+    let stalls = stalls_hit.load(Ordering::Relaxed);
 
-    assert!(writes > 0, "Should have completed writes");
-    // With slow flush and fast writes, we expect rotation to be blocked sometimes
-    // (though not guaranteed depending on timing)
-
-    println!("Slow flush test: {writes} writes, {blocked} rotation blocks");
-
-    // All written data should be readable
-    let stats = engine.stats();
-    println!(
-        "Final state: active_size={}, frozen_count={}",
-        stats.active_memtable_size, stats.frozen_memtable_count
+    assert!(writes > 0, "Should have completed some writes");
+    assert!(
+        stalls > 0,
+        "Should have hit write stalls with slow flush and fast writes"
     );
+
+    println!("Slow flush test: {writes} writes, {stalls} stalls");
 }
 
 /// Test write stall behavior with explicit transaction-like writes.
@@ -1868,35 +1879,41 @@ fn test_large_batch_under_frozen_limit() {
     )
     .unwrap();
 
-    // Fill to frozen limit
-    for i in 0..10 {
-        let key = format!("setup_{i:02}");
-        write_test_data(&engine, key.as_bytes(), b"setup", (i + 1) as u64);
-    }
+    // Fill to frozen limit. Write minimally to avoid auto-rotation.
+    write_test_data(&engine, b"setup_key", b"s", 1);
     engine.freeze_active();
     assert_eq!(engine.frozen_count(), 1);
 
-    // Now write a large batch that would normally trigger multiple rotations
-    // Since frozen limit is reached, all goes to active memtable
+    // Write large entries — some should succeed (while active < memtable_size),
+    // then fail with stall error once active is full and frozen is at capacity
     let large_value = vec![b'x'; 256]; // Larger than memtable_size
+    let mut successes = 0;
+    let mut stalls = 0;
     for i in 0..20 {
         let key = format!("large_batch_{i:02}");
-        write_test_data(&engine, key.as_bytes(), &large_value, (i + 100) as u64);
+        let mut batch = WriteBatch::new();
+        batch.put(key.into_bytes(), large_value.clone());
+        batch.set_commit_ts((i + 100) as u64);
+        match engine.write_batch(batch) {
+            Ok(()) => successes += 1,
+            Err(e) if e.to_string().contains("frozen memtables") => stalls += 1,
+            Err(e) => panic!("Unexpected error: {e}"),
+        }
     }
 
-    // All writes should succeed
-    for i in 0..20 {
-        let key = format!("large_batch_{i:02}");
-        let value = get_for_test(&engine, key.as_bytes());
-        assert!(value.is_some(), "Large batch key {key} should be readable");
-        assert_eq!(value.unwrap().len(), 256);
-    }
-
-    // Active memtable should be significantly larger than configured size
-    let stats = engine.stats();
+    // First write should succeed (active is empty after freeze), then stall
+    assert!(successes > 0, "At least one write should succeed");
     assert!(
-        stats.active_memtable_size > 128 * 10, // Much larger than single memtable
-        "Active memtable ({}) should be very large due to blocked rotation",
-        stats.active_memtable_size
+        stalls > 0,
+        "Should get stall errors when frozen is at capacity and active exceeds memtable_size"
+    );
+
+    // Flush frozen memtable → writes resume
+    engine.flush_all().unwrap();
+    write_test_data(&engine, b"after_flush", &large_value, 999);
+    let value = get_for_test(&engine, b"after_flush");
+    assert!(
+        value.is_some(),
+        "Write should succeed after flushing frozen"
     );
 }

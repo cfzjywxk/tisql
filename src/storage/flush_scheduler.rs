@@ -294,7 +294,7 @@ mod tests {
         let tmp = TempDir::new().unwrap();
         let config = LsmConfig::builder(tmp.path())
             .memtable_size(100) // Very small
-            .max_frozen_memtables(4)
+            .max_frozen_memtables(16) // High enough to avoid write stall
             .build()
             .unwrap();
         let engine = Arc::new(LsmEngine::open(config).unwrap());
@@ -353,7 +353,10 @@ mod tests {
         let tmp = TempDir::new().unwrap();
         let config = LsmConfig::builder(tmp.path())
             .memtable_size(200) // Small
-            .max_frozen_memtables(8)
+            .max_frozen_memtables(64) // High to avoid write stall with 100 concurrent entries
+            .l0_compaction_trigger(100) // High to avoid L0 stop during concurrent writes
+            .l0_slowdown_trigger(200)
+            .l0_stop_trigger(300)
             .build()
             .unwrap();
         let engine = Arc::new(LsmEngine::open(config).unwrap());

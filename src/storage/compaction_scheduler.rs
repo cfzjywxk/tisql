@@ -293,8 +293,10 @@ mod tests {
         let tmp = TempDir::new().unwrap();
         let config = LsmConfig::builder(tmp.path())
             .memtable_size(100) // Very small
-            .max_frozen_memtables(16)
+            .max_frozen_memtables(32) // High to avoid write stall
             .l0_compaction_trigger(4)
+            .l0_slowdown_trigger(100)
+            .l0_stop_trigger(200)
             .target_file_size(512)
             .l1_max_size(4096)
             .build()

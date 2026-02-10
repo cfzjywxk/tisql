@@ -46,6 +46,7 @@ use std::collections::VecDeque;
 use std::ops::Range;
 use std::sync::atomic::{AtomicU64, Ordering as AtomicOrdering};
 use std::sync::{Arc, RwLock, RwLockWriteGuard};
+use std::time::Duration;
 
 #[cfg(feature = "failpoints")]
 use fail::fail_point;
@@ -343,10 +344,8 @@ impl LsmEngine {
 
         // Check frozen limit
         if state.frozen.len() >= self.config.max_frozen_memtables {
-            // Cannot rotate - too many frozen memtables awaiting flush.
-            // TODO: Implement write stalling/backpressure when flush can't keep up.
-            // Currently, writes continue to the active memtable, which can grow
-            // memory unbounded under sustained load without flush.
+            // Cannot rotate — frozen list at capacity. Writers get an error
+            // from check_write_stall() until flush drains the queue.
             return None;
         }
 
@@ -635,6 +634,49 @@ impl LsmEngine {
     /// Used to wire flush completion → compaction scheduler notification.
     pub fn set_compaction_notify(&self, notify: Arc<dyn Fn() + Send + Sync>) {
         *self.compaction_notify.write().unwrap() = Some(notify);
+    }
+
+    /// Check write backpressure conditions and return error or sleep briefly.
+    ///
+    /// Two tiers:
+    /// 1. **L0 slowdown**: If L0 file count is in `[slowdown_trigger, stop_trigger)`,
+    ///    sleep with a linearly increasing delay (1ms → 100ms).
+    /// 2. **Frozen memtable stall**: If the active memtable is full AND frozen list
+    ///    is at capacity, return error immediately (caller should retry after flush).
+    fn check_write_stall(&self) -> Result<()> {
+        // L0 slowdown: sleep proportionally
+        let l0_count = self.current_version().level_size(0);
+        if self.config.should_slowdown_writes(l0_count) && !self.config.should_stop_writes(l0_count)
+        {
+            let delay = self.compute_write_delay(l0_count);
+            std::thread::sleep(delay);
+        }
+
+        // Frozen memtable stall: reject immediately
+        let state = self.state.read().unwrap();
+        if state.active.approximate_size() >= self.config.memtable_size
+            && state.frozen.len() >= self.config.max_frozen_memtables
+        {
+            return Err(TiSqlError::Storage(
+                "Write stalled: frozen memtables at capacity, flush is not keeping up".into(),
+            ));
+        }
+
+        Ok(())
+    }
+
+    /// Compute write delay for L0 slowdown. Linearly interpolates from 1ms to 100ms
+    /// across the range `[slowdown_trigger, stop_trigger)`.
+    fn compute_write_delay(&self, l0_count: usize) -> Duration {
+        let slowdown = self.config.l0_slowdown_trigger;
+        let stop = self.config.l0_stop_trigger;
+        if stop <= slowdown {
+            return Duration::from_millis(1);
+        }
+        let range = (stop - slowdown) as u64;
+        let excess = (l0_count.saturating_sub(slowdown).min(stop - slowdown)) as u64;
+        let delay_ms = 1 + 99 * excess / range;
+        Duration::from_millis(delay_ms)
     }
 
     /// Perform one round of compaction.
@@ -2017,6 +2059,9 @@ impl StorageEngine for LsmEngine {
             ));
         }
 
+        // Slow down or reject if L0 files are accumulating or frozen memtables at capacity
+        self.check_write_stall()?;
+
         // Use CLOG LSN if provided, otherwise allocate locally.
         // Using the CLOG LSN ensures proper recovery ordering: when we flush
         // the memtable to SST, the flushed_lsn in SST metadata matches the
@@ -2228,7 +2273,7 @@ mod tests {
     fn test_config(dir: &Path) -> LsmConfig {
         LsmConfig::builder(dir)
             .memtable_size(1024) // Small for testing
-            .max_frozen_memtables(4)
+            .max_frozen_memtables(16)
             .build()
             .unwrap()
     }
@@ -3228,7 +3273,7 @@ mod tests {
         let tmp = TempDir::new().unwrap();
         let config = LsmConfig::builder(tmp.path())
             .memtable_size(50) // Very small to trigger rotation
-            .max_frozen_memtables(16) // Allow many frozen memtables
+            .max_frozen_memtables(32) // Allow many frozen memtables (entries are ~80 bytes with overhead)
             .build()
             .unwrap();
 
@@ -6083,7 +6128,7 @@ mod tests {
         let tmp = TempDir::new().unwrap();
         let config = LsmConfig::builder(tmp.path())
             .memtable_size(100) // Small to trigger rotation
-            .max_frozen_memtables(4)
+            .max_frozen_memtables(16)
             .build()
             .unwrap();
         let engine = LsmEngine::open(config).unwrap();
@@ -6850,5 +6895,195 @@ mod tests {
             .collect();
         assert_eq!(real_entries.len(), 1, "real_key should be in SST");
         assert_eq!(real_entries[0].1, b"real_value");
+    }
+
+    // ==================== Write Flow Control Tests ====================
+
+    #[test]
+    fn test_compute_write_delay() {
+        let tmp = TempDir::new().unwrap();
+        let config = LsmConfig::builder(tmp.path())
+            .memtable_size(1024)
+            .l0_compaction_trigger(4)
+            .l0_slowdown_trigger(8)
+            .l0_stop_trigger(12)
+            .build()
+            .unwrap();
+        let engine = LsmEngine::open(config).unwrap();
+
+        // At slowdown trigger: excess=0, delay=1ms
+        let delay = engine.compute_write_delay(8);
+        assert_eq!(delay, Duration::from_millis(1));
+
+        // At stop trigger - 1: excess=3, range=4, delay = 1 + 99*3/4 = 75ms
+        let delay = engine.compute_write_delay(11);
+        assert_eq!(delay, Duration::from_millis(75));
+
+        // At stop trigger: capped at max excess=4, delay = 1 + 99*4/4 = 100ms
+        let delay = engine.compute_write_delay(12);
+        assert_eq!(delay, Duration::from_millis(100));
+
+        // Beyond stop trigger: same cap
+        let delay = engine.compute_write_delay(20);
+        assert_eq!(delay, Duration::from_millis(100));
+
+        // Below slowdown: excess=0 (saturating_sub), delay=1ms
+        let delay = engine.compute_write_delay(5);
+        assert_eq!(delay, Duration::from_millis(1));
+    }
+
+    #[test]
+    fn test_compute_write_delay_degenerate() {
+        // Edge case: stop == slowdown
+        let tmp = TempDir::new().unwrap();
+        let config = LsmConfig::builder(tmp.path())
+            .memtable_size(1024)
+            .l0_compaction_trigger(4)
+            .l0_slowdown_trigger(8)
+            .l0_stop_trigger(8)
+            .build_unchecked();
+        let engine = LsmEngine::open(config).unwrap();
+
+        let delay = engine.compute_write_delay(8);
+        assert_eq!(delay, Duration::from_millis(1));
+    }
+
+    #[test]
+    fn test_write_stall_l0_slowdown() {
+        // Create engine with low L0 thresholds
+        let tmp = TempDir::new().unwrap();
+        let config = LsmConfig::builder(tmp.path())
+            .memtable_size(100)
+            .max_frozen_memtables(20)
+            .l0_compaction_trigger(1)
+            .l0_slowdown_trigger(2)
+            .l0_stop_trigger(10)
+            .build()
+            .unwrap();
+        let engine = LsmEngine::open(config).unwrap();
+
+        // Flush to create L0 files in the slowdown range
+        for i in 0..3 {
+            let mut batch = WriteBatch::new();
+            batch.set_commit_ts(i + 1);
+            batch.put(format!("key_{i:04}").into_bytes(), vec![b'x'; 60]);
+            engine.write_batch(batch).unwrap();
+        }
+        // Rotate + flush to create L0 SSTs
+        engine.flush_all_with_active().unwrap();
+
+        let l0 = engine.current_version().level_size(0);
+        assert!(l0 >= 2, "Need at least 2 L0 files for slowdown, got {l0}");
+
+        // Now a write should be slowed down
+        let start = std::time::Instant::now();
+        let mut batch = WriteBatch::new();
+        batch.set_commit_ts(100);
+        batch.put(b"slow_key".to_vec(), b"slow_val".to_vec());
+        engine.write_batch(batch).unwrap();
+        let elapsed = start.elapsed();
+
+        assert!(
+            elapsed >= Duration::from_millis(1),
+            "Write should be slowed by at least 1ms, took {elapsed:?}",
+        );
+    }
+
+    #[test]
+    fn test_write_stall_frozen_memtable_returns_error() {
+        // When frozen is at capacity and active is full, write returns error
+        let tmp = TempDir::new().unwrap();
+        let config = LsmConfig::builder(tmp.path())
+            .memtable_size(100)
+            .max_frozen_memtables(1)
+            .l0_compaction_trigger(100)
+            .l0_slowdown_trigger(200)
+            .l0_stop_trigger(300)
+            .build()
+            .unwrap();
+        let engine = LsmEngine::open(config).unwrap();
+
+        // Write 1: fills active past 100 bytes
+        let mut batch = WriteBatch::new();
+        batch.set_commit_ts(1);
+        batch.put(b"k1".to_vec(), vec![b'x'; 60]);
+        engine.write_batch(batch).unwrap();
+
+        // Write 2: triggers rotation (active full), frozen now has 1
+        let mut batch = WriteBatch::new();
+        batch.set_commit_ts(2);
+        batch.put(b"k2".to_vec(), vec![b'x'; 60]);
+        engine.write_batch(batch).unwrap();
+
+        // Write 3: fills new active past 100 bytes again → now both are full
+        // This write itself succeeds because check_write_stall runs before the write
+        // (active wasn't full yet when checked). But the NEXT write will see the stall.
+        let mut batch = WriteBatch::new();
+        batch.set_commit_ts(3);
+        batch.put(b"k3".to_vec(), vec![b'x'; 60]);
+        // May or may not error depending on timing of rotation
+        let _ = engine.write_batch(batch);
+
+        // This write should definitely get an error
+        let mut batch = WriteBatch::new();
+        batch.set_commit_ts(10);
+        batch.put(b"stalled_key".to_vec(), vec![b'y'; 60]);
+        let result = engine.write_batch(batch);
+        assert!(result.is_err(), "Write should be rejected when stalled");
+        let msg = result.unwrap_err().to_string();
+        assert!(
+            msg.contains("frozen memtables at capacity"),
+            "Error should mention frozen memtable stall, got: {msg}"
+        );
+    }
+
+    #[test]
+    fn test_write_stall_clears_after_flush() {
+        // After flush drains frozen, writes succeed again
+        let tmp = TempDir::new().unwrap();
+        let config = LsmConfig::builder(tmp.path())
+            .memtable_size(100)
+            .max_frozen_memtables(1)
+            .l0_compaction_trigger(100)
+            .l0_slowdown_trigger(200)
+            .l0_stop_trigger(300)
+            .build()
+            .unwrap();
+        let engine = LsmEngine::open(config).unwrap();
+
+        // Fill to stall condition
+        let mut batch = WriteBatch::new();
+        batch.set_commit_ts(1);
+        batch.put(b"k1".to_vec(), vec![b'x'; 60]);
+        engine.write_batch(batch).unwrap();
+
+        let mut batch = WriteBatch::new();
+        batch.set_commit_ts(2);
+        batch.put(b"k2".to_vec(), vec![b'x'; 60]);
+        engine.write_batch(batch).unwrap();
+
+        // Fill new active too
+        let mut batch = WriteBatch::new();
+        batch.set_commit_ts(3);
+        batch.put(b"k3".to_vec(), vec![b'x'; 60]);
+        let _ = engine.write_batch(batch);
+
+        // Verify stalled
+        let mut batch = WriteBatch::new();
+        batch.set_commit_ts(10);
+        batch.put(b"fail".to_vec(), vec![b'y'; 10]);
+        assert!(engine.write_batch(batch).is_err(), "Should be stalled");
+
+        // Flush to drain frozen
+        engine.flush_all().unwrap();
+
+        // Now writes should succeed
+        let mut batch = WriteBatch::new();
+        batch.set_commit_ts(20);
+        batch.put(b"after_flush".to_vec(), vec![b'z'; 10]);
+        assert!(
+            engine.write_batch(batch).is_ok(),
+            "Should succeed after flush"
+        );
     }
 }

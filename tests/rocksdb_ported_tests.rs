@@ -125,7 +125,7 @@ fn create_engine(dir: &TempDir) -> LsmEngine {
 
     let config = LsmConfigBuilder::new(dir.path())
         .memtable_size(4096)
-        .max_frozen_memtables(8)
+        .max_frozen_memtables(64)
         .build_unchecked();
     LsmEngine::open_with_recovery(config, lsn_provider, ilog, Version::new()).unwrap()
 }
@@ -137,7 +137,7 @@ fn create_durable_engine(dir: &TempDir) -> (LsmEngine, Arc<IlogService>) {
 
     let config = LsmConfigBuilder::new(dir.path())
         .memtable_size(256) // Small for testing
-        .max_frozen_memtables(16)
+        .max_frozen_memtables(32)
         .build_unchecked();
 
     let engine =
@@ -605,7 +605,7 @@ fn test_flush_while_writing() {
     let engine = Arc::new({
         let config = LsmConfigBuilder::new(dir.path())
             .memtable_size(128) // Very small to trigger frequent rotations
-            .max_frozen_memtables(32)
+            .max_frozen_memtables(256) // High to avoid write stall (flusher thread drains)
             .build_unchecked();
         let lsn_provider = new_lsn_provider();
         let ilog_config = IlogConfig::new(dir.path());
