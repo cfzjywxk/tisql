@@ -307,11 +307,29 @@ impl MySqlBackend {
                 mut batch_rx,
                 done_rx,
             } => {
-                let mut all_rows = Vec::new();
+                let cols: Vec<Column> = columns
+                    .iter()
+                    .map(|name| Column {
+                        table: String::new(),
+                        column: name.clone(),
+                        coltype: ColumnType::MYSQL_TYPE_VAR_STRING,
+                        colflags: ColumnFlags::empty(),
+                    })
+                    .collect();
+
+                let mut rw = results.start(&cols).await?;
+
+                // Stream rows directly from the channel without materializing
                 while let Some(batch) = batch_rx.recv().await {
-                    all_rows.push(batch);
+                    for row in &batch {
+                        for val in row.iter() {
+                            write_value_col(&mut rw, val)?;
+                        }
+                        rw.end_row().await?;
+                    }
                 }
 
+                // Check final status after all rows have been streamed
                 let done = done_rx.await.unwrap_or(QueryDone::Error {
                     error: crate::error::TiSqlError::Internal("Worker task dropped".into()),
                     txn_ctx: None,
@@ -322,35 +340,21 @@ impl MySqlBackend {
                         if let Some(ctx) = txn_ctx {
                             self.session.set_current_txn(ctx);
                         }
-
-                        let cols: Vec<Column> = columns
-                            .iter()
-                            .map(|name| Column {
-                                table: String::new(),
-                                column: name.clone(),
-                                coltype: ColumnType::MYSQL_TYPE_VAR_STRING,
-                                colflags: ColumnFlags::empty(),
-                            })
-                            .collect();
-
-                        let mut rw = results.start(&cols).await?;
-                        for batch in all_rows {
-                            for row in &batch {
-                                for val in row.iter() {
-                                    write_value_col(&mut rw, val)?;
-                                }
-                                rw.end_row().await?;
-                            }
-                        }
                         rw.finish().await
                     }
                     QueryDone::Error { error, txn_ctx } => {
                         if let Some(ctx) = txn_ctx {
                             self.session.set_current_txn(ctx);
                         }
-                        results
-                            .error(ErrorKind::ER_UNKNOWN_ERROR, error.to_string().as_bytes())
-                            .await
+                        // Rows already streamed; send error in the finish phase.
+                        // The MySQL protocol doesn't support aborting mid-resultset
+                        // cleanly, but finish() will close the resultset, and the
+                        // error will be visible in server logs.
+                        rw.finish_error(
+                            ErrorKind::ER_UNKNOWN_ERROR,
+                            &error.to_string().into_bytes(),
+                        )
+                        .await
                     }
                 }
             }
