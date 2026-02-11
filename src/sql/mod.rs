@@ -20,4 +20,4 @@ mod plan;
 // Parser, Binder, and LogicalPlan are encapsulated within SQLEngine
 pub(crate) use binder::Binder;
 pub(crate) use parser::Parser;
-pub(crate) use plan::{AggFunc, BinaryOp, Expr, LogicalPlan, UnaryOp};
+pub(crate) use plan::{AggFunc, BinaryOp, Expr, LogicalPlan, OrderByExpr, UnaryOp};
