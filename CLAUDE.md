@@ -198,6 +198,16 @@ src/storage/
 
 ### Recent Changes
 
+**MVCC Garbage Collection During Compaction (Feb 2026)**
+- **SessionRegistry**: Tracks active explicit transactions (`parking_lot::RwLock<HashMap<u64, Timestamp>>`) for GC safe point computation
+- **GC safe point**: `AtomicU64` on `LsmEngine`, advanced before each compaction round via updater callback; never regresses (atomic CAS)
+- **Updater callback**: `min(active_txn_start_ts) - 1`; falls back to `tso.last_ts()` when no active transactions
+- **GC filter in CompactionExecutor**: State machine per user key — keeps versions above safe point, keeps GC barrier (newest version <= safe_point), drops everything below barrier
+- **Bottommost detection**: `CompactionTask::check_bottommost()` scans levels below output for overlapping SSTs; tombstones only dropped at bottommost level
+- **Protocol integration**: `MySqlBackend` registers/unregisters session in registry after each query; `Drop` impl ensures cleanup on disconnect
+- **Enhanced stats**: `LsmStats` now includes `gc_safe_point` and per-level `LevelStats` (file count + size)
+- 7 new GC tests in `rocksdb_ported_compaction_tests.rs`; total: 795 lib + 36 compaction integration tests
+
 **Physical Thread Separation — Dedicated Worker Runtime (Feb 2026)**
 - **Separate runtimes**: Protocol I/O runs on main tokio runtime; ALL database work (parse, bind, execute, txn control, SHOW) runs on dedicated `tisql-worker` tokio runtime
 - **OceanBase-inspired**: Like OceanBase's I/O thread / worker thread separation, but adapted for `opensrv-mysql` (serialization stays on protocol task)
@@ -354,6 +364,7 @@ src/storage/
 - [x] Async iterator pipeline (native AFIT async seek/advance on all iterators)
 - [x] Volcano-style operator tree (pull-based Operator<I> with open/next/close)
 - [x] End-to-end streaming (batched mpsc row streaming from worker to protocol)
+- [x] MVCC garbage collection during compaction (GC safe point + bottommost tombstone/version cleanup)
 - [ ] Background compaction workers
 - [ ] Block cache for SST read performance
 - [ ] Bloom filters for SST point lookups
