@@ -166,7 +166,7 @@ impl MySqlBackend {
         )
         .await;
 
-        match response {
+        let result = match response {
             QueryResponse::Rows {
                 columns,
                 mut batch_rx,
@@ -200,6 +200,8 @@ impl MySqlBackend {
                             }
                         }
                         Err(e) => {
+                            // Update registry before early return on error
+                            self.update_session_registry();
                             return rw
                                 .finish_error(
                                     ErrorKind::ER_UNKNOWN_ERROR,
@@ -232,6 +234,27 @@ impl MySqlBackend {
                     .error(ErrorKind::ER_UNKNOWN_ERROR, error.to_string().as_bytes())
                     .await
             }
+        };
+
+        // Update session registry after every dispatched query
+        self.update_session_registry();
+
+        result
+    }
+
+    /// Update the session registry based on current transaction state.
+    ///
+    /// If an explicit transaction is active, register its start_ts.
+    /// Otherwise, unregister this session to allow GC safe point advancement.
+    fn update_session_registry(&self) {
+        if self.session.has_active_txn() {
+            if let Some(txn) = self.session.current_txn() {
+                self.db
+                    .session_registry()
+                    .register(self.session.id(), txn.start_ts());
+            }
+        } else {
+            self.db.session_registry().unregister(self.session.id());
         }
     }
 
@@ -288,6 +311,13 @@ impl MySqlBackend {
 
         rw.end_row().await?;
         rw.finish().await
+    }
+}
+
+impl Drop for MySqlBackend {
+    fn drop(&mut self) {
+        // Unregister from session registry on connection close
+        self.db.session_registry().unregister(self.session.id());
     }
 }
 

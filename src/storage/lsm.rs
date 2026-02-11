@@ -165,6 +165,14 @@ pub struct LsmEngine {
     /// Used to notify the CompactionScheduler that new L0 SSTs are available,
     /// triggering compaction if thresholds are met.
     compaction_notify: RwLock<Option<Arc<dyn Fn() + Send + Sync>>>,
+
+    /// GC safe point: versions at the bottommost level with ts <= safe_point
+    /// (below the GC barrier) are dropped during compaction. 0 = no GC.
+    gc_safe_point: AtomicU64,
+
+    /// Callback to compute the current GC safe point from active sessions/TSO.
+    /// Called before each compaction round to advance the safe point.
+    gc_safe_point_updater: RwLock<Option<Arc<dyn Fn() -> u64 + Send + Sync>>>,
 }
 
 impl LsmEngine {
@@ -217,6 +225,8 @@ impl LsmEngine {
             io: io_service,
             current_sv: RwLock::new(initial_sv),
             compaction_notify: RwLock::new(None),
+            gc_safe_point: AtomicU64::new(0),
+            gc_safe_point_updater: RwLock::new(None),
         })
     }
 
@@ -651,6 +661,53 @@ impl LsmEngine {
         *self.compaction_notify.write() = Some(notify);
     }
 
+    // ========================================================================
+    // GC Safe Point
+    // ========================================================================
+
+    /// Get the current GC safe point. Returns 0 if GC is disabled.
+    pub fn gc_safe_point(&self) -> Timestamp {
+        self.gc_safe_point.load(AtomicOrdering::Relaxed)
+    }
+
+    /// Set the GC safe point. The safe point can only advance (never regress).
+    pub fn set_gc_safe_point(&self, ts: Timestamp) {
+        loop {
+            let current = self.gc_safe_point.load(AtomicOrdering::Relaxed);
+            if ts <= current {
+                break; // Never regress
+            }
+            if self
+                .gc_safe_point
+                .compare_exchange_weak(
+                    current,
+                    ts,
+                    AtomicOrdering::Relaxed,
+                    AtomicOrdering::Relaxed,
+                )
+                .is_ok()
+            {
+                break;
+            }
+        }
+    }
+
+    /// Set the callback used to compute the GC safe point from active sessions.
+    pub fn set_gc_safe_point_updater(&self, updater: Arc<dyn Fn() -> Timestamp + Send + Sync>) {
+        *self.gc_safe_point_updater.write() = Some(updater);
+    }
+
+    /// Invoke the updater callback to advance the GC safe point.
+    ///
+    /// Called before each compaction round by the CompactionScheduler.
+    pub fn update_gc_safe_point(&self) {
+        let updater = self.gc_safe_point_updater.read();
+        if let Some(ref f) = *updater {
+            let new_ts = f();
+            self.set_gc_safe_point(new_ts);
+        }
+    }
+
     /// Check write backpressure conditions and return error or sleep briefly.
     ///
     /// Two tiers:
@@ -720,6 +777,10 @@ impl LsmEngine {
             None => return Ok(false),
         };
 
+        // Compute GC parameters for this compaction
+        let gc_safe_point = self.gc_safe_point();
+        let is_bottommost = task.check_bottommost(&version, self.config.max_levels);
+
         // Handle trivial move separately (no SST I/O needed)
         if task.is_trivial_move {
             let executor = CompactionExecutor::new(Arc::clone(&self.config));
@@ -731,6 +792,8 @@ impl LsmEngine {
                     &self.config.sst_dir(),
                     &[],
                     Arc::clone(&self.io),
+                    gc_safe_point,
+                    is_bottommost,
                 )
                 .await?;
 
@@ -774,6 +837,8 @@ impl LsmEngine {
                 &self.config.sst_dir(),
                 &pre_allocated_ids,
                 Arc::clone(&self.io),
+                gc_safe_point,
+                is_bottommost,
             )
             .await?;
 
@@ -844,6 +909,14 @@ impl LsmEngine {
         let state = self.state.read();
         let version = self.version_set.current();
 
+        let mut level_stats = Vec::with_capacity(self.config.max_levels);
+        for level in 0..self.config.max_levels {
+            level_stats.push(LevelStats {
+                file_count: version.level_size(level),
+                size_bytes: version.level_size_bytes(level),
+            });
+        }
+
         LsmStats {
             active_memtable_size: state.active.approximate_size(),
             frozen_memtable_count: state.frozen.len(),
@@ -852,6 +925,8 @@ impl LsmEngine {
             total_sst_bytes: version.total_size_bytes(),
             version_num: version.version_num(),
             flushed_lsn: version.flushed_lsn(),
+            gc_safe_point: self.gc_safe_point(),
+            level_stats,
         }
     }
 
@@ -2253,8 +2328,15 @@ impl PessimisticStorage for LsmEngine {
     }
 }
 
-/// Statistics about the LSM engine.
-#[derive(Debug, Clone)]
+/// Per-level statistics.
+#[derive(Debug, Clone, Default)]
+pub struct LevelStats {
+    /// Number of SST files at this level.
+    pub file_count: usize,
+    /// Total size of SST files at this level in bytes.
+    pub size_bytes: u64,
+}
+
 pub struct LsmStats {
     /// Size of active memtable in bytes.
     pub active_memtable_size: usize,
@@ -2276,6 +2358,12 @@ pub struct LsmStats {
 
     /// Highest LSN that has been flushed.
     pub flushed_lsn: u64,
+
+    /// Current GC safe point (0 = no GC).
+    pub gc_safe_point: Timestamp,
+
+    /// Per-level statistics.
+    pub level_stats: Vec<LevelStats>,
 }
 
 #[cfg(test)]
@@ -2329,6 +2417,8 @@ mod tests {
                 io: io_service,
                 current_sv: RwLock::new(initial_sv),
                 compaction_notify: RwLock::new(None),
+                gc_safe_point: AtomicU64::new(0),
+                gc_safe_point_updater: RwLock::new(None),
             })
         }
     }

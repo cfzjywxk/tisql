@@ -89,6 +89,13 @@ impl<S: StorageEngine, L: ClogService, T: TsoService> TransactionService<S, L, T
         &self.tso
     }
 
+    /// Get the last allocated timestamp without advancing the counter.
+    ///
+    /// Used for computing the GC safe point when no explicit transactions are active.
+    pub fn last_ts(&self) -> Timestamp {
+        self.tso.last_ts()
+    }
+
     /// Execute a write batch with durability guarantees (for direct/autocommit writes).
     ///
     /// Recover state by replaying commit log entries.

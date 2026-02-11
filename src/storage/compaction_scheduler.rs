@@ -197,6 +197,9 @@ impl CompactionSchedulerInner {
         tracing::info!("Compaction worker started (async)");
 
         while !self.shutdown.load(Ordering::Relaxed) {
+            // Advance GC safe point before each compaction attempt
+            self.engine.update_gc_safe_point();
+
             match self.engine.do_compaction().await {
                 Ok(true) => {
                     self.compaction_count.fetch_add(1, Ordering::Relaxed);
@@ -227,6 +230,9 @@ impl CompactionSchedulerInner {
         tracing::info!("Compaction worker started (sync fallback)");
 
         while !self.shutdown.load(Ordering::Relaxed) {
+            // Advance GC safe point before each compaction attempt
+            self.engine.update_gc_safe_point();
+
             match crate::io::block_on_sync(self.engine.do_compaction()) {
                 Ok(true) => {
                     self.compaction_count.fetch_add(1, Ordering::Relaxed);

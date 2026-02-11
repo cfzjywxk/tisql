@@ -342,6 +342,8 @@ fn test_executor_merge_keys() {
         &sst_dir,
         &pre_allocated_ids,
         IoService::new(32).unwrap(),
+        0, // gc_safe_point = 0 → no GC
+        false,
     ))
     .unwrap();
 
@@ -434,6 +436,8 @@ fn test_executor_mvcc_ordering() {
         &sst_dir,
         &pre_allocated_ids,
         IoService::new(32).unwrap(),
+        0, // gc_safe_point = 0 → no GC
+        false,
     ))
     .unwrap();
 
@@ -505,6 +509,8 @@ fn test_executor_tombstones() {
         &sst_dir,
         &pre_allocated_ids,
         IoService::new(32).unwrap(),
+        0, // gc_safe_point = 0 → no GC
+        false,
     ))
     .unwrap();
 
@@ -1505,4 +1511,492 @@ fn test_write_stall_e2e() {
     // Verify some flushes happened (L0 SSTs created)
     let l0 = engine.current_version().level_size(0);
     assert!(l0 > 0, "Should have flushed to L0 SSTs, got 0");
+}
+
+// ============================================================================
+// MVCC GC COMPACTION TESTS
+// ============================================================================
+
+/// Helper to create MVCC key: user_key || !ts
+fn mvcc_key(user_key: &[u8], ts: u64) -> Vec<u8> {
+    let mut key = user_key.to_vec();
+    key.extend_from_slice(&(!ts).to_be_bytes());
+    key
+}
+
+/// Test: gc_safe_point=0 (default) preserves all versions — no GC.
+#[test]
+fn test_gc_safe_point_zero_no_gc() {
+    let dir = TempDir::new().unwrap();
+    let sst_dir = dir.path().join("sst");
+    std::fs::create_dir_all(&sst_dir).unwrap();
+
+    let config = Arc::new(
+        LsmConfigBuilder::new(dir.path())
+            .target_file_size(1024 * 1024)
+            .build_unchecked(),
+    );
+    let executor = CompactionExecutor::new(Arc::clone(&config));
+
+    // SST with 3 versions of same key
+    let sst_path = sst_dir.join("00000001.sst");
+    let mut builder = SstBuilder::new(&sst_path, SstBuilderOptions::default()).unwrap();
+    builder.add(&mvcc_key(b"k", 30), b"v30").unwrap();
+    builder.add(&mvcc_key(b"k", 20), b"v20").unwrap();
+    builder.add(&mvcc_key(b"k", 10), b"v10").unwrap();
+    let meta = builder.finish(1, 0).unwrap();
+
+    let version = Version::builder().add_sst(meta).next_sst_id(2).build();
+    let task = CompactionTask {
+        inputs: vec![(0, 1)],
+        output_level: 1,
+        is_trivial_move: false,
+    };
+
+    let pre_allocated_ids = vec![2, 3];
+    let delta = tisql::io::block_on_sync(executor.execute(
+        &task,
+        &version,
+        &sst_dir,
+        &pre_allocated_ids,
+        IoService::new(32).unwrap(),
+        0, // gc_safe_point = 0 → no GC
+        true,
+    ))
+    .unwrap();
+
+    // Read output and count entries — all 3 should be preserved
+    let output_path = sst_dir.join(format!("{:08}.sst", delta.new_ssts[0].id));
+    let reader = tisql::io::block_on_sync(SstReaderRef::open(
+        &output_path,
+        IoService::new(32).unwrap(),
+    ))
+    .unwrap();
+    let mut iter = tisql::testkit::SstIterator::new(reader).unwrap();
+    tisql::io::block_on_sync(iter.seek_to_first()).unwrap();
+
+    let mut count = 0;
+    while iter.valid() {
+        count += 1;
+        tisql::io::block_on_sync(iter.advance()).unwrap();
+    }
+    assert_eq!(count, 3, "gc_safe_point=0 should preserve all 3 versions");
+}
+
+/// Test: versions below GC barrier are dropped, barrier + above kept.
+#[test]
+fn test_gc_drops_old_versions() {
+    let dir = TempDir::new().unwrap();
+    let sst_dir = dir.path().join("sst");
+    std::fs::create_dir_all(&sst_dir).unwrap();
+
+    let config = Arc::new(
+        LsmConfigBuilder::new(dir.path())
+            .target_file_size(1024 * 1024)
+            .build_unchecked(),
+    );
+    let executor = CompactionExecutor::new(Arc::clone(&config));
+
+    // key with versions at ts=30, 20, 10
+    let sst_path = sst_dir.join("00000001.sst");
+    let mut builder = SstBuilder::new(&sst_path, SstBuilderOptions::default()).unwrap();
+    builder.add(&mvcc_key(b"k", 30), b"v30").unwrap();
+    builder.add(&mvcc_key(b"k", 20), b"v20").unwrap();
+    builder.add(&mvcc_key(b"k", 10), b"v10").unwrap();
+    let meta = builder.finish(1, 0).unwrap();
+
+    let version = Version::builder().add_sst(meta).next_sst_id(2).build();
+    let task = CompactionTask {
+        inputs: vec![(0, 1)],
+        output_level: 1,
+        is_trivial_move: false,
+    };
+
+    // gc_safe_point=25: ts=30 is above, ts=20 is the GC barrier (keep), ts=10 is below (drop)
+    let pre_allocated_ids = vec![2, 3];
+    let delta = tisql::io::block_on_sync(executor.execute(
+        &task,
+        &version,
+        &sst_dir,
+        &pre_allocated_ids,
+        IoService::new(32).unwrap(),
+        25, // gc_safe_point = 25
+        true,
+    ))
+    .unwrap();
+
+    // Read output
+    let output_path = sst_dir.join(format!("{:08}.sst", delta.new_ssts[0].id));
+    let reader = tisql::io::block_on_sync(SstReaderRef::open(
+        &output_path,
+        IoService::new(32).unwrap(),
+    ))
+    .unwrap();
+    let mut iter = tisql::testkit::SstIterator::new(reader).unwrap();
+    tisql::io::block_on_sync(iter.seek_to_first()).unwrap();
+
+    let mut values = Vec::new();
+    while iter.valid() {
+        values.push(iter.value().to_vec());
+        tisql::io::block_on_sync(iter.advance()).unwrap();
+    }
+
+    // ts=30 (above safe point) + ts=20 (GC barrier) → keep 2, drop ts=10
+    assert_eq!(values.len(), 2, "Should keep 2 versions (above + barrier)");
+    assert_eq!(values[0], b"v30");
+    assert_eq!(values[1], b"v20");
+}
+
+/// Test: tombstone at bottommost level drops itself and all older versions.
+#[test]
+fn test_gc_tombstone_at_bottommost() {
+    let dir = TempDir::new().unwrap();
+    let sst_dir = dir.path().join("sst");
+    std::fs::create_dir_all(&sst_dir).unwrap();
+
+    let config = Arc::new(
+        LsmConfigBuilder::new(dir.path())
+            .target_file_size(1024 * 1024)
+            .build_unchecked(),
+    );
+    let executor = CompactionExecutor::new(Arc::clone(&config));
+
+    // key: ts=30 → value, ts=20 → TOMBSTONE, ts=10 → old value
+    let tombstone = tisql::storage::mvcc::TOMBSTONE;
+    let sst_path = sst_dir.join("00000001.sst");
+    let mut builder = SstBuilder::new(&sst_path, SstBuilderOptions::default()).unwrap();
+    builder.add(&mvcc_key(b"k", 30), b"v30").unwrap();
+    builder.add(&mvcc_key(b"k", 20), tombstone).unwrap();
+    builder.add(&mvcc_key(b"k", 10), b"v10").unwrap();
+    let meta = builder.finish(1, 0).unwrap();
+
+    let version = Version::builder().add_sst(meta).next_sst_id(2).build();
+    let task = CompactionTask {
+        inputs: vec![(0, 1)],
+        output_level: 1,
+        is_trivial_move: false,
+    };
+
+    // gc_safe_point=25: ts=30 above, ts=20 is barrier tombstone at bottommost → drop + skip ts=10
+    let pre_allocated_ids = vec![2, 3];
+    let delta = tisql::io::block_on_sync(executor.execute(
+        &task,
+        &version,
+        &sst_dir,
+        &pre_allocated_ids,
+        IoService::new(32).unwrap(),
+        25,
+        true, // is_bottommost
+    ))
+    .unwrap();
+
+    let output_path = sst_dir.join(format!("{:08}.sst", delta.new_ssts[0].id));
+    let reader = tisql::io::block_on_sync(SstReaderRef::open(
+        &output_path,
+        IoService::new(32).unwrap(),
+    ))
+    .unwrap();
+    let mut iter = tisql::testkit::SstIterator::new(reader).unwrap();
+    tisql::io::block_on_sync(iter.seek_to_first()).unwrap();
+
+    let mut values = Vec::new();
+    while iter.valid() {
+        values.push(iter.value().to_vec());
+        tisql::io::block_on_sync(iter.advance()).unwrap();
+    }
+
+    // Only ts=30 should survive: tombstone at barrier + bottommost → dropped, ts=10 also dropped
+    assert_eq!(
+        values.len(),
+        1,
+        "Tombstone at bottommost should drop itself + older"
+    );
+    assert_eq!(values[0], b"v30");
+}
+
+/// Test: tombstone at non-bottommost level is preserved (masks data at lower levels).
+#[test]
+fn test_gc_tombstone_not_bottommost() {
+    let dir = TempDir::new().unwrap();
+    let sst_dir = dir.path().join("sst");
+    std::fs::create_dir_all(&sst_dir).unwrap();
+
+    let config = Arc::new(
+        LsmConfigBuilder::new(dir.path())
+            .target_file_size(1024 * 1024)
+            .build_unchecked(),
+    );
+    let executor = CompactionExecutor::new(Arc::clone(&config));
+
+    let tombstone = tisql::storage::mvcc::TOMBSTONE;
+    let sst_path = sst_dir.join("00000001.sst");
+    let mut builder = SstBuilder::new(&sst_path, SstBuilderOptions::default()).unwrap();
+    builder.add(&mvcc_key(b"k", 30), b"v30").unwrap();
+    builder.add(&mvcc_key(b"k", 20), tombstone).unwrap();
+    builder.add(&mvcc_key(b"k", 10), b"v10").unwrap();
+    let meta = builder.finish(1, 0).unwrap();
+
+    let version = Version::builder().add_sst(meta).next_sst_id(2).build();
+    let task = CompactionTask {
+        inputs: vec![(0, 1)],
+        output_level: 1,
+        is_trivial_move: false,
+    };
+
+    // Same gc_safe_point=25, but NOT bottommost → tombstone preserved
+    let pre_allocated_ids = vec![2, 3];
+    let delta = tisql::io::block_on_sync(executor.execute(
+        &task,
+        &version,
+        &sst_dir,
+        &pre_allocated_ids,
+        IoService::new(32).unwrap(),
+        25,
+        false, // NOT bottommost
+    ))
+    .unwrap();
+
+    let output_path = sst_dir.join(format!("{:08}.sst", delta.new_ssts[0].id));
+    let reader = tisql::io::block_on_sync(SstReaderRef::open(
+        &output_path,
+        IoService::new(32).unwrap(),
+    ))
+    .unwrap();
+    let mut iter = tisql::testkit::SstIterator::new(reader).unwrap();
+    tisql::io::block_on_sync(iter.seek_to_first()).unwrap();
+
+    let mut values = Vec::new();
+    while iter.valid() {
+        values.push(iter.value().to_vec());
+        tisql::io::block_on_sync(iter.advance()).unwrap();
+    }
+
+    // ts=30 (above) + ts=20 tombstone (barrier, not bottommost → keep) = 2 entries
+    // ts=10 is below barrier → dropped
+    assert_eq!(
+        values.len(),
+        2,
+        "Tombstone at non-bottommost should be preserved (masks lower data)"
+    );
+    assert_eq!(values[0], b"v30");
+    assert_eq!(values[1], tombstone);
+}
+
+/// Test: multiple keys with different version patterns in one compaction.
+#[test]
+fn test_gc_mixed_keys() {
+    let dir = TempDir::new().unwrap();
+    let sst_dir = dir.path().join("sst");
+    std::fs::create_dir_all(&sst_dir).unwrap();
+
+    let config = Arc::new(
+        LsmConfigBuilder::new(dir.path())
+            .target_file_size(1024 * 1024)
+            .build_unchecked(),
+    );
+    let executor = CompactionExecutor::new(Arc::clone(&config));
+
+    let tombstone = tisql::storage::mvcc::TOMBSTONE;
+    let sst_path = sst_dir.join("00000001.sst");
+    let mut builder = SstBuilder::new(&sst_path, SstBuilderOptions::default()).unwrap();
+    // key "a": 3 versions, all above safe point → all kept
+    builder.add(&mvcc_key(b"a", 50), b"a50").unwrap();
+    builder.add(&mvcc_key(b"a", 40), b"a40").unwrap();
+    builder.add(&mvcc_key(b"a", 30), b"a30").unwrap();
+    // key "b": ts=50 above, ts=15 barrier value (keep), ts=5 below (drop)
+    builder.add(&mvcc_key(b"b", 50), b"b50").unwrap();
+    builder.add(&mvcc_key(b"b", 15), b"b15").unwrap();
+    builder.add(&mvcc_key(b"b", 5), b"b5").unwrap();
+    // key "c": ts=50 above, ts=10 barrier tombstone at bottommost → drop + ts=5 drop
+    builder.add(&mvcc_key(b"c", 50), b"c50").unwrap();
+    builder.add(&mvcc_key(b"c", 10), tombstone).unwrap();
+    builder.add(&mvcc_key(b"c", 5), b"c5").unwrap();
+    let meta = builder.finish(1, 0).unwrap();
+
+    let version = Version::builder().add_sst(meta).next_sst_id(2).build();
+    let task = CompactionTask {
+        inputs: vec![(0, 1)],
+        output_level: 1,
+        is_trivial_move: false,
+    };
+
+    // gc_safe_point=25, bottommost
+    let pre_allocated_ids = vec![2, 3];
+    let delta = tisql::io::block_on_sync(executor.execute(
+        &task,
+        &version,
+        &sst_dir,
+        &pre_allocated_ids,
+        IoService::new(32).unwrap(),
+        25,
+        true, // bottommost
+    ))
+    .unwrap();
+
+    let output_path = sst_dir.join(format!("{:08}.sst", delta.new_ssts[0].id));
+    let reader = tisql::io::block_on_sync(SstReaderRef::open(
+        &output_path,
+        IoService::new(32).unwrap(),
+    ))
+    .unwrap();
+    let mut iter = tisql::testkit::SstIterator::new(reader).unwrap();
+    tisql::io::block_on_sync(iter.seek_to_first()).unwrap();
+
+    let mut entries = Vec::new();
+    while iter.valid() {
+        entries.push((iter.key().to_vec(), iter.value().to_vec()));
+        tisql::io::block_on_sync(iter.advance()).unwrap();
+    }
+
+    // Expected:
+    // "a": 3 versions above safe_point=25 → all 3 kept
+    // "b": ts=50 (above) + ts=15 (barrier value) → 2 kept, ts=5 dropped
+    // "c": ts=50 (above) + ts=10 (barrier tombstone at bottommost → dropped) → 1 kept
+    assert_eq!(entries.len(), 6, "a:3 + b:2 + c:1 = 6 entries");
+
+    // Verify key "a" has 3 entries
+    let a_entries: Vec<_> = entries
+        .iter()
+        .filter(|(k, _)| k.starts_with(b"a"))
+        .collect();
+    assert_eq!(a_entries.len(), 3);
+
+    // Verify key "b" has 2 entries
+    let b_entries: Vec<_> = entries
+        .iter()
+        .filter(|(k, _)| k.starts_with(b"b"))
+        .collect();
+    assert_eq!(b_entries.len(), 2);
+    assert_eq!(b_entries[0].1, b"b50");
+    assert_eq!(b_entries[1].1, b"b15");
+
+    // Verify key "c" has 1 entry
+    let c_entries: Vec<_> = entries
+        .iter()
+        .filter(|(k, _)| k.starts_with(b"c"))
+        .collect();
+    assert_eq!(c_entries.len(), 1);
+    assert_eq!(c_entries[0].1, b"c50");
+}
+
+/// Test: `get_at()` returns correct values at all timestamps after GC compaction.
+#[test]
+fn test_gc_preserves_read_correctness() {
+    let dir = TempDir::new().unwrap();
+    let (engine, _ilog) = create_durable_engine(&dir);
+
+    // Write 6 versions of the same key across flushes
+    for version_num in 0..6 {
+        let ts = (version_num + 1) as Timestamp;
+        let mut batch = new_batch_with_lsn(ts, ts);
+        batch.put(
+            b"gc_key".to_vec(),
+            format!("version_{version_num}").into_bytes(),
+        );
+        engine.write_batch(batch).unwrap();
+        engine.flush_all_with_active().unwrap();
+    }
+
+    // Set GC safe point = 3: versions at ts=1,2 should be dropped after compaction,
+    // ts=3 becomes the barrier (kept), ts=4,5,6 above safe point (kept).
+    engine.set_gc_safe_point(3);
+
+    // Compact
+    let compacted = tisql::io::block_on_sync(engine.do_compaction()).unwrap();
+    assert!(compacted, "Should compact");
+
+    // Versions above safe point should still be readable
+    for ts in 3..=6 {
+        let value = get_at_for_test(&engine, b"gc_key", ts as Timestamp);
+        assert!(
+            value.is_some(),
+            "Version at ts={ts} should survive GC (>= safe_point)"
+        );
+    }
+
+    // Latest version should still be correct
+    let latest = get_for_test(&engine, b"gc_key");
+    assert_eq!(
+        latest,
+        Some(b"version_5".to_vec()),
+        "Latest version should be version_5"
+    );
+}
+
+/// Test: data flows to L2+ via cascading compaction, all keys survive.
+#[test]
+fn test_multi_level_cascading() {
+    let dir = TempDir::new().unwrap();
+    let lsn_provider = new_lsn_provider();
+    let ilog_config = IlogConfig::new(dir.path());
+    let ilog = Arc::new(IlogService::open(ilog_config, Arc::clone(&lsn_provider)).unwrap());
+
+    let config = LsmConfigBuilder::new(dir.path())
+        .memtable_size(200)
+        .max_frozen_memtables(32)
+        .l0_compaction_trigger(4)
+        .l0_slowdown_trigger(100)
+        .l0_stop_trigger(200)
+        .target_file_size(512)
+        .l1_max_size(1024) // Small L1 to trigger L1→L2 compaction
+        .build_unchecked();
+
+    let engine =
+        LsmEngine::open_with_recovery(config, lsn_provider, Arc::clone(&ilog), Version::new())
+            .unwrap();
+
+    // Set a GC safe point so GC runs during compaction
+    engine.set_gc_safe_point(5);
+
+    // Write enough data across many flushes to trigger cascading compaction
+    let mut ts = 1u64;
+    for round in 0..6 {
+        for i in 0..10 {
+            let mut batch = new_batch_with_lsn(ts, ts);
+            let key = format!("cascade_key_{i:03}");
+            let value = format!("round_{round}_val_{i}");
+            batch.put(key.into_bytes(), value.into_bytes());
+            engine.write_batch(batch).unwrap();
+            ts += 1;
+        }
+        engine.flush_all_with_active().unwrap();
+    }
+
+    // Run multiple rounds of compaction until no more work
+    let mut total_compactions = 0;
+    loop {
+        match tisql::io::block_on_sync(engine.do_compaction()) {
+            Ok(true) => total_compactions += 1,
+            Ok(false) => break,
+            Err(e) => panic!("Compaction error: {e}"),
+        }
+    }
+    assert!(
+        total_compactions >= 1,
+        "Should have compacted at least once"
+    );
+
+    // Verify all keys are readable with their latest values
+    for i in 0..10 {
+        let key = format!("cascade_key_{i:03}");
+        let value = get_for_test(&engine, key.as_bytes());
+        assert!(
+            value.is_some(),
+            "Key {key} should survive cascading compaction"
+        );
+        // Latest value is from round 5 (the last round)
+        assert_eq!(
+            value.unwrap(),
+            format!("round_5_val_{i}").into_bytes(),
+            "Latest value should be from last round"
+        );
+    }
+
+    // Verify data exists at multiple levels
+    let version = engine.current_version();
+    let total_files: usize = (0..7).map(|l| version.level_size(l)).sum();
+    assert!(
+        total_files > 0,
+        "Should have SST files after cascading compaction"
+    );
 }

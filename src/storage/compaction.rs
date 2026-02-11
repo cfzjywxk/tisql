@@ -48,9 +48,10 @@ use std::sync::Arc;
 use fail::fail_point;
 
 use crate::error::Result;
-use crate::types::RawValue;
+use crate::types::{RawValue, Timestamp};
 
 use super::config::LsmConfig;
+use super::mvcc::{decode_mvcc_key, is_tombstone};
 use super::sstable::{SstBuilder, SstBuilderOptions, SstIterator, SstMeta, SstReaderRef};
 use super::version::{ManifestDelta, Version};
 
@@ -65,6 +66,57 @@ pub struct CompactionTask {
 
     /// Whether this is a trivial move (no merge needed).
     pub is_trivial_move: bool,
+}
+
+impl CompactionTask {
+    /// Check whether the output of this compaction is at the bottommost level.
+    ///
+    /// A compaction is bottommost if no level below `output_level` has SSTs
+    /// whose key ranges overlap with the compaction's input key range.
+    /// At the bottommost level, tombstones and old versions below the GC
+    /// barrier can be safely dropped.
+    pub fn check_bottommost(&self, version: &Version, max_levels: usize) -> bool {
+        // Compute the MVCC key range from input SST metadata.
+        let (min_key, max_key) = {
+            let mut min_key: Option<&[u8]> = None;
+            let mut max_key: Option<&[u8]> = None;
+
+            for (level, sst_id) in &self.inputs {
+                let level_files = version.level(*level as usize);
+                if let Some(meta) = level_files.iter().find(|sst| sst.id == *sst_id) {
+                    match min_key {
+                        None => min_key = Some(&meta.smallest_key),
+                        Some(cur) if meta.smallest_key.as_slice() < cur => {
+                            min_key = Some(&meta.smallest_key);
+                        }
+                        _ => {}
+                    }
+                    match max_key {
+                        None => max_key = Some(&meta.largest_key),
+                        Some(cur) if meta.largest_key.as_slice() > cur => {
+                            max_key = Some(&meta.largest_key);
+                        }
+                        _ => {}
+                    }
+                }
+            }
+
+            match (min_key, max_key) {
+                (Some(min), Some(max)) => (min, max),
+                _ => return true, // No inputs → trivially bottommost
+            }
+        };
+
+        // Check every level below output_level for overlapping SSTs.
+        let output = self.output_level as usize;
+        for level in (output + 1)..max_levels {
+            let overlapping = version.find_overlapping_at_level_mvcc(level, min_key, max_key);
+            if !overlapping.is_empty() {
+                return false;
+            }
+        }
+        true
+    }
 }
 
 /// Compaction picker selects files for compaction.
@@ -365,7 +417,6 @@ impl MergeIterator {
     ///
     /// Note: This method extracts the key portion (removes timestamp suffix)
     /// to compare key prefixes.
-    #[allow(dead_code)]
     pub async fn skip_to_next_key(&mut self) -> Result<()> {
         let last_key_prefix = match &self.last_key {
             Some(k) if k.len() >= 8 => k[..k.len() - 8].to_vec(),
@@ -404,11 +455,18 @@ impl CompactionExecutor {
         Self { config }
     }
 
-    /// Execute a compaction task.
+    /// Execute a compaction task with optional MVCC garbage collection.
+    #[allow(clippy::too_many_arguments)]
     ///
     /// `pre_allocated_ids` contains SST IDs allocated by the caller (LsmEngine)
     /// for crash-safe compaction. These IDs are recorded in CompactIntent before
     /// execution begins, enabling orphan cleanup on crash recovery.
+    ///
+    /// `gc_safe_point`: versions below the GC barrier are dropped at the bottommost
+    /// level. A value of 0 disables GC (preserves all versions).
+    ///
+    /// `is_bottommost`: when true, tombstones at the GC barrier are dropped
+    /// (no data below to mask). When false, tombstones are preserved.
     ///
     /// Returns the manifest delta to apply on success.
     pub async fn execute(
@@ -418,6 +476,8 @@ impl CompactionExecutor {
         sst_dir: &Path,
         pre_allocated_ids: &[u64],
         io: std::sync::Arc<crate::io::IoService>,
+        gc_safe_point: Timestamp,
+        is_bottommost: bool,
     ) -> Result<ManifestDelta> {
         // Handle trivial move (just update metadata, no I/O)
         if task.is_trivial_move {
@@ -456,9 +516,15 @@ impl CompactionExecutor {
         };
         let mut builder = SstBuilder::new(&output_path, options.clone())?;
 
-        // Merge and write output
+        // Merge and write output with optional GC filtering
         let mut output_ssts = Vec::new();
         let mut current_size = 0usize;
+
+        // GC state machine (per user key group)
+        let gc_enabled = gc_safe_point > 0;
+        let mut current_user_key: Option<Vec<u8>> = None;
+        let mut found_gc_barrier = false;
+        let mut skip_remaining = false;
 
         while merge_iter.valid() {
             if let Some((key, value)) = merge_iter.current() {
@@ -466,36 +532,78 @@ impl CompactionExecutor {
                 #[cfg(feature = "failpoints")]
                 fail_point!("compaction_mid_write");
 
-                builder.add(&key, &value)?;
-                current_size += key.len() + value.len();
-
-                // Check if we should split to a new SST
-                if current_size >= self.config.target_file_size {
-                    let sst_id = pre_allocated_ids[id_idx];
-                    let meta = builder.finish(sst_id, task.output_level)?;
-                    output_ssts.push(meta);
-                    id_idx += 1;
-
-                    // Start new output file
-                    if id_idx >= pre_allocated_ids.len() {
-                        return Err(crate::error::TiSqlError::Storage(
-                            "Ran out of pre-allocated SST IDs during compaction".to_string(),
-                        ));
+                // GC filter: decide whether to emit or drop this entry
+                let should_emit = if !gc_enabled {
+                    true // No GC — emit everything
+                } else if let Some((user_key, ts)) = decode_mvcc_key(&key) {
+                    // Detect new user key → reset GC state
+                    let is_new_key = match &current_user_key {
+                        Some(prev) => prev.as_slice() != user_key.as_slice(),
+                        None => true,
+                    };
+                    if is_new_key {
+                        current_user_key = Some(user_key.clone());
+                        found_gc_barrier = false;
+                        skip_remaining = false;
                     }
-                    let new_id = pre_allocated_ids[id_idx];
-                    let new_path = sst_dir.join(format!("{new_id:08}.sst"));
-                    builder = SstBuilder::new(&new_path, options.clone())?;
-                    current_size = 0;
+
+                    if skip_remaining {
+                        false // Below GC barrier tombstone at bottommost — drop
+                    } else if ts > gc_safe_point {
+                        true // Above safe point — keep for active readers
+                    } else if !found_gc_barrier {
+                        // First version at or below safe point → GC barrier
+                        found_gc_barrier = true;
+                        if is_tombstone(&value) && is_bottommost {
+                            // Tombstone at bottommost → drop it and all older versions
+                            skip_remaining = true;
+                            false
+                        } else {
+                            // Stable version (or tombstone at non-bottommost) → keep
+                            true
+                        }
+                    } else {
+                        false // Below GC barrier — drop
+                    }
+                } else {
+                    true // Not a valid MVCC key — emit as-is
+                };
+
+                if should_emit {
+                    builder.add(&key, &value)?;
+                    current_size += key.len() + value.len();
+
+                    // Check if we should split to a new SST
+                    if current_size >= self.config.target_file_size {
+                        let sst_id = pre_allocated_ids[id_idx];
+                        let meta = builder.finish(sst_id, task.output_level)?;
+                        output_ssts.push(meta);
+                        id_idx += 1;
+
+                        // Start new output file
+                        if id_idx >= pre_allocated_ids.len() {
+                            return Err(crate::error::TiSqlError::Storage(
+                                "Ran out of pre-allocated SST IDs during compaction".to_string(),
+                            ));
+                        }
+                        let new_id = pre_allocated_ids[id_idx];
+                        let new_path = sst_dir.join(format!("{new_id:08}.sst"));
+                        builder = SstBuilder::new(&new_path, options.clone())?;
+                        current_size = 0;
+                    }
                 }
             }
             merge_iter.advance().await?;
         }
 
-        // Finish last output file
-        if current_size > 0 || output_ssts.is_empty() {
+        // Finish last output file (or handle empty output from GC)
+        if current_size > 0 {
             let sst_id = pre_allocated_ids[id_idx];
             let meta = builder.finish(sst_id, task.output_level)?;
             output_ssts.push(meta);
+        } else if output_ssts.is_empty() {
+            // GC dropped all entries — abort builder, return empty delta
+            builder.abort()?;
         } else {
             builder.abort()?;
         }
@@ -850,6 +958,8 @@ mod tests {
                 &config.sst_dir(),
                 &pre_allocated_ids,
                 test_io().await,
+                0, // gc_safe_point = 0 → no GC
+                false,
             )
             .await
             .unwrap();
@@ -1311,6 +1421,8 @@ mod tests {
                 &config.sst_dir(),
                 &pre_allocated_ids,
                 test_io().await,
+                0, // gc_safe_point = 0 → no GC
+                false,
             )
             .await
             .unwrap();

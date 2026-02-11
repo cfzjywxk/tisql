@@ -94,7 +94,7 @@ pub use version::{ManifestDelta, Version, VersionBuilder, MAX_LEVELS};
 pub use version_set::{SuperVersion, VersionSet};
 
 // Re-export LSM engine
-pub use lsm::{LsmEngine, LsmStats, TieredMergeIterator};
+pub use lsm::{LevelStats, LsmEngine, LsmStats, TieredMergeIterator};
 
 // Re-export flush scheduler
 pub use flush_scheduler::FlushScheduler;

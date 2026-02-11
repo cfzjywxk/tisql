@@ -61,9 +61,11 @@
 //!   current_txn = None  (keep txn)  current_txn = None
 //! ```
 
+use std::collections::HashMap;
 use std::sync::atomic::{AtomicU64, Ordering};
 
 use crate::transaction::{IsolationLevel, TxnCtx};
+use crate::types::Timestamp;
 
 // ============================================================================
 // Session ID Generator
@@ -83,6 +85,51 @@ pub fn alloc_session_id() -> u64 {
 /// Allocate a new unique statement context ID.
 fn alloc_stmt_ctx_id() -> u64 {
     STMT_CTX_ID_COUNTER.fetch_add(1, Ordering::Relaxed)
+}
+
+// ============================================================================
+// Session Registry — tracks active explicit transactions for GC safe point
+// ============================================================================
+
+/// Registry tracking active explicit transactions across all sessions.
+///
+/// Used to compute the GC safe point: versions older than the minimum
+/// active start_ts cannot be garbage collected because an active reader
+/// may still need them.
+pub struct SessionRegistry {
+    active_txns: parking_lot::RwLock<HashMap<u64, Timestamp>>,
+}
+
+impl SessionRegistry {
+    pub fn new() -> Self {
+        Self {
+            active_txns: parking_lot::RwLock::new(HashMap::new()),
+        }
+    }
+
+    /// Register an active explicit transaction for a session.
+    pub fn register(&self, session_id: u64, start_ts: Timestamp) {
+        self.active_txns.write().insert(session_id, start_ts);
+    }
+
+    /// Unregister a session's transaction (on COMMIT/ROLLBACK/disconnect).
+    pub fn unregister(&self, session_id: u64) {
+        self.active_txns.write().remove(&session_id);
+    }
+
+    /// Return the minimum start_ts among all active explicit transactions.
+    ///
+    /// Returns `None` if no explicit transactions are active.
+    pub fn min_start_ts(&self) -> Option<Timestamp> {
+        let guard = self.active_txns.read();
+        guard.values().copied().min()
+    }
+}
+
+impl Default for SessionRegistry {
+    fn default() -> Self {
+        Self::new()
+    }
 }
 
 // ============================================================================

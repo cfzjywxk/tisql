@@ -55,7 +55,7 @@ pub use catalog::Catalog;
 pub use clog::{AsyncClogService, ClogFsyncFuture, ClogService};
 pub use lsn::{new_lsn_provider, LsnProvider, SharedLsnProvider};
 pub use protocol::{MySqlServer, MYSQL_DEFAULT_PORT};
-pub use session::{ExecutionCtx, Priority, QueryCtx, Session, SessionVars};
+pub use session::{ExecutionCtx, Priority, QueryCtx, Session, SessionRegistry, SessionVars};
 pub use storage::{PessimisticStorage, StorageEngine};
 pub use transaction::{CommitInfo, TxnCtx, TxnService, TxnState};
 pub use tso::TsoService;
@@ -315,6 +315,8 @@ pub struct Database {
     /// Dedicated worker runtime for query execution (separate from protocol I/O).
     /// Created in `open()` for production; `None` in tests (falls back to tokio::spawn).
     worker_runtime: Option<tokio::runtime::Runtime>,
+    /// Registry of active explicit transactions for GC safe point computation.
+    session_registry: Arc<session::SessionRegistry>,
 }
 
 impl Database {
@@ -394,6 +396,25 @@ impl Database {
 
         log_info!("Worker runtime created with {} threads", worker_threads);
 
+        // Create session registry and wire GC safe point
+        let session_registry = Arc::new(session::SessionRegistry::new());
+
+        // Set initial GC safe point from TSO
+        let initial_gc_ts = tso.get_ts();
+        storage.set_gc_safe_point(initial_gc_ts);
+
+        // Wire GC safe point updater: computes safe_point from active sessions
+        {
+            let registry = Arc::clone(&session_registry);
+            let txn_svc = Arc::clone(&txn_service);
+            storage.set_gc_safe_point_updater(Arc::new(move || -> u64 {
+                match registry.min_start_ts() {
+                    Some(min_ts) if min_ts > 0 => min_ts - 1,
+                    _ => txn_svc.last_ts(),
+                }
+            }));
+        }
+
         Ok(Self {
             sql_engine: SQLEngine::new(),
             txn_service,
@@ -403,6 +424,7 @@ impl Database {
             flush_scheduler,
             compaction_scheduler,
             worker_runtime: Some(worker_runtime),
+            session_registry,
         })
     }
 
@@ -412,6 +434,11 @@ impl Database {
     /// When `None`, `dispatch_full_query` falls back to `tokio::spawn`.
     pub fn worker_handle(&self) -> Option<&tokio::runtime::Handle> {
         self.worker_runtime.as_ref().map(|rt| rt.handle())
+    }
+
+    /// Get the session registry for tracking active transactions.
+    pub fn session_registry(&self) -> &Arc<session::SessionRegistry> {
+        &self.session_registry
     }
 
     /// Handle MySQL protocol query text (COM_QUERY).
