@@ -8,10 +8,12 @@ A minimal SQL database in Rust with MySQL protocol support, designed for learnin
 ## Features
 
 - **MySQL Protocol**: Connect using any MySQL client
-- **SQL Support**: CREATE, INSERT, SELECT, UPDATE, DELETE
+- **SQL Support**: CREATE, INSERT, SELECT, UPDATE, DELETE with explicit transactions (BEGIN/COMMIT/ROLLBACK)
 - **MVCC**: Snapshot isolation with TiDB-compatible key encoding
-- **Durability**: LSM-tree storage with WAL (commit log)
-- **Concurrency**: Lock table with KeyHandle pattern (TiKV-style)
+- **Streaming Execution**: Volcano-style operator tree with end-to-end row streaming (zero materialization)
+- **Async I/O**: io_uring for SST reads (O_DIRECT, positional reads), async iterator pipeline
+- **Durability**: LSM-tree storage with WAL (commit log), group commit for batched fsync
+- **Concurrency**: OceanBase-style pessimistic locking with pending version nodes
 - **Recovery**: Crash-safe with coordinated clog/ilog recovery
 
 ## Quick Start
@@ -100,23 +102,25 @@ src/
 ├── lib.rs           # Public API: Database, traits
 ├── catalog/         # Table metadata (MVCC-based)
 ├── codec/           # TiDB-compatible key encoding
-├── clog/            # Commit log (WAL)
-├── executor/        # Volcano-style execution
+├── clog/            # Commit log (WAL) with group commit
+├── executor/        # Volcano-style operator tree (streaming)
+├── io/              # io_uring async I/O (O_DIRECT, AlignedBuf, DmaFile)
 ├── protocol/        # MySQL wire protocol
 ├── session/         # Per-connection state
 ├── sql/             # Parser, Binder
 ├── storage/         # LSM engine, memtables, SSTables
 ├── transaction/     # TxnService, ConcurrencyManager
 ├── tso/             # Timestamp oracle
-└── worker/          # yatp thread pool
+└── worker/          # Async worker dispatch (tokio::spawn)
 ```
 
 ## Design Highlights
 
 - **Trait-based layering**: Each layer depends on traits, not implementations
 - **TiDB/TiKV patterns**: MVCC key encoding, ConcurrencyManager, TSO
-- **OceanBase patterns**: Unified TxnService with TxnCtx context
-- **Zero-copy lock table**: KeyHandle pattern minimizes key cloning
+- **OceanBase patterns**: Unified TxnService with TxnCtx, pessimistic locking
+- **Zero materialization**: Rows stream from operator tree directly to MySQL wire — O(1) memory per row
+- **Async iterators**: All iterator seek/advance are async fn (native AFIT), yielding during SST I/O
 
 ## License
 
