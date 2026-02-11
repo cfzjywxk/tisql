@@ -57,7 +57,7 @@ fn get_at(engine: &VersionedMemTableEngine, key: &[u8], ts: Timestamp) -> Option
 
     let inner = engine.inner_arc();
     let mut iter = ArcVersionedMemTableIterator::new(inner, range, 0);
-    iter.advance().unwrap();
+    tisql::io::block_on_sync(iter.advance()).unwrap();
 
     while iter.valid() {
         if iter.user_key() == key && iter.timestamp() <= ts {
@@ -67,7 +67,7 @@ fn get_at(engine: &VersionedMemTableEngine, key: &[u8], ts: Timestamp) -> Option
             }
             return Some(value);
         }
-        iter.advance().unwrap();
+        tisql::io::block_on_sync(iter.advance()).unwrap();
     }
     None
 }
@@ -168,13 +168,13 @@ fn test_many_unique_keys() {
     let range = Arc::new(MvccKey::unbounded()..MvccKey::unbounded());
     let inner = engine.inner_arc();
     let mut iter = ArcVersionedMemTableIterator::new(inner, range, 0);
-    iter.advance().unwrap();
+    tisql::io::block_on_sync(iter.advance()).unwrap();
 
     let mut count = 0;
     while iter.valid() && count < 100 {
         let expected_key = format!("key_{count:08}");
         assert_eq!(iter.user_key(), expected_key.as_bytes());
-        iter.advance().unwrap();
+        tisql::io::block_on_sync(iter.advance()).unwrap();
         count += 1;
     }
     assert_eq!(count, 100);

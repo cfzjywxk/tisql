@@ -16,7 +16,7 @@
 //
 // Thin protocol layer: transaction control runs directly on the async task
 // (CPU-only). Query execution is dispatched to a worker task via
-// worker::dispatch_full_query which uses spawn_blocking for storage I/O.
+// worker::dispatch_full_query which awaits async storage I/O.
 
 use std::io;
 use std::sync::Arc;

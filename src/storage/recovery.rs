@@ -343,7 +343,7 @@ mod tests {
         let range = start..end;
 
         let mut iter = engine.scan_iter(range, 0).unwrap();
-        iter.advance().unwrap(); // Position on first entry
+        crate::io::block_on_sync(iter.advance()).unwrap(); // Position on first entry
 
         while iter.valid() {
             let decoded_key = iter.user_key();
@@ -354,7 +354,7 @@ mod tests {
                 }
                 return Some(iter.value().to_vec());
             }
-            iter.advance().unwrap();
+            crate::io::block_on_sync(iter.advance()).unwrap();
         }
         None
     }

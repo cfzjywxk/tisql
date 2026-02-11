@@ -407,11 +407,13 @@ mod persistence {
         // First session: create table and insert data
         {
             let db = Database::open(config.clone()).unwrap();
-            db.handle_mp_query("CREATE TABLE users (id INT PRIMARY KEY, name VARCHAR(100))")
+            tisql::io::block_on_sync(
+                db.handle_mp_query("CREATE TABLE users (id INT PRIMARY KEY, name VARCHAR(100))"),
+            )
+            .unwrap();
+            tisql::io::block_on_sync(db.handle_mp_query("INSERT INTO users VALUES (1, 'Alice')"))
                 .unwrap();
-            db.handle_mp_query("INSERT INTO users VALUES (1, 'Alice')")
-                .unwrap();
-            db.handle_mp_query("INSERT INTO users VALUES (2, 'Bob')")
+            tisql::io::block_on_sync(db.handle_mp_query("INSERT INTO users VALUES (2, 'Bob')"))
                 .unwrap();
             db.close().unwrap();
         }
@@ -421,7 +423,9 @@ mod persistence {
             let db = Database::open(config.clone()).unwrap();
 
             // Table should exist
-            let result = db.handle_mp_query("SELECT id, name FROM users ORDER BY id");
+            let result = tisql::io::block_on_sync(
+                db.handle_mp_query("SELECT id, name FROM users ORDER BY id"),
+            );
             match result {
                 Ok(QueryResult::Rows { data, columns }) => {
                     assert_eq!(columns, vec!["id", "name"]);
@@ -445,12 +449,14 @@ mod persistence {
         // First session: create multiple tables
         {
             let db = Database::open(config.clone()).unwrap();
-            db.handle_mp_query("CREATE TABLE t1 (a INT PRIMARY KEY)")
+            tisql::io::block_on_sync(db.handle_mp_query("CREATE TABLE t1 (a INT PRIMARY KEY)"))
                 .unwrap();
-            db.handle_mp_query("CREATE TABLE t2 (b INT PRIMARY KEY, c INT)")
-                .unwrap();
-            db.handle_mp_query("INSERT INTO t1 VALUES (100)").unwrap();
-            db.handle_mp_query("INSERT INTO t2 VALUES (200, 300)")
+            tisql::io::block_on_sync(
+                db.handle_mp_query("CREATE TABLE t2 (b INT PRIMARY KEY, c INT)"),
+            )
+            .unwrap();
+            tisql::io::block_on_sync(db.handle_mp_query("INSERT INTO t1 VALUES (100)")).unwrap();
+            tisql::io::block_on_sync(db.handle_mp_query("INSERT INTO t2 VALUES (200, 300)"))
                 .unwrap();
             db.close().unwrap();
         }
@@ -460,7 +466,7 @@ mod persistence {
             let db = Database::open(config.clone()).unwrap();
 
             // Check t1
-            let result = db.handle_mp_query("SELECT a FROM t1").unwrap();
+            let result = tisql::io::block_on_sync(db.handle_mp_query("SELECT a FROM t1")).unwrap();
             match result {
                 QueryResult::Rows { data, .. } => {
                     assert_eq!(data.len(), 1);
@@ -470,7 +476,8 @@ mod persistence {
             }
 
             // Check t2
-            let result = db.handle_mp_query("SELECT b, c FROM t2").unwrap();
+            let result =
+                tisql::io::block_on_sync(db.handle_mp_query("SELECT b, c FROM t2")).unwrap();
             match result {
                 QueryResult::Rows { data, .. } => {
                     assert_eq!(data.len(), 1);
@@ -491,14 +498,14 @@ mod persistence {
         // First session: create and drop a table
         {
             let db = Database::open(config.clone()).unwrap();
-            db.handle_mp_query("CREATE TABLE temp (x INT PRIMARY KEY)")
+            tisql::io::block_on_sync(db.handle_mp_query("CREATE TABLE temp (x INT PRIMARY KEY)"))
                 .unwrap();
-            db.handle_mp_query("INSERT INTO temp VALUES (1)").unwrap();
-            db.handle_mp_query("DROP TABLE temp").unwrap();
+            tisql::io::block_on_sync(db.handle_mp_query("INSERT INTO temp VALUES (1)")).unwrap();
+            tisql::io::block_on_sync(db.handle_mp_query("DROP TABLE temp")).unwrap();
             // Create another table to verify we can still create tables
-            db.handle_mp_query("CREATE TABLE perm (y INT PRIMARY KEY)")
+            tisql::io::block_on_sync(db.handle_mp_query("CREATE TABLE perm (y INT PRIMARY KEY)"))
                 .unwrap();
-            db.handle_mp_query("INSERT INTO perm VALUES (2)").unwrap();
+            tisql::io::block_on_sync(db.handle_mp_query("INSERT INTO perm VALUES (2)")).unwrap();
             db.close().unwrap();
         }
 
@@ -507,11 +514,12 @@ mod persistence {
             let db = Database::open(config.clone()).unwrap();
 
             // temp should not exist
-            let result = db.handle_mp_query("SELECT * FROM temp");
+            let result = tisql::io::block_on_sync(db.handle_mp_query("SELECT * FROM temp"));
             assert!(result.is_err(), "temp table should not exist after restart");
 
             // perm should exist
-            let result = db.handle_mp_query("SELECT y FROM perm").unwrap();
+            let result =
+                tisql::io::block_on_sync(db.handle_mp_query("SELECT y FROM perm")).unwrap();
             match result {
                 QueryResult::Rows { data, .. } => {
                     assert_eq!(data.len(), 1);
@@ -531,9 +539,9 @@ mod persistence {
         // First session: create tables
         {
             let db = Database::open(config.clone()).unwrap();
-            db.handle_mp_query("CREATE TABLE t1 (a INT PRIMARY KEY)")
+            tisql::io::block_on_sync(db.handle_mp_query("CREATE TABLE t1 (a INT PRIMARY KEY)"))
                 .unwrap();
-            db.handle_mp_query("CREATE TABLE t2 (b INT PRIMARY KEY)")
+            tisql::io::block_on_sync(db.handle_mp_query("CREATE TABLE t2 (b INT PRIMARY KEY)"))
                 .unwrap();
             db.close().unwrap();
         }
@@ -542,11 +550,11 @@ mod persistence {
         {
             let db = Database::open(config.clone()).unwrap();
             // This should succeed without ID conflict
-            db.handle_mp_query("CREATE TABLE t3 (c INT PRIMARY KEY)")
+            tisql::io::block_on_sync(db.handle_mp_query("CREATE TABLE t3 (c INT PRIMARY KEY)"))
                 .unwrap();
-            db.handle_mp_query("INSERT INTO t3 VALUES (333)").unwrap();
+            tisql::io::block_on_sync(db.handle_mp_query("INSERT INTO t3 VALUES (333)")).unwrap();
 
-            let result = db.handle_mp_query("SELECT c FROM t3").unwrap();
+            let result = tisql::io::block_on_sync(db.handle_mp_query("SELECT c FROM t3")).unwrap();
             match result {
                 QueryResult::Rows { data, .. } => {
                     assert_eq!(data.len(), 1);
@@ -568,14 +576,22 @@ mod persistence {
         // First session: write data and "crash" (no close)
         {
             let db = Database::open(config.clone()).unwrap();
-            db.handle_mp_query("CREATE TABLE crash_test (id INT PRIMARY KEY, data VARCHAR(100))")
-                .unwrap();
-            db.handle_mp_query("INSERT INTO crash_test VALUES (1, 'first')")
-                .unwrap();
-            db.handle_mp_query("INSERT INTO crash_test VALUES (2, 'second')")
-                .unwrap();
-            db.handle_mp_query("INSERT INTO crash_test VALUES (3, 'third')")
-                .unwrap();
+            tisql::io::block_on_sync(db.handle_mp_query(
+                "CREATE TABLE crash_test (id INT PRIMARY KEY, data VARCHAR(100))",
+            ))
+            .unwrap();
+            tisql::io::block_on_sync(
+                db.handle_mp_query("INSERT INTO crash_test VALUES (1, 'first')"),
+            )
+            .unwrap();
+            tisql::io::block_on_sync(
+                db.handle_mp_query("INSERT INTO crash_test VALUES (2, 'second')"),
+            )
+            .unwrap();
+            tisql::io::block_on_sync(
+                db.handle_mp_query("INSERT INTO crash_test VALUES (3, 'third')"),
+            )
+            .unwrap();
             // NO close() - simulate kill -9
             // Database is dropped here, but close() is not called
         }
@@ -584,9 +600,10 @@ mod persistence {
         {
             let db = Database::open(config.clone()).unwrap();
 
-            let result = db
-                .handle_mp_query("SELECT id, data FROM crash_test ORDER BY id")
-                .unwrap();
+            let result = tisql::io::block_on_sync(
+                db.handle_mp_query("SELECT id, data FROM crash_test ORDER BY id"),
+            )
+            .unwrap();
             match result {
                 QueryResult::Rows { data, columns } => {
                     assert_eq!(columns, vec!["id", "data"]);
@@ -613,21 +630,25 @@ mod persistence {
         // First session: create, insert, update, delete, then crash
         {
             let db = Database::open(config.clone()).unwrap();
-            db.handle_mp_query("CREATE TABLE modify_test (id INT PRIMARY KEY, value INT)")
+            tisql::io::block_on_sync(
+                db.handle_mp_query("CREATE TABLE modify_test (id INT PRIMARY KEY, value INT)"),
+            )
+            .unwrap();
+            tisql::io::block_on_sync(db.handle_mp_query("INSERT INTO modify_test VALUES (1, 100)"))
                 .unwrap();
-            db.handle_mp_query("INSERT INTO modify_test VALUES (1, 100)")
+            tisql::io::block_on_sync(db.handle_mp_query("INSERT INTO modify_test VALUES (2, 200)"))
                 .unwrap();
-            db.handle_mp_query("INSERT INTO modify_test VALUES (2, 200)")
-                .unwrap();
-            db.handle_mp_query("INSERT INTO modify_test VALUES (3, 300)")
+            tisql::io::block_on_sync(db.handle_mp_query("INSERT INTO modify_test VALUES (3, 300)"))
                 .unwrap();
 
             // Update id=2
-            db.handle_mp_query("UPDATE modify_test SET value = 999 WHERE id = 2")
-                .unwrap();
+            tisql::io::block_on_sync(
+                db.handle_mp_query("UPDATE modify_test SET value = 999 WHERE id = 2"),
+            )
+            .unwrap();
 
             // Delete id=1
-            db.handle_mp_query("DELETE FROM modify_test WHERE id = 1")
+            tisql::io::block_on_sync(db.handle_mp_query("DELETE FROM modify_test WHERE id = 1"))
                 .unwrap();
 
             // NO close() - crash
@@ -637,9 +658,10 @@ mod persistence {
         {
             let db = Database::open(config.clone()).unwrap();
 
-            let result = db
-                .handle_mp_query("SELECT id, value FROM modify_test ORDER BY id")
-                .unwrap();
+            let result = tisql::io::block_on_sync(
+                db.handle_mp_query("SELECT id, value FROM modify_test ORDER BY id"),
+            )
+            .unwrap();
             match result {
                 QueryResult::Rows { data, .. } => {
                     // Should have id=2 (updated) and id=3 (unchanged)
@@ -665,9 +687,11 @@ mod persistence {
         // Cycle 1: create and insert
         {
             let db = Database::open(config.clone()).unwrap();
-            db.handle_mp_query("CREATE TABLE cycle_test (id INT PRIMARY KEY)")
-                .unwrap();
-            db.handle_mp_query("INSERT INTO cycle_test VALUES (1)")
+            tisql::io::block_on_sync(
+                db.handle_mp_query("CREATE TABLE cycle_test (id INT PRIMARY KEY)"),
+            )
+            .unwrap();
+            tisql::io::block_on_sync(db.handle_mp_query("INSERT INTO cycle_test VALUES (1)"))
                 .unwrap();
             // crash - no close()
         }
@@ -677,9 +701,10 @@ mod persistence {
             let db = Database::open(config.clone()).unwrap();
 
             // Verify cycle 1 data
-            let result = db
-                .handle_mp_query("SELECT id FROM cycle_test ORDER BY id")
-                .unwrap();
+            let result = tisql::io::block_on_sync(
+                db.handle_mp_query("SELECT id FROM cycle_test ORDER BY id"),
+            )
+            .unwrap();
             match &result {
                 QueryResult::Rows { data, .. } => {
                     assert_eq!(data.len(), 1, "Should have 1 row from cycle 1");
@@ -688,9 +713,9 @@ mod persistence {
                 _ => panic!("Expected rows"),
             }
 
-            db.handle_mp_query("INSERT INTO cycle_test VALUES (2)")
+            tisql::io::block_on_sync(db.handle_mp_query("INSERT INTO cycle_test VALUES (2)"))
                 .unwrap();
-            db.handle_mp_query("INSERT INTO cycle_test VALUES (3)")
+            tisql::io::block_on_sync(db.handle_mp_query("INSERT INTO cycle_test VALUES (3)"))
                 .unwrap();
             // crash - no close()
         }
@@ -700,9 +725,10 @@ mod persistence {
             let db = Database::open(config.clone()).unwrap();
 
             // Verify cycle 1+2 data
-            let result = db
-                .handle_mp_query("SELECT id FROM cycle_test ORDER BY id")
-                .unwrap();
+            let result = tisql::io::block_on_sync(
+                db.handle_mp_query("SELECT id FROM cycle_test ORDER BY id"),
+            )
+            .unwrap();
             match &result {
                 QueryResult::Rows { data, .. } => {
                     assert_eq!(data.len(), 3, "Should have 3 rows from cycles 1+2");
@@ -713,7 +739,7 @@ mod persistence {
                 _ => panic!("Expected rows"),
             }
 
-            db.handle_mp_query("INSERT INTO cycle_test VALUES (4)")
+            tisql::io::block_on_sync(db.handle_mp_query("INSERT INTO cycle_test VALUES (4)"))
                 .unwrap();
             // crash - no close()
         }
@@ -722,9 +748,10 @@ mod persistence {
         {
             let db = Database::open(config.clone()).unwrap();
 
-            let result = db
-                .handle_mp_query("SELECT id FROM cycle_test ORDER BY id")
-                .unwrap();
+            let result = tisql::io::block_on_sync(
+                db.handle_mp_query("SELECT id FROM cycle_test ORDER BY id"),
+            )
+            .unwrap();
             match result {
                 QueryResult::Rows { data, .. } => {
                     assert_eq!(data.len(), 4, "Should have all 4 rows from 3 cycles");
@@ -748,13 +775,17 @@ mod persistence {
         // Create two tables
         {
             let db = Database::open(config.clone()).unwrap();
-            db.handle_mp_query("CREATE TABLE keep_me (x INT PRIMARY KEY)")
+            tisql::io::block_on_sync(
+                db.handle_mp_query("CREATE TABLE keep_me (x INT PRIMARY KEY)"),
+            )
+            .unwrap();
+            tisql::io::block_on_sync(db.handle_mp_query("INSERT INTO keep_me VALUES (42)"))
                 .unwrap();
-            db.handle_mp_query("INSERT INTO keep_me VALUES (42)")
-                .unwrap();
-            db.handle_mp_query("CREATE TABLE drop_me (y INT PRIMARY KEY)")
-                .unwrap();
-            db.handle_mp_query("INSERT INTO drop_me VALUES (99)")
+            tisql::io::block_on_sync(
+                db.handle_mp_query("CREATE TABLE drop_me (y INT PRIMARY KEY)"),
+            )
+            .unwrap();
+            tisql::io::block_on_sync(db.handle_mp_query("INSERT INTO drop_me VALUES (99)"))
                 .unwrap();
             db.close().unwrap();
         }
@@ -762,7 +793,7 @@ mod persistence {
         // Drop one table and crash
         {
             let db = Database::open(config.clone()).unwrap();
-            db.handle_mp_query("DROP TABLE drop_me").unwrap();
+            tisql::io::block_on_sync(db.handle_mp_query("DROP TABLE drop_me")).unwrap();
             // crash
         }
 
@@ -771,7 +802,8 @@ mod persistence {
             let db = Database::open(config.clone()).unwrap();
 
             // keep_me should exist
-            let result = db.handle_mp_query("SELECT x FROM keep_me").unwrap();
+            let result =
+                tisql::io::block_on_sync(db.handle_mp_query("SELECT x FROM keep_me")).unwrap();
             match result {
                 QueryResult::Rows { data, .. } => {
                     assert_eq!(data[0][0], "42");
@@ -780,7 +812,7 @@ mod persistence {
             }
 
             // drop_me should not exist
-            let result = db.handle_mp_query("SELECT * FROM drop_me");
+            let result = tisql::io::block_on_sync(db.handle_mp_query("SELECT * FROM drop_me"));
             assert!(
                 result.is_err(),
                 "drop_me should not exist after crash recovery"

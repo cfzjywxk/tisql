@@ -46,7 +46,7 @@ fn get_at_for_test(engine: &LsmEngine, key: &[u8], ts: Timestamp) -> Option<RawV
 
     // Use streaming scan_iter() - process one entry at a time
     let mut iter = engine.scan_iter(range, 0).unwrap();
-    iter.advance().unwrap(); // Position on first entry
+    tisql::io::block_on_sync(iter.advance()).unwrap(); // Position on first entry
 
     while iter.valid() {
         let decoded_key = iter.user_key();
@@ -58,7 +58,7 @@ fn get_at_for_test(engine: &LsmEngine, key: &[u8], ts: Timestamp) -> Option<RawV
             }
             return Some(value);
         }
-        iter.advance().unwrap();
+        tisql::io::block_on_sync(iter.advance()).unwrap();
     }
     None
 }
@@ -74,7 +74,7 @@ fn scan_for_test(engine: &LsmEngine, range: &std::ops::Range<Key>) -> Vec<(Key, 
 
     // Use streaming scan_iter() - process one entry at a time
     let mut iter = engine.scan_iter(mvcc_range, 0).unwrap();
-    iter.advance().unwrap(); // Position on first entry
+    tisql::io::block_on_sync(iter.advance()).unwrap(); // Position on first entry
 
     let mut seen_keys: std::collections::HashSet<Key> = std::collections::HashSet::new();
     let mut output = Vec::new();
@@ -84,7 +84,7 @@ fn scan_for_test(engine: &LsmEngine, range: &std::ops::Range<Key>) -> Vec<(Key, 
         let value = iter.value().to_vec();
 
         // Move to next before continue checks (so we don't get stuck)
-        iter.advance().unwrap();
+        tisql::io::block_on_sync(iter.advance()).unwrap();
 
         if decoded_key < range.start || decoded_key >= range.end {
             continue;
@@ -336,15 +336,14 @@ fn test_executor_merge_keys() {
 
     // Execute with pre-allocated IDs
     let pre_allocated_ids = vec![3, 4];
-    let delta = executor
-        .execute(
-            &task,
-            &version,
-            &sst_dir,
-            &pre_allocated_ids,
-            IoService::new(32).unwrap(),
-        )
-        .unwrap();
+    let delta = tisql::io::block_on_sync(executor.execute(
+        &task,
+        &version,
+        &sst_dir,
+        &pre_allocated_ids,
+        IoService::new(32).unwrap(),
+    ))
+    .unwrap();
 
     // Verify output
     assert!(!delta.new_ssts.is_empty(), "Should produce output SSTs");
@@ -353,14 +352,18 @@ fn test_executor_merge_keys() {
     // Read output SST and verify keys are merged in order
     let output_sst = &delta.new_ssts[0];
     let output_path = sst_dir.join(format!("{:08}.sst", output_sst.id));
-    let reader = SstReaderRef::open(&output_path, IoService::new(32).unwrap()).unwrap();
+    let reader = tisql::io::block_on_sync(SstReaderRef::open(
+        &output_path,
+        IoService::new(32).unwrap(),
+    ))
+    .unwrap();
     let mut iter = tisql::testkit::SstIterator::new(reader).unwrap();
-    iter.seek_to_first().unwrap();
+    tisql::io::block_on_sync(iter.seek_to_first()).unwrap();
 
     let mut keys = Vec::new();
     while iter.valid() {
         keys.push(iter.key().to_vec());
-        iter.advance().unwrap();
+        tisql::io::block_on_sync(iter.advance()).unwrap();
     }
 
     // Should be in sorted order: a, b, c, d, e, f
@@ -425,26 +428,29 @@ fn test_executor_mvcc_ordering() {
     };
 
     let pre_allocated_ids = vec![3, 4];
-    let delta = executor
-        .execute(
-            &task,
-            &version,
-            &sst_dir,
-            &pre_allocated_ids,
-            IoService::new(32).unwrap(),
-        )
-        .unwrap();
+    let delta = tisql::io::block_on_sync(executor.execute(
+        &task,
+        &version,
+        &sst_dir,
+        &pre_allocated_ids,
+        IoService::new(32).unwrap(),
+    ))
+    .unwrap();
 
     // Read and verify all versions are preserved in correct order
     let output_path = sst_dir.join(format!("{:08}.sst", delta.new_ssts[0].id));
-    let reader = SstReaderRef::open(&output_path, IoService::new(32).unwrap()).unwrap();
+    let reader = tisql::io::block_on_sync(SstReaderRef::open(
+        &output_path,
+        IoService::new(32).unwrap(),
+    ))
+    .unwrap();
     let mut iter = tisql::testkit::SstIterator::new(reader).unwrap();
-    iter.seek_to_first().unwrap();
+    tisql::io::block_on_sync(iter.seek_to_first()).unwrap();
 
     let mut values = Vec::new();
     while iter.valid() {
         values.push(iter.value().to_vec());
-        iter.advance().unwrap();
+        tisql::io::block_on_sync(iter.advance()).unwrap();
     }
 
     // All 3 versions should be preserved: v20, v10, v5 (in MVCC order)
@@ -493,26 +499,29 @@ fn test_executor_tombstones() {
     };
 
     let pre_allocated_ids = vec![3, 4];
-    let delta = executor
-        .execute(
-            &task,
-            &version,
-            &sst_dir,
-            &pre_allocated_ids,
-            IoService::new(32).unwrap(),
-        )
-        .unwrap();
+    let delta = tisql::io::block_on_sync(executor.execute(
+        &task,
+        &version,
+        &sst_dir,
+        &pre_allocated_ids,
+        IoService::new(32).unwrap(),
+    ))
+    .unwrap();
 
     // Both versions should be in output (MVCC preserves all)
     let output_path = sst_dir.join(format!("{:08}.sst", delta.new_ssts[0].id));
-    let reader = SstReaderRef::open(&output_path, IoService::new(32).unwrap()).unwrap();
+    let reader = tisql::io::block_on_sync(SstReaderRef::open(
+        &output_path,
+        IoService::new(32).unwrap(),
+    ))
+    .unwrap();
     let mut iter = tisql::testkit::SstIterator::new(reader).unwrap();
-    iter.seek_to_first().unwrap();
+    tisql::io::block_on_sync(iter.seek_to_first()).unwrap();
 
     let mut entries = Vec::new();
     while iter.valid() {
         entries.push((iter.key().to_vec(), iter.value().to_vec()));
-        iter.advance().unwrap();
+        tisql::io::block_on_sync(iter.advance()).unwrap();
     }
 
     assert_eq!(entries.len(), 2, "Both versions should be preserved");
@@ -846,7 +855,7 @@ fn test_do_compaction_no_work() {
     let dir = TempDir::new().unwrap();
     let (engine, _ilog) = create_durable_engine(&dir);
 
-    let result = engine.do_compaction().unwrap();
+    let result = tisql::io::block_on_sync(engine.do_compaction()).unwrap();
     assert!(!result, "Fresh engine should have nothing to compact");
 }
 
@@ -877,7 +886,7 @@ fn test_do_compaction_l0_to_l1() {
     );
 
     // Run compaction
-    let compacted = engine.do_compaction().unwrap();
+    let compacted = tisql::io::block_on_sync(engine.do_compaction()).unwrap();
     assert!(compacted, "Should have compacted L0 → L1");
 
     let stats_after = engine.stats();
@@ -931,7 +940,7 @@ fn test_do_compaction_deletes_old_ssts() {
     assert!(count_before >= 4, "Should have L0 SST files");
 
     // Compact
-    let compacted = engine.do_compaction().unwrap();
+    let compacted = tisql::io::block_on_sync(engine.do_compaction()).unwrap();
     assert!(compacted, "Should have compacted");
 
     // Count SST files after compaction
@@ -1006,7 +1015,7 @@ fn test_do_compaction_preserves_mvcc_versions() {
     }
 
     // Compact
-    let compacted = engine.do_compaction().unwrap();
+    let compacted = tisql::io::block_on_sync(engine.do_compaction()).unwrap();
     assert!(compacted, "Should compact");
 
     // Verify all historical versions still readable after compaction
@@ -1050,7 +1059,7 @@ fn test_do_compaction_with_ilog_recovery() {
         }
 
         // Compact
-        let compacted = engine.do_compaction().unwrap();
+        let compacted = tisql::io::block_on_sync(engine.do_compaction()).unwrap();
         assert!(compacted, "Should compact");
 
         // Write checkpoint to persist state
@@ -1112,7 +1121,7 @@ fn test_compaction_concurrent_read() {
     let sv_before = engine.get_super_version();
 
     // Run compaction
-    let compacted = engine.do_compaction().unwrap();
+    let compacted = tisql::io::block_on_sync(engine.do_compaction()).unwrap();
     assert!(compacted, "Should compact");
 
     // Old SuperVersion should still work for reading
@@ -1287,7 +1296,7 @@ fn test_do_compaction_delete_then_put() {
     }
 
     // Compact
-    let compacted = engine.do_compaction().unwrap();
+    let compacted = tisql::io::block_on_sync(engine.do_compaction()).unwrap();
     assert!(compacted, "Should compact");
 
     // Latest read should see "resurrected"
@@ -1334,7 +1343,7 @@ fn test_repeated_compaction() {
         engine.flush_all_with_active().unwrap();
     }
 
-    let compacted = engine.do_compaction().unwrap();
+    let compacted = tisql::io::block_on_sync(engine.do_compaction()).unwrap();
     assert!(compacted, "Round 1 should compact");
 
     // Round 2: Write more, flush, compact again
@@ -1349,7 +1358,7 @@ fn test_repeated_compaction() {
         engine.flush_all_with_active().unwrap();
     }
 
-    let compacted = engine.do_compaction().unwrap();
+    let compacted = tisql::io::block_on_sync(engine.do_compaction()).unwrap();
     assert!(compacted, "Round 2 should compact");
 
     // Verify data from both rounds
@@ -1389,7 +1398,7 @@ fn test_scan_after_compaction() {
     engine.flush_all_with_active().unwrap();
 
     // Compact
-    let compacted = engine.do_compaction().unwrap();
+    let compacted = tisql::io::block_on_sync(engine.do_compaction()).unwrap();
     assert!(compacted, "Should compact");
 
     // Full range scan
@@ -1484,7 +1493,7 @@ fn test_write_stall_e2e() {
     for t in 0..4u64 {
         for i in 0..50u64 {
             let key = format!("t{t}_key_{i:04}");
-            let val = engine.get(key.as_bytes()).unwrap();
+            let val = tisql::io::block_on_sync(engine.get(key.as_bytes())).unwrap();
             assert!(
                 val.is_some(),
                 "Key {key} missing after write stall e2e test"

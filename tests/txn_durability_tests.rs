@@ -41,7 +41,7 @@ fn get_value(engine: &LsmEngine, key: &[u8], read_ts: Timestamp) -> Option<Vec<u
     let range = seek_key..end_key;
 
     let mut iter = engine.scan_iter(range, 0).unwrap();
-    iter.advance().unwrap();
+    tisql::io::block_on_sync(iter.advance()).unwrap();
 
     while iter.valid() {
         let entry_key = iter.user_key();
@@ -53,7 +53,7 @@ fn get_value(engine: &LsmEngine, key: &[u8], read_ts: Timestamp) -> Option<Vec<u
             }
             return Some(value.to_vec());
         }
-        iter.advance().unwrap();
+        tisql::io::block_on_sync(iter.advance()).unwrap();
     }
     None
 }

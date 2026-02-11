@@ -201,14 +201,14 @@ impl SstIterator {
     }
 
     /// Seek to the first entry in the SST.
-    pub fn seek_to_first(&mut self) -> Result<()> {
+    pub async fn seek_to_first(&mut self) -> Result<()> {
         if self.num_blocks == 0 {
             self.block_state = None;
             return Ok(());
         }
 
         self.block_idx = 0;
-        self.load_block()?;
+        self.load_block().await?;
 
         if let Some(ref mut state) = self.block_state {
             state.seek_to_first();
@@ -218,14 +218,14 @@ impl SstIterator {
     }
 
     /// Seek to the last entry in the SST.
-    pub fn seek_to_last(&mut self) -> Result<()> {
+    pub async fn seek_to_last(&mut self) -> Result<()> {
         if self.num_blocks == 0 {
             self.block_state = None;
             return Ok(());
         }
 
         self.block_idx = self.num_blocks as usize - 1;
-        self.load_block()?;
+        self.load_block().await?;
 
         if let Some(ref mut state) = self.block_state {
             state.seek_to_last();
@@ -237,7 +237,7 @@ impl SstIterator {
     /// Seek to the first entry >= target key.
     ///
     /// If no such entry exists, the iterator becomes invalid.
-    pub fn seek(&mut self, target: &[u8]) -> Result<()> {
+    pub async fn seek(&mut self, target: &[u8]) -> Result<()> {
         if self.num_blocks == 0 {
             self.block_state = None;
             return Ok(());
@@ -246,7 +246,7 @@ impl SstIterator {
         // Find the block that may contain the target key
         let block_idx = self.reader.find_block(target)?;
         self.block_idx = block_idx;
-        self.load_block()?;
+        self.load_block().await?;
 
         if let Some(ref mut state) = self.block_state {
             state.seek(target);
@@ -254,7 +254,7 @@ impl SstIterator {
             // If the current block doesn't have a key >= target,
             // try the next block
             if !state.valid() {
-                self.next_block()?;
+                self.next_block().await?;
             }
         }
 
@@ -262,16 +262,16 @@ impl SstIterator {
     }
 
     /// Seek to the first entry > target key (seek for prev).
-    pub fn seek_for_prev(&mut self, target: &[u8]) -> Result<()> {
+    pub async fn seek_for_prev(&mut self, target: &[u8]) -> Result<()> {
         // First seek to target
-        self.seek(target)?;
+        self.seek(target).await?;
 
         if !self.valid() {
             // No key >= target, seek to last
-            self.seek_to_last()?;
+            self.seek_to_last().await?;
         } else if self.key() != target {
             // Current key > target, go to prev
-            self.prev()?;
+            self.prev().await?;
         }
 
         Ok(())
@@ -280,7 +280,7 @@ impl SstIterator {
     /// Move to the next entry.
     ///
     /// Note: This returns `Result` for I/O error handling, unlike `std::iter::Iterator`.
-    pub fn advance(&mut self) -> Result<()> {
+    pub async fn advance(&mut self) -> Result<()> {
         if !self.valid() {
             return Ok(());
         }
@@ -290,7 +290,7 @@ impl SstIterator {
 
             if !state.valid() {
                 // Current block exhausted, move to next block
-                self.next_block()?;
+                self.next_block().await?;
             }
         }
 
@@ -298,7 +298,7 @@ impl SstIterator {
     }
 
     /// Move to the previous entry.
-    pub fn prev(&mut self) -> Result<()> {
+    pub async fn prev(&mut self) -> Result<()> {
         if !self.valid() {
             return Ok(());
         }
@@ -308,7 +308,7 @@ impl SstIterator {
 
             if !state.valid() {
                 // Current block exhausted, move to previous block
-                self.prev_block()?;
+                self.prev_block().await?;
             }
         }
 
@@ -316,19 +316,19 @@ impl SstIterator {
     }
 
     /// Load the current block.
-    fn load_block(&mut self) -> Result<()> {
+    async fn load_block(&mut self) -> Result<()> {
         if self.block_idx >= self.num_blocks as usize {
             self.block_state = None;
             return Ok(());
         }
 
-        let block = self.reader.read_block(self.block_idx)?;
+        let block = self.reader.read_block(self.block_idx).await?;
         self.block_state = Some(BlockState::new(block));
         Ok(())
     }
 
     /// Move to the next block.
-    fn next_block(&mut self) -> Result<()> {
+    async fn next_block(&mut self) -> Result<()> {
         self.block_idx += 1;
 
         if self.block_idx >= self.num_blocks as usize {
@@ -336,7 +336,7 @@ impl SstIterator {
             return Ok(());
         }
 
-        self.load_block()?;
+        self.load_block().await?;
 
         if let Some(ref mut state) = self.block_state {
             state.seek_to_first();
@@ -346,14 +346,14 @@ impl SstIterator {
     }
 
     /// Move to the previous block.
-    fn prev_block(&mut self) -> Result<()> {
+    async fn prev_block(&mut self) -> Result<()> {
         if self.block_idx == 0 {
             self.block_state = None;
             return Ok(());
         }
 
         self.block_idx -= 1;
-        self.load_block()?;
+        self.load_block().await?;
 
         if let Some(ref mut state) = self.block_state {
             state.seek_to_last();
@@ -411,29 +411,29 @@ impl ConcatIterator {
     }
 
     /// Seek to the first entry.
-    pub fn seek_to_first(&mut self) -> Result<()> {
+    pub async fn seek_to_first(&mut self) -> Result<()> {
         self.sst_idx = 0;
-        self.load_current_sst()?;
+        self.load_current_sst().await?;
 
         // Skip empty SSTs
         while !self.valid() && self.sst_idx + 1 < self.readers.len() {
             self.sst_idx += 1;
-            self.load_current_sst()?;
+            self.load_current_sst().await?;
         }
 
         Ok(())
     }
 
     /// Seek to a specific key.
-    pub fn seek(&mut self, target: &[u8]) -> Result<()> {
+    pub async fn seek(&mut self, target: &[u8]) -> Result<()> {
         // Start from first SST and seek
         self.sst_idx = 0;
 
         while self.sst_idx < self.readers.len() {
-            self.load_current_sst()?;
+            self.load_current_sst().await?;
 
             if let Some(ref mut current) = self.current {
-                current.seek(target)?;
+                current.seek(target).await?;
                 if current.valid() {
                     return Ok(());
                 }
@@ -450,33 +450,33 @@ impl ConcatIterator {
     /// Move to the next entry.
     ///
     /// Note: This returns `Result` for I/O error handling, unlike `std::iter::Iterator`.
-    pub fn advance(&mut self) -> Result<()> {
+    pub async fn advance(&mut self) -> Result<()> {
         if !self.valid() {
             return Ok(());
         }
 
         if let Some(ref mut current) = self.current {
-            current.advance()?;
+            current.advance().await?;
         }
 
         // If current SST exhausted, move to next
         while !self.valid() && self.sst_idx + 1 < self.readers.len() {
             self.sst_idx += 1;
-            self.load_current_sst()?;
+            self.load_current_sst().await?;
         }
 
         Ok(())
     }
 
     /// Load the iterator for the current SST and position at first entry.
-    fn load_current_sst(&mut self) -> Result<()> {
+    async fn load_current_sst(&mut self) -> Result<()> {
         if self.sst_idx >= self.readers.len() {
             self.current = None;
             return Ok(());
         }
 
         let mut iter = SstIterator::new(self.readers[self.sst_idx].clone())?;
-        iter.seek_to_first()?; // Position the iterator
+        iter.seek_to_first().await?; // Position the iterator
         self.current = Some(iter);
         Ok(())
     }
@@ -568,28 +568,28 @@ impl SstMvccIterator {
 }
 
 impl MvccIterator for SstMvccIterator {
-    fn seek(&mut self, target: &MvccKey) -> Result<()> {
+    async fn seek(&mut self, target: &MvccKey) -> Result<()> {
         // If seeking to unbounded target, use range start instead.
         // This ensures we position within the range, not at the beginning of the SST.
         // The VersionedMemTableIterator handles this similarly in its seek() method.
         if target.is_unbounded() && !self.range.start.is_unbounded() {
-            self.inner.seek(self.range.start.as_bytes())
+            self.inner.seek(self.range.start.as_bytes()).await
         } else {
-            self.inner.seek(target.as_bytes())
+            self.inner.seek(target.as_bytes()).await
         }
     }
 
-    fn advance(&mut self) -> Result<()> {
+    async fn advance(&mut self) -> Result<()> {
         // If not yet positioned, seek to range start first
         if !self.inner.valid() {
             if self.range.start.is_unbounded() {
-                self.inner.seek_to_first()?;
+                self.inner.seek_to_first().await?;
             } else {
-                self.inner.seek(self.range.start.as_bytes())?;
+                self.inner.seek(self.range.start.as_bytes()).await?;
             }
             return Ok(());
         }
-        self.inner.advance()
+        self.inner.advance().await
     }
 
     fn valid(&self) -> bool {
@@ -627,7 +627,7 @@ mod tests {
     use crate::storage::sstable::builder::{SstBuilder, SstBuilderOptions};
     use tempfile::tempdir;
 
-    fn test_io() -> std::sync::Arc<crate::io::IoService> {
+    async fn test_io() -> std::sync::Arc<crate::io::IoService> {
         crate::io::IoService::new(32).unwrap()
     }
 
@@ -639,7 +639,7 @@ mod tests {
     }
 
     // Helper to create an SST file with test data
-    fn create_test_sst(
+    async fn create_test_sst(
         path: &std::path::Path,
         entries: &[(&[u8], &[u8])],
     ) -> crate::error::Result<SstReaderRef> {
@@ -648,11 +648,11 @@ mod tests {
             builder.add(key, value)?;
         }
         builder.finish(1, 0)?;
-        SstReaderRef::open(path, test_io())
+        SstReaderRef::open(path, test_io().await).await
     }
 
     // Helper to create an SST with sequential keys
-    fn create_sequential_sst(
+    async fn create_sequential_sst(
         path: &std::path::Path,
         start: usize,
         count: usize,
@@ -664,53 +664,53 @@ mod tests {
             builder.add(key.as_bytes(), value.as_bytes())?;
         }
         builder.finish(1, 0)?;
-        SstReaderRef::open(path, test_io())
+        SstReaderRef::open(path, test_io().await).await
     }
 
     // ------------------------------------------------------------------------
     // SstIterator Tests
     // ------------------------------------------------------------------------
 
-    #[test]
-    fn test_iterator_empty_sst() {
+    #[tokio::test]
+    async fn test_iterator_empty_sst() {
         let dir = tempdir().unwrap();
         let path = dir.path().join("empty.sst");
 
         let builder = SstBuilder::new(&path, SstBuilderOptions::default()).unwrap();
         builder.finish(1, 0).unwrap();
 
-        let reader = SstReaderRef::open(&path, test_io()).unwrap();
+        let reader = SstReaderRef::open(&path, test_io().await).await.unwrap();
         let mut iter = SstIterator::new(reader).unwrap();
-        iter.seek_to_first().unwrap(); // Position the iterator
+        iter.seek_to_first().await.unwrap(); // Position the iterator
 
         assert!(!iter.valid());
     }
 
-    #[test]
-    fn test_iterator_single_entry() {
+    #[tokio::test]
+    async fn test_iterator_single_entry() {
         let dir = tempdir().unwrap();
         let path = dir.path().join("single.sst");
 
         let key = b"key".to_vec();
         let value = b"value".to_vec();
-        let reader = create_test_sst(&path, &[(&key, &value)]).unwrap();
+        let reader = create_test_sst(&path, &[(&key, &value)]).await.unwrap();
 
         let mut iter = SstIterator::new(reader).unwrap();
-        iter.seek_to_first().unwrap(); // Position the iterator
+        iter.seek_to_first().await.unwrap(); // Position the iterator
 
         assert!(iter.valid());
         assert_eq!(iter.key(), key.as_slice());
         assert_eq!(iter.value(), value.as_slice());
     }
 
-    #[test]
-    fn test_iterator_multiple_entries() {
+    #[tokio::test]
+    async fn test_iterator_multiple_entries() {
         let dir = tempdir().unwrap();
         let path = dir.path().join("multi.sst");
 
-        let reader = create_sequential_sst(&path, 0, 10).unwrap();
+        let reader = create_sequential_sst(&path, 0, 10).await.unwrap();
         let mut iter = SstIterator::new(reader).unwrap();
-        iter.seek_to_first().unwrap(); // Position the iterator
+        iter.seek_to_first().await.unwrap(); // Position the iterator
 
         let mut count = 0;
         while iter.valid() {
@@ -718,92 +718,92 @@ mod tests {
             let expected_value = format!("value_{count:05}");
             assert_eq!(iter.key(), expected_key.as_bytes());
             assert_eq!(iter.value(), expected_value.as_bytes());
-            iter.advance().unwrap();
+            iter.advance().await.unwrap();
             count += 1;
         }
 
         assert_eq!(count, 10);
     }
 
-    #[test]
-    fn test_iterator_seek_to_first() {
+    #[tokio::test]
+    async fn test_iterator_seek_to_first() {
         let dir = tempdir().unwrap();
         let path = dir.path().join("seek_first.sst");
 
-        let reader = create_sequential_sst(&path, 0, 10).unwrap();
+        let reader = create_sequential_sst(&path, 0, 10).await.unwrap();
         let mut iter = SstIterator::new(reader).unwrap();
-        iter.seek_to_first().unwrap(); // Position the iterator
+        iter.seek_to_first().await.unwrap(); // Position the iterator
 
         // Move forward
-        iter.advance().unwrap();
-        iter.advance().unwrap();
+        iter.advance().await.unwrap();
+        iter.advance().await.unwrap();
         assert_eq!(iter.key(), b"key_00002".as_slice());
 
         // Seek to first
-        iter.seek_to_first().unwrap();
+        iter.seek_to_first().await.unwrap();
         assert!(iter.valid());
         assert_eq!(iter.key(), b"key_00000".as_slice());
     }
 
-    #[test]
-    fn test_iterator_seek_to_last() {
+    #[tokio::test]
+    async fn test_iterator_seek_to_last() {
         let dir = tempdir().unwrap();
         let path = dir.path().join("seek_last.sst");
 
-        let reader = create_sequential_sst(&path, 0, 10).unwrap();
+        let reader = create_sequential_sst(&path, 0, 10).await.unwrap();
         let mut iter = SstIterator::new(reader).unwrap();
         // No need to seek_to_first - we're testing seek_to_last
 
-        iter.seek_to_last().unwrap();
+        iter.seek_to_last().await.unwrap();
         assert!(iter.valid());
         assert_eq!(iter.key(), b"key_00009".as_slice());
     }
 
-    #[test]
-    fn test_iterator_seek() {
+    #[tokio::test]
+    async fn test_iterator_seek() {
         let dir = tempdir().unwrap();
         let path = dir.path().join("seek.sst");
 
-        let reader = create_sequential_sst(&path, 0, 10).unwrap();
+        let reader = create_sequential_sst(&path, 0, 10).await.unwrap();
         let mut iter = SstIterator::new(reader).unwrap();
         // No need to seek_to_first - we're testing seek
 
         // Seek to existing key
-        iter.seek(b"key_00005").unwrap();
+        iter.seek(b"key_00005").await.unwrap();
         assert!(iter.valid());
         assert_eq!(iter.key(), b"key_00005".as_slice());
 
         // Seek to non-existing key (between 5 and 6)
-        iter.seek(b"key_00005z").unwrap();
+        iter.seek(b"key_00005z").await.unwrap();
         assert!(iter.valid());
         assert_eq!(iter.key(), b"key_00006".as_slice());
 
         // Seek to key before all
-        iter.seek(b"aaa").unwrap();
+        iter.seek(b"aaa").await.unwrap();
         assert!(iter.valid());
         assert_eq!(iter.key(), b"key_00000".as_slice());
 
         // Seek to key after all
-        iter.seek(b"zzz").unwrap();
+        iter.seek(b"zzz").await.unwrap();
         assert!(!iter.valid());
     }
 
-    #[test]
-    fn test_iterator_prev() {
+    #[tokio::test]
+    async fn test_iterator_prev() {
         let dir = tempdir().unwrap();
         let path = dir.path().join("prev.sst");
 
-        let reader = create_sequential_sst(&path, 0, 10).unwrap();
+        let reader = create_sequential_sst(&path, 0, 10).await.unwrap();
         let mut iter = SstIterator::new(reader).unwrap();
 
         // Go to last and iterate backwards
-        iter.seek_to_last().unwrap();
+        iter.seek_to_last().await.unwrap();
 
         let mut count = 9;
         while iter.valid() {
             let expected_key = format!("key_{count:05}");
             assert_eq!(iter.key(), expected_key.as_bytes());
-            iter.prev().unwrap();
+            iter.prev().await.unwrap();
             if count == 0 {
                 break;
             }
@@ -813,8 +813,8 @@ mod tests {
         assert_eq!(count, 0);
     }
 
-    #[test]
-    fn test_iterator_multiple_blocks() {
+    #[tokio::test]
+    async fn test_iterator_multiple_blocks() {
         let dir = tempdir().unwrap();
         let path = dir.path().join("multiblock.sst");
 
@@ -829,27 +829,27 @@ mod tests {
         }
         builder.finish(1, 0).unwrap();
 
-        let reader = SstReaderRef::open(&path, test_io()).unwrap();
+        let reader = SstReaderRef::open(&path, test_io().await).await.unwrap();
         let mut iter = SstIterator::new(reader).unwrap();
-        iter.seek_to_first().unwrap(); // Position the iterator
+        iter.seek_to_first().await.unwrap(); // Position the iterator
 
         // Iterate forward through all blocks
         let mut count = 0;
         while iter.valid() {
             let expected_key = format!("key_{count:05}");
             assert_eq!(iter.key(), expected_key.as_bytes());
-            iter.advance().unwrap();
+            iter.advance().await.unwrap();
             count += 1;
         }
         assert_eq!(count, 100);
 
         // Iterate backward
-        iter.seek_to_last().unwrap();
+        iter.seek_to_last().await.unwrap();
         count = 99;
         while iter.valid() {
             let expected_key = format!("key_{count:05}");
             assert_eq!(iter.key(), expected_key.as_bytes());
-            iter.prev().unwrap();
+            iter.prev().await.unwrap();
             if count == 0 {
                 break;
             }
@@ -857,8 +857,8 @@ mod tests {
         }
     }
 
-    #[test]
-    fn test_iterator_seek_multiblock() {
+    #[tokio::test]
+    async fn test_iterator_seek_multiblock() {
         let dir = tempdir().unwrap();
         let path = dir.path().join("seek_multiblock.sst");
 
@@ -872,20 +872,20 @@ mod tests {
         }
         builder.finish(1, 0).unwrap();
 
-        let reader = SstReaderRef::open(&path, test_io()).unwrap();
+        let reader = SstReaderRef::open(&path, test_io().await).await.unwrap();
         let mut iter = SstIterator::new(reader).unwrap();
 
         // Seek to various keys across blocks
         for target in [0, 25, 50, 75, 99] {
             let key = format!("key_{target:05}");
-            iter.seek(key.as_bytes()).unwrap();
+            iter.seek(key.as_bytes()).await.unwrap();
             assert!(iter.valid(), "Failed for target {target}");
             assert_eq!(iter.key(), key.as_bytes());
         }
     }
 
-    #[test]
-    fn test_iterator_mvcc_keys() {
+    #[tokio::test]
+    async fn test_iterator_mvcc_keys() {
         let dir = tempdir().unwrap();
         let path = dir.path().join("mvcc.sst");
 
@@ -902,18 +902,18 @@ mod tests {
         }
         builder.finish(1, 0).unwrap();
 
-        let reader = SstReaderRef::open(&path, test_io()).unwrap();
+        let reader = SstReaderRef::open(&path, test_io().await).await.unwrap();
         let mut iter = SstIterator::new(reader).unwrap();
-        iter.seek_to_first().unwrap(); // Position the iterator
+        iter.seek_to_first().await.unwrap(); // Position the iterator
 
         // Verify order
         assert!(iter.valid());
         assert_eq!(iter.key(), entries[0].0.as_slice());
-        iter.advance().unwrap();
+        iter.advance().await.unwrap();
         assert_eq!(iter.key(), entries[1].0.as_slice());
-        iter.advance().unwrap();
+        iter.advance().await.unwrap();
         assert_eq!(iter.key(), entries[2].0.as_slice());
-        iter.advance().unwrap();
+        iter.advance().await.unwrap();
         assert!(!iter.valid());
     }
 
@@ -921,104 +921,117 @@ mod tests {
     // ConcatIterator Tests
     // ------------------------------------------------------------------------
 
-    #[test]
-    fn test_concat_iterator_empty() {
+    #[tokio::test]
+    async fn test_concat_iterator_empty() {
         let mut iter = ConcatIterator::new(vec![]).unwrap();
-        iter.seek_to_first().unwrap(); // Position the iterator
+        iter.seek_to_first().await.unwrap(); // Position the iterator
         assert!(!iter.valid());
     }
 
-    #[test]
-    fn test_concat_iterator_single_sst() {
+    #[tokio::test]
+    async fn test_concat_iterator_single_sst() {
         let dir = tempdir().unwrap();
         let path = dir.path().join("concat_single.sst");
 
-        let reader = create_sequential_sst(&path, 0, 10).unwrap();
+        let reader = create_sequential_sst(&path, 0, 10).await.unwrap();
         let mut iter = ConcatIterator::new(vec![reader]).unwrap();
-        iter.seek_to_first().unwrap(); // Position the iterator
+        iter.seek_to_first().await.unwrap(); // Position the iterator
 
         let mut count = 0;
         while iter.valid() {
             let expected_key = format!("key_{count:05}");
             assert_eq!(iter.key(), expected_key.as_bytes());
-            iter.advance().unwrap();
+            iter.advance().await.unwrap();
             count += 1;
         }
         assert_eq!(count, 10);
     }
 
-    #[test]
-    fn test_concat_iterator_multiple_ssts() {
+    #[tokio::test]
+    async fn test_concat_iterator_multiple_ssts() {
         let dir = tempdir().unwrap();
 
         // Create three non-overlapping SSTs
-        let reader1 = create_sequential_sst(&dir.path().join("sst1.sst"), 0, 10).unwrap();
-        let reader2 = create_sequential_sst(&dir.path().join("sst2.sst"), 10, 10).unwrap();
-        let reader3 = create_sequential_sst(&dir.path().join("sst3.sst"), 20, 10).unwrap();
+        let reader1 = create_sequential_sst(&dir.path().join("sst1.sst"), 0, 10)
+            .await
+            .unwrap();
+        let reader2 = create_sequential_sst(&dir.path().join("sst2.sst"), 10, 10)
+            .await
+            .unwrap();
+        let reader3 = create_sequential_sst(&dir.path().join("sst3.sst"), 20, 10)
+            .await
+            .unwrap();
 
         let mut iter = ConcatIterator::new(vec![reader1, reader2, reader3]).unwrap();
-        iter.seek_to_first().unwrap(); // Position the iterator
+        iter.seek_to_first().await.unwrap(); // Position the iterator
 
         // Should iterate through all 30 entries in order
         let mut count = 0;
         while iter.valid() {
             let expected_key = format!("key_{count:05}");
             assert_eq!(iter.key(), expected_key.as_bytes());
-            iter.advance().unwrap();
+            iter.advance().await.unwrap();
             count += 1;
         }
         assert_eq!(count, 30);
     }
 
-    #[test]
-    fn test_concat_iterator_seek() {
+    #[tokio::test]
+    async fn test_concat_iterator_seek() {
         let dir = tempdir().unwrap();
 
-        let reader1 = create_sequential_sst(&dir.path().join("sst1.sst"), 0, 10).unwrap();
-        let reader2 = create_sequential_sst(&dir.path().join("sst2.sst"), 10, 10).unwrap();
+        let reader1 = create_sequential_sst(&dir.path().join("sst1.sst"), 0, 10)
+            .await
+            .unwrap();
+        let reader2 = create_sequential_sst(&dir.path().join("sst2.sst"), 10, 10)
+            .await
+            .unwrap();
 
         let mut iter = ConcatIterator::new(vec![reader1, reader2]).unwrap();
         // No need to seek_to_first - we're testing seek
 
         // Seek to key in first SST
-        iter.seek(b"key_00005").unwrap();
+        iter.seek(b"key_00005").await.unwrap();
         assert!(iter.valid());
         assert_eq!(iter.key(), b"key_00005".as_slice());
 
         // Seek to key in second SST
-        iter.seek(b"key_00015").unwrap();
+        iter.seek(b"key_00015").await.unwrap();
         assert!(iter.valid());
         assert_eq!(iter.key(), b"key_00015".as_slice());
     }
 
-    #[test]
-    fn test_concat_iterator_with_empty_sst() {
+    #[tokio::test]
+    async fn test_concat_iterator_with_empty_sst() {
         let dir = tempdir().unwrap();
 
         // Create an empty SST
         let empty_path = dir.path().join("empty.sst");
         let builder = SstBuilder::new(&empty_path, SstBuilderOptions::default()).unwrap();
         builder.finish(1, 0).unwrap();
-        let empty_reader = SstReaderRef::open(&empty_path, test_io()).unwrap();
+        let empty_reader = SstReaderRef::open(&empty_path, test_io().await)
+            .await
+            .unwrap();
 
         // Create a non-empty SST
-        let non_empty_reader =
-            create_sequential_sst(&dir.path().join("nonempty.sst"), 0, 5).unwrap();
+        let non_empty_reader = create_sequential_sst(&dir.path().join("nonempty.sst"), 0, 5)
+            .await
+            .unwrap();
 
         // Empty first, then non-empty
         let mut iter =
             ConcatIterator::new(vec![empty_reader.clone(), non_empty_reader.clone()]).unwrap();
-        iter.seek_to_first().unwrap(); // Position the iterator
+        iter.seek_to_first().await.unwrap(); // Position the iterator
         assert!(iter.valid());
         assert_eq!(iter.key(), b"key_00000".as_slice());
 
         // Non-empty first, then empty
         let mut iter = ConcatIterator::new(vec![non_empty_reader, empty_reader]).unwrap();
-        iter.seek_to_first().unwrap(); // Position the iterator
+        iter.seek_to_first().await.unwrap(); // Position the iterator
         let mut count = 0;
         while iter.valid() {
             count += 1;
-            iter.advance().unwrap();
+            iter.advance().await.unwrap();
         }
         assert_eq!(count, 5);
     }
@@ -1027,92 +1040,92 @@ mod tests {
     // SstIterator Additional Coverage Tests
     // ------------------------------------------------------------------------
 
-    #[test]
-    fn test_iterator_not_positioned_after_new() {
+    #[tokio::test]
+    async fn test_iterator_not_positioned_after_new() {
         let dir = tempdir().unwrap();
         let path = dir.path().join("test.sst");
 
-        let reader = create_sequential_sst(&path, 0, 5).unwrap();
+        let reader = create_sequential_sst(&path, 0, 5).await.unwrap();
         let iter = SstIterator::new(reader).unwrap();
 
         // Iterator should not be valid until positioned
         assert!(!iter.valid());
     }
 
-    #[test]
-    fn test_iterator_advance_when_not_valid() {
+    #[tokio::test]
+    async fn test_iterator_advance_when_not_valid() {
         let dir = tempdir().unwrap();
         let path = dir.path().join("test.sst");
 
-        let reader = create_sequential_sst(&path, 0, 3).unwrap();
+        let reader = create_sequential_sst(&path, 0, 3).await.unwrap();
         let mut iter = SstIterator::new(reader).unwrap();
 
         // Advance on invalid iterator should be no-op
-        iter.advance().unwrap();
+        iter.advance().await.unwrap();
         assert!(!iter.valid());
 
         // Position and iterate to end
-        iter.seek_to_first().unwrap();
+        iter.seek_to_first().await.unwrap();
         while iter.valid() {
-            iter.advance().unwrap();
+            iter.advance().await.unwrap();
         }
 
         // Advance again should still be no-op
-        iter.advance().unwrap();
+        iter.advance().await.unwrap();
         assert!(!iter.valid());
     }
 
-    #[test]
-    fn test_iterator_prev_when_not_valid() {
+    #[tokio::test]
+    async fn test_iterator_prev_when_not_valid() {
         let dir = tempdir().unwrap();
         let path = dir.path().join("test.sst");
 
-        let reader = create_sequential_sst(&path, 0, 3).unwrap();
+        let reader = create_sequential_sst(&path, 0, 3).await.unwrap();
         let mut iter = SstIterator::new(reader).unwrap();
 
         // Prev on invalid iterator should be no-op
-        iter.prev().unwrap();
+        iter.prev().await.unwrap();
         assert!(!iter.valid());
     }
 
-    #[test]
-    fn test_iterator_seek_for_prev_exact_match() {
+    #[tokio::test]
+    async fn test_iterator_seek_for_prev_exact_match() {
         let dir = tempdir().unwrap();
         let path = dir.path().join("test.sst");
 
-        let reader = create_sequential_sst(&path, 0, 10).unwrap();
+        let reader = create_sequential_sst(&path, 0, 10).await.unwrap();
         let mut iter = SstIterator::new(reader).unwrap();
 
         // Seek for prev with exact match should stay on that key
-        iter.seek_for_prev(b"key_00005").unwrap();
+        iter.seek_for_prev(b"key_00005").await.unwrap();
         assert!(iter.valid());
         assert_eq!(iter.key(), b"key_00005".as_slice());
     }
 
-    #[test]
-    fn test_iterator_seek_for_prev_between_keys() {
+    #[tokio::test]
+    async fn test_iterator_seek_for_prev_between_keys() {
         let dir = tempdir().unwrap();
         let path = dir.path().join("test.sst");
 
-        let reader = create_sequential_sst(&path, 0, 10).unwrap();
+        let reader = create_sequential_sst(&path, 0, 10).await.unwrap();
         let mut iter = SstIterator::new(reader).unwrap();
 
         // Seek for prev between keys should go to previous key
-        iter.seek_for_prev(b"key_00005z").unwrap();
+        iter.seek_for_prev(b"key_00005z").await.unwrap();
         assert!(iter.valid());
         assert_eq!(iter.key(), b"key_00005".as_slice());
     }
 
-    #[test]
-    fn test_iterator_seek_for_prev_before_first() {
+    #[tokio::test]
+    async fn test_iterator_seek_for_prev_before_first() {
         let dir = tempdir().unwrap();
         let path = dir.path().join("test.sst");
 
-        let reader = create_sequential_sst(&path, 0, 10).unwrap();
+        let reader = create_sequential_sst(&path, 0, 10).await.unwrap();
         let mut iter = SstIterator::new(reader).unwrap();
 
         // Seek for prev before first key should become invalid
-        iter.seek_for_prev(b"aaa").unwrap();
+        iter.seek_for_prev(b"aaa").await.unwrap();
         // The current implementation seeks to the target first, which finds key_00000
         // Since key_00000 > "aaa", it goes to prev which makes it invalid
         // Actually, seek finds key_00000, and since key_00000 != "aaa" and key_00000 > "aaa",
@@ -1120,46 +1133,46 @@ mod tests {
         assert!(!iter.valid());
     }
 
-    #[test]
-    fn test_iterator_seek_for_prev_after_last() {
+    #[tokio::test]
+    async fn test_iterator_seek_for_prev_after_last() {
         let dir = tempdir().unwrap();
         let path = dir.path().join("test.sst");
 
-        let reader = create_sequential_sst(&path, 0, 10).unwrap();
+        let reader = create_sequential_sst(&path, 0, 10).await.unwrap();
         let mut iter = SstIterator::new(reader).unwrap();
 
         // Seek for prev after last key should go to last key
-        iter.seek_for_prev(b"zzz").unwrap();
+        iter.seek_for_prev(b"zzz").await.unwrap();
         assert!(iter.valid());
         assert_eq!(iter.key(), b"key_00009".as_slice());
     }
 
-    #[test]
-    fn test_iterator_reseek_while_iterating() {
+    #[tokio::test]
+    async fn test_iterator_reseek_while_iterating() {
         let dir = tempdir().unwrap();
         let path = dir.path().join("test.sst");
 
-        let reader = create_sequential_sst(&path, 0, 10).unwrap();
+        let reader = create_sequential_sst(&path, 0, 10).await.unwrap();
         let mut iter = SstIterator::new(reader).unwrap();
 
         // Position and advance a few times
-        iter.seek_to_first().unwrap();
-        iter.advance().unwrap();
-        iter.advance().unwrap();
+        iter.seek_to_first().await.unwrap();
+        iter.advance().await.unwrap();
+        iter.advance().await.unwrap();
         assert_eq!(iter.key(), b"key_00002".as_slice());
 
         // Reseek to a different position
-        iter.seek(b"key_00007").unwrap();
+        iter.seek(b"key_00007").await.unwrap();
         assert!(iter.valid());
         assert_eq!(iter.key(), b"key_00007".as_slice());
 
         // Continue iterating
-        iter.advance().unwrap();
+        iter.advance().await.unwrap();
         assert_eq!(iter.key(), b"key_00008".as_slice());
     }
 
-    #[test]
-    fn test_iterator_prev_across_blocks() {
+    #[tokio::test]
+    async fn test_iterator_prev_across_blocks() {
         let dir = tempdir().unwrap();
         let path = dir.path().join("test.sst");
 
@@ -1173,59 +1186,59 @@ mod tests {
         }
         builder.finish(1, 0).unwrap();
 
-        let reader = SstReaderRef::open(&path, test_io()).unwrap();
+        let reader = SstReaderRef::open(&path, test_io().await).await.unwrap();
         let mut iter = SstIterator::new(reader).unwrap();
 
         // Seek to middle
-        iter.seek(b"key_00025").unwrap();
+        iter.seek(b"key_00025").await.unwrap();
         assert!(iter.valid());
         assert_eq!(iter.key(), b"key_00025".as_slice());
 
         // Iterate backwards
         for expected in (0..25).rev() {
-            iter.prev().unwrap();
+            iter.prev().await.unwrap();
             let expected_key = format!("key_{expected:05}");
             assert!(iter.valid(), "Should be valid at key {expected}");
             assert_eq!(iter.key(), expected_key.as_bytes());
         }
 
         // One more prev should become invalid
-        iter.prev().unwrap();
+        iter.prev().await.unwrap();
         assert!(!iter.valid());
     }
 
-    #[test]
-    fn test_iterator_seek_to_first_and_last_empty_sst() {
+    #[tokio::test]
+    async fn test_iterator_seek_to_first_and_last_empty_sst() {
         let dir = tempdir().unwrap();
         let path = dir.path().join("empty.sst");
 
         let builder = SstBuilder::new(&path, SstBuilderOptions::default()).unwrap();
         builder.finish(1, 0).unwrap();
 
-        let reader = SstReaderRef::open(&path, test_io()).unwrap();
+        let reader = SstReaderRef::open(&path, test_io().await).await.unwrap();
         let mut iter = SstIterator::new(reader).unwrap();
 
-        iter.seek_to_first().unwrap();
+        iter.seek_to_first().await.unwrap();
         assert!(!iter.valid());
 
-        iter.seek_to_last().unwrap();
+        iter.seek_to_last().await.unwrap();
         assert!(!iter.valid());
     }
 
-    #[test]
-    fn test_iterator_single_entry_prev() {
+    #[tokio::test]
+    async fn test_iterator_single_entry_prev() {
         let dir = tempdir().unwrap();
         let path = dir.path().join("single.sst");
 
-        let reader = create_test_sst(&path, &[(b"key", b"value")]).unwrap();
+        let reader = create_test_sst(&path, &[(b"key", b"value")]).await.unwrap();
         let mut iter = SstIterator::new(reader).unwrap();
 
-        iter.seek_to_last().unwrap();
+        iter.seek_to_last().await.unwrap();
         assert!(iter.valid());
         assert_eq!(iter.key(), b"key".as_slice());
 
         // Prev should become invalid
-        iter.prev().unwrap();
+        iter.prev().await.unwrap();
         assert!(!iter.valid());
     }
 
@@ -1233,48 +1246,58 @@ mod tests {
     // ConcatIterator Additional Coverage Tests
     // ------------------------------------------------------------------------
 
-    #[test]
-    fn test_concat_iterator_seek_to_gap() {
+    #[tokio::test]
+    async fn test_concat_iterator_seek_to_gap() {
         let dir = tempdir().unwrap();
 
         // Create SSTs with gaps: key_00000-00009 and key_00020-00029
-        let reader1 = create_sequential_sst(&dir.path().join("sst1.sst"), 0, 10).unwrap();
-        let reader2 = create_sequential_sst(&dir.path().join("sst2.sst"), 20, 10).unwrap();
+        let reader1 = create_sequential_sst(&dir.path().join("sst1.sst"), 0, 10)
+            .await
+            .unwrap();
+        let reader2 = create_sequential_sst(&dir.path().join("sst2.sst"), 20, 10)
+            .await
+            .unwrap();
 
         let mut iter = ConcatIterator::new(vec![reader1, reader2]).unwrap();
 
         // Seek to key in gap should find next key
-        iter.seek(b"key_00015").unwrap();
+        iter.seek(b"key_00015").await.unwrap();
         assert!(iter.valid());
         assert_eq!(iter.key(), b"key_00020".as_slice());
     }
 
-    #[test]
-    fn test_concat_iterator_seek_past_all() {
+    #[tokio::test]
+    async fn test_concat_iterator_seek_past_all() {
         let dir = tempdir().unwrap();
 
-        let reader = create_sequential_sst(&dir.path().join("sst.sst"), 0, 10).unwrap();
+        let reader = create_sequential_sst(&dir.path().join("sst.sst"), 0, 10)
+            .await
+            .unwrap();
         let mut iter = ConcatIterator::new(vec![reader]).unwrap();
 
-        iter.seek(b"zzz").unwrap();
+        iter.seek(b"zzz").await.unwrap();
         assert!(!iter.valid());
     }
 
-    #[test]
-    fn test_concat_iterator_advance_exhausts_correctly() {
+    #[tokio::test]
+    async fn test_concat_iterator_advance_exhausts_correctly() {
         let dir = tempdir().unwrap();
 
-        let reader1 = create_sequential_sst(&dir.path().join("sst1.sst"), 0, 3).unwrap();
-        let reader2 = create_sequential_sst(&dir.path().join("sst2.sst"), 3, 3).unwrap();
+        let reader1 = create_sequential_sst(&dir.path().join("sst1.sst"), 0, 3)
+            .await
+            .unwrap();
+        let reader2 = create_sequential_sst(&dir.path().join("sst2.sst"), 3, 3)
+            .await
+            .unwrap();
 
         let mut iter = ConcatIterator::new(vec![reader1, reader2]).unwrap();
-        iter.seek_to_first().unwrap();
+        iter.seek_to_first().await.unwrap();
 
         // Collect all keys
         let mut keys = Vec::new();
         while iter.valid() {
             keys.push(iter.key().to_vec());
-            iter.advance().unwrap();
+            iter.advance().await.unwrap();
         }
 
         assert_eq!(keys.len(), 6);
@@ -1284,23 +1307,25 @@ mod tests {
         assert_eq!(keys[5], b"key_00005".as_slice());
     }
 
-    #[test]
-    fn test_concat_iterator_advance_when_invalid() {
+    #[tokio::test]
+    async fn test_concat_iterator_advance_when_invalid() {
         let dir = tempdir().unwrap();
 
-        let reader = create_sequential_sst(&dir.path().join("sst.sst"), 0, 3).unwrap();
+        let reader = create_sequential_sst(&dir.path().join("sst.sst"), 0, 3)
+            .await
+            .unwrap();
         let mut iter = ConcatIterator::new(vec![reader]).unwrap();
 
         // Not positioned yet
         assert!(!iter.valid());
 
         // Advance should be no-op
-        iter.advance().unwrap();
+        iter.advance().await.unwrap();
         assert!(!iter.valid());
     }
 
-    #[test]
-    fn test_concat_iterator_multiple_empty_ssts() {
+    #[tokio::test]
+    async fn test_concat_iterator_multiple_empty_ssts() {
         let dir = tempdir().unwrap();
 
         // Create multiple empty SSTs with one non-empty in the middle
@@ -1313,19 +1338,22 @@ mod tests {
             builder.finish(1, 0).unwrap();
         }
 
-        let empty1 = SstReaderRef::open(&empty1_path, test_io()).unwrap();
-        let empty2 = SstReaderRef::open(&empty2_path, test_io()).unwrap();
-        let empty3 = SstReaderRef::open(&empty3_path, test_io()).unwrap();
-        let non_empty = create_sequential_sst(&dir.path().join("nonempty.sst"), 0, 3).unwrap();
+        let io = test_io().await;
+        let empty1 = SstReaderRef::open(&empty1_path, io.clone()).await.unwrap();
+        let empty2 = SstReaderRef::open(&empty2_path, io.clone()).await.unwrap();
+        let empty3 = SstReaderRef::open(&empty3_path, io).await.unwrap();
+        let non_empty = create_sequential_sst(&dir.path().join("nonempty.sst"), 0, 3)
+            .await
+            .unwrap();
 
         // [empty, empty, non_empty, empty]
         let mut iter = ConcatIterator::new(vec![empty1, empty2, non_empty, empty3]).unwrap();
-        iter.seek_to_first().unwrap();
+        iter.seek_to_first().await.unwrap();
 
         let mut count = 0;
         while iter.valid() {
             count += 1;
-            iter.advance().unwrap();
+            iter.advance().await.unwrap();
         }
         assert_eq!(count, 3);
     }
@@ -1334,8 +1362,8 @@ mod tests {
     // SstMvccIterator Tests
     // ------------------------------------------------------------------------
 
-    #[test]
-    fn test_sst_mvcc_iterator_basic() {
+    #[tokio::test]
+    async fn test_sst_mvcc_iterator_basic() {
         use std::sync::Arc;
 
         let dir = tempdir().unwrap();
@@ -1348,7 +1376,7 @@ mod tests {
         builder.add(&mvcc_key(b"key2", 200), b"v2_200").unwrap();
         builder.finish(1, 0).unwrap();
 
-        let reader = SstReaderRef::open(&path, test_io()).unwrap();
+        let reader = SstReaderRef::open(&path, test_io().await).await.unwrap();
         let range = Arc::new(MvccKey::unbounded()..MvccKey::unbounded());
         let mut iter = SstMvccIterator::new(reader, range).unwrap();
 
@@ -1356,28 +1384,28 @@ mod tests {
         assert!(!iter.valid());
 
         // Position at start
-        iter.advance().unwrap();
+        iter.advance().await.unwrap();
         assert!(iter.valid());
         assert_eq!(iter.user_key(), b"key1");
         assert_eq!(iter.timestamp(), 100);
         assert_eq!(iter.value(), b"v1_100");
 
-        iter.advance().unwrap();
+        iter.advance().await.unwrap();
         assert!(iter.valid());
         assert_eq!(iter.user_key(), b"key1");
         assert_eq!(iter.timestamp(), 50);
 
-        iter.advance().unwrap();
+        iter.advance().await.unwrap();
         assert!(iter.valid());
         assert_eq!(iter.user_key(), b"key2");
         assert_eq!(iter.timestamp(), 200);
 
-        iter.advance().unwrap();
+        iter.advance().await.unwrap();
         assert!(!iter.valid());
     }
 
-    #[test]
-    fn test_sst_mvcc_iterator_with_range_start() {
+    #[tokio::test]
+    async fn test_sst_mvcc_iterator_with_range_start() {
         use std::sync::Arc;
 
         let dir = tempdir().unwrap();
@@ -1390,27 +1418,27 @@ mod tests {
         builder.add(&mvcc_key(b"d", 100), b"vd").unwrap();
         builder.finish(1, 0).unwrap();
 
-        let reader = SstReaderRef::open(&path, test_io()).unwrap();
+        let reader = SstReaderRef::open(&path, test_io().await).await.unwrap();
         // Range starting from "b"
         let range = Arc::new(MvccKey::encode(b"b", u64::MAX)..MvccKey::unbounded());
         let mut iter = SstMvccIterator::new(reader, range).unwrap();
 
-        iter.advance().unwrap();
+        iter.advance().await.unwrap();
         assert!(iter.valid());
         assert_eq!(iter.user_key(), b"b");
 
-        iter.advance().unwrap();
+        iter.advance().await.unwrap();
         assert_eq!(iter.user_key(), b"c");
 
-        iter.advance().unwrap();
+        iter.advance().await.unwrap();
         assert_eq!(iter.user_key(), b"d");
 
-        iter.advance().unwrap();
+        iter.advance().await.unwrap();
         assert!(!iter.valid());
     }
 
-    #[test]
-    fn test_sst_mvcc_iterator_with_range_end() {
+    #[tokio::test]
+    async fn test_sst_mvcc_iterator_with_range_end() {
         use std::sync::Arc;
 
         let dir = tempdir().unwrap();
@@ -1423,25 +1451,25 @@ mod tests {
         builder.add(&mvcc_key(b"d", 100), b"vd").unwrap();
         builder.finish(1, 0).unwrap();
 
-        let reader = SstReaderRef::open(&path, test_io()).unwrap();
+        let reader = SstReaderRef::open(&path, test_io().await).await.unwrap();
         // Range ending before "c" (exclusive)
         let range = Arc::new(MvccKey::unbounded()..MvccKey::encode(b"c", u64::MAX));
         let mut iter = SstMvccIterator::new(reader, range).unwrap();
 
-        iter.advance().unwrap();
+        iter.advance().await.unwrap();
         assert!(iter.valid());
         assert_eq!(iter.user_key(), b"a");
 
-        iter.advance().unwrap();
+        iter.advance().await.unwrap();
         assert_eq!(iter.user_key(), b"b");
 
         // "c" should be excluded
-        iter.advance().unwrap();
+        iter.advance().await.unwrap();
         assert!(!iter.valid());
     }
 
-    #[test]
-    fn test_sst_mvcc_iterator_with_range_both_bounds() {
+    #[tokio::test]
+    async fn test_sst_mvcc_iterator_with_range_both_bounds() {
         use std::sync::Arc;
 
         let dir = tempdir().unwrap();
@@ -1454,24 +1482,24 @@ mod tests {
         builder.add(&mvcc_key(b"d", 100), b"vd").unwrap();
         builder.finish(1, 0).unwrap();
 
-        let reader = SstReaderRef::open(&path, test_io()).unwrap();
+        let reader = SstReaderRef::open(&path, test_io().await).await.unwrap();
         // Range [b, d) - should include b, c but not d
         let range = Arc::new(MvccKey::encode(b"b", u64::MAX)..MvccKey::encode(b"d", u64::MAX));
         let mut iter = SstMvccIterator::new(reader, range).unwrap();
 
-        iter.advance().unwrap();
+        iter.advance().await.unwrap();
         assert!(iter.valid());
         assert_eq!(iter.user_key(), b"b");
 
-        iter.advance().unwrap();
+        iter.advance().await.unwrap();
         assert_eq!(iter.user_key(), b"c");
 
-        iter.advance().unwrap();
+        iter.advance().await.unwrap();
         assert!(!iter.valid());
     }
 
-    #[test]
-    fn test_sst_mvcc_iterator_seek() {
+    #[tokio::test]
+    async fn test_sst_mvcc_iterator_seek() {
         use std::sync::Arc;
 
         let dir = tempdir().unwrap();
@@ -1483,20 +1511,20 @@ mod tests {
         builder.add(&mvcc_key(b"c", 100), b"vc").unwrap();
         builder.finish(1, 0).unwrap();
 
-        let reader = SstReaderRef::open(&path, test_io()).unwrap();
+        let reader = SstReaderRef::open(&path, test_io().await).await.unwrap();
         let range = Arc::new(MvccKey::unbounded()..MvccKey::unbounded());
         let mut iter = SstMvccIterator::new(reader, range).unwrap();
 
         // Seek to specific key
         let target = MvccKey::encode(b"b", 100);
-        iter.seek(&target).unwrap();
+        iter.seek(&target).await.unwrap();
         assert!(iter.valid());
         assert_eq!(iter.user_key(), b"b");
         assert_eq!(iter.timestamp(), 100);
     }
 
-    #[test]
-    fn test_sst_mvcc_iterator_seek_unbounded_target_with_range() {
+    #[tokio::test]
+    async fn test_sst_mvcc_iterator_seek_unbounded_target_with_range() {
         use std::sync::Arc;
 
         let dir = tempdir().unwrap();
@@ -1508,19 +1536,19 @@ mod tests {
         builder.add(&mvcc_key(b"c", 100), b"vc").unwrap();
         builder.finish(1, 0).unwrap();
 
-        let reader = SstReaderRef::open(&path, test_io()).unwrap();
+        let reader = SstReaderRef::open(&path, test_io().await).await.unwrap();
         // Range starting from "b"
         let range = Arc::new(MvccKey::encode(b"b", u64::MAX)..MvccKey::unbounded());
         let mut iter = SstMvccIterator::new(reader, range).unwrap();
 
         // Seek with unbounded target should use range start instead
-        iter.seek(&MvccKey::unbounded()).unwrap();
+        iter.seek(&MvccKey::unbounded()).await.unwrap();
         assert!(iter.valid());
         assert_eq!(iter.user_key(), b"b");
     }
 
-    #[test]
-    fn test_sst_mvcc_iterator_multiple_versions_same_key() {
+    #[tokio::test]
+    async fn test_sst_mvcc_iterator_multiple_versions_same_key() {
         use std::sync::Arc;
 
         let dir = tempdir().unwrap();
@@ -1534,24 +1562,24 @@ mod tests {
         builder.add(&mvcc_key(b"key", 10), b"v10").unwrap();
         builder.finish(1, 0).unwrap();
 
-        let reader = SstReaderRef::open(&path, test_io()).unwrap();
+        let reader = SstReaderRef::open(&path, test_io().await).await.unwrap();
         let range = Arc::new(MvccKey::unbounded()..MvccKey::unbounded());
         let mut iter = SstMvccIterator::new(reader, range).unwrap();
 
-        iter.advance().unwrap();
+        iter.advance().await.unwrap();
         assert_eq!(iter.timestamp(), 100);
-        iter.advance().unwrap();
+        iter.advance().await.unwrap();
         assert_eq!(iter.timestamp(), 50);
-        iter.advance().unwrap();
+        iter.advance().await.unwrap();
         assert_eq!(iter.timestamp(), 25);
-        iter.advance().unwrap();
+        iter.advance().await.unwrap();
         assert_eq!(iter.timestamp(), 10);
-        iter.advance().unwrap();
+        iter.advance().await.unwrap();
         assert!(!iter.valid());
     }
 
-    #[test]
-    fn test_sst_mvcc_iterator_invalid_mvcc_key_too_short() {
+    #[tokio::test]
+    async fn test_sst_mvcc_iterator_invalid_mvcc_key_too_short() {
         use std::sync::Arc;
 
         let dir = tempdir().unwrap();
@@ -1562,18 +1590,18 @@ mod tests {
         builder.add(b"short", b"value").unwrap();
         builder.finish(1, 0).unwrap();
 
-        let reader = SstReaderRef::open(&path, test_io()).unwrap();
+        let reader = SstReaderRef::open(&path, test_io().await).await.unwrap();
         let range = Arc::new(MvccKey::unbounded()..MvccKey::unbounded());
         let mut iter = SstMvccIterator::new(reader, range).unwrap();
 
         // Advance should position but the entry should be filtered out
-        iter.advance().unwrap();
+        iter.advance().await.unwrap();
         // The iterator should not be valid because the key is too short
         assert!(!iter.valid());
     }
 
-    #[test]
-    fn test_sst_mvcc_iterator_empty_sst() {
+    #[tokio::test]
+    async fn test_sst_mvcc_iterator_empty_sst() {
         use std::sync::Arc;
 
         let dir = tempdir().unwrap();
@@ -1582,16 +1610,16 @@ mod tests {
         let builder = SstBuilder::new(&path, SstBuilderOptions::default()).unwrap();
         builder.finish(1, 0).unwrap();
 
-        let reader = SstReaderRef::open(&path, test_io()).unwrap();
+        let reader = SstReaderRef::open(&path, test_io().await).await.unwrap();
         let range = Arc::new(MvccKey::unbounded()..MvccKey::unbounded());
         let mut iter = SstMvccIterator::new(reader, range).unwrap();
 
-        iter.advance().unwrap();
+        iter.advance().await.unwrap();
         assert!(!iter.valid());
     }
 
-    #[test]
-    fn test_sst_mvcc_iterator_range_filters_all() {
+    #[tokio::test]
+    async fn test_sst_mvcc_iterator_range_filters_all() {
         use std::sync::Arc;
 
         let dir = tempdir().unwrap();
@@ -1602,12 +1630,12 @@ mod tests {
         builder.add(&mvcc_key(b"b", 100), b"vb").unwrap();
         builder.finish(1, 0).unwrap();
 
-        let reader = SstReaderRef::open(&path, test_io()).unwrap();
+        let reader = SstReaderRef::open(&path, test_io().await).await.unwrap();
         // Range that doesn't overlap with any data
         let range = Arc::new(MvccKey::encode(b"x", u64::MAX)..MvccKey::encode(b"z", u64::MAX));
         let mut iter = SstMvccIterator::new(reader, range).unwrap();
 
-        iter.advance().unwrap();
+        iter.advance().await.unwrap();
         assert!(!iter.valid());
     }
 
@@ -1615,8 +1643,8 @@ mod tests {
     // BlockState Tests (internal)
     // ------------------------------------------------------------------------
 
-    #[test]
-    fn test_block_seek_empty_block() {
+    #[tokio::test]
+    async fn test_block_seek_empty_block() {
         // This tests the edge case where a block has no entries
         // In practice, SST builder would not create such a block,
         // but we test the BlockState behavior directly
@@ -1626,16 +1654,16 @@ mod tests {
         let builder = SstBuilder::new(&path, SstBuilderOptions::default()).unwrap();
         builder.finish(1, 0).unwrap();
 
-        let reader = SstReaderRef::open(&path, test_io()).unwrap();
+        let reader = SstReaderRef::open(&path, test_io().await).await.unwrap();
         let mut iter = SstIterator::new(reader).unwrap();
 
         // Seek should handle empty SST gracefully
-        iter.seek(b"any_key").unwrap();
+        iter.seek(b"any_key").await.unwrap();
         assert!(!iter.valid());
     }
 
-    #[test]
-    fn test_iterator_seek_to_exact_boundary() {
+    #[tokio::test]
+    async fn test_iterator_seek_to_exact_boundary() {
         let dir = tempdir().unwrap();
         let path = dir.path().join("test.sst");
 
@@ -1649,17 +1677,18 @@ mod tests {
                 (b"ddd", b"v4"),
             ],
         )
+        .await
         .unwrap();
 
         let mut iter = SstIterator::new(reader).unwrap();
 
         // Seek to exact first key
-        iter.seek(b"aaa").unwrap();
+        iter.seek(b"aaa").await.unwrap();
         assert!(iter.valid());
         assert_eq!(iter.key(), b"aaa".as_slice());
 
         // Seek to exact last key
-        iter.seek(b"ddd").unwrap();
+        iter.seek(b"ddd").await.unwrap();
         assert!(iter.valid());
         assert_eq!(iter.key(), b"ddd".as_slice());
     }

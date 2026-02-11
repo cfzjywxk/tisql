@@ -24,6 +24,7 @@
 
 use std::sync::Arc;
 use tempfile::TempDir;
+use tisql::io::block_on_sync;
 use tisql::{Database, DatabaseConfig, QueryResult};
 
 /// TestKit provides a convenient API for testing SQL execution
@@ -48,7 +49,7 @@ impl TestKit {
 
     /// Execute SQL and panic on error
     pub fn must_exec(&self, sql: &str) -> ExecResult {
-        match self.db.handle_mp_query(sql) {
+        match block_on_sync(self.db.handle_mp_query(sql)) {
             Ok(result) => ExecResult { result },
             Err(e) => panic!("SQL execution failed: {e}\nSQL: {sql}"),
         }
@@ -56,7 +57,7 @@ impl TestKit {
 
     /// Execute SQL and expect an error
     pub fn must_exec_err(&self, sql: &str) -> String {
-        match self.db.handle_mp_query(sql) {
+        match block_on_sync(self.db.handle_mp_query(sql)) {
             Ok(_) => panic!("Expected error but got success\nSQL: {sql}"),
             Err(e) => e.to_string(),
         }
@@ -64,7 +65,7 @@ impl TestKit {
 
     /// Execute SQL that should return rows
     pub fn must_query(&self, sql: &str) -> QueryChecker {
-        match self.db.handle_mp_query(sql) {
+        match block_on_sync(self.db.handle_mp_query(sql)) {
             Ok(QueryResult::Rows { columns, data }) => QueryChecker { columns, data },
             Ok(other) => panic!("Expected rows but got: {other:?}\nSQL: {sql}"),
             Err(e) => panic!("Query failed: {e}\nSQL: {sql}"),
@@ -74,7 +75,7 @@ impl TestKit {
     /// Execute SQL without checking result
     #[allow(dead_code)]
     pub fn exec(&self, sql: &str) -> Result<QueryResult, String> {
-        self.db.handle_mp_query(sql).map_err(|e| e.to_string())
+        block_on_sync(self.db.handle_mp_query(sql)).map_err(|e| e.to_string())
     }
 
     /// Get the underlying database

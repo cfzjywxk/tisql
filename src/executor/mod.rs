@@ -92,7 +92,7 @@ impl From<ExecutionResult> for ExecutionOutput {
 /// - Read statements: TxnService.begin(true) creates read-only transaction
 /// - Write statements: TxnService.begin(false) + commit() with durability
 /// - Transaction control: BEGIN/COMMIT/ROLLBACK managed via Session
-pub trait Executor {
+pub trait Executor: Send + Sync {
     /// Execute a logical plan through the transaction service.
     ///
     /// For read operations (SELECT):
@@ -108,7 +108,7 @@ pub trait Executor {
         plan: LogicalPlan,
         txn_service: &T,
         catalog: &C,
-    ) -> Result<ExecutionResult>;
+    ) -> impl std::future::Future<Output = Result<ExecutionResult>> + Send;
 
     /// Execute a logical plan with session context for explicit transactions.
     ///
@@ -125,7 +125,7 @@ pub trait Executor {
         txn_service: &T,
         catalog: &C,
         session: &mut Session,
-    ) -> Result<ExecutionResult>;
+    ) -> impl std::future::Future<Output = Result<ExecutionResult>> + Send;
 
     /// Execute a logical plan with optional TxnCtx (unified entry point).
     ///
@@ -151,5 +151,5 @@ pub trait Executor {
         txn_service: &T,
         catalog: &C,
         txn_ctx: Option<TxnCtx>,
-    ) -> Result<(ExecutionResult, Option<TxnCtx>)>;
+    ) -> impl std::future::Future<Output = Result<(ExecutionResult, Option<TxnCtx>)>> + Send;
 }

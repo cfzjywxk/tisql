@@ -406,6 +406,8 @@ impl Ord for MvccKey {
 // MvccIterator Trait
 // ============================================================================
 
+use std::future::Future;
+
 use crate::error::Result;
 
 /// Streaming iterator over MVCC key-value pairs.
@@ -447,23 +449,22 @@ use crate::error::Result;
 ///
 /// ## Thread Safety
 ///
-/// Iterators are not required to be `Send` - they are typically used within
-/// a single thread for the duration of a scan operation. The `StorageEngine`
-/// itself must be `Send + Sync`, but the iterators it produces need not be.
-pub trait MvccIterator {
+/// Iterators must be `Send` so they can be used across `.await` points
+/// in async tasks spawned with `tokio::spawn`.
+pub trait MvccIterator: Send {
     /// Seek to the first entry with MVCC key >= target.
     ///
     /// After seeking:
     /// - `valid()` returns true if an entry with MVCC key >= target exists
     /// - `user_key()` and `timestamp()` return the positioned entry's components
-    fn seek(&mut self, target: &MvccKey) -> Result<()>;
+    fn seek(&mut self, target: &MvccKey) -> impl Future<Output = Result<()>> + Send;
 
     /// Advance to the next entry.
     ///
     /// This advances the iterator to the next key in MVCC order.
     ///
     /// Named `advance` instead of `next` to avoid conflict with `Iterator::next`.
-    fn advance(&mut self) -> Result<()>;
+    fn advance(&mut self) -> impl Future<Output = Result<()>> + Send;
 
     /// Check if the iterator is positioned on a valid entry.
     ///
@@ -514,45 +515,6 @@ pub trait MvccIterator {
     /// Default: 0 (no owner).
     fn pending_owner(&self) -> Timestamp {
         0
-    }
-}
-
-// ============================================================================
-// Box<dyn MvccIterator> implementation
-// ============================================================================
-
-/// Implement MvccIterator for boxed trait objects to allow dynamic dispatch.
-impl MvccIterator for Box<dyn MvccIterator> {
-    fn seek(&mut self, target: &MvccKey) -> Result<()> {
-        (**self).seek(target)
-    }
-
-    fn advance(&mut self) -> Result<()> {
-        (**self).advance()
-    }
-
-    fn valid(&self) -> bool {
-        (**self).valid()
-    }
-
-    fn user_key(&self) -> &[u8] {
-        (**self).user_key()
-    }
-
-    fn timestamp(&self) -> Timestamp {
-        (**self).timestamp()
-    }
-
-    fn value(&self) -> &[u8] {
-        (**self).value()
-    }
-
-    fn is_pending(&self) -> bool {
-        (**self).is_pending()
-    }
-
-    fn pending_owner(&self) -> Timestamp {
-        (**self).pending_owner()
     }
 }
 

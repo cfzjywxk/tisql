@@ -93,7 +93,7 @@ fn test_crash_before_freeze() {
     write_test_data(&engine, b"key2", b"value2", 2);
 
     // Verify data is readable
-    let v1 = engine.get(b"key1").unwrap();
+    let v1 = tisql::io::block_on_sync(engine.get(b"key1")).unwrap();
     assert_eq!(v1, Some(b"value1".to_vec()));
 
     // The data is in active memtable, not frozen
@@ -187,7 +187,7 @@ fn test_crash_before_sst_build() {
     fail::cfg("lsm_flush_before_sst_build", "off").unwrap();
 
     // Data should still be in the frozen memtable (no SST was created)
-    let value = engine.get(b"test_key").unwrap();
+    let value = tisql::io::block_on_sync(engine.get(b"test_key")).unwrap();
     assert_eq!(value, Some(b"test_value".to_vec()));
 
     // Verify no SST was created
@@ -311,7 +311,7 @@ fn test_crash_after_ilog_commit() {
 
     // Recovery should rebuild version from ilog and find the SST
     let result = recover_engine(&dir);
-    let value = result.engine.get(b"committed_key").unwrap();
+    let value = tisql::io::block_on_sync(result.engine.get(b"committed_key")).unwrap();
     assert_eq!(
         value,
         Some(b"committed_value".to_vec()),
@@ -335,8 +335,8 @@ fn test_crash_after_version_update() {
 
         // Write enough data to trigger rotation (memtable_size = 256)
         for i in 0..5 {
-            let key = format!("version_key_{:04}", i);
-            let value = format!("version_value_{:04}", i);
+            let key = format!("version_key_{i:04}");
+            let value = format!("version_value_{i:04}");
             write_test_data(&engine, key.as_bytes(), value.as_bytes(), i as u64 + 1);
         }
 
@@ -366,8 +366,11 @@ fn test_crash_after_version_update() {
     // At least some data should be recoverable (the first SST that was flushed)
     let mut recovered_count = 0;
     for i in 0..5 {
-        let key = format!("version_key_{:04}", i);
-        if result.engine.get(key.as_bytes()).unwrap().is_some() {
+        let key = format!("version_key_{i:04}");
+        if tisql::io::block_on_sync(result.engine.get(key.as_bytes()))
+            .unwrap()
+            .is_some()
+        {
             recovered_count += 1;
         }
     }
@@ -501,7 +504,9 @@ fn test_crash_before_merge() {
     fail::cfg("compaction_before_merge", "panic").unwrap();
 
     // Trigger compaction - should panic at failpoint
-    let result = panic::catch_unwind(panic::AssertUnwindSafe(|| engine.do_compaction()));
+    let result = panic::catch_unwind(panic::AssertUnwindSafe(|| {
+        tisql::io::block_on_sync(engine.do_compaction())
+    }));
     assert!(
         result.is_err(),
         "Failpoint should have triggered a panic during compaction"
@@ -514,7 +519,7 @@ fn test_crash_before_merge() {
     for i in 0..3 {
         for j in 0..5 {
             let key = format!("comp_key_{i}_{j}");
-            let value = engine.get(key.as_bytes()).unwrap();
+            let value = tisql::io::block_on_sync(engine.get(key.as_bytes())).unwrap();
             assert!(value.is_some(), "Key {key} should exist");
         }
     }
@@ -556,7 +561,9 @@ fn test_crash_mid_compaction() {
     fail::cfg("compaction_mid_write", "panic").unwrap();
 
     // Trigger compaction - should panic mid-write
-    let result = panic::catch_unwind(panic::AssertUnwindSafe(|| engine.do_compaction()));
+    let result = panic::catch_unwind(panic::AssertUnwindSafe(|| {
+        tisql::io::block_on_sync(engine.do_compaction())
+    }));
     assert!(
         result.is_err(),
         "Failpoint should have triggered a panic during compaction"
@@ -569,7 +576,7 @@ fn test_crash_mid_compaction() {
     for i in 0..3 {
         for j in 0..5 {
             let key = format!("mid_comp_key_{:04}", i * 10 + j);
-            let value = engine.get(key.as_bytes()).unwrap();
+            let value = tisql::io::block_on_sync(engine.get(key.as_bytes())).unwrap();
             assert!(
                 value.is_some(),
                 "Key {key} should exist after failed compaction"
@@ -613,7 +620,9 @@ fn test_crash_after_compaction_finish() {
     fail::cfg("compaction_after_finish", "panic").unwrap();
 
     // Trigger compaction - should panic after writing new SSTs but before committing
-    let result = panic::catch_unwind(panic::AssertUnwindSafe(|| engine.do_compaction()));
+    let result = panic::catch_unwind(panic::AssertUnwindSafe(|| {
+        tisql::io::block_on_sync(engine.do_compaction())
+    }));
     assert!(
         result.is_err(),
         "Failpoint should have triggered a panic during compaction"
@@ -634,7 +643,7 @@ fn test_crash_after_compaction_finish() {
     for i in 0..3 {
         for j in 0..5 {
             let key = format!("post_comp_key_{i}_{j}");
-            let value = engine.get(key.as_bytes()).unwrap();
+            let value = tisql::io::block_on_sync(engine.get(key.as_bytes())).unwrap();
             assert!(value.is_some(), "Key {key} should exist");
         }
     }
@@ -749,8 +758,8 @@ fn test_recovery_after_clean_shutdown() {
         let (engine, ilog, _clog) = create_test_lsm_engine(&dir);
 
         for i in 0..10 {
-            let key = format!("recovery_key_{:04}", i);
-            let value = format!("recovery_value_{:04}", i);
+            let key = format!("recovery_key_{i:04}");
+            let value = format!("recovery_value_{i:04}");
             write_test_data(&engine, key.as_bytes(), value.as_bytes(), i as u64 + 1);
         }
 
@@ -766,10 +775,10 @@ fn test_recovery_after_clean_shutdown() {
 
     // Verify all data
     for i in 0..10 {
-        let key = format!("recovery_key_{:04}", i);
-        let expected = format!("recovery_value_{:04}", i);
-        let value = result.engine.get(key.as_bytes()).unwrap();
-        assert_eq!(value, Some(expected.into_bytes()), "Key {} mismatch", key);
+        let key = format!("recovery_key_{i:04}");
+        let expected = format!("recovery_value_{i:04}");
+        let value = tisql::io::block_on_sync(result.engine.get(key.as_bytes())).unwrap();
+        assert_eq!(value, Some(expected.into_bytes()), "Key {key} mismatch");
     }
 
     scenario.teardown();
@@ -800,15 +809,15 @@ fn test_recovery_interleaved_txns() {
     let result = recover_engine(&dir);
 
     assert_eq!(
-        result.engine.get(b"key_a").unwrap(),
+        tisql::io::block_on_sync(result.engine.get(b"key_a")).unwrap(),
         Some(b"value_a_2".to_vec())
     );
     assert_eq!(
-        result.engine.get(b"key_b").unwrap(),
+        tisql::io::block_on_sync(result.engine.get(b"key_b")).unwrap(),
         Some(b"value_b_2".to_vec())
     );
     assert_eq!(
-        result.engine.get(b"key_c").unwrap(),
+        tisql::io::block_on_sync(result.engine.get(b"key_c")).unwrap(),
         Some(b"value_c_1".to_vec())
     );
 
@@ -845,11 +854,11 @@ fn test_recovery_with_tombstones() {
     let result = recover_engine(&dir);
 
     // Deleted key should not be visible
-    let deleted = result.engine.get(b"delete_me").unwrap();
+    let deleted = tisql::io::block_on_sync(result.engine.get(b"delete_me")).unwrap();
     assert!(deleted.is_none(), "Deleted key should not exist");
 
     // Kept key should exist
-    let kept = result.engine.get(b"keep_me").unwrap();
+    let kept = tisql::io::block_on_sync(result.engine.get(b"keep_me")).unwrap();
     assert_eq!(kept, Some(b"permanent".to_vec()));
 
     scenario.teardown();
@@ -890,7 +899,7 @@ fn test_multiple_consecutive_flushes() {
     // Do multiple write-rotate-flush cycles
     for cycle in 0..3 {
         for i in 0..5 {
-            let key = format!("cycle{}_key{}", cycle, i);
+            let key = format!("cycle{cycle}_key{i}");
             write_test_data(
                 &engine,
                 key.as_bytes(),
@@ -905,8 +914,8 @@ fn test_multiple_consecutive_flushes() {
     // Verify all data
     for cycle in 0..3 {
         for i in 0..5 {
-            let key = format!("cycle{}_key{}", cycle, i);
-            let value = engine.get(key.as_bytes()).unwrap();
+            let key = format!("cycle{cycle}_key{i}");
+            let value = tisql::io::block_on_sync(engine.get(key.as_bytes())).unwrap();
             assert!(value.is_some(), "Key {key} should exist");
         }
     }
@@ -933,7 +942,7 @@ fn test_truncate_at_checkpoint_boundary() {
 
     // Write data and flush
     for i in 0..10 {
-        let key = format!("gc_key_{:04}", i);
+        let key = format!("gc_key_{i:04}");
         write_test_data(&engine, key.as_bytes(), b"value", i as u64 + 1);
     }
 
@@ -964,9 +973,9 @@ fn test_truncate_at_checkpoint_boundary() {
 
     // All data should still be readable from SST
     for i in 0..10 {
-        let key = format!("gc_key_{:04}", i);
-        let value = result.engine.get(key.as_bytes()).unwrap();
-        assert!(value.is_some(), "Key {} should exist after GC", key);
+        let key = format!("gc_key_{i:04}");
+        let value = tisql::io::block_on_sync(result.engine.get(key.as_bytes())).unwrap();
+        assert!(value.is_some(), "Key {key} should exist after GC");
     }
 
     scenario.teardown();
@@ -1016,7 +1025,7 @@ fn test_concurrent_truncate_and_write() {
 
     // Write initial data and flush
     for i in 0..5 {
-        let key = format!("init_key_{}", i);
+        let key = format!("init_key_{i}");
         write_test_data(&engine, key.as_bytes(), b"value", i as u64 + 1);
     }
     if let Some(frozen) = engine.maybe_rotate() {
@@ -1030,7 +1039,7 @@ fn test_concurrent_truncate_and_write() {
     // (In practice, truncation and writes should be serialized,
     // but this tests the resilience)
     for i in 0..10 {
-        let key = format!("concurrent_key_{}", i);
+        let key = format!("concurrent_key_{i}");
         write_test_data(&engine, key.as_bytes(), b"value", (i + 100) as u64);
     }
 
@@ -1041,16 +1050,16 @@ fn test_concurrent_truncate_and_write() {
 
     // Verify data integrity
     for i in 0..5 {
-        let key = format!("init_key_{}", i);
-        let value = engine.get(key.as_bytes()).unwrap();
-        assert!(value.is_some(), "Initial key {} should exist", key);
+        let key = format!("init_key_{i}");
+        let value = tisql::io::block_on_sync(engine.get(key.as_bytes())).unwrap();
+        assert!(value.is_some(), "Initial key {key} should exist");
     }
 
     // Keys written after flush should still be in memtable
     for i in 0..10 {
-        let key = format!("concurrent_key_{}", i);
-        let value = engine.get(key.as_bytes()).unwrap();
-        assert!(value.is_some(), "Concurrent key {} should exist", key);
+        let key = format!("concurrent_key_{i}");
+        let value = tisql::io::block_on_sync(engine.get(key.as_bytes())).unwrap();
+        assert!(value.is_some(), "Concurrent key {key} should exist");
     }
 
     scenario.teardown();
@@ -1067,7 +1076,7 @@ fn test_truncate_then_crash_then_recover() {
 
         // Write and flush
         for i in 0..20 {
-            let key = format!("truncate_crash_key_{:04}", i);
+            let key = format!("truncate_crash_key_{i:04}");
             write_test_data(&engine, key.as_bytes(), b"value", i as u64 + 1);
         }
         // Flush all data
@@ -1089,9 +1098,9 @@ fn test_truncate_then_crash_then_recover() {
 
     // All data should be recoverable from SST
     for i in 0..20 {
-        let key = format!("truncate_crash_key_{:04}", i);
-        let value = result.engine.get(key.as_bytes()).unwrap();
-        assert!(value.is_some(), "Key {} should survive truncate+crash", key);
+        let key = format!("truncate_crash_key_{i:04}");
+        let value = tisql::io::block_on_sync(result.engine.get(key.as_bytes())).unwrap();
+        assert!(value.is_some(), "Key {key} should survive truncate+crash");
     }
 
     scenario.teardown();
@@ -1111,7 +1120,7 @@ fn test_flushed_lsn_consistency() {
     for round in 0..3 {
         // Write data
         for i in 0..10 {
-            let key = format!("lsn_consistency_{}_{}", round, i);
+            let key = format!("lsn_consistency_{round}_{i}");
             write_test_data(
                 &engine,
                 key.as_bytes(),
@@ -1129,9 +1138,7 @@ fn test_flushed_lsn_consistency() {
 
         assert!(
             flushed_lsn >= last_flushed_lsn,
-            "flushed_lsn should increase: {} >= {}",
-            flushed_lsn,
-            last_flushed_lsn
+            "flushed_lsn should increase: {flushed_lsn} >= {last_flushed_lsn}"
         );
         last_flushed_lsn = flushed_lsn;
     }
@@ -1148,9 +1155,7 @@ fn test_flushed_lsn_consistency() {
 
     assert!(
         recovered_flushed_lsn >= last_flushed_lsn,
-        "Recovered flushed_lsn {} should be >= pre-crash {}",
-        recovered_flushed_lsn,
-        last_flushed_lsn
+        "Recovered flushed_lsn {recovered_flushed_lsn} should be >= pre-crash {last_flushed_lsn}"
     );
 
     scenario.teardown();
@@ -1228,7 +1233,7 @@ fn test_level_iterator_open_file_error() {
     engine.flush_all().unwrap();
 
     // Verify data is readable normally via get (uses memtable first, then SST)
-    let v1 = engine.get(b"key1").unwrap();
+    let v1 = tisql::io::block_on_sync(engine.get(b"key1")).unwrap();
     assert_eq!(v1, Some(b"value1".to_vec()));
 
     // Enable fail point to cause open_file error on L0 SST
@@ -1243,7 +1248,7 @@ fn test_level_iterator_open_file_error() {
     let has_error = match iter_result {
         Err(_) => true,
         Ok(mut iter) => {
-            let result = iter.advance();
+            let result = tisql::io::block_on_sync(iter.advance());
             result.is_err() || !iter.valid()
         }
     };
@@ -1281,7 +1286,7 @@ fn test_level_iterator_seek_error() {
     let has_error = match iter_result {
         Err(_) => true,
         Ok(mut iter) => {
-            let result = iter.advance();
+            let result = tisql::io::block_on_sync(iter.advance());
             result.is_err() || !iter.valid()
         }
     };
@@ -1324,11 +1329,11 @@ fn test_level_iterator_advance_error() {
     // First advance: initializes iterator via seek, reads first entry,
     // then calls L0 iterator's advance() which triggers failpoint.
     // The error is stored in pending_error but the first entry is returned.
-    let result1 = iter.advance();
+    let result1 = tisql::io::block_on_sync(iter.advance());
 
     // If first advance worked, second advance should return the pending error
     let has_error = if result1.is_ok() && iter.valid() {
-        let result2 = iter.advance();
+        let result2 = tisql::io::block_on_sync(iter.advance());
         result2.is_err()
     } else {
         // First advance already failed
@@ -1356,14 +1361,14 @@ fn test_get_from_memtable() {
     write_test_data(&engine, b"key2", b"value2", 2);
 
     // Data should be readable from active memtable (no SST involved)
-    let v1 = engine.get(b"key1").unwrap();
+    let v1 = tisql::io::block_on_sync(engine.get(b"key1")).unwrap();
     assert_eq!(v1, Some(b"value1".to_vec()));
 
-    let v2 = engine.get(b"key2").unwrap();
+    let v2 = tisql::io::block_on_sync(engine.get(b"key2")).unwrap();
     assert_eq!(v2, Some(b"value2".to_vec()));
 
     // Non-existent key should return None
-    let v3 = engine.get(b"nonexistent").unwrap();
+    let v3 = tisql::io::block_on_sync(engine.get(b"nonexistent")).unwrap();
     assert!(v3.is_none());
 
     // Freeze and write more data
@@ -1371,11 +1376,11 @@ fn test_get_from_memtable() {
     write_test_data(&engine, b"key3", b"value3", 3);
 
     // Data from frozen memtable should be readable
-    let v1_frozen = engine.get(b"key1").unwrap();
+    let v1_frozen = tisql::io::block_on_sync(engine.get(b"key1")).unwrap();
     assert_eq!(v1_frozen, Some(b"value1".to_vec()));
 
     // Data from active memtable should be readable
-    let v3_active = engine.get(b"key3").unwrap();
+    let v3_active = tisql::io::block_on_sync(engine.get(b"key3")).unwrap();
     assert_eq!(v3_active, Some(b"value3".to_vec()));
 
     scenario.teardown();
@@ -1447,7 +1452,7 @@ fn test_scan_iter_memtable_and_sst() {
 
     let mut keys = Vec::new();
     loop {
-        iter.advance().unwrap();
+        tisql::io::block_on_sync(iter.advance()).unwrap();
         if !iter.valid() {
             break;
         }

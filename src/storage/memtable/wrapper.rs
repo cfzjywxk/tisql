@@ -345,11 +345,11 @@ mod tests {
         let mut iter = mt
             .inner()
             .create_streaming_iter(std::sync::Arc::new(range), 0);
-        iter.advance().unwrap();
+        crate::io::block_on_sync(iter.advance()).unwrap();
         while iter.valid() {
             let key = MvccKey::encode(iter.user_key(), iter.timestamp());
             results.push((key, iter.value().to_vec()));
-            iter.advance().unwrap();
+            crate::io::block_on_sync(iter.advance()).unwrap();
         }
         results
     }

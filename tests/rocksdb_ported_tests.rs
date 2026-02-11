@@ -50,7 +50,7 @@ fn get_at_for_test(engine: &LsmEngine, key: &[u8], ts: Timestamp) -> Option<RawV
 
     // Use streaming scan_iter() - process one entry at a time
     let mut iter = engine.scan_iter(range, 0).unwrap();
-    iter.advance().unwrap(); // Position on first entry
+    tisql::io::block_on_sync(iter.advance()).unwrap(); // Position on first entry
 
     while iter.valid() {
         let decoded_key = iter.user_key();
@@ -62,7 +62,7 @@ fn get_at_for_test(engine: &LsmEngine, key: &[u8], ts: Timestamp) -> Option<RawV
             }
             return Some(value);
         }
-        iter.advance().unwrap();
+        tisql::io::block_on_sync(iter.advance()).unwrap();
     }
     None
 }
@@ -82,7 +82,7 @@ fn scan_at_for_test(
 
     // Use streaming scan_iter() - process one entry at a time
     let mut iter = engine.scan_iter(mvcc_range, 0).unwrap();
-    iter.advance().unwrap(); // Position on first entry
+    tisql::io::block_on_sync(iter.advance()).unwrap(); // Position on first entry
 
     let mut seen_keys: std::collections::HashSet<Vec<u8>> = std::collections::HashSet::new();
     let mut output = Vec::new();
@@ -93,7 +93,7 @@ fn scan_at_for_test(
         let value = iter.value().to_vec();
 
         // Move to next before continue checks (so we don't get stuck)
-        iter.advance().unwrap();
+        tisql::io::block_on_sync(iter.advance()).unwrap();
 
         if decoded_key < range.start || decoded_key >= range.end {
             continue;
@@ -765,14 +765,16 @@ fn test_sst_iterator_key_patterns() {
     builder.finish(1, 0).unwrap();
 
     // Read and verify
-    let reader = SstReaderRef::open(&sst_path, IoService::new(32).unwrap()).unwrap();
+    let reader =
+        tisql::io::block_on_sync(SstReaderRef::open(&sst_path, IoService::new(32).unwrap()))
+            .unwrap();
     let mut iter = SstIterator::new(reader).unwrap();
-    iter.seek_to_first().unwrap();
+    tisql::io::block_on_sync(iter.seek_to_first()).unwrap();
 
     let mut keys = Vec::new();
     while iter.valid() {
         keys.push(iter.key().to_vec());
-        iter.advance().unwrap();
+        tisql::io::block_on_sync(iter.advance()).unwrap();
     }
 
     // Keys should be in sorted order
@@ -809,9 +811,11 @@ fn test_sst_many_entries() {
     assert_eq!(meta.entry_count, num_entries as u64);
 
     // Read and count
-    let reader = SstReaderRef::open(&sst_path, IoService::new(32).unwrap()).unwrap();
+    let reader =
+        tisql::io::block_on_sync(SstReaderRef::open(&sst_path, IoService::new(32).unwrap()))
+            .unwrap();
     let mut iter = SstIterator::new(reader).unwrap();
-    iter.seek_to_first().unwrap();
+    tisql::io::block_on_sync(iter.seek_to_first()).unwrap();
 
     let mut count = 0;
     let mut prev_key: Option<Vec<u8>> = None;
@@ -828,7 +832,7 @@ fn test_sst_many_entries() {
 
         prev_key = Some(key);
         count += 1;
-        iter.advance().unwrap();
+        tisql::io::block_on_sync(iter.advance()).unwrap();
     }
 
     assert_eq!(count, num_entries);
@@ -866,14 +870,16 @@ fn test_sst_mvcc_keys() {
     builder.finish(1, 0).unwrap();
 
     // Read and verify order
-    let reader = SstReaderRef::open(&sst_path, IoService::new(32).unwrap()).unwrap();
+    let reader =
+        tisql::io::block_on_sync(SstReaderRef::open(&sst_path, IoService::new(32).unwrap()))
+            .unwrap();
     let mut iter = SstIterator::new(reader).unwrap();
-    iter.seek_to_first().unwrap();
+    tisql::io::block_on_sync(iter.seek_to_first()).unwrap();
 
     let mut entries: Vec<(Vec<u8>, Vec<u8>)> = Vec::new();
     while iter.valid() {
         entries.push((iter.key().to_vec(), iter.value().to_vec()));
-        iter.advance().unwrap();
+        tisql::io::block_on_sync(iter.advance()).unwrap();
     }
 
     // Should have 5 entries

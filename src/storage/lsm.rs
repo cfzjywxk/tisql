@@ -432,13 +432,13 @@ impl LsmEngine {
         let range = Arc::new(MvccKey::unbounded()..MvccKey::unbounded());
         // Flush only committed data (owner_ts = 0 means no pending nodes visible)
         let mut iter = memtable.inner().create_streaming_iter(range, 0);
-        iter.advance()?; // Initialize iterator to first entry
+        crate::io::block_on_sync(iter.advance())?; // Initialize iterator to first entry
 
         while iter.valid() {
             // Reconstruct MVCC key from user_key + timestamp
             let mvcc_key = MvccKey::encode(iter.user_key(), iter.timestamp());
             builder.add(mvcc_key.as_bytes(), iter.value())?;
-            iter.advance()?;
+            crate::io::block_on_sync(iter.advance())?;
         }
 
         // Finish building (writes to disk with fsync)
@@ -507,7 +507,7 @@ impl LsmEngine {
     /// 1. Scan for entries matching the key
     /// 2. Find the latest version with entry_ts <= ts
     /// 3. Return None if that version is a tombstone
-    fn get_from_sst(&self, key: &[u8], ts: Timestamp) -> Result<Option<RawValue>> {
+    async fn get_from_sst(&self, key: &[u8], ts: Timestamp) -> Result<Option<RawValue>> {
         let version = self.current_version();
 
         // Find SSTs that may contain this key
@@ -536,9 +536,9 @@ impl LsmEngine {
 
             // SST now contains MVCC keys - iterate to find matching key with ts visibility
             // Propagate errors instead of silently ignoring (risks wrong reads)
-            let reader = SstReaderRef::open(&sst_path, Arc::clone(&self.io))?;
+            let reader = SstReaderRef::open(&sst_path, Arc::clone(&self.io)).await?;
             let mut iter = SstIterator::new(reader)?;
-            iter.seek_to_first()?; // Position at first entry
+            iter.seek_to_first().await?; // Position at first entry
 
             while iter.valid() {
                 let mvcc_key = iter.key();
@@ -563,7 +563,7 @@ impl LsmEngine {
                     }
                 }
 
-                iter.advance()?;
+                iter.advance().await?;
             }
         }
 
@@ -708,7 +708,7 @@ impl LsmEngine {
     /// 9. Checkpoint if needed
     ///
     /// Returns `Ok(true)` if compaction was performed, `Ok(false)` if no work needed.
-    pub fn do_compaction(&self) -> Result<bool> {
+    pub async fn do_compaction(&self) -> Result<bool> {
         use super::compaction::{CompactionExecutor, CompactionPicker};
 
         let version = self.current_version();
@@ -724,13 +724,15 @@ impl LsmEngine {
         if task.is_trivial_move {
             let executor = CompactionExecutor::new(Arc::clone(&self.config));
             // Trivial move doesn't use pre-allocated IDs or IO service
-            let delta = executor.execute(
-                &task,
-                &version,
-                &self.config.sst_dir(),
-                &[],
-                Arc::clone(&self.io),
-            )?;
+            let delta = executor
+                .execute(
+                    &task,
+                    &version,
+                    &self.config.sst_dir(),
+                    &[],
+                    Arc::clone(&self.io),
+                )
+                .await?;
 
             // Apply delta
             let new_version = self.version_set.apply_delta(&delta);
@@ -765,13 +767,15 @@ impl LsmEngine {
 
         // Phase 3: Execute compaction
         let executor = CompactionExecutor::new(Arc::clone(&self.config));
-        let delta = executor.execute(
-            &task,
-            &version,
-            &self.config.sst_dir(),
-            &pre_allocated_ids,
-            Arc::clone(&self.io),
-        )?;
+        let delta = executor
+            .execute(
+                &task,
+                &version,
+                &self.config.sst_dir(),
+                &pre_allocated_ids,
+                Arc::clone(&self.io),
+            )
+            .await?;
 
         // Phase 4: Write CompactCommit (if durable)
         if let Some(ref ilog) = self.ilog {
@@ -859,8 +863,8 @@ impl LsmEngine {
     /// 3. Checks SST files via `get_from_sst`
     ///
     /// Returns `Ok(Some(value))` if found, `Ok(None)` if not found or deleted.
-    pub fn get(&self, key: &[u8]) -> Result<Option<RawValue>> {
-        self.get_at(key, Timestamp::MAX)
+    pub async fn get(&self, key: &[u8]) -> Result<Option<RawValue>> {
+        self.get_at(key, Timestamp::MAX).await
     }
 
     /// Get a value by key at a specific MVCC timestamp.
@@ -871,35 +875,35 @@ impl LsmEngine {
     /// 3. Checks SST files
     ///
     /// Returns `Ok(Some(value))` if found, `Ok(None)` if not found or deleted.
-    pub fn get_at(&self, key: &[u8], ts: Timestamp) -> Result<Option<RawValue>> {
-        let state = self.state.read();
+    pub async fn get_at(&self, key: &[u8], ts: Timestamp) -> Result<Option<RawValue>> {
+        // Scope the lock so it's dropped before the async SST read.
+        {
+            let state = self.state.read();
 
-        // Check active memtable first
-        // owner_start_ts = 0 means don't see pending writes from any transaction
-        if let Some(value) = state.active.get_with_owner(key, ts, 0) {
-            return if is_tombstone(&value) {
-                Ok(None)
-            } else {
-                Ok(Some(value))
-            };
-        }
-
-        // Check frozen memtables (newest first = iterate from back)
-        for frozen in state.frozen.iter().rev() {
-            if let Some(value) = frozen.get_with_owner(key, ts, 0) {
+            // Check active memtable first
+            // owner_start_ts = 0 means don't see pending writes from any transaction
+            if let Some(value) = state.active.get_with_owner(key, ts, 0) {
                 return if is_tombstone(&value) {
                     Ok(None)
                 } else {
                     Ok(Some(value))
                 };
             }
+
+            // Check frozen memtables (newest first = iterate from back)
+            for frozen in state.frozen.iter().rev() {
+                if let Some(value) = frozen.get_with_owner(key, ts, 0) {
+                    return if is_tombstone(&value) {
+                        Ok(None)
+                    } else {
+                        Ok(Some(value))
+                    };
+                }
+            }
         }
 
-        // Drop the lock before reading SSTs
-        drop(state);
-
         // Check SSTs
-        self.get_from_sst(key, ts)
+        self.get_from_sst(key, ts).await
     }
 }
 
@@ -962,12 +966,12 @@ impl ArcMemTableIterator {
 }
 
 impl MvccIterator for ArcMemTableIterator {
-    fn seek(&mut self, target: &MvccKey) -> Result<()> {
-        self.iter.seek(target)
+    async fn seek(&mut self, target: &MvccKey) -> Result<()> {
+        self.iter.seek(target).await
     }
 
-    fn advance(&mut self) -> Result<()> {
-        self.iter.advance()
+    async fn advance(&mut self) -> Result<()> {
+        self.iter.advance().await
     }
 
     fn valid(&self) -> bool {
@@ -1057,24 +1061,24 @@ enum ChildIterator {
 
 impl ChildIterator {
     #[inline]
-    fn seek(&mut self, target: &MvccKey) -> Result<()> {
+    async fn seek(&mut self, target: &MvccKey) -> Result<()> {
         match self {
-            Self::Memtable(iter) => iter.seek(target),
-            Self::L0Sst(iter) => iter.seek(target),
-            Self::Level(iter) => iter.seek(target),
+            Self::Memtable(iter) => iter.seek(target).await,
+            Self::L0Sst(iter) => iter.seek(target).await,
+            Self::Level(iter) => iter.seek(target).await,
             #[cfg(test)]
-            Self::Mock(iter) => iter.seek(target),
+            Self::Mock(iter) => iter.seek(target).await,
         }
     }
 
     #[inline]
-    fn advance(&mut self) -> Result<()> {
+    async fn advance(&mut self) -> Result<()> {
         match self {
-            Self::Memtable(iter) => iter.advance(),
-            Self::L0Sst(iter) => iter.advance(),
-            Self::Level(iter) => iter.advance(),
+            Self::Memtable(iter) => iter.advance().await,
+            Self::L0Sst(iter) => iter.advance().await,
+            Self::Level(iter) => iter.advance().await,
             #[cfg(test)]
-            Self::Mock(iter) => iter.advance(),
+            Self::Mock(iter) => iter.advance().await,
         }
     }
 
@@ -1270,7 +1274,7 @@ impl L0SstIterator {
     }
 
     /// Open the SST file if not already open.
-    fn ensure_open(&mut self) -> Result<()> {
+    async fn ensure_open(&mut self) -> Result<()> {
         if self.inner.is_some() {
             return Ok(());
         }
@@ -1290,7 +1294,7 @@ impl L0SstIterator {
             )));
         }
 
-        let reader = SstReaderRef::open(&path, Arc::clone(&self.io))?;
+        let reader = SstReaderRef::open(&path, Arc::clone(&self.io)).await?;
         let iter = SstMvccIterator::new(reader, Arc::clone(&self.range))?;
         self.inner = Some(iter);
         Ok(())
@@ -1298,7 +1302,7 @@ impl L0SstIterator {
 }
 
 impl MvccIterator for L0SstIterator {
-    fn seek(&mut self, target: &MvccKey) -> Result<()> {
+    async fn seek(&mut self, target: &MvccKey) -> Result<()> {
         #[cfg(feature = "failpoints")]
         fail_point!("l0_sst_iterator_seek", |_| {
             Err(TiSqlError::Storage("injected L0 seek error".into()))
@@ -1308,14 +1312,14 @@ impl MvccIterator for L0SstIterator {
             return Err(e);
         }
 
-        self.ensure_open()?;
+        self.ensure_open().await?;
         if let Some(ref mut iter) = self.inner {
-            iter.seek(target)?;
+            iter.seek(target).await?;
         }
         Ok(())
     }
 
-    fn advance(&mut self) -> Result<()> {
+    async fn advance(&mut self) -> Result<()> {
         #[cfg(feature = "failpoints")]
         fail_point!("l0_sst_iterator_advance", |_| {
             Err(TiSqlError::Storage("injected L0 advance error".into()))
@@ -1327,11 +1331,11 @@ impl MvccIterator for L0SstIterator {
 
         // If not yet opened, open and advance (which positions at range start)
         if self.inner.is_none() {
-            self.ensure_open()?;
+            self.ensure_open().await?;
         }
 
         if let Some(ref mut iter) = self.inner {
-            iter.advance()?;
+            iter.advance().await?;
         }
         Ok(())
     }
@@ -1405,7 +1409,7 @@ impl LevelIterator {
     }
 
     /// Open the file at the given index.
-    fn open_file(&mut self, idx: usize) -> Result<()> {
+    async fn open_file(&mut self, idx: usize) -> Result<()> {
         if idx >= self.sst_metas.len() {
             self.current_file_idx = None;
             self.current_iter = None;
@@ -1429,7 +1433,7 @@ impl LevelIterator {
             )));
         }
 
-        let reader = SstReaderRef::open(&path, Arc::clone(&self.io))?;
+        let reader = SstReaderRef::open(&path, Arc::clone(&self.io)).await?;
         let iter = SstMvccIterator::new(reader, Arc::clone(&self.range))?;
         self.current_file_idx = Some(idx);
         self.current_iter = Some(iter);
@@ -1440,7 +1444,7 @@ impl LevelIterator {
     ///
     /// If the current iterator is not positioned, positions it first (via advance).
     /// Then skips to the next file if the current file has no entries in range.
-    fn skip_empty_files(&mut self) -> Result<()> {
+    async fn skip_empty_files(&mut self) -> Result<()> {
         #[cfg(feature = "failpoints")]
         fail_point!("level_iterator_skip_empty_files", |_| {
             Err(TiSqlError::Storage(
@@ -1452,7 +1456,7 @@ impl LevelIterator {
             // Position the iterator if not already positioned
             if let Some(ref mut iter) = self.current_iter {
                 if !iter.valid() {
-                    iter.advance()?; // Positions at range start if not positioned
+                    iter.advance().await?; // Positions at range start if not positioned
                 }
                 if iter.valid() {
                     break; // Found valid entry
@@ -1464,7 +1468,7 @@ impl LevelIterator {
             // Current file exhausted, move to next file
             if let Some(idx) = self.current_file_idx {
                 if idx + 1 < self.sst_metas.len() {
-                    self.open_file(idx + 1)?;
+                    self.open_file(idx + 1).await?;
                 } else {
                     self.current_file_idx = None;
                     self.current_iter = None;
@@ -1479,7 +1483,7 @@ impl LevelIterator {
 }
 
 impl MvccIterator for LevelIterator {
-    fn seek(&mut self, target: &MvccKey) -> Result<()> {
+    async fn seek(&mut self, target: &MvccKey) -> Result<()> {
         #[cfg(feature = "failpoints")]
         fail_point!("level_iterator_seek", |_| {
             Err(TiSqlError::Storage("injected seek error".into()))
@@ -1497,8 +1501,8 @@ impl MvccIterator for LevelIterator {
                 return Ok(());
             }
             // Open first file, skip_empty_files will position the iterator
-            self.open_file(0)?;
-            return self.skip_empty_files();
+            self.open_file(0).await?;
+            return self.skip_empty_files().await;
         }
 
         // Binary search to find the right file
@@ -1516,20 +1520,20 @@ impl MvccIterator for LevelIterator {
         // Check if we can reuse current file
         if self.current_file_idx == Some(idx) {
             if let Some(ref mut iter) = self.current_iter {
-                iter.seek(target)?;
-                return self.skip_empty_files();
+                iter.seek(target).await?;
+                return self.skip_empty_files().await;
             }
         }
 
         // Open the file and seek
-        self.open_file(idx)?;
+        self.open_file(idx).await?;
         if let Some(ref mut iter) = self.current_iter {
-            iter.seek(target)?;
+            iter.seek(target).await?;
         }
-        self.skip_empty_files()
+        self.skip_empty_files().await
     }
 
-    fn advance(&mut self) -> Result<()> {
+    async fn advance(&mut self) -> Result<()> {
         #[cfg(feature = "failpoints")]
         fail_point!("level_iterator_advance", |_| {
             Err(TiSqlError::Storage("injected advance error".into()))
@@ -1540,13 +1544,13 @@ impl MvccIterator for LevelIterator {
         }
 
         if let Some(ref mut iter) = self.current_iter {
-            iter.advance()?;
+            iter.advance().await?;
             // If current file exhausted, move to next
             if !iter.valid() {
                 if let Some(idx) = self.current_file_idx {
                     if idx + 1 < self.sst_metas.len() {
-                        self.open_file(idx + 1)?;
-                        return self.skip_empty_files();
+                        self.open_file(idx + 1).await?;
+                        return self.skip_empty_files().await;
                     }
                 }
                 self.current_file_idx = None;
@@ -1743,9 +1747,7 @@ impl TieredMergeIterator {
 // by the ChildIterator::Mock variant (which needs to be in the main enum).
 
 #[cfg(test)]
-use std::cell::RefCell;
-#[cfg(test)]
-use std::rc::Rc;
+use std::sync::atomic::AtomicBool;
 
 /// Mock iterator that tracks whether seek() has been called.
 /// Used to verify lazy initialization behavior.
@@ -1756,17 +1758,17 @@ struct MockMvccIterator {
     /// Current position (-1 = not initialized, >= data.len() = exhausted)
     pos: i32,
     /// Tracks whether seek() has been called (shared for external inspection)
-    seek_called: Rc<RefCell<bool>>,
+    seek_called: Arc<AtomicBool>,
 }
 
 #[cfg(test)]
 impl MockMvccIterator {
-    fn new(_name: &str, data: Vec<(MvccKey, Vec<u8>)>) -> (Self, Rc<RefCell<bool>>) {
-        let seek_called = Rc::new(RefCell::new(false));
+    fn new(_name: &str, data: Vec<(MvccKey, Vec<u8>)>) -> (Self, Arc<AtomicBool>) {
+        let seek_called = Arc::new(AtomicBool::new(false));
         let iter = Self {
             data,
             pos: -1, // Not initialized
-            seek_called: Rc::clone(&seek_called),
+            seek_called: Arc::clone(&seek_called),
         };
         (iter, seek_called)
     }
@@ -1774,7 +1776,7 @@ impl MockMvccIterator {
     fn new_with_tracker(
         _name: &str,
         data: Vec<(MvccKey, Vec<u8>)>,
-        seek_called: Rc<RefCell<bool>>,
+        seek_called: Arc<AtomicBool>,
     ) -> Self {
         Self {
             data,
@@ -1786,8 +1788,9 @@ impl MockMvccIterator {
 
 #[cfg(test)]
 impl MvccIterator for MockMvccIterator {
-    fn seek(&mut self, target: &MvccKey) -> Result<()> {
-        *self.seek_called.borrow_mut() = true;
+    async fn seek(&mut self, target: &MvccKey) -> Result<()> {
+        self.seek_called
+            .store(true, std::sync::atomic::Ordering::Relaxed);
         // Binary search for first key >= target
         self.pos = self
             .data
@@ -1798,7 +1801,7 @@ impl MvccIterator for MockMvccIterator {
         Ok(())
     }
 
-    fn advance(&mut self) -> Result<()> {
+    async fn advance(&mut self) -> Result<()> {
         if self.pos >= 0 {
             self.pos += 1;
         }
@@ -1864,7 +1867,7 @@ impl TieredMergeIterator {
     /// This is called on first `seek()` or `advance()`. It:
     /// 1. Seeks all children to the target (lazy iterators open files on demand)
     /// 2. Adds valid children to the heap with cached keys
-    fn initialize(&mut self, target: &MvccKey) -> Result<()> {
+    async fn initialize(&mut self, target: &MvccKey) -> Result<()> {
         if self.initialized {
             return Ok(());
         }
@@ -1873,7 +1876,7 @@ impl TieredMergeIterator {
 
         for (idx, child) in self.children.iter_mut().enumerate() {
             // Seek the iterator (lazy iterators open files on first seek)
-            child.iter.seek(target)?;
+            child.iter.seek(target).await?;
 
             // Add to heap if valid (with cached key for comparison)
             if child.iter.valid() {
@@ -1887,11 +1890,11 @@ impl TieredMergeIterator {
     }
 
     /// Re-seek all children to a new target and rebuild the heap.
-    fn reseek(&mut self, target: &MvccKey) -> Result<()> {
+    async fn reseek(&mut self, target: &MvccKey) -> Result<()> {
         self.heap.clear();
 
         for (idx, child) in self.children.iter_mut().enumerate() {
-            child.iter.seek(target)?;
+            child.iter.seek(target).await?;
 
             if child.iter.valid() {
                 self.heap
@@ -1904,7 +1907,7 @@ impl TieredMergeIterator {
 }
 
 impl MvccIterator for TieredMergeIterator {
-    fn seek(&mut self, target: &MvccKey) -> Result<()> {
+    async fn seek(&mut self, target: &MvccKey) -> Result<()> {
         // Clear any pending error from previous advance() - seek resets iterator state
         if let Some(e) = self.pending_error.take() {
             // Log but don't return - seek should reset the iterator
@@ -1920,27 +1923,27 @@ impl MvccIterator for TieredMergeIterator {
 
         if !self.initialized {
             // First seek: initialize all children
-            self.initialize(target)?;
+            self.initialize(target).await?;
         } else {
             // Subsequent seek: re-seek all children
-            self.reseek(target)?;
+            self.reseek(target).await?;
         }
 
         // Move to first valid entry
-        self.advance_internal()
+        self.advance_internal().await
     }
 
-    fn advance(&mut self) -> Result<()> {
+    async fn advance(&mut self) -> Result<()> {
         if let Some(e) = self.pending_error.take() {
             return Err(e);
         }
 
         // Lazy initialization on first advance
         if !self.initialized {
-            self.initialize(&MvccKey::unbounded())?;
+            self.initialize(&MvccKey::unbounded()).await?;
         }
 
-        self.advance_internal()
+        self.advance_internal().await
     }
 
     fn valid(&self) -> bool {
@@ -1970,7 +1973,7 @@ impl MvccIterator for TieredMergeIterator {
 
 impl TieredMergeIterator {
     /// Internal advance logic - assumes initialization is done.
-    fn advance_internal(&mut self) -> Result<()> {
+    async fn advance_internal(&mut self) -> Result<()> {
         loop {
             if self.heap.is_empty() {
                 self.current_user_key = None;
@@ -1995,7 +1998,7 @@ impl TieredMergeIterator {
             let pending_owner = child.iter.pending_owner();
 
             // Advance the iterator
-            if let Err(e) = child.iter.advance() {
+            if let Err(e) = child.iter.advance().await {
                 self.pending_error = Some(e);
             }
 
@@ -2242,8 +2245,11 @@ impl PessimisticStorage for LsmEngine {
         // For SST files, pending nodes don't exist, so we just do normal MVCC read
         drop(state); // Release lock before I/O
 
-        // get_from_sst uses current_version() internally
-        self.get_from_sst(key, read_ts).ok().flatten()
+        // get_from_sst is async; use sync bridge since StorageEngine trait is sync.
+        // The scan path uses proper .await; this sync bridge is only for point lookups.
+        crate::io::block_on_sync(self.get_from_sst(key, read_ts))
+            .ok()
+            .flatten()
     }
 }
 
@@ -2352,11 +2358,11 @@ mod tests {
     fn scan_mvcc(engine: &LsmEngine, range: Range<MvccKey>) -> Vec<(MvccKey, RawValue)> {
         let mut results = Vec::new();
         let mut iter = engine.scan_iter(range, 0).unwrap();
-        iter.advance().unwrap(); // Position on first entry
+        crate::io::block_on_sync(iter.advance()).unwrap();
         while iter.valid() {
             let key = MvccKey::encode(iter.user_key(), iter.timestamp());
             results.push((key, iter.value().to_vec()));
-            iter.advance().unwrap();
+            crate::io::block_on_sync(iter.advance()).unwrap();
         }
         results
     }
@@ -3124,8 +3130,8 @@ mod tests {
         );
     }
 
-    #[test]
-    fn test_sst_contains_mvcc_keys() {
+    #[tokio::test]
+    async fn test_sst_contains_mvcc_keys() {
         // Critical: Verify SST contains MVCC-encoded keys
         let tmp = TempDir::new().unwrap();
         let config = LsmConfig::builder(tmp.path())
@@ -3168,9 +3174,11 @@ mod tests {
         assert!(!ssts.is_empty(), "Should have at least one SST");
 
         let sst_path = config.sst_dir().join(format!("{:08}.sst", ssts[0].id));
-        let reader = SstReaderRef::open(&sst_path, crate::io::IoService::new(32).unwrap()).unwrap();
+        let reader = SstReaderRef::open(&sst_path, crate::io::IoService::new(32).unwrap())
+            .await
+            .unwrap();
         let mut iter = SstIterator::new(reader).unwrap();
-        iter.seek_to_first().unwrap(); // Position the iterator
+        iter.seek_to_first().await.unwrap(); // Position the iterator
 
         let mut entry_count = 0;
         let mut found_ts_10 = false;
@@ -3195,7 +3203,7 @@ mod tests {
                 }
             }
             entry_count += 1;
-            if iter.advance().is_err() {
+            if iter.advance().await.is_err() {
                 break;
             }
         }
@@ -3832,8 +3840,7 @@ mod tests {
     // 4. Priority-based deduplication: higher priority source wins for same MVCC key
     // 5. Lazy file I/O: SST files are opened on first seek, not at construction
 
-    use std::cell::RefCell;
-    use std::rc::Rc;
+    use std::sync::atomic::AtomicBool;
 
     // MockMvccIterator is defined outside the tests module (at module level with #[cfg(test)])
     // so it can be used by ChildIterator::Mock variant
@@ -3848,8 +3855,8 @@ mod tests {
         MvccKey::encode(iter.user_key(), iter.timestamp())
     }
 
-    #[test]
-    fn test_tiered_merge_iterator_memtable_only() {
+    #[tokio::test]
+    async fn test_tiered_merge_iterator_memtable_only() {
         // Test that when memtable has all data, it's returned correctly
         let (active_iter, active_seek) = MockMvccIterator::new(
             "active",
@@ -3865,15 +3872,18 @@ mod tests {
         let mut merge_iter = merge_iter.build();
 
         // Seek happens on first advance (lazy initialization)
-        merge_iter.advance().unwrap(); // Position on first entry
-        assert!(*active_seek.borrow(), "Active memtable should be seeked");
+        merge_iter.advance().await.unwrap(); // Position on first entry
+        assert!(
+            active_seek.load(std::sync::atomic::Ordering::Relaxed),
+            "Active memtable should be seeked"
+        );
         assert!(merge_iter.valid());
         assert_eq!(iter_key(&merge_iter), test_key(b"a", 100));
         assert_eq!(merge_iter.value(), b"a_active");
     }
 
-    #[test]
-    fn test_tiered_merge_iterator_tier_order_active_frozen() {
+    #[tokio::test]
+    async fn test_tiered_merge_iterator_tier_order_active_frozen() {
         // Test that active memtable has priority over frozen memtables
         // Same key exists in both, active should win
         let (active_iter, _) = MockMvccIterator::new(
@@ -3891,7 +3901,7 @@ mod tests {
         merge_iter.add_mock_frozen(frozen_iter, 0);
 
         let mut merge_iter = merge_iter.build();
-        merge_iter.advance().unwrap(); // Position on first entry
+        merge_iter.advance().await.unwrap(); // Position on first entry
 
         assert!(merge_iter.valid());
         // Active has priority 0, frozen has priority 100+
@@ -3899,8 +3909,8 @@ mod tests {
         assert_eq!(merge_iter.value(), b"active_value");
     }
 
-    #[test]
-    fn test_tiered_merge_iterator_all_tiers_initialized_at_first_advance() {
+    #[tokio::test]
+    async fn test_tiered_merge_iterator_all_tiers_initialized_at_first_advance() {
         // Test that ALL tiers (memtable and L0) are initialized at first advance
         // (lazy initialization) for correct MVCC key ordering.
 
@@ -3912,14 +3922,14 @@ mod tests {
             ],
         );
 
-        let l0_seek = Rc::new(RefCell::new(false));
+        let l0_seek = Arc::new(AtomicBool::new(false));
         let l0_iter = MockMvccIterator::new_with_tracker(
             "l0_sst",
             vec![
                 (test_key(b"c", 100), b"c_l0".to_vec()),
                 (test_key(b"d", 100), b"d_l0".to_vec()),
             ],
-            Rc::clone(&l0_seek),
+            Arc::clone(&l0_seek),
         );
 
         let mut merge_iter = TieredMergeIterator::new();
@@ -3930,64 +3940,64 @@ mod tests {
 
         // Before first advance, nothing should be seeked (lazy initialization)
         assert!(
-            !*active_seek.borrow(),
+            !active_seek.load(std::sync::atomic::Ordering::Relaxed),
             "Active memtable should NOT be seeked before first advance (lazy)"
         );
         assert!(
-            !*l0_seek.borrow(),
+            !l0_seek.load(std::sync::atomic::Ordering::Relaxed),
             "L0 SST should NOT be seeked before first advance (lazy)"
         );
 
         // Position on first entry - this triggers initialization
-        merge_iter.advance().unwrap();
+        merge_iter.advance().await.unwrap();
 
         // After first advance, ALL tiers should be initialized
         assert!(
-            *active_seek.borrow(),
+            active_seek.load(std::sync::atomic::Ordering::Relaxed),
             "Active memtable should be seeked after first advance"
         );
         assert!(
-            *l0_seek.borrow(),
+            l0_seek.load(std::sync::atomic::Ordering::Relaxed),
             "L0 SST should be seeked after first advance"
         );
 
         assert!(merge_iter.valid());
         assert_eq!(iter_key(&merge_iter), test_key(b"a", 100));
 
-        merge_iter.advance().unwrap();
+        merge_iter.advance().await.unwrap();
         assert!(merge_iter.valid());
         assert_eq!(iter_key(&merge_iter), test_key(b"b", 100));
 
-        merge_iter.advance().unwrap();
+        merge_iter.advance().await.unwrap();
         assert!(merge_iter.valid());
         assert_eq!(iter_key(&merge_iter), test_key(b"c", 100));
         assert_eq!(merge_iter.value(), b"c_l0");
 
-        merge_iter.advance().unwrap();
+        merge_iter.advance().await.unwrap();
         assert!(merge_iter.valid());
         assert_eq!(iter_key(&merge_iter), test_key(b"d", 100));
     }
 
-    #[test]
-    fn test_tiered_merge_iterator_all_levels_initialized_at_first_advance() {
+    #[tokio::test]
+    async fn test_tiered_merge_iterator_all_levels_initialized_at_first_advance() {
         // Test that ALL tiers (memtable, L0, and L1+) are initialized at first advance
         // (lazy initialization) for correct MVCC key ordering.
 
         let (active_iter, _) =
             MockMvccIterator::new("active", vec![(test_key(b"a", 100), b"a_active".to_vec())]);
 
-        let l0_seek = Rc::new(RefCell::new(false));
+        let l0_seek = Arc::new(AtomicBool::new(false));
         let l0_iter = MockMvccIterator::new_with_tracker(
             "l0_sst",
             vec![(test_key(b"b", 100), b"b_l0".to_vec())],
-            Rc::clone(&l0_seek),
+            Arc::clone(&l0_seek),
         );
 
-        let l1_seek = Rc::new(RefCell::new(false));
+        let l1_seek = Arc::new(AtomicBool::new(false));
         let l1_iter = MockMvccIterator::new_with_tracker(
             "l1_level",
             vec![(test_key(b"c", 100), b"c_l1".to_vec())],
-            Rc::clone(&l1_seek),
+            Arc::clone(&l1_seek),
         );
 
         let mut merge_iter = TieredMergeIterator::new();
@@ -3999,45 +4009,45 @@ mod tests {
 
         // Before first advance, nothing should be seeked (lazy initialization)
         assert!(
-            !*l0_seek.borrow(),
+            !l0_seek.load(std::sync::atomic::Ordering::Relaxed),
             "L0 SST should NOT be seeked before first advance"
         );
         assert!(
-            !*l1_seek.borrow(),
+            !l1_seek.load(std::sync::atomic::Ordering::Relaxed),
             "L1 level should NOT be seeked before first advance"
         );
 
         // Position on first entry and read - should be sorted correctly
-        merge_iter.advance().unwrap();
+        merge_iter.advance().await.unwrap();
 
         // After first advance, ALL tiers should be initialized
         assert!(
-            *l0_seek.borrow(),
+            l0_seek.load(std::sync::atomic::Ordering::Relaxed),
             "L0 SST should be seeked after first advance"
         );
         assert!(
-            *l1_seek.borrow(),
+            l1_seek.load(std::sync::atomic::Ordering::Relaxed),
             "L1 level should be seeked after first advance"
         );
 
         assert!(merge_iter.valid());
         assert_eq!(iter_key(&merge_iter), test_key(b"a", 100));
 
-        merge_iter.advance().unwrap();
+        merge_iter.advance().await.unwrap();
         assert!(merge_iter.valid());
         assert_eq!(iter_key(&merge_iter), test_key(b"b", 100));
 
-        merge_iter.advance().unwrap();
+        merge_iter.advance().await.unwrap();
         assert!(merge_iter.valid());
         assert_eq!(iter_key(&merge_iter), test_key(b"c", 100));
 
         // Exhaust all
-        merge_iter.advance().unwrap();
+        merge_iter.advance().await.unwrap();
         assert!(!merge_iter.valid(), "All tiers exhausted");
     }
 
-    #[test]
-    fn test_tiered_merge_iterator_l0_unordered_all_considered() {
+    #[tokio::test]
+    async fn test_tiered_merge_iterator_l0_unordered_all_considered() {
         // Test that ALL L0 SST files are considered during merge.
         // L0 files can have overlapping key ranges, so all must be in the heap.
 
@@ -4046,36 +4056,36 @@ mod tests {
 
         // L0 SSTs with overlapping/unordered key ranges
         // SST 0: keys a, d (newer, higher priority)
-        let l0_0_seek = Rc::new(RefCell::new(false));
+        let l0_0_seek = Arc::new(AtomicBool::new(false));
         let l0_0_iter = MockMvccIterator::new_with_tracker(
             "l0_sst_0",
             vec![
                 (test_key(b"a", 100), b"a_l0_0".to_vec()),
                 (test_key(b"d", 100), b"d_l0_0".to_vec()),
             ],
-            Rc::clone(&l0_0_seek),
+            Arc::clone(&l0_0_seek),
         );
 
         // SST 1: keys b, c (older, lower priority)
-        let l0_1_seek = Rc::new(RefCell::new(false));
+        let l0_1_seek = Arc::new(AtomicBool::new(false));
         let l0_1_iter = MockMvccIterator::new_with_tracker(
             "l0_sst_1",
             vec![
                 (test_key(b"b", 100), b"b_l0_1".to_vec()),
                 (test_key(b"c", 100), b"c_l0_1".to_vec()),
             ],
-            Rc::clone(&l0_1_seek),
+            Arc::clone(&l0_1_seek),
         );
 
         // SST 2: keys a, e (even older) - 'a' overlaps with SST 0
-        let l0_2_seek = Rc::new(RefCell::new(false));
+        let l0_2_seek = Arc::new(AtomicBool::new(false));
         let l0_2_iter = MockMvccIterator::new_with_tracker(
             "l0_sst_2",
             vec![
                 (test_key(b"a", 100), b"a_l0_2".to_vec()),
                 (test_key(b"e", 100), b"e_l0_2".to_vec()),
             ],
-            Rc::clone(&l0_2_seek),
+            Arc::clone(&l0_2_seek),
         );
 
         let mut merge_iter = TieredMergeIterator::new();
@@ -4088,19 +4098,19 @@ mod tests {
         let mut merge_iter = merge_iter.build();
 
         // First advance positions on first entry and triggers lazy initialization
-        merge_iter.advance().unwrap();
+        merge_iter.advance().await.unwrap();
 
         // After first advance, ALL L0 SSTs should be initialized for correct ordering
         assert!(
-            *l0_0_seek.borrow(),
+            l0_0_seek.load(std::sync::atomic::Ordering::Relaxed),
             "L0 SST 0 should be seeked after first advance"
         );
         assert!(
-            *l0_1_seek.borrow(),
+            l0_1_seek.load(std::sync::atomic::Ordering::Relaxed),
             "L0 SST 1 should be seeked after first advance"
         );
         assert!(
-            *l0_2_seek.borrow(),
+            l0_2_seek.load(std::sync::atomic::Ordering::Relaxed),
             "L0 SST 2 should be seeked after first advance"
         );
 
@@ -4115,49 +4125,49 @@ mod tests {
             "SST 0 (higher priority) should win for key 'a'"
         );
 
-        merge_iter.advance().unwrap();
+        merge_iter.advance().await.unwrap();
         assert!(merge_iter.valid());
         assert_eq!(iter_key(&merge_iter), test_key(b"b", 100));
         assert_eq!(merge_iter.value(), b"b_l0_1");
 
-        merge_iter.advance().unwrap();
+        merge_iter.advance().await.unwrap();
         assert!(merge_iter.valid());
         assert_eq!(iter_key(&merge_iter), test_key(b"c", 100));
         assert_eq!(merge_iter.value(), b"c_l0_1");
 
-        merge_iter.advance().unwrap();
+        merge_iter.advance().await.unwrap();
         assert!(merge_iter.valid());
         assert_eq!(iter_key(&merge_iter), test_key(b"d", 100));
         assert_eq!(merge_iter.value(), b"d_l0_0");
 
-        merge_iter.advance().unwrap();
+        merge_iter.advance().await.unwrap();
         assert!(merge_iter.valid());
         assert_eq!(iter_key(&merge_iter), test_key(b"e", 100));
         assert_eq!(merge_iter.value(), b"e_l0_2");
 
-        merge_iter.advance().unwrap();
+        merge_iter.advance().await.unwrap();
         assert!(!merge_iter.valid());
     }
 
-    #[test]
-    fn test_tiered_merge_iterator_seek_initializes_all() {
+    #[tokio::test]
+    async fn test_tiered_merge_iterator_seek_initializes_all() {
         // Test that seek() initializes ALL pending iterators (lazy initialization)
 
         let (active_iter, _) =
             MockMvccIterator::new("active", vec![(test_key(b"z", 100), b"z_active".to_vec())]);
 
-        let l0_seek = Rc::new(RefCell::new(false));
+        let l0_seek = Arc::new(AtomicBool::new(false));
         let l0_iter = MockMvccIterator::new_with_tracker(
             "l0_sst",
             vec![(test_key(b"a", 100), b"a_l0".to_vec())],
-            Rc::clone(&l0_seek),
+            Arc::clone(&l0_seek),
         );
 
-        let l1_seek = Rc::new(RefCell::new(false));
+        let l1_seek = Arc::new(AtomicBool::new(false));
         let l1_iter = MockMvccIterator::new_with_tracker(
             "l1_level",
             vec![(test_key(b"b", 100), b"b_l1".to_vec())],
-            Rc::clone(&l1_seek),
+            Arc::clone(&l1_seek),
         );
 
         let mut merge_iter = TieredMergeIterator::new();
@@ -4169,28 +4179,34 @@ mod tests {
 
         // Before seek, nothing should be initialized (lazy)
         assert!(
-            !*l0_seek.borrow(),
+            !l0_seek.load(std::sync::atomic::Ordering::Relaxed),
             "L0 SST should NOT be seeked before first seek/advance"
         );
         assert!(
-            !*l1_seek.borrow(),
+            !l1_seek.load(std::sync::atomic::Ordering::Relaxed),
             "L1 level should NOT be seeked before first seek/advance"
         );
 
         // Seek to a specific key triggers lazy initialization
-        merge_iter.seek(&test_key(b"a", 100)).unwrap();
+        merge_iter.seek(&test_key(b"a", 100)).await.unwrap();
 
         // After seek, ALL tiers should be initialized
-        assert!(*l0_seek.borrow(), "L0 SST should be seeked after seek");
-        assert!(*l1_seek.borrow(), "L1 level should be seeked after seek");
+        assert!(
+            l0_seek.load(std::sync::atomic::Ordering::Relaxed),
+            "L0 SST should be seeked after seek"
+        );
+        assert!(
+            l1_seek.load(std::sync::atomic::Ordering::Relaxed),
+            "L1 level should be seeked after seek"
+        );
 
         // Should be positioned at 'a' from L0
         assert!(merge_iter.valid());
         assert_eq!(iter_key(&merge_iter), test_key(b"a", 100));
     }
 
-    #[test]
-    fn test_tiered_merge_iterator_full_tier_flow() {
+    #[tokio::test]
+    async fn test_tiered_merge_iterator_full_tier_flow() {
         // Test the complete flow: active -> frozen -> L0 -> L1 -> L2
         // Each tier has unique keys to verify the flow
 
@@ -4209,25 +4225,25 @@ mod tests {
             vec![(test_key(b"03_frozen1", 100), b"v_frozen1".to_vec())],
         );
 
-        let l0_seek = Rc::new(RefCell::new(false));
+        let l0_seek = Arc::new(AtomicBool::new(false));
         let l0_iter = MockMvccIterator::new_with_tracker(
             "l0_sst",
             vec![(test_key(b"04_l0", 100), b"v_l0".to_vec())],
-            Rc::clone(&l0_seek),
+            Arc::clone(&l0_seek),
         );
 
-        let l1_seek = Rc::new(RefCell::new(false));
+        let l1_seek = Arc::new(AtomicBool::new(false));
         let l1_iter = MockMvccIterator::new_with_tracker(
             "l1_level",
             vec![(test_key(b"05_l1", 100), b"v_l1".to_vec())],
-            Rc::clone(&l1_seek),
+            Arc::clone(&l1_seek),
         );
 
-        let l2_seek = Rc::new(RefCell::new(false));
+        let l2_seek = Arc::new(AtomicBool::new(false));
         let l2_iter = MockMvccIterator::new_with_tracker(
             "l2_level",
             vec![(test_key(b"06_l2", 100), b"v_l2".to_vec())],
-            Rc::clone(&l2_seek),
+            Arc::clone(&l2_seek),
         );
 
         let mut merge_iter = TieredMergeIterator::new();
@@ -4241,40 +4257,44 @@ mod tests {
         let mut merge_iter = merge_iter.build();
 
         // Position on first entry - triggers lazy initialization
-        merge_iter.advance().unwrap();
+        merge_iter.advance().await.unwrap();
 
         // After first advance, ALL tiers should be initialized
-        assert!(*l0_seek.borrow() && *l1_seek.borrow() && *l2_seek.borrow());
+        assert!(
+            l0_seek.load(std::sync::atomic::Ordering::Relaxed)
+                && l1_seek.load(std::sync::atomic::Ordering::Relaxed)
+                && l2_seek.load(std::sync::atomic::Ordering::Relaxed)
+        );
 
         assert!(merge_iter.valid());
         assert_eq!(merge_iter.value(), b"v_active");
 
-        merge_iter.advance().unwrap();
+        merge_iter.advance().await.unwrap();
         assert!(merge_iter.valid());
         assert_eq!(merge_iter.value(), b"v_frozen0");
 
-        merge_iter.advance().unwrap();
+        merge_iter.advance().await.unwrap();
         assert!(merge_iter.valid());
         assert_eq!(merge_iter.value(), b"v_frozen1");
 
-        merge_iter.advance().unwrap();
+        merge_iter.advance().await.unwrap();
         assert!(merge_iter.valid());
         assert_eq!(merge_iter.value(), b"v_l0");
 
-        merge_iter.advance().unwrap();
+        merge_iter.advance().await.unwrap();
         assert!(merge_iter.valid());
         assert_eq!(merge_iter.value(), b"v_l1");
 
-        merge_iter.advance().unwrap();
+        merge_iter.advance().await.unwrap();
         assert!(merge_iter.valid());
         assert_eq!(merge_iter.value(), b"v_l2");
 
-        merge_iter.advance().unwrap();
+        merge_iter.advance().await.unwrap();
         assert!(!merge_iter.valid());
     }
 
-    #[test]
-    fn test_tiered_merge_iterator_priority_deduplication() {
+    #[tokio::test]
+    async fn test_tiered_merge_iterator_priority_deduplication() {
         // Test that higher priority source wins for duplicate keys
         // Priority order: active (0) > frozen (100+) > L0 (1000+) > L1+ (10000+)
 
@@ -4288,11 +4308,11 @@ mod tests {
             vec![(test_key(b"key", 100), b"frozen_loses".to_vec())],
         );
 
-        let l0_seek = Rc::new(RefCell::new(false));
+        let l0_seek = Arc::new(AtomicBool::new(false));
         let l0_iter = MockMvccIterator::new_with_tracker(
             "l0_sst",
             vec![(test_key(b"key", 100), b"l0_loses".to_vec())],
-            Rc::clone(&l0_seek),
+            Arc::clone(&l0_seek),
         );
 
         let mut merge_iter = TieredMergeIterator::new();
@@ -4303,7 +4323,7 @@ mod tests {
         let mut merge_iter = merge_iter.build();
 
         // Position on first entry
-        merge_iter.advance().unwrap();
+        merge_iter.advance().await.unwrap();
 
         // Only active's value should be returned
         assert!(merge_iter.valid());
@@ -4311,23 +4331,23 @@ mod tests {
         assert_eq!(merge_iter.value(), b"active_wins");
 
         // Next should exhaust all (duplicates were skipped)
-        merge_iter.advance().unwrap();
+        merge_iter.advance().await.unwrap();
 
         // L0 should be initialized, but its duplicate entry should have been skipped
         assert!(!merge_iter.valid());
     }
 
-    #[test]
-    fn test_tiered_merge_iterator_empty_memtable_with_l0() {
+    #[tokio::test]
+    async fn test_tiered_merge_iterator_empty_memtable_with_l0() {
         // Test that L0 data is correctly returned when memtable is empty
 
         let (active_iter, _) = MockMvccIterator::new("active", vec![]);
 
-        let l0_seek = Rc::new(RefCell::new(false));
+        let l0_seek = Arc::new(AtomicBool::new(false));
         let l0_iter = MockMvccIterator::new_with_tracker(
             "l0_sst",
             vec![(test_key(b"a", 100), b"a_l0".to_vec())],
-            Rc::clone(&l0_seek),
+            Arc::clone(&l0_seek),
         );
 
         let mut merge_iter = TieredMergeIterator::new();
@@ -4337,17 +4357,20 @@ mod tests {
         let mut merge_iter = merge_iter.build();
 
         // First advance positions on L0 data and triggers lazy initialization
-        merge_iter.advance().unwrap();
+        merge_iter.advance().await.unwrap();
 
         // L0 should be seeked after first advance
-        assert!(*l0_seek.borrow(), "L0 should be seeked after first advance");
+        assert!(
+            l0_seek.load(std::sync::atomic::Ordering::Relaxed),
+            "L0 should be seeked after first advance"
+        );
 
         assert!(merge_iter.valid());
         assert_eq!(iter_key(&merge_iter), test_key(b"a", 100));
     }
 
-    #[test]
-    fn test_tiered_merge_iterator_multiple_frozen_memtables() {
+    #[tokio::test]
+    async fn test_tiered_merge_iterator_multiple_frozen_memtables() {
         // Test multiple frozen memtables are merged correctly in order
 
         let (active_iter, _) =
@@ -4378,38 +4401,38 @@ mod tests {
         let mut merge_iter = merge_iter.build();
 
         // Position on first entry
-        merge_iter.advance().unwrap();
+        merge_iter.advance().await.unwrap();
 
         // Should get: a, b, c, shared (from frozen0 - higher priority)
         assert!(merge_iter.valid());
         assert_eq!(iter_key(&merge_iter), test_key(b"a", 100));
 
-        merge_iter.advance().unwrap();
+        merge_iter.advance().await.unwrap();
         assert_eq!(iter_key(&merge_iter), test_key(b"b", 100));
 
-        merge_iter.advance().unwrap();
+        merge_iter.advance().await.unwrap();
         assert_eq!(iter_key(&merge_iter), test_key(b"c", 100));
 
-        merge_iter.advance().unwrap();
+        merge_iter.advance().await.unwrap();
         assert_eq!(iter_key(&merge_iter), test_key(b"shared", 100));
         // frozen0 (priority 100) beats frozen1 (priority 101)
         assert_eq!(merge_iter.value(), b"shared_frozen0");
 
-        merge_iter.advance().unwrap();
+        merge_iter.advance().await.unwrap();
         assert!(!merge_iter.valid());
     }
 
-    #[test]
-    fn test_tiered_merge_iterator_all_empty() {
+    #[tokio::test]
+    async fn test_tiered_merge_iterator_all_empty() {
         // Test when all tiers are empty
 
         let (active_iter, _) = MockMvccIterator::new("active", vec![]);
 
-        let l0_seek = Rc::new(RefCell::new(false));
-        let l0_iter = MockMvccIterator::new_with_tracker("l0_sst", vec![], Rc::clone(&l0_seek));
+        let l0_seek = Arc::new(AtomicBool::new(false));
+        let l0_iter = MockMvccIterator::new_with_tracker("l0_sst", vec![], Arc::clone(&l0_seek));
 
-        let l1_seek = Rc::new(RefCell::new(false));
-        let l1_iter = MockMvccIterator::new_with_tracker("l1_level", vec![], Rc::clone(&l1_seek));
+        let l1_seek = Arc::new(AtomicBool::new(false));
+        let l1_iter = MockMvccIterator::new_with_tracker("l1_level", vec![], Arc::clone(&l1_seek));
 
         let mut merge_iter = TieredMergeIterator::new();
         merge_iter.add_mock_active(active_iter);
@@ -4419,27 +4442,33 @@ mod tests {
         let mut merge_iter = merge_iter.build();
 
         // With lazy initialization, children are NOT initialized at build time
-        assert!(!*l0_seek.borrow(), "L0 should NOT be initialized at build");
-        assert!(!*l1_seek.borrow(), "L1 should NOT be initialized at build");
+        assert!(
+            !l0_seek.load(std::sync::atomic::Ordering::Relaxed),
+            "L0 should NOT be initialized at build"
+        );
+        assert!(
+            !l1_seek.load(std::sync::atomic::Ordering::Relaxed),
+            "L1 should NOT be initialized at build"
+        );
 
         // First advance initializes ALL tiers for correct ordering
-        merge_iter.advance().unwrap();
+        merge_iter.advance().await.unwrap();
 
         // Now all tiers should be initialized
         assert!(
-            *l0_seek.borrow(),
+            l0_seek.load(std::sync::atomic::Ordering::Relaxed),
             "L0 should be initialized after first advance"
         );
         assert!(
-            *l1_seek.borrow(),
+            l1_seek.load(std::sync::atomic::Ordering::Relaxed),
             "L1 should be initialized after first advance"
         );
 
         assert!(!merge_iter.valid(), "Should be invalid - all empty");
     }
 
-    #[test]
-    fn test_tiered_merge_iterator_interleaved_keys() {
+    #[tokio::test]
+    async fn test_tiered_merge_iterator_interleaved_keys() {
         // Test that keys from different tiers are properly interleaved in sorted order
 
         let (active_iter, _) = MockMvccIterator::new(
@@ -4465,7 +4494,7 @@ mod tests {
         let mut merge_iter = merge_iter.build();
 
         // Position on first entry
-        merge_iter.advance().unwrap();
+        merge_iter.advance().await.unwrap();
 
         // Should be sorted: a, b, c, d
         let expected = [
@@ -4479,14 +4508,14 @@ mod tests {
             assert!(merge_iter.valid());
             assert_eq!(iter_key(&merge_iter), test_key(*key, 100));
             assert_eq!(merge_iter.value(), *value);
-            merge_iter.advance().unwrap();
+            merge_iter.advance().await.unwrap();
         }
 
         assert!(!merge_iter.valid());
     }
 
-    #[test]
-    fn test_lsm_engine_scan_iter_tiered_lazy_loading() {
+    #[tokio::test]
+    async fn test_lsm_engine_scan_iter_tiered_lazy_loading() {
         // Integration test: verify that LsmEngine's scan_iter uses tiered lazy loading
         // When all data is in memtable, SST files should not be opened
 
@@ -4510,22 +4539,22 @@ mod tests {
         let mut iter = engine.scan_iter(range, 0).unwrap();
 
         // Position on first entry
-        iter.advance().unwrap();
+        iter.advance().await.unwrap();
 
         // Should be able to read from memtable
         assert!(iter.valid());
         assert_eq!(iter.user_key(), b"key1");
 
-        iter.advance().unwrap();
+        iter.advance().await.unwrap();
         assert!(iter.valid());
         assert_eq!(iter.user_key(), b"key2");
 
-        iter.advance().unwrap();
+        iter.advance().await.unwrap();
         assert!(!iter.valid());
     }
 
-    #[test]
-    fn test_lsm_engine_scan_iter_with_sst_lazy_loading() {
+    #[tokio::test]
+    async fn test_lsm_engine_scan_iter_with_sst_lazy_loading() {
         // Integration test: verify SST data is loaded lazily when memtable doesn't have the key
 
         let tmp = TempDir::new().unwrap();
@@ -4558,11 +4587,11 @@ mod tests {
         let range = MvccKey::encode(b"new_key", Timestamp::MAX)..MvccKey::encode(b"new_key\xff", 0);
         let mut iter = engine.scan_iter(range, 0).unwrap();
 
-        iter.advance().unwrap();
+        iter.advance().await.unwrap();
         assert!(iter.valid());
         assert_eq!(iter.user_key(), b"new_key");
 
-        iter.advance().unwrap();
+        iter.advance().await.unwrap();
         assert!(!iter.valid());
 
         // Scan for old keys (will need SST)
@@ -4570,11 +4599,11 @@ mod tests {
         let mut iter = engine.scan_iter(range, 0).unwrap();
 
         // Should find all old keys from SST
-        iter.advance().unwrap();
+        iter.advance().await.unwrap();
         let mut count = 0;
         while iter.valid() {
             count += 1;
-            iter.advance().unwrap();
+            iter.advance().await.unwrap();
         }
         assert_eq!(count, 5, "Should find all 5 old keys from SST");
     }
@@ -4586,8 +4615,8 @@ mod tests {
     // 2. SstMvccIterator range start bound enforcement
     // 3. LazySstIterator error handling
 
-    #[test]
-    fn test_tiered_merge_iterator_ordering_memtable_vs_sst() {
+    #[tokio::test]
+    async fn test_tiered_merge_iterator_ordering_memtable_vs_sst() {
         // CRITICAL: Verify scan_iter returns keys in correct MVCC order
         // when SST has key "a" and memtable has key "b".
         // Previously, tier-gating would return "b" before "a", violating order.
@@ -4619,7 +4648,7 @@ mod tests {
         let range = MvccKey::encode(b"a", Timestamp::MAX)..MvccKey::encode(b"d", 0);
         let mut iter = engine.scan_iter(range, 0).unwrap();
 
-        iter.advance().unwrap();
+        iter.advance().await.unwrap();
         assert!(iter.valid(), "Should have first entry");
         assert_eq!(
             iter.user_key(),
@@ -4627,7 +4656,7 @@ mod tests {
             "First key must be 'a' (from SST), not 'b' (from memtable)"
         );
 
-        iter.advance().unwrap();
+        iter.advance().await.unwrap();
         assert!(iter.valid(), "Should have second entry");
         assert_eq!(
             iter.user_key(),
@@ -4635,16 +4664,16 @@ mod tests {
             "Second key must be 'b' (from memtable)"
         );
 
-        iter.advance().unwrap();
+        iter.advance().await.unwrap();
         assert!(iter.valid(), "Should have third entry");
         assert_eq!(iter.user_key(), b"c", "Third key must be 'c' (from SST)");
 
-        iter.advance().unwrap();
+        iter.advance().await.unwrap();
         assert!(!iter.valid(), "Should have no more entries after a, b, c");
     }
 
-    #[test]
-    fn test_tiered_merge_iterator_ordering_multiple_ssts() {
+    #[tokio::test]
+    async fn test_tiered_merge_iterator_ordering_multiple_ssts() {
         // Test ordering when data is spread across multiple SSTs and memtable
 
         let tmp = TempDir::new().unwrap();
@@ -4691,7 +4720,7 @@ mod tests {
             b"key_50",
         ];
 
-        iter.advance().unwrap();
+        iter.advance().await.unwrap();
         for expected_key in expected_order {
             assert!(
                 iter.valid(),
@@ -4704,14 +4733,14 @@ mod tests {
                 std::str::from_utf8(expected_key),
                 std::str::from_utf8(iter.user_key())
             );
-            iter.advance().unwrap();
+            iter.advance().await.unwrap();
         }
 
         assert!(!iter.valid(), "Should have no more entries");
     }
 
-    #[test]
-    fn test_sst_mvcc_iterator_respects_range_start() {
+    #[tokio::test]
+    async fn test_sst_mvcc_iterator_respects_range_start() {
         // Test that SstMvccIterator filters keys before range.start
 
         let tmp = TempDir::new().unwrap();
@@ -4739,7 +4768,7 @@ mod tests {
         let range = MvccKey::encode(b"b", Timestamp::MAX)..MvccKey::encode(b"d", Timestamp::MAX);
         let mut iter = engine.scan_iter(range, 0).unwrap();
 
-        iter.advance().unwrap();
+        iter.advance().await.unwrap();
         assert!(iter.valid());
         assert_eq!(
             iter.user_key(),
@@ -4747,19 +4776,19 @@ mod tests {
             "First key should be 'b' (range start), not 'a'"
         );
 
-        iter.advance().unwrap();
+        iter.advance().await.unwrap();
         assert!(iter.valid());
         assert_eq!(iter.user_key(), b"c", "Second key should be 'c'");
 
-        iter.advance().unwrap();
+        iter.advance().await.unwrap();
         assert!(
             !iter.valid(),
             "Should not have 'd' (beyond range end) or 'a' (before range start)"
         );
     }
 
-    #[test]
-    fn test_sst_mvcc_iterator_range_start_with_timestamp() {
+    #[tokio::test]
+    async fn test_sst_mvcc_iterator_range_start_with_timestamp() {
         // Test range filtering with specific MVCC timestamps
 
         let tmp = TempDir::new().unwrap();
@@ -4791,7 +4820,7 @@ mod tests {
         let range = MvccKey::encode(b"k", 25)..MvccKey::encode(b"l", 0);
         let mut iter = engine.scan_iter(range, 0).unwrap();
 
-        iter.advance().unwrap();
+        iter.advance().await.unwrap();
         assert!(iter.valid());
         assert_eq!(iter.user_key(), b"k");
         assert_eq!(
@@ -4800,11 +4829,11 @@ mod tests {
             "Should get ts=20 (first visible version)"
         );
 
-        iter.advance().unwrap();
+        iter.advance().await.unwrap();
         assert!(iter.valid());
         assert_eq!(iter.timestamp(), 10, "Should get ts=10");
 
-        iter.advance().unwrap();
+        iter.advance().await.unwrap();
         assert!(
             !iter.valid(),
             "Should not have ts=30 version (filtered by range start)"
@@ -4848,8 +4877,8 @@ mod tests {
         );
     }
 
-    #[test]
-    fn test_merge_iterator_deduplication_across_sources() {
+    #[tokio::test]
+    async fn test_merge_iterator_deduplication_across_sources() {
         // Test that duplicate MVCC keys from different sources are deduplicated
 
         let tmp = TempDir::new().unwrap();
@@ -4876,7 +4905,7 @@ mod tests {
         let range = MvccKey::encode(b"key", Timestamp::MAX)..MvccKey::encode(b"key\xff", 0);
         let mut iter = engine.scan_iter(range, 0).unwrap();
 
-        iter.advance().unwrap();
+        iter.advance().await.unwrap();
         assert!(iter.valid());
         assert_eq!(iter.user_key(), b"key");
         assert_eq!(
@@ -4886,7 +4915,7 @@ mod tests {
         );
         assert_eq!(iter.value(), b"new_value");
 
-        iter.advance().unwrap();
+        iter.advance().await.unwrap();
         assert!(iter.valid());
         assert_eq!(iter.user_key(), b"key");
         assert_eq!(
@@ -4896,12 +4925,12 @@ mod tests {
         );
         assert_eq!(iter.value(), b"old_value");
 
-        iter.advance().unwrap();
+        iter.advance().await.unwrap();
         assert!(!iter.valid());
     }
 
-    #[test]
-    fn test_scan_iter_ordering_stress_test() {
+    #[tokio::test]
+    async fn test_scan_iter_ordering_stress_test() {
         // Stress test: verify ordering with many keys across memtable and SSTs
 
         let tmp = TempDir::new().unwrap();
@@ -4932,7 +4961,7 @@ mod tests {
         let range = MvccKey::encode(b"key_", Timestamp::MAX)..MvccKey::encode(b"key_\xff", 0);
         let mut iter = engine.scan_iter(range, 0).unwrap();
 
-        iter.advance().unwrap();
+        iter.advance().await.unwrap();
         let mut prev_key: Option<Vec<u8>> = None;
         let mut count = 0;
 
@@ -4948,7 +4977,7 @@ mod tests {
             }
             prev_key = Some(current_key);
             count += 1;
-            iter.advance().unwrap();
+            iter.advance().await.unwrap();
         }
 
         assert_eq!(count, 100, "Should have all 100 keys in sorted order");
@@ -4964,19 +4993,19 @@ mod tests {
         // Verify that building a TieredMergeIterator does NOT trigger any seek operations.
         // This is the core lazy initialization invariant.
 
-        let active_seek = Rc::new(RefCell::new(false));
+        let active_seek = Arc::new(AtomicBool::new(false));
         let active_iter =
-            MockMvccIterator::new_with_tracker("active", vec![], Rc::clone(&active_seek));
+            MockMvccIterator::new_with_tracker("active", vec![], Arc::clone(&active_seek));
 
-        let frozen_seek = Rc::new(RefCell::new(false));
+        let frozen_seek = Arc::new(AtomicBool::new(false));
         let frozen_iter =
-            MockMvccIterator::new_with_tracker("frozen", vec![], Rc::clone(&frozen_seek));
+            MockMvccIterator::new_with_tracker("frozen", vec![], Arc::clone(&frozen_seek));
 
-        let l0_seek = Rc::new(RefCell::new(false));
-        let l0_iter = MockMvccIterator::new_with_tracker("l0", vec![], Rc::clone(&l0_seek));
+        let l0_seek = Arc::new(AtomicBool::new(false));
+        let l0_iter = MockMvccIterator::new_with_tracker("l0", vec![], Arc::clone(&l0_seek));
 
-        let l1_seek = Rc::new(RefCell::new(false));
-        let l1_iter = MockMvccIterator::new_with_tracker("l1", vec![], Rc::clone(&l1_seek));
+        let l1_seek = Arc::new(AtomicBool::new(false));
+        let l1_iter = MockMvccIterator::new_with_tracker("l1", vec![], Arc::clone(&l1_seek));
 
         let mut merge_iter = TieredMergeIterator::new();
         merge_iter.add_mock_active(active_iter);
@@ -4989,46 +5018,46 @@ mod tests {
 
         // Verify NO iterators were seeked during build
         assert!(
-            !*active_seek.borrow(),
+            !active_seek.load(std::sync::atomic::Ordering::Relaxed),
             "Active memtable should NOT be seeked at build time"
         );
         assert!(
-            !*frozen_seek.borrow(),
+            !frozen_seek.load(std::sync::atomic::Ordering::Relaxed),
             "Frozen memtable should NOT be seeked at build time"
         );
         assert!(
-            !*l0_seek.borrow(),
+            !l0_seek.load(std::sync::atomic::Ordering::Relaxed),
             "L0 SST should NOT be seeked at build time"
         );
         assert!(
-            !*l1_seek.borrow(),
+            !l1_seek.load(std::sync::atomic::Ordering::Relaxed),
             "L1 level should NOT be seeked at build time"
         );
     }
 
-    #[test]
-    fn test_lazy_io_triggered_by_advance() {
+    #[tokio::test]
+    async fn test_lazy_io_triggered_by_advance() {
         // Verify that calling advance() triggers seek on ALL child iterators.
 
-        let active_seek = Rc::new(RefCell::new(false));
+        let active_seek = Arc::new(AtomicBool::new(false));
         let active_iter = MockMvccIterator::new_with_tracker(
             "active",
             vec![(test_key(b"a", 100), b"v".to_vec())],
-            Rc::clone(&active_seek),
+            Arc::clone(&active_seek),
         );
 
-        let l0_seek = Rc::new(RefCell::new(false));
+        let l0_seek = Arc::new(AtomicBool::new(false));
         let l0_iter = MockMvccIterator::new_with_tracker(
             "l0",
             vec![(test_key(b"b", 100), b"v".to_vec())],
-            Rc::clone(&l0_seek),
+            Arc::clone(&l0_seek),
         );
 
-        let l1_seek = Rc::new(RefCell::new(false));
+        let l1_seek = Arc::new(AtomicBool::new(false));
         let l1_iter = MockMvccIterator::new_with_tracker(
             "l1",
             vec![(test_key(b"c", 100), b"v".to_vec())],
-            Rc::clone(&l1_seek),
+            Arc::clone(&l1_seek),
         );
 
         let mut merge_iter = TieredMergeIterator::new();
@@ -5039,49 +5068,64 @@ mod tests {
         let mut merge_iter = merge_iter.build();
 
         // Before advance: NO seeks
-        assert!(!*active_seek.borrow(), "No seek before advance");
-        assert!(!*l0_seek.borrow(), "No seek before advance");
-        assert!(!*l1_seek.borrow(), "No seek before advance");
+        assert!(
+            !active_seek.load(std::sync::atomic::Ordering::Relaxed),
+            "No seek before advance"
+        );
+        assert!(
+            !l0_seek.load(std::sync::atomic::Ordering::Relaxed),
+            "No seek before advance"
+        );
+        assert!(
+            !l1_seek.load(std::sync::atomic::Ordering::Relaxed),
+            "No seek before advance"
+        );
 
         // First advance triggers lazy initialization
-        merge_iter.advance().unwrap();
+        merge_iter.advance().await.unwrap();
 
         // After advance: ALL iterators seeked
         assert!(
-            *active_seek.borrow(),
+            active_seek.load(std::sync::atomic::Ordering::Relaxed),
             "Active should be seeked after advance"
         );
-        assert!(*l0_seek.borrow(), "L0 should be seeked after advance");
-        assert!(*l1_seek.borrow(), "L1 should be seeked after advance");
+        assert!(
+            l0_seek.load(std::sync::atomic::Ordering::Relaxed),
+            "L0 should be seeked after advance"
+        );
+        assert!(
+            l1_seek.load(std::sync::atomic::Ordering::Relaxed),
+            "L1 should be seeked after advance"
+        );
 
         // Verify iterator is valid and positioned correctly
         assert!(merge_iter.valid());
         assert_eq!(iter_key(&merge_iter), test_key(b"a", 100));
     }
 
-    #[test]
-    fn test_lazy_io_triggered_by_seek() {
+    #[tokio::test]
+    async fn test_lazy_io_triggered_by_seek() {
         // Verify that calling seek() triggers seek on ALL child iterators.
 
-        let active_seek = Rc::new(RefCell::new(false));
+        let active_seek = Arc::new(AtomicBool::new(false));
         let active_iter = MockMvccIterator::new_with_tracker(
             "active",
             vec![(test_key(b"a", 100), b"v".to_vec())],
-            Rc::clone(&active_seek),
+            Arc::clone(&active_seek),
         );
 
-        let l0_seek = Rc::new(RefCell::new(false));
+        let l0_seek = Arc::new(AtomicBool::new(false));
         let l0_iter = MockMvccIterator::new_with_tracker(
             "l0",
             vec![(test_key(b"b", 100), b"v".to_vec())],
-            Rc::clone(&l0_seek),
+            Arc::clone(&l0_seek),
         );
 
-        let l1_seek = Rc::new(RefCell::new(false));
+        let l1_seek = Arc::new(AtomicBool::new(false));
         let l1_iter = MockMvccIterator::new_with_tracker(
             "l1",
             vec![(test_key(b"c", 100), b"v".to_vec())],
-            Rc::clone(&l1_seek),
+            Arc::clone(&l1_seek),
         );
 
         let mut merge_iter = TieredMergeIterator::new();
@@ -5092,32 +5136,47 @@ mod tests {
         let mut merge_iter = merge_iter.build();
 
         // Before seek: NO seeks
-        assert!(!*active_seek.borrow(), "No seek before seek()");
-        assert!(!*l0_seek.borrow(), "No seek before seek()");
-        assert!(!*l1_seek.borrow(), "No seek before seek()");
+        assert!(
+            !active_seek.load(std::sync::atomic::Ordering::Relaxed),
+            "No seek before seek()"
+        );
+        assert!(
+            !l0_seek.load(std::sync::atomic::Ordering::Relaxed),
+            "No seek before seek()"
+        );
+        assert!(
+            !l1_seek.load(std::sync::atomic::Ordering::Relaxed),
+            "No seek before seek()"
+        );
 
         // Explicit seek triggers lazy initialization
-        merge_iter.seek(&test_key(b"b", 100)).unwrap();
+        merge_iter.seek(&test_key(b"b", 100)).await.unwrap();
 
         // After seek: ALL iterators seeked
         assert!(
-            *active_seek.borrow(),
+            active_seek.load(std::sync::atomic::Ordering::Relaxed),
             "Active should be seeked after seek()"
         );
-        assert!(*l0_seek.borrow(), "L0 should be seeked after seek()");
-        assert!(*l1_seek.borrow(), "L1 should be seeked after seek()");
+        assert!(
+            l0_seek.load(std::sync::atomic::Ordering::Relaxed),
+            "L0 should be seeked after seek()"
+        );
+        assert!(
+            l1_seek.load(std::sync::atomic::Ordering::Relaxed),
+            "L1 should be seeked after seek()"
+        );
 
         // Verify iterator is positioned at the seek target
         assert!(merge_iter.valid());
         assert_eq!(iter_key(&merge_iter), test_key(b"b", 100));
     }
 
-    #[test]
-    fn test_lazy_io_subsequent_operations_no_reinit() {
+    #[tokio::test]
+    async fn test_lazy_io_subsequent_operations_no_reinit() {
         // Verify that after first initialization, subsequent advance/seek
         // operations do NOT re-initialize (seek_called should still be true from first init).
 
-        let l0_seek = Rc::new(RefCell::new(false));
+        let l0_seek = Arc::new(AtomicBool::new(false));
         let l0_iter = MockMvccIterator::new_with_tracker(
             "l0",
             vec![
@@ -5125,7 +5184,7 @@ mod tests {
                 (test_key(b"b", 100), b"vb".to_vec()),
                 (test_key(b"c", 100), b"vc".to_vec()),
             ],
-            Rc::clone(&l0_seek),
+            Arc::clone(&l0_seek),
         );
 
         let mut merge_iter = TieredMergeIterator::new();
@@ -5134,27 +5193,27 @@ mod tests {
         let mut merge_iter = merge_iter.build();
 
         // First advance - initializes
-        merge_iter.advance().unwrap();
-        assert!(*l0_seek.borrow());
+        merge_iter.advance().await.unwrap();
+        assert!(l0_seek.load(std::sync::atomic::Ordering::Relaxed));
 
         // Reset the tracker to verify subsequent operations don't re-seek
-        *l0_seek.borrow_mut() = false;
+        l0_seek.store(false, std::sync::atomic::Ordering::Relaxed);
 
         // Subsequent advances - should NOT re-initialize
-        merge_iter.advance().unwrap();
+        merge_iter.advance().await.unwrap();
         assert!(merge_iter.valid());
         // Note: MockMvccIterator.advance() doesn't call seek(), so seek_called stays false
         // This confirms we're not re-running initialization
 
-        merge_iter.advance().unwrap();
+        merge_iter.advance().await.unwrap();
         assert!(merge_iter.valid());
 
-        merge_iter.advance().unwrap();
+        merge_iter.advance().await.unwrap();
         assert!(!merge_iter.valid()); // Exhausted
     }
 
-    #[test]
-    fn test_lazy_io_with_real_sst_files() {
+    #[tokio::test]
+    async fn test_lazy_io_with_real_sst_files() {
         // Integration test: verify lazy IO with real SST files.
         // The test creates SST files and verifies they can be read after lazy init.
 
@@ -5188,13 +5247,13 @@ mod tests {
         // but the test verifies correctness after lazy init)
 
         // First advance triggers lazy initialization and file IO
-        iter.advance().unwrap();
+        iter.advance().await.unwrap();
 
         // Verify all data is accessible (from both memtable and SST)
         let mut keys_found = Vec::new();
         while iter.valid() {
             keys_found.push(iter.user_key().to_vec());
-            iter.advance().unwrap();
+            iter.advance().await.unwrap();
         }
 
         assert!(
@@ -5229,30 +5288,30 @@ mod tests {
         );
     }
 
-    #[test]
-    fn test_lazy_io_multiple_l0_ssts_all_initialized() {
+    #[tokio::test]
+    async fn test_lazy_io_multiple_l0_ssts_all_initialized() {
         // Verify that ALL L0 SSTs are initialized on first advance/seek.
         // This is critical because L0 SSTs can overlap and all must participate.
 
-        let l0_0_seek = Rc::new(RefCell::new(false));
+        let l0_0_seek = Arc::new(AtomicBool::new(false));
         let l0_0_iter = MockMvccIterator::new_with_tracker(
             "l0_0",
             vec![(test_key(b"a", 100), b"v0".to_vec())],
-            Rc::clone(&l0_0_seek),
+            Arc::clone(&l0_0_seek),
         );
 
-        let l0_1_seek = Rc::new(RefCell::new(false));
+        let l0_1_seek = Arc::new(AtomicBool::new(false));
         let l0_1_iter = MockMvccIterator::new_with_tracker(
             "l0_1",
             vec![(test_key(b"b", 100), b"v1".to_vec())],
-            Rc::clone(&l0_1_seek),
+            Arc::clone(&l0_1_seek),
         );
 
-        let l0_2_seek = Rc::new(RefCell::new(false));
+        let l0_2_seek = Arc::new(AtomicBool::new(false));
         let l0_2_iter = MockMvccIterator::new_with_tracker(
             "l0_2",
             vec![(test_key(b"c", 100), b"v2".to_vec())],
-            Rc::clone(&l0_2_seek),
+            Arc::clone(&l0_2_seek),
         );
 
         let mut merge_iter = TieredMergeIterator::new();
@@ -5263,35 +5322,53 @@ mod tests {
         let mut merge_iter = merge_iter.build();
 
         // Before advance: NO L0 SSTs seeked
-        assert!(!*l0_0_seek.borrow(), "L0[0] not seeked before advance");
-        assert!(!*l0_1_seek.borrow(), "L0[1] not seeked before advance");
-        assert!(!*l0_2_seek.borrow(), "L0[2] not seeked before advance");
+        assert!(
+            !l0_0_seek.load(std::sync::atomic::Ordering::Relaxed),
+            "L0[0] not seeked before advance"
+        );
+        assert!(
+            !l0_1_seek.load(std::sync::atomic::Ordering::Relaxed),
+            "L0[1] not seeked before advance"
+        );
+        assert!(
+            !l0_2_seek.load(std::sync::atomic::Ordering::Relaxed),
+            "L0[2] not seeked before advance"
+        );
 
         // First advance
-        merge_iter.advance().unwrap();
+        merge_iter.advance().await.unwrap();
 
         // After advance: ALL L0 SSTs should be seeked
-        assert!(*l0_0_seek.borrow(), "L0[0] should be seeked after advance");
-        assert!(*l0_1_seek.borrow(), "L0[1] should be seeked after advance");
-        assert!(*l0_2_seek.borrow(), "L0[2] should be seeked after advance");
+        assert!(
+            l0_0_seek.load(std::sync::atomic::Ordering::Relaxed),
+            "L0[0] should be seeked after advance"
+        );
+        assert!(
+            l0_1_seek.load(std::sync::atomic::Ordering::Relaxed),
+            "L0[1] should be seeked after advance"
+        );
+        assert!(
+            l0_2_seek.load(std::sync::atomic::Ordering::Relaxed),
+            "L0[2] should be seeked after advance"
+        );
     }
 
     // ==================== TieredMergeIterator Additional Coverage Tests ====================
 
-    #[test]
-    fn test_tiered_merge_iterator_empty() {
+    #[tokio::test]
+    async fn test_tiered_merge_iterator_empty() {
         let mut merge_iter = TieredMergeIterator::new().build();
 
         // Before advance
         assert!(!merge_iter.valid());
 
         // After advance with no children
-        merge_iter.advance().unwrap();
+        merge_iter.advance().await.unwrap();
         assert!(!merge_iter.valid());
     }
 
-    #[test]
-    fn test_tiered_merge_iterator_single_source() {
+    #[tokio::test]
+    async fn test_tiered_merge_iterator_single_source() {
         let (iter, _) = MockMvccIterator::new(
             "single",
             vec![
@@ -5307,17 +5384,17 @@ mod tests {
 
         // Iterate all entries
         let mut keys = Vec::new();
-        merge_iter.advance().unwrap();
+        merge_iter.advance().await.unwrap();
         while merge_iter.valid() {
             keys.push(merge_iter.user_key().to_vec());
-            merge_iter.advance().unwrap();
+            merge_iter.advance().await.unwrap();
         }
 
         assert_eq!(keys, vec![b"a".to_vec(), b"b".to_vec(), b"c".to_vec()]);
     }
 
-    #[test]
-    fn test_tiered_merge_iterator_active_wins_over_frozen_same_key() {
+    #[tokio::test]
+    async fn test_tiered_merge_iterator_active_wins_over_frozen_same_key() {
         // Test that higher priority source wins when same MVCC key exists in multiple sources.
         // Active memtable (priority 0) should win over frozen (priority 100+).
 
@@ -5336,7 +5413,7 @@ mod tests {
         merge_iter.add_mock_frozen(frozen, 0);
         let mut merge_iter = merge_iter.build();
 
-        merge_iter.advance().unwrap();
+        merge_iter.advance().await.unwrap();
 
         // Should get active value (higher priority = lower priority number)
         assert!(merge_iter.valid());
@@ -5345,12 +5422,12 @@ mod tests {
         assert_eq!(merge_iter.value(), b"active_value");
 
         // Should skip the duplicate from frozen
-        merge_iter.advance().unwrap();
+        merge_iter.advance().await.unwrap();
         assert!(!merge_iter.valid());
     }
 
-    #[test]
-    fn test_tiered_merge_iterator_different_versions_not_deduplicated() {
+    #[tokio::test]
+    async fn test_tiered_merge_iterator_different_versions_not_deduplicated() {
         // Different versions (same user_key, different timestamp) should NOT be deduplicated.
 
         let (active, _) =
@@ -5367,23 +5444,23 @@ mod tests {
         let mut merge_iter = merge_iter.build();
 
         // First entry: ts=100 (higher timestamp = smaller encoded key, comes first)
-        merge_iter.advance().unwrap();
+        merge_iter.advance().await.unwrap();
         assert!(merge_iter.valid());
         assert_eq!(merge_iter.timestamp(), 100);
         assert_eq!(merge_iter.value(), b"v100");
 
         // Second entry: ts=50 (NOT deduplicated - different version)
-        merge_iter.advance().unwrap();
+        merge_iter.advance().await.unwrap();
         assert!(merge_iter.valid());
         assert_eq!(merge_iter.timestamp(), 50);
         assert_eq!(merge_iter.value(), b"v50");
 
-        merge_iter.advance().unwrap();
+        merge_iter.advance().await.unwrap();
         assert!(!merge_iter.valid());
     }
 
-    #[test]
-    fn test_tiered_merge_iterator_mvcc_ordering() {
+    #[tokio::test]
+    async fn test_tiered_merge_iterator_mvcc_ordering() {
         // Test MVCC ordering: (user_key ASC, timestamp DESC)
         // Higher timestamps should come first for the same key.
 
@@ -5401,28 +5478,28 @@ mod tests {
         merge_iter.add_mock_active(iter);
         let mut merge_iter = merge_iter.build();
 
-        merge_iter.advance().unwrap();
+        merge_iter.advance().await.unwrap();
         assert_eq!(merge_iter.user_key(), b"a");
         assert_eq!(merge_iter.timestamp(), 100);
 
-        merge_iter.advance().unwrap();
+        merge_iter.advance().await.unwrap();
         assert_eq!(merge_iter.user_key(), b"a");
         assert_eq!(merge_iter.timestamp(), 50);
 
-        merge_iter.advance().unwrap();
+        merge_iter.advance().await.unwrap();
         assert_eq!(merge_iter.user_key(), b"b");
         assert_eq!(merge_iter.timestamp(), 200);
 
-        merge_iter.advance().unwrap();
+        merge_iter.advance().await.unwrap();
         assert_eq!(merge_iter.user_key(), b"b");
         assert_eq!(merge_iter.timestamp(), 100);
 
-        merge_iter.advance().unwrap();
+        merge_iter.advance().await.unwrap();
         assert!(!merge_iter.valid());
     }
 
-    #[test]
-    fn test_tiered_merge_iterator_interleaved_sources() {
+    #[tokio::test]
+    async fn test_tiered_merge_iterator_interleaved_sources() {
         // Test correct ordering when sources have interleaved keys.
 
         let (active, _) = MockMvccIterator::new(
@@ -5450,10 +5527,10 @@ mod tests {
 
         // Should iterate in sorted order: a, b, c, d, e, f
         let mut keys = Vec::new();
-        merge_iter.advance().unwrap();
+        merge_iter.advance().await.unwrap();
         while merge_iter.valid() {
             keys.push(merge_iter.user_key().to_vec());
-            merge_iter.advance().unwrap();
+            merge_iter.advance().await.unwrap();
         }
 
         assert_eq!(
@@ -5469,8 +5546,8 @@ mod tests {
         );
     }
 
-    #[test]
-    fn test_tiered_merge_iterator_seek() {
+    #[tokio::test]
+    async fn test_tiered_merge_iterator_seek() {
         let (iter, _) = MockMvccIterator::new(
             "source",
             vec![
@@ -5485,20 +5562,20 @@ mod tests {
         let mut merge_iter = merge_iter.build();
 
         // Seek to "b"
-        merge_iter.seek(&test_key(b"b", 100)).unwrap();
+        merge_iter.seek(&test_key(b"b", 100)).await.unwrap();
         assert!(merge_iter.valid());
         assert_eq!(merge_iter.user_key(), b"b");
 
         // Continue iteration
-        merge_iter.advance().unwrap();
+        merge_iter.advance().await.unwrap();
         assert_eq!(merge_iter.user_key(), b"c");
 
-        merge_iter.advance().unwrap();
+        merge_iter.advance().await.unwrap();
         assert!(!merge_iter.valid());
     }
 
-    #[test]
-    fn test_tiered_merge_iterator_seek_resets_dedup_state() {
+    #[tokio::test]
+    async fn test_tiered_merge_iterator_seek_resets_dedup_state() {
         // Verify that seek clears deduplication state.
 
         let (iter, _) = MockMvccIterator::new(
@@ -5514,19 +5591,19 @@ mod tests {
         let mut merge_iter = merge_iter.build();
 
         // Iterate to end
-        merge_iter.advance().unwrap();
-        merge_iter.advance().unwrap();
-        merge_iter.advance().unwrap();
+        merge_iter.advance().await.unwrap();
+        merge_iter.advance().await.unwrap();
+        merge_iter.advance().await.unwrap();
         assert!(!merge_iter.valid());
 
         // Seek should reset state
-        merge_iter.seek(&test_key(b"a", 100)).unwrap();
+        merge_iter.seek(&test_key(b"a", 100)).await.unwrap();
         assert!(merge_iter.valid());
         assert_eq!(merge_iter.user_key(), b"a");
     }
 
-    #[test]
-    fn test_tiered_merge_iterator_four_tier_ordering() {
+    #[tokio::test]
+    async fn test_tiered_merge_iterator_four_tier_ordering() {
         // Test all four tier types together: active, frozen, L0, level.
 
         let (active, _) =
@@ -5548,10 +5625,10 @@ mod tests {
         let mut merge_iter = merge_iter.build();
 
         let mut results = Vec::new();
-        merge_iter.advance().unwrap();
+        merge_iter.advance().await.unwrap();
         while merge_iter.valid() {
             results.push((merge_iter.user_key().to_vec(), merge_iter.value().to_vec()));
-            merge_iter.advance().unwrap();
+            merge_iter.advance().await.unwrap();
         }
 
         assert_eq!(results.len(), 4);
@@ -5561,8 +5638,8 @@ mod tests {
         assert_eq!(results[3], (b"d".to_vec(), b"level".to_vec()));
     }
 
-    #[test]
-    fn test_tiered_merge_iterator_priority_l0_newer_wins() {
+    #[tokio::test]
+    async fn test_tiered_merge_iterator_priority_l0_newer_wins() {
         // L0 with lower index (newer) should win over L0 with higher index (older).
 
         let (l0_0, _) =
@@ -5578,17 +5655,17 @@ mod tests {
         merge_iter.add_mock_l0(l0_1, 1); // Priority 1001
         let mut merge_iter = merge_iter.build();
 
-        merge_iter.advance().unwrap();
+        merge_iter.advance().await.unwrap();
         assert!(merge_iter.valid());
         assert_eq!(merge_iter.value(), b"newer");
 
         // Should skip duplicate
-        merge_iter.advance().unwrap();
+        merge_iter.advance().await.unwrap();
         assert!(!merge_iter.valid());
     }
 
-    #[test]
-    fn test_tiered_merge_iterator_empty_sources_skipped() {
+    #[tokio::test]
+    async fn test_tiered_merge_iterator_empty_sources_skipped() {
         // Sources with no entries should be handled gracefully.
 
         let (empty1, _) = MockMvccIterator::new("empty1", vec![]);
@@ -5604,17 +5681,17 @@ mod tests {
         merge_iter.add_mock_l0(empty2, 0);
         let mut merge_iter = merge_iter.build();
 
-        merge_iter.advance().unwrap();
+        merge_iter.advance().await.unwrap();
         assert!(merge_iter.valid());
         assert_eq!(merge_iter.user_key(), b"key");
         assert_eq!(merge_iter.value(), b"value");
 
-        merge_iter.advance().unwrap();
+        merge_iter.advance().await.unwrap();
         assert!(!merge_iter.valid());
     }
 
-    #[test]
-    fn test_tiered_merge_iterator_frozen_priority_ordering() {
+    #[tokio::test]
+    async fn test_tiered_merge_iterator_frozen_priority_ordering() {
         // Test multiple frozen memtables with correct priority ordering.
 
         let (frozen0, _) = MockMvccIterator::new(
@@ -5636,16 +5713,16 @@ mod tests {
         merge_iter.add_mock_frozen(frozen2, 2); // Priority 102
         let mut merge_iter = merge_iter.build();
 
-        merge_iter.advance().unwrap();
+        merge_iter.advance().await.unwrap();
         // frozen0 (priority 100) should win
         assert_eq!(merge_iter.value(), b"frozen0");
 
-        merge_iter.advance().unwrap();
+        merge_iter.advance().await.unwrap();
         assert!(!merge_iter.valid()); // Duplicates skipped
     }
 
-    #[test]
-    fn test_tiered_merge_iterator_seek_past_all_data() {
+    #[tokio::test]
+    async fn test_tiered_merge_iterator_seek_past_all_data() {
         let (iter, _) = MockMvccIterator::new(
             "source",
             vec![
@@ -5659,12 +5736,12 @@ mod tests {
         let mut merge_iter = merge_iter.build();
 
         // Seek past all data
-        merge_iter.seek(&test_key(b"z", 100)).unwrap();
+        merge_iter.seek(&test_key(b"z", 100)).await.unwrap();
         assert!(!merge_iter.valid());
     }
 
-    #[test]
-    fn test_tiered_merge_iterator_all_sources_empty() {
+    #[tokio::test]
+    async fn test_tiered_merge_iterator_all_sources_empty() {
         let (empty1, _) = MockMvccIterator::new("empty1", vec![]);
         let (empty2, _) = MockMvccIterator::new("empty2", vec![]);
         let (empty3, _) = MockMvccIterator::new("empty3", vec![]);
@@ -5675,7 +5752,7 @@ mod tests {
         merge_iter.add_mock_l0(empty3, 0);
         let mut merge_iter = merge_iter.build();
 
-        merge_iter.advance().unwrap();
+        merge_iter.advance().await.unwrap();
         assert!(!merge_iter.valid());
     }
 
@@ -6095,11 +6172,11 @@ mod tests {
             for _ in 0..50 {
                 let range = MvccKey::unbounded()..MvccKey::unbounded();
                 let mut iter = engine_reader.scan_iter(range, 0).unwrap();
-                iter.advance().unwrap();
+                crate::io::block_on_sync(iter.advance()).unwrap();
                 let mut count = 0;
                 while iter.valid() {
                     count += 1;
-                    iter.advance().unwrap();
+                    crate::io::block_on_sync(iter.advance()).unwrap();
                 }
                 assert!(count >= 100, "Should see at least 100 entries");
             }
@@ -6421,18 +6498,18 @@ mod tests {
 
         let mut results = Vec::new();
         let mut iter = engine.scan_iter(range, owner_ts).unwrap();
-        iter.advance().unwrap();
+        crate::io::block_on_sync(iter.advance()).unwrap();
         while iter.valid() {
             if iter.user_key() == key {
                 results.push((iter.timestamp(), iter.value().to_vec()));
             }
-            iter.advance().unwrap();
+            crate::io::block_on_sync(iter.advance()).unwrap();
         }
         results
     }
 
-    #[test]
-    fn test_record_type_delete_nonexistent() {
+    #[tokio::test]
+    async fn test_record_type_delete_nonexistent() {
         // Delete a key that was never written → should produce a LOCK node
         let tmp = TempDir::new().unwrap();
         let config = test_config(tmp.path());
@@ -6458,7 +6535,7 @@ mod tests {
                 .next_key()
                 .unwrap_or_else(MvccKey::unbounded);
             let mut iter = engine.scan_iter(start..end, 0).unwrap();
-            iter.advance().unwrap();
+            iter.advance().await.unwrap();
             if iter.valid() && iter.user_key() == b"key1" {
                 assert!(iter.is_pending());
                 assert_eq!(iter.pending_owner(), owner_ts);
@@ -6687,8 +6764,8 @@ mod tests {
         assert_eq!(ts10_val, b"v1", "second entry should be the original value");
     }
 
-    #[test]
-    fn test_tombstone_preserved_through_compaction() {
+    #[tokio::test]
+    async fn test_tombstone_preserved_through_compaction() {
         // Write to multiple SSTs, compact, verify tombstone still works
         let tmp = TempDir::new().unwrap();
         let config = LsmConfig::builder(tmp.path())
@@ -6716,7 +6793,7 @@ mod tests {
         assert_eq!(get_at_for_test(&engine, b"key1", 10), Some(b"v1".to_vec()));
 
         // Trigger compaction
-        let compacted = engine.do_compaction().unwrap();
+        let compacted = engine.do_compaction().await.unwrap();
         assert!(compacted, "compaction should have run");
 
         // After compaction: tombstone + old value should still be correct
@@ -6825,8 +6902,8 @@ mod tests {
         assert_eq!(key1_entries.len(), 1, "key1 should be in SST");
     }
 
-    #[test]
-    fn test_lock_skipped_in_read_before_finalize() {
+    #[tokio::test]
+    async fn test_lock_skipped_in_read_before_finalize() {
         // LOCK nodes should be invisible to owner reads.
         // Non-owner reads return the LOCK as a pending node for txn layer resolution.
         let tmp = TempDir::new().unwrap();
@@ -6858,7 +6935,7 @@ mod tests {
             .next_key()
             .unwrap_or_else(MvccKey::unbounded);
         let mut iter = engine.scan_iter(start..end, 0).unwrap();
-        iter.advance().unwrap();
+        iter.advance().await.unwrap();
         assert!(iter.valid());
         assert!(iter.is_pending());
         assert_eq!(iter.pending_owner(), owner_ts);

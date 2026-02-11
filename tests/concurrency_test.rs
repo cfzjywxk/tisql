@@ -48,7 +48,7 @@ fn get_at_for_test(storage: &MemTableEngine, key: &[u8], ts: Timestamp) -> Optio
 
     // Use streaming scan_iter() - process one entry at a time
     let mut iter = storage.scan_iter(range, 0).unwrap();
-    iter.advance().unwrap(); // Position on first entry
+    tisql::io::block_on_sync(iter.advance()).unwrap(); // Position on first entry
 
     while iter.valid() {
         let decoded_key = iter.user_key();
@@ -60,7 +60,7 @@ fn get_at_for_test(storage: &MemTableEngine, key: &[u8], ts: Timestamp) -> Optio
             }
             return Some(value);
         }
-        iter.advance().unwrap();
+        tisql::io::block_on_sync(iter.advance()).unwrap();
     }
     None
 }
@@ -563,10 +563,10 @@ fn test_implicit_dedup_commit() {
     let range = b"a".to_vec()..b"d".to_vec();
     let mut iter = txn_service.scan_iter(&read_ctx, range).unwrap();
     let mut results = Vec::new();
-    iter.advance().unwrap();
+    tisql::io::block_on_sync(iter.advance()).unwrap();
     while iter.valid() {
         results.push((iter.user_key().to_vec(), iter.value().to_vec()));
-        iter.advance().unwrap();
+        tisql::io::block_on_sync(iter.advance()).unwrap();
     }
 
     assert_eq!(results.len(), 2, "Should have 2 keys (a and c, not b)");
@@ -801,7 +801,7 @@ mod ddl_concurrency {
 
                     // Each thread creates a different table
                     let sql = format!("CREATE TABLE t{i} (id INT PRIMARY KEY, name VARCHAR(100))");
-                    match db.handle_mp_query(&sql) {
+                    match tisql::io::block_on_sync(db.handle_mp_query(&sql)) {
                         Ok(_) => {
                             success_count.fetch_add(1, Ordering::SeqCst);
                         }
@@ -827,7 +827,10 @@ mod ddl_concurrency {
         // Verify all tables exist
         for i in 0..num_threads {
             let sql = format!("SELECT * FROM t{i}");
-            assert!(db.handle_mp_query(&sql).is_ok(), "Table t{i} should exist");
+            assert!(
+                tisql::io::block_on_sync(db.handle_mp_query(&sql)).is_ok(),
+                "Table t{i} should exist"
+            );
         }
 
         db.close().unwrap();
@@ -856,7 +859,9 @@ mod ddl_concurrency {
                     barrier.wait();
 
                     // All threads try to create the same table
-                    match db.handle_mp_query("CREATE TABLE conflict_table (id INT PRIMARY KEY)") {
+                    match tisql::io::block_on_sync(
+                        db.handle_mp_query("CREATE TABLE conflict_table (id INT PRIMARY KEY)"),
+                    ) {
                         Ok(_) => {
                             success_count.fetch_add(1, Ordering::SeqCst);
                         }
@@ -903,9 +908,11 @@ mod ddl_concurrency {
         let db = Arc::new(Database::open(config).unwrap());
 
         // Create initial table
-        db.handle_mp_query("CREATE TABLE users (id INT PRIMARY KEY, name VARCHAR(100))")
-            .unwrap();
-        db.handle_mp_query("INSERT INTO users VALUES (1, 'Alice')")
+        tisql::io::block_on_sync(
+            db.handle_mp_query("CREATE TABLE users (id INT PRIMARY KEY, name VARCHAR(100))"),
+        )
+        .unwrap();
+        tisql::io::block_on_sync(db.handle_mp_query("INSERT INTO users VALUES (1, 'Alice')"))
             .unwrap();
 
         // This test verifies that schema version is checked.
@@ -915,18 +922,19 @@ mod ddl_concurrency {
         // For now, verify that the schema version mechanism works by checking
         // that after a DDL, subsequent operations see the updated schema.
         // Execute a query to exercise the catalog
-        db.handle_mp_query("SELECT * FROM users").unwrap();
+        tisql::io::block_on_sync(db.handle_mp_query("SELECT * FROM users")).unwrap();
 
         // DDL changes schema
-        db.handle_mp_query("CREATE TABLE orders (id INT PRIMARY KEY)")
+        tisql::io::block_on_sync(db.handle_mp_query("CREATE TABLE orders (id INT PRIMARY KEY)"))
             .unwrap();
 
         // DML on original table should still work (schema of 'users' didn't change)
-        db.handle_mp_query("INSERT INTO users VALUES (2, 'Bob')")
+        tisql::io::block_on_sync(db.handle_mp_query("INSERT INTO users VALUES (2, 'Bob')"))
             .unwrap();
 
         // Verify data
-        let result = db.handle_mp_query("SELECT id FROM users ORDER BY id");
+        let result =
+            tisql::io::block_on_sync(db.handle_mp_query("SELECT id FROM users ORDER BY id"));
         match result {
             Ok(QueryResult::Rows { data, .. }) => {
                 assert_eq!(data.len(), 2);
@@ -948,8 +956,10 @@ mod ddl_concurrency {
 
         // Create tables sequentially to establish baseline
         for i in 0..5 {
-            db.handle_mp_query(&format!("CREATE TABLE seq_t{i} (id INT PRIMARY KEY)"))
-                .unwrap();
+            tisql::io::block_on_sync(
+                db.handle_mp_query(&format!("CREATE TABLE seq_t{i} (id INT PRIMARY KEY)")),
+            )
+            .unwrap();
         }
 
         // Now create more tables concurrently
@@ -963,8 +973,10 @@ mod ddl_concurrency {
 
                 thread::spawn(move || {
                     barrier.wait();
-                    db.handle_mp_query(&format!("CREATE TABLE conc_t{i} (id INT PRIMARY KEY)"))
-                        .unwrap();
+                    tisql::io::block_on_sync(
+                        db.handle_mp_query(&format!("CREATE TABLE conc_t{i} (id INT PRIMARY KEY)")),
+                    )
+                    .unwrap();
                 })
             })
             .collect();
@@ -976,14 +988,14 @@ mod ddl_concurrency {
         // Verify all 9 tables exist (5 sequential + 4 concurrent)
         for i in 0..5 {
             assert!(
-                db.handle_mp_query(&format!("SELECT * FROM seq_t{i}"))
+                tisql::io::block_on_sync(db.handle_mp_query(&format!("SELECT * FROM seq_t{i}")))
                     .is_ok(),
                 "seq_t{i} should exist"
             );
         }
         for i in 0..num_threads {
             assert!(
-                db.handle_mp_query(&format!("SELECT * FROM conc_t{i}"))
+                tisql::io::block_on_sync(db.handle_mp_query(&format!("SELECT * FROM conc_t{i}")))
                     .is_ok(),
                 "conc_t{i} should exist"
             );
@@ -1000,17 +1012,19 @@ mod ddl_concurrency {
         let db = Arc::new(Database::open(config).unwrap());
 
         // Create, drop, recreate in sequence
-        db.handle_mp_query("CREATE TABLE temp (id INT PRIMARY KEY)")
+        tisql::io::block_on_sync(db.handle_mp_query("CREATE TABLE temp (id INT PRIMARY KEY)"))
             .unwrap();
-        db.handle_mp_query("INSERT INTO temp VALUES (1)").unwrap();
-        db.handle_mp_query("DROP TABLE temp").unwrap();
-        db.handle_mp_query("CREATE TABLE temp (id INT PRIMARY KEY, name VARCHAR(50))")
-            .unwrap();
-        db.handle_mp_query("INSERT INTO temp VALUES (2, 'test')")
+        tisql::io::block_on_sync(db.handle_mp_query("INSERT INTO temp VALUES (1)")).unwrap();
+        tisql::io::block_on_sync(db.handle_mp_query("DROP TABLE temp")).unwrap();
+        tisql::io::block_on_sync(
+            db.handle_mp_query("CREATE TABLE temp (id INT PRIMARY KEY, name VARCHAR(50))"),
+        )
+        .unwrap();
+        tisql::io::block_on_sync(db.handle_mp_query("INSERT INTO temp VALUES (2, 'test')"))
             .unwrap();
 
         // Verify new schema is in effect
-        let result = db.handle_mp_query("SELECT id, name FROM temp");
+        let result = tisql::io::block_on_sync(db.handle_mp_query("SELECT id, name FROM temp"));
         match result {
             Ok(QueryResult::Rows { data, columns }) => {
                 assert_eq!(columns.len(), 2);
@@ -1096,7 +1110,7 @@ fn test_concurrent_scan_while_writers_run() {
                 let range = b"safe_00".to_vec()..b"safe_99".to_vec();
                 match txn_service.scan_iter(&ctx, range) {
                     Ok(mut iter) => {
-                        iter.advance().unwrap();
+                        tisql::io::block_on_sync(iter.advance()).unwrap();
                         let mut count = 0;
                         let mut prev_key: Option<Vec<u8>> = None;
                         while iter.valid() {
@@ -1112,7 +1126,7 @@ fn test_concurrent_scan_while_writers_run() {
                             }
                             prev_key = Some(key);
                             count += 1;
-                            iter.advance().unwrap();
+                            tisql::io::block_on_sync(iter.advance()).unwrap();
                         }
                         total_entries += count;
                     }
@@ -1212,12 +1226,12 @@ fn test_mvcc_iterator_ordering_invariant() {
 
     let storage = txn_service.storage();
     let mut iter = storage.scan_iter(start..end, 0).unwrap();
-    iter.advance().unwrap();
+    tisql::io::block_on_sync(iter.advance()).unwrap();
 
     let mut entries: Vec<(Vec<u8>, Timestamp)> = Vec::new();
     while iter.valid() {
         entries.push((iter.user_key().to_vec(), iter.timestamp()));
-        iter.advance().unwrap();
+        tisql::io::block_on_sync(iter.advance()).unwrap();
     }
 
     // Verify we got all 6 entries
@@ -1282,7 +1296,7 @@ fn test_mvcc_scan_iterator_returns_latest_visible_only() {
     let ctx = txn_service.begin(true).unwrap();
     let range = b"key_a".to_vec()..b"key_d".to_vec();
     let mut iter = txn_service.scan_iter(&ctx, range).unwrap();
-    iter.advance().unwrap();
+    tisql::io::block_on_sync(iter.advance()).unwrap();
 
     let mut results: Vec<(Vec<u8>, Vec<u8>)> = Vec::new();
     let mut prev_key: Option<Vec<u8>> = None;
@@ -1302,7 +1316,7 @@ fn test_mvcc_scan_iterator_returns_latest_visible_only() {
         }
         prev_key = Some(key.clone());
         results.push((key, value));
-        iter.advance().unwrap();
+        tisql::io::block_on_sync(iter.advance()).unwrap();
     }
 
     // Should see exactly 3 keys with their latest values
@@ -1330,8 +1344,10 @@ fn test_e2e_key_is_locked_concurrent_inserts() {
     let db = Arc::new(Database::open(config).unwrap());
 
     // Create table with primary key
-    db.handle_mp_query("CREATE TABLE lock_test (id INT PRIMARY KEY, value VARCHAR(100))")
-        .unwrap();
+    tisql::io::block_on_sync(
+        db.handle_mp_query("CREATE TABLE lock_test (id INT PRIMARY KEY, value VARCHAR(100))"),
+    )
+    .unwrap();
 
     let num_threads = 10;
     let barrier = Arc::new(std::sync::Barrier::new(num_threads));
@@ -1353,7 +1369,7 @@ fn test_e2e_key_is_locked_concurrent_inserts() {
 
             // All threads try to insert with the same primary key
             let sql = format!("INSERT INTO lock_test (id, value) VALUES (1, 'thread_{i}')");
-            match db.handle_mp_query(&sql) {
+            match tisql::io::block_on_sync(db.handle_mp_query(&sql)) {
                 Ok(QueryResult::Affected(_)) => {
                     success_count.fetch_add(1, Ordering::Relaxed);
                 }
@@ -1398,10 +1414,7 @@ fn test_e2e_key_is_locked_concurrent_inserts() {
     );
 
     // Verify the data is consistent - exactly one row should exist
-    match db
-        .handle_mp_query("SELECT COUNT(*) FROM lock_test")
-        .unwrap()
-    {
+    match tisql::io::block_on_sync(db.handle_mp_query("SELECT COUNT(*) FROM lock_test")).unwrap() {
         QueryResult::Rows { data, .. } => {
             assert_eq!(data.len(), 1);
             assert_eq!(data[0][0], "1", "Exactly one row should exist");
@@ -1425,9 +1438,11 @@ fn test_e2e_key_is_locked_concurrent_updates() {
     let db = Arc::new(Database::open(config).unwrap());
 
     // Create table and insert initial row
-    db.handle_mp_query("CREATE TABLE update_lock_test (id INT PRIMARY KEY, counter INT)")
-        .unwrap();
-    db.handle_mp_query("INSERT INTO update_lock_test VALUES (1, 0)")
+    tisql::io::block_on_sync(
+        db.handle_mp_query("CREATE TABLE update_lock_test (id INT PRIMARY KEY, counter INT)"),
+    )
+    .unwrap();
+    tisql::io::block_on_sync(db.handle_mp_query("INSERT INTO update_lock_test VALUES (1, 0)"))
         .unwrap();
 
     let num_threads = 10;
@@ -1448,9 +1463,9 @@ fn test_e2e_key_is_locked_concurrent_updates() {
             barrier.wait();
 
             for _ in 0..updates_per_thread {
-                match db.handle_mp_query(
+                match tisql::io::block_on_sync(db.handle_mp_query(
                     "UPDATE update_lock_test SET counter = counter + 1 WHERE id = 1",
-                ) {
+                )) {
                     Ok(QueryResult::Affected(_)) => {
                         success_count.fetch_add(1, Ordering::Relaxed);
                     }
@@ -1500,9 +1515,10 @@ fn test_e2e_key_is_locked_concurrent_updates() {
     // possible when multiple transactions read before any write. The counter will be
     // at least 1 (at least one update succeeded) and at most successes (all updates
     // incremented unique values).
-    match db
-        .handle_mp_query("SELECT counter FROM update_lock_test WHERE id = 1")
-        .unwrap()
+    match tisql::io::block_on_sync(
+        db.handle_mp_query("SELECT counter FROM update_lock_test WHERE id = 1"),
+    )
+    .unwrap()
     {
         QueryResult::Rows { data, .. } => {
             let counter: i64 = data[0][0].parse().unwrap();
@@ -1535,8 +1551,10 @@ mod explicit_transaction_tests {
         let mut session = Session::new();
 
         // Create table
-        db.handle_mp_query("CREATE TABLE txn_test (id INT PRIMARY KEY, val VARCHAR(100))")
-            .unwrap();
+        tisql::io::block_on_sync(
+            db.handle_mp_query("CREATE TABLE txn_test (id INT PRIMARY KEY, val VARCHAR(100))"),
+        )
+        .unwrap();
 
         // Session should not have active transaction initially
         assert!(
@@ -1545,7 +1563,8 @@ mod explicit_transaction_tests {
         );
 
         // BEGIN should start a transaction
-        let result = db.handle_mp_query_with_session_mut("BEGIN", &mut session);
+        let result =
+            tisql::io::block_on_sync(db.handle_mp_query_with_session_mut("BEGIN", &mut session));
         assert!(result.is_ok(), "BEGIN should succeed");
 
         // Session should now have active transaction
@@ -1566,11 +1585,13 @@ mod explicit_transaction_tests {
         let mut session = Session::new();
 
         // Create table
-        db.handle_mp_query("CREATE TABLE txn_test2 (id INT PRIMARY KEY)")
+        tisql::io::block_on_sync(db.handle_mp_query("CREATE TABLE txn_test2 (id INT PRIMARY KEY)"))
             .unwrap();
 
         // START TRANSACTION should start a transaction
-        let result = db.handle_mp_query_with_session_mut("START TRANSACTION", &mut session);
+        let result = tisql::io::block_on_sync(
+            db.handle_mp_query_with_session_mut("START TRANSACTION", &mut session),
+        );
         assert!(result.is_ok(), "START TRANSACTION should succeed");
 
         assert!(
@@ -1590,22 +1611,24 @@ mod explicit_transaction_tests {
         let mut session = Session::new();
 
         // Create table
-        db.handle_mp_query("CREATE TABLE commit_test (id INT PRIMARY KEY, val VARCHAR(100))")
-            .unwrap();
-
-        // Begin transaction
-        db.handle_mp_query_with_session_mut("BEGIN", &mut session)
-            .unwrap();
-
-        // Insert within transaction
-        db.handle_mp_query_with_session_mut(
-            "INSERT INTO commit_test VALUES (1, 'committed')",
-            &mut session,
+        tisql::io::block_on_sync(
+            db.handle_mp_query("CREATE TABLE commit_test (id INT PRIMARY KEY, val VARCHAR(100))"),
         )
         .unwrap();
 
+        // Begin transaction
+        tisql::io::block_on_sync(db.handle_mp_query_with_session_mut("BEGIN", &mut session))
+            .unwrap();
+
+        // Insert within transaction
+        tisql::io::block_on_sync(db.handle_mp_query_with_session_mut(
+            "INSERT INTO commit_test VALUES (1, 'committed')",
+            &mut session,
+        ))
+        .unwrap();
+
         // Commit
-        db.handle_mp_query_with_session_mut("COMMIT", &mut session)
+        tisql::io::block_on_sync(db.handle_mp_query_with_session_mut("COMMIT", &mut session))
             .unwrap();
 
         // Session should no longer have active transaction
@@ -1615,9 +1638,10 @@ mod explicit_transaction_tests {
         );
 
         // Data should be visible
-        match db
-            .handle_mp_query("SELECT val FROM commit_test WHERE id = 1")
-            .unwrap()
+        match tisql::io::block_on_sync(
+            db.handle_mp_query("SELECT val FROM commit_test WHERE id = 1"),
+        )
+        .unwrap()
         {
             QueryResult::Rows { data, .. } => {
                 assert_eq!(data.len(), 1);
@@ -1638,24 +1662,28 @@ mod explicit_transaction_tests {
         let mut session = Session::new();
 
         // Create table and insert initial data
-        db.handle_mp_query("CREATE TABLE rollback_test (id INT PRIMARY KEY, val VARCHAR(100))")
-            .unwrap();
-        db.handle_mp_query("INSERT INTO rollback_test VALUES (1, 'original')")
-            .unwrap();
-
-        // Begin transaction
-        db.handle_mp_query_with_session_mut("BEGIN", &mut session)
-            .unwrap();
-
-        // Update within transaction
-        db.handle_mp_query_with_session_mut(
-            "UPDATE rollback_test SET val = 'modified' WHERE id = 1",
-            &mut session,
+        tisql::io::block_on_sync(
+            db.handle_mp_query("CREATE TABLE rollback_test (id INT PRIMARY KEY, val VARCHAR(100))"),
+        )
+        .unwrap();
+        tisql::io::block_on_sync(
+            db.handle_mp_query("INSERT INTO rollback_test VALUES (1, 'original')"),
         )
         .unwrap();
 
+        // Begin transaction
+        tisql::io::block_on_sync(db.handle_mp_query_with_session_mut("BEGIN", &mut session))
+            .unwrap();
+
+        // Update within transaction
+        tisql::io::block_on_sync(db.handle_mp_query_with_session_mut(
+            "UPDATE rollback_test SET val = 'modified' WHERE id = 1",
+            &mut session,
+        ))
+        .unwrap();
+
         // Rollback
-        db.handle_mp_query_with_session_mut("ROLLBACK", &mut session)
+        tisql::io::block_on_sync(db.handle_mp_query_with_session_mut("ROLLBACK", &mut session))
             .unwrap();
 
         // Session should no longer have active transaction
@@ -1665,9 +1693,10 @@ mod explicit_transaction_tests {
         );
 
         // Data should be unchanged
-        match db
-            .handle_mp_query("SELECT val FROM rollback_test WHERE id = 1")
-            .unwrap()
+        match tisql::io::block_on_sync(
+            db.handle_mp_query("SELECT val FROM rollback_test WHERE id = 1"),
+        )
+        .unwrap()
         {
             QueryResult::Rows { data, .. } => {
                 assert_eq!(data.len(), 1);
@@ -1692,32 +1721,34 @@ mod explicit_transaction_tests {
         let mut session = Session::new();
 
         // Create table
-        db.handle_mp_query("CREATE TABLE multi_insert_test (id INT PRIMARY KEY, val INT)")
-            .unwrap();
+        tisql::io::block_on_sync(
+            db.handle_mp_query("CREATE TABLE multi_insert_test (id INT PRIMARY KEY, val INT)"),
+        )
+        .unwrap();
 
         // Begin transaction
-        db.handle_mp_query_with_session_mut("BEGIN", &mut session)
+        tisql::io::block_on_sync(db.handle_mp_query_with_session_mut("BEGIN", &mut session))
             .unwrap();
 
         // Multiple inserts within the transaction
-        db.handle_mp_query_with_session_mut(
+        tisql::io::block_on_sync(db.handle_mp_query_with_session_mut(
             "INSERT INTO multi_insert_test VALUES (1, 10)",
             &mut session,
-        )
+        ))
         .unwrap();
-        db.handle_mp_query_with_session_mut(
+        tisql::io::block_on_sync(db.handle_mp_query_with_session_mut(
             "INSERT INTO multi_insert_test VALUES (2, 20)",
             &mut session,
-        )
+        ))
         .unwrap();
-        db.handle_mp_query_with_session_mut(
+        tisql::io::block_on_sync(db.handle_mp_query_with_session_mut(
             "INSERT INTO multi_insert_test VALUES (3, 30)",
             &mut session,
-        )
+        ))
         .unwrap();
 
         // Commit
-        db.handle_mp_query_with_session_mut("COMMIT", &mut session)
+        tisql::io::block_on_sync(db.handle_mp_query_with_session_mut("COMMIT", &mut session))
             .unwrap();
 
         // Session should no longer have active transaction
@@ -1727,9 +1758,10 @@ mod explicit_transaction_tests {
         );
 
         // All inserts should be visible after commit
-        match db
-            .handle_mp_query("SELECT id, val FROM multi_insert_test ORDER BY id")
-            .unwrap()
+        match tisql::io::block_on_sync(
+            db.handle_mp_query("SELECT id, val FROM multi_insert_test ORDER BY id"),
+        )
+        .unwrap()
         {
             QueryResult::Rows { data, .. } => {
                 assert_eq!(data.len(), 3);
@@ -1758,24 +1790,28 @@ mod explicit_transaction_tests {
         let mut session = Session::new();
 
         // Create table
-        db.handle_mp_query("CREATE TABLE ryw_test (id INT PRIMARY KEY, val VARCHAR(100))")
-            .unwrap();
-
-        // Begin transaction
-        db.handle_mp_query_with_session_mut("BEGIN", &mut session)
-            .unwrap();
-
-        // Insert within transaction
-        db.handle_mp_query_with_session_mut(
-            "INSERT INTO ryw_test VALUES (1, 'first')",
-            &mut session,
+        tisql::io::block_on_sync(
+            db.handle_mp_query("CREATE TABLE ryw_test (id INT PRIMARY KEY, val VARCHAR(100))"),
         )
         .unwrap();
 
+        // Begin transaction
+        tisql::io::block_on_sync(db.handle_mp_query_with_session_mut("BEGIN", &mut session))
+            .unwrap();
+
+        // Insert within transaction
+        tisql::io::block_on_sync(db.handle_mp_query_with_session_mut(
+            "INSERT INTO ryw_test VALUES (1, 'first')",
+            &mut session,
+        ))
+        .unwrap();
+
         // Read should see the uncommitted insert (read-your-writes)
-        match db
-            .handle_mp_query_with_session_mut("SELECT val FROM ryw_test WHERE id = 1", &mut session)
-            .unwrap()
+        match tisql::io::block_on_sync(db.handle_mp_query_with_session_mut(
+            "SELECT val FROM ryw_test WHERE id = 1",
+            &mut session,
+        ))
+        .unwrap()
         {
             QueryResult::Rows { data, .. } => {
                 assert_eq!(data.len(), 1, "Should see own uncommitted write");
@@ -1785,16 +1821,18 @@ mod explicit_transaction_tests {
         }
 
         // Update within transaction
-        db.handle_mp_query_with_session_mut(
+        tisql::io::block_on_sync(db.handle_mp_query_with_session_mut(
             "UPDATE ryw_test SET val = 'updated' WHERE id = 1",
             &mut session,
-        )
+        ))
         .unwrap();
 
         // Read should see the updated value
-        match db
-            .handle_mp_query_with_session_mut("SELECT val FROM ryw_test WHERE id = 1", &mut session)
-            .unwrap()
+        match tisql::io::block_on_sync(db.handle_mp_query_with_session_mut(
+            "SELECT val FROM ryw_test WHERE id = 1",
+            &mut session,
+        ))
+        .unwrap()
         {
             QueryResult::Rows { data, .. } => {
                 assert_eq!(data[0][0], "updated");
@@ -1803,7 +1841,7 @@ mod explicit_transaction_tests {
         }
 
         // Commit
-        db.handle_mp_query_with_session_mut("COMMIT", &mut session)
+        tisql::io::block_on_sync(db.handle_mp_query_with_session_mut("COMMIT", &mut session))
             .unwrap();
 
         db.close().unwrap();
@@ -1818,11 +1856,12 @@ mod explicit_transaction_tests {
         let mut session = Session::new();
 
         // Create table
-        db.handle_mp_query("CREATE TABLE noop_test (id INT PRIMARY KEY)")
+        tisql::io::block_on_sync(db.handle_mp_query("CREATE TABLE noop_test (id INT PRIMARY KEY)"))
             .unwrap();
 
         // COMMIT without BEGIN should succeed (MySQL behavior)
-        let result = db.handle_mp_query_with_session_mut("COMMIT", &mut session);
+        let result =
+            tisql::io::block_on_sync(db.handle_mp_query_with_session_mut("COMMIT", &mut session));
         assert!(result.is_ok(), "COMMIT without txn should be no-op");
 
         db.close().unwrap();
@@ -1837,11 +1876,14 @@ mod explicit_transaction_tests {
         let mut session = Session::new();
 
         // Create table
-        db.handle_mp_query("CREATE TABLE noop_rb_test (id INT PRIMARY KEY)")
-            .unwrap();
+        tisql::io::block_on_sync(
+            db.handle_mp_query("CREATE TABLE noop_rb_test (id INT PRIMARY KEY)"),
+        )
+        .unwrap();
 
         // ROLLBACK without BEGIN should succeed (MySQL behavior)
-        let result = db.handle_mp_query_with_session_mut("ROLLBACK", &mut session);
+        let result =
+            tisql::io::block_on_sync(db.handle_mp_query_with_session_mut("ROLLBACK", &mut session));
         assert!(result.is_ok(), "ROLLBACK without txn should be no-op");
 
         db.close().unwrap();
@@ -1859,22 +1901,25 @@ mod explicit_transaction_tests {
         let mut session = Session::new();
 
         // Create table
-        db.handle_mp_query("CREATE TABLE nested_test (id INT PRIMARY KEY, val INT)")
-            .unwrap();
-
-        // Begin first transaction
-        db.handle_mp_query_with_session_mut("BEGIN", &mut session)
-            .unwrap();
-
-        // Insert data
-        db.handle_mp_query_with_session_mut(
-            "INSERT INTO nested_test VALUES (1, 100)",
-            &mut session,
+        tisql::io::block_on_sync(
+            db.handle_mp_query("CREATE TABLE nested_test (id INT PRIMARY KEY, val INT)"),
         )
         .unwrap();
 
+        // Begin first transaction
+        tisql::io::block_on_sync(db.handle_mp_query_with_session_mut("BEGIN", &mut session))
+            .unwrap();
+
+        // Insert data
+        tisql::io::block_on_sync(db.handle_mp_query_with_session_mut(
+            "INSERT INTO nested_test VALUES (1, 100)",
+            &mut session,
+        ))
+        .unwrap();
+
         // Nested BEGIN should return an error (not supported yet)
-        let result = db.handle_mp_query_with_session_mut("BEGIN", &mut session);
+        let result =
+            tisql::io::block_on_sync(db.handle_mp_query_with_session_mut("BEGIN", &mut session));
         assert!(result.is_err(), "Nested BEGIN should return error");
         assert!(
             result
@@ -1892,13 +1937,14 @@ mod explicit_transaction_tests {
         );
 
         // Commit the original transaction
-        db.handle_mp_query_with_session_mut("COMMIT", &mut session)
+        tisql::io::block_on_sync(db.handle_mp_query_with_session_mut("COMMIT", &mut session))
             .unwrap();
 
         // Data should be visible after commit
-        match db
-            .handle_mp_query("SELECT val FROM nested_test WHERE id = 1")
-            .unwrap()
+        match tisql::io::block_on_sync(
+            db.handle_mp_query("SELECT val FROM nested_test WHERE id = 1"),
+        )
+        .unwrap()
         {
             QueryResult::Rows { data, .. } => {
                 assert_eq!(data.len(), 1);

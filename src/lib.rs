@@ -218,7 +218,7 @@ impl SQLEngine {
     ///
     /// All SQL execution goes through this method. Internal components
     /// (Parser, Binder, Executor) are not exposed to callers.
-    fn handle_mp_query<T: TxnService, C: Catalog>(
+    async fn handle_mp_query<T: TxnService, C: Catalog>(
         &self,
         sql: &str,
         query_ctx: &session::QueryCtx,
@@ -236,14 +236,14 @@ impl SQLEngine {
 
         // Execute through TxnService
         // TODO: Use query_ctx for execution options (priority, isolation level, etc.)
-        self.executor.execute(plan, txn_service, catalog)
+        self.executor.execute(plan, txn_service, catalog).await
     }
 
     /// Execute SQL with session context for explicit transaction support.
     ///
     /// This method handles transaction control statements (BEGIN, COMMIT, ROLLBACK)
     /// and uses the session's active transaction context when available.
-    fn handle_mp_query_with_session<T: TxnService, C: Catalog>(
+    async fn handle_mp_query_with_session<T: TxnService, C: Catalog>(
         &self,
         sql: &str,
         query_ctx: &session::QueryCtx,
@@ -261,6 +261,7 @@ impl SQLEngine {
         // Execute with session context for transaction control
         self.executor
             .execute_with_session(plan, txn_service, catalog, session)
+            .await
     }
 
     /// Execute SQL with optional TxnCtx (unified entry point).
@@ -273,7 +274,7 @@ impl SQLEngine {
     ///
     /// Transaction control statements (BEGIN/COMMIT/ROLLBACK) should be
     /// handled at the protocol layer, not dispatched here.
-    fn execute<T: TxnService, C: Catalog>(
+    async fn execute<T: TxnService, C: Catalog>(
         &self,
         sql: &str,
         exec_ctx: &session::ExecutionCtx,
@@ -291,6 +292,7 @@ impl SQLEngine {
         // Execute with the unified executor method
         self.executor
             .execute_unified(plan, exec_ctx, txn_service, catalog, txn_ctx)
+            .await
     }
 }
 
@@ -422,10 +424,10 @@ impl Database {
     ///
     /// Note: This method creates a temporary QueryCtx for backward compatibility.
     /// The proper way is to use `handle_mp_query_with_session` which takes a Session.
-    pub fn handle_mp_query(&self, sql: &str) -> Result<QueryResult> {
+    pub async fn handle_mp_query(&self, sql: &str) -> Result<QueryResult> {
         // Create a temporary QueryCtx for backward compatibility
         let query_ctx = session::QueryCtx::new();
-        self.handle_mp_query_with_ctx(sql, &query_ctx)
+        self.handle_mp_query_with_ctx(sql, &query_ctx).await
     }
 
     /// Handle MySQL protocol query text with a Session (immutable).
@@ -433,13 +435,13 @@ impl Database {
     /// This method creates a QueryCtx from the Session before executing.
     /// For explicit transaction support (BEGIN/COMMIT/ROLLBACK), use
     /// `handle_mp_query_with_session_mut` instead.
-    pub fn handle_mp_query_with_session(
+    pub async fn handle_mp_query_with_session(
         &self,
         sql: &str,
         session: &session::Session,
     ) -> Result<QueryResult> {
         let query_ctx = session.new_query_ctx();
-        self.handle_mp_query_with_ctx(sql, &query_ctx)
+        self.handle_mp_query_with_ctx(sql, &query_ctx).await
     }
 
     /// Handle MySQL protocol query text with mutable Session for transaction control.
@@ -449,7 +451,7 @@ impl Database {
     /// - COMMIT: Commits the current explicit transaction
     /// - ROLLBACK: Rolls back the current explicit transaction
     /// - Other statements: Uses session's active transaction or auto-commit mode
-    pub fn handle_mp_query_with_session_mut(
+    pub async fn handle_mp_query_with_session_mut(
         &self,
         sql: &str,
         session: &mut session::Session,
@@ -458,13 +460,16 @@ impl Database {
         let query_ctx = session.new_query_ctx();
 
         // Use session-aware execution for transaction control
-        let result = self.sql_engine.handle_mp_query_with_session(
-            sql,
-            &query_ctx,
-            self.txn_service.as_ref(),
-            &self.catalog,
-            session,
-        )?;
+        let result = self
+            .sql_engine
+            .handle_mp_query_with_session(
+                sql,
+                &query_ctx,
+                self.txn_service.as_ref(),
+                &self.catalog,
+                session,
+            )
+            .await?;
 
         // Convert ExecutionResult to QueryResult
         let query_result = match result {
@@ -518,7 +523,7 @@ impl Database {
     /// execute) is delegated to SQLEngine.
     ///
     /// This is the primary method used by the protocol layer via WorkerPool.
-    pub fn handle_mp_query_with_ctx(
+    pub async fn handle_mp_query_with_ctx(
         &self,
         sql: &str,
         query_ctx: &session::QueryCtx,
@@ -527,12 +532,10 @@ impl Database {
 
         // Delegate all SQL processing to SQLEngine
         // SQLEngine handles: parse -> bind -> execute through TxnService
-        let result = self.sql_engine.handle_mp_query(
-            sql,
-            query_ctx,
-            self.txn_service.as_ref(),
-            &self.catalog,
-        )?;
+        let result = self
+            .sql_engine
+            .handle_mp_query(sql, query_ctx, self.txn_service.as_ref(), &self.catalog)
+            .await?;
 
         // Convert ExecutionResult to QueryResult
         let query_result = match result {
@@ -650,19 +653,23 @@ impl Database {
     /// Returns `ExecutionOutput` (with lazy `Execution` for reads) and the
     /// optionally-updated `TxnCtx`. This method runs blocking I/O and should
     /// be called inside `tokio::task::spawn_blocking`.
-    pub(crate) fn execute_plan(
+    pub(crate) async fn execute_plan(
         &self,
         plan: sql::LogicalPlan,
         exec_ctx: &session::ExecutionCtx,
         txn_ctx: Option<transaction::TxnCtx>,
     ) -> Result<(ExecutionOutput, Option<transaction::TxnCtx>)> {
-        let (result, ctx) = self.sql_engine.executor.execute_unified(
-            plan,
-            exec_ctx,
-            self.txn_service.as_ref(),
-            &self.catalog,
-            txn_ctx,
-        )?;
+        let (result, ctx) = self
+            .sql_engine
+            .executor
+            .execute_unified(
+                plan,
+                exec_ctx,
+                self.txn_service.as_ref(),
+                &self.catalog,
+                txn_ctx,
+            )
+            .await?;
         Ok((result.into(), ctx))
     }
 
@@ -673,7 +680,7 @@ impl Database {
     ///
     /// The `exec_ctx` provides read-only access to session variables (current_db,
     /// isolation_level, etc.) during execution.
-    pub fn handle_query(
+    pub async fn handle_query(
         &self,
         sql: &str,
         exec_ctx: &session::ExecutionCtx,
@@ -682,13 +689,16 @@ impl Database {
         let timer = Timer::new("query");
 
         // Execute through SQL engine with the new unified interface
-        let (result, returned_ctx) = self.sql_engine.execute(
-            sql,
-            exec_ctx,
-            self.txn_service.as_ref(),
-            &self.catalog,
-            txn_ctx,
-        )?;
+        let (result, returned_ctx) = self
+            .sql_engine
+            .execute(
+                sql,
+                exec_ctx,
+                self.txn_service.as_ref(),
+                &self.catalog,
+                txn_ctx,
+            )
+            .await?;
 
         // Convert ExecutionResult to QueryResult
         let query_result = match result {
@@ -893,10 +903,10 @@ mod tests {
         (db, dir)
     }
 
-    #[test]
-    fn test_select_literal() {
+    #[tokio::test]
+    async fn test_select_literal() {
         let (db, _dir) = create_test_db();
-        let result = db.handle_mp_query("SELECT 1 + 1").unwrap();
+        let result = db.handle_mp_query("SELECT 1 + 1").await.unwrap();
         match result {
             QueryResult::Rows { data, .. } => {
                 assert_eq!(data.len(), 1);
@@ -906,22 +916,27 @@ mod tests {
         }
     }
 
-    #[test]
-    fn test_create_and_insert() {
+    #[tokio::test]
+    async fn test_create_and_insert() {
         let (db, _dir) = create_test_db();
 
         db.handle_mp_query("CREATE TABLE users (id INT PRIMARY KEY, name VARCHAR(255))")
+            .await
             .unwrap();
 
         let result = db
             .handle_mp_query("INSERT INTO users (id, name) VALUES (1, 'Alice')")
+            .await
             .unwrap();
         match result {
             QueryResult::Affected(count) => assert_eq!(count, 1),
             _ => panic!("Expected affected count"),
         }
 
-        let result = db.handle_mp_query("SELECT id, name FROM users").unwrap();
+        let result = db
+            .handle_mp_query("SELECT id, name FROM users")
+            .await
+            .unwrap();
         match result {
             QueryResult::Rows { data, columns } => {
                 assert_eq!(columns, vec!["id", "name"]);
@@ -933,8 +948,8 @@ mod tests {
         }
     }
 
-    #[test]
-    fn test_database_with_durability() {
+    #[tokio::test]
+    async fn test_database_with_durability() {
         let dir = tempdir().unwrap();
         let config = DatabaseConfig::with_data_dir(dir.path());
 
@@ -942,10 +957,13 @@ mod tests {
         {
             let db = Database::open(config.clone()).unwrap();
             db.handle_mp_query("CREATE TABLE t (id INT PRIMARY KEY, val VARCHAR(100))")
+                .await
                 .unwrap();
             db.handle_mp_query("INSERT INTO t VALUES (1, 'hello')")
+                .await
                 .unwrap();
             db.handle_mp_query("INSERT INTO t VALUES (2, 'world')")
+                .await
                 .unwrap();
             db.close().unwrap();
         }
@@ -959,17 +977,20 @@ mod tests {
         }
     }
 
-    #[test]
-    fn test_where_clause() {
+    #[tokio::test]
+    async fn test_where_clause() {
         let (db, _dir) = create_test_db();
 
         db.handle_mp_query("CREATE TABLE t (a INT PRIMARY KEY, b INT)")
+            .await
             .unwrap();
         db.handle_mp_query("INSERT INTO t VALUES (1, 10), (2, 20), (3, 30)")
+            .await
             .unwrap();
 
         let result = db
             .handle_mp_query("SELECT a, b FROM t WHERE a > 1")
+            .await
             .unwrap();
         match result {
             QueryResult::Rows { data, .. } => {
@@ -979,16 +1000,21 @@ mod tests {
         }
     }
 
-    #[test]
-    fn test_order_by() {
+    #[tokio::test]
+    async fn test_order_by() {
         let (db, _dir) = create_test_db();
 
         db.handle_mp_query("CREATE TABLE t (a INT PRIMARY KEY)")
+            .await
             .unwrap();
         db.handle_mp_query("INSERT INTO t VALUES (3), (1), (2)")
+            .await
             .unwrap();
 
-        let result = db.handle_mp_query("SELECT a FROM t ORDER BY a").unwrap();
+        let result = db
+            .handle_mp_query("SELECT a FROM t ORDER BY a")
+            .await
+            .unwrap();
         match result {
             QueryResult::Rows { data, .. } => {
                 assert_eq!(data[0][0], "1");
@@ -999,16 +1025,18 @@ mod tests {
         }
     }
 
-    #[test]
-    fn test_limit() {
+    #[tokio::test]
+    async fn test_limit() {
         let (db, _dir) = create_test_db();
 
         db.handle_mp_query("CREATE TABLE t (a INT PRIMARY KEY)")
+            .await
             .unwrap();
         db.handle_mp_query("INSERT INTO t VALUES (1), (2), (3), (4), (5)")
+            .await
             .unwrap();
 
-        let result = db.handle_mp_query("SELECT a FROM t LIMIT 3").unwrap();
+        let result = db.handle_mp_query("SELECT a FROM t LIMIT 3").await.unwrap();
         match result {
             QueryResult::Rows { data, .. } => {
                 assert_eq!(data.len(), 3);
@@ -1017,20 +1045,24 @@ mod tests {
         }
     }
 
-    #[test]
-    fn test_update() {
+    #[tokio::test]
+    async fn test_update() {
         let (db, _dir) = create_test_db();
 
         db.handle_mp_query("CREATE TABLE t (id INT PRIMARY KEY, val INT)")
+            .await
             .unwrap();
         db.handle_mp_query("INSERT INTO t VALUES (1, 100), (2, 200)")
+            .await
             .unwrap();
 
         db.handle_mp_query("UPDATE t SET val = 999 WHERE id = 1")
+            .await
             .unwrap();
 
         let result = db
             .handle_mp_query("SELECT id, val FROM t WHERE id = 1")
+            .await
             .unwrap();
         match result {
             QueryResult::Rows { data, .. } => {
@@ -1040,18 +1072,22 @@ mod tests {
         }
     }
 
-    #[test]
-    fn test_delete() {
+    #[tokio::test]
+    async fn test_delete() {
         let (db, _dir) = create_test_db();
 
         db.handle_mp_query("CREATE TABLE t (a INT PRIMARY KEY)")
+            .await
             .unwrap();
         db.handle_mp_query("INSERT INTO t VALUES (1), (2), (3)")
+            .await
             .unwrap();
 
-        db.handle_mp_query("DELETE FROM t WHERE a = 2").unwrap();
+        db.handle_mp_query("DELETE FROM t WHERE a = 2")
+            .await
+            .unwrap();
 
-        let result = db.handle_mp_query("SELECT a FROM t").unwrap();
+        let result = db.handle_mp_query("SELECT a FROM t").await.unwrap();
         match result {
             QueryResult::Rows { data, .. } => {
                 assert_eq!(data.len(), 2);

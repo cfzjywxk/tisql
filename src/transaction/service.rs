@@ -783,11 +783,11 @@ impl<I: MvccIterator> MvccScanIterator<I> {
     ///
     /// After finding a visible entry, the storage iterator stays positioned on it.
     /// The key is recorded in `last_returned_key` for skipping on the next call.
-    fn find_next_visible(&mut self) -> crate::error::Result<()> {
+    async fn find_next_visible(&mut self) -> crate::error::Result<()> {
         // Lazy skip: skip older versions of the previously returned key
         if let Some(ref skip_key) = self.last_returned_key {
             while self.storage_iter.valid() && self.storage_iter.user_key() == skip_key.as_slice() {
-                self.storage_iter.advance()?;
+                self.storage_iter.advance().await?;
             }
         }
         self.last_returned_key = None;
@@ -795,7 +795,7 @@ impl<I: MvccIterator> MvccScanIterator<I> {
 
         // Initialize storage iterator if needed
         if !self.storage_iter.valid() {
-            self.storage_iter.advance()?;
+            self.storage_iter.advance().await?;
         }
 
         while self.storage_iter.valid() {
@@ -809,7 +809,7 @@ impl<I: MvccIterator> MvccScanIterator<I> {
 
             // Skip if before start of range
             if user_key < self.range.start.as_slice() {
-                self.storage_iter.advance()?;
+                self.storage_iter.advance().await?;
                 continue;
             }
 
@@ -817,7 +817,7 @@ impl<I: MvccIterator> MvccScanIterator<I> {
             if self.storage_iter.is_pending() {
                 match self.resolve_pending(self.storage_iter.pending_owner())? {
                     PendingResolution::Skip => {
-                        self.storage_iter.advance()?;
+                        self.storage_iter.advance().await?;
                         continue;
                     }
                     PendingResolution::Visible => {
@@ -825,11 +825,11 @@ impl<I: MvccIterator> MvccScanIterator<I> {
                         // Check tombstone before returning.
                         if is_tombstone(self.storage_iter.value()) {
                             let skip_key = user_key.to_vec();
-                            self.storage_iter.advance()?;
+                            self.storage_iter.advance().await?;
                             while self.storage_iter.valid()
                                 && self.storage_iter.user_key() == skip_key.as_slice()
                             {
-                                self.storage_iter.advance()?;
+                                self.storage_iter.advance().await?;
                             }
                             continue;
                         }
@@ -842,7 +842,7 @@ impl<I: MvccIterator> MvccScanIterator<I> {
 
             // Skip if not visible at read_ts
             if ts > self.read_ts {
-                self.storage_iter.advance()?;
+                self.storage_iter.advance().await?;
                 continue;
             }
 
@@ -851,11 +851,11 @@ impl<I: MvccIterator> MvccScanIterator<I> {
                 // Tombstone: skip this key and all older versions immediately
                 // (we don't return tombstones, so no lazy skip needed)
                 let skip_key = user_key.to_vec();
-                self.storage_iter.advance()?;
+                self.storage_iter.advance().await?;
                 while self.storage_iter.valid()
                     && self.storage_iter.user_key() == skip_key.as_slice()
                 {
-                    self.storage_iter.advance()?;
+                    self.storage_iter.advance().await?;
                 }
                 continue;
             }
@@ -872,15 +872,15 @@ impl<I: MvccIterator> MvccScanIterator<I> {
 }
 
 impl<I: MvccIterator> MvccIterator for MvccScanIterator<I> {
-    fn seek(&mut self, _target: &MvccKey) -> crate::error::Result<()> {
+    async fn seek(&mut self, _target: &MvccKey) -> crate::error::Result<()> {
         // MvccScanIterator is created for a specific range.
         // Seeking within the result is not supported - this is a forward-only iterator.
         // The iterator should be created with the appropriate range instead.
         Ok(())
     }
 
-    fn advance(&mut self) -> crate::error::Result<()> {
-        self.find_next_visible()
+    async fn advance(&mut self) -> crate::error::Result<()> {
+        self.find_next_visible().await
     }
 
     fn valid(&self) -> bool {
@@ -966,7 +966,7 @@ mod tests {
         let range = seek_key..end_key;
 
         let mut iter = storage.scan_iter(range, 0).unwrap();
-        iter.advance().unwrap(); // Position on first entry
+        crate::io::block_on_sync(iter.advance()).unwrap(); // Position on first entry
 
         while iter.valid() {
             let decoded_key = iter.user_key();
@@ -978,7 +978,7 @@ mod tests {
                 }
                 return Some(value.to_vec());
             }
-            iter.advance().unwrap();
+            crate::io::block_on_sync(iter.advance()).unwrap();
         }
         None
     }
@@ -990,8 +990,8 @@ mod tests {
     // Import test extension trait for autocommit helpers
     use crate::testkit::TxnServiceTestExt;
 
-    #[test]
-    fn test_autocommit_put() {
+    #[tokio::test]
+    async fn test_autocommit_put() {
         let (storage, txn_service, _dir) = create_test_service();
 
         // Execute writes using proper transaction flow
@@ -1009,8 +1009,8 @@ mod tests {
         assert_eq!(v2, Some(b"value2".to_vec()));
     }
 
-    #[test]
-    fn test_recover() {
+    #[tokio::test]
+    async fn test_recover() {
         let dir = tempdir().unwrap();
         let config = FileClogConfig::with_dir(dir.path());
 
@@ -1050,8 +1050,8 @@ mod tests {
         assert!(txn_service.tso().last_ts() > 3);
     }
 
-    #[test]
-    fn test_mvcc_versions_after_writes() {
+    #[tokio::test]
+    async fn test_mvcc_versions_after_writes() {
         let (storage, txn_service, _dir) = create_test_service();
 
         // Write v1
@@ -1079,8 +1079,8 @@ mod tests {
     // TxnService trait tests (new unified API)
     // ========================================================================
 
-    #[test]
-    fn test_txn_service_begin() {
+    #[tokio::test]
+    async fn test_txn_service_begin() {
         let (_storage, txn_service, _dir) = create_test_service();
 
         // Begin a read-write transaction
@@ -1092,8 +1092,8 @@ mod tests {
         assert!(!ctx.is_read_only());
     }
 
-    #[test]
-    fn test_txn_service_begin_read_only() {
+    #[tokio::test]
+    async fn test_txn_service_begin_read_only() {
         let (_storage, txn_service, _dir) = create_test_service();
 
         // Begin a read-only transaction
@@ -1104,8 +1104,8 @@ mod tests {
         assert!(ctx.is_read_only());
     }
 
-    #[test]
-    fn test_txn_service_put_commit() {
+    #[tokio::test]
+    async fn test_txn_service_put_commit() {
         let (storage, txn_service, _dir) = create_test_service();
 
         let mut ctx = txn_service.begin(false).unwrap();
@@ -1125,8 +1125,8 @@ mod tests {
         assert_eq!(storage_value, Some(b"value1".to_vec()));
     }
 
-    #[test]
-    fn test_txn_service_delete_commit() {
+    #[tokio::test]
+    async fn test_txn_service_delete_commit() {
         let (storage, txn_service, _dir) = create_test_service();
 
         // First commit a value
@@ -1142,8 +1142,8 @@ mod tests {
         assert!(get_for_test(&*storage, b"key1").is_none());
     }
 
-    #[test]
-    fn test_txn_service_rollback() {
+    #[tokio::test]
+    async fn test_txn_service_rollback() {
         let (storage, txn_service, _dir) = create_test_service();
 
         let mut ctx = txn_service.begin(false).unwrap();
@@ -1160,8 +1160,8 @@ mod tests {
         assert!(value.is_none());
     }
 
-    #[test]
-    fn test_txn_service_snapshot_isolation() {
+    #[tokio::test]
+    async fn test_txn_service_snapshot_isolation() {
         let (_storage, txn_service, _dir) = create_test_service();
 
         // Write initial data
@@ -1186,8 +1186,8 @@ mod tests {
         assert_eq!(latest, Some(b"v2".to_vec()));
     }
 
-    #[test]
-    fn test_txn_service_read_only_rejects_writes() {
+    #[tokio::test]
+    async fn test_txn_service_read_only_rejects_writes() {
         let (storage, txn_service, _dir) = create_test_service();
 
         let mut ctx = txn_service.begin(true).unwrap();
@@ -1217,8 +1217,8 @@ mod tests {
         assert!(value.is_none());
     }
 
-    #[test]
-    fn test_txn_service_scan_mvcc() {
+    #[tokio::test]
+    async fn test_txn_service_scan_mvcc() {
         let (_storage, txn_service, _dir) = create_test_service();
 
         // Write some data via autocommit
@@ -1234,10 +1234,10 @@ mod tests {
             .scan_iter(&ctx, b"a".to_vec()..b"d".to_vec())
             .unwrap();
         let mut results = Vec::new();
-        iter.advance().unwrap();
+        iter.advance().await.unwrap();
         while iter.valid() {
             results.push((iter.user_key().to_vec(), iter.value().to_vec()));
-            iter.advance().unwrap();
+            iter.advance().await.unwrap();
         }
 
         assert_eq!(
@@ -1249,8 +1249,8 @@ mod tests {
         );
     }
 
-    #[test]
-    fn test_scan_storage_only() {
+    #[tokio::test]
+    async fn test_scan_storage_only() {
         // Test: Storage has data, scan returns it
         let (_storage, txn_service, _dir) = create_test_service();
 
@@ -1267,10 +1267,10 @@ mod tests {
             .scan_iter(&ctx, b"m".to_vec()..b"p".to_vec())
             .unwrap();
         let mut results = Vec::new();
-        iter.advance().unwrap();
+        iter.advance().await.unwrap();
         while iter.valid() {
             results.push((iter.user_key().to_vec(), iter.value().to_vec()));
-            iter.advance().unwrap();
+            iter.advance().await.unwrap();
         }
 
         assert_eq!(results.len(), 3, "should see all 3 storage keys");
@@ -1279,8 +1279,8 @@ mod tests {
         assert_eq!(results[2], (b"o".to_vec(), b"o_value".to_vec()));
     }
 
-    #[test]
-    fn test_scan_empty_range() {
+    #[tokio::test]
+    async fn test_scan_empty_range() {
         // Test: Empty range returns nothing
         let (_storage, txn_service, _dir) = create_test_service();
 
@@ -1294,12 +1294,12 @@ mod tests {
         let mut iter = txn_service
             .scan_iter(&ctx, b"mmm".to_vec()..b"nnn".to_vec())
             .unwrap();
-        iter.advance().unwrap();
+        iter.advance().await.unwrap();
         assert!(!iter.valid(), "should be empty - no data in range");
     }
 
-    #[test]
-    fn test_scan_range_boundaries() {
+    #[tokio::test]
+    async fn test_scan_range_boundaries() {
         // Test: Keys exactly at range boundaries
         let (_storage, txn_service, _dir) = create_test_service();
 
@@ -1315,10 +1315,10 @@ mod tests {
             .scan_iter(&ctx, b"aaa".to_vec()..b"ccc".to_vec())
             .unwrap();
         let mut results = Vec::new();
-        iter.advance().unwrap();
+        iter.advance().await.unwrap();
         while iter.valid() {
             results.push((iter.user_key().to_vec(), iter.value().to_vec()));
-            iter.advance().unwrap();
+            iter.advance().await.unwrap();
         }
 
         assert_eq!(results.len(), 2, "should see aaa and bbb only");
@@ -1326,8 +1326,8 @@ mod tests {
         assert_eq!(results[1], (b"bbb".to_vec(), b"b_val".to_vec()));
     }
 
-    #[test]
-    fn test_tso_advances_on_begin() {
+    #[tokio::test]
+    async fn test_tso_advances_on_begin() {
         let (_storage, txn_service, _dir) = create_test_service();
 
         let ts1 = txn_service.tso().last_ts();
@@ -1371,12 +1371,12 @@ mod tests {
     }
 
     impl MvccIterator for ErrorInjectingIterator {
-        fn seek(&mut self, _target: &MvccKey) -> Result<()> {
+        async fn seek(&mut self, _target: &MvccKey) -> Result<()> {
             self.position = 0;
             Ok(())
         }
 
-        fn advance(&mut self) -> Result<()> {
+        async fn advance(&mut self) -> Result<()> {
             if self.has_errored {
                 return Ok(());
             }
@@ -1421,12 +1421,12 @@ mod tests {
     }
 
     /// Helper to collect scan results using streaming API
-    fn collect_scan_results<I: MvccIterator>(
+    async fn collect_scan_results<I: MvccIterator>(
         mut iter: MvccScanIterator<I>,
     ) -> Vec<Result<(Key, RawValue)>> {
         let mut results = Vec::new();
         loop {
-            match MvccIterator::advance(&mut iter) {
+            match MvccIterator::advance(&mut iter).await {
                 Ok(()) => {
                     if !iter.valid() {
                         break;
@@ -1442,8 +1442,8 @@ mod tests {
         results
     }
 
-    #[test]
-    fn test_mvcc_scan_iterator_propagates_storage_error() {
+    #[tokio::test]
+    async fn test_mvcc_scan_iterator_propagates_storage_error() {
         // Create test data: 3 entries (a@5, b@5, c@5)
         let entries = vec![
             (MvccKey::encode(b"a", 5), b"value_a".to_vec()),
@@ -1466,7 +1466,7 @@ mod tests {
             None,
         );
 
-        let results = collect_scan_results(scan_iter);
+        let results = collect_scan_results(scan_iter).await;
 
         // Should have 2 Ok entries followed by error
         assert_eq!(results.len(), 3, "expected 3 items: 2 Ok + 1 Err");
@@ -1484,8 +1484,8 @@ mod tests {
         );
     }
 
-    #[test]
-    fn test_mvcc_scan_iterator_error_on_first_advance() {
+    #[tokio::test]
+    async fn test_mvcc_scan_iterator_error_on_first_advance() {
         // Create test data
         let entries = vec![
             (MvccKey::encode(b"a", 5), b"value_a".to_vec()),
@@ -1501,7 +1501,7 @@ mod tests {
 
         let scan_iter = MvccScanIterator::new(mock_iter, 10, b"a".to_vec()..b"z".to_vec(), None);
 
-        let results = collect_scan_results(scan_iter);
+        let results = collect_scan_results(scan_iter).await;
 
         // One successful entry, then error when trying to advance
         assert_eq!(results.len(), 2, "expected 2 items: 1 Ok + 1 Err");
@@ -1509,8 +1509,8 @@ mod tests {
         assert!(results[1].is_err(), "second should be error");
     }
 
-    #[test]
-    fn test_mvcc_scan_iterator_error_after_all_entries() {
+    #[tokio::test]
+    async fn test_mvcc_scan_iterator_error_after_all_entries() {
         // Create test data
         let entries = vec![
             (MvccKey::encode(b"a", 5), b"value_a".to_vec()),
@@ -1522,7 +1522,7 @@ mod tests {
 
         let scan_iter = MvccScanIterator::new(mock_iter, 10, b"a".to_vec()..b"z".to_vec(), None);
 
-        let results = collect_scan_results(scan_iter);
+        let results = collect_scan_results(scan_iter).await;
 
         // All entries should succeed
         assert_eq!(results.len(), 2, "expected 2 successful entries");
@@ -1530,8 +1530,8 @@ mod tests {
         assert!(results[1].is_ok());
     }
 
-    #[test]
-    fn test_mvcc_scan_iterator_no_silent_truncation() {
+    #[tokio::test]
+    async fn test_mvcc_scan_iterator_no_silent_truncation() {
         // This test verifies the original bug is fixed:
         // Previously, errors would cause silent truncation (returning None)
         // Now, errors must be explicitly returned to the caller
@@ -1550,7 +1550,7 @@ mod tests {
 
         let scan_iter = MvccScanIterator::new(mock_iter, 10, b"a".to_vec()..b"z".to_vec(), None);
 
-        let results = collect_scan_results(scan_iter);
+        let results = collect_scan_results(scan_iter).await;
 
         // Count successful and error results
         let successful_count = results.iter().filter(|r| r.is_ok()).count();
@@ -1576,8 +1576,8 @@ mod tests {
     // Explicit Transaction Tests (Pessimistic Locking)
     // ========================================================================
 
-    #[test]
-    fn test_explicit_txn_begin() {
+    #[tokio::test]
+    async fn test_explicit_txn_begin() {
         let (_storage, txn_service, _dir) = create_test_service();
 
         let ctx = txn_service.begin_explicit(false).unwrap();
@@ -1588,8 +1588,8 @@ mod tests {
         assert!(ctx.is_explicit());
     }
 
-    #[test]
-    fn test_explicit_txn_put_commit() {
+    #[tokio::test]
+    async fn test_explicit_txn_put_commit() {
         let (storage, txn_service, _dir) = create_test_service();
 
         // Start explicit transaction
@@ -1613,8 +1613,8 @@ mod tests {
         assert_eq!(value, Some(b"value1".to_vec()));
     }
 
-    #[test]
-    fn test_explicit_txn_put_rollback() {
+    #[tokio::test]
+    async fn test_explicit_txn_put_rollback() {
         let (storage, txn_service, _dir) = create_test_service();
 
         // Start explicit transaction
@@ -1633,8 +1633,8 @@ mod tests {
         assert!(value.is_none());
     }
 
-    #[test]
-    fn test_explicit_txn_delete_commit() {
+    #[tokio::test]
+    async fn test_explicit_txn_delete_commit() {
         let (storage, txn_service, _dir) = create_test_service();
 
         // First commit a value (via implicit txn)
@@ -1655,8 +1655,8 @@ mod tests {
         assert!(value.is_none());
     }
 
-    #[test]
-    fn test_explicit_txn_multiple_writes() {
+    #[tokio::test]
+    async fn test_explicit_txn_multiple_writes() {
         let (storage, txn_service, _dir) = create_test_service();
 
         // Start explicit transaction
@@ -1685,8 +1685,8 @@ mod tests {
         assert_eq!(get_for_test(&*storage, b"key3"), Some(b"value3".to_vec()));
     }
 
-    #[test]
-    fn test_explicit_txn_update_same_key() {
+    #[tokio::test]
+    async fn test_explicit_txn_update_same_key() {
         let (storage, txn_service, _dir) = create_test_service();
 
         // Start explicit transaction
@@ -1711,8 +1711,8 @@ mod tests {
         assert_eq!(value, Some(b"v2".to_vec()));
     }
 
-    #[test]
-    fn test_explicit_txn_read_only_rejects_writes() {
+    #[tokio::test]
+    async fn test_explicit_txn_read_only_rejects_writes() {
         let (_storage, txn_service, _dir) = create_test_service();
 
         let mut ctx = txn_service.begin_explicit(true).unwrap();
@@ -1733,8 +1733,8 @@ mod tests {
         assert_eq!(info.lsn, 0);
     }
 
-    #[test]
-    fn test_explicit_txn_empty_commit() {
+    #[tokio::test]
+    async fn test_explicit_txn_empty_commit() {
         let (_storage, txn_service, _dir) = create_test_service();
 
         // Start explicit transaction but don't write anything
@@ -1746,8 +1746,8 @@ mod tests {
         assert_eq!(info.lsn, 0);
     }
 
-    #[test]
-    fn test_explicit_txn_empty_rollback() {
+    #[tokio::test]
+    async fn test_explicit_txn_empty_rollback() {
         let (_storage, txn_service, _dir) = create_test_service();
 
         // Start explicit transaction but don't write anything
@@ -1759,8 +1759,8 @@ mod tests {
 
     // ==================== Read-Your-Writes Tests ====================
 
-    #[test]
-    fn test_read_your_writes_get() {
+    #[tokio::test]
+    async fn test_read_your_writes_get() {
         let (_storage, txn_service, _dir) = create_test_service();
 
         // Start explicit transaction
@@ -1779,8 +1779,8 @@ mod tests {
         txn_service.rollback(ctx).unwrap();
     }
 
-    #[test]
-    fn test_read_your_writes_update() {
+    #[tokio::test]
+    async fn test_read_your_writes_update() {
         let (_storage, txn_service, _dir) = create_test_service();
 
         // Start explicit transaction
@@ -1804,8 +1804,8 @@ mod tests {
         txn_service.rollback(ctx).unwrap();
     }
 
-    #[test]
-    fn test_read_your_writes_delete() {
+    #[tokio::test]
+    async fn test_read_your_writes_delete() {
         let (_storage, txn_service, _dir) = create_test_service();
 
         // First, commit an initial value
@@ -1829,8 +1829,8 @@ mod tests {
         txn_service.rollback(ctx).unwrap();
     }
 
-    #[test]
-    fn test_read_your_writes_scan() {
+    #[tokio::test]
+    async fn test_read_your_writes_scan() {
         let (_storage, txn_service, _dir) = create_test_service();
 
         // Start explicit transaction
@@ -1854,10 +1854,10 @@ mod tests {
 
         // Collect results
         let mut results = vec![];
-        scan_iter.advance().unwrap();
+        scan_iter.advance().await.unwrap();
         while scan_iter.valid() {
             results.push((scan_iter.user_key().to_vec(), scan_iter.value().to_vec()));
-            scan_iter.advance().unwrap();
+            scan_iter.advance().await.unwrap();
         }
 
         assert_eq!(results.len(), 3);
@@ -1869,8 +1869,8 @@ mod tests {
         txn_service.rollback(ctx).unwrap();
     }
 
-    #[test]
-    fn test_read_your_writes_isolation() {
+    #[tokio::test]
+    async fn test_read_your_writes_isolation() {
         let (_storage, txn_service, _dir) = create_test_service();
 
         // Start two explicit transactions
@@ -1895,8 +1895,8 @@ mod tests {
         txn_service.rollback(ctx2).unwrap();
     }
 
-    #[test]
-    fn test_read_your_writes_with_committed_base() {
+    #[tokio::test]
+    async fn test_read_your_writes_with_committed_base() {
         let (_storage, txn_service, _dir) = create_test_service();
 
         // First, commit a base value
@@ -1922,8 +1922,8 @@ mod tests {
         txn_service.rollback(ctx).unwrap();
     }
 
-    #[test]
-    fn test_read_your_writes_delete_then_insert() {
+    #[tokio::test]
+    async fn test_read_your_writes_delete_then_insert() {
         let (_storage, txn_service, _dir) = create_test_service();
 
         // First, commit a base value
@@ -1960,8 +1960,8 @@ mod tests {
     // Additional coverage tests for edge cases
     // ========================================================================
 
-    #[test]
-    fn test_concurrency_manager_getter() {
+    #[tokio::test]
+    async fn test_concurrency_manager_getter() {
         let (_storage, txn_service, _dir) = create_test_service();
 
         // Test that concurrency_manager() getter works
@@ -1973,8 +1973,8 @@ mod tests {
         assert!(cm.max_ts() > 0);
     }
 
-    #[test]
-    fn test_clog_service_getter() {
+    #[tokio::test]
+    async fn test_clog_service_getter() {
         let (_storage, txn_service, _dir) = create_test_service();
 
         // Test that clog_service() getter works
@@ -1987,8 +1987,8 @@ mod tests {
         assert!(clog.max_lsn().unwrap() >= 1);
     }
 
-    #[test]
-    fn test_put_on_committed_transaction() {
+    #[tokio::test]
+    async fn test_put_on_committed_transaction() {
         let (_storage, txn_service, _dir) = create_test_service();
 
         // Begin and commit a transaction
@@ -2014,8 +2014,8 @@ mod tests {
         ));
     }
 
-    #[test]
-    fn test_delete_on_committed_transaction() {
+    #[tokio::test]
+    async fn test_delete_on_committed_transaction() {
         let (_storage, txn_service, _dir) = create_test_service();
 
         let ctx = txn_service.begin(false).unwrap();
@@ -2037,8 +2037,8 @@ mod tests {
         ));
     }
 
-    #[test]
-    fn test_put_on_aborted_transaction() {
+    #[tokio::test]
+    async fn test_put_on_aborted_transaction() {
         let (_storage, txn_service, _dir) = create_test_service();
 
         // Create an aborted context
@@ -2054,8 +2054,8 @@ mod tests {
         ));
     }
 
-    #[test]
-    fn test_delete_on_aborted_transaction() {
+    #[tokio::test]
+    async fn test_delete_on_aborted_transaction() {
         let (_storage, txn_service, _dir) = create_test_service();
 
         // Create an aborted context
@@ -2071,8 +2071,8 @@ mod tests {
         ));
     }
 
-    #[test]
-    fn test_commit_on_aborted_transaction() {
+    #[tokio::test]
+    async fn test_commit_on_aborted_transaction() {
         let (_storage, txn_service, _dir) = create_test_service();
 
         // Create an aborted context
@@ -2084,8 +2084,8 @@ mod tests {
         assert!(result.is_err());
     }
 
-    #[test]
-    fn test_commit_on_already_committed() {
+    #[tokio::test]
+    async fn test_commit_on_already_committed() {
         let (_storage, txn_service, _dir) = create_test_service();
 
         // Create a committed context
@@ -2097,8 +2097,8 @@ mod tests {
         assert!(result.is_err());
     }
 
-    #[test]
-    fn test_recover_with_uncommitted_entries() {
+    #[tokio::test]
+    async fn test_recover_with_uncommitted_entries() {
         // Test recovery where some transactions are not committed (rolled back)
         let dir = tempdir().unwrap();
         let config = FileClogConfig::with_dir(dir.path());
@@ -2173,8 +2173,8 @@ mod tests {
         );
     }
 
-    #[test]
-    fn test_scan_with_unbounded_end() {
+    #[tokio::test]
+    async fn test_scan_with_unbounded_end() {
         let (_storage, txn_service, _dir) = create_test_service();
 
         // Write some data
@@ -2189,10 +2189,10 @@ mod tests {
             .scan_iter(&ctx, b"key1".to_vec()..vec![])
             .unwrap();
         let mut results = Vec::new();
-        iter.advance().unwrap();
+        iter.advance().await.unwrap();
         while iter.valid() {
             results.push(iter.user_key().to_vec());
-            iter.advance().unwrap();
+            iter.advance().await.unwrap();
         }
 
         // Should see all keys starting from key1
@@ -2202,8 +2202,8 @@ mod tests {
         assert_eq!(results[2], b"key3");
     }
 
-    #[test]
-    fn test_get_iterates_through_versions() {
+    #[tokio::test]
+    async fn test_get_iterates_through_versions() {
         let (_storage, txn_service, _dir) = create_test_service();
 
         // Write multiple versions of same key
@@ -2225,8 +2225,8 @@ mod tests {
         assert_eq!(value3, Some(b"v3".to_vec()));
     }
 
-    #[test]
-    fn test_get_with_tombstone_in_middle() {
+    #[tokio::test]
+    async fn test_get_with_tombstone_in_middle() {
         let (_storage, txn_service, _dir) = create_test_service();
 
         // Write, delete, write again
@@ -2245,8 +2245,8 @@ mod tests {
         assert_eq!(value3, Some(b"v3".to_vec()));
     }
 
-    #[test]
-    fn test_explicit_txn_write_conflict() {
+    #[tokio::test]
+    async fn test_explicit_txn_write_conflict() {
         let (_storage, txn_service, _dir) = create_test_service();
 
         // Transaction 1: Lock key
@@ -2273,8 +2273,8 @@ mod tests {
         txn_service.rollback(ctx2).unwrap();
     }
 
-    #[test]
-    fn test_explicit_txn_delete_conflict() {
+    #[tokio::test]
+    async fn test_explicit_txn_delete_conflict() {
         let (_storage, txn_service, _dir) = create_test_service();
 
         // Commit initial value
@@ -2304,8 +2304,8 @@ mod tests {
         txn_service.rollback(ctx2).unwrap();
     }
 
-    #[test]
-    fn test_recover_with_delete_operation() {
+    #[tokio::test]
+    async fn test_recover_with_delete_operation() {
         let dir = tempdir().unwrap();
         let config = FileClogConfig::with_dir(dir.path());
 
@@ -2341,8 +2341,8 @@ mod tests {
         assert!(get_for_test(&*storage, b"del_key").is_none());
     }
 
-    #[test]
-    fn test_recover_empty_entries() {
+    #[tokio::test]
+    async fn test_recover_empty_entries() {
         let dir = tempdir().unwrap();
         let config = FileClogConfig::with_dir(dir.path());
         let clog_service = Arc::new(FileClogService::open(config).unwrap());
@@ -2360,8 +2360,8 @@ mod tests {
         assert_eq!(stats.rolled_back_entries, 0);
     }
 
-    #[test]
-    fn test_storage_getter() {
+    #[tokio::test]
+    async fn test_storage_getter() {
         let (storage, txn_service, _dir) = create_test_service();
 
         // Test storage() getter returns the same storage
@@ -2377,8 +2377,8 @@ mod tests {
         assert_eq!(value1, Some(b"test_value".to_vec()));
     }
 
-    #[test]
-    fn test_tso_getter() {
+    #[tokio::test]
+    async fn test_tso_getter() {
         let (_storage, txn_service, _dir) = create_test_service();
 
         // Test tso() getter
@@ -2406,8 +2406,8 @@ mod tests {
             .collect()
     }
 
-    #[test]
-    fn test_implicit_txn_commit_writes_clog() {
+    #[tokio::test]
+    async fn test_implicit_txn_commit_writes_clog() {
         let (_storage, txn_service, _dir) = create_test_service();
 
         let info = txn_service.autocommit_put(b"key1", b"value1").unwrap();
@@ -2427,8 +2427,8 @@ mod tests {
         assert_eq!(commits.len(), 1, "should have 1 Commit entry");
     }
 
-    #[test]
-    fn test_explicit_txn_commit_writes_clog() {
+    #[tokio::test]
+    async fn test_explicit_txn_commit_writes_clog() {
         let (_storage, txn_service, _dir) = create_test_service();
 
         let mut ctx = txn_service.begin_explicit(false).unwrap();
@@ -2453,8 +2453,8 @@ mod tests {
         assert_eq!(commits.len(), 1, "should have 1 Commit entry");
     }
 
-    #[test]
-    fn test_explicit_txn_delete_existing_writes_clog() {
+    #[tokio::test]
+    async fn test_explicit_txn_delete_existing_writes_clog() {
         let (_storage, txn_service, _dir) = create_test_service();
 
         // First, commit a value via autocommit
@@ -2478,8 +2478,8 @@ mod tests {
         );
     }
 
-    #[test]
-    fn test_explicit_txn_multiple_writes_clog() {
+    #[tokio::test]
+    async fn test_explicit_txn_multiple_writes_clog() {
         let (_storage, txn_service, _dir) = create_test_service();
 
         let mut ctx = txn_service.begin_explicit(false).unwrap();
@@ -2506,8 +2506,8 @@ mod tests {
         assert_eq!(commits.len(), 1, "should have 1 Commit entry");
     }
 
-    #[test]
-    fn test_explicit_txn_delete_nonexistent_no_clog() {
+    #[tokio::test]
+    async fn test_explicit_txn_delete_nonexistent_no_clog() {
         let (_storage, txn_service, _dir) = create_test_service();
 
         // Delete a key that was never written
@@ -2528,8 +2528,8 @@ mod tests {
         );
     }
 
-    #[test]
-    fn test_explicit_txn_put_then_delete_produces_tombstone() {
+    #[tokio::test]
+    async fn test_explicit_txn_put_then_delete_produces_tombstone() {
         let (_storage, txn_service, _dir) = create_test_service();
 
         // PUT then DELETE same key (no committed value underneath).
@@ -2557,8 +2557,8 @@ mod tests {
         );
     }
 
-    #[test]
-    fn test_explicit_txn_put_delete_put_writes_clog() {
+    #[tokio::test]
+    async fn test_explicit_txn_put_delete_put_writes_clog() {
         let (_storage, txn_service, _dir) = create_test_service();
 
         // PUT → DELETE → PUT sequence (no committed base)
@@ -2589,8 +2589,8 @@ mod tests {
     // Snapshot Isolation / Preparing State Tests
     // ========================================================================
 
-    #[test]
-    fn test_reader_skips_running_pending() {
+    #[tokio::test]
+    async fn test_reader_skips_running_pending() {
         // A reader encountering a Running txn's pending node should skip it
         // and see the old committed version.
         let (_storage, txn_service, _dir) = create_test_service();
@@ -2621,8 +2621,8 @@ mod tests {
         txn_service.rollback(writer).unwrap();
     }
 
-    #[test]
-    fn test_reader_skips_aborted_pending() {
+    #[tokio::test]
+    async fn test_reader_skips_aborted_pending() {
         // A reader encountering an Aborted txn's pending node should skip it.
         let (_storage, txn_service, _dir) = create_test_service();
 
@@ -2642,8 +2642,8 @@ mod tests {
         assert_eq!(val.as_deref(), Some(b"v1".as_slice()));
     }
 
-    #[test]
-    fn test_implicit_commit_registers_in_txn_state_cache() {
+    #[tokio::test]
+    async fn test_implicit_commit_registers_in_txn_state_cache() {
         // Verify that implicit txn commit registers in TxnStateCache
         // and cleans up after itself.
         let (_storage, txn_service, _dir) = create_test_service();
@@ -2663,8 +2663,8 @@ mod tests {
         assert_eq!(val.as_deref(), Some(b"v1".as_slice()));
     }
 
-    #[test]
-    fn test_explicit_commit_uses_preparing_state() {
+    #[tokio::test]
+    async fn test_explicit_commit_uses_preparing_state() {
         // Verify that explicit transaction commit transitions through Preparing.
         let (_storage, txn_service, _dir) = create_test_service();
 
@@ -2694,8 +2694,8 @@ mod tests {
         );
     }
 
-    #[test]
-    fn test_reader_sees_committed_value_after_prepare() {
+    #[tokio::test]
+    async fn test_reader_sees_committed_value_after_prepare() {
         // After a writer commits, readers should see the committed value.
         let (_storage, txn_service, _dir) = create_test_service();
 
@@ -2716,8 +2716,8 @@ mod tests {
         assert_eq!(val.as_deref(), Some(b"v2".as_slice()));
     }
 
-    #[test]
-    fn test_scan_iter_resolves_pending_running() {
+    #[tokio::test]
+    async fn test_scan_iter_resolves_pending_running() {
         // scan_iter should skip pending nodes from Running transactions.
         let (_storage, txn_service, _dir) = create_test_service();
 
@@ -2736,17 +2736,17 @@ mod tests {
         let mut iter = txn_service
             .scan_iter(&reader, b"a".to_vec()..b"d".to_vec())
             .unwrap();
-        iter.advance().unwrap();
+        iter.advance().await.unwrap();
 
         assert!(iter.valid());
         assert_eq!(iter.user_key(), b"a");
         assert_eq!(iter.value(), b"v1");
-        iter.advance().unwrap();
+        iter.advance().await.unwrap();
 
         assert!(iter.valid());
         assert_eq!(iter.user_key(), b"c");
         assert_eq!(iter.value(), b"v3");
-        iter.advance().unwrap();
+        iter.advance().await.unwrap();
 
         assert!(!iter.valid());
 
@@ -2754,8 +2754,8 @@ mod tests {
         txn_service.rollback(writer).unwrap();
     }
 
-    #[test]
-    fn test_get_resolves_pending_running() {
+    #[tokio::test]
+    async fn test_get_resolves_pending_running() {
         // get() for non-explicit txns should skip Running pending nodes.
         let (_storage, txn_service, _dir) = create_test_service();
 
@@ -2778,8 +2778,8 @@ mod tests {
         txn_service.rollback(writer).unwrap();
     }
 
-    #[test]
-    fn test_pending_resolution_committed_visible() {
+    #[tokio::test]
+    async fn test_pending_resolution_committed_visible() {
         // Test: writer commits with commit_ts <= reader.start_ts
         // → reader should see the committed value.
         let (_storage, txn_service, _dir) = create_test_service();

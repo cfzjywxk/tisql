@@ -197,7 +197,7 @@ impl CompactionSchedulerInner {
         tracing::info!("Compaction worker started (async)");
 
         while !self.shutdown.load(Ordering::Relaxed) {
-            match self.engine.do_compaction() {
+            match self.engine.do_compaction().await {
                 Ok(true) => {
                     self.compaction_count.fetch_add(1, Ordering::Relaxed);
                     tracing::debug!(
@@ -227,7 +227,7 @@ impl CompactionSchedulerInner {
         tracing::info!("Compaction worker started (sync fallback)");
 
         while !self.shutdown.load(Ordering::Relaxed) {
-            match self.engine.do_compaction() {
+            match crate::io::block_on_sync(self.engine.do_compaction()) {
                 Ok(true) => {
                     self.compaction_count.fetch_add(1, Ordering::Relaxed);
                     continue;

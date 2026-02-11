@@ -201,7 +201,7 @@ fn read_balances(
     // Scan all MVCC entries up to read_ts
     let range = MvccKey::unbounded()..MvccKey::unbounded();
     let mut iter = engine.scan_iter(range, 0).expect("scan should succeed");
-    iter.advance().expect("advance should succeed");
+    tisql::io::block_on_sync(iter.advance()).expect("advance should succeed");
 
     while iter.valid() {
         let ts = iter.timestamp();
@@ -213,7 +213,7 @@ fn read_balances(
                 }
             }
         }
-        iter.advance().expect("advance should succeed");
+        tisql::io::block_on_sync(iter.advance()).expect("advance should succeed");
     }
 
     let total: i64 = balances.values().sum();
@@ -376,13 +376,13 @@ fn is_key_visible(engine: &VersionedMemTableEngine, key: &[u8], read_ts: Timesta
     let mut iter = engine
         .scan_iter(start..end, 0)
         .expect("scan should succeed");
-    iter.advance().expect("advance should succeed");
+    tisql::io::block_on_sync(iter.advance()).expect("advance should succeed");
 
     while iter.valid() {
         if iter.user_key() == key && iter.timestamp() <= read_ts {
             return true;
         }
-        iter.advance().expect("advance should succeed");
+        tisql::io::block_on_sync(iter.advance()).expect("advance should succeed");
     }
 
     false

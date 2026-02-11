@@ -304,10 +304,10 @@ impl MergeIterator {
     /// Position the iterator at the first entry.
     ///
     /// This must be called after `new()` before accessing entries.
-    pub fn seek_to_first(&mut self) -> Result<()> {
+    pub async fn seek_to_first(&mut self) -> Result<()> {
         // Position all child iterators
         for iter in &mut self.iters {
-            iter.seek_to_first()?;
+            iter.seek_to_first().await?;
         }
 
         // Initialize heap with first entry from each valid iterator
@@ -338,13 +338,13 @@ impl MergeIterator {
     }
 
     /// Advance to the next entry.
-    pub fn advance(&mut self) -> Result<()> {
+    pub async fn advance(&mut self) -> Result<()> {
         if let Some(entry) = self.heap.pop() {
             let idx = entry.source_idx;
             self.last_key = Some(entry.key);
 
             // Advance the source iterator and push next entry
-            self.iters[idx].advance()?;
+            self.iters[idx].advance().await?;
             if self.iters[idx].valid() {
                 let key = self.iters[idx].key().to_vec();
                 let value = self.iters[idx].value().to_vec();
@@ -366,7 +366,7 @@ impl MergeIterator {
     /// Note: This method extracts the key portion (removes timestamp suffix)
     /// to compare key prefixes.
     #[allow(dead_code)]
-    pub fn skip_to_next_key(&mut self) -> Result<()> {
+    pub async fn skip_to_next_key(&mut self) -> Result<()> {
         let last_key_prefix = match &self.last_key {
             Some(k) if k.len() >= 8 => k[..k.len() - 8].to_vec(),
             _ => return Ok(()),
@@ -382,7 +382,7 @@ impl MergeIterator {
             };
 
             if should_skip {
-                self.advance()?;
+                self.advance().await?;
             } else {
                 break;
             }
@@ -411,7 +411,7 @@ impl CompactionExecutor {
     /// execution begins, enabling orphan cleanup on crash recovery.
     ///
     /// Returns the manifest delta to apply on success.
-    pub fn execute(
+    pub async fn execute(
         &self,
         task: &CompactionTask,
         version: &Version,
@@ -434,7 +434,7 @@ impl CompactionExecutor {
         let mut readers = Vec::new();
         for (_level, sst_id) in &task.inputs {
             let sst_path = sst_dir.join(format!("{sst_id:08}.sst"));
-            let reader = SstReaderRef::open(&sst_path, std::sync::Arc::clone(&io))?;
+            let reader = SstReaderRef::open(&sst_path, std::sync::Arc::clone(&io)).await?;
             readers.push(reader);
         }
 
@@ -444,7 +444,7 @@ impl CompactionExecutor {
         fail_point!("compaction_before_merge");
 
         let mut merge_iter = MergeIterator::new(readers)?;
-        merge_iter.seek_to_first()?;
+        merge_iter.seek_to_first().await?;
 
         // Create output SST builder using pre-allocated IDs
         let mut id_idx = 0;
@@ -488,7 +488,7 @@ impl CompactionExecutor {
                     current_size = 0;
                 }
             }
-            merge_iter.advance()?;
+            merge_iter.advance().await?;
         }
 
         // Finish last output file
@@ -548,11 +548,11 @@ mod tests {
     use crate::storage::sstable::SstBuilder;
     use tempfile::TempDir;
 
-    fn test_io() -> Arc<crate::io::IoService> {
+    async fn test_io() -> Arc<crate::io::IoService> {
         crate::io::IoService::new(32).unwrap()
     }
 
-    fn test_config(dir: &Path) -> Arc<LsmConfig> {
+    async fn test_config(dir: &Path) -> Arc<LsmConfig> {
         Arc::new(
             LsmConfig::builder(dir)
                 .memtable_size(1024)
@@ -578,20 +578,20 @@ mod tests {
         }
     }
 
-    #[test]
-    fn test_picker_no_compaction_needed() {
+    #[tokio::test]
+    async fn test_picker_no_compaction_needed() {
         let tmp = TempDir::new().unwrap();
-        let config = test_config(tmp.path());
+        let config = test_config(tmp.path()).await;
         let picker = CompactionPicker::new(config);
 
         let version = Version::new();
         assert!(picker.pick(&version).is_none());
     }
 
-    #[test]
-    fn test_picker_l0_compaction() {
+    #[tokio::test]
+    async fn test_picker_l0_compaction() {
         let tmp = TempDir::new().unwrap();
-        let config = test_config(tmp.path());
+        let config = test_config(tmp.path()).await;
         let picker = CompactionPicker::new(config);
 
         // Add 4 L0 files (triggers compaction)
@@ -608,10 +608,10 @@ mod tests {
         assert_eq!(task.inputs.len(), 4); // All 4 L0 files
     }
 
-    #[test]
-    fn test_picker_l0_with_l1_overlap() {
+    #[tokio::test]
+    async fn test_picker_l0_with_l1_overlap() {
         let tmp = TempDir::new().unwrap();
-        let config = test_config(tmp.path());
+        let config = test_config(tmp.path()).await;
         let picker = CompactionPicker::new(config);
 
         // L0 files overlapping with some L1 files
@@ -636,8 +636,8 @@ mod tests {
         assert!(!l1_inputs.is_empty()); // At least some L1 overlap
     }
 
-    #[test]
-    fn test_picker_level_compaction() {
+    #[tokio::test]
+    async fn test_picker_level_compaction() {
         let tmp = TempDir::new().unwrap();
         let config = Arc::new(
             LsmConfig::builder(tmp.path())
@@ -658,8 +658,8 @@ mod tests {
         assert_eq!(task.output_level, 2);
     }
 
-    #[test]
-    fn test_picker_trivial_move() {
+    #[tokio::test]
+    async fn test_picker_trivial_move() {
         let tmp = TempDir::new().unwrap();
         let config = Arc::new(
             LsmConfig::builder(tmp.path())
@@ -682,8 +682,8 @@ mod tests {
         assert_eq!(task.inputs.len(), 1);
     }
 
-    #[test]
-    fn test_merge_iterator_single_source() {
+    #[tokio::test]
+    async fn test_merge_iterator_single_source() {
         let tmp = TempDir::new().unwrap();
         let sst_path = tmp.path().join("test.sst");
 
@@ -696,9 +696,11 @@ mod tests {
         builder.finish(1, 0).unwrap();
 
         // Create merge iterator
-        let reader = SstReaderRef::open(&sst_path, test_io()).unwrap();
+        let reader = SstReaderRef::open(&sst_path, test_io().await)
+            .await
+            .unwrap();
         let mut iter = MergeIterator::new(vec![reader]).unwrap();
-        iter.seek_to_first().unwrap();
+        iter.seek_to_first().await.unwrap();
 
         // Verify iteration
         assert!(iter.valid());
@@ -706,20 +708,20 @@ mod tests {
         assert_eq!(k, b"key1");
         assert_eq!(v, b"value1");
 
-        iter.advance().unwrap();
+        iter.advance().await.unwrap();
         let (k, _) = iter.current().unwrap();
         assert_eq!(k, b"key2");
 
-        iter.advance().unwrap();
+        iter.advance().await.unwrap();
         let (k, _) = iter.current().unwrap();
         assert_eq!(k, b"key3");
 
-        iter.advance().unwrap();
+        iter.advance().await.unwrap();
         assert!(!iter.valid());
     }
 
-    #[test]
-    fn test_merge_iterator_multiple_sources() {
+    #[tokio::test]
+    async fn test_merge_iterator_multiple_sources() {
         let tmp = TempDir::new().unwrap();
 
         // Create first SST: a, c, e
@@ -739,17 +741,20 @@ mod tests {
         builder.finish(2, 0).unwrap();
 
         // Merge both
-        let reader1 = SstReaderRef::open(&sst1_path, test_io()).unwrap();
-        let reader2 = SstReaderRef::open(&sst2_path, test_io()).unwrap();
+        let io = test_io().await;
+        let reader1 = SstReaderRef::open(&sst1_path, Arc::clone(&io))
+            .await
+            .unwrap();
+        let reader2 = SstReaderRef::open(&sst2_path, io).await.unwrap();
         let mut iter = MergeIterator::new(vec![reader1, reader2]).unwrap();
-        iter.seek_to_first().unwrap();
+        iter.seek_to_first().await.unwrap();
 
         // Should be in sorted order
         let mut keys = Vec::new();
         while iter.valid() {
             let (k, _) = iter.current().unwrap();
             keys.push(k);
-            iter.advance().unwrap();
+            iter.advance().await.unwrap();
         }
 
         assert_eq!(
@@ -765,8 +770,8 @@ mod tests {
         );
     }
 
-    #[test]
-    fn test_merge_iterator_duplicate_keys() {
+    #[tokio::test]
+    async fn test_merge_iterator_duplicate_keys() {
         let tmp = TempDir::new().unwrap();
 
         // Create first SST (newer): key->new
@@ -782,10 +787,13 @@ mod tests {
         builder.finish(2, 0).unwrap();
 
         // Merge with newer first
-        let reader1 = SstReaderRef::open(&sst1_path, test_io()).unwrap();
-        let reader2 = SstReaderRef::open(&sst2_path, test_io()).unwrap();
+        let io = test_io().await;
+        let reader1 = SstReaderRef::open(&sst1_path, Arc::clone(&io))
+            .await
+            .unwrap();
+        let reader2 = SstReaderRef::open(&sst2_path, io).await.unwrap();
         let mut iter = MergeIterator::new(vec![reader1, reader2]).unwrap();
-        iter.seek_to_first().unwrap();
+        iter.seek_to_first().await.unwrap();
 
         // First should be newer value
         let (k, v) = iter.current().unwrap();
@@ -793,16 +801,16 @@ mod tests {
         assert_eq!(v, b"new");
 
         // Second should be older value (both versions preserved)
-        iter.advance().unwrap();
+        iter.advance().await.unwrap();
         let (k, v) = iter.current().unwrap();
         assert_eq!(k, b"key");
         assert_eq!(v, b"old");
     }
 
-    #[test]
-    fn test_compaction_executor_basic() {
+    #[tokio::test]
+    async fn test_compaction_executor_basic() {
         let tmp = TempDir::new().unwrap();
-        let config = test_config(tmp.path());
+        let config = test_config(tmp.path()).await;
         let executor = CompactionExecutor::new(Arc::clone(&config));
 
         // Create L0 SSTs
@@ -841,8 +849,9 @@ mod tests {
                 &version,
                 &config.sst_dir(),
                 &pre_allocated_ids,
-                test_io(),
+                test_io().await,
             )
+            .await
             .unwrap();
 
         // Verify delta
@@ -853,17 +862,17 @@ mod tests {
 
     // ==================== MergeIterator Additional Coverage Tests ====================
 
-    #[test]
-    fn test_merge_iterator_empty_sources() {
+    #[tokio::test]
+    async fn test_merge_iterator_empty_sources() {
         let mut iter = MergeIterator::new(vec![]).unwrap();
-        iter.seek_to_first().unwrap();
+        iter.seek_to_first().await.unwrap();
 
         assert!(!iter.valid());
         assert!(iter.current().is_none());
     }
 
-    #[test]
-    fn test_merge_iterator_single_empty_sst() {
+    #[tokio::test]
+    async fn test_merge_iterator_single_empty_sst() {
         let tmp = TempDir::new().unwrap();
         let sst_path = tmp.path().join("empty.sst");
 
@@ -871,15 +880,17 @@ mod tests {
         let builder = SstBuilder::new(&sst_path, SstBuilderOptions::default()).unwrap();
         builder.finish(1, 0).unwrap();
 
-        let reader = SstReaderRef::open(&sst_path, test_io()).unwrap();
+        let reader = SstReaderRef::open(&sst_path, test_io().await)
+            .await
+            .unwrap();
         let mut iter = MergeIterator::new(vec![reader]).unwrap();
-        iter.seek_to_first().unwrap();
+        iter.seek_to_first().await.unwrap();
 
         assert!(!iter.valid());
     }
 
-    #[test]
-    fn test_merge_iterator_not_positioned_after_new() {
+    #[tokio::test]
+    async fn test_merge_iterator_not_positioned_after_new() {
         let tmp = TempDir::new().unwrap();
         let sst_path = tmp.path().join("test.sst");
 
@@ -887,15 +898,17 @@ mod tests {
         builder.add(b"key", b"value").unwrap();
         builder.finish(1, 0).unwrap();
 
-        let reader = SstReaderRef::open(&sst_path, test_io()).unwrap();
+        let reader = SstReaderRef::open(&sst_path, test_io().await)
+            .await
+            .unwrap();
         let iter = MergeIterator::new(vec![reader]).unwrap();
 
         // Iterator should not be valid until seek_to_first
         assert!(!iter.valid());
     }
 
-    #[test]
-    fn test_merge_iterator_advance_when_not_valid() {
+    #[tokio::test]
+    async fn test_merge_iterator_advance_when_not_valid() {
         let tmp = TempDir::new().unwrap();
         let sst_path = tmp.path().join("test.sst");
 
@@ -903,21 +916,23 @@ mod tests {
         builder.add(b"key", b"value").unwrap();
         builder.finish(1, 0).unwrap();
 
-        let reader = SstReaderRef::open(&sst_path, test_io()).unwrap();
+        let reader = SstReaderRef::open(&sst_path, test_io().await)
+            .await
+            .unwrap();
         let mut iter = MergeIterator::new(vec![reader]).unwrap();
-        iter.seek_to_first().unwrap();
+        iter.seek_to_first().await.unwrap();
 
         // Exhaust iterator
-        iter.advance().unwrap();
+        iter.advance().await.unwrap();
         assert!(!iter.valid());
 
         // Advance on invalid should be no-op
-        iter.advance().unwrap();
+        iter.advance().await.unwrap();
         assert!(!iter.valid());
     }
 
-    #[test]
-    fn test_merge_iterator_tie_breaking_newer_first() {
+    #[tokio::test]
+    async fn test_merge_iterator_tie_breaking_newer_first() {
         let tmp = TempDir::new().unwrap();
 
         // Create SST1 (newer, index 0)
@@ -932,12 +947,15 @@ mod tests {
         builder.add(b"key", b"older").unwrap();
         builder.finish(2, 0).unwrap();
 
-        let reader1 = SstReaderRef::open(&sst1_path, test_io()).unwrap();
-        let reader2 = SstReaderRef::open(&sst2_path, test_io()).unwrap();
+        let io = test_io().await;
+        let reader1 = SstReaderRef::open(&sst1_path, Arc::clone(&io))
+            .await
+            .unwrap();
+        let reader2 = SstReaderRef::open(&sst2_path, io).await.unwrap();
 
         // Newer file first
         let mut iter = MergeIterator::new(vec![reader1, reader2]).unwrap();
-        iter.seek_to_first().unwrap();
+        iter.seek_to_first().await.unwrap();
 
         // First entry should be from newer file (source_idx 0)
         let (k, v) = iter.current().unwrap();
@@ -945,20 +963,21 @@ mod tests {
         assert_eq!(v, b"newer");
 
         // Second entry should be from older file (source_idx 1)
-        iter.advance().unwrap();
+        iter.advance().await.unwrap();
         let (k, v) = iter.current().unwrap();
         assert_eq!(k, b"key");
         assert_eq!(v, b"older");
 
-        iter.advance().unwrap();
+        iter.advance().await.unwrap();
         assert!(!iter.valid());
     }
 
-    #[test]
-    fn test_merge_iterator_large_merge() {
+    #[tokio::test]
+    async fn test_merge_iterator_large_merge() {
         let tmp = TempDir::new().unwrap();
 
         // Create 10 SSTs with interleaved keys
+        let io = test_io().await;
         let mut readers = Vec::new();
         for sst_idx in 0..10u32 {
             let sst_path = tmp.path().join(format!("sst{sst_idx}.sst"));
@@ -972,18 +991,22 @@ mod tests {
             }
             builder.finish(sst_idx as u64 + 1, 0).unwrap();
 
-            readers.push(SstReaderRef::open(&sst_path, test_io()).unwrap());
+            readers.push(
+                SstReaderRef::open(&sst_path, Arc::clone(&io))
+                    .await
+                    .unwrap(),
+            );
         }
 
         let mut iter = MergeIterator::new(readers).unwrap();
-        iter.seek_to_first().unwrap();
+        iter.seek_to_first().await.unwrap();
 
         // Collect all keys
         let mut keys = Vec::new();
         while iter.valid() {
             let (k, _) = iter.current().unwrap();
             keys.push(String::from_utf8_lossy(&k).to_string());
-            iter.advance().unwrap();
+            iter.advance().await.unwrap();
         }
 
         // Should have 100 keys in sorted order
@@ -995,8 +1018,8 @@ mod tests {
         }
     }
 
-    #[test]
-    fn test_merge_iterator_skip_to_next_key_basic() {
+    #[tokio::test]
+    async fn test_merge_iterator_skip_to_next_key_basic() {
         let tmp = TempDir::new().unwrap();
         let sst_path = tmp.path().join("mvcc.sst");
 
@@ -1017,24 +1040,26 @@ mod tests {
         builder.add(&mvcc(b"key2", 100), b"v2_100").unwrap();
         builder.finish(1, 0).unwrap();
 
-        let reader = SstReaderRef::open(&sst_path, test_io()).unwrap();
+        let reader = SstReaderRef::open(&sst_path, test_io().await)
+            .await
+            .unwrap();
         let mut iter = MergeIterator::new(vec![reader]).unwrap();
-        iter.seek_to_first().unwrap();
+        iter.seek_to_first().await.unwrap();
 
         // First entry: key1@100
         let (k, _) = iter.current().unwrap();
         assert!(k.starts_with(b"key1"));
 
         // Skip to next key should jump to key2
-        iter.advance().unwrap();
-        iter.skip_to_next_key().unwrap();
+        iter.advance().await.unwrap();
+        iter.skip_to_next_key().await.unwrap();
 
         let (k, _) = iter.current().unwrap();
         assert!(k.starts_with(b"key2"));
     }
 
-    #[test]
-    fn test_merge_iterator_skip_to_next_key_at_last_key() {
+    #[tokio::test]
+    async fn test_merge_iterator_skip_to_next_key_at_last_key() {
         let tmp = TempDir::new().unwrap();
         let sst_path = tmp.path().join("mvcc.sst");
 
@@ -1049,19 +1074,21 @@ mod tests {
         builder.add(&mvcc(b"only_key", 50), b"v50").unwrap();
         builder.finish(1, 0).unwrap();
 
-        let reader = SstReaderRef::open(&sst_path, test_io()).unwrap();
+        let reader = SstReaderRef::open(&sst_path, test_io().await)
+            .await
+            .unwrap();
         let mut iter = MergeIterator::new(vec![reader]).unwrap();
-        iter.seek_to_first().unwrap();
+        iter.seek_to_first().await.unwrap();
 
         // First entry
-        iter.advance().unwrap();
+        iter.advance().await.unwrap();
         // Skip should exhaust iterator (no more keys)
-        iter.skip_to_next_key().unwrap();
+        iter.skip_to_next_key().await.unwrap();
         assert!(!iter.valid());
     }
 
-    #[test]
-    fn test_merge_iterator_skip_to_next_key_short_key() {
+    #[tokio::test]
+    async fn test_merge_iterator_skip_to_next_key_short_key() {
         let tmp = TempDir::new().unwrap();
         let sst_path = tmp.path().join("test.sst");
 
@@ -1071,13 +1098,15 @@ mod tests {
         builder.add(b"b", b"vb").unwrap();
         builder.finish(1, 0).unwrap();
 
-        let reader = SstReaderRef::open(&sst_path, test_io()).unwrap();
+        let reader = SstReaderRef::open(&sst_path, test_io().await)
+            .await
+            .unwrap();
         let mut iter = MergeIterator::new(vec![reader]).unwrap();
-        iter.seek_to_first().unwrap();
+        iter.seek_to_first().await.unwrap();
 
         // Skip to next key with short key should be no-op
-        iter.advance().unwrap();
-        iter.skip_to_next_key().unwrap();
+        iter.advance().await.unwrap();
+        iter.skip_to_next_key().await.unwrap();
 
         // Should still be valid (skipping is based on key prefix comparison)
         // For keys < 8 bytes, there's no timestamp to strip, so nothing is skipped
@@ -1085,8 +1114,8 @@ mod tests {
         assert_eq!(k, b"b");
     }
 
-    #[test]
-    fn test_merge_iterator_multiple_sources_with_overlap() {
+    #[tokio::test]
+    async fn test_merge_iterator_multiple_sources_with_overlap() {
         let tmp = TempDir::new().unwrap();
 
         // SST1: a, b, c
@@ -1105,17 +1134,20 @@ mod tests {
         builder.add(b"d", b"d2").unwrap();
         builder.finish(2, 0).unwrap();
 
-        let reader1 = SstReaderRef::open(&sst1_path, test_io()).unwrap();
-        let reader2 = SstReaderRef::open(&sst2_path, test_io()).unwrap();
+        let io = test_io().await;
+        let reader1 = SstReaderRef::open(&sst1_path, Arc::clone(&io))
+            .await
+            .unwrap();
+        let reader2 = SstReaderRef::open(&sst2_path, io).await.unwrap();
 
         let mut iter = MergeIterator::new(vec![reader1, reader2]).unwrap();
-        iter.seek_to_first().unwrap();
+        iter.seek_to_first().await.unwrap();
 
         let mut entries = Vec::new();
         while iter.valid() {
             let (k, v) = iter.current().unwrap();
             entries.push((k, v));
-            iter.advance().unwrap();
+            iter.advance().await.unwrap();
         }
 
         // Should have all entries, with duplicates
@@ -1127,8 +1159,8 @@ mod tests {
         assert_eq!(entries[2].1, b"b2"); // older second
     }
 
-    #[test]
-    fn test_merge_iterator_current_none_when_invalid() {
+    #[tokio::test]
+    async fn test_merge_iterator_current_none_when_invalid() {
         let tmp = TempDir::new().unwrap();
         let sst_path = tmp.path().join("test.sst");
 
@@ -1136,7 +1168,9 @@ mod tests {
         builder.add(b"key", b"value").unwrap();
         builder.finish(1, 0).unwrap();
 
-        let reader = SstReaderRef::open(&sst_path, test_io()).unwrap();
+        let reader = SstReaderRef::open(&sst_path, test_io().await)
+            .await
+            .unwrap();
         let iter = MergeIterator::new(vec![reader]).unwrap();
 
         // Before seek_to_first, current should be None
@@ -1145,8 +1179,8 @@ mod tests {
 
     // ==================== MergeEntry Ordering Tests ====================
 
-    #[test]
-    fn test_merge_entry_ordering_by_key() {
+    #[tokio::test]
+    async fn test_merge_entry_ordering_by_key() {
         use std::cmp::Ordering;
 
         let entry_a = MergeEntry {
@@ -1166,8 +1200,8 @@ mod tests {
         assert!(entry_a.cmp(&entry_b) == Ordering::Greater);
     }
 
-    #[test]
-    fn test_merge_entry_ordering_by_source_idx() {
+    #[tokio::test]
+    async fn test_merge_entry_ordering_by_source_idx() {
         use std::cmp::Ordering;
 
         let entry_newer = MergeEntry {
@@ -1188,8 +1222,8 @@ mod tests {
 
     // ==================== CompactionPicker Additional Tests ====================
 
-    #[test]
-    fn test_picker_respects_l0_trigger_threshold() {
+    #[tokio::test]
+    async fn test_picker_respects_l0_trigger_threshold() {
         let tmp = TempDir::new().unwrap();
         let config = Arc::new(
             LsmConfig::builder(tmp.path())
@@ -1210,8 +1244,8 @@ mod tests {
         assert!(picker.pick(&version).is_none());
     }
 
-    #[test]
-    fn test_picker_l1_to_l2_compaction() {
+    #[tokio::test]
+    async fn test_picker_l1_to_l2_compaction() {
         let tmp = TempDir::new().unwrap();
         let config = Arc::new(
             LsmConfig::builder(tmp.path())
@@ -1236,10 +1270,10 @@ mod tests {
         assert_eq!(task.output_level, 2);
     }
 
-    #[test]
-    fn test_compaction_key_range_computation() {
+    #[tokio::test]
+    async fn test_compaction_key_range_computation() {
         let tmp = TempDir::new().unwrap();
-        let config = test_config(tmp.path());
+        let config = test_config(tmp.path()).await;
         let executor = CompactionExecutor::new(Arc::clone(&config));
 
         // Create SSTs with specific key ranges
@@ -1276,8 +1310,9 @@ mod tests {
                 &version,
                 &config.sst_dir(),
                 &pre_allocated_ids,
-                test_io(),
+                test_io().await,
             )
+            .await
             .unwrap();
 
         // Output should span full key range
@@ -1289,8 +1324,8 @@ mod tests {
 
     // ==================== CompactionPicker Score Tests ====================
 
-    #[test]
-    fn test_picker_score_l0_by_file_count() {
+    #[tokio::test]
+    async fn test_picker_score_l0_by_file_count() {
         let tmp = TempDir::new().unwrap();
         let config = Arc::new(
             LsmConfig::builder(tmp.path())
@@ -1329,8 +1364,8 @@ mod tests {
         );
     }
 
-    #[test]
-    fn test_picker_score_level_by_bytes() {
+    #[tokio::test]
+    async fn test_picker_score_level_by_bytes() {
         let tmp = TempDir::new().unwrap();
         let config = Arc::new(
             LsmConfig::builder(tmp.path())
@@ -1358,8 +1393,8 @@ mod tests {
         );
     }
 
-    #[test]
-    fn test_picker_highest_score_wins() {
+    #[tokio::test]
+    async fn test_picker_highest_score_wins() {
         let tmp = TempDir::new().unwrap();
         let config = Arc::new(
             LsmConfig::builder(tmp.path())
@@ -1394,8 +1429,8 @@ mod tests {
         assert_eq!(scores[0].0, 2, "L2 should have the highest score");
     }
 
-    #[test]
-    fn test_picker_no_compaction_all_scores_below_one() {
+    #[tokio::test]
+    async fn test_picker_no_compaction_all_scores_below_one() {
         let tmp = TempDir::new().unwrap();
         let config = Arc::new(
             LsmConfig::builder(tmp.path())
@@ -1423,10 +1458,10 @@ mod tests {
         assert!(picker.pick(&version).is_none());
     }
 
-    #[test]
-    fn test_picker_empty_version_scores() {
+    #[tokio::test]
+    async fn test_picker_empty_version_scores() {
         let tmp = TempDir::new().unwrap();
-        let config = test_config(tmp.path());
+        let config = test_config(tmp.path()).await;
         let picker = CompactionPicker::new(config);
 
         let version = Version::new();

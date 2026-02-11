@@ -449,7 +449,7 @@ mod tests {
         for t in 0..4 {
             for i in 0..25 {
                 let key = format!("t{t}_key_{i:04}");
-                let result = engine.get(key.as_bytes()).unwrap();
+                let result = engine.get(key.as_bytes()).await.unwrap();
                 assert!(result.is_some(), "Key {key} should exist");
             }
         }

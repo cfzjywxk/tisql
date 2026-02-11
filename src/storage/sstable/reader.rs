@@ -59,7 +59,7 @@ pub struct SstReader {
 
 impl SstReader {
     /// Open an SST file for reading.
-    pub fn open<P: AsRef<Path>>(path: P, io: Arc<IoService>) -> Result<Self> {
+    pub async fn open<P: AsRef<Path>>(path: P, io: Arc<IoService>) -> Result<Self> {
         let path = path.as_ref().to_path_buf();
         let file = DmaFile::open_read(&path).map_err(|e| {
             TiSqlError::Storage(format!("Failed to open SST {}: {e}", path.display()))
@@ -76,7 +76,7 @@ impl SstReader {
         let footer_offset = file_size - FOOTER_SIZE as u64;
         let footer_data = io
             .read_at(&file, footer_offset, FOOTER_SIZE)
-            .wait()
+            .await
             .map_err(|e| TiSqlError::Storage(format!("Failed to read SST footer: {e}")))?;
         let footer_buf: [u8; FOOTER_SIZE] = footer_data[..FOOTER_SIZE]
             .try_into()
@@ -90,7 +90,7 @@ impl SstReader {
         // Read index block via io_uring
         let index_buf = io
             .read_at(&file, footer.index_offset, footer.index_size as usize)
-            .wait()
+            .await
             .map_err(|e| TiSqlError::Storage(format!("Failed to read SST index: {e}")))?;
         let index = IndexBlock::decode(&index_buf)?;
 
@@ -176,7 +176,7 @@ impl SstReader {
     /// Read a data block by index.
     ///
     /// This is `&self` — no Mutex needed. Uses positional reads via io_uring.
-    pub fn read_block(&self, block_idx: usize) -> Result<DataBlock> {
+    pub async fn read_block(&self, block_idx: usize) -> Result<DataBlock> {
         let entry = self.index.get_entry(block_idx).ok_or_else(|| {
             TiSqlError::Storage(format!(
                 "Block index out of range: {} >= {}",
@@ -186,14 +186,15 @@ impl SstReader {
         })?;
 
         self.read_block_at(entry.block_offset, entry.block_size)
+            .await
     }
 
     /// Read a data block at the given offset and size.
-    fn read_block_at(&self, offset: u64, size: u32) -> Result<DataBlock> {
+    async fn read_block_at(&self, offset: u64, size: u32) -> Result<DataBlock> {
         let buf = self
             .io
             .read_at(&self.file, offset, size as usize)
-            .wait()
+            .await
             .map_err(|e| TiSqlError::Storage(format!("io_uring read_block failed: {e}")))?;
         DataBlock::decode(&buf)
     }
@@ -212,14 +213,14 @@ impl SstReader {
     /// Point lookup for a key.
     ///
     /// Returns the value if found, or None if not found.
-    pub fn get(&self, key: &[u8]) -> Result<Option<Vec<u8>>> {
+    pub async fn get(&self, key: &[u8]) -> Result<Option<Vec<u8>>> {
         if self.footer.num_blocks == 0 {
             return Ok(None);
         }
 
         // Find candidate block
         let block_idx = self.find_block(key);
-        let block = self.read_block(block_idx)?;
+        let block = self.read_block(block_idx).await?;
 
         // Search within block
         Ok(block.get(key).map(|v| v.to_vec()))
@@ -254,19 +255,19 @@ impl SstReaderRef {
     }
 
     /// Open an SST file and create a shared reader.
-    pub fn open<P: AsRef<Path>>(path: P, io: Arc<IoService>) -> Result<Self> {
-        let reader = SstReader::open(path, io)?;
+    pub async fn open<P: AsRef<Path>>(path: P, io: Arc<IoService>) -> Result<Self> {
+        let reader = SstReader::open(path, io).await?;
         Ok(Self::new(reader))
     }
 
     /// Read a data block by index.
-    pub fn read_block(&self, block_idx: usize) -> Result<DataBlock> {
-        self.inner.read_block(block_idx)
+    pub async fn read_block(&self, block_idx: usize) -> Result<DataBlock> {
+        self.inner.read_block(block_idx).await
     }
 
     /// Point lookup for a key.
-    pub fn get(&self, key: &[u8]) -> Result<Option<Vec<u8>>> {
-        self.inner.get(key)
+    pub async fn get(&self, key: &[u8]) -> Result<Option<Vec<u8>>> {
+        self.inner.get(key).await
     }
 
     /// Get the number of blocks.
@@ -326,8 +327,8 @@ mod tests {
     // Basic Reader Tests
     // ------------------------------------------------------------------------
 
-    #[test]
-    fn test_reader_open_empty_sst() {
+    #[tokio::test]
+    async fn test_reader_open_empty_sst() {
         let dir = tempdir().unwrap();
         let path = dir.path().join("empty.sst");
         let io = test_io();
@@ -337,13 +338,13 @@ mod tests {
         builder.finish(1, 0).unwrap();
 
         // Open and verify
-        let reader = SstReader::open(&path, io).unwrap();
+        let reader = SstReader::open(&path, io).await.unwrap();
         assert_eq!(reader.num_blocks(), 0);
         assert_eq!(reader.num_entries(), 0);
     }
 
-    #[test]
-    fn test_reader_open_single_entry() {
+    #[tokio::test]
+    async fn test_reader_open_single_entry() {
         let dir = tempdir().unwrap();
         let path = dir.path().join("single.sst");
         let io = test_io();
@@ -351,13 +352,13 @@ mod tests {
         let key = mvcc_key(b"key", 100);
         create_test_sst(&path, &[(&key, b"value")]).unwrap();
 
-        let reader = SstReader::open(&path, io).unwrap();
+        let reader = SstReader::open(&path, io).await.unwrap();
         assert_eq!(reader.num_entries(), 1);
         assert_eq!(reader.num_blocks(), 1);
     }
 
-    #[test]
-    fn test_reader_open_multiple_entries() {
+    #[tokio::test]
+    async fn test_reader_open_multiple_entries() {
         let dir = tempdir().unwrap();
         let path = dir.path().join("multi.sst");
         let io = test_io();
@@ -372,12 +373,12 @@ mod tests {
 
         create_test_sst(&path, &entries).unwrap();
 
-        let reader = SstReader::open(&path, io).unwrap();
+        let reader = SstReader::open(&path, io).await.unwrap();
         assert_eq!(reader.num_entries(), 100);
     }
 
-    #[test]
-    fn test_reader_open_invalid_file() {
+    #[tokio::test]
+    async fn test_reader_open_invalid_file() {
         let dir = tempdir().unwrap();
         let path = dir.path().join("invalid.sst");
         let io = test_io();
@@ -385,12 +386,12 @@ mod tests {
         // Create a file with invalid content
         std::fs::write(&path, b"invalid data").unwrap();
 
-        let result = SstReader::open(&path, io);
+        let result = SstReader::open(&path, io).await;
         assert!(result.is_err());
     }
 
-    #[test]
-    fn test_reader_open_too_small() {
+    #[tokio::test]
+    async fn test_reader_open_too_small() {
         let dir = tempdir().unwrap();
         let path = dir.path().join("small.sst");
         let io = test_io();
@@ -398,7 +399,7 @@ mod tests {
         // Create a file smaller than footer size
         std::fs::write(&path, b"x").unwrap();
 
-        let result = SstReader::open(&path, io);
+        let result = SstReader::open(&path, io).await;
         assert!(result.is_err());
         assert!(result.unwrap_err().to_string().contains("too small"));
     }
@@ -407,8 +408,8 @@ mod tests {
     // Block Reading Tests
     // ------------------------------------------------------------------------
 
-    #[test]
-    fn test_reader_read_block() {
+    #[tokio::test]
+    async fn test_reader_read_block() {
         let dir = tempdir().unwrap();
         let path = dir.path().join("block.sst");
         let io = test_io();
@@ -427,28 +428,28 @@ mod tests {
 
         create_test_sst(&path, &entry_refs).unwrap();
 
-        let reader = SstReader::open(&path, io).unwrap();
-        let block = reader.read_block(0).unwrap();
+        let reader = SstReader::open(&path, io).await.unwrap();
+        let block = reader.read_block(0).await.unwrap();
 
         // Block should contain the entries
         assert!(block.num_entries() > 0);
     }
 
-    #[test]
-    fn test_reader_read_block_out_of_range() {
+    #[tokio::test]
+    async fn test_reader_read_block_out_of_range() {
         let dir = tempdir().unwrap();
         let path = dir.path().join("range.sst");
         let io = test_io();
 
         create_test_sst(&path, &[(b"key", b"value")]).unwrap();
 
-        let reader = SstReader::open(&path, io).unwrap();
-        let result = reader.read_block(100);
+        let reader = SstReader::open(&path, io).await.unwrap();
+        let result = reader.read_block(100).await;
         assert!(result.is_err());
     }
 
-    #[test]
-    fn test_reader_multiple_blocks() {
+    #[tokio::test]
+    async fn test_reader_multiple_blocks() {
         let dir = tempdir().unwrap();
         let path = dir.path().join("multiblock.sst");
         let io = test_io();
@@ -464,12 +465,12 @@ mod tests {
         }
         builder.finish(1, 0).unwrap();
 
-        let reader = SstReader::open(&path, io).unwrap();
+        let reader = SstReader::open(&path, io).await.unwrap();
         assert!(reader.num_blocks() > 1);
 
         // Read all blocks
         for i in 0..reader.num_blocks() as usize {
-            let block = reader.read_block(i).unwrap();
+            let block = reader.read_block(i).await.unwrap();
             assert!(block.num_entries() > 0);
         }
     }
@@ -478,8 +479,8 @@ mod tests {
     // Point Lookup Tests
     // ------------------------------------------------------------------------
 
-    #[test]
-    fn test_reader_get_found() {
+    #[tokio::test]
+    async fn test_reader_get_found() {
         let dir = tempdir().unwrap();
         let path = dir.path().join("get.sst");
         let io = test_io();
@@ -498,39 +499,39 @@ mod tests {
 
         create_test_sst(&path, &entry_refs).unwrap();
 
-        let reader = SstReader::open(&path, io).unwrap();
+        let reader = SstReader::open(&path, io).await.unwrap();
 
         // Find existing keys
         for i in 0..10 {
             let key = format!("key_{i:05}").into_bytes();
             let expected = format!("value_{i:05}").into_bytes();
-            let result = reader.get(&key).unwrap();
+            let result = reader.get(&key).await.unwrap();
             assert_eq!(result, Some(expected));
         }
     }
 
-    #[test]
-    fn test_reader_get_not_found() {
+    #[tokio::test]
+    async fn test_reader_get_not_found() {
         let dir = tempdir().unwrap();
         let path = dir.path().join("notfound.sst");
         let io = test_io();
 
         create_test_sst(&path, &[(b"key_a", b"value_a"), (b"key_c", b"value_c")]).unwrap();
 
-        let reader = SstReader::open(&path, io).unwrap();
+        let reader = SstReader::open(&path, io).await.unwrap();
 
         // Key before all entries
-        assert_eq!(reader.get(b"key_0").unwrap(), None);
+        assert_eq!(reader.get(b"key_0").await.unwrap(), None);
 
         // Key between entries
-        assert_eq!(reader.get(b"key_b").unwrap(), None);
+        assert_eq!(reader.get(b"key_b").await.unwrap(), None);
 
         // Key after all entries
-        assert_eq!(reader.get(b"key_z").unwrap(), None);
+        assert_eq!(reader.get(b"key_z").await.unwrap(), None);
     }
 
-    #[test]
-    fn test_reader_get_empty_sst() {
+    #[tokio::test]
+    async fn test_reader_get_empty_sst() {
         let dir = tempdir().unwrap();
         let path = dir.path().join("empty_get.sst");
         let io = test_io();
@@ -538,12 +539,12 @@ mod tests {
         let builder = SstBuilder::new(&path, SstBuilderOptions::default()).unwrap();
         builder.finish(1, 0).unwrap();
 
-        let reader = SstReader::open(&path, io).unwrap();
-        assert_eq!(reader.get(b"any_key").unwrap(), None);
+        let reader = SstReader::open(&path, io).await.unwrap();
+        assert_eq!(reader.get(b"any_key").await.unwrap(), None);
     }
 
-    #[test]
-    fn test_reader_get_multiblock() {
+    #[tokio::test]
+    async fn test_reader_get_multiblock() {
         let dir = tempdir().unwrap();
         let path = dir.path().join("get_multiblock.sst");
         let io = test_io();
@@ -559,13 +560,13 @@ mod tests {
         }
         builder.finish(1, 0).unwrap();
 
-        let reader = SstReader::open(&path, io).unwrap();
+        let reader = SstReader::open(&path, io).await.unwrap();
 
         // Find keys across different blocks
         for i in [0, 25, 50, 75, 99] {
             let key = format!("key_{i:05}").into_bytes();
             let expected = format!("value_{i:05}").into_bytes();
-            let result = reader.get(&key).unwrap();
+            let result = reader.get(&key).await.unwrap();
             assert_eq!(result, Some(expected), "Failed for key {i}");
         }
     }
@@ -574,8 +575,8 @@ mod tests {
     // Find Block Tests
     // ------------------------------------------------------------------------
 
-    #[test]
-    fn test_reader_find_block() {
+    #[tokio::test]
+    async fn test_reader_find_block() {
         let dir = tempdir().unwrap();
         let path = dir.path().join("find.sst");
         let io = test_io();
@@ -591,7 +592,7 @@ mod tests {
         }
         builder.finish(1, 0).unwrap();
 
-        let reader = SstReader::open(&path, io).unwrap();
+        let reader = SstReader::open(&path, io).await.unwrap();
 
         // First key should be in first block
         let idx = reader.find_block(b"key_00000");
@@ -606,41 +607,41 @@ mod tests {
     // SstReaderRef Tests
     // ------------------------------------------------------------------------
 
-    #[test]
-    fn test_reader_ref_basic() {
+    #[tokio::test]
+    async fn test_reader_ref_basic() {
         let dir = tempdir().unwrap();
         let path = dir.path().join("ref.sst");
         let io = test_io();
 
         create_test_sst(&path, &[(b"key", b"value")]).unwrap();
 
-        let reader = SstReaderRef::open(&path, io).unwrap();
+        let reader = SstReaderRef::open(&path, io).await.unwrap();
         assert_eq!(reader.num_entries().unwrap(), 1);
-        assert_eq!(reader.get(b"key").unwrap(), Some(b"value".to_vec()));
+        assert_eq!(reader.get(b"key").await.unwrap(), Some(b"value".to_vec()));
     }
 
-    #[test]
-    fn test_reader_ref_clone() {
+    #[tokio::test]
+    async fn test_reader_ref_clone() {
         let dir = tempdir().unwrap();
         let path = dir.path().join("clone.sst");
         let io = test_io();
 
         create_test_sst(&path, &[(b"key", b"value")]).unwrap();
 
-        let reader1 = SstReaderRef::open(&path, Arc::clone(&io)).unwrap();
+        let reader1 = SstReaderRef::open(&path, Arc::clone(&io)).await.unwrap();
         let reader2 = reader1.clone();
 
         // Both should work
-        assert_eq!(reader1.get(b"key").unwrap(), Some(b"value".to_vec()));
-        assert_eq!(reader2.get(b"key").unwrap(), Some(b"value".to_vec()));
+        assert_eq!(reader1.get(b"key").await.unwrap(), Some(b"value".to_vec()));
+        assert_eq!(reader2.get(b"key").await.unwrap(), Some(b"value".to_vec()));
     }
 
     // ------------------------------------------------------------------------
     // Timestamp Tests
     // ------------------------------------------------------------------------
 
-    #[test]
-    fn test_reader_timestamp_tracking() {
+    #[tokio::test]
+    async fn test_reader_timestamp_tracking() {
         let dir = tempdir().unwrap();
         let path = dir.path().join("ts.sst");
         let io = test_io();
@@ -654,7 +655,7 @@ mod tests {
 
         builder.finish(1, 0).unwrap();
 
-        let reader = SstReader::open(&path, io).unwrap();
+        let reader = SstReader::open(&path, io).await.unwrap();
         assert_eq!(reader.min_ts(), 50);
         assert_eq!(reader.max_ts(), 200);
     }
@@ -663,8 +664,8 @@ mod tests {
     // Integration Tests
     // ------------------------------------------------------------------------
 
-    #[test]
-    fn test_reader_roundtrip() {
+    #[tokio::test]
+    async fn test_reader_roundtrip() {
         let dir = tempdir().unwrap();
         let path = dir.path().join("roundtrip.sst");
         let io = test_io();
@@ -686,17 +687,17 @@ mod tests {
         builder.finish(1, 0).unwrap();
 
         // Read and verify
-        let reader = SstReader::open(&path, io).unwrap();
+        let reader = SstReader::open(&path, io).await.unwrap();
         assert_eq!(reader.num_entries(), 50);
 
         for (key, expected_value) in &entries {
-            let result = reader.get(key).unwrap();
+            let result = reader.get(key).await.unwrap();
             assert_eq!(result.as_ref(), Some(expected_value));
         }
     }
 
-    #[test]
-    fn test_reader_large_values() {
+    #[tokio::test]
+    async fn test_reader_large_values() {
         let dir = tempdir().unwrap();
         let path = dir.path().join("large.sst");
         let io = test_io();
@@ -708,8 +709,8 @@ mod tests {
         builder.add(&key, &value).unwrap();
         builder.finish(1, 0).unwrap();
 
-        let reader = SstReader::open(&path, io).unwrap();
-        let result = reader.get(&key).unwrap();
+        let reader = SstReader::open(&path, io).await.unwrap();
+        let result = reader.get(&key).await.unwrap();
         assert_eq!(result, Some(value));
     }
 
@@ -717,8 +718,8 @@ mod tests {
     // Corruption Detection Tests
     // ------------------------------------------------------------------------
 
-    #[test]
-    fn test_reader_corrupted_index_offset_too_large() {
+    #[tokio::test]
+    async fn test_reader_corrupted_index_offset_too_large() {
         use crate::storage::sstable::builder::{FOOTER_SIZE, SST_MAGIC};
 
         let dir = tempdir().unwrap();
@@ -743,14 +744,14 @@ mod tests {
 
         std::fs::write(&path, &data).unwrap();
 
-        let result = SstReader::open(&path, io);
+        let result = SstReader::open(&path, io).await;
         assert!(result.is_err());
         let err = result.unwrap_err().to_string();
         assert!(err.contains("index_offset") || err.contains("corrupted"));
     }
 
-    #[test]
-    fn test_reader_corrupted_index_size_overflow() {
+    #[tokio::test]
+    async fn test_reader_corrupted_index_size_overflow() {
         use crate::storage::sstable::builder::{FOOTER_SIZE, SST_MAGIC};
 
         let dir = tempdir().unwrap();
@@ -780,14 +781,14 @@ mod tests {
 
         std::fs::write(&path, &data).unwrap();
 
-        let result = SstReader::open(&path, io);
+        let result = SstReader::open(&path, io).await;
         assert!(result.is_err());
         let err = result.unwrap_err().to_string();
         assert!(err.contains("overflow") || err.contains("corrupted"));
     }
 
-    #[test]
-    fn test_reader_corrupted_index_end_exceeds_data() {
+    #[tokio::test]
+    async fn test_reader_corrupted_index_end_exceeds_data() {
         use crate::storage::sstable::builder::{FOOTER_SIZE, SST_MAGIC};
 
         let dir = tempdir().unwrap();
@@ -816,14 +817,14 @@ mod tests {
 
         std::fs::write(&path, &data).unwrap();
 
-        let result = SstReader::open(&path, io);
+        let result = SstReader::open(&path, io).await;
         assert!(result.is_err());
         let err = result.unwrap_err().to_string();
         assert!(err.contains("exceeds") || err.contains("corrupted"));
     }
 
-    #[test]
-    fn test_reader_corrupted_index_size_exceeds_max() {
+    #[tokio::test]
+    async fn test_reader_corrupted_index_size_exceeds_max() {
         use crate::storage::sstable::builder::{FOOTER_SIZE, SST_MAGIC};
 
         let dir = tempdir().unwrap();
@@ -849,7 +850,7 @@ mod tests {
 
         std::fs::write(&path, &data).unwrap();
 
-        let result = SstReader::open(&path, io);
+        let result = SstReader::open(&path, io).await;
         assert!(result.is_err());
         let err = result.unwrap_err().to_string();
         assert!(err.contains("exceeds maximum") || err.contains("index_size"));
@@ -858,8 +859,8 @@ mod tests {
         std::fs::remove_file(&path).ok();
     }
 
-    #[test]
-    fn test_reader_file_size_getter() {
+    #[tokio::test]
+    async fn test_reader_file_size_getter() {
         let dir = tempdir().unwrap();
         let path = dir.path().join("size_test.sst");
         let io = test_io();
@@ -867,13 +868,13 @@ mod tests {
         let key = mvcc_key(b"key", 100);
         create_test_sst(&path, &[(&key, b"value")]).unwrap();
 
-        let reader = SstReader::open(&path, io).unwrap();
+        let reader = SstReader::open(&path, io).await.unwrap();
         assert!(reader.file_size() > 0);
         assert!(reader.file_size() >= FOOTER_SIZE as u64);
     }
 
-    #[test]
-    fn test_reader_path_getter() {
+    #[tokio::test]
+    async fn test_reader_path_getter() {
         let dir = tempdir().unwrap();
         let path = dir.path().join("path_test.sst");
         let io = test_io();
@@ -881,12 +882,12 @@ mod tests {
         let key = mvcc_key(b"key", 100);
         create_test_sst(&path, &[(&key, b"value")]).unwrap();
 
-        let reader = SstReader::open(&path, io).unwrap();
+        let reader = SstReader::open(&path, io).await.unwrap();
         assert_eq!(reader.path(), path);
     }
 
-    #[test]
-    fn test_reader_footer_and_index_getters() {
+    #[tokio::test]
+    async fn test_reader_footer_and_index_getters() {
         let dir = tempdir().unwrap();
         let path = dir.path().join("getters.sst");
         let io = test_io();
@@ -894,7 +895,7 @@ mod tests {
         let key = mvcc_key(b"key", 100);
         create_test_sst(&path, &[(&key, b"value")]).unwrap();
 
-        let reader = SstReader::open(&path, io).unwrap();
+        let reader = SstReader::open(&path, io).await.unwrap();
 
         // Test footer getter
         let footer = reader.footer();
@@ -905,8 +906,8 @@ mod tests {
         assert!(!index.entries().is_empty() || reader.num_blocks() == 0);
     }
 
-    #[test]
-    fn test_reader_min_max_ts() {
+    #[tokio::test]
+    async fn test_reader_min_max_ts() {
         let dir = tempdir().unwrap();
         let path = dir.path().join("ts_test.sst");
         let io = test_io();
@@ -917,7 +918,7 @@ mod tests {
         builder.add(&mvcc_key(b"key2", 200), b"v2").unwrap();
         builder.finish(1, 0).unwrap();
 
-        let reader = SstReader::open(&path, io).unwrap();
+        let reader = SstReader::open(&path, io).await.unwrap();
         // min_ts and max_ts depend on the MVCC key encoding
         assert!(reader.min_ts() <= reader.max_ts());
     }

@@ -244,7 +244,7 @@ fn run_test(config: &Config, test_case: &TestCase) -> TestResult {
         output.push('\n');
 
         // Execute
-        match db.handle_mp_query(&stmt.sql) {
+        match tisql::io::block_on_sync(db.handle_mp_query(&stmt.sql)) {
             Ok(result) => {
                 if stmt.expectations.expected_error.is_some() {
                     return TestResult {

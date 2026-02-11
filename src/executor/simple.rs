@@ -46,7 +46,7 @@ impl Default for SimpleExecutor {
 }
 
 impl Executor for SimpleExecutor {
-    fn execute<T: TxnService, C: Catalog>(
+    async fn execute<T: TxnService, C: Catalog>(
         &self,
         plan: LogicalPlan,
         txn_service: &T,
@@ -54,13 +54,13 @@ impl Executor for SimpleExecutor {
     ) -> Result<ExecutionResult> {
         // Determine if this is a read or write operation
         if plan.is_write() {
-            self.execute_write(plan, txn_service, catalog)
+            self.execute_write(plan, txn_service, catalog).await
         } else {
-            self.execute_read(plan, txn_service, catalog)
+            self.execute_read(plan, txn_service, catalog).await
         }
     }
 
-    fn execute_with_session<T: TxnService, C: Catalog>(
+    async fn execute_with_session<T: TxnService, C: Catalog>(
         &self,
         plan: LogicalPlan,
         txn_service: &T,
@@ -82,18 +82,19 @@ impl Executor for SimpleExecutor {
             // Execute within the existing transaction
             if plan.is_write() {
                 self.execute_write_in_txn(plan, txn_service, catalog, session)
+                    .await
             } else {
                 // For reads in explicit transaction, use the session's transaction context
                 let ctx = session.current_txn().unwrap();
-                self.execute_with_ctx(plan, ctx, txn_service, catalog)
+                self.execute_with_ctx(plan, ctx, txn_service, catalog).await
             }
         } else {
             // No active transaction - use auto-commit mode (implicit transactions)
-            self.execute(plan, txn_service, catalog)
+            self.execute(plan, txn_service, catalog).await
         }
     }
 
-    fn execute_unified<T: TxnService, C: Catalog>(
+    async fn execute_unified<T: TxnService, C: Catalog>(
         &self,
         plan: LogicalPlan,
         _exec_ctx: &ExecutionCtx,
@@ -131,18 +132,21 @@ impl Executor for SimpleExecutor {
                     }
 
                     // Execute write within the transaction (no auto-commit)
-                    let result =
-                        self.execute_write_with_ctx(plan, &mut ctx, txn_service, catalog)?;
+                    let result = self
+                        .execute_write_with_ctx(plan, &mut ctx, txn_service, catalog)
+                        .await?;
                     Ok((result, Some(ctx)))
                 } else {
                     // Execute read using the transaction's snapshot
-                    let result = self.execute_with_ctx(plan, &ctx, txn_service, catalog)?;
+                    let result = self
+                        .execute_with_ctx(plan, &ctx, txn_service, catalog)
+                        .await?;
                     Ok((result, Some(ctx)))
                 }
             }
             None => {
                 // No explicit transaction - use auto-commit mode
-                let result = self.execute(plan, txn_service, catalog)?;
+                let result = self.execute(plan, txn_service, catalog).await?;
                 Ok((result, None))
             }
         }
@@ -209,7 +213,7 @@ impl SimpleExecutor {
     ///
     /// Unlike `execute_write`, this method does NOT commit after the operation.
     /// The transaction remains open for more statements until COMMIT or ROLLBACK.
-    fn execute_write_in_txn<T: TxnService, C: Catalog>(
+    async fn execute_write_in_txn<T: TxnService, C: Catalog>(
         &self,
         plan: LogicalPlan,
         txn_service: &T,
@@ -232,6 +236,7 @@ impl SimpleExecutor {
 
         // Execute the write operation (buffered in transaction, not committed)
         self.execute_write_with_ctx(plan, ctx, txn_service, catalog)
+            .await
     }
 
     // ========================================================================
@@ -242,7 +247,7 @@ impl SimpleExecutor {
     ///
     /// Creates a transaction with read_only=true, which allocates start_ts
     /// from TSO for consistent reads.
-    fn execute_read<T: TxnService, C: Catalog>(
+    async fn execute_read<T: TxnService, C: Catalog>(
         &self,
         plan: LogicalPlan,
         txn_service: &T,
@@ -260,13 +265,14 @@ impl SimpleExecutor {
 
         // Execute the read plan using the transaction context
         self.execute_with_ctx(plan, &ctx, txn_service, catalog)
+            .await
     }
 
     /// Execute a write plan using a read-write transaction.
     ///
     /// Creates a transaction, executes writes (buffered), then commits.
     /// Checks schema version at commit to detect concurrent DDL changes.
-    fn execute_write<T: TxnService, C: Catalog>(
+    async fn execute_write<T: TxnService, C: Catalog>(
         &self,
         plan: LogicalPlan,
         txn_service: &T,
@@ -287,7 +293,10 @@ impl SimpleExecutor {
         let mut ctx = txn_service.begin(false)?;
 
         // Execute the write plan and get the result
-        let result = match self.execute_write_with_ctx(plan, &mut ctx, txn_service, catalog) {
+        let result = match self
+            .execute_write_with_ctx(plan, &mut ctx, txn_service, catalog)
+            .await
+        {
             Ok(r) => r,
             Err(e) => {
                 let _ = txn_service.rollback(ctx);
@@ -360,259 +369,274 @@ impl SimpleExecutor {
 
     /// Execute read operations using a transaction context.
     #[allow(clippy::only_used_in_recursion)]
-    fn execute_with_ctx<T: TxnService, C: Catalog>(
-        &self,
+    fn execute_with_ctx<'a, T: TxnService, C: Catalog>(
+        &'a self,
         plan: LogicalPlan,
-        ctx: &TxnCtx,
-        txn_service: &T,
-        catalog: &C,
-    ) -> Result<ExecutionResult> {
-        match plan {
-            LogicalPlan::Values { rows, schema } => {
-                let result_rows = rows
-                    .into_iter()
-                    .map(|row| {
-                        let values = row
-                            .into_iter()
-                            .map(|expr| self.eval_expr(&expr, &Row::new(vec![])))
-                            .collect::<Result<Vec<_>>>()?;
-                        Ok(Row::new(values))
-                    })
-                    .collect::<Result<Vec<_>>>()?;
-                Ok(ExecutionResult::Rows {
-                    schema,
-                    rows: result_rows,
-                })
-            }
-
-            LogicalPlan::Project { input, exprs } => {
-                let input_result = self.execute_with_ctx(*input, ctx, txn_service, catalog)?;
-
-                match input_result {
-                    ExecutionResult::Rows { rows, .. } => {
-                        let schema = Schema::new(
-                            exprs
-                                .iter()
-                                .map(|(expr, alias)| {
-                                    ColumnInfo::new(alias.clone(), expr.data_type(), true)
-                                })
-                                .collect(),
-                        );
-
-                        let result_rows = rows
-                            .iter()
-                            .map(|row| {
-                                let values = exprs
-                                    .iter()
-                                    .map(|(expr, _)| self.eval_expr(expr, row))
-                                    .collect::<Result<Vec<_>>>()?;
-                                Ok(Row::new(values))
-                            })
-                            .collect::<Result<Vec<_>>>()?;
-
-                        Ok(ExecutionResult::Rows {
-                            schema,
-                            rows: result_rows,
-                        })
-                    }
-                    other => Ok(other),
-                }
-            }
-
-            LogicalPlan::Scan {
-                table,
-                filter,
-                projection,
-            } => {
-                // Build key range for this table
-                let table_id = table.id();
-                let start_key = encode_key(table_id, &[]);
-                let end_key = encode_key(table_id + 1, &[]);
-
-                // Extract column IDs and data types for decoding
-                let col_ids: Vec<ColumnId> = table.columns().iter().map(|c| c.id()).collect();
-                let data_types: Vec<DataType> = table
-                    .columns()
-                    .iter()
-                    .map(|c| c.data_type().clone())
-                    .collect();
-
-                // Scan using transaction service (reads at start_ts)
-                // Uses zero-copy iterator - allocation only when decoding rows
-                let mut iter = txn_service.scan_iter(ctx, start_key..end_key)?;
-
-                let mut rows = Vec::new();
-                iter.advance()?; // Position on first entry
-                while iter.valid() {
-                    // Zero-copy: value is a reference to underlying storage
-                    let value = iter.value();
-                    let values = decode_row_to_values(value, &col_ids, &data_types)?;
-                    let row = Row::new(values);
-
-                    // Apply filter
-                    if let Some(ref filter_expr) = filter {
-                        let result = self.eval_expr(filter_expr, &row)?;
-                        if !self.value_to_bool(&result)? {
-                            iter.advance()?;
-                            continue;
-                        }
-                    }
-
-                    // Apply projection
-                    let projected_row = if let Some(ref indices) = projection {
-                        let values = indices
-                            .iter()
-                            .map(|&i| row.get(i).cloned().unwrap_or(Value::Null))
-                            .collect();
-                        Row::new(values)
-                    } else {
-                        row
-                    };
-
-                    rows.push(projected_row);
-                    iter.advance()?;
-                }
-
-                let schema = Schema::new(
-                    table
-                        .columns()
-                        .iter()
-                        .map(|c| {
-                            ColumnInfo::new(
-                                c.name().to_string(),
-                                c.data_type().clone(),
-                                c.nullable(),
-                            )
-                        })
-                        .collect(),
-                );
-
-                Ok(ExecutionResult::Rows { schema, rows })
-            }
-
-            LogicalPlan::Filter { input, predicate } => {
-                let input_result = self.execute_with_ctx(*input, ctx, txn_service, catalog)?;
-
-                match input_result {
-                    ExecutionResult::Rows { schema, rows } => {
-                        let filtered_rows = rows
-                            .into_iter()
-                            .filter(|row| {
-                                self.eval_expr(&predicate, row)
-                                    .and_then(|v| self.value_to_bool(&v))
-                                    .unwrap_or(false)
-                            })
-                            .collect();
-
-                        Ok(ExecutionResult::Rows {
-                            schema,
-                            rows: filtered_rows,
-                        })
-                    }
-                    other => Ok(other),
-                }
-            }
-
-            LogicalPlan::Limit {
-                input,
-                limit,
-                offset,
-            } => {
-                let input_result = self.execute_with_ctx(*input, ctx, txn_service, catalog)?;
-
-                match input_result {
-                    ExecutionResult::Rows { schema, rows } => {
-                        let limited_rows: Vec<_> = rows
-                            .into_iter()
-                            .skip(offset)
-                            .take(limit.unwrap_or(usize::MAX))
-                            .collect();
-
-                        Ok(ExecutionResult::Rows {
-                            schema,
-                            rows: limited_rows,
-                        })
-                    }
-                    other => Ok(other),
-                }
-            }
-
-            LogicalPlan::Sort { input, order_by } => {
-                let input_result = self.execute_with_ctx(*input, ctx, txn_service, catalog)?;
-
-                match input_result {
-                    ExecutionResult::Rows { schema, mut rows } => {
-                        rows.sort_by(|a, b| {
-                            for order in &order_by {
-                                let val_a = self.eval_expr(&order.expr, a).unwrap_or(Value::Null);
-                                let val_b = self.eval_expr(&order.expr, b).unwrap_or(Value::Null);
-                                let cmp = self.compare_values(&val_a, &val_b);
-                                let cmp = if order.asc { cmp } else { cmp.reverse() };
-                                if cmp != std::cmp::Ordering::Equal {
-                                    return cmp;
-                                }
-                            }
-                            std::cmp::Ordering::Equal
-                        });
-
-                        Ok(ExecutionResult::Rows { schema, rows })
-                    }
-                    other => Ok(other),
-                }
-            }
-
-            LogicalPlan::Aggregate {
-                input,
-                group_by,
-                agg_exprs,
-            } => {
-                let input_result = self.execute_with_ctx(*input, ctx, txn_service, catalog)?;
-
-                match input_result {
-                    ExecutionResult::Rows { rows, .. } => {
-                        if group_by.is_empty() && agg_exprs.is_empty() {
-                            return Ok(ExecutionResult::Rows {
-                                schema: Schema::new(vec![]),
-                                rows,
-                            });
-                        }
-
-                        if group_by.is_empty() {
-                            let agg_values = agg_exprs
-                                .iter()
-                                .map(|(func, arg, _)| self.compute_aggregate(func, arg, &rows))
+        ctx: &'a TxnCtx,
+        txn_service: &'a T,
+        catalog: &'a C,
+    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<ExecutionResult>> + Send + 'a>>
+    {
+        Box::pin(async move {
+            match plan {
+                LogicalPlan::Values { rows, schema } => {
+                    let result_rows = rows
+                        .into_iter()
+                        .map(|row| {
+                            let values = row
+                                .into_iter()
+                                .map(|expr| self.eval_expr(&expr, &Row::new(vec![])))
                                 .collect::<Result<Vec<_>>>()?;
+                            Ok(Row::new(values))
+                        })
+                        .collect::<Result<Vec<_>>>()?;
+                    Ok(ExecutionResult::Rows {
+                        schema,
+                        rows: result_rows,
+                    })
+                }
 
+                LogicalPlan::Project { input, exprs } => {
+                    let input_result = self
+                        .execute_with_ctx(*input, ctx, txn_service, catalog)
+                        .await?;
+
+                    match input_result {
+                        ExecutionResult::Rows { rows, .. } => {
                             let schema = Schema::new(
-                                agg_exprs
+                                exprs
                                     .iter()
-                                    .map(|(_, _, alias)| {
-                                        ColumnInfo::new(alias.clone(), DataType::Double, true)
+                                    .map(|(expr, alias)| {
+                                        ColumnInfo::new(alias.clone(), expr.data_type(), true)
                                     })
                                     .collect(),
                             );
 
-                            return Ok(ExecutionResult::Rows {
+                            let result_rows = rows
+                                .iter()
+                                .map(|row| {
+                                    let values = exprs
+                                        .iter()
+                                        .map(|(expr, _)| self.eval_expr(expr, row))
+                                        .collect::<Result<Vec<_>>>()?;
+                                    Ok(Row::new(values))
+                                })
+                                .collect::<Result<Vec<_>>>()?;
+
+                            Ok(ExecutionResult::Rows {
                                 schema,
-                                rows: vec![Row::new(agg_values)],
-                            });
+                                rows: result_rows,
+                            })
+                        }
+                        other => Ok(other),
+                    }
+                }
+
+                LogicalPlan::Scan {
+                    table,
+                    filter,
+                    projection,
+                } => {
+                    // Build key range for this table
+                    let table_id = table.id();
+                    let start_key = encode_key(table_id, &[]);
+                    let end_key = encode_key(table_id + 1, &[]);
+
+                    // Extract column IDs and data types for decoding
+                    let col_ids: Vec<ColumnId> = table.columns().iter().map(|c| c.id()).collect();
+                    let data_types: Vec<DataType> = table
+                        .columns()
+                        .iter()
+                        .map(|c| c.data_type().clone())
+                        .collect();
+
+                    // Scan using transaction service (reads at start_ts)
+                    // Uses zero-copy iterator - allocation only when decoding rows
+                    let mut iter = txn_service.scan_iter(ctx, start_key..end_key)?;
+
+                    let mut rows = Vec::new();
+                    iter.advance().await?; // Position on first entry
+                    while iter.valid() {
+                        // Zero-copy: value is a reference to underlying storage
+                        let value = iter.value();
+                        let values = decode_row_to_values(value, &col_ids, &data_types)?;
+                        let row = Row::new(values);
+
+                        // Apply filter
+                        if let Some(ref filter_expr) = filter {
+                            let result = self.eval_expr(filter_expr, &row)?;
+                            if !self.value_to_bool(&result)? {
+                                iter.advance().await?;
+                                continue;
+                            }
                         }
 
-                        Err(TiSqlError::Execution("GROUP BY not yet implemented".into()))
-                    }
-                    other => Ok(other),
-                }
-            }
+                        // Apply projection
+                        let projected_row = if let Some(ref indices) = projection {
+                            let values = indices
+                                .iter()
+                                .map(|&i| row.get(i).cloned().unwrap_or(Value::Null))
+                                .collect();
+                            Row::new(values)
+                        } else {
+                            row
+                        };
 
-            _ => Err(TiSqlError::Execution(format!(
-                "Unsupported read plan: {:?}",
-                std::mem::discriminant(&plan)
-            ))),
-        }
+                        rows.push(projected_row);
+                        iter.advance().await?;
+                    }
+
+                    let schema = Schema::new(
+                        table
+                            .columns()
+                            .iter()
+                            .map(|c| {
+                                ColumnInfo::new(
+                                    c.name().to_string(),
+                                    c.data_type().clone(),
+                                    c.nullable(),
+                                )
+                            })
+                            .collect(),
+                    );
+
+                    Ok(ExecutionResult::Rows { schema, rows })
+                }
+
+                LogicalPlan::Filter { input, predicate } => {
+                    let input_result = self
+                        .execute_with_ctx(*input, ctx, txn_service, catalog)
+                        .await?;
+
+                    match input_result {
+                        ExecutionResult::Rows { schema, rows } => {
+                            let filtered_rows = rows
+                                .into_iter()
+                                .filter(|row| {
+                                    self.eval_expr(&predicate, row)
+                                        .and_then(|v| self.value_to_bool(&v))
+                                        .unwrap_or(false)
+                                })
+                                .collect();
+
+                            Ok(ExecutionResult::Rows {
+                                schema,
+                                rows: filtered_rows,
+                            })
+                        }
+                        other => Ok(other),
+                    }
+                }
+
+                LogicalPlan::Limit {
+                    input,
+                    limit,
+                    offset,
+                } => {
+                    let input_result = self
+                        .execute_with_ctx(*input, ctx, txn_service, catalog)
+                        .await?;
+
+                    match input_result {
+                        ExecutionResult::Rows { schema, rows } => {
+                            let limited_rows: Vec<_> = rows
+                                .into_iter()
+                                .skip(offset)
+                                .take(limit.unwrap_or(usize::MAX))
+                                .collect();
+
+                            Ok(ExecutionResult::Rows {
+                                schema,
+                                rows: limited_rows,
+                            })
+                        }
+                        other => Ok(other),
+                    }
+                }
+
+                LogicalPlan::Sort { input, order_by } => {
+                    let input_result = self
+                        .execute_with_ctx(*input, ctx, txn_service, catalog)
+                        .await?;
+
+                    match input_result {
+                        ExecutionResult::Rows { schema, mut rows } => {
+                            rows.sort_by(|a, b| {
+                                for order in &order_by {
+                                    let val_a =
+                                        self.eval_expr(&order.expr, a).unwrap_or(Value::Null);
+                                    let val_b =
+                                        self.eval_expr(&order.expr, b).unwrap_or(Value::Null);
+                                    let cmp = self.compare_values(&val_a, &val_b);
+                                    let cmp = if order.asc { cmp } else { cmp.reverse() };
+                                    if cmp != std::cmp::Ordering::Equal {
+                                        return cmp;
+                                    }
+                                }
+                                std::cmp::Ordering::Equal
+                            });
+
+                            Ok(ExecutionResult::Rows { schema, rows })
+                        }
+                        other => Ok(other),
+                    }
+                }
+
+                LogicalPlan::Aggregate {
+                    input,
+                    group_by,
+                    agg_exprs,
+                } => {
+                    let input_result = self
+                        .execute_with_ctx(*input, ctx, txn_service, catalog)
+                        .await?;
+
+                    match input_result {
+                        ExecutionResult::Rows { rows, .. } => {
+                            if group_by.is_empty() && agg_exprs.is_empty() {
+                                return Ok(ExecutionResult::Rows {
+                                    schema: Schema::new(vec![]),
+                                    rows,
+                                });
+                            }
+
+                            if group_by.is_empty() {
+                                let agg_values = agg_exprs
+                                    .iter()
+                                    .map(|(func, arg, _)| self.compute_aggregate(func, arg, &rows))
+                                    .collect::<Result<Vec<_>>>()?;
+
+                                let schema = Schema::new(
+                                    agg_exprs
+                                        .iter()
+                                        .map(|(_, _, alias)| {
+                                            ColumnInfo::new(alias.clone(), DataType::Double, true)
+                                        })
+                                        .collect(),
+                                );
+
+                                return Ok(ExecutionResult::Rows {
+                                    schema,
+                                    rows: vec![Row::new(agg_values)],
+                                });
+                            }
+
+                            Err(TiSqlError::Execution("GROUP BY not yet implemented".into()))
+                        }
+                        other => Ok(other),
+                    }
+                }
+
+                _ => Err(TiSqlError::Execution(format!(
+                    "Unsupported read plan: {:?}",
+                    std::mem::discriminant(&plan)
+                ))),
+            }
+        }) // Box::pin(async move { ... })
     }
 
     /// Execute write operations using a transaction context.
-    fn execute_write_with_ctx<T: TxnService, C: Catalog>(
+    async fn execute_write_with_ctx<T: TxnService, C: Catalog>(
         &self,
         plan: LogicalPlan,
         ctx: &mut TxnCtx,
@@ -720,7 +744,7 @@ impl SimpleExecutor {
                 // Use zero-copy streaming iteration - process one row at a time
                 let mut iter = txn_service.scan_iter(ctx, start_key..end_key)?;
 
-                iter.advance()?; // Position on first entry
+                iter.advance().await?; // Position on first entry
                 while iter.valid() {
                     // Zero-copy: references to underlying storage
                     let key = iter.user_key();
@@ -732,7 +756,7 @@ impl SimpleExecutor {
                     if let Some(ref filter_expr) = filter {
                         let result = self.eval_expr(filter_expr, &row)?;
                         if !self.value_to_bool(&result)? {
-                            iter.advance()?;
+                            iter.advance().await?;
                             continue;
                         }
                     }
@@ -740,7 +764,7 @@ impl SimpleExecutor {
                     // Buffer delete in transaction (need to clone key for ownership)
                     txn_service.delete(ctx, key.to_vec())?;
                     count += 1;
-                    iter.advance()?;
+                    iter.advance().await?;
                 }
 
                 Ok(ExecutionResult::Affected { count })
@@ -769,7 +793,7 @@ impl SimpleExecutor {
                 // Use zero-copy streaming iteration - process one row at a time
                 let mut iter = txn_service.scan_iter(ctx, start_key..end_key)?;
 
-                iter.advance()?; // Position on first entry
+                iter.advance().await?; // Position on first entry
                 while iter.valid() {
                     // Zero-copy: references to underlying storage
                     let key_ref = iter.user_key();
@@ -781,7 +805,7 @@ impl SimpleExecutor {
                     if let Some(ref filter_expr) = filter {
                         let result = self.eval_expr(filter_expr, &row)?;
                         if !self.value_to_bool(&result)? {
-                            iter.advance()?;
+                            iter.advance().await?;
                             continue;
                         }
                     }
@@ -831,7 +855,7 @@ impl SimpleExecutor {
                     let new_value = encode_row(&col_ids, row.values());
                     txn_service.put(ctx, new_key, new_value)?;
                     count += 1;
-                    iter.advance()?;
+                    iter.advance().await?;
                 }
 
                 Ok(ExecutionResult::Affected { count })

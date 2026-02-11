@@ -53,7 +53,7 @@ fn get_at_for_test(engine: &LsmEngine, key: &[u8], ts: Timestamp) -> Option<RawV
 
     // Use streaming scan_iter() - process one entry at a time
     let mut iter = engine.scan_iter(range, 0).unwrap();
-    iter.advance().unwrap(); // Position on first entry
+    tisql::io::block_on_sync(iter.advance()).unwrap(); // Position on first entry
 
     while iter.valid() {
         let decoded_key = iter.user_key();
@@ -65,7 +65,7 @@ fn get_at_for_test(engine: &LsmEngine, key: &[u8], ts: Timestamp) -> Option<RawV
             }
             return Some(value);
         }
-        iter.advance().unwrap();
+        tisql::io::block_on_sync(iter.advance()).unwrap();
     }
     None
 }
@@ -883,7 +883,7 @@ fn test_scan_across_frozen_and_active_memtables() {
     let range = start..end;
 
     let mut iter = engine.scan_iter(range, 0).unwrap();
-    iter.advance().unwrap();
+    tisql::io::block_on_sync(iter.advance()).unwrap();
 
     let mut results: Vec<(Vec<u8>, Vec<u8>)> = Vec::new();
     let mut prev_key: Option<Vec<u8>> = None;
@@ -903,7 +903,7 @@ fn test_scan_across_frozen_and_active_memtables() {
         }
         prev_key = Some(key.clone());
         results.push((key, value));
-        iter.advance().unwrap();
+        tisql::io::block_on_sync(iter.advance()).unwrap();
     }
 
     // Should have 20 entries total (10 from frozen + 10 from active)
@@ -1029,7 +1029,7 @@ fn test_scan_with_concurrent_writes_across_frozen_active() {
 
                 match engine.scan_iter(range, 0) {
                     Ok(mut iter) => {
-                        if iter.advance().is_err() {
+                        if tisql::io::block_on_sync(iter.advance()).is_err() {
                             scan_errors.fetch_add(1, Ordering::Relaxed);
                             continue;
                         }
@@ -1070,7 +1070,7 @@ fn test_scan_with_concurrent_writes_across_frozen_active() {
                             prev_ts = Some(ts);
                             count += 1;
 
-                            if iter.advance().is_err() {
+                            if tisql::io::block_on_sync(iter.advance()).is_err() {
                                 break;
                             }
                         }
@@ -1113,11 +1113,11 @@ fn test_scan_with_concurrent_writes_across_frozen_active() {
         let start = MvccKey::encode(b"frozen_", Timestamp::MAX);
         let end = MvccKey::encode(b"frozen_\xff", 0);
         let mut iter = engine.scan_iter(start..end, 0).unwrap();
-        iter.advance().unwrap();
+        tisql::io::block_on_sync(iter.advance()).unwrap();
         let mut count = 0;
         while iter.valid() {
             count += 1;
-            iter.advance().unwrap();
+            tisql::io::block_on_sync(iter.advance()).unwrap();
         }
         count
     };
@@ -1164,14 +1164,14 @@ fn test_scan_snapshot_isolation_during_rotation() {
     let start = MvccKey::encode(b"key_", Timestamp::MAX);
     let end = MvccKey::encode(b"key_\xff", 0);
     let mut iter = engine.scan_iter(start..end, 0).unwrap();
-    iter.advance().unwrap();
+    tisql::io::block_on_sync(iter.advance()).unwrap();
 
     // Read first 10 entries
     let mut pre_rotation_keys = Vec::new();
     for _ in 0..10 {
         if iter.valid() {
             pre_rotation_keys.push(iter.user_key().to_vec());
-            iter.advance().unwrap();
+            tisql::io::block_on_sync(iter.advance()).unwrap();
         }
     }
 
@@ -1189,7 +1189,7 @@ fn test_scan_snapshot_isolation_during_rotation() {
     let mut post_rotation_keys = Vec::new();
     while iter.valid() {
         post_rotation_keys.push(iter.user_key().to_vec());
-        iter.advance().unwrap();
+        tisql::io::block_on_sync(iter.advance()).unwrap();
     }
 
     // Total should be 50 (the original data), not 60
@@ -1216,12 +1216,12 @@ fn test_scan_snapshot_isolation_during_rotation() {
     let start = MvccKey::encode(b"key_", Timestamp::MAX);
     let end = MvccKey::encode(b"key_\xff", 0);
     let mut new_iter = engine.scan_iter(start..end, 0).unwrap();
-    new_iter.advance().unwrap();
+    tisql::io::block_on_sync(new_iter.advance()).unwrap();
 
     let mut new_scan_count = 0;
     while new_iter.valid() {
         new_scan_count += 1;
-        new_iter.advance().unwrap();
+        tisql::io::block_on_sync(new_iter.advance()).unwrap();
     }
 
     assert_eq!(
@@ -1259,7 +1259,7 @@ fn test_same_key_in_frozen_and_active_memtables() {
     let start = MvccKey::encode(b"shared_key_", Timestamp::MAX);
     let end = MvccKey::encode(b"shared_key_\xff", 0);
     let mut iter = engine.scan_iter(start..end, 0).unwrap();
-    iter.advance().unwrap();
+    tisql::io::block_on_sync(iter.advance()).unwrap();
 
     let mut entries: Vec<(Vec<u8>, Timestamp, Vec<u8>)> = Vec::new();
     while iter.valid() {
@@ -1268,7 +1268,7 @@ fn test_same_key_in_frozen_and_active_memtables() {
             iter.timestamp(),
             iter.value().to_vec(),
         ));
-        iter.advance().unwrap();
+        tisql::io::block_on_sync(iter.advance()).unwrap();
     }
 
     // Should have 20 entries (2 versions per key * 10 keys)
@@ -1392,7 +1392,7 @@ fn test_stress_rotations_with_concurrent_scans() {
 
                 match engine.scan_iter(start..end, 0) {
                     Ok(mut iter) => {
-                        if iter.advance().is_err() {
+                        if tisql::io::block_on_sync(iter.advance()).is_err() {
                             scan_errors.fetch_add(1, Ordering::Relaxed);
                             continue;
                         }
@@ -1426,7 +1426,7 @@ fn test_stress_rotations_with_concurrent_scans() {
                             prev_user_key = Some(user_key);
                             prev_ts = Some(ts);
 
-                            if iter.advance().is_err() {
+                            if tisql::io::block_on_sync(iter.advance()).is_err() {
                                 break;
                             }
                         }

@@ -17,12 +17,9 @@
 // Architecture:
 // - Single tokio runtime for both network I/O and query processing
 // - CPU work (parse, bind, row streaming) runs inline on async tasks
-// - Storage I/O (execute_plan) uses spawn_blocking until storage becomes async
+// - Storage I/O (execute_plan) awaited directly (iterators are async)
 // - tokio::sync::mpsc bridges worker task → network task (row batches)
 // - tokio::sync::oneshot for response delivery
-//
-// Future: When the storage layer exposes async read/write, spawn_blocking
-// calls are replaced with direct .await on storage operations.
 
 use std::sync::Arc;
 
@@ -78,7 +75,7 @@ pub enum QueryResponse {
 ///
 /// Spawns a tokio task that:
 /// 1. Parses and binds SQL (CPU work, inline)
-/// 2. Executes the plan (storage I/O, spawn_blocking for now)
+/// 2. Executes the plan (async — iterators yield during I/O)
 /// 3. Streams rows via channels (CPU work, inline)
 ///
 /// For read queries, returns immediately with streaming channels.
@@ -118,14 +115,11 @@ pub async fn dispatch_full_query(
                 return; // caller dropped
             }
 
-            // Storage I/O: execute plan (spawn_blocking until storage is async)
-            let db_exec = Arc::clone(&db);
-            let exec_result =
-                tokio::task::spawn_blocking(move || db_exec.execute_plan(plan, &exec_ctx, txn_ctx))
-                    .await;
+            // Execute plan (async — iterators yield during SST I/O)
+            let exec_result = db.execute_plan(plan, &exec_ctx, txn_ctx).await;
 
             match exec_result {
-                Ok(Ok((ExecutionOutput::Rows(mut exec), returned_ctx))) => {
+                Ok((ExecutionOutput::Rows(mut exec), returned_ctx)) => {
                     // CPU: stream materialized rows via channel
                     let mut batch = Vec::with_capacity(BATCH_SIZE);
                     while let Some(row) = exec.next() {
@@ -145,56 +139,40 @@ pub async fn dispatch_full_query(
                         txn_ctx: returned_ctx,
                     });
                 }
-                Ok(Ok((_, returned_ctx))) => {
+                Ok((_, returned_ctx)) => {
                     drop(batch_tx);
                     let _ = done_tx.send(QueryDone::Success {
                         txn_ctx: returned_ctx,
                     });
                 }
-                Ok(Err(e)) => {
-                    drop(batch_tx);
-                    let _ = done_tx.send(QueryDone::Error {
-                        error: e,
-                        txn_ctx: None,
-                    });
-                }
                 Err(e) => {
                     drop(batch_tx);
                     let _ = done_tx.send(QueryDone::Error {
-                        error: TiSqlError::Internal(format!("Task panicked: {e}")),
+                        error: e,
                         txn_ctx: None,
                     });
                 }
             }
         } else {
-            // Write/DDL: execute (storage I/O via spawn_blocking)
-            let db_exec = Arc::clone(&db);
-            let exec_result =
-                tokio::task::spawn_blocking(move || db_exec.execute_plan(plan, &exec_ctx, txn_ctx))
-                    .await;
+            // Write/DDL: execute (async)
+            let exec_result = db.execute_plan(plan, &exec_ctx, txn_ctx).await;
 
             match exec_result {
-                Ok(Ok((ExecutionOutput::Affected { count }, ctx))) => {
+                Ok((ExecutionOutput::Affected { count }, ctx)) => {
                     let _ = response_tx.send(QueryResponse::Affected {
                         count,
                         txn_ctx: ctx,
                     });
                 }
-                Ok(Ok((ExecutionOutput::Ok, ctx))) => {
+                Ok((ExecutionOutput::Ok, ctx)) => {
                     let _ = response_tx.send(QueryResponse::Ok { txn_ctx: ctx });
                 }
-                Ok(Ok((ExecutionOutput::Rows(_), ctx))) => {
+                Ok((ExecutionOutput::Rows(_), ctx)) => {
                     let _ = response_tx.send(QueryResponse::Ok { txn_ctx: ctx });
-                }
-                Ok(Err(e)) => {
-                    let _ = response_tx.send(QueryResponse::Error {
-                        error: e,
-                        txn_ctx: None,
-                    });
                 }
                 Err(e) => {
                     let _ = response_tx.send(QueryResponse::Error {
-                        error: TiSqlError::Internal(format!("Task panicked: {e}")),
+                        error: e,
                         txn_ctx: None,
                     });
                 }

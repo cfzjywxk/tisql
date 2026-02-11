@@ -39,3 +39,36 @@ mod service;
 pub use aligned_buf::AlignedBuf;
 pub use dma_file::DmaFile;
 pub use service::{IoFuture, IoService};
+
+/// Minimal single-future executor that blocks the current thread until completion.
+///
+/// Works in any context (inside or outside a tokio runtime). Uses thread parking
+/// for efficient waiting — no busy-loop. The waker unparks the thread when the
+/// future is ready.
+///
+/// Used by `LsmEngine::get_with_owner` (sync trait method) to call async SST I/O.
+/// The scan path uses proper `.await`; this sync bridge is only for point lookups.
+pub fn block_on_sync<F: std::future::Future>(fut: F) -> F::Output {
+    use std::pin::pin;
+    use std::sync::Arc;
+    use std::task::{Context, Poll, Wake, Waker};
+
+    struct ThreadWaker(std::thread::Thread);
+
+    impl Wake for ThreadWaker {
+        fn wake(self: Arc<Self>) {
+            self.0.unpark();
+        }
+    }
+
+    let waker = Waker::from(Arc::new(ThreadWaker(std::thread::current())));
+    let mut cx = Context::from_waker(&waker);
+    let mut fut = pin!(fut);
+
+    loop {
+        match fut.as_mut().poll(&mut cx) {
+            Poll::Ready(val) => return val,
+            Poll::Pending => std::thread::park(),
+        }
+    }
+}

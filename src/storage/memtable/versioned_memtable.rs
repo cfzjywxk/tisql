@@ -1077,15 +1077,23 @@ pub struct VersionedMemTableIterator<'a> {
     current_pending_owner: Timestamp,
 }
 
-// Note: This iterator is intentionally !Send and !Sync because:
-// 1. It contains raw pointers (*const VersionNode) which are !Send by default
-// 2. The MvccIterator trait explicitly states Send/Sync is not required
-// 3. Iterators are used within single-threaded scan operations only
-// 4. Removing unsafe impls eliminates soundness concerns about crossbeam internals
+// Safety: VersionedMemTableIterator is Send because:
+// 1. The raw pointer `*const VersionNode` points into a SkipMap entry's MvccRow,
+//    which is kept alive by the `&'a VersionedMemTableEngineInner` reference (or Arc).
+// 2. VersionNode fields (AtomicU64 ts, Vec<u8> value, AtomicPtr next, AtomicBool aborted,
+//    owner_start_ts) are all Send-safe: atomics are explicitly designed for cross-thread use,
+//    and Vec<u8> is Send.
+// 3. crossbeam_skiplist::Entry<'a, K, V> is Send when K: Send and V: Send (both Vec<u8>
+//    and MvccRow satisfy this).
+// 4. The iterator is used within async tasks (tokio::spawn) which require Send.
+//    The iterator never holds the pointer across yield points — it's only dereferenced
+//    in synchronous accessor methods (user_key, timestamp, value).
 //
-// If Send/Sync is ever needed, it would require careful analysis of:
-// - crossbeam_skiplist::Entry thread-safety guarantees
-// - Version chain node lifetime across threads
+// SAFETY PROOF: The pointer is valid for the lifetime 'a of the iterator because
+// MvccRow uses a linked list of heap-allocated VersionNode objects that are never
+// deallocated while the SkipMap entry exists. The entry is pinned by the `current_entry`
+// field which borrows from the SkipMap.
+unsafe impl Send for VersionedMemTableIterator<'_> {}
 // - Memory ordering requirements for concurrent access
 
 impl<'a> VersionedMemTableIterator<'a> {
@@ -1424,7 +1432,7 @@ impl<'a> VersionedMemTableIterator<'a> {
 }
 
 impl<'a> MvccIterator for VersionedMemTableIterator<'a> {
-    fn seek(&mut self, target: &MvccKey) -> Result<()> {
+    async fn seek(&mut self, target: &MvccKey) -> Result<()> {
         // Reset state
         self.initialized = true;
         self.current_entry = None;
@@ -1445,7 +1453,7 @@ impl<'a> MvccIterator for VersionedMemTableIterator<'a> {
         Ok(())
     }
 
-    fn advance(&mut self) -> Result<()> {
+    async fn advance(&mut self) -> Result<()> {
         if !self.initialized {
             self.initialize();
         } else {
@@ -1541,12 +1549,12 @@ impl ArcVersionedMemTableIterator {
 }
 
 impl MvccIterator for ArcVersionedMemTableIterator {
-    fn seek(&mut self, target: &MvccKey) -> Result<()> {
-        self.iter.seek(target)
+    async fn seek(&mut self, target: &MvccKey) -> Result<()> {
+        self.iter.seek(target).await
     }
 
-    fn advance(&mut self) -> Result<()> {
-        self.iter.advance()
+    async fn advance(&mut self) -> Result<()> {
+        self.iter.advance().await
     }
 
     fn valid(&self) -> bool {
@@ -1602,17 +1610,17 @@ mod tests {
 
     /// Scan MVCC keys in range using the streaming iterator (test-only helper).
     /// Collects results into a Vec for easy testing assertions.
-    fn scan_mvcc(
+    async fn scan_mvcc(
         engine: &VersionedMemTableEngine,
         range: Range<MvccKey>,
     ) -> Vec<(MvccKey, RawValue)> {
         let mut results = Vec::new();
         let mut iter = engine.create_streaming_iter(std::sync::Arc::new(range), 0);
-        iter.advance().unwrap();
+        iter.advance().await.unwrap();
         while iter.valid() {
             let key = MvccKey::encode(iter.user_key(), iter.timestamp());
             results.push((key, iter.value().to_vec()));
-            iter.advance().unwrap();
+            iter.advance().await.unwrap();
         }
         results
     }
@@ -1697,8 +1705,8 @@ mod tests {
 
     // ==================== Basic Tests ====================
 
-    #[test]
-    fn test_basic_put_get() {
+    #[tokio::test]
+    async fn test_basic_put_get() {
         let engine = new_engine();
 
         put_at(&engine, b"key1", b"value1", 1);
@@ -1707,16 +1715,16 @@ mod tests {
         assert_eq!(value, Some(b"value1".to_vec()));
     }
 
-    #[test]
-    fn test_get_nonexistent() {
+    #[tokio::test]
+    async fn test_get_nonexistent() {
         let engine = new_engine();
 
         let value = get_for_test(&engine, b"nonexistent");
         assert_eq!(value, None);
     }
 
-    #[test]
-    fn test_delete() {
+    #[tokio::test]
+    async fn test_delete() {
         let engine = new_engine();
 
         put_at(&engine, b"key1", b"value1", 1);
@@ -1728,8 +1736,8 @@ mod tests {
 
     // ==================== MVCC Version Tests ====================
 
-    #[test]
-    fn test_mvcc_versions() {
+    #[tokio::test]
+    async fn test_mvcc_versions() {
         let engine = new_engine();
 
         // Write version 1
@@ -1767,8 +1775,8 @@ mod tests {
         assert_eq!(v, None);
     }
 
-    #[test]
-    fn test_mvcc_delete_version() {
+    #[tokio::test]
+    async fn test_mvcc_delete_version() {
         let engine = new_engine();
 
         // Write value at ts=10
@@ -1794,8 +1802,8 @@ mod tests {
         assert_eq!(v, None);
     }
 
-    #[test]
-    fn test_mvcc_multiple_versions_visibility() {
+    #[tokio::test]
+    async fn test_mvcc_multiple_versions_visibility() {
         let engine = new_engine();
 
         // Create multiple versions
@@ -1820,8 +1828,8 @@ mod tests {
 
     // ==================== Scan Tests ====================
 
-    #[test]
-    fn test_scan() {
+    #[tokio::test]
+    async fn test_scan() {
         let engine = new_engine();
 
         put_at(&engine, b"a", b"1", 1);
@@ -1837,8 +1845,8 @@ mod tests {
         assert!(keys.contains(&b"c".to_vec()));
     }
 
-    #[test]
-    fn test_scan_at_mvcc() {
+    #[tokio::test]
+    async fn test_scan_at_mvcc() {
         let engine = new_engine();
 
         // Write data at explicit timestamps
@@ -1864,8 +1872,8 @@ mod tests {
         assert_eq!(results.len(), 0, "scan_at ts=5 should see 0 keys");
     }
 
-    #[test]
-    fn test_scan_at_with_deletes() {
+    #[tokio::test]
+    async fn test_scan_at_with_deletes() {
         let engine = new_engine();
 
         // Write keys at ts=10
@@ -1891,8 +1899,8 @@ mod tests {
 
     // ==================== WriteBatch Tests ====================
 
-    #[test]
-    fn test_write_batch_requires_commit_ts() {
+    #[tokio::test]
+    async fn test_write_batch_requires_commit_ts() {
         let engine = new_engine();
 
         let mut batch = WriteBatch::new();
@@ -1902,8 +1910,8 @@ mod tests {
         assert!(result.is_err());
     }
 
-    #[test]
-    fn test_write_batch_with_commit_ts() {
+    #[tokio::test]
+    async fn test_write_batch_with_commit_ts() {
         let engine = new_engine();
 
         let commit_ts = 100;
@@ -1931,8 +1939,8 @@ mod tests {
 
     // ==================== StorageEngine Scan Tests ====================
 
-    #[test]
-    fn test_storage_engine_scan_unbounded() {
+    #[tokio::test]
+    async fn test_storage_engine_scan_unbounded() {
         let engine = new_engine();
 
         put_at(&engine, b"a", b"1", 10);
@@ -1940,7 +1948,7 @@ mod tests {
         put_at(&engine, b"b", b"3", 15);
 
         // Scan all with unbounded range
-        let results = scan_mvcc(&engine, MvccKey::unbounded()..MvccKey::unbounded());
+        let results = scan_mvcc(&engine, MvccKey::unbounded()..MvccKey::unbounded()).await;
 
         // Should have 3 entries (2 for "a", 1 for "b")
         assert_eq!(results.len(), 3);
@@ -1950,8 +1958,8 @@ mod tests {
         assert_eq!(key_a_20, b"a".to_vec());
     }
 
-    #[test]
-    fn test_storage_engine_scan_bounded() {
+    #[tokio::test]
+    async fn test_storage_engine_scan_bounded() {
         let engine = new_engine();
 
         put_at(&engine, b"a", b"1", 10);
@@ -1964,7 +1972,7 @@ mod tests {
         let start = MvccKey::encode(b"a", Timestamp::MAX);
         let end = MvccKey::encode(b"c", 0);
 
-        let results = scan_mvcc(&engine, start..end);
+        let results = scan_mvcc(&engine, start..end).await;
 
         // All three entries are included:
         // - (a, 10): a || !10 is in range
@@ -1976,13 +1984,13 @@ mod tests {
         let start = MvccKey::encode(b"a", Timestamp::MAX);
         let end = MvccKey::encode(b"c", Timestamp::MAX); // Start of "c" versions
 
-        let results = scan_mvcc(&engine, start..end);
+        let results = scan_mvcc(&engine, start..end).await;
         // Now only a and b are included
         assert_eq!(results.len(), 2);
     }
 
-    #[test]
-    fn test_storage_engine_scan_same_key_timestamp_range() {
+    #[tokio::test]
+    async fn test_storage_engine_scan_same_key_timestamp_range() {
         // Regression test: when start_user_key == end_user_key, both timestamp
         // bounds must be enforced. Previously the code used mutually exclusive
         // if/else branches that only checked one bound.
@@ -2002,7 +2010,7 @@ mod tests {
         let start = MvccKey::encode(b"key", 40);
         let end = MvccKey::encode(b"key", 20);
 
-        let results = scan_mvcc(&engine, start..end);
+        let results = scan_mvcc(&engine, start..end).await;
 
         // Should have exactly 2 versions: ts=40 and ts=30
         assert_eq!(
@@ -2042,8 +2050,8 @@ mod tests {
     use std::sync::Barrier;
     use std::thread;
 
-    #[test]
-    fn test_concurrent_writes() {
+    #[tokio::test]
+    async fn test_concurrent_writes() {
         let engine = VersionedMemTableEngine::new();
         let num_threads = 8;
         let writes_per_thread = 1000;
@@ -2081,8 +2089,8 @@ mod tests {
         assert_eq!(engine.len(), num_threads * writes_per_thread);
     }
 
-    #[test]
-    fn test_concurrent_writes_same_key() {
+    #[tokio::test]
+    async fn test_concurrent_writes_same_key() {
         // Multiple threads writing versions to the same key.
         //
         // In production, the ConcurrencyManager ensures per-key serialization:
@@ -2134,8 +2142,8 @@ mod tests {
         }
     }
 
-    #[test]
-    fn test_concurrent_reads_and_writes() {
+    #[tokio::test]
+    async fn test_concurrent_reads_and_writes() {
         // Test concurrent reads and writes where each writer thread has its own
         // distinct key space. This matches real-world behavior where concurrent
         // writes to the same key would be serialized by ConcurrencyManager.
@@ -2200,8 +2208,8 @@ mod tests {
         });
     }
 
-    #[test]
-    fn test_memory_stats() {
+    #[tokio::test]
+    async fn test_memory_stats() {
         let engine = new_engine();
 
         let stats_before = engine.memory_stats();
@@ -2219,8 +2227,8 @@ mod tests {
         assert_eq!(stats_after.key_count, 100); // 100 unique keys
     }
 
-    #[test]
-    fn test_scan_all_versions() {
+    #[tokio::test]
+    async fn test_scan_all_versions() {
         let engine = new_engine();
 
         put_at(&engine, b"a", b"a1", 10);
@@ -2247,8 +2255,8 @@ mod tests {
 
     // ==================== Version Chain Ordering Tests ====================
 
-    #[test]
-    fn test_version_chain_ordering_correct() {
+    #[tokio::test]
+    async fn test_version_chain_ordering_correct() {
         // Verify that when versions are inserted in correct order (ascending ts),
         // reads return the correct latest visible version.
         let engine = new_engine();
@@ -2275,8 +2283,8 @@ mod tests {
         assert_eq!(value, None);
     }
 
-    #[test]
-    fn test_version_chain_ordering_same_timestamp() {
+    #[tokio::test]
+    async fn test_version_chain_ordering_same_timestamp() {
         // Test that inserting at the same timestamp is allowed (idempotent writes)
         let engine = new_engine();
 
@@ -2288,9 +2296,9 @@ mod tests {
         assert_eq!(value, Some(b"v2".to_vec()));
     }
 
-    #[test]
+    #[tokio::test]
     #[should_panic(expected = "MVCC version chain ordering violation")]
-    fn test_version_chain_ordering_violation_panics() {
+    async fn test_version_chain_ordering_violation_panics() {
         // Inserting a version with ts < head's ts must panic to prevent silent corruption.
         // This catches bugs where the transaction layer violates the ordering invariant.
         let engine = new_engine();
@@ -2305,23 +2313,23 @@ mod tests {
 
     // ==================== Iterator Edge Case Tests ====================
 
-    #[test]
-    fn test_iterator_empty_memtable() {
+    #[tokio::test]
+    async fn test_iterator_empty_memtable() {
         // Iterating over an empty memtable should immediately be invalid
         let engine = new_engine();
 
         let range = MvccKey::unbounded()..MvccKey::unbounded();
         let mut iter = engine.create_streaming_iter(std::sync::Arc::new(range), 0);
 
-        iter.advance().unwrap();
+        iter.advance().await.unwrap();
         assert!(
             !iter.valid(),
             "Iterator over empty memtable should be invalid"
         );
     }
 
-    #[test]
-    fn test_iterator_single_entry() {
+    #[tokio::test]
+    async fn test_iterator_single_entry() {
         // Single entry iteration
         let engine = new_engine();
         put_at(&engine, b"only_key", b"only_value", 100);
@@ -2329,18 +2337,18 @@ mod tests {
         let range = MvccKey::unbounded()..MvccKey::unbounded();
         let mut iter = engine.create_streaming_iter(std::sync::Arc::new(range), 0);
 
-        iter.advance().unwrap();
+        iter.advance().await.unwrap();
         assert!(iter.valid());
         assert_eq!(iter.user_key(), b"only_key");
         assert_eq!(iter.timestamp(), 100);
         assert_eq!(iter.value(), b"only_value");
 
-        iter.advance().unwrap();
+        iter.advance().await.unwrap();
         assert!(!iter.valid(), "Should be invalid after single entry");
     }
 
-    #[test]
-    fn test_iterator_single_key_multiple_versions() {
+    #[tokio::test]
+    async fn test_iterator_single_key_multiple_versions() {
         // Single key with multiple versions
         let engine = new_engine();
         for ts in 1..=10 {
@@ -2349,7 +2357,7 @@ mod tests {
         }
 
         let range = MvccKey::unbounded()..MvccKey::unbounded();
-        let results = scan_mvcc(&engine, range);
+        let results = scan_mvcc(&engine, range).await;
 
         // Should see all 10 versions in descending timestamp order (newest first)
         assert_eq!(results.len(), 10);
@@ -2361,8 +2369,8 @@ mod tests {
         }
     }
 
-    #[test]
-    fn test_iterator_large_version_chain() {
+    #[tokio::test]
+    async fn test_iterator_large_version_chain() {
         // Large version chain (100+ versions per key)
         let engine = new_engine();
         let num_versions = 200;
@@ -2377,7 +2385,7 @@ mod tests {
 
         // Verify all versions are accessible via scan
         let range = MvccKey::unbounded()..MvccKey::unbounded();
-        let results = scan_mvcc(&engine, range);
+        let results = scan_mvcc(&engine, range).await;
         assert_eq!(results.len(), num_versions as usize);
 
         // Verify point reads at various timestamps
@@ -2391,8 +2399,8 @@ mod tests {
         }
     }
 
-    #[test]
-    fn test_iterator_seek_to_nonexistent_key() {
+    #[tokio::test]
+    async fn test_iterator_seek_to_nonexistent_key() {
         // Seek to a key that doesn't exist should find the next key
         let engine = new_engine();
         put_at(&engine, b"aaa", b"v1", 10);
@@ -2403,14 +2411,14 @@ mod tests {
         let range = MvccKey::encode(b"bbb", Timestamp::MAX)..MvccKey::unbounded();
         let mut iter = engine.create_streaming_iter(std::sync::Arc::new(range), 0);
 
-        iter.advance().unwrap();
+        iter.advance().await.unwrap();
         assert!(iter.valid());
         assert_eq!(iter.user_key(), b"ccc");
         assert_eq!(iter.timestamp(), 20);
     }
 
-    #[test]
-    fn test_iterator_seek_past_all_keys() {
+    #[tokio::test]
+    async fn test_iterator_seek_past_all_keys() {
         // Seek past all keys should be invalid
         let engine = new_engine();
         put_at(&engine, b"aaa", b"v1", 10);
@@ -2419,12 +2427,12 @@ mod tests {
         let range = MvccKey::encode(b"zzz", Timestamp::MAX)..MvccKey::unbounded();
         let mut iter = engine.create_streaming_iter(std::sync::Arc::new(range), 0);
 
-        iter.advance().unwrap();
+        iter.advance().await.unwrap();
         assert!(!iter.valid(), "Seek past all keys should be invalid");
     }
 
-    #[test]
-    fn test_iterator_seek_before_all_keys() {
+    #[tokio::test]
+    async fn test_iterator_seek_before_all_keys() {
         // Seek before all keys should find the first key
         let engine = new_engine();
         put_at(&engine, b"mmm", b"v1", 10);
@@ -2434,13 +2442,13 @@ mod tests {
         let range = MvccKey::encode(b"aaa", Timestamp::MAX)..MvccKey::unbounded();
         let mut iter = engine.create_streaming_iter(std::sync::Arc::new(range), 0);
 
-        iter.advance().unwrap();
+        iter.advance().await.unwrap();
         assert!(iter.valid());
         assert_eq!(iter.user_key(), b"mmm");
     }
 
-    #[test]
-    fn test_iterator_seek_exact_match() {
+    #[tokio::test]
+    async fn test_iterator_seek_exact_match() {
         // Seek to exact key and timestamp
         let engine = new_engine();
         put_at(&engine, b"key", b"v10", 10);
@@ -2451,20 +2459,20 @@ mod tests {
         let range = MvccKey::encode(b"key", 20)..MvccKey::unbounded();
         let mut iter = engine.create_streaming_iter(std::sync::Arc::new(range), 0);
 
-        iter.advance().unwrap();
+        iter.advance().await.unwrap();
         assert!(iter.valid());
         assert_eq!(iter.user_key(), b"key");
         assert_eq!(iter.timestamp(), 20);
 
-        iter.advance().unwrap();
+        iter.advance().await.unwrap();
         assert!(iter.valid());
         assert_eq!(iter.timestamp(), 10, "Next version should be ts=10");
     }
 
     // ==================== Boundary Condition Tests ====================
 
-    #[test]
-    fn test_timestamp_boundary_zero() {
+    #[tokio::test]
+    async fn test_timestamp_boundary_zero() {
         // Timestamp 0 is the minimum timestamp
         let engine = new_engine();
         put_at(&engine, b"key", b"at_zero", 0);
@@ -2479,8 +2487,8 @@ mod tests {
         assert_eq!(value, Some(b"at_one".to_vec()));
     }
 
-    #[test]
-    fn test_timestamp_boundary_max() {
+    #[tokio::test]
+    async fn test_timestamp_boundary_max() {
         // Timestamp::MAX is the maximum timestamp
         let engine = new_engine();
         put_at(&engine, b"key", b"at_max", Timestamp::MAX);
@@ -2493,8 +2501,8 @@ mod tests {
         assert_eq!(value, None);
     }
 
-    #[test]
-    fn test_empty_range_scan() {
+    #[tokio::test]
+    async fn test_empty_range_scan() {
         // Range where start >= end (empty range)
         let engine = new_engine();
         put_at(&engine, b"aaa", b"v1", 10);
@@ -2502,12 +2510,12 @@ mod tests {
 
         // Empty range: start == end
         let range = MvccKey::encode(b"bbb", 15)..MvccKey::encode(b"bbb", 15);
-        let results = scan_mvcc(&engine, range);
+        let results = scan_mvcc(&engine, range).await;
         assert!(results.is_empty(), "Empty range should return no results");
     }
 
-    #[test]
-    fn test_single_key_range_scan() {
+    #[tokio::test]
+    async fn test_single_key_range_scan() {
         // Range covering exactly one key
         let engine = new_engine();
         put_at(&engine, b"aaa", b"v1", 10);
@@ -2517,25 +2525,25 @@ mod tests {
         // Range covering only "bbb"
         let range =
             MvccKey::encode(b"bbb", Timestamp::MAX)..MvccKey::encode(b"ccc", Timestamp::MAX);
-        let results = scan_mvcc(&engine, range);
+        let results = scan_mvcc(&engine, range).await;
         assert_eq!(results.len(), 1);
         let (key, _) = &results[0];
         let (user_key, _) = MvccKey::decode(key);
         assert_eq!(user_key, b"bbb");
     }
 
-    #[test]
-    fn test_unbounded_range_with_no_data() {
+    #[tokio::test]
+    async fn test_unbounded_range_with_no_data() {
         // Full unbounded range on empty memtable
         let engine = new_engine();
 
         let range = MvccKey::unbounded()..MvccKey::unbounded();
-        let results = scan_mvcc(&engine, range);
+        let results = scan_mvcc(&engine, range).await;
         assert!(results.is_empty());
     }
 
-    #[test]
-    fn test_range_excludes_exact_end_bound() {
+    #[tokio::test]
+    async fn test_range_excludes_exact_end_bound() {
         // Range end is exclusive - key at exact end bound should not be included
         let engine = new_engine();
         put_at(&engine, b"aaa", b"v1", 10);
@@ -2544,7 +2552,7 @@ mod tests {
 
         // Range excludes "bbb" at ts=20 exactly
         let range = MvccKey::encode(b"aaa", Timestamp::MAX)..MvccKey::encode(b"bbb", 20);
-        let results = scan_mvcc(&engine, range);
+        let results = scan_mvcc(&engine, range).await;
 
         // Should only include "aaa" (bbb@20 is excluded by exclusive end bound)
         assert_eq!(results.len(), 1);
@@ -2555,8 +2563,8 @@ mod tests {
 
     // ==================== Arc Iterator Lifetime Tests ====================
 
-    #[test]
-    fn test_arc_iterator_outlives_engine_reference() {
+    #[tokio::test]
+    async fn test_arc_iterator_outlives_engine_reference() {
         // The Arc iterator should be usable after the engine reference is dropped
         let engine = new_engine();
         put_at(&engine, b"key1", b"value1", 10);
@@ -2573,20 +2581,20 @@ mod tests {
         drop(engine);
 
         // Iterator should still work
-        iter.advance().unwrap();
+        iter.advance().await.unwrap();
         assert!(iter.valid());
         assert_eq!(iter.user_key(), b"key1");
 
-        iter.advance().unwrap();
+        iter.advance().await.unwrap();
         assert!(iter.valid());
         assert_eq!(iter.user_key(), b"key2");
 
-        iter.advance().unwrap();
+        iter.advance().await.unwrap();
         assert!(!iter.valid());
     }
 
-    #[test]
-    fn test_arc_iterator_seek_operations() {
+    #[tokio::test]
+    async fn test_arc_iterator_seek_operations() {
         // Test seek operations on Arc iterator
         let engine = new_engine();
         for i in 0..10 {
@@ -2600,21 +2608,21 @@ mod tests {
 
         // Seek to middle
         let target = MvccKey::encode(b"key_05", Timestamp::MAX);
-        iter.seek(&target).unwrap();
+        iter.seek(&target).await.unwrap();
         assert!(iter.valid());
         assert_eq!(iter.user_key(), b"key_05");
 
         // Seek to non-existent key
         let target = MvccKey::encode(b"key_03a", Timestamp::MAX);
-        iter.seek(&target).unwrap();
+        iter.seek(&target).await.unwrap();
         assert!(iter.valid());
         assert_eq!(iter.user_key(), b"key_04"); // Next key after "key_03a"
     }
 
     // ==================== MvccRow Edge Case Tests ====================
 
-    #[test]
-    fn test_mvcc_row_get_at_empty_chain() {
+    #[tokio::test]
+    async fn test_mvcc_row_get_at_empty_chain() {
         // Getting from an empty row should return None
         let row = MvccRow::new_empty();
         assert!(row.get_at(100).is_none());
@@ -2622,8 +2630,8 @@ mod tests {
         assert!(row.get_at(Timestamp::MAX).is_none());
     }
 
-    #[test]
-    fn test_mvcc_row_version_count_accuracy() {
+    #[tokio::test]
+    async fn test_mvcc_row_version_count_accuracy() {
         // Version count should accurately reflect the number of versions
         let row = MvccRow::new_empty();
         assert_eq!(row.version_count.load(Ordering::Relaxed), 0);
@@ -2638,8 +2646,8 @@ mod tests {
         assert_eq!(row.version_count.load(Ordering::Relaxed), 3);
     }
 
-    #[test]
-    fn test_key_with_binary_data() {
+    #[tokio::test]
+    async fn test_key_with_binary_data() {
         // Keys and values can contain arbitrary binary data including nulls
         let engine = new_engine();
 
@@ -2652,8 +2660,8 @@ mod tests {
         assert_eq!(value, Some(binary_value.to_vec()));
     }
 
-    #[test]
-    fn test_empty_key_and_value() {
+    #[tokio::test]
+    async fn test_empty_key_and_value() {
         // Empty keys and values should work
         let engine = new_engine();
 
@@ -2663,8 +2671,8 @@ mod tests {
         assert_eq!(value, Some(vec![]));
     }
 
-    #[test]
-    fn test_large_value() {
+    #[tokio::test]
+    async fn test_large_value() {
         // Large values (1MB+) should work
         let engine = new_engine();
 
@@ -2676,8 +2684,8 @@ mod tests {
         assert_eq!(value, Some(large_value));
     }
 
-    #[test]
-    fn test_many_keys_iteration_order() {
+    #[tokio::test]
+    async fn test_many_keys_iteration_order() {
         // Verify iteration order is correct across many keys
         let engine = new_engine();
 
@@ -2689,7 +2697,7 @@ mod tests {
 
         // Scan should return keys in sorted order
         let range = MvccKey::unbounded()..MvccKey::unbounded();
-        let results = scan_mvcc(&engine, range);
+        let results = scan_mvcc(&engine, range).await;
 
         assert_eq!(results.len(), 10);
         for (i, (mvcc_key, _)) in results.iter().enumerate() {
@@ -2705,8 +2713,8 @@ mod tests {
 
     // ==================== Pessimistic Locking Tests ====================
 
-    #[test]
-    fn test_put_pending_basic() {
+    #[tokio::test]
+    async fn test_put_pending_basic() {
         let engine = new_engine();
 
         // Write pending value
@@ -2721,8 +2729,8 @@ mod tests {
         assert_eq!(engine.get_lock_owner(b"key1"), Some(100));
     }
 
-    #[test]
-    fn test_put_pending_conflict() {
+    #[tokio::test]
+    async fn test_put_pending_conflict() {
         let engine = new_engine();
 
         // First write from txn 100
@@ -2733,8 +2741,8 @@ mod tests {
         assert_eq!(result, Err(100)); // Returns lock owner
     }
 
-    #[test]
-    fn test_put_pending_same_txn_update() {
+    #[tokio::test]
+    async fn test_put_pending_same_txn_update() {
         let engine = new_engine();
 
         // First write
@@ -2752,8 +2760,8 @@ mod tests {
         assert_eq!(engine.len(), 1);
     }
 
-    #[test]
-    fn test_finalize_pending() {
+    #[tokio::test]
+    async fn test_finalize_pending() {
         let engine = new_engine();
 
         // Write pending values
@@ -2777,8 +2785,8 @@ mod tests {
         assert_eq!(engine.get_lock_owner(b"key2"), None);
     }
 
-    #[test]
-    fn test_abort_pending() {
+    #[tokio::test]
+    async fn test_abort_pending() {
         let engine = new_engine();
 
         // Write pending values
@@ -2798,8 +2806,8 @@ mod tests {
         assert!(get_for_test(&engine, b"key1").is_none());
     }
 
-    #[test]
-    fn test_abort_pending_allows_new_write() {
+    #[tokio::test]
+    async fn test_abort_pending_allows_new_write() {
         let engine = new_engine();
 
         // Txn 100 writes and aborts
@@ -2815,8 +2823,8 @@ mod tests {
         assert_eq!(engine.get_lock_owner(b"key1"), Some(200));
     }
 
-    #[test]
-    fn test_pending_not_visible_to_scan() {
+    #[tokio::test]
+    async fn test_pending_not_visible_to_scan() {
         let engine = new_engine();
 
         // Write committed value
@@ -2832,32 +2840,32 @@ mod tests {
         // for resolution by the transaction layer.
         let range = Arc::new(MvccKey::unbounded()..MvccKey::unbounded());
         let mut iter = engine.create_streaming_iter(range, 0);
-        iter.advance().unwrap();
+        iter.advance().await.unwrap();
 
         // First: "a" committed
         assert!(iter.valid());
         assert_eq!(iter.user_key(), b"a");
         assert!(!iter.is_pending());
-        iter.advance().unwrap();
+        iter.advance().await.unwrap();
 
         // Second: "b" pending (returned for resolution)
         assert!(iter.valid());
         assert_eq!(iter.user_key(), b"b");
         assert!(iter.is_pending());
         assert_eq!(iter.pending_owner(), 100);
-        iter.advance().unwrap();
+        iter.advance().await.unwrap();
 
         // Third: "c" committed
         assert!(iter.valid());
         assert_eq!(iter.user_key(), b"c");
         assert!(!iter.is_pending());
-        iter.advance().unwrap();
+        iter.advance().await.unwrap();
 
         assert!(!iter.valid());
     }
 
-    #[test]
-    fn test_finalized_visible_to_scan() {
+    #[tokio::test]
+    async fn test_finalized_visible_to_scan() {
         let engine = new_engine();
 
         // Write and finalize pending value
@@ -2867,7 +2875,7 @@ mod tests {
 
         // Scan should see the finalized value
         let range = MvccKey::unbounded()..MvccKey::unbounded();
-        let results = scan_mvcc(&engine, range);
+        let results = scan_mvcc(&engine, range).await;
 
         assert_eq!(results.len(), 1);
         let (key, value) = &results[0];
@@ -2878,8 +2886,8 @@ mod tests {
 
     // ==================== Read-Your-Writes Tests ====================
 
-    #[test]
-    fn test_get_at_with_owner_reads_own_pending() {
+    #[tokio::test]
+    async fn test_get_at_with_owner_reads_own_pending() {
         // Owner should see their own pending write
         let row = MvccRow::new_empty();
 
@@ -2895,8 +2903,8 @@ mod tests {
         assert!(value.is_none());
     }
 
-    #[test]
-    fn test_get_at_with_owner_lock_skips_to_previous() {
+    #[tokio::test]
+    async fn test_get_at_with_owner_lock_skips_to_previous() {
         use crate::storage::mvcc::LOCK;
 
         let row = MvccRow::new_empty();
@@ -2916,8 +2924,8 @@ mod tests {
         assert_eq!(value, Some(&b"committed_value".to_vec()));
     }
 
-    #[test]
-    fn test_get_at_with_owner_lock_no_previous_returns_none() {
+    #[tokio::test]
+    async fn test_get_at_with_owner_lock_no_previous_returns_none() {
         use crate::storage::mvcc::LOCK;
 
         let row = MvccRow::new_empty();
@@ -2930,8 +2938,8 @@ mod tests {
         assert!(value.is_none());
     }
 
-    #[test]
-    fn test_get_at_with_owner_tombstone_returns_none() {
+    #[tokio::test]
+    async fn test_get_at_with_owner_tombstone_returns_none() {
         let row = MvccRow::new_empty();
 
         // Add a committed tombstone at ts=50
@@ -2945,8 +2953,8 @@ mod tests {
         assert!(value.is_none());
     }
 
-    #[test]
-    fn test_get_at_with_owner_pending_tombstone_for_owner() {
+    #[tokio::test]
+    async fn test_get_at_with_owner_pending_tombstone_for_owner() {
         let row = MvccRow::new_empty();
 
         // Add a committed value
@@ -2968,8 +2976,8 @@ mod tests {
         assert_eq!(value, Some(&b"old_value".to_vec()));
     }
 
-    #[test]
-    fn test_get_at_with_owner_skips_aborted() {
+    #[tokio::test]
+    async fn test_get_at_with_owner_skips_aborted() {
         let row = MvccRow::new_empty();
 
         // Add committed value
@@ -2987,8 +2995,8 @@ mod tests {
         assert_eq!(value, Some(&b"committed".to_vec()));
     }
 
-    #[test]
-    fn test_get_at_with_owner_multiple_pending_from_different_txns() {
+    #[tokio::test]
+    async fn test_get_at_with_owner_multiple_pending_from_different_txns() {
         // This shouldn't happen in practice (lock conflict), but test behavior
         let row = MvccRow::new_empty();
 
@@ -3011,8 +3019,8 @@ mod tests {
         assert_eq!(value, Some(&b"base".to_vec()));
     }
 
-    #[test]
-    fn test_get_at_with_owner_insert_delete_insert_pattern() {
+    #[tokio::test]
+    async fn test_get_at_with_owner_insert_delete_insert_pattern() {
         use crate::storage::mvcc::LOCK;
 
         let row = MvccRow::new_empty();
@@ -3047,8 +3055,8 @@ mod tests {
 
     // ==================== delete_pending Tests ====================
 
-    #[test]
-    fn test_delete_pending_on_own_pending_write() {
+    #[tokio::test]
+    async fn test_delete_pending_on_own_pending_write() {
         let row = MvccRow::new_empty();
 
         // Txn 100 writes a pending value
@@ -3063,8 +3071,8 @@ mod tests {
         assert!(value.is_none());
     }
 
-    #[test]
-    fn test_delete_pending_on_own_pending_with_committed_base() {
+    #[tokio::test]
+    async fn test_delete_pending_on_own_pending_with_committed_base() {
         let row = MvccRow::new_empty();
 
         // Committed base value
@@ -3082,8 +3090,8 @@ mod tests {
         assert_eq!(value, Some(&b"base".to_vec()));
     }
 
-    #[test]
-    fn test_delete_pending_on_committed_value() {
+    #[tokio::test]
+    async fn test_delete_pending_on_committed_value() {
         let row = MvccRow::new_empty();
 
         // Committed value
@@ -3102,8 +3110,8 @@ mod tests {
         assert_eq!(value, Some(&b"committed".to_vec()));
     }
 
-    #[test]
-    fn test_delete_pending_conflict_with_other_txn() {
+    #[tokio::test]
+    async fn test_delete_pending_conflict_with_other_txn() {
         let row = MvccRow::new_empty();
 
         // Txn 100 writes pending
@@ -3114,8 +3122,8 @@ mod tests {
         assert_eq!(result, Err(100));
     }
 
-    #[test]
-    fn test_delete_pending_on_empty_row() {
+    #[tokio::test]
+    async fn test_delete_pending_on_empty_row() {
         let row = MvccRow::new_empty();
 
         // Delete on non-existent key - should do nothing
@@ -3123,8 +3131,8 @@ mod tests {
         assert_eq!(result, Ok(false));
     }
 
-    #[test]
-    fn test_delete_pending_on_already_deleted() {
+    #[tokio::test]
+    async fn test_delete_pending_on_already_deleted() {
         let row = MvccRow::new_empty();
 
         // Committed tombstone
@@ -3135,8 +3143,8 @@ mod tests {
         assert_eq!(result, Ok(false));
     }
 
-    #[test]
-    fn test_delete_pending_then_reinsert() {
+    #[tokio::test]
+    async fn test_delete_pending_then_reinsert() {
         let row = MvccRow::new_empty();
 
         // Txn 100: INSERT
@@ -3152,8 +3160,8 @@ mod tests {
         assert_eq!(row.get_at_with_owner(100, 100), Some(&b"second".to_vec()));
     }
 
-    #[test]
-    fn test_delete_pending_after_aborted_node() {
+    #[tokio::test]
+    async fn test_delete_pending_after_aborted_node() {
         let row = MvccRow::new_empty();
 
         // Committed base
@@ -3174,8 +3182,8 @@ mod tests {
 
     // ==================== finalize_pending with LOCK Tests ====================
 
-    #[test]
-    fn test_finalize_pending_aborts_lock_nodes() {
+    #[tokio::test]
+    async fn test_finalize_pending_aborts_lock_nodes() {
         let row = MvccRow::new_empty();
 
         // Committed base
@@ -3198,8 +3206,8 @@ mod tests {
         assert!(row.get_head_pending_owner().is_none());
     }
 
-    #[test]
-    fn test_finalize_pending_finalizes_value_nodes() {
+    #[tokio::test]
+    async fn test_finalize_pending_finalizes_value_nodes() {
         let row = MvccRow::new_empty();
 
         // Txn 100: INSERT
@@ -3218,8 +3226,8 @@ mod tests {
         assert!(row.get_at_with_owner(100, 200).is_none());
     }
 
-    #[test]
-    fn test_finalize_pending_finalizes_tombstone_nodes() {
+    #[tokio::test]
+    async fn test_finalize_pending_finalizes_tombstone_nodes() {
         let row = MvccRow::new_empty();
 
         // Committed value
@@ -3238,8 +3246,8 @@ mod tests {
         assert!(row.get_at_with_owner(200, 200).is_none());
     }
 
-    #[test]
-    fn test_finalize_pending_mixed_nodes() {
+    #[tokio::test]
+    async fn test_finalize_pending_mixed_nodes() {
         let row = MvccRow::new_empty();
 
         // Txn 100: Multiple operations
@@ -3260,8 +3268,8 @@ mod tests {
 
     // ==================== Iterator with Owner Tests ====================
 
-    #[test]
-    fn test_iterator_with_owner_sees_pending_value() {
+    #[tokio::test]
+    async fn test_iterator_with_owner_sees_pending_value() {
         use crate::storage::mvcc::MvccKey;
 
         let engine = VersionedMemTableEngine::new();
@@ -3283,7 +3291,7 @@ mod tests {
 
         let mut iter =
             VersionedMemTableIterator::new(engine.inner.as_ref(), Arc::clone(&range_arc), 0);
-        iter.advance().unwrap();
+        iter.advance().await.unwrap();
         assert!(iter.valid());
         assert_eq!(iter.user_key(), b"key1");
         assert!(iter.is_pending());
@@ -3297,15 +3305,15 @@ mod tests {
         };
         let mut owner_iter =
             VersionedMemTableIterator::new(engine.inner.as_ref(), Arc::new(range2), 200);
-        owner_iter.advance().unwrap();
+        owner_iter.advance().await.unwrap();
         assert!(owner_iter.valid());
         assert_eq!(owner_iter.user_key(), b"key1");
         assert_eq!(owner_iter.value(), b"pending");
         assert!(!owner_iter.is_pending()); // Own pending not reported as pending
     }
 
-    #[test]
-    fn test_iterator_with_owner_skips_lock_node() {
+    #[tokio::test]
+    async fn test_iterator_with_owner_skips_lock_node() {
         use crate::storage::mvcc::MvccKey;
 
         let engine = VersionedMemTableEngine::new();
@@ -3326,14 +3334,14 @@ mod tests {
         };
         let mut owner_iter =
             VersionedMemTableIterator::new(engine.inner.as_ref(), Arc::new(range), 200);
-        owner_iter.advance().unwrap();
+        owner_iter.advance().await.unwrap();
         assert!(owner_iter.valid());
         assert_eq!(owner_iter.user_key(), b"key1");
         assert_eq!(owner_iter.value(), b"committed");
     }
 
-    #[test]
-    fn test_iterator_with_owner_multiple_keys() {
+    #[tokio::test]
+    async fn test_iterator_with_owner_multiple_keys() {
         use crate::storage::mvcc::MvccKey;
 
         let engine = VersionedMemTableEngine::new();
@@ -3364,36 +3372,36 @@ mod tests {
             VersionedMemTableIterator::new(engine.inner.as_ref(), Arc::new(range), 200);
 
         // key1: committed@100
-        owner_iter.advance().unwrap();
+        owner_iter.advance().await.unwrap();
         assert!(owner_iter.valid());
         assert_eq!(owner_iter.user_key(), b"key1");
         assert_eq!(owner_iter.value(), b"k1_committed");
 
         // key2: pending@200 (owned - visible)
-        owner_iter.advance().unwrap();
+        owner_iter.advance().await.unwrap();
         assert!(owner_iter.valid());
         assert_eq!(owner_iter.user_key(), b"key2");
         assert_eq!(owner_iter.value(), b"k2_pending");
 
         // key2: committed@100 (also visible - MVCC iterator returns all versions)
-        owner_iter.advance().unwrap();
+        owner_iter.advance().await.unwrap();
         assert!(owner_iter.valid());
         assert_eq!(owner_iter.user_key(), b"key2");
         assert_eq!(owner_iter.value(), b"k2_committed");
 
         // key3: pending@200 (owned - visible)
-        owner_iter.advance().unwrap();
+        owner_iter.advance().await.unwrap();
         assert!(owner_iter.valid());
         assert_eq!(owner_iter.user_key(), b"key3");
         assert_eq!(owner_iter.value(), b"k3_pending");
 
         // No more
-        owner_iter.advance().unwrap();
+        owner_iter.advance().await.unwrap();
         assert!(!owner_iter.valid());
     }
 
-    #[test]
-    fn test_iterator_with_owner_does_not_see_other_txn_pending() {
+    #[tokio::test]
+    async fn test_iterator_with_owner_does_not_see_other_txn_pending() {
         use crate::storage::mvcc::MvccKey;
 
         let engine = VersionedMemTableEngine::new();
@@ -3413,15 +3421,15 @@ mod tests {
         };
         let mut iter_300 =
             VersionedMemTableIterator::new(engine.inner.as_ref(), Arc::new(range), 300);
-        iter_300.advance().unwrap();
+        iter_300.advance().await.unwrap();
         assert!(iter_300.valid());
         assert_eq!(iter_300.user_key(), b"key1");
         assert!(iter_300.is_pending());
         assert_eq!(iter_300.pending_owner(), 200);
     }
 
-    #[test]
-    fn test_arc_iterator_with_owner() {
+    #[tokio::test]
+    async fn test_arc_iterator_with_owner() {
         use crate::storage::mvcc::MvccKey;
 
         let engine = VersionedMemTableEngine::new();
@@ -3442,14 +3450,14 @@ mod tests {
         let mut arc_iter =
             ArcVersionedMemTableIterator::new(engine.inner_arc(), Arc::new(range), 200);
 
-        arc_iter.advance().unwrap();
+        arc_iter.advance().await.unwrap();
         assert!(arc_iter.valid());
         assert_eq!(arc_iter.user_key(), b"key1");
         assert_eq!(arc_iter.value(), b"pending");
     }
 
-    #[test]
-    fn test_scan_iter_with_owner_via_storage_engine() {
+    #[tokio::test]
+    async fn test_scan_iter_with_owner_via_storage_engine() {
         use crate::storage::mvcc::MvccKey;
         use crate::storage::{MvccIterator, PessimisticStorage, StorageEngine};
 
@@ -3468,14 +3476,14 @@ mod tests {
         };
         let mut iter = engine.scan_iter(range, 200).unwrap();
 
-        iter.advance().unwrap();
+        iter.advance().await.unwrap();
         assert!(iter.valid());
         assert_eq!(iter.user_key(), b"key1");
         assert_eq!(iter.value(), b"pending");
     }
 
-    #[test]
-    fn test_iterator_with_owner_pending_only_key() {
+    #[tokio::test]
+    async fn test_iterator_with_owner_pending_only_key() {
         use crate::storage::mvcc::MvccKey;
 
         let engine = VersionedMemTableEngine::new();
@@ -3492,7 +3500,7 @@ mod tests {
         };
         let mut non_owner_iter =
             VersionedMemTableIterator::new(engine.inner.as_ref(), Arc::new(range), 0);
-        non_owner_iter.advance().unwrap();
+        non_owner_iter.advance().await.unwrap();
         assert!(non_owner_iter.valid());
         assert!(non_owner_iter.is_pending());
         assert_eq!(non_owner_iter.pending_owner(), 200);
@@ -3504,15 +3512,15 @@ mod tests {
         };
         let mut owner_iter =
             VersionedMemTableIterator::new(engine.inner.as_ref(), Arc::new(range2), 200);
-        owner_iter.advance().unwrap();
+        owner_iter.advance().await.unwrap();
         assert!(owner_iter.valid());
         assert_eq!(owner_iter.user_key(), b"key1");
         assert_eq!(owner_iter.value(), b"pending");
         assert!(!owner_iter.is_pending());
     }
 
-    #[test]
-    fn test_iterator_with_owner_lock_only_key() {
+    #[tokio::test]
+    async fn test_iterator_with_owner_lock_only_key() {
         use crate::storage::mvcc::MvccKey;
 
         let engine = VersionedMemTableEngine::new();
@@ -3530,14 +3538,14 @@ mod tests {
         };
         let mut owner_iter =
             VersionedMemTableIterator::new(engine.inner.as_ref(), Arc::new(range), 200);
-        owner_iter.advance().unwrap();
+        owner_iter.advance().await.unwrap();
         assert!(!owner_iter.valid()); // LOCK is skipped, no other version
     }
 
     // ==================== Additional Coverage Tests ====================
 
-    #[test]
-    fn test_delete_nonexistent_key() {
+    #[tokio::test]
+    async fn test_delete_nonexistent_key() {
         let engine = VersionedMemTableEngine::new();
 
         // Delete on nonexistent key should return Ok(false)
@@ -3546,8 +3554,8 @@ mod tests {
         assert!(!result.unwrap()); // False means nothing was deleted
     }
 
-    #[test]
-    fn test_abort_nonexistent_key() {
+    #[tokio::test]
+    async fn test_abort_nonexistent_key() {
         let engine = VersionedMemTableEngine::new();
 
         // Abort on nonexistent key should complete without error
@@ -3555,8 +3563,8 @@ mod tests {
         // No error expected
     }
 
-    #[test]
-    fn test_finalize_nonexistent_key() {
+    #[tokio::test]
+    async fn test_finalize_nonexistent_key() {
         let engine = VersionedMemTableEngine::new();
 
         // Finalize on nonexistent key should complete without error
@@ -3564,8 +3572,8 @@ mod tests {
         // No error expected
     }
 
-    #[test]
-    fn test_get_lock_owner_nonexistent_key() {
+    #[tokio::test]
+    async fn test_get_lock_owner_nonexistent_key() {
         let engine = VersionedMemTableEngine::new();
 
         // get_lock_owner on nonexistent key should return None
@@ -3573,8 +3581,8 @@ mod tests {
         assert!(result.is_none());
     }
 
-    #[test]
-    fn test_get_lock_owner_committed_key() {
+    #[tokio::test]
+    async fn test_get_lock_owner_committed_key() {
         let engine = VersionedMemTableEngine::new();
 
         // Committed key has no lock owner
@@ -3583,8 +3591,8 @@ mod tests {
         assert!(result.is_none());
     }
 
-    #[test]
-    fn test_get_lock_owner_pending_key() {
+    #[tokio::test]
+    async fn test_get_lock_owner_pending_key() {
         let engine = VersionedMemTableEngine::new();
 
         // Pending key has lock owner
@@ -3593,8 +3601,8 @@ mod tests {
         assert_eq!(result, Some(200));
     }
 
-    #[test]
-    fn test_delete_already_tombstone() {
+    #[tokio::test]
+    async fn test_delete_already_tombstone() {
         let engine = VersionedMemTableEngine::new();
 
         // Write then delete (commit) using write batch
@@ -3611,8 +3619,8 @@ mod tests {
         assert!(!result.unwrap());
     }
 
-    #[test]
-    fn test_finalize_on_committed_key() {
+    #[tokio::test]
+    async fn test_finalize_on_committed_key() {
         let engine = VersionedMemTableEngine::new();
 
         // Write committed data
@@ -3623,8 +3631,8 @@ mod tests {
         // No error expected
     }
 
-    #[test]
-    fn test_abort_on_committed_key() {
+    #[tokio::test]
+    async fn test_abort_on_committed_key() {
         let engine = VersionedMemTableEngine::new();
 
         // Write committed data
@@ -3635,8 +3643,8 @@ mod tests {
         // No error expected
     }
 
-    #[test]
-    fn test_finalize_wrong_owner() {
+    #[tokio::test]
+    async fn test_finalize_wrong_owner() {
         let engine = VersionedMemTableEngine::new();
 
         // Write pending with owner 100
@@ -3649,8 +3657,8 @@ mod tests {
         assert_eq!(engine.get_lock_owner(b"key"), Some(100));
     }
 
-    #[test]
-    fn test_abort_wrong_owner() {
+    #[tokio::test]
+    async fn test_abort_wrong_owner() {
         let engine = VersionedMemTableEngine::new();
 
         // Write pending with owner 100
@@ -3663,8 +3671,8 @@ mod tests {
         assert_eq!(engine.get_lock_owner(b"key"), Some(100));
     }
 
-    #[test]
-    fn test_get_with_owner_tombstone_filtering() {
+    #[tokio::test]
+    async fn test_get_with_owner_tombstone_filtering() {
         let engine = VersionedMemTableEngine::new();
 
         // Write then delete (pending tombstone)
@@ -3677,8 +3685,8 @@ mod tests {
         assert!(result.is_none() || result.as_ref().is_some_and(|v| is_lock(v)));
     }
 
-    #[test]
-    fn test_put_pending_then_finalize_then_read() {
+    #[tokio::test]
+    async fn test_put_pending_then_finalize_then_read() {
         let engine = VersionedMemTableEngine::new();
 
         // Put pending
@@ -3692,8 +3700,8 @@ mod tests {
         assert_eq!(result, Some(b"value".to_vec()));
     }
 
-    #[test]
-    fn test_put_pending_then_abort_then_read() {
+    #[tokio::test]
+    async fn test_put_pending_then_abort_then_read() {
         let engine = VersionedMemTableEngine::new();
 
         // Put pending
@@ -3707,8 +3715,8 @@ mod tests {
         assert!(result.is_none());
     }
 
-    #[test]
-    fn test_multiple_abort_same_key() {
+    #[tokio::test]
+    async fn test_multiple_abort_same_key() {
         let engine = VersionedMemTableEngine::new();
 
         // Write committed base
@@ -3727,8 +3735,8 @@ mod tests {
         assert_eq!(result, Some(b"v3".to_vec()));
     }
 
-    #[test]
-    fn test_engine_default() {
+    #[tokio::test]
+    async fn test_engine_default() {
         // Test Default trait implementation
         let engine1 = VersionedMemTableEngine::new();
         let engine2 = VersionedMemTableEngine::default();
@@ -3740,8 +3748,8 @@ mod tests {
         assert_eq!(engine2.len(), 0);
     }
 
-    #[test]
-    fn test_write_batch_empty() {
+    #[tokio::test]
+    async fn test_write_batch_empty() {
         let engine = VersionedMemTableEngine::new();
 
         // Empty write batch (with commit_ts set) should work
@@ -3752,8 +3760,8 @@ mod tests {
         assert!(engine.is_empty());
     }
 
-    #[test]
-    fn test_write_batch_delete_only() {
+    #[tokio::test]
+    async fn test_write_batch_delete_only() {
         let engine = VersionedMemTableEngine::new();
 
         // First put a value
@@ -3773,8 +3781,8 @@ mod tests {
         assert!(result.is_none());
     }
 
-    #[test]
-    fn test_scan_iter_with_range_boundaries() {
+    #[tokio::test]
+    async fn test_scan_iter_with_range_boundaries() {
         use crate::storage::StorageEngine;
 
         let engine = VersionedMemTableEngine::new();
@@ -3788,12 +3796,12 @@ mod tests {
         // Scan all - should get all 4 keys
         let range = MvccKey::unbounded()..MvccKey::unbounded();
         let mut iter = engine.scan_iter(range, 0).unwrap();
-        iter.advance().unwrap();
+        iter.advance().await.unwrap();
 
         let mut keys = Vec::new();
         while iter.valid() {
             keys.push(iter.user_key().to_vec());
-            iter.advance().unwrap();
+            iter.advance().await.unwrap();
         }
 
         assert_eq!(keys.len(), 4);
@@ -3803,8 +3811,8 @@ mod tests {
         assert_eq!(keys[3], b"ddd");
     }
 
-    #[test]
-    fn test_concurrent_put_and_read() {
+    #[tokio::test]
+    async fn test_concurrent_put_and_read() {
         use std::sync::Arc;
         use std::thread;
 
