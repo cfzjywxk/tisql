@@ -263,7 +263,6 @@ impl SQLEngine {
             .execute_with_session(plan, txn_service, catalog, session)
             .await
     }
-
 }
 
 // ============================================================================
@@ -313,6 +312,9 @@ pub struct Database {
     flush_scheduler: FlushScheduler,
     /// Background compaction scheduler (Drop stops the worker)
     compaction_scheduler: CompactionScheduler,
+    /// Dedicated worker runtime for query execution (separate from protocol I/O).
+    /// Created in `open()` for production; `None` in tests (falls back to tokio::spawn).
+    worker_runtime: Option<tokio::runtime::Runtime>,
 }
 
 impl Database {
@@ -376,6 +378,22 @@ impl Database {
             catalog.load_schema_version()?;
         }
 
+        // Create dedicated worker runtime for query execution.
+        // Sized to available parallelism (defaults to CPU count).
+        let worker_threads = std::thread::available_parallelism()
+            .map(|n| n.get())
+            .unwrap_or(4);
+        let worker_runtime = tokio::runtime::Builder::new_multi_thread()
+            .worker_threads(worker_threads)
+            .thread_name("tisql-worker")
+            .enable_all()
+            .build()
+            .map_err(|e| {
+                crate::error::TiSqlError::Internal(format!("Failed to create worker runtime: {e}"))
+            })?;
+
+        log_info!("Worker runtime created with {} threads", worker_threads);
+
         Ok(Self {
             sql_engine: SQLEngine::new(),
             txn_service,
@@ -384,7 +402,16 @@ impl Database {
             storage,
             flush_scheduler,
             compaction_scheduler,
+            worker_runtime: Some(worker_runtime),
         })
+    }
+
+    /// Get a handle to the dedicated worker runtime, if available.
+    ///
+    /// Returns `Some` in production (server mode), `None` in tests.
+    /// When `None`, `dispatch_full_query` falls back to `tokio::spawn`.
+    pub fn worker_handle(&self) -> Option<&tokio::runtime::Handle> {
+        self.worker_runtime.as_ref().map(|rt| rt.handle())
     }
 
     /// Handle MySQL protocol query text (COM_QUERY).
@@ -647,7 +674,13 @@ impl Database {
 
 impl Drop for Database {
     fn drop(&mut self) {
-        // Stop background schedulers first (flush before compaction)
+        // Shut down worker runtime first — drain in-flight queries before
+        // stopping background schedulers and flushing storage.
+        if let Some(rt) = self.worker_runtime.take() {
+            rt.shutdown_background();
+        }
+
+        // Stop background schedulers (flush before compaction)
         self.flush_scheduler.stop();
         self.compaction_scheduler.stop();
 

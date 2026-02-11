@@ -14,9 +14,10 @@
 
 // MySQL wire protocol implementation using opensrv-mysql
 //
-// Thin protocol layer: transaction control runs directly on the async task
-// (CPU-only). Query execution is dispatched to a worker task via
-// worker::dispatch_full_query which awaits async storage I/O.
+// Thin I/O shell: ALL database work (parse, bind, execute, txn control,
+// SHOW) is dispatched to the worker runtime via dispatch_full_query.
+// Protocol task only handles MySQL wire I/O, session state (SET/USE),
+// and @@variables.
 
 use std::io;
 use std::sync::Arc;
@@ -31,41 +32,7 @@ use tokio::io::AsyncWrite;
 use crate::session::{ExecutionCtx, Session};
 use crate::types::{DataType, Value};
 use crate::worker::{self, QueryResponse};
-use crate::{log_debug, log_info, log_warn, Database};
-
-// ============================================================================
-// Statement Classification
-// ============================================================================
-
-/// Classifies SQL statements for protocol-level handling.
-#[derive(Debug)]
-enum StatementType {
-    Begin { read_only: bool },
-    Commit,
-    Rollback,
-    UseDatabase(String),
-    Other,
-}
-
-fn classify_statement(sql: &str) -> StatementType {
-    let sql_trimmed = sql.trim();
-    let sql_upper = sql_trimmed.to_uppercase();
-
-    if sql_upper.starts_with("BEGIN") || sql_upper.starts_with("START TRANSACTION") {
-        let read_only = sql_upper.contains("READ ONLY");
-        StatementType::Begin { read_only }
-    } else if sql_upper.starts_with("COMMIT") {
-        StatementType::Commit
-    } else if sql_upper.starts_with("ROLLBACK") {
-        StatementType::Rollback
-    } else if sql_upper.starts_with("USE ") {
-        let db_name = sql_trimmed[4..].trim();
-        let db_name = db_name.trim_matches('`').trim_end_matches(';').trim();
-        StatementType::UseDatabase(db_name.to_string())
-    } else {
-        StatementType::Other
-    }
-}
+use crate::{log_debug, log_info, Database};
 
 /// MySQL protocol backend for a single client connection.
 pub struct MySqlBackend {
@@ -129,31 +96,26 @@ impl<W: AsyncWrite + Send + Unpin> AsyncMysqlShim<W> for MySqlBackend {
             return results.completed(Self::make_ok_response(0, 0)).await;
         }
 
-        // SHOW — catalog queries dispatched via spawn_blocking
-        if query_lower.starts_with("show ") {
-            return self.handle_show(query, results).await;
-        }
-
-        // @@variables — pure computation
+        // @@variables — pure computation, no DB access
         if query_lower.contains("@@") {
             return self.handle_system_variable(query, results).await;
         }
 
-        match classify_statement(query) {
-            StatementType::Begin { read_only } => self.handle_begin(read_only, results).await,
-            StatementType::Commit => self.handle_commit(results).await,
-            StatementType::Rollback => self.handle_rollback(results).await,
-            StatementType::UseDatabase(db_name) => {
-                log_info!(
-                    "Session {} selected database via USE query: {}",
-                    self.session.id(),
-                    db_name
-                );
-                self.session.set_current_db(&db_name);
-                results.completed(Self::make_ok_response(0, 0)).await
-            }
-            StatementType::Other => self.dispatch_query(query, results).await,
+        // USE — session state update, no DB access
+        if query_lower.starts_with("use ") {
+            let db_name = query.trim()[4..].trim();
+            let db_name = db_name.trim_matches('`').trim_end_matches(';').trim();
+            log_info!(
+                "Session {} selected database via USE query: {}",
+                self.session.id(),
+                db_name
+            );
+            self.session.set_current_db(db_name);
+            return results.completed(Self::make_ok_response(0, 0)).await;
         }
+
+        // Everything else → worker runtime
+        self.dispatch_query(query, results).await
     }
 
     async fn on_prepare<'a>(
@@ -182,112 +144,7 @@ impl<W: AsyncWrite + Send + Unpin> AsyncMysqlShim<W> for MySqlBackend {
 
 impl MySqlBackend {
     // ========================================================================
-    // Transaction Control — runs directly on async task (CPU-only, no I/O)
-    // ========================================================================
-
-    async fn handle_begin<W: AsyncWrite + Send + Unpin>(
-        &mut self,
-        read_only: bool,
-        results: QueryResultWriter<'_, W>,
-    ) -> io::Result<()> {
-        if self.session.has_active_txn() {
-            return results
-                .error(
-                    ErrorKind::ER_UNKNOWN_ERROR,
-                    b"Nested transactions are not supported. Use COMMIT or ROLLBACK first.",
-                )
-                .await;
-        }
-
-        // CPU-only: allocates TSO timestamp + creates TxnCtx
-        match self.db.begin_explicit(read_only) {
-            Ok(txn_ctx) => {
-                log_debug!(
-                    "Session {} started explicit transaction (txn_id={}, read_only={})",
-                    self.session.id(),
-                    txn_ctx.txn_id(),
-                    read_only
-                );
-                self.session.set_current_txn(txn_ctx);
-                results.completed(Self::make_ok_response(0, 0)).await
-            }
-            Err(e) => {
-                results
-                    .error(ErrorKind::ER_UNKNOWN_ERROR, e.to_string().as_bytes())
-                    .await
-            }
-        }
-    }
-
-    async fn handle_commit<W: AsyncWrite + Send + Unpin>(
-        &mut self,
-        results: QueryResultWriter<'_, W>,
-    ) -> io::Result<()> {
-        if let Some(ctx) = self.session.take_current_txn() {
-            let txn_id = ctx.txn_id();
-            // Async: yields during clog fsync
-            match self.db.commit_async(ctx).await {
-                Ok(info) => {
-                    log_debug!(
-                        "Session {} committed transaction (txn_id={}, commit_ts={})",
-                        self.session.id(),
-                        info.txn_id,
-                        info.commit_ts
-                    );
-                    results.completed(Self::make_ok_response(0, 0)).await
-                }
-                Err(e) => {
-                    log_warn!(
-                        "Session {} failed to commit transaction (txn_id={}): {}",
-                        self.session.id(),
-                        txn_id,
-                        e
-                    );
-                    results
-                        .error(ErrorKind::ER_UNKNOWN_ERROR, e.to_string().as_bytes())
-                        .await
-                }
-            }
-        } else {
-            results.completed(Self::make_ok_response(0, 0)).await
-        }
-    }
-
-    async fn handle_rollback<W: AsyncWrite + Send + Unpin>(
-        &mut self,
-        results: QueryResultWriter<'_, W>,
-    ) -> io::Result<()> {
-        if let Some(ctx) = self.session.take_current_txn() {
-            let txn_id = ctx.txn_id();
-            // CPU-only: releases in-memory locks and pending nodes
-            match self.db.rollback(ctx) {
-                Ok(()) => {
-                    log_debug!(
-                        "Session {} rolled back transaction (txn_id={})",
-                        self.session.id(),
-                        txn_id
-                    );
-                    results.completed(Self::make_ok_response(0, 0)).await
-                }
-                Err(e) => {
-                    log_warn!(
-                        "Session {} failed to rollback transaction (txn_id={}): {}",
-                        self.session.id(),
-                        txn_id,
-                        e
-                    );
-                    results
-                        .error(ErrorKind::ER_UNKNOWN_ERROR, e.to_string().as_bytes())
-                        .await
-                }
-            }
-        } else {
-            results.completed(Self::make_ok_response(0, 0)).await
-        }
-    }
-
-    // ========================================================================
-    // Query Dispatch
+    // Query Dispatch — single entry point for all DB commands
     // ========================================================================
 
     async fn dispatch_query<W: AsyncWrite + Send + Unpin>(
@@ -296,15 +153,23 @@ impl MySqlBackend {
         results: QueryResultWriter<'_, W>,
     ) -> io::Result<()> {
         let db = Arc::clone(&self.db);
+        let worker_handle = db.worker_handle().cloned();
         let exec_ctx = ExecutionCtx::from_session(&self.session);
         let txn_ctx = self.session.take_current_txn();
 
-        let response = worker::dispatch_full_query(db, query.to_string(), exec_ctx, txn_ctx).await;
+        let response = worker::dispatch_full_query(
+            worker_handle.as_ref(),
+            db,
+            query.to_string(),
+            exec_ctx,
+            txn_ctx,
+        )
+        .await;
 
         match response {
             QueryResponse::Rows {
                 columns,
-                mut exec,
+                mut batch_rx,
                 txn_ctx,
             } => {
                 if let Some(ctx) = txn_ctx {
@@ -323,17 +188,16 @@ impl MySqlBackend {
 
                 let mut rw = results.start(&cols).await?;
 
-                // Pull rows directly from the live operator tree
-                loop {
-                    match exec.next().await {
-                        Ok(Some(row)) => {
-                            for val in row.iter() {
-                                write_value_col(&mut rw, val)?;
+                // Receive row batches from the worker
+                while let Some(batch_result) = batch_rx.recv().await {
+                    match batch_result {
+                        Ok(batch) => {
+                            for row in &batch {
+                                for val in row.iter() {
+                                    write_value_col(&mut rw, val)?;
+                                }
+                                rw.end_row().await?;
                             }
-                            rw.end_row().await?;
-                        }
-                        Ok(None) => {
-                            return rw.finish().await;
                         }
                         Err(e) => {
                             return rw
@@ -345,6 +209,8 @@ impl MySqlBackend {
                         }
                     }
                 }
+
+                rw.finish().await
             }
             QueryResponse::Affected { count, txn_ctx } => {
                 if let Some(ctx) = txn_ctx {
@@ -370,135 +236,8 @@ impl MySqlBackend {
     }
 
     // ========================================================================
-    // SHOW and System Variable Handlers
+    // System Variable Handler — pure computation, no DB access
     // ========================================================================
-
-    async fn handle_show<W: AsyncWrite + Send + Unpin>(
-        &self,
-        query: &str,
-        results: QueryResultWriter<'_, W>,
-    ) -> io::Result<()> {
-        let query_lower = query.trim().to_lowercase();
-
-        if query_lower.contains("databases") {
-            // Catalog scan — storage I/O via spawn_blocking
-            let db = Arc::clone(&self.db);
-            let result = tokio::task::spawn_blocking(move || db.list_schemas()).await;
-
-            match result {
-                Ok(Ok(databases)) => {
-                    let cols = vec![Column {
-                        table: String::new(),
-                        column: "Database".to_string(),
-                        coltype: ColumnType::MYSQL_TYPE_VAR_STRING,
-                        colflags: ColumnFlags::empty(),
-                    }];
-                    let mut rw = results.start(&cols).await?;
-                    for db_name in databases {
-                        rw.write_col(db_name.as_str())?;
-                        rw.end_row().await?;
-                    }
-                    rw.finish().await
-                }
-                Ok(Err(e)) => {
-                    results
-                        .error(ErrorKind::ER_UNKNOWN_ERROR, e.to_string().as_bytes())
-                        .await
-                }
-                Err(e) => {
-                    results
-                        .error(
-                            ErrorKind::ER_UNKNOWN_ERROR,
-                            format!("Internal error: {e}").as_bytes(),
-                        )
-                        .await
-                }
-            }
-        } else if query_lower.contains("tables") {
-            // Catalog scan — storage I/O via spawn_blocking
-            let db = Arc::clone(&self.db);
-            let database = self.session.current_db().to_string();
-            let col_name = format!("Tables_in_{}", self.session.current_db());
-            let result = tokio::task::spawn_blocking(move || db.list_tables(&database)).await;
-
-            match result {
-                Ok(Ok(tables)) => {
-                    let cols = vec![Column {
-                        table: String::new(),
-                        column: col_name,
-                        coltype: ColumnType::MYSQL_TYPE_VAR_STRING,
-                        colflags: ColumnFlags::empty(),
-                    }];
-                    let mut rw = results.start(&cols).await?;
-                    for table in tables {
-                        rw.write_col(table.as_str())?;
-                        rw.end_row().await?;
-                    }
-                    rw.finish().await
-                }
-                Ok(Err(e)) => {
-                    results
-                        .error(ErrorKind::ER_UNKNOWN_ERROR, e.to_string().as_bytes())
-                        .await
-                }
-                Err(e) => {
-                    results
-                        .error(
-                            ErrorKind::ER_UNKNOWN_ERROR,
-                            format!("Internal error: {e}").as_bytes(),
-                        )
-                        .await
-                }
-            }
-        } else if query_lower.contains("warnings") {
-            let cols = vec![
-                Column {
-                    table: String::new(),
-                    column: "Level".to_string(),
-                    coltype: ColumnType::MYSQL_TYPE_VAR_STRING,
-                    colflags: ColumnFlags::empty(),
-                },
-                Column {
-                    table: String::new(),
-                    column: "Code".to_string(),
-                    coltype: ColumnType::MYSQL_TYPE_LONG,
-                    colflags: ColumnFlags::empty(),
-                },
-                Column {
-                    table: String::new(),
-                    column: "Message".to_string(),
-                    coltype: ColumnType::MYSQL_TYPE_VAR_STRING,
-                    colflags: ColumnFlags::empty(),
-                },
-            ];
-            let rw = results.start(&cols).await?;
-            rw.finish().await
-        } else if query_lower.contains("status") {
-            let cols = vec![
-                Column {
-                    table: String::new(),
-                    column: "Variable_name".to_string(),
-                    coltype: ColumnType::MYSQL_TYPE_VAR_STRING,
-                    colflags: ColumnFlags::empty(),
-                },
-                Column {
-                    table: String::new(),
-                    column: "Value".to_string(),
-                    coltype: ColumnType::MYSQL_TYPE_VAR_STRING,
-                    colflags: ColumnFlags::empty(),
-                },
-            ];
-            let rw = results.start(&cols).await?;
-            rw.finish().await
-        } else {
-            results
-                .error(
-                    ErrorKind::ER_UNKNOWN_ERROR,
-                    format!("Unsupported SHOW command: {query}").as_bytes(),
-                )
-                .await
-        }
-    }
 
     async fn handle_system_variable<W: AsyncWrite + Send + Unpin>(
         &self,

@@ -891,12 +891,33 @@ impl Executor for SimpleExecutor {
             return Ok((ExecutionOutput::Ok, txn_ctx));
         }
 
-        // Transaction control statements should NOT be dispatched here.
-        // They are handled at the protocol layer.
+        // Handle transaction control statements directly.
         if plan.is_transaction_control() {
-            return Err(TiSqlError::Internal(
-                "Transaction control statements should be handled at protocol layer".into(),
-            ));
+            return match plan {
+                LogicalPlan::Begin { read_only } => {
+                    if txn_ctx.is_some() {
+                        return Err(TiSqlError::Internal(
+                            "Nested transactions are not supported. Use COMMIT or ROLLBACK first."
+                                .into(),
+                        ));
+                    }
+                    let ctx = txn_service.begin_explicit(read_only)?;
+                    Ok((ExecutionOutput::Ok, Some(ctx)))
+                }
+                LogicalPlan::Commit => {
+                    if let Some(ctx) = txn_ctx {
+                        txn_service.commit(ctx)?;
+                    }
+                    Ok((ExecutionOutput::Ok, None))
+                }
+                LogicalPlan::Rollback => {
+                    if let Some(ctx) = txn_ctx {
+                        txn_service.rollback(ctx)?;
+                    }
+                    Ok((ExecutionOutput::Ok, None))
+                }
+                _ => unreachable!(),
+            };
         }
 
         match txn_ctx {

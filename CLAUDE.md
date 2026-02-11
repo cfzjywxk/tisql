@@ -37,7 +37,14 @@
 └───────────────────────────────┬─────────────────────────────────┘
                                 ▼
 ┌─────────────────────────────────────────────────────────────────┐
-│  Protocol Layer: MySqlServer (opensrv-mysql) + Session          │
+│  Protocol Layer: MySqlServer (thin I/O shell)                    │
+│  SET/USE/@@vars handled inline; everything else → worker         │
+└───────────────────────────────┬─────────────────────────────────┘
+                       mpsc batched row streaming
+                                ▼
+┌─────────────────────────────────────────────────────────────────┐
+│  Worker Runtime: Dedicated tokio runtime (tisql-worker)          │
+│  parse + bind + execute + txn control + SHOW                    │
 └───────────────────────────────┬─────────────────────────────────┘
                                 ▼
 ┌─────────────────────────────────────────────────────────────────┐
@@ -78,8 +85,8 @@ src/
 ├── clog/            # FileClogService (commit log / WAL)
 ├── catalog/         # MemoryCatalog (schema metadata)
 ├── codec/           # TiDB-compatible key/value encoding
-├── protocol/        # MySQL protocol handler
-└── worker/          # Async worker dispatch (tokio::spawn)
+├── protocol/        # MySQL protocol handler (thin I/O shell)
+└── worker/          # Dedicated worker runtime dispatch (mpsc row streaming)
 ```
 
 ---
@@ -107,7 +114,8 @@ mysql -h 127.0.0.1 -P 4000 -uroot
 ### Completed
 
 - **SQL**: Parsing (sqlparser), binding, volcano-style execution with end-to-end streaming
-- **Protocol**: MySQL wire protocol (opensrv-mysql), session lifecycle, direct row streaming
+- **Protocol**: MySQL wire protocol (opensrv-mysql), thin I/O shell with batched row streaming
+- **Worker Runtime**: Dedicated tokio runtime for all DB work (OceanBase-inspired physical thread separation)
 - **Transaction**: Unified TxnService with TxnCtx, 1PC with in-memory locks
 - **Explicit Transactions**: BEGIN/COMMIT/ROLLBACK SQL support with pessimistic locking
 - **MVCC**: Key encoding (`key || !commit_ts`), snapshot isolation
@@ -190,14 +198,23 @@ src/storage/
 
 ### Recent Changes
 
+**Physical Thread Separation — Dedicated Worker Runtime (Feb 2026)**
+- **Separate runtimes**: Protocol I/O runs on main tokio runtime; ALL database work (parse, bind, execute, txn control, SHOW) runs on dedicated `tisql-worker` tokio runtime
+- **OceanBase-inspired**: Like OceanBase's I/O thread / worker thread separation, but adapted for `opensrv-mysql` (serialization stays on protocol task)
+- **Batched row streaming**: Worker pulls rows from live operator tree, accumulates batches of 1024, sends via bounded `mpsc(4)` channel to protocol — `Execution` never crosses runtime boundary
+- **Thin protocol shell**: Protocol only handles SET/USE/@@variables inline; everything else dispatched to worker via `dispatch_full_query`
+- **Txn control in worker**: `execute_unified` now handles BEGIN/COMMIT/ROLLBACK directly (was protocol-only before), enabling full worker dispatch
+- **SHOW in worker**: Catalog scans run on worker runtime (no more `spawn_blocking`)
+- **Removed from protocol**: `handle_begin`, `handle_commit`, `handle_rollback`, `handle_show`, `classify_statement` — protocol is now ~230 lines (was ~600)
+- **Database::worker_runtime**: `Option<tokio::runtime::Runtime>` — created in `open()` with `available_parallelism()` threads; `None` falls back to `tokio::spawn` (test path)
+- **Graceful shutdown**: Worker runtime shut down before schedulers in `Database::drop()`
+- Memory per query: 1 oneshot + 1 mpsc(4) + batches of 1024 rows (bounded)
+
 **End-to-End Streaming — Zero Materialization (Feb 2026)**
 - **RowPuller trait**: Type-erased async row pulling interface — `Operator<I>` implements it directly, enabling live operator trees to flow through non-generic `Execution`
 - **Execution refactor**: Changed from `Vec<Row>::IntoIter` to `Box<dyn RowPuller>` — `exec.next().await` pulls rows one-at-a-time from the operator tree
 - **Streaming execute_with_ctx**: Returns `ExecutionOutput::Rows { schema, exec }` with a live operator tree — zero `Vec<Row>` allocation in the production path
-- **Oneshot-only worker**: Eliminated mpsc(4) batch channel — `Execution` handle transferred via single oneshot from worker to protocol task, protocol pulls rows directly
-- **Direct wire streaming**: Protocol task calls `exec.next().await` in a loop, writing each row to MySQL wire immediately — O(1) memory per row
 - **Dead code cleanup**: Removed `Database::handle_query()`, `SQLEngine::execute()`, `Database::handle_mp_query_with_session()` (118 lines)
-- Memory: 0 heap allocs per row (read path), 1 oneshot + 1 Box<Operator> per query (fixed)
 
 **Async Iterator Pipeline (Feb 2026)**
 - All iterator `seek()`/`advance()` are `async fn` using native AFIT (Rust 1.88.0, no `#[async_trait]`)
@@ -224,12 +241,12 @@ src/storage/
 - SstBuilder writes remain on std I/O (written once during flush/compaction, not a bottleneck)
 - Total: 795 library tests, 40 store/compaction tests, 12 integration tests pass
 
-**Worker Dispatch — Single Runtime, Fully Async (Feb 2026)**
-- **Single tokio runtime**: No separate WorkerPool — `tokio::spawn` for worker tasks on the shared runtime
-- **Full query dispatch**: `dispatch_full_query()` spawns async task: parse → bind → execute → return `Execution` via oneshot
-- **Oneshot-only**: Worker sends `QueryResponse` (containing live `Execution` handle) via single oneshot — no mpsc channel, no batching
-- **Transaction control**: BEGIN/ROLLBACK run directly on protocol task (CPU-only), COMMIT awaits `commit_async()` (yields during fsync)
-- **SHOW dispatch**: `spawn_blocking` for catalog scan
+**Worker Dispatch — Dedicated Runtime, mpsc Streaming (Feb 2026)**
+- **Dedicated worker runtime**: `Database::worker_runtime` — separate tokio runtime for all DB work; protocol runtime handles only I/O
+- **Full query dispatch**: `dispatch_full_query(worker_handle, ...)` spawns on worker runtime: parse → bind → execute → stream rows via mpsc
+- **Batched streaming**: Read queries stream `Vec<Row>` batches (1024 rows) via `mpsc::channel(4)`; protocol receives batches and writes to wire
+- **All commands dispatched**: SELECT, INSERT, DDL, BEGIN, COMMIT, ROLLBACK, SHOW — all go through worker
+- **Fallback path**: When `worker_handle` is `None` (tests), falls back to `tokio::spawn` on current runtime
 
 **Async Refactoring: yatp Routing + parking_lot + Group Commit (Feb 2026)**
 - **yatp routing**: All DB-accessing MySQL commands (BEGIN, COMMIT, ROLLBACK, SHOW TABLES/DATABASES) now dispatched to yatp worker pool via `WorkerCommand`/`WorkerResult` enums, keeping tokio threads free for network I/O
@@ -333,10 +350,10 @@ src/storage/
 - [x] Group commit for clog/ilog (batched fsync via dedicated writer thread)
 - [x] parking_lot locks (replaced std::sync across all modules)
 - [x] yatp routing for all DB commands (BEGIN/COMMIT/ROLLBACK/SHOW off tokio threads)
-- [x] Dedicated WorkerPool (parse+bind+execute on worker runtime, batch size 1024)
+- [x] Dedicated worker runtime (physical thread separation — protocol I/O vs DB work)
 - [x] Async iterator pipeline (native AFIT async seek/advance on all iterators)
 - [x] Volcano-style operator tree (pull-based Operator<I> with open/next/close)
-- [x] End-to-end streaming (zero materialization, Execution via oneshot, direct wire streaming)
+- [x] End-to-end streaming (batched mpsc row streaming from worker to protocol)
 - [ ] Background compaction workers
 - [ ] Block cache for SST read performance
 - [ ] Bloom filters for SST point lookups

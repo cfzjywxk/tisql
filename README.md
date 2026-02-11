@@ -79,7 +79,11 @@ cargo test --test concurrency_test --features failpoints
                          MySQL Client
                               |
                     +---------+---------+
-                    |  Protocol Layer   |  opensrv-mysql
+                    |  Protocol Layer   |  opensrv-mysql (thin I/O shell)
+                    +---------+---------+
+                              |  mpsc batched row streaming
+                    +---------+---------+
+                    |  Worker Runtime   |  Dedicated tokio runtime
                     +---------+---------+
                               |
                     +---------+---------+
@@ -105,21 +109,22 @@ src/
 ├── clog/            # Commit log (WAL) with group commit
 ├── executor/        # Volcano-style operator tree (streaming)
 ├── io/              # io_uring async I/O (O_DIRECT, AlignedBuf, DmaFile)
-├── protocol/        # MySQL wire protocol
+├── protocol/        # MySQL wire protocol (thin I/O shell)
 ├── session/         # Per-connection state
 ├── sql/             # Parser, Binder
 ├── storage/         # LSM engine, memtables, SSTables
 ├── transaction/     # TxnService, ConcurrencyManager
 ├── tso/             # Timestamp oracle
-└── worker/          # Async worker dispatch (tokio::spawn)
+└── worker/          # Dedicated worker runtime dispatch
 ```
 
 ## Design Highlights
 
+- **Physical thread separation**: Protocol I/O on main runtime, all DB work on dedicated worker runtime (OceanBase-inspired)
 - **Trait-based layering**: Each layer depends on traits, not implementations
 - **TiDB/TiKV patterns**: MVCC key encoding, ConcurrencyManager, TSO
 - **OceanBase patterns**: Unified TxnService with TxnCtx, pessimistic locking
-- **Zero materialization**: Rows stream from operator tree directly to MySQL wire — O(1) memory per row
+- **Batched row streaming**: Worker pulls rows from operator tree, sends batches (1024) via bounded mpsc(4) to protocol
 - **Async iterators**: All iterator seek/advance are async fn (native AFIT), yielding during SST I/O
 
 ## License
