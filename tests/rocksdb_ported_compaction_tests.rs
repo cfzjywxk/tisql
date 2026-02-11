@@ -337,7 +337,7 @@ fn test_executor_merge_keys() {
     // Execute with pre-allocated IDs
     let pre_allocated_ids = vec![3, 4];
     let delta = executor
-        .execute(&task, &version, &sst_dir, &pre_allocated_ids)
+        .execute(&task, &version, &sst_dir, &pre_allocated_ids, None)
         .unwrap();
 
     // Verify output
@@ -420,7 +420,7 @@ fn test_executor_mvcc_ordering() {
 
     let pre_allocated_ids = vec![3, 4];
     let delta = executor
-        .execute(&task, &version, &sst_dir, &pre_allocated_ids)
+        .execute(&task, &version, &sst_dir, &pre_allocated_ids, None)
         .unwrap();
 
     // Read and verify all versions are preserved in correct order
@@ -482,7 +482,7 @@ fn test_executor_tombstones() {
 
     let pre_allocated_ids = vec![3, 4];
     let delta = executor
-        .execute(&task, &version, &sst_dir, &pre_allocated_ids)
+        .execute(&task, &version, &sst_dir, &pre_allocated_ids, None)
         .unwrap();
 
     // Both versions should be in output (MVCC preserves all)

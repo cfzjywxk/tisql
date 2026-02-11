@@ -24,7 +24,7 @@ use crate::sql::LogicalPlan;
 use crate::transaction::{TxnCtx, TxnService};
 use crate::types::{Row, Schema};
 
-/// Query execution result
+/// Query execution result (materialized — all rows in memory).
 pub enum ExecutionResult {
     /// Query returned rows
     Rows { schema: Schema, rows: Vec<Row> },
@@ -32,6 +32,58 @@ pub enum ExecutionResult {
     Affected { count: u64 },
     /// DDL success
     Ok,
+}
+
+// ============================================================================
+// Volcano-Style Execution (Streaming)
+// ============================================================================
+
+/// Lazy row-producing execution handle (volcano-style).
+///
+/// Wraps a materialized result set and yields rows one at a time via `next()`.
+/// Created and consumed inside a single blocking task — not `Send`.
+///
+/// Future optimization: replace the inner `Vec<Row>` with a true pull-based
+/// iterator over the storage engine (no materialization).
+pub struct Execution {
+    rows: std::vec::IntoIter<Row>,
+}
+
+impl Execution {
+    pub(crate) fn new(rows: Vec<Row>) -> Self {
+        Self {
+            rows: rows.into_iter(),
+        }
+    }
+
+    /// Pull the next row (volcano-style).
+    #[inline]
+    pub fn next(&mut self) -> Option<Row> {
+        self.rows.next()
+    }
+}
+
+/// Output from plan execution.
+///
+/// Unlike `ExecutionResult` (which materializes all rows), `ExecutionOutput`
+/// wraps an `Execution` handle that yields rows lazily.
+pub enum ExecutionOutput {
+    /// Read query — stream rows via Execution.
+    Rows(Execution),
+    /// DML — affected row count.
+    Affected { count: u64 },
+    /// DDL/session command.
+    Ok,
+}
+
+impl From<ExecutionResult> for ExecutionOutput {
+    fn from(result: ExecutionResult) -> Self {
+        match result {
+            ExecutionResult::Rows { rows, .. } => ExecutionOutput::Rows(Execution::new(rows)),
+            ExecutionResult::Affected { count } => ExecutionOutput::Affected { count },
+            ExecutionResult::Ok => ExecutionOutput::Ok,
+        }
+    }
 }
 
 /// Executor trait - executes plans through TxnService

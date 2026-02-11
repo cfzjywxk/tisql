@@ -39,10 +39,6 @@ async-trait = "0.1"
 # Command line parsing
 clap = { version = "4", features = ["derive"] }
 
-# Thread pool for database work
-yatp = { git = "https://github.com/tikv/yatp.git" }
-num_cpus = "1"
-
 # Concurrent data structures for MVCC
 crossbeam-skiplist = "0.1"
 crossbeam-epoch = "0.9"
@@ -51,6 +47,11 @@ dashmap = "5"
 
 # Fast synchronous locks (spin-then-park, no poisoning)
 parking_lot = "0.12"
+
+# io_uring for async I/O (Linux only)
+[target.'cfg(target_os = "linux")'.dependencies]
+io-uring = "0.7"
+libc = "0.2"
 
 # Memory allocator (jemalloc for production, like TiKV)
 [target.'cfg(unix)'.dependencies]

@@ -1089,6 +1089,17 @@ dependencies = [
 ]
 
 [[package]]
+name = "io-uring"
+version = "0.7.11"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "fdd7bddefd0a8833b88a4b68f90dae22c7450d11b354198baee3874fd811b344"
+dependencies = [
+ "bitflags",
+ "cfg-if",
+ "libc",
+]
+
+[[package]]
 name = "is-terminal"
 version = "0.4.17"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1426,16 +1437,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "num_cpus"
-version = "1.17.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "91df4bbde75afed763b708b7eee1e8e7651e02d97f6d5dd763e89367e957b23b"
-dependencies = [
- "hermit-abi",
- "libc",
-]
-
-[[package]]
 name = "once_cell"
 version = "1.21.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1680,20 +1681,6 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "8fd00f0bb2e90d81d1044c2b32617f68fcb9fa3bb7640c23e9c748e53fb30934"
 dependencies = [
  "unicode-ident",
-]
-
-[[package]]
-name = "prometheus"
-version = "0.13.4"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "3d33c28a30771f7f96db69893f78b857f7450d7e0237e9c8fc6427a81bae7ed1"
-dependencies = [
- "cfg-if",
- "fnv",
- "lazy_static",
- "memchr",
- "parking_lot",
- "thiserror",
 ]
 
 [[package]]
@@ -2377,8 +2364,9 @@ dependencies = [
  "crossbeam-skiplist",
  "dashmap",
  "fail",
+ "io-uring",
+ "libc",
  "mysql_async",
- "num_cpus",
  "opensrv-mysql",
  "parking_lot",
  "regex",
@@ -2390,7 +2378,6 @@ dependencies = [
  "tokio",
  "tracing",
  "tracing-subscriber",
- "yatp",
 ]
 
 [[package]]
@@ -2981,23 +2968,6 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "05f360fc0b24296329c78fda852a1e9ae82de9cf7b27dae4b7f62f118f77b9ed"
 dependencies = [
  "tap",
-]
-
-[[package]]
-name = "yatp"
-version = "0.0.1"
-source = "git+https://github.com/tikv/yatp.git#793be4d789d4bd15292fe4d06e38063b4ec9d48e"
-dependencies = [
- "crossbeam-deque",
- "crossbeam-skiplist",
- "crossbeam-utils",
- "dashmap",
- "fail",
- "lazy_static",
- "num_cpus",
- "parking_lot_core",
- "prometheus",
- "rand",
 ]
 
 [[package]]

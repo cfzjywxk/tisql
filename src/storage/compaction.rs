@@ -417,6 +417,7 @@ impl CompactionExecutor {
         version: &Version,
         sst_dir: &Path,
         pre_allocated_ids: &[u64],
+        io: Option<std::sync::Arc<crate::io::IoService>>,
     ) -> Result<ManifestDelta> {
         // Handle trivial move (just update metadata, no I/O)
         if task.is_trivial_move {
@@ -433,7 +434,11 @@ impl CompactionExecutor {
         let mut readers = Vec::new();
         for (_level, sst_id) in &task.inputs {
             let sst_path = sst_dir.join(format!("{sst_id:08}.sst"));
-            let reader = SstReaderRef::open(&sst_path)?;
+            let reader = if let Some(ref io_service) = io {
+                SstReaderRef::open_with_io(&sst_path, std::sync::Arc::clone(io_service))?
+            } else {
+                SstReaderRef::open(&sst_path)?
+            };
             readers.push(reader);
         }
 
@@ -828,10 +833,10 @@ mod tests {
             is_trivial_move: false,
         };
 
-        // Execute compaction with pre-allocated IDs
+        // Execute compaction with pre-allocated IDs (tests use standard I/O)
         let pre_allocated_ids = vec![3, 4]; // Over-allocate for safety
         let delta = executor
-            .execute(&task, &version, &config.sst_dir(), &pre_allocated_ids)
+            .execute(&task, &version, &config.sst_dir(), &pre_allocated_ids, None)
             .unwrap();
 
         // Verify delta
@@ -1260,7 +1265,7 @@ mod tests {
 
         let pre_allocated_ids = vec![3, 4];
         let delta = executor
-            .execute(&task, &version, &config.sst_dir(), &pre_allocated_ids)
+            .execute(&task, &version, &config.sst_dir(), &pre_allocated_ids, None)
             .unwrap();
 
         // Output should span full key range

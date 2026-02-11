@@ -17,30 +17,21 @@
 //! ## Usage
 //!
 //! ```ignore
-//! // Open an SST file
+//! // Open with IoService (production — io_uring + O_DIRECT)
+//! let reader = SstReader::open_with_io(path, io)?;
+//! let block = reader.read_block(0)?;   // &self — no Mutex needed
+//!
+//! // Open without IoService (tests — standard I/O)
 //! let reader = SstReader::open(path)?;
-//!
-//! // Read a data block
-//! let block = reader.read_block(0)?;
-//!
-//! // Point lookup
-//! if let Some(value) = reader.get(key)? {
-//!     // Found
-//! }
-//!
-//! // Iterate all entries
-//! let mut iter = reader.iter()?;
-//! while let Some((key, value)) = iter.next() {
-//!     // Process entry
-//! }
+//! let block = reader.read_block(0)?;   // &self — uses pread64
 //! ```
 
-use std::fs::File;
-use std::io::{Read, Seek, SeekFrom};
+use std::os::unix::io::AsRawFd;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use crate::error::{Result, TiSqlError};
+use crate::io::{DmaFile, IoService};
 
 use super::block::{DataBlock, IndexBlock, IndexEntry};
 use super::builder::{Footer, FOOTER_SIZE};
@@ -49,16 +40,38 @@ use super::builder::{Footer, FOOTER_SIZE};
 // SstReader
 // ============================================================================
 
+/// Backend for SST file reads.
+///
+/// - `IoUring`: Positional reads via IoService + DmaFile (production path).
+/// - `StdFile`: Positional reads via pread64 on a standard file (test fallback).
+enum ReadBackend {
+    IoUring { file: DmaFile, io: Arc<IoService> },
+    StdFile { file: std::fs::File },
+}
+
+impl std::fmt::Debug for ReadBackend {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            ReadBackend::IoUring { file, .. } => f.debug_tuple("IoUring").field(file).finish(),
+            ReadBackend::StdFile { .. } => f.write_str("StdFile"),
+        }
+    }
+}
+
 /// Reader for SST files.
 ///
 /// The reader loads the footer and index block into memory on open,
-/// then reads data blocks on demand.
+/// then reads data blocks on demand using positional reads (`&self`).
+///
+/// With IoService, reads go through io_uring with O_DIRECT.
+/// Without IoService, reads use pread64 (standard file, no seek state).
+/// Both paths are `&self` — no Mutex needed in `SstReaderRef`.
 #[derive(Debug)]
 pub struct SstReader {
     /// File path
     path: PathBuf,
-    /// File handle
-    file: File,
+    /// Read backend (io_uring or std pread64)
+    backend: ReadBackend,
     /// File size in bytes
     file_size: u64,
     /// Footer information
@@ -68,12 +81,56 @@ pub struct SstReader {
 }
 
 impl SstReader {
-    /// Open an SST file for reading.
+    /// Open an SST file with io_uring backend (production path).
+    pub fn open_with_io<P: AsRef<Path>>(path: P, io: Arc<IoService>) -> Result<Self> {
+        let path = path.as_ref().to_path_buf();
+        let file = DmaFile::open_read(&path).map_err(|e| {
+            TiSqlError::Storage(format!("Failed to open SST {}: {e}", path.display()))
+        })?;
+
+        let file_size = file.file_size();
+        if file_size < FOOTER_SIZE as u64 {
+            return Err(TiSqlError::Storage(format!(
+                "SST file too small: {file_size} bytes"
+            )));
+        }
+
+        // Read footer via io_uring
+        let footer_offset = file_size - FOOTER_SIZE as u64;
+        let footer_data = io
+            .read_at_sync(&file, footer_offset, FOOTER_SIZE)
+            .map_err(|e| TiSqlError::Storage(format!("Failed to read SST footer: {e}")))?;
+        let footer_buf: [u8; FOOTER_SIZE] = footer_data[..FOOTER_SIZE]
+            .try_into()
+            .map_err(|_| TiSqlError::Storage("Footer read returned wrong size".into()))?;
+        let footer = Footer::decode(&footer_buf)?;
+
+        // Validate index block bounds
+        let data_end = file_size - FOOTER_SIZE as u64;
+        Self::validate_index_bounds(&footer, data_end)?;
+
+        // Read index block via io_uring
+        let index_buf = io
+            .read_at_sync(&file, footer.index_offset, footer.index_size as usize)
+            .map_err(|e| TiSqlError::Storage(format!("Failed to read SST index: {e}")))?;
+        let index = IndexBlock::decode(&index_buf)?;
+
+        Ok(Self {
+            path,
+            backend: ReadBackend::IoUring { file, io },
+            file_size,
+            footer,
+            index,
+        })
+    }
+
+    /// Open an SST file with standard I/O (test fallback — no IoService needed).
+    ///
+    /// Uses pread64 for positional reads, which is `&self`-safe (no seek state).
     pub fn open<P: AsRef<Path>>(path: P) -> Result<Self> {
         let path = path.as_ref().to_path_buf();
-        let mut file = File::open(&path)?;
+        let file = std::fs::File::open(&path)?;
 
-        // Get file size
         let file_size = file.metadata()?.len();
         if file_size < FOOTER_SIZE as u64 {
             return Err(TiSqlError::Storage(format!(
@@ -81,15 +138,32 @@ impl SstReader {
             )));
         }
 
-        // Read footer
-        file.seek(SeekFrom::End(-(FOOTER_SIZE as i64)))?;
+        // Read footer using pread64
         let mut footer_buf = [0u8; FOOTER_SIZE];
-        file.read_exact(&mut footer_buf)?;
+        let footer_offset = file_size - FOOTER_SIZE as u64;
+        pread_exact(&file, &mut footer_buf, footer_offset)?;
         let footer = Footer::decode(&footer_buf)?;
 
-        // Validate index block bounds before reading
-        // The footer stores index_offset and index_size, which must be within the file
+        // Validate index block bounds
         let data_end = file_size - FOOTER_SIZE as u64;
+        Self::validate_index_bounds(&footer, data_end)?;
+
+        // Read index block using pread64
+        let mut index_buf = vec![0u8; footer.index_size as usize];
+        pread_exact(&file, &mut index_buf, footer.index_offset)?;
+        let index = IndexBlock::decode(&index_buf)?;
+
+        Ok(Self {
+            path,
+            backend: ReadBackend::StdFile { file },
+            file_size,
+            footer,
+            index,
+        })
+    }
+
+    /// Validate index block bounds against file data region.
+    fn validate_index_bounds(footer: &Footer, data_end: u64) -> Result<()> {
         if footer.index_offset > data_end {
             return Err(TiSqlError::Storage(format!(
                 "SST corrupted: index_offset {} exceeds data region end {}",
@@ -107,7 +181,6 @@ impl SstReader {
                 "SST corrupted: index block end {index_end} exceeds data region end {data_end}"
             )));
         }
-        // Cap index_size to a reasonable maximum (e.g., 256MB) to prevent OOM from corrupted footer
         const MAX_INDEX_SIZE: u32 = 256 * 1024 * 1024;
         if footer.index_size > MAX_INDEX_SIZE {
             return Err(TiSqlError::Storage(format!(
@@ -115,20 +188,7 @@ impl SstReader {
                 footer.index_size, MAX_INDEX_SIZE
             )));
         }
-
-        // Read index block
-        file.seek(SeekFrom::Start(footer.index_offset))?;
-        let mut index_buf = vec![0u8; footer.index_size as usize];
-        file.read_exact(&mut index_buf)?;
-        let index = IndexBlock::decode(&index_buf)?;
-
-        Ok(Self {
-            path,
-            file,
-            file_size,
-            footer,
-            index,
-        })
+        Ok(())
     }
 
     /// Get the file path.
@@ -172,7 +232,9 @@ impl SstReader {
     }
 
     /// Read a data block by index.
-    pub fn read_block(&mut self, block_idx: usize) -> Result<DataBlock> {
+    ///
+    /// This is `&self` — no Mutex needed. Both backends use positional reads.
+    pub fn read_block(&self, block_idx: usize) -> Result<DataBlock> {
         let entry = self.index.get_entry(block_idx).ok_or_else(|| {
             TiSqlError::Storage(format!(
                 "Block index out of range: {} >= {}",
@@ -185,11 +247,22 @@ impl SstReader {
     }
 
     /// Read a data block at the given offset and size.
-    fn read_block_at(&mut self, offset: u64, size: u32) -> Result<DataBlock> {
-        self.file.seek(SeekFrom::Start(offset))?;
-        let mut buf = vec![0u8; size as usize];
-        self.file.read_exact(&mut buf)?;
-        DataBlock::decode(&buf)
+    ///
+    /// Uses positional reads — `&self`, no seek state.
+    fn read_block_at(&self, offset: u64, size: u32) -> Result<DataBlock> {
+        match &self.backend {
+            ReadBackend::IoUring { file, io } => {
+                let buf = io
+                    .read_at_sync(file, offset, size as usize)
+                    .map_err(|e| TiSqlError::Storage(format!("io_uring read_block failed: {e}")))?;
+                DataBlock::decode(&buf)
+            }
+            ReadBackend::StdFile { file } => {
+                let mut buf = vec![0u8; size as usize];
+                pread_exact(file, &mut buf, offset)?;
+                DataBlock::decode(&buf)
+            }
+        }
     }
 
     /// Find the block that may contain the given key using binary search.
@@ -206,7 +279,7 @@ impl SstReader {
     /// Point lookup for a key.
     ///
     /// Returns the value if found, or None if not found.
-    pub fn get(&mut self, key: &[u8]) -> Result<Option<Vec<u8>>> {
+    pub fn get(&self, key: &[u8]) -> Result<Option<Vec<u8>>> {
         if self.footer.num_blocks == 0 {
             return Ok(None);
         }
@@ -226,61 +299,104 @@ impl SstReader {
 }
 
 // ============================================================================
-// SstReaderRef - Shareable reader using Arc
+// SstReaderRef - Shareable reader using Arc (no Mutex!)
 // ============================================================================
 
 /// A shareable SST reader wrapped in Arc.
 ///
-/// This allows the same SST file to be shared across multiple iterators
-/// or threads (with interior mutability for file access).
+/// Since `SstReader::read_block()` is now `&self` (positional reads, no seek state),
+/// `SstReaderRef` no longer needs a Mutex. Multiple threads can read concurrently.
 #[derive(Clone)]
 pub struct SstReaderRef {
-    inner: Arc<parking_lot::Mutex<SstReader>>,
+    inner: Arc<SstReader>,
 }
 
 impl SstReaderRef {
     /// Create a new shared reader.
     pub fn new(reader: SstReader) -> Self {
         Self {
-            inner: Arc::new(parking_lot::Mutex::new(reader)),
+            inner: Arc::new(reader),
         }
     }
 
-    /// Open an SST file and create a shared reader.
+    /// Open an SST file and create a shared reader (standard I/O).
     pub fn open<P: AsRef<Path>>(path: P) -> Result<Self> {
         let reader = SstReader::open(path)?;
         Ok(Self::new(reader))
     }
 
+    /// Open an SST file and create a shared reader (io_uring).
+    pub fn open_with_io<P: AsRef<Path>>(path: P, io: Arc<IoService>) -> Result<Self> {
+        let reader = SstReader::open_with_io(path, io)?;
+        Ok(Self::new(reader))
+    }
+
     /// Read a data block by index.
     pub fn read_block(&self, block_idx: usize) -> Result<DataBlock> {
-        self.inner.lock().read_block(block_idx)
+        self.inner.read_block(block_idx)
     }
 
     /// Point lookup for a key.
     pub fn get(&self, key: &[u8]) -> Result<Option<Vec<u8>>> {
-        self.inner.lock().get(key)
+        self.inner.get(key)
     }
 
     /// Get the number of blocks.
     pub fn num_blocks(&self) -> Result<u32> {
-        Ok(self.inner.lock().num_blocks())
+        Ok(self.inner.num_blocks())
     }
 
     /// Get the number of entries.
     pub fn num_entries(&self) -> Result<u64> {
-        Ok(self.inner.lock().num_entries())
+        Ok(self.inner.num_entries())
     }
 
     /// Find the block that may contain the given key.
     pub fn find_block(&self, key: &[u8]) -> Result<usize> {
-        Ok(self.inner.lock().find_block(key))
+        Ok(self.inner.find_block(key))
     }
 
     /// Get the footer.
     pub fn footer(&self) -> Result<Footer> {
-        Ok(self.inner.lock().footer().clone())
+        Ok(self.inner.footer().clone())
     }
+}
+
+// ============================================================================
+// pread64 helper — positional read without seek state
+// ============================================================================
+
+/// Read exactly `buf.len()` bytes at `offset` using pread64.
+///
+/// Unlike seek+read_exact, pread64 is atomic and `&self`-safe — no file
+/// offset state is modified. Multiple threads can read concurrently.
+fn pread_exact(file: &std::fs::File, buf: &mut [u8], offset: u64) -> Result<()> {
+    let mut total = 0;
+    while total < buf.len() {
+        let n = unsafe {
+            libc::pread64(
+                file.as_raw_fd(),
+                buf[total..].as_mut_ptr() as *mut libc::c_void,
+                buf.len() - total,
+                (offset + total as u64) as i64,
+            )
+        };
+        if n < 0 {
+            return Err(TiSqlError::Storage(format!(
+                "pread64 failed: {}",
+                std::io::Error::last_os_error()
+            )));
+        }
+        if n == 0 {
+            return Err(TiSqlError::Storage(format!(
+                "pread64: unexpected EOF at offset {} (read {total}/{} bytes)",
+                offset + total as u64,
+                buf.len()
+            )));
+        }
+        total += n as usize;
+    }
+    Ok(())
 }
 
 // ============================================================================
@@ -409,7 +525,7 @@ mod tests {
 
         create_test_sst(&path, &entry_refs).unwrap();
 
-        let mut reader = SstReader::open(&path).unwrap();
+        let reader = SstReader::open(&path).unwrap();
         let block = reader.read_block(0).unwrap();
 
         // Block should contain the entries
@@ -423,7 +539,7 @@ mod tests {
 
         create_test_sst(&path, &[(b"key", b"value")]).unwrap();
 
-        let mut reader = SstReader::open(&path).unwrap();
+        let reader = SstReader::open(&path).unwrap();
         let result = reader.read_block(100);
         assert!(result.is_err());
     }
@@ -444,7 +560,7 @@ mod tests {
         }
         builder.finish(1, 0).unwrap();
 
-        let mut reader = SstReader::open(&path).unwrap();
+        let reader = SstReader::open(&path).unwrap();
         assert!(reader.num_blocks() > 1);
 
         // Read all blocks
@@ -477,7 +593,7 @@ mod tests {
 
         create_test_sst(&path, &entry_refs).unwrap();
 
-        let mut reader = SstReader::open(&path).unwrap();
+        let reader = SstReader::open(&path).unwrap();
 
         // Find existing keys
         for i in 0..10 {
@@ -495,7 +611,7 @@ mod tests {
 
         create_test_sst(&path, &[(b"key_a", b"value_a"), (b"key_c", b"value_c")]).unwrap();
 
-        let mut reader = SstReader::open(&path).unwrap();
+        let reader = SstReader::open(&path).unwrap();
 
         // Key before all entries
         assert_eq!(reader.get(b"key_0").unwrap(), None);
@@ -515,7 +631,7 @@ mod tests {
         let builder = SstBuilder::new(&path, SstBuilderOptions::default()).unwrap();
         builder.finish(1, 0).unwrap();
 
-        let mut reader = SstReader::open(&path).unwrap();
+        let reader = SstReader::open(&path).unwrap();
         assert_eq!(reader.get(b"any_key").unwrap(), None);
     }
 
@@ -535,7 +651,7 @@ mod tests {
         }
         builder.finish(1, 0).unwrap();
 
-        let mut reader = SstReader::open(&path).unwrap();
+        let reader = SstReader::open(&path).unwrap();
 
         // Find keys across different blocks
         for i in [0, 25, 50, 75, 99] {
@@ -657,7 +773,7 @@ mod tests {
         builder.finish(1, 0).unwrap();
 
         // Read and verify
-        let mut reader = SstReader::open(&path).unwrap();
+        let reader = SstReader::open(&path).unwrap();
         assert_eq!(reader.num_entries(), 50);
 
         for (key, expected_value) in &entries {
@@ -678,7 +794,7 @@ mod tests {
         builder.add(&key, &value).unwrap();
         builder.finish(1, 0).unwrap();
 
-        let mut reader = SstReader::open(&path).unwrap();
+        let reader = SstReader::open(&path).unwrap();
         let result = reader.get(&key).unwrap();
         assert_eq!(result, Some(value));
     }

@@ -72,6 +72,7 @@ src/
 ├── executor/        # Volcano-style execution
 ├── transaction/     # TxnService, ConcurrencyManager
 ├── storage/         # LsmEngine, MemTable, SSTable (persistent storage)
+├── io/              # io_uring async I/O: AlignedBuf, DmaFile (O_DIRECT), IoService
 ├── lsn.rs           # LsnProvider trait for unified LSN allocation
 ├── tso/             # TsoService, LocalTso (timestamp oracle)
 ├── clog/            # FileClogService (commit log / WAL)
@@ -149,8 +150,9 @@ Persistent LSM-tree storage engine with crash recovery. **Now integrated as defa
 | 6 | Unified LSN (clog + ilog share LsnProvider) | ✅ Complete |
 | 7 | Integration with TxnService | ✅ Complete |
 | 8 | Background flush/compaction workers + write flow control | 🔶 Partial (flush + write flow control done, background compaction workers pending) |
-| 9 | Block cache for read performance | ⏳ Pending |
-| 10 | Bloom filters for SST | ⏳ Pending |
+| 9 | io_uring async I/O for SST reads (O_DIRECT, positional reads) | ✅ Complete |
+| 10 | Block cache for read performance | ⏳ Pending |
+| 11 | Bloom filters for SST | ⏳ Pending |
 
 **Storage Module Structure:**
 ```
@@ -187,6 +189,28 @@ src/storage/
 - TSO initialized to `max_commit_ts + 1` after recovery
 
 ### Recent Changes
+
+**io_uring Async I/O for SST Reads (Feb 2026)**
+- **IoService**: Dedicated io_uring thread with event loop, dual-mode reply (sync crossbeam / async tokio oneshot) — same pattern as GroupCommitWriter
+- **AlignedBuf**: Custom heap buffer with 4096-byte alignment for O_DIRECT, implements `Deref<Target=[u8]>` so existing code works unchanged
+- **DmaFile**: File descriptor opened with `O_DIRECT` via `libc::open` (bypasses page cache)
+- **SstReader**: Uses positional reads (`pread64` / io_uring `ReadAt`) — `&self` instead of `&mut self`, no seek state
+- **SstReaderRef**: Changed from `Arc<Mutex<SstReader>>` to `Arc<SstReader>` — no more lock contention on concurrent SST reads
+- **ReadBackend enum**: `IoUring { DmaFile, Arc<IoService> }` for production, `StdFile { std::fs::File }` with `pread64` for tests
+- **LsmEngine**: `io: Option<Arc<IoService>>` — `open_with_recovery()` creates IoService(256), `open()` (test) uses None
+- O_DIRECT alignment handled transparently inside IoService (align_down/align_up)
+- SstBuilder writes remain on std I/O (written once during flush/compaction, not a bottleneck)
+- Total: 795 library tests, 40 store/compaction tests, 12 integration tests pass
+
+**Dedicated WorkerPool + Full Query Dispatch (Feb 2026)**
+- **WorkerPool**: Dedicated `tokio::runtime::Runtime` isolated from the main server runtime. Network I/O stays on main runtime; all DB work (parse, bind, execute, storage I/O) runs on worker runtime's blocking threads
+- **Full query dispatch**: `dispatch_full_query()` moves parse+bind to worker threads (previously ran inline on tokio thread). Single `spawn_blocking` per query: parse → columns → execute → stream rows
+- **Channel protocol**: Response oneshot delivers columns + streaming handles; mpsc(4) streams row batches of 1024; done oneshot signals completion
+- **Transaction dispatch**: BEGIN/ROLLBACK via `spawn_blocking`, COMMIT via `runtime.spawn()` (async — yields during clog fsync)
+- **SHOW dispatch**: `dispatch_show_databases/tables` via `spawn_blocking` on worker runtime
+- **CLI**: Added `--worker-threads` arg (default: 0 = auto-detect via `available_parallelism()`)
+- **Batch size**: Changed from 256 to 1024 rows per batch
+- All 779 library tests + 31 protocol tests pass
 
 **Async Refactoring: yatp Routing + parking_lot + Group Commit (Feb 2026)**
 - **yatp routing**: All DB-accessing MySQL commands (BEGIN, COMMIT, ROLLBACK, SHOW TABLES/DATABASES) now dispatched to yatp worker pool via `WorkerCommand`/`WorkerResult` enums, keeping tokio threads free for network I/O
@@ -290,10 +314,14 @@ src/storage/
 - [x] Group commit for clog/ilog (batched fsync via dedicated writer thread)
 - [x] parking_lot locks (replaced std::sync across all modules)
 - [x] yatp routing for all DB commands (BEGIN/COMMIT/ROLLBACK/SHOW off tokio threads)
+- [x] Dedicated WorkerPool (parse+bind+execute on worker runtime, batch size 1024)
+- [ ] Async iterator pipeline (AsyncMvccIterator for non-blocking SST reads)
 - [ ] Background compaction workers
 - [ ] Block cache for SST read performance
 - [ ] Bloom filters for SST point lookups
-- [ ] Async I/O (io_uring) for non-blocking clog/ilog writes
+- [x] io_uring async I/O for SST reads (O_DIRECT, positional reads, no Mutex)
+- [ ] io_uring for SST writes (SstBuilder — currently std I/O)
+- [ ] io_uring for clog/ilog writes
 
 ---
 
@@ -317,5 +345,7 @@ src/storage/
 | yatp | Thread pool (TiKV) |
 | parking_lot | Fast synchronous locks (spin-then-park, no poisoning) |
 | crossbeam-channel | Lock-free MPMC channels (group commit) |
+| io-uring | Linux io_uring async I/O for SST reads (O_DIRECT) |
+| libc | Raw syscalls for O_DIRECT open, pread64 |
 | tikv-jemallocator | jemalloc allocator (default) |
 | fail | Fail point injection |

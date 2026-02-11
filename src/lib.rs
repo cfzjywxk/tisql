@@ -33,6 +33,7 @@
 // Public modules - common types and server infrastructure
 pub mod codec;
 pub mod error;
+pub mod io;
 pub mod lsn;
 pub mod protocol;
 pub mod session;
@@ -58,7 +59,7 @@ pub use session::{ExecutionCtx, Priority, QueryCtx, Session, SessionVars};
 pub use storage::{PessimisticStorage, StorageEngine};
 pub use transaction::{CommitInfo, TxnCtx, TxnService, TxnState};
 pub use tso::TsoService;
-pub use worker::{WorkerPool, WorkerPoolConfig};
+pub use worker::{QueryDone, QueryResponse, RowBatch};
 
 // ============================================================================
 // Test-only exports - implementation details for integration tests
@@ -144,7 +145,7 @@ pub mod testkit {
 use catalog::MvccCatalog;
 use clog::FileClogService;
 use error::Result;
-use executor::{ExecutionResult, Executor, SimpleExecutor};
+use executor::{ExecutionOutput, ExecutionResult, Executor, SimpleExecutor};
 use sql::{Binder, Parser};
 use storage::{CompactionScheduler, FlushScheduler, IlogService, LsmEngine, LsmRecovery};
 use transaction::{ConcurrencyManager, TransactionService};
@@ -625,6 +626,42 @@ impl Database {
     // ========================================================================
     // Unified Query Execution (for Worker Pool)
     // ========================================================================
+
+    /// Parse and bind SQL into a logical plan (fast, no I/O).
+    ///
+    /// This is the first phase of query processing, suitable for running
+    /// inline on a tokio network thread. The resulting plan can then be
+    /// dispatched to a blocking thread for execution.
+    pub(crate) fn parse_and_bind(
+        &self,
+        sql: &str,
+        exec_ctx: &session::ExecutionCtx,
+    ) -> Result<sql::LogicalPlan> {
+        let stmt = self.sql_engine.parser.parse_one(sql)?;
+        let binder = sql::Binder::new(&self.catalog, &exec_ctx.current_db);
+        binder.bind(stmt)
+    }
+
+    /// Execute a pre-bound logical plan.
+    ///
+    /// Returns `ExecutionOutput` (with lazy `Execution` for reads) and the
+    /// optionally-updated `TxnCtx`. This method runs blocking I/O and should
+    /// be called inside `tokio::task::spawn_blocking`.
+    pub(crate) fn execute_plan(
+        &self,
+        plan: sql::LogicalPlan,
+        exec_ctx: &session::ExecutionCtx,
+        txn_ctx: Option<transaction::TxnCtx>,
+    ) -> Result<(ExecutionOutput, Option<transaction::TxnCtx>)> {
+        let (result, ctx) = self.sql_engine.executor.execute_unified(
+            plan,
+            exec_ctx,
+            self.txn_service.as_ref(),
+            &self.catalog,
+            txn_ctx,
+        )?;
+        Ok((result.into(), ctx))
+    }
 
     /// Handle a query with execution context and optional transaction context.
     ///
