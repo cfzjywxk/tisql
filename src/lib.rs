@@ -264,38 +264,6 @@ impl SQLEngine {
             .await
     }
 
-    /// Execute SQL with optional TxnCtx (unified entry point).
-    ///
-    /// This is the new unified execution method that:
-    /// - Takes ExecutionCtx with session variables
-    /// - Takes optional TxnCtx for explicit transactions
-    /// - Returns the (potentially updated) TxnCtx along with the result
-    /// - Handles transaction control at the protocol layer (not here)
-    ///
-    /// Transaction control statements (BEGIN/COMMIT/ROLLBACK) should be
-    /// handled at the protocol layer, not dispatched here.
-    async fn execute<T: TxnService, C: Catalog>(
-        &self,
-        sql: &str,
-        exec_ctx: &session::ExecutionCtx,
-        txn_service: &T,
-        catalog: &C,
-        txn_ctx: Option<transaction::TxnCtx>,
-    ) -> Result<(ExecutionResult, Option<transaction::TxnCtx>)> {
-        // Parse SQL text into AST
-        let stmt = self.parser.parse_one(sql)?;
-
-        // Bind to logical plan
-        let binder = Binder::new(catalog, &exec_ctx.current_db);
-        let plan = binder.bind(stmt)?;
-
-        // Execute with the unified executor method, then materialize
-        let (output, ctx) = self
-            .executor
-            .execute_unified(plan, exec_ctx, txn_service, catalog, txn_ctx)
-            .await?;
-        Ok((output.into_result().await?, ctx))
-    }
 }
 
 // ============================================================================
@@ -429,20 +397,6 @@ impl Database {
     pub async fn handle_mp_query(&self, sql: &str) -> Result<QueryResult> {
         // Create a temporary QueryCtx for backward compatibility
         let query_ctx = session::QueryCtx::new();
-        self.handle_mp_query_with_ctx(sql, &query_ctx).await
-    }
-
-    /// Handle MySQL protocol query text with a Session (immutable).
-    ///
-    /// This method creates a QueryCtx from the Session before executing.
-    /// For explicit transaction support (BEGIN/COMMIT/ROLLBACK), use
-    /// `handle_mp_query_with_session_mut` instead.
-    pub async fn handle_mp_query_with_session(
-        &self,
-        sql: &str,
-        session: &session::Session,
-    ) -> Result<QueryResult> {
-        let query_ctx = session.new_query_ctx();
         self.handle_mp_query_with_ctx(sql, &query_ctx).await
     }
 
@@ -671,78 +625,6 @@ impl Database {
                 txn_ctx,
             )
             .await
-    }
-
-    /// Handle a query with execution context and optional transaction context.
-    ///
-    /// This is the new unified entry point for the worker pool.
-    /// Returns the query result and the (potentially updated) TxnCtx.
-    ///
-    /// The `exec_ctx` provides read-only access to session variables (current_db,
-    /// isolation_level, etc.) during execution.
-    pub async fn handle_query(
-        &self,
-        sql: &str,
-        exec_ctx: &session::ExecutionCtx,
-        txn_ctx: Option<transaction::TxnCtx>,
-    ) -> Result<(QueryResult, Option<transaction::TxnCtx>)> {
-        let timer = Timer::new("query");
-
-        // Execute through SQL engine with the new unified interface
-        let (result, returned_ctx) = self
-            .sql_engine
-            .execute(
-                sql,
-                exec_ctx,
-                self.txn_service.as_ref(),
-                &self.catalog,
-                txn_ctx,
-            )
-            .await?;
-
-        // Convert ExecutionResult to QueryResult
-        let query_result = match result {
-            ExecutionResult::Rows { schema, rows } => {
-                let row_count = rows.len();
-                let columns: Vec<String> = schema
-                    .columns()
-                    .iter()
-                    .map(|c| c.name().to_string())
-                    .collect();
-                let data: Vec<Vec<String>> = rows
-                    .iter()
-                    .map(|row| row.iter().map(value_to_string).collect())
-                    .collect();
-
-                log_trace!(
-                    "SQL: {} | elapsed={:.3}ms rows={}",
-                    truncate_sql(sql, 50),
-                    timer.elapsed_ms(),
-                    row_count
-                );
-
-                QueryResult::Rows { columns, data }
-            }
-            ExecutionResult::Affected { count } => {
-                log_trace!(
-                    "SQL: {} | elapsed={:.3}ms affected={}",
-                    truncate_sql(sql, 50),
-                    timer.elapsed_ms(),
-                    count
-                );
-                QueryResult::Affected(count)
-            }
-            ExecutionResult::Ok => {
-                log_trace!(
-                    "SQL: {} | elapsed={:.3}ms",
-                    truncate_sql(sql, 50),
-                    timer.elapsed_ms()
-                );
-                QueryResult::Ok
-            }
-        };
-
-        Ok((query_result, returned_ctx))
     }
 
     /// Close the database (flush memtables and sync logs).
