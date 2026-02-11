@@ -59,7 +59,7 @@ pub use session::{ExecutionCtx, Priority, QueryCtx, Session, SessionVars};
 pub use storage::{PessimisticStorage, StorageEngine};
 pub use transaction::{CommitInfo, TxnCtx, TxnService, TxnState};
 pub use tso::TsoService;
-pub use worker::{QueryDone, QueryResponse, RowBatch};
+pub use worker::QueryResponse;
 
 // ============================================================================
 // Test-only exports - implementation details for integration tests

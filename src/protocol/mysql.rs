@@ -30,7 +30,7 @@ use tokio::io::AsyncWrite;
 
 use crate::session::{ExecutionCtx, Session};
 use crate::types::{DataType, Value};
-use crate::worker::{self, QueryDone, QueryResponse};
+use crate::worker::{self, QueryResponse};
 use crate::{log_debug, log_info, log_warn, Database};
 
 // ============================================================================
@@ -304,9 +304,13 @@ impl MySqlBackend {
         match response {
             QueryResponse::Rows {
                 columns,
-                mut batch_rx,
-                done_rx,
+                mut exec,
+                txn_ctx,
             } => {
+                if let Some(ctx) = txn_ctx {
+                    self.session.set_current_txn(ctx);
+                }
+
                 let cols: Vec<Column> = columns
                     .iter()
                     .map(|name| Column {
@@ -319,42 +323,26 @@ impl MySqlBackend {
 
                 let mut rw = results.start(&cols).await?;
 
-                // Stream rows directly from the channel without materializing
-                while let Some(batch) = batch_rx.recv().await {
-                    for row in &batch {
-                        for val in row.iter() {
-                            write_value_col(&mut rw, val)?;
+                // Pull rows directly from the live operator tree
+                loop {
+                    match exec.next().await {
+                        Ok(Some(row)) => {
+                            for val in row.iter() {
+                                write_value_col(&mut rw, val)?;
+                            }
+                            rw.end_row().await?;
                         }
-                        rw.end_row().await?;
-                    }
-                }
-
-                // Check final status after all rows have been streamed
-                let done = done_rx.await.unwrap_or(QueryDone::Error {
-                    error: crate::error::TiSqlError::Internal("Worker task dropped".into()),
-                    txn_ctx: None,
-                });
-
-                match done {
-                    QueryDone::Success { txn_ctx } => {
-                        if let Some(ctx) = txn_ctx {
-                            self.session.set_current_txn(ctx);
+                        Ok(None) => {
+                            return rw.finish().await;
                         }
-                        rw.finish().await
-                    }
-                    QueryDone::Error { error, txn_ctx } => {
-                        if let Some(ctx) = txn_ctx {
-                            self.session.set_current_txn(ctx);
+                        Err(e) => {
+                            return rw
+                                .finish_error(
+                                    ErrorKind::ER_UNKNOWN_ERROR,
+                                    &e.to_string().into_bytes(),
+                                )
+                                .await;
                         }
-                        // Rows already streamed; send error in the finish phase.
-                        // The MySQL protocol doesn't support aborting mid-resultset
-                        // cleanly, but finish() will close the resultset, and the
-                        // error will be visible in server logs.
-                        rw.finish_error(
-                            ErrorKind::ER_UNKNOWN_ERROR,
-                            &error.to_string().into_bytes(),
-                        )
-                        .await
                     }
                 }
             }

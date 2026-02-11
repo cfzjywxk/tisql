@@ -16,54 +16,42 @@
 //
 // Architecture:
 // - Single tokio runtime for both network I/O and query processing
-// - CPU work (parse, bind, row streaming) runs inline on async tasks
-// - Storage I/O (execute_plan) awaited directly (iterators are async)
-// - tokio::sync::mpsc bridges worker task → network task (row batches)
-// - tokio::sync::oneshot for response delivery
+// - CPU work (parse, bind, operator tree construction) runs on spawned tasks
+// - The Execution handle (live operator tree) is returned to the protocol
+//   task via oneshot — rows are pulled directly, no intermediate channel
+// - tokio::sync::oneshot bridges worker task → protocol task
 
 use std::sync::Arc;
 
-use tokio::sync::{mpsc, oneshot};
+use tokio::sync::oneshot;
 
 use crate::error::TiSqlError;
-use crate::executor::ExecutionOutput;
+use crate::executor::{Execution, ExecutionOutput};
 use crate::session::ExecutionCtx;
 use crate::transaction::TxnCtx;
-use crate::types::Row;
 use crate::Database;
-
-/// Batch of rows sent through the streaming channel.
-pub type RowBatch = Vec<Row>;
-
-/// Maximum rows per batch before sending through the channel.
-const BATCH_SIZE: usize = 1024;
-
-/// Completion signal for a streaming read query.
-pub enum QueryDone {
-    /// Execution completed successfully.
-    Success { txn_ctx: Option<TxnCtx> },
-    /// Execution failed.
-    Error {
-        error: TiSqlError,
-        txn_ctx: Option<TxnCtx>,
-    },
-}
 
 /// Response from query dispatch.
 ///
-/// Read queries return `Rows` with streaming channels; writes and
-/// transaction control return results directly.
+/// Read queries return `Rows` with a live `Execution` handle; the protocol
+/// task pulls rows directly via `exec.next().await`. Writes and transaction
+/// control return results directly.
 pub enum QueryResponse {
-    /// Read query — stream rows through mpsc, completion via oneshot.
+    /// Read query — pull rows from Execution on the protocol task.
     Rows {
         columns: Vec<String>,
-        batch_rx: mpsc::Receiver<RowBatch>,
-        done_rx: oneshot::Receiver<QueryDone>,
+        exec: Execution,
+        txn_ctx: Option<TxnCtx>,
     },
     /// Write operation (INSERT/UPDATE/DELETE).
-    Affected { count: u64, txn_ctx: Option<TxnCtx> },
+    Affected {
+        count: u64,
+        txn_ctx: Option<TxnCtx>,
+    },
     /// DDL/session command (CREATE TABLE, USE, etc.).
-    Ok { txn_ctx: Option<TxnCtx> },
+    Ok {
+        txn_ctx: Option<TxnCtx>,
+    },
     /// Error before any streaming started.
     Error {
         error: TiSqlError,
@@ -74,12 +62,12 @@ pub enum QueryResponse {
 /// Dispatch a full query (parse + bind + execute) as an async worker task.
 ///
 /// Spawns a tokio task that:
-/// 1. Parses and binds SQL (CPU work, inline)
-/// 2. Executes the plan (async — iterators yield during I/O)
-/// 3. Streams rows via channels (CPU work, inline)
+/// 1. Parses and binds SQL (CPU work)
+/// 2. Executes the plan (async — builds operator tree, opens iterators)
+/// 3. Returns the result via oneshot
 ///
-/// For read queries, returns immediately with streaming channels.
-/// For writes, awaits execution completion.
+/// For read queries, returns an `Execution` handle that the protocol task
+/// pulls rows from directly — no intermediate channel or batching.
 pub async fn dispatch_full_query(
     db: Arc<Database>,
     sql: String,
@@ -98,105 +86,32 @@ pub async fn dispatch_full_query(
             }
         };
 
-        if plan.is_read_query() {
-            let columns = plan.output_columns();
-            let (batch_tx, batch_rx) = mpsc::channel(4);
-            let (done_tx, done_rx) = oneshot::channel();
-
-            // Send response with streaming channels to caller
-            if response_tx
-                .send(QueryResponse::Rows {
-                    columns,
-                    batch_rx,
-                    done_rx,
-                })
-                .is_err()
-            {
-                return; // caller dropped
-            }
-
-            // Execute plan (async — iterators yield during SST I/O)
-            let exec_result = db.execute_plan(plan, &exec_ctx, txn_ctx).await;
-
-            match exec_result {
-                Ok((ExecutionOutput::Rows { mut exec, .. }, returned_ctx)) => {
-                    // Stream rows from live operator tree via channel
-                    let mut batch = Vec::with_capacity(BATCH_SIZE);
-                    loop {
-                        match exec.next().await {
-                            Ok(Some(row)) => {
-                                batch.push(row);
-                                if batch.len() >= BATCH_SIZE {
-                                    if batch_tx
-                                        .send(std::mem::take(&mut batch))
-                                        .await
-                                        .is_err()
-                                    {
-                                        return; // receiver dropped (client disconnected)
-                                    }
-                                    batch = Vec::with_capacity(BATCH_SIZE);
-                                }
-                            }
-                            Ok(None) => {
-                                if !batch.is_empty() {
-                                    let _ = batch_tx.send(batch).await;
-                                }
-                                drop(batch_tx);
-                                let _ = done_tx.send(QueryDone::Success {
-                                    txn_ctx: returned_ctx,
-                                });
-                                return;
-                            }
-                            Err(e) => {
-                                drop(batch_tx);
-                                let _ = done_tx.send(QueryDone::Error {
-                                    error: e,
-                                    txn_ctx: returned_ctx,
-                                });
-                                return;
-                            }
-                        }
-                    }
-                }
-                Ok((_, returned_ctx)) => {
-                    drop(batch_tx);
-                    let _ = done_tx.send(QueryDone::Success {
-                        txn_ctx: returned_ctx,
-                    });
-                }
-                Err(e) => {
-                    drop(batch_tx);
-                    let _ = done_tx.send(QueryDone::Error {
-                        error: e,
-                        txn_ctx: None,
-                    });
-                }
-            }
+        let columns = if plan.is_read_query() {
+            Some(plan.output_columns())
         } else {
-            // Write/DDL: execute (async)
-            let exec_result = db.execute_plan(plan, &exec_ctx, txn_ctx).await;
+            None
+        };
 
-            match exec_result {
-                Ok((ExecutionOutput::Affected { count }, ctx)) => {
-                    let _ = response_tx.send(QueryResponse::Affected {
-                        count,
-                        txn_ctx: ctx,
-                    });
-                }
-                Ok((ExecutionOutput::Ok, ctx)) => {
-                    let _ = response_tx.send(QueryResponse::Ok { txn_ctx: ctx });
-                }
-                Ok((ExecutionOutput::Rows { .. }, ctx)) => {
-                    let _ = response_tx.send(QueryResponse::Ok { txn_ctx: ctx });
-                }
-                Err(e) => {
-                    let _ = response_tx.send(QueryResponse::Error {
-                        error: e,
-                        txn_ctx: None,
-                    });
-                }
+        // Execute plan (async — iterators yield during SST I/O)
+        let exec_result = db.execute_plan(plan, &exec_ctx, txn_ctx).await;
+
+        let response = match exec_result {
+            Ok((ExecutionOutput::Rows { exec, .. }, returned_ctx)) => QueryResponse::Rows {
+                columns: columns.unwrap_or_default(),
+                exec,
+                txn_ctx: returned_ctx,
+            },
+            Ok((ExecutionOutput::Affected { count }, ctx)) => {
+                QueryResponse::Affected { count, txn_ctx: ctx }
             }
-        }
+            Ok((ExecutionOutput::Ok, ctx)) => QueryResponse::Ok { txn_ctx: ctx },
+            Err(e) => QueryResponse::Error {
+                error: e,
+                txn_ctx: None,
+            },
+        };
+
+        let _ = response_tx.send(response);
     });
 
     response_rx.await.unwrap_or(QueryResponse::Error {
