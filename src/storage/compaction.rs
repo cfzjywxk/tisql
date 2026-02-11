@@ -417,7 +417,7 @@ impl CompactionExecutor {
         version: &Version,
         sst_dir: &Path,
         pre_allocated_ids: &[u64],
-        io: Option<std::sync::Arc<crate::io::IoService>>,
+        io: std::sync::Arc<crate::io::IoService>,
     ) -> Result<ManifestDelta> {
         // Handle trivial move (just update metadata, no I/O)
         if task.is_trivial_move {
@@ -434,11 +434,7 @@ impl CompactionExecutor {
         let mut readers = Vec::new();
         for (_level, sst_id) in &task.inputs {
             let sst_path = sst_dir.join(format!("{sst_id:08}.sst"));
-            let reader = if let Some(ref io_service) = io {
-                SstReaderRef::open_with_io(&sst_path, std::sync::Arc::clone(io_service))?
-            } else {
-                SstReaderRef::open(&sst_path)?
-            };
+            let reader = SstReaderRef::open(&sst_path, std::sync::Arc::clone(&io))?;
             readers.push(reader);
         }
 
@@ -551,6 +547,10 @@ mod tests {
     use super::*;
     use crate::storage::sstable::SstBuilder;
     use tempfile::TempDir;
+
+    fn test_io() -> Arc<crate::io::IoService> {
+        crate::io::IoService::new(32).unwrap()
+    }
 
     fn test_config(dir: &Path) -> Arc<LsmConfig> {
         Arc::new(
@@ -696,7 +696,7 @@ mod tests {
         builder.finish(1, 0).unwrap();
 
         // Create merge iterator
-        let reader = SstReaderRef::open(&sst_path).unwrap();
+        let reader = SstReaderRef::open(&sst_path, test_io()).unwrap();
         let mut iter = MergeIterator::new(vec![reader]).unwrap();
         iter.seek_to_first().unwrap();
 
@@ -739,8 +739,8 @@ mod tests {
         builder.finish(2, 0).unwrap();
 
         // Merge both
-        let reader1 = SstReaderRef::open(&sst1_path).unwrap();
-        let reader2 = SstReaderRef::open(&sst2_path).unwrap();
+        let reader1 = SstReaderRef::open(&sst1_path, test_io()).unwrap();
+        let reader2 = SstReaderRef::open(&sst2_path, test_io()).unwrap();
         let mut iter = MergeIterator::new(vec![reader1, reader2]).unwrap();
         iter.seek_to_first().unwrap();
 
@@ -782,8 +782,8 @@ mod tests {
         builder.finish(2, 0).unwrap();
 
         // Merge with newer first
-        let reader1 = SstReaderRef::open(&sst1_path).unwrap();
-        let reader2 = SstReaderRef::open(&sst2_path).unwrap();
+        let reader1 = SstReaderRef::open(&sst1_path, test_io()).unwrap();
+        let reader2 = SstReaderRef::open(&sst2_path, test_io()).unwrap();
         let mut iter = MergeIterator::new(vec![reader1, reader2]).unwrap();
         iter.seek_to_first().unwrap();
 
@@ -836,7 +836,13 @@ mod tests {
         // Execute compaction with pre-allocated IDs (tests use standard I/O)
         let pre_allocated_ids = vec![3, 4]; // Over-allocate for safety
         let delta = executor
-            .execute(&task, &version, &config.sst_dir(), &pre_allocated_ids, None)
+            .execute(
+                &task,
+                &version,
+                &config.sst_dir(),
+                &pre_allocated_ids,
+                test_io(),
+            )
             .unwrap();
 
         // Verify delta
@@ -865,7 +871,7 @@ mod tests {
         let builder = SstBuilder::new(&sst_path, SstBuilderOptions::default()).unwrap();
         builder.finish(1, 0).unwrap();
 
-        let reader = SstReaderRef::open(&sst_path).unwrap();
+        let reader = SstReaderRef::open(&sst_path, test_io()).unwrap();
         let mut iter = MergeIterator::new(vec![reader]).unwrap();
         iter.seek_to_first().unwrap();
 
@@ -881,7 +887,7 @@ mod tests {
         builder.add(b"key", b"value").unwrap();
         builder.finish(1, 0).unwrap();
 
-        let reader = SstReaderRef::open(&sst_path).unwrap();
+        let reader = SstReaderRef::open(&sst_path, test_io()).unwrap();
         let iter = MergeIterator::new(vec![reader]).unwrap();
 
         // Iterator should not be valid until seek_to_first
@@ -897,7 +903,7 @@ mod tests {
         builder.add(b"key", b"value").unwrap();
         builder.finish(1, 0).unwrap();
 
-        let reader = SstReaderRef::open(&sst_path).unwrap();
+        let reader = SstReaderRef::open(&sst_path, test_io()).unwrap();
         let mut iter = MergeIterator::new(vec![reader]).unwrap();
         iter.seek_to_first().unwrap();
 
@@ -926,8 +932,8 @@ mod tests {
         builder.add(b"key", b"older").unwrap();
         builder.finish(2, 0).unwrap();
 
-        let reader1 = SstReaderRef::open(&sst1_path).unwrap();
-        let reader2 = SstReaderRef::open(&sst2_path).unwrap();
+        let reader1 = SstReaderRef::open(&sst1_path, test_io()).unwrap();
+        let reader2 = SstReaderRef::open(&sst2_path, test_io()).unwrap();
 
         // Newer file first
         let mut iter = MergeIterator::new(vec![reader1, reader2]).unwrap();
@@ -966,7 +972,7 @@ mod tests {
             }
             builder.finish(sst_idx as u64 + 1, 0).unwrap();
 
-            readers.push(SstReaderRef::open(&sst_path).unwrap());
+            readers.push(SstReaderRef::open(&sst_path, test_io()).unwrap());
         }
 
         let mut iter = MergeIterator::new(readers).unwrap();
@@ -1011,7 +1017,7 @@ mod tests {
         builder.add(&mvcc(b"key2", 100), b"v2_100").unwrap();
         builder.finish(1, 0).unwrap();
 
-        let reader = SstReaderRef::open(&sst_path).unwrap();
+        let reader = SstReaderRef::open(&sst_path, test_io()).unwrap();
         let mut iter = MergeIterator::new(vec![reader]).unwrap();
         iter.seek_to_first().unwrap();
 
@@ -1043,7 +1049,7 @@ mod tests {
         builder.add(&mvcc(b"only_key", 50), b"v50").unwrap();
         builder.finish(1, 0).unwrap();
 
-        let reader = SstReaderRef::open(&sst_path).unwrap();
+        let reader = SstReaderRef::open(&sst_path, test_io()).unwrap();
         let mut iter = MergeIterator::new(vec![reader]).unwrap();
         iter.seek_to_first().unwrap();
 
@@ -1065,7 +1071,7 @@ mod tests {
         builder.add(b"b", b"vb").unwrap();
         builder.finish(1, 0).unwrap();
 
-        let reader = SstReaderRef::open(&sst_path).unwrap();
+        let reader = SstReaderRef::open(&sst_path, test_io()).unwrap();
         let mut iter = MergeIterator::new(vec![reader]).unwrap();
         iter.seek_to_first().unwrap();
 
@@ -1099,8 +1105,8 @@ mod tests {
         builder.add(b"d", b"d2").unwrap();
         builder.finish(2, 0).unwrap();
 
-        let reader1 = SstReaderRef::open(&sst1_path).unwrap();
-        let reader2 = SstReaderRef::open(&sst2_path).unwrap();
+        let reader1 = SstReaderRef::open(&sst1_path, test_io()).unwrap();
+        let reader2 = SstReaderRef::open(&sst2_path, test_io()).unwrap();
 
         let mut iter = MergeIterator::new(vec![reader1, reader2]).unwrap();
         iter.seek_to_first().unwrap();
@@ -1130,7 +1136,7 @@ mod tests {
         builder.add(b"key", b"value").unwrap();
         builder.finish(1, 0).unwrap();
 
-        let reader = SstReaderRef::open(&sst_path).unwrap();
+        let reader = SstReaderRef::open(&sst_path, test_io()).unwrap();
         let iter = MergeIterator::new(vec![reader]).unwrap();
 
         // Before seek_to_first, current should be None
@@ -1265,7 +1271,13 @@ mod tests {
 
         let pre_allocated_ids = vec![3, 4];
         let delta = executor
-            .execute(&task, &version, &config.sst_dir(), &pre_allocated_ids, None)
+            .execute(
+                &task,
+                &version,
+                &config.sst_dir(),
+                &pre_allocated_ids,
+                test_io(),
+            )
             .unwrap();
 
         // Output should span full key range

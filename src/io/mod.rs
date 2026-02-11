@@ -16,19 +16,20 @@
 //!
 //! This module provides:
 //! - `AlignedBuf`: heap buffer with custom alignment for O_DIRECT
-//! - `DmaFile`: file descriptor opened with O_DIRECT
+//! - `DmaFile`: file descriptor opened with O_DIRECT (automatic fallback)
 //! - `IoService`: dedicated thread with io_uring event loop
+//! - `IoFuture`: dual-mode future (`.await` or `.wait()`) for I/O results
 //!
 //! ## Architecture
 //!
 //! ```text
 //! Caller threads                 Dedicated IO thread
 //! ─────────────                  ─────────────────────
-//! io.read_at_sync(fd,off,len)    io_uring event loop:
+//! io.read_at(fd,off,len)         io_uring event loop:
 //!   → submit via crossbeam         recv IoRequest
-//!   → block on crossbeam recv      submit to io_uring SQ
+//!   → .wait() or .await            submit to io_uring SQ
 //! ← AlignedBuf                     poll io_uring CQ
-//!                                   send result via reply
+//!                                   send result via oneshot
 //! ```
 
 mod aligned_buf;
@@ -37,4 +38,4 @@ mod service;
 
 pub use aligned_buf::AlignedBuf;
 pub use dma_file::DmaFile;
-pub use service::IoService;
+pub use service::{IoFuture, IoService};

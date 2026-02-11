@@ -326,9 +326,9 @@ impl<S: PessimisticStorage + 'static, L: AsyncClogService + 'static, T: TsoServi
         self.concurrency_manager.prepare_txn(start_ts, commit_ts)?;
 
         // Step 4: Submit to clog (non-blocking — returns future)
-        let fsync_future = self
-            .clog_service
-            .write_batch_async(txn_id, storage_batch, commit_ts, true)?;
+        let fsync_future =
+            self.clog_service
+                .write_batch_async(txn_id, storage_batch, commit_ts, true)?;
 
         Ok((commit_ts, fsync_future))
     }

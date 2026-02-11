@@ -627,6 +627,10 @@ mod tests {
     use crate::storage::sstable::builder::{SstBuilder, SstBuilderOptions};
     use tempfile::tempdir;
 
+    fn test_io() -> std::sync::Arc<crate::io::IoService> {
+        crate::io::IoService::new(32).unwrap()
+    }
+
     // Helper to create MVCC key
     fn mvcc_key(key_bytes: &[u8], ts: u64) -> Vec<u8> {
         let mut result = key_bytes.to_vec();
@@ -644,7 +648,7 @@ mod tests {
             builder.add(key, value)?;
         }
         builder.finish(1, 0)?;
-        SstReaderRef::open(path)
+        SstReaderRef::open(path, test_io())
     }
 
     // Helper to create an SST with sequential keys
@@ -660,7 +664,7 @@ mod tests {
             builder.add(key.as_bytes(), value.as_bytes())?;
         }
         builder.finish(1, 0)?;
-        SstReaderRef::open(path)
+        SstReaderRef::open(path, test_io())
     }
 
     // ------------------------------------------------------------------------
@@ -675,7 +679,7 @@ mod tests {
         let builder = SstBuilder::new(&path, SstBuilderOptions::default()).unwrap();
         builder.finish(1, 0).unwrap();
 
-        let reader = SstReaderRef::open(&path).unwrap();
+        let reader = SstReaderRef::open(&path, test_io()).unwrap();
         let mut iter = SstIterator::new(reader).unwrap();
         iter.seek_to_first().unwrap(); // Position the iterator
 
@@ -825,7 +829,7 @@ mod tests {
         }
         builder.finish(1, 0).unwrap();
 
-        let reader = SstReaderRef::open(&path).unwrap();
+        let reader = SstReaderRef::open(&path, test_io()).unwrap();
         let mut iter = SstIterator::new(reader).unwrap();
         iter.seek_to_first().unwrap(); // Position the iterator
 
@@ -868,7 +872,7 @@ mod tests {
         }
         builder.finish(1, 0).unwrap();
 
-        let reader = SstReaderRef::open(&path).unwrap();
+        let reader = SstReaderRef::open(&path, test_io()).unwrap();
         let mut iter = SstIterator::new(reader).unwrap();
 
         // Seek to various keys across blocks
@@ -898,7 +902,7 @@ mod tests {
         }
         builder.finish(1, 0).unwrap();
 
-        let reader = SstReaderRef::open(&path).unwrap();
+        let reader = SstReaderRef::open(&path, test_io()).unwrap();
         let mut iter = SstIterator::new(reader).unwrap();
         iter.seek_to_first().unwrap(); // Position the iterator
 
@@ -995,7 +999,7 @@ mod tests {
         let empty_path = dir.path().join("empty.sst");
         let builder = SstBuilder::new(&empty_path, SstBuilderOptions::default()).unwrap();
         builder.finish(1, 0).unwrap();
-        let empty_reader = SstReaderRef::open(&empty_path).unwrap();
+        let empty_reader = SstReaderRef::open(&empty_path, test_io()).unwrap();
 
         // Create a non-empty SST
         let non_empty_reader =
@@ -1169,7 +1173,7 @@ mod tests {
         }
         builder.finish(1, 0).unwrap();
 
-        let reader = SstReaderRef::open(&path).unwrap();
+        let reader = SstReaderRef::open(&path, test_io()).unwrap();
         let mut iter = SstIterator::new(reader).unwrap();
 
         // Seek to middle
@@ -1198,7 +1202,7 @@ mod tests {
         let builder = SstBuilder::new(&path, SstBuilderOptions::default()).unwrap();
         builder.finish(1, 0).unwrap();
 
-        let reader = SstReaderRef::open(&path).unwrap();
+        let reader = SstReaderRef::open(&path, test_io()).unwrap();
         let mut iter = SstIterator::new(reader).unwrap();
 
         iter.seek_to_first().unwrap();
@@ -1309,9 +1313,9 @@ mod tests {
             builder.finish(1, 0).unwrap();
         }
 
-        let empty1 = SstReaderRef::open(&empty1_path).unwrap();
-        let empty2 = SstReaderRef::open(&empty2_path).unwrap();
-        let empty3 = SstReaderRef::open(&empty3_path).unwrap();
+        let empty1 = SstReaderRef::open(&empty1_path, test_io()).unwrap();
+        let empty2 = SstReaderRef::open(&empty2_path, test_io()).unwrap();
+        let empty3 = SstReaderRef::open(&empty3_path, test_io()).unwrap();
         let non_empty = create_sequential_sst(&dir.path().join("nonempty.sst"), 0, 3).unwrap();
 
         // [empty, empty, non_empty, empty]
@@ -1344,7 +1348,7 @@ mod tests {
         builder.add(&mvcc_key(b"key2", 200), b"v2_200").unwrap();
         builder.finish(1, 0).unwrap();
 
-        let reader = SstReaderRef::open(&path).unwrap();
+        let reader = SstReaderRef::open(&path, test_io()).unwrap();
         let range = Arc::new(MvccKey::unbounded()..MvccKey::unbounded());
         let mut iter = SstMvccIterator::new(reader, range).unwrap();
 
@@ -1386,7 +1390,7 @@ mod tests {
         builder.add(&mvcc_key(b"d", 100), b"vd").unwrap();
         builder.finish(1, 0).unwrap();
 
-        let reader = SstReaderRef::open(&path).unwrap();
+        let reader = SstReaderRef::open(&path, test_io()).unwrap();
         // Range starting from "b"
         let range = Arc::new(MvccKey::encode(b"b", u64::MAX)..MvccKey::unbounded());
         let mut iter = SstMvccIterator::new(reader, range).unwrap();
@@ -1419,7 +1423,7 @@ mod tests {
         builder.add(&mvcc_key(b"d", 100), b"vd").unwrap();
         builder.finish(1, 0).unwrap();
 
-        let reader = SstReaderRef::open(&path).unwrap();
+        let reader = SstReaderRef::open(&path, test_io()).unwrap();
         // Range ending before "c" (exclusive)
         let range = Arc::new(MvccKey::unbounded()..MvccKey::encode(b"c", u64::MAX));
         let mut iter = SstMvccIterator::new(reader, range).unwrap();
@@ -1450,7 +1454,7 @@ mod tests {
         builder.add(&mvcc_key(b"d", 100), b"vd").unwrap();
         builder.finish(1, 0).unwrap();
 
-        let reader = SstReaderRef::open(&path).unwrap();
+        let reader = SstReaderRef::open(&path, test_io()).unwrap();
         // Range [b, d) - should include b, c but not d
         let range = Arc::new(MvccKey::encode(b"b", u64::MAX)..MvccKey::encode(b"d", u64::MAX));
         let mut iter = SstMvccIterator::new(reader, range).unwrap();
@@ -1479,7 +1483,7 @@ mod tests {
         builder.add(&mvcc_key(b"c", 100), b"vc").unwrap();
         builder.finish(1, 0).unwrap();
 
-        let reader = SstReaderRef::open(&path).unwrap();
+        let reader = SstReaderRef::open(&path, test_io()).unwrap();
         let range = Arc::new(MvccKey::unbounded()..MvccKey::unbounded());
         let mut iter = SstMvccIterator::new(reader, range).unwrap();
 
@@ -1504,7 +1508,7 @@ mod tests {
         builder.add(&mvcc_key(b"c", 100), b"vc").unwrap();
         builder.finish(1, 0).unwrap();
 
-        let reader = SstReaderRef::open(&path).unwrap();
+        let reader = SstReaderRef::open(&path, test_io()).unwrap();
         // Range starting from "b"
         let range = Arc::new(MvccKey::encode(b"b", u64::MAX)..MvccKey::unbounded());
         let mut iter = SstMvccIterator::new(reader, range).unwrap();
@@ -1530,7 +1534,7 @@ mod tests {
         builder.add(&mvcc_key(b"key", 10), b"v10").unwrap();
         builder.finish(1, 0).unwrap();
 
-        let reader = SstReaderRef::open(&path).unwrap();
+        let reader = SstReaderRef::open(&path, test_io()).unwrap();
         let range = Arc::new(MvccKey::unbounded()..MvccKey::unbounded());
         let mut iter = SstMvccIterator::new(reader, range).unwrap();
 
@@ -1558,7 +1562,7 @@ mod tests {
         builder.add(b"short", b"value").unwrap();
         builder.finish(1, 0).unwrap();
 
-        let reader = SstReaderRef::open(&path).unwrap();
+        let reader = SstReaderRef::open(&path, test_io()).unwrap();
         let range = Arc::new(MvccKey::unbounded()..MvccKey::unbounded());
         let mut iter = SstMvccIterator::new(reader, range).unwrap();
 
@@ -1578,7 +1582,7 @@ mod tests {
         let builder = SstBuilder::new(&path, SstBuilderOptions::default()).unwrap();
         builder.finish(1, 0).unwrap();
 
-        let reader = SstReaderRef::open(&path).unwrap();
+        let reader = SstReaderRef::open(&path, test_io()).unwrap();
         let range = Arc::new(MvccKey::unbounded()..MvccKey::unbounded());
         let mut iter = SstMvccIterator::new(reader, range).unwrap();
 
@@ -1598,7 +1602,7 @@ mod tests {
         builder.add(&mvcc_key(b"b", 100), b"vb").unwrap();
         builder.finish(1, 0).unwrap();
 
-        let reader = SstReaderRef::open(&path).unwrap();
+        let reader = SstReaderRef::open(&path, test_io()).unwrap();
         // Range that doesn't overlap with any data
         let range = Arc::new(MvccKey::encode(b"x", u64::MAX)..MvccKey::encode(b"z", u64::MAX));
         let mut iter = SstMvccIterator::new(reader, range).unwrap();
@@ -1622,7 +1626,7 @@ mod tests {
         let builder = SstBuilder::new(&path, SstBuilderOptions::default()).unwrap();
         builder.finish(1, 0).unwrap();
 
-        let reader = SstReaderRef::open(&path).unwrap();
+        let reader = SstReaderRef::open(&path, test_io()).unwrap();
         let mut iter = SstIterator::new(reader).unwrap();
 
         // Seek should handle empty SST gracefully

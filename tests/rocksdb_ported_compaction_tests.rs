@@ -29,7 +29,7 @@ use tisql::storage::mvcc::{is_tombstone, MvccIterator, MvccKey};
 use tisql::storage::WriteBatch;
 use tisql::testkit::{
     CompactionExecutor, CompactionPicker, CompactionScheduler, CompactionTask, FlushScheduler,
-    IlogConfig, IlogService, LsmConfigBuilder, LsmEngine, ManifestDelta, SstBuilder,
+    IlogConfig, IlogService, IoService, LsmConfigBuilder, LsmEngine, ManifestDelta, SstBuilder,
     SstBuilderOptions, SstMeta, SstReaderRef, Version,
 };
 use tisql::types::{Key, RawValue, Timestamp};
@@ -337,7 +337,13 @@ fn test_executor_merge_keys() {
     // Execute with pre-allocated IDs
     let pre_allocated_ids = vec![3, 4];
     let delta = executor
-        .execute(&task, &version, &sst_dir, &pre_allocated_ids, None)
+        .execute(
+            &task,
+            &version,
+            &sst_dir,
+            &pre_allocated_ids,
+            IoService::new(32).unwrap(),
+        )
         .unwrap();
 
     // Verify output
@@ -347,7 +353,7 @@ fn test_executor_merge_keys() {
     // Read output SST and verify keys are merged in order
     let output_sst = &delta.new_ssts[0];
     let output_path = sst_dir.join(format!("{:08}.sst", output_sst.id));
-    let reader = SstReaderRef::open(&output_path).unwrap();
+    let reader = SstReaderRef::open(&output_path, IoService::new(32).unwrap()).unwrap();
     let mut iter = tisql::testkit::SstIterator::new(reader).unwrap();
     iter.seek_to_first().unwrap();
 
@@ -420,12 +426,18 @@ fn test_executor_mvcc_ordering() {
 
     let pre_allocated_ids = vec![3, 4];
     let delta = executor
-        .execute(&task, &version, &sst_dir, &pre_allocated_ids, None)
+        .execute(
+            &task,
+            &version,
+            &sst_dir,
+            &pre_allocated_ids,
+            IoService::new(32).unwrap(),
+        )
         .unwrap();
 
     // Read and verify all versions are preserved in correct order
     let output_path = sst_dir.join(format!("{:08}.sst", delta.new_ssts[0].id));
-    let reader = SstReaderRef::open(&output_path).unwrap();
+    let reader = SstReaderRef::open(&output_path, IoService::new(32).unwrap()).unwrap();
     let mut iter = tisql::testkit::SstIterator::new(reader).unwrap();
     iter.seek_to_first().unwrap();
 
@@ -482,12 +494,18 @@ fn test_executor_tombstones() {
 
     let pre_allocated_ids = vec![3, 4];
     let delta = executor
-        .execute(&task, &version, &sst_dir, &pre_allocated_ids, None)
+        .execute(
+            &task,
+            &version,
+            &sst_dir,
+            &pre_allocated_ids,
+            IoService::new(32).unwrap(),
+        )
         .unwrap();
 
     // Both versions should be in output (MVCC preserves all)
     let output_path = sst_dir.join(format!("{:08}.sst", delta.new_ssts[0].id));
-    let reader = SstReaderRef::open(&output_path).unwrap();
+    let reader = SstReaderRef::open(&output_path, IoService::new(32).unwrap()).unwrap();
     let mut iter = tisql::testkit::SstIterator::new(reader).unwrap();
     iter.seek_to_first().unwrap();
 

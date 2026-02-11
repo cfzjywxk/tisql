@@ -12,228 +12,198 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-// Worker pool module - separates database work from network IO using yatp
+// Worker dispatch module — runs database work on async tokio tasks.
 //
 // Architecture:
-// - Tokio runtime handles network IO (TCP accept, MySQL protocol)
-// - yatp FuturePool handles CPU-bound database work (parse, bind, execute)
-// - Communication via tokio::sync::oneshot channels
+// - Single tokio runtime for both network I/O and query processing
+// - CPU work (parse, bind, row streaming) runs inline on async tasks
+// - Storage I/O (execute_plan) uses spawn_blocking until storage becomes async
+// - tokio::sync::mpsc bridges worker task → network task (row batches)
+// - tokio::sync::oneshot for response delivery
 //
-// All DB-accessing commands (queries, BEGIN, COMMIT, ROLLBACK, SHOW) are
-// dispatched to the worker pool to keep tokio threads free for network I/O.
+// Future: When the storage layer exposes async read/write, spawn_blocking
+// calls are replaced with direct .await on storage operations.
 
 use std::sync::Arc;
 
-use tokio::sync::oneshot;
-use yatp::pool::Remote;
-use yatp::task::future::TaskCell;
+use tokio::sync::{mpsc, oneshot};
 
 use crate::error::TiSqlError;
+use crate::executor::ExecutionOutput;
 use crate::session::ExecutionCtx;
-use crate::transaction::{CommitInfo, TxnCtx};
-use crate::{Database, QueryResult};
+use crate::transaction::TxnCtx;
+use crate::types::Row;
+use crate::Database;
 
-/// Configuration for the worker thread pool
-pub struct WorkerPoolConfig {
-    /// Name prefix for worker threads (e.g., "tisql-worker")
-    pub name: String,
-    /// Minimum number of worker threads
-    pub min_threads: usize,
-    /// Maximum number of worker threads
-    pub max_threads: usize,
-}
+/// Batch of rows sent through the streaming channel.
+pub type RowBatch = Vec<Row>;
 
-impl Default for WorkerPoolConfig {
-    fn default() -> Self {
-        let cpus = num_cpus::get();
-        Self {
-            name: "tisql-worker".to_string(),
-            min_threads: 4.min(cpus),
-            max_threads: cpus,
-        }
-    }
-}
+/// Maximum rows per batch before sending through the channel.
+const BATCH_SIZE: usize = 1024;
 
-/// Thread pool for executing database work off the network IO threads
-pub struct WorkerPool {
-    remote: Remote<TaskCell>,
-    // Keep pool alive - dropping it shuts down the threads
-    _pool: yatp::ThreadPool<TaskCell>,
-}
-
-/// Result type for query execution with TxnCtx ownership transfer.
-///
-/// On success: (QueryResult, Option<TxnCtx>) - the TxnCtx is returned if still active.
-/// On error: (TiSqlError, Option<TxnCtx>) - the TxnCtx is returned to keep the transaction active.
-pub type QueryResultWithCtx = Result<(QueryResult, Option<TxnCtx>), (TiSqlError, Option<TxnCtx>)>;
-
-/// Commands that can be dispatched to the worker pool.
-///
-/// Each variant represents a database operation that should run off the
-/// tokio network thread to avoid blocking the event loop.
-pub enum WorkerCommand {
-    /// Execute a SQL query with optional transaction context.
-    Query {
-        sql: String,
-        exec_ctx: ExecutionCtx,
-        txn_ctx: Option<TxnCtx>,
-    },
-    /// BEGIN / START TRANSACTION.
-    Begin { read_only: bool },
-    /// COMMIT an explicit transaction.
-    Commit { txn_ctx: TxnCtx },
-    /// ROLLBACK an explicit transaction.
-    Rollback { txn_ctx: TxnCtx },
-    /// SHOW TABLES in a database.
-    ShowTables { database: String },
-    /// SHOW DATABASES.
-    ShowDatabases,
-}
-
-/// Results returned from the worker pool.
-pub enum WorkerResult {
-    /// Query execution result with optional returned TxnCtx.
-    Query {
-        result: QueryResult,
-        txn_ctx: Option<TxnCtx>,
-    },
-    /// A new transaction was started.
-    Begin { txn_ctx: TxnCtx },
-    /// Transaction committed successfully.
-    Committed { info: CommitInfo },
-    /// Transaction rolled back successfully.
-    RolledBack,
-    /// List of table names.
-    Tables(Vec<String>),
-    /// List of database/schema names.
-    Databases(Vec<String>),
-    /// An error occurred, with optional TxnCtx returned for session recovery.
+/// Completion signal for a streaming read query.
+pub enum QueryDone {
+    /// Execution completed successfully.
+    Success { txn_ctx: Option<TxnCtx> },
+    /// Execution failed.
     Error {
         error: TiSqlError,
         txn_ctx: Option<TxnCtx>,
     },
 }
 
-impl WorkerPool {
-    /// Create a new worker pool with the given configuration
-    pub fn new(config: WorkerPoolConfig) -> Self {
-        let pool = yatp::Builder::new(&config.name)
-            .min_thread_count(config.min_threads)
-            .max_thread_count(config.max_threads)
-            .build_future_pool();
-
-        let remote = pool.remote().clone();
-
-        Self {
-            remote,
-            _pool: pool,
-        }
-    }
-
-    /// Dispatch a command to the worker pool and await the result.
-    ///
-    /// This is the unified entry point for all DB-accessing operations.
-    /// The command is executed on a yatp worker thread, keeping the
-    /// tokio network thread free for I/O.
-    ///
-    /// The `Commit` variant uses `commit_async()` which yields during fsync,
-    /// freeing the yatp thread for other work. All other variants remain
-    /// synchronous (no I/O wait).
-    pub async fn dispatch(&self, db: Arc<Database>, cmd: WorkerCommand) -> WorkerResult {
-        let (tx, rx) = oneshot::channel();
-
-        self.remote.spawn(async move {
-            let result = Self::execute_command(&db, cmd).await;
-            let _ = tx.send(result);
-        });
-
-        rx.await.unwrap_or_else(|_| WorkerResult::Error {
-            error: TiSqlError::Internal("Worker task dropped".into()),
-            txn_ctx: None,
-        })
-    }
-
-    /// Execute a command on the worker thread.
-    ///
-    /// Only `Commit` actually awaits (on clog fsync). All other variants
-    /// run synchronously — their CPU-bound work completes quickly.
-    async fn execute_command(db: &Database, cmd: WorkerCommand) -> WorkerResult {
-        match cmd {
-            WorkerCommand::Query {
-                sql,
-                exec_ctx,
-                txn_ctx,
-            } => match db.handle_query(&sql, &exec_ctx, txn_ctx) {
-                Ok((result, returned_ctx)) => WorkerResult::Query {
-                    result,
-                    txn_ctx: returned_ctx,
-                },
-                Err(e) => WorkerResult::Error {
-                    error: e,
-                    txn_ctx: None,
-                },
-            },
-            WorkerCommand::Begin { read_only } => match db.begin_explicit(read_only) {
-                Ok(ctx) => WorkerResult::Begin { txn_ctx: ctx },
-                Err(e) => WorkerResult::Error {
-                    error: e,
-                    txn_ctx: None,
-                },
-            },
-            WorkerCommand::Commit { txn_ctx } => match db.commit_async(txn_ctx).await {
-                Ok(info) => WorkerResult::Committed { info },
-                Err(e) => WorkerResult::Error {
-                    error: e,
-                    txn_ctx: None,
-                },
-            },
-            WorkerCommand::Rollback { txn_ctx } => match db.rollback(txn_ctx) {
-                Ok(()) => WorkerResult::RolledBack,
-                Err(e) => WorkerResult::Error {
-                    error: e,
-                    txn_ctx: None,
-                },
-            },
-            WorkerCommand::ShowTables { database } => match db.list_tables(&database) {
-                Ok(tables) => WorkerResult::Tables(tables),
-                Err(e) => WorkerResult::Error {
-                    error: e,
-                    txn_ctx: None,
-                },
-            },
-            WorkerCommand::ShowDatabases => match db.list_schemas() {
-                Ok(schemas) => WorkerResult::Databases(schemas),
-                Err(e) => WorkerResult::Error {
-                    error: e,
-                    txn_ctx: None,
-                },
-            },
-        }
-    }
-
-    /// Handle a query on a worker thread with TxnCtx ownership transfer.
-    ///
-    /// This is the legacy entry point kept for backward compatibility.
-    /// New code should use `dispatch()` with `WorkerCommand::Query`.
-    pub async fn handle_query(
-        &self,
-        db: Arc<Database>,
-        sql: String,
-        exec_ctx: ExecutionCtx,
+/// Response from query dispatch.
+///
+/// Read queries return `Rows` with streaming channels; writes and
+/// transaction control return results directly.
+pub enum QueryResponse {
+    /// Read query — stream rows through mpsc, completion via oneshot.
+    Rows {
+        columns: Vec<String>,
+        batch_rx: mpsc::Receiver<RowBatch>,
+        done_rx: oneshot::Receiver<QueryDone>,
+    },
+    /// Write operation (INSERT/UPDATE/DELETE).
+    Affected { count: u64, txn_ctx: Option<TxnCtx> },
+    /// DDL/session command (CREATE TABLE, USE, etc.).
+    Ok { txn_ctx: Option<TxnCtx> },
+    /// Error before any streaming started.
+    Error {
+        error: TiSqlError,
         txn_ctx: Option<TxnCtx>,
-    ) -> QueryResultWithCtx {
-        let cmd = WorkerCommand::Query {
-            sql,
-            exec_ctx,
-            txn_ctx,
+    },
+}
+
+/// Dispatch a full query (parse + bind + execute) as an async worker task.
+///
+/// Spawns a tokio task that:
+/// 1. Parses and binds SQL (CPU work, inline)
+/// 2. Executes the plan (storage I/O, spawn_blocking for now)
+/// 3. Streams rows via channels (CPU work, inline)
+///
+/// For read queries, returns immediately with streaming channels.
+/// For writes, awaits execution completion.
+pub async fn dispatch_full_query(
+    db: Arc<Database>,
+    sql: String,
+    exec_ctx: ExecutionCtx,
+    txn_ctx: Option<TxnCtx>,
+) -> QueryResponse {
+    let (response_tx, response_rx) = oneshot::channel::<QueryResponse>();
+
+    tokio::spawn(async move {
+        // CPU: parse and bind
+        let plan = match db.parse_and_bind(&sql, &exec_ctx) {
+            Ok(plan) => plan,
+            Err(e) => {
+                let _ = response_tx.send(QueryResponse::Error { error: e, txn_ctx });
+                return;
+            }
         };
-        match self.dispatch(db, cmd).await {
-            WorkerResult::Query { result, txn_ctx } => Ok((result, txn_ctx)),
-            WorkerResult::Error { error, txn_ctx } => Err((error, txn_ctx)),
-            _ => Err((
-                TiSqlError::Internal("Unexpected worker result for query".into()),
-                None,
-            )),
+
+        if plan.is_read_query() {
+            let columns = plan.output_columns();
+            let (batch_tx, batch_rx) = mpsc::channel(4);
+            let (done_tx, done_rx) = oneshot::channel();
+
+            // Send response with streaming channels to caller
+            if response_tx
+                .send(QueryResponse::Rows {
+                    columns,
+                    batch_rx,
+                    done_rx,
+                })
+                .is_err()
+            {
+                return; // caller dropped
+            }
+
+            // Storage I/O: execute plan (spawn_blocking until storage is async)
+            let db_exec = Arc::clone(&db);
+            let exec_result =
+                tokio::task::spawn_blocking(move || db_exec.execute_plan(plan, &exec_ctx, txn_ctx))
+                    .await;
+
+            match exec_result {
+                Ok(Ok((ExecutionOutput::Rows(mut exec), returned_ctx))) => {
+                    // CPU: stream materialized rows via channel
+                    let mut batch = Vec::with_capacity(BATCH_SIZE);
+                    while let Some(row) = exec.next() {
+                        batch.push(row);
+                        if batch.len() >= BATCH_SIZE {
+                            if batch_tx.send(std::mem::take(&mut batch)).await.is_err() {
+                                return; // receiver dropped (client disconnected)
+                            }
+                            batch = Vec::with_capacity(BATCH_SIZE);
+                        }
+                    }
+                    if !batch.is_empty() {
+                        let _ = batch_tx.send(batch).await;
+                    }
+                    drop(batch_tx);
+                    let _ = done_tx.send(QueryDone::Success {
+                        txn_ctx: returned_ctx,
+                    });
+                }
+                Ok(Ok((_, returned_ctx))) => {
+                    drop(batch_tx);
+                    let _ = done_tx.send(QueryDone::Success {
+                        txn_ctx: returned_ctx,
+                    });
+                }
+                Ok(Err(e)) => {
+                    drop(batch_tx);
+                    let _ = done_tx.send(QueryDone::Error {
+                        error: e,
+                        txn_ctx: None,
+                    });
+                }
+                Err(e) => {
+                    drop(batch_tx);
+                    let _ = done_tx.send(QueryDone::Error {
+                        error: TiSqlError::Internal(format!("Task panicked: {e}")),
+                        txn_ctx: None,
+                    });
+                }
+            }
+        } else {
+            // Write/DDL: execute (storage I/O via spawn_blocking)
+            let db_exec = Arc::clone(&db);
+            let exec_result =
+                tokio::task::spawn_blocking(move || db_exec.execute_plan(plan, &exec_ctx, txn_ctx))
+                    .await;
+
+            match exec_result {
+                Ok(Ok((ExecutionOutput::Affected { count }, ctx))) => {
+                    let _ = response_tx.send(QueryResponse::Affected {
+                        count,
+                        txn_ctx: ctx,
+                    });
+                }
+                Ok(Ok((ExecutionOutput::Ok, ctx))) => {
+                    let _ = response_tx.send(QueryResponse::Ok { txn_ctx: ctx });
+                }
+                Ok(Ok((ExecutionOutput::Rows(_), ctx))) => {
+                    let _ = response_tx.send(QueryResponse::Ok { txn_ctx: ctx });
+                }
+                Ok(Err(e)) => {
+                    let _ = response_tx.send(QueryResponse::Error {
+                        error: e,
+                        txn_ctx: None,
+                    });
+                }
+                Err(e) => {
+                    let _ = response_tx.send(QueryResponse::Error {
+                        error: TiSqlError::Internal(format!("Task panicked: {e}")),
+                        txn_ctx: None,
+                    });
+                }
+            }
         }
-    }
+    });
+
+    response_rx.await.unwrap_or(QueryResponse::Error {
+        error: TiSqlError::Internal("Worker task dropped".into()),
+        txn_ctx: None,
+    })
 }

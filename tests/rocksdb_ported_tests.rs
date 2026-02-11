@@ -33,7 +33,7 @@ use tisql::new_lsn_provider;
 use tisql::storage::mvcc::{is_tombstone, MvccIterator, MvccKey};
 use tisql::storage::WriteBatch;
 use tisql::testkit::{
-    IlogConfig, IlogService, LsmConfigBuilder, LsmEngine, SstBuilder, SstBuilderOptions,
+    IlogConfig, IlogService, IoService, LsmConfigBuilder, LsmEngine, SstBuilder, SstBuilderOptions,
     SstIterator, SstReaderRef, Version,
 };
 use tisql::types::{RawValue, Timestamp};
@@ -765,7 +765,7 @@ fn test_sst_iterator_key_patterns() {
     builder.finish(1, 0).unwrap();
 
     // Read and verify
-    let reader = SstReaderRef::open(&sst_path).unwrap();
+    let reader = SstReaderRef::open(&sst_path, IoService::new(32).unwrap()).unwrap();
     let mut iter = SstIterator::new(reader).unwrap();
     iter.seek_to_first().unwrap();
 
@@ -809,7 +809,7 @@ fn test_sst_many_entries() {
     assert_eq!(meta.entry_count, num_entries as u64);
 
     // Read and count
-    let reader = SstReaderRef::open(&sst_path).unwrap();
+    let reader = SstReaderRef::open(&sst_path, IoService::new(32).unwrap()).unwrap();
     let mut iter = SstIterator::new(reader).unwrap();
     iter.seek_to_first().unwrap();
 
@@ -866,7 +866,7 @@ fn test_sst_mvcc_keys() {
     builder.finish(1, 0).unwrap();
 
     // Read and verify order
-    let reader = SstReaderRef::open(&sst_path).unwrap();
+    let reader = SstReaderRef::open(&sst_path, IoService::new(32).unwrap()).unwrap();
     let mut iter = SstIterator::new(reader).unwrap();
     iter.seek_to_first().unwrap();
 

@@ -17,15 +17,11 @@
 //! ## Design
 //!
 //! A single dedicated thread owns the io_uring ring. Callers submit requests
-//! via a crossbeam channel and block (or await) on a reply channel. The IO
-//! thread batches pending requests, submits them to io_uring, reaps completions,
-//! and notifies callers.
+//! via a crossbeam channel and receive results through `IoFuture<T>`:
 //!
-//! ## Dual-Mode Reply
-//!
-//! Like `GroupCommitWriter`, callers can use either:
-//! - `read_at_sync()` / `write_at_sync()` / `fsync_sync()` — blocks on crossbeam (for flush/compaction threads)
-//! - `read_at_async()` / `fsync_async()` — returns tokio oneshot (for async protocol tasks)
+//! - **Async callers**: `.await` the IoFuture in tokio tasks
+//! - **Sync callers**: `.wait()` using `blocking_recv()` (for iterators,
+//!   flush/compaction on spawn_blocking threads)
 //!
 //! ## O_DIRECT Alignment
 //!
@@ -34,7 +30,9 @@
 //! requested (the service reads a larger aligned range and slices the result).
 
 use std::os::unix::io::RawFd;
+use std::pin::Pin;
 use std::sync::Arc;
+use std::task::{Context, Poll};
 
 use super::aligned_buf::{align_down, align_up, AlignedBuf, DMA_ALIGNMENT};
 use super::dma_file::DmaFile;
@@ -42,23 +40,45 @@ use super::dma_file::DmaFile;
 /// Result type for IO operations — contains either data or an error message.
 type IoResult<T> = Result<T, String>;
 
-/// Reply channel for notifying the caller when an IO operation completes.
+/// A future representing a pending I/O operation.
 ///
-/// Same dual-mode pattern as `GroupCommitWriter` in clog.
-enum ReplyChannel<T: Send + 'static> {
-    Sync(crossbeam_channel::Sender<IoResult<T>>),
-    Async(tokio::sync::oneshot::Sender<IoResult<T>>),
+/// Supports both async (`.await`) and sync (`.wait()`) consumption,
+/// following the same dual-mode pattern as `ClogFsyncFuture`.
+pub struct IoFuture<T: Send + 'static> {
+    rx: tokio::sync::oneshot::Receiver<IoResult<T>>,
 }
 
-impl<T: Send + 'static> ReplyChannel<T> {
-    fn send(self, result: IoResult<T>) {
-        match self {
-            ReplyChannel::Sync(tx) => {
-                let _ = tx.send(result);
-            }
-            ReplyChannel::Async(tx) => {
-                let _ = tx.send(result);
-            }
+impl<T: Send + 'static> IoFuture<T> {
+    /// Block until the I/O operation completes (for sync callers).
+    ///
+    /// Use this in `spawn_blocking` threads, dedicated I/O threads,
+    /// or iterator chains that haven't been converted to async yet.
+    ///
+    /// When called from within a tokio runtime, uses `block_in_place`
+    /// to avoid the "cannot block from within a runtime" panic.
+    pub fn wait(self) -> IoResult<T> {
+        if tokio::runtime::Handle::try_current().is_ok() {
+            tokio::task::block_in_place(|| {
+                self.rx
+                    .blocking_recv()
+                    .map_err(|_| "IoService reply channel closed".to_string())?
+            })
+        } else {
+            self.rx
+                .blocking_recv()
+                .map_err(|_| "IoService reply channel closed".to_string())?
+        }
+    }
+}
+
+impl<T: Send + 'static> std::future::Future for IoFuture<T> {
+    type Output = IoResult<T>;
+
+    fn poll(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
+        match Pin::new(&mut self.rx).poll(cx) {
+            Poll::Ready(Ok(result)) => Poll::Ready(result),
+            Poll::Ready(Err(_)) => Poll::Ready(Err("IoService reply channel closed".to_string())),
+            Poll::Pending => Poll::Pending,
         }
     }
 }
@@ -69,17 +89,17 @@ enum IoOp {
         fd: RawFd,
         offset: u64,
         len: usize,
-        reply: ReplyChannel<AlignedBuf>,
+        reply: tokio::sync::oneshot::Sender<IoResult<AlignedBuf>>,
     },
     WriteAt {
         fd: RawFd,
         offset: u64,
         buf: AlignedBuf,
-        reply: ReplyChannel<usize>,
+        reply: tokio::sync::oneshot::Sender<IoResult<usize>>,
     },
     Fsync {
         fd: RawFd,
-        reply: ReplyChannel<()>,
+        reply: tokio::sync::oneshot::Sender<IoResult<()>>,
     },
 }
 
@@ -90,6 +110,12 @@ enum IoOp {
 pub struct IoService {
     tx: crossbeam_channel::Sender<IoOp>,
     thread: Option<std::thread::JoinHandle<()>>,
+}
+
+impl std::fmt::Debug for IoService {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("IoService")
+    }
 }
 
 impl IoService {
@@ -114,34 +140,10 @@ impl IoService {
         }))
     }
 
-    /// Read `len` bytes at `offset` from the file, blocking until complete.
-    pub fn read_at_sync(
-        &self,
-        file: &DmaFile,
-        offset: u64,
-        len: usize,
-    ) -> Result<AlignedBuf, String> {
-        let (reply_tx, reply_rx) = crossbeam_channel::bounded(1);
-        self.tx
-            .send(IoOp::ReadAt {
-                fd: file.fd(),
-                offset,
-                len,
-                reply: ReplyChannel::Sync(reply_tx),
-            })
-            .map_err(|_| "IoService shut down".to_string())?;
-        reply_rx
-            .recv()
-            .map_err(|_| "IoService reply channel closed".to_string())?
-    }
-
-    /// Read `len` bytes at `offset` from the file, returning a future.
-    pub fn read_at_async(
-        &self,
-        file: &DmaFile,
-        offset: u64,
-        len: usize,
-    ) -> tokio::sync::oneshot::Receiver<IoResult<AlignedBuf>> {
+    /// Read `len` bytes at `offset` from the file.
+    ///
+    /// Returns an `IoFuture` that can be `.await`ed or `.wait()`ed.
+    pub fn read_at(&self, file: &DmaFile, offset: u64, len: usize) -> IoFuture<AlignedBuf> {
         let (reply_tx, reply_rx) = tokio::sync::oneshot::channel();
         if self
             .tx
@@ -149,71 +151,57 @@ impl IoService {
                 fd: file.fd(),
                 offset,
                 len,
-                reply: ReplyChannel::Async(reply_tx),
+                reply: reply_tx,
             })
             .is_err()
         {
-            // Service shut down — create a new channel and send error
             let (err_tx, err_rx) = tokio::sync::oneshot::channel();
             let _ = err_tx.send(Err("IoService shut down".into()));
-            return err_rx;
+            return IoFuture { rx: err_rx };
         }
-        reply_rx
+        IoFuture { rx: reply_rx }
     }
 
-    /// Write `buf` at `offset` to the file, blocking until complete.
+    /// Write `buf` at `offset` to the file.
     ///
-    /// Returns the number of bytes written.
-    pub fn write_at_sync(
-        &self,
-        file: &DmaFile,
-        offset: u64,
-        buf: AlignedBuf,
-    ) -> Result<usize, String> {
-        let (reply_tx, reply_rx) = crossbeam_channel::bounded(1);
-        self.tx
+    /// Returns an `IoFuture` with the number of bytes written.
+    pub fn write_at(&self, file: &DmaFile, offset: u64, buf: AlignedBuf) -> IoFuture<usize> {
+        let (reply_tx, reply_rx) = tokio::sync::oneshot::channel();
+        if self
+            .tx
             .send(IoOp::WriteAt {
                 fd: file.fd(),
                 offset,
                 buf,
-                reply: ReplyChannel::Sync(reply_tx),
-            })
-            .map_err(|_| "IoService shut down".to_string())?;
-        reply_rx
-            .recv()
-            .map_err(|_| "IoService reply channel closed".to_string())?
-    }
-
-    /// Fsync the file, blocking until complete.
-    pub fn fsync_sync(&self, file: &DmaFile) -> Result<(), String> {
-        let (reply_tx, reply_rx) = crossbeam_channel::bounded(1);
-        self.tx
-            .send(IoOp::Fsync {
-                fd: file.fd(),
-                reply: ReplyChannel::Sync(reply_tx),
-            })
-            .map_err(|_| "IoService shut down".to_string())?;
-        reply_rx
-            .recv()
-            .map_err(|_| "IoService reply channel closed".to_string())?
-    }
-
-    /// Fsync the file, returning a future.
-    pub fn fsync_async(&self, file: &DmaFile) -> tokio::sync::oneshot::Receiver<IoResult<()>> {
-        let (reply_tx, reply_rx) = tokio::sync::oneshot::channel();
-        if self
-            .tx
-            .send(IoOp::Fsync {
-                fd: file.fd(),
-                reply: ReplyChannel::Async(reply_tx),
+                reply: reply_tx,
             })
             .is_err()
         {
             let (err_tx, err_rx) = tokio::sync::oneshot::channel();
             let _ = err_tx.send(Err("IoService shut down".into()));
-            return err_rx;
+            return IoFuture { rx: err_rx };
         }
-        reply_rx
+        IoFuture { rx: reply_rx }
+    }
+
+    /// Fsync the file.
+    ///
+    /// Returns an `IoFuture` that completes when the fsync is done.
+    pub fn fsync(&self, file: &DmaFile) -> IoFuture<()> {
+        let (reply_tx, reply_rx) = tokio::sync::oneshot::channel();
+        if self
+            .tx
+            .send(IoOp::Fsync {
+                fd: file.fd(),
+                reply: reply_tx,
+            })
+            .is_err()
+        {
+            let (err_tx, err_rx) = tokio::sync::oneshot::channel();
+            let _ = err_tx.send(Err("IoService shut down".into()));
+            return IoFuture { rx: err_rx };
+        }
+        IoFuture { rx: reply_rx }
     }
 }
 
@@ -244,7 +232,7 @@ impl Drop for IoService {
 /// Main loop for the dedicated io_uring thread.
 ///
 /// Receives IoOp requests from the channel, submits them to io_uring,
-/// reaps completions, and notifies callers via reply channels.
+/// reaps completions, and notifies callers via oneshot reply channels.
 fn io_thread_main(rx: crossbeam_channel::Receiver<IoOp>, ring_size: u32) -> Result<(), String> {
     let mut ring = io_uring::IoUring::new(ring_size)
         .map_err(|e| format!("io_uring::IoUring::new failed: {e}"))?;
@@ -386,7 +374,7 @@ fn io_thread_main(rx: crossbeam_channel::Receiver<IoOp>, ring_size: u32) -> Resu
                         reply,
                     } => {
                         if result < 0 {
-                            reply.send(Err(format!(
+                            let _ = reply.send(Err(format!(
                                 "io_uring read failed: {}",
                                 std::io::Error::from_raw_os_error(-result)
                             )));
@@ -397,7 +385,7 @@ fn io_thread_main(rx: crossbeam_channel::Receiver<IoOp>, ring_size: u32) -> Resu
                             if end <= buf.len() {
                                 let result_buf =
                                     AlignedBuf::from_slice(&buf[skip..end], DMA_ALIGNMENT);
-                                reply.send(Ok(result_buf));
+                                let _ = reply.send(Ok(result_buf));
                             } else {
                                 // Short read — return what we got
                                 let available = buf.len().saturating_sub(skip);
@@ -406,28 +394,28 @@ fn io_thread_main(rx: crossbeam_channel::Receiver<IoOp>, ring_size: u32) -> Resu
                                     &buf[skip..skip + actual_len],
                                     DMA_ALIGNMENT,
                                 );
-                                reply.send(Ok(result_buf));
+                                let _ = reply.send(Ok(result_buf));
                             }
                         }
                     }
                     PendingOp::Write { _buf, reply } => {
                         if result < 0 {
-                            reply.send(Err(format!(
+                            let _ = reply.send(Err(format!(
                                 "io_uring write failed: {}",
                                 std::io::Error::from_raw_os_error(-result)
                             )));
                         } else {
-                            reply.send(Ok(result as usize));
+                            let _ = reply.send(Ok(result as usize));
                         }
                     }
                     PendingOp::Fsync { reply } => {
                         if result < 0 {
-                            reply.send(Err(format!(
+                            let _ = reply.send(Err(format!(
                                 "io_uring fsync failed: {}",
                                 std::io::Error::from_raw_os_error(-result)
                             )));
                         } else {
-                            reply.send(Ok(()));
+                            let _ = reply.send(Ok(()));
                         }
                     }
                 }
@@ -445,14 +433,14 @@ enum PendingOp {
         requested_offset: u64,
         aligned_offset: u64,
         requested_len: usize,
-        reply: ReplyChannel<AlignedBuf>,
+        reply: tokio::sync::oneshot::Sender<IoResult<AlignedBuf>>,
     },
     Write {
         _buf: AlignedBuf, // Keep alive until io_uring completes
-        reply: ReplyChannel<usize>,
+        reply: tokio::sync::oneshot::Sender<IoResult<usize>>,
     },
     Fsync {
-        reply: ReplyChannel<()>,
+        reply: tokio::sync::oneshot::Sender<IoResult<()>>,
     },
 }
 
@@ -461,21 +449,6 @@ mod tests {
     use super::*;
     use crate::io::DmaFile;
     use tempfile::tempdir;
-
-    fn skip_if_no_direct_io(path: &std::path::Path) -> bool {
-        // Try opening a file with O_DIRECT to check support
-        match DmaFile::open_write(path.join("__probe_direct_io")) {
-            Ok(_) => {
-                let _ = std::fs::remove_file(path.join("__probe_direct_io"));
-                false
-            }
-            Err(e) if e.raw_os_error() == Some(libc::EINVAL) => {
-                eprintln!("O_DIRECT not supported, skipping test");
-                true
-            }
-            Err(_) => false,
-        }
-    }
 
     #[test]
     fn test_io_service_create() {
@@ -486,23 +459,19 @@ mod tests {
     #[test]
     fn test_io_service_write_and_read() {
         let dir = tempdir().unwrap();
-        if skip_if_no_direct_io(dir.path()) {
-            return;
-        }
-
         let io = IoService::new(32).unwrap();
         let path = dir.path().join("test_io.dat");
 
         // Write aligned data
         let file = DmaFile::open_write(&path).unwrap();
         let data = AlignedBuf::from_slice(&[0xAA; 4096], DMA_ALIGNMENT);
-        io.write_at_sync(&file, 0, data).unwrap();
-        io.fsync_sync(&file).unwrap();
+        io.write_at(&file, 0, data).wait().unwrap();
+        io.fsync(&file).wait().unwrap();
         drop(file);
 
         // Read it back
         let file = DmaFile::open_read(&path).unwrap();
-        let buf = io.read_at_sync(&file, 0, 4096).unwrap();
+        let buf = io.read_at(&file, 0, 4096).wait().unwrap();
         assert_eq!(buf.len(), 4096);
         assert!(buf.iter().all(|&b| b == 0xAA));
     }
@@ -510,10 +479,6 @@ mod tests {
     #[test]
     fn test_io_service_unaligned_read() {
         let dir = tempdir().unwrap();
-        if skip_if_no_direct_io(dir.path()) {
-            return;
-        }
-
         let io = IoService::new(32).unwrap();
         let path = dir.path().join("test_unaligned.dat");
 
@@ -523,13 +488,13 @@ mod tests {
         for (i, byte) in data.iter_mut().enumerate() {
             *byte = (i % 256) as u8;
         }
-        io.write_at_sync(&file, 0, data).unwrap();
-        io.fsync_sync(&file).unwrap();
+        io.write_at(&file, 0, data).wait().unwrap();
+        io.fsync(&file).wait().unwrap();
         drop(file);
 
         // Read 100 bytes starting at offset 1000 (unaligned)
         let file = DmaFile::open_read(&path).unwrap();
-        let buf = io.read_at_sync(&file, 1000, 100).unwrap();
+        let buf = io.read_at(&file, 1000, 100).wait().unwrap();
         assert_eq!(buf.len(), 100);
         for (i, &byte) in buf.iter().enumerate() {
             assert_eq!(byte, ((1000 + i) % 256) as u8);
@@ -539,10 +504,6 @@ mod tests {
     #[test]
     fn test_io_service_multiple_writes() {
         let dir = tempdir().unwrap();
-        if skip_if_no_direct_io(dir.path()) {
-            return;
-        }
-
         let io = IoService::new(32).unwrap();
         let path = dir.path().join("test_multi_write.dat");
 
@@ -550,15 +511,15 @@ mod tests {
         let file = DmaFile::open_write(&path).unwrap();
         let block1 = AlignedBuf::from_slice(&[0x11; 4096], DMA_ALIGNMENT);
         let block2 = AlignedBuf::from_slice(&[0x22; 4096], DMA_ALIGNMENT);
-        io.write_at_sync(&file, 0, block1).unwrap();
-        io.write_at_sync(&file, 4096, block2).unwrap();
-        io.fsync_sync(&file).unwrap();
+        io.write_at(&file, 0, block1).wait().unwrap();
+        io.write_at(&file, 4096, block2).wait().unwrap();
+        io.fsync(&file).wait().unwrap();
         drop(file);
 
         // Read both back
         let file = DmaFile::open_read(&path).unwrap();
-        let buf1 = io.read_at_sync(&file, 0, 4096).unwrap();
-        let buf2 = io.read_at_sync(&file, 4096, 4096).unwrap();
+        let buf1 = io.read_at(&file, 0, 4096).wait().unwrap();
+        let buf2 = io.read_at(&file, 4096, 4096).wait().unwrap();
         assert!(buf1.iter().all(|&b| b == 0x11));
         assert!(buf2.iter().all(|&b| b == 0x22));
     }

@@ -92,6 +92,9 @@ pub mod testkit {
     // Re-export FlushScheduler for testing
     pub use crate::storage::FlushScheduler;
 
+    // Re-export IoService for testing
+    pub use crate::io::IoService;
+
     pub use crate::transaction::{ConcurrencyManager, TransactionService};
     pub use crate::tso::LocalTso;
 

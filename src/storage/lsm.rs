@@ -147,8 +147,8 @@ pub struct LsmEngine {
     /// Optional ilog service for durable SST metadata.
     ilog: Option<Arc<IlogService>>,
 
-    /// Optional io_uring-backed I/O service for async SST reads.
-    io: Option<Arc<crate::io::IoService>>,
+    /// io_uring-backed I/O service for SST reads.
+    io: Arc<crate::io::IoService>,
 
     /// Cached SuperVersion for atomic snapshot access.
     ///
@@ -214,7 +214,7 @@ impl LsmEngine {
             sv_number: AtomicU64::new(1),
             lsn_provider: Some(lsn_provider),
             ilog: Some(ilog),
-            io: Some(io_service),
+            io: io_service,
             current_sv: RwLock::new(initial_sv),
             compaction_notify: RwLock::new(None),
         })
@@ -230,9 +230,9 @@ impl LsmEngine {
         self.ilog.is_some()
     }
 
-    /// Get the io_uring I/O service if available.
-    pub fn io_service(&self) -> Option<&Arc<crate::io::IoService>> {
-        self.io.as_ref()
+    /// Get the io_uring I/O service.
+    pub fn io_service(&self) -> &Arc<crate::io::IoService> {
+        &self.io
     }
 
     /// Get the next LSN and increment.
@@ -536,11 +536,7 @@ impl LsmEngine {
 
             // SST now contains MVCC keys - iterate to find matching key with ts visibility
             // Propagate errors instead of silently ignoring (risks wrong reads)
-            let reader = if let Some(ref io) = self.io {
-                SstReaderRef::open_with_io(&sst_path, Arc::clone(io))?
-            } else {
-                SstReaderRef::open(&sst_path)?
-            };
+            let reader = SstReaderRef::open(&sst_path, Arc::clone(&self.io))?;
             let mut iter = SstIterator::new(reader)?;
             iter.seek_to_first()?; // Position at first entry
 
@@ -728,7 +724,13 @@ impl LsmEngine {
         if task.is_trivial_move {
             let executor = CompactionExecutor::new(Arc::clone(&self.config));
             // Trivial move doesn't use pre-allocated IDs or IO service
-            let delta = executor.execute(&task, &version, &self.config.sst_dir(), &[], None)?;
+            let delta = executor.execute(
+                &task,
+                &version,
+                &self.config.sst_dir(),
+                &[],
+                Arc::clone(&self.io),
+            )?;
 
             // Apply delta
             let new_version = self.version_set.apply_delta(&delta);
@@ -768,7 +770,7 @@ impl LsmEngine {
             &version,
             &self.config.sst_dir(),
             &pre_allocated_ids,
-            self.io.clone(),
+            Arc::clone(&self.io),
         )?;
 
         // Phase 4: Write CompactCommit (if durable)
@@ -1245,8 +1247,8 @@ struct L0SstIterator {
     inner: Option<SstMvccIterator>,
     /// Pending error
     pending_error: Option<TiSqlError>,
-    /// Optional io_uring I/O service
-    io: Option<Arc<crate::io::IoService>>,
+    /// io_uring I/O service
+    io: Arc<crate::io::IoService>,
 }
 
 impl L0SstIterator {
@@ -1255,7 +1257,7 @@ impl L0SstIterator {
         meta: Arc<SstMeta>,
         sst_dir: PathBuf,
         range: SharedMvccRange,
-        io: Option<Arc<crate::io::IoService>>,
+        io: Arc<crate::io::IoService>,
     ) -> Self {
         Self {
             meta,
@@ -1288,11 +1290,7 @@ impl L0SstIterator {
             )));
         }
 
-        let reader = if let Some(ref io) = self.io {
-            SstReaderRef::open_with_io(&path, Arc::clone(io))?
-        } else {
-            SstReaderRef::open(&path)?
-        };
+        let reader = SstReaderRef::open(&path, Arc::clone(&self.io))?;
         let iter = SstMvccIterator::new(reader, Arc::clone(&self.range))?;
         self.inner = Some(iter);
         Ok(())
@@ -1381,8 +1379,8 @@ struct LevelIterator {
     current_iter: Option<SstMvccIterator>,
     /// Pending error
     pending_error: Option<TiSqlError>,
-    /// Optional io_uring I/O service
-    io: Option<Arc<crate::io::IoService>>,
+    /// io_uring I/O service
+    io: Arc<crate::io::IoService>,
 }
 
 impl LevelIterator {
@@ -1393,7 +1391,7 @@ impl LevelIterator {
         sst_metas: Vec<Arc<SstMeta>>,
         sst_dir: PathBuf,
         range: SharedMvccRange,
-        io: Option<Arc<crate::io::IoService>>,
+        io: Arc<crate::io::IoService>,
     ) -> Self {
         Self {
             io,
@@ -1431,11 +1429,7 @@ impl LevelIterator {
             )));
         }
 
-        let reader = if let Some(ref io) = self.io {
-            SstReaderRef::open_with_io(&path, Arc::clone(io))?
-        } else {
-            SstReaderRef::open(&path)?
-        };
+        let reader = SstReaderRef::open(&path, Arc::clone(&self.io))?;
         let iter = SstMvccIterator::new(reader, Arc::clone(&self.range))?;
         self.current_file_idx = Some(idx);
         self.current_iter = Some(iter);
@@ -1704,7 +1698,7 @@ impl TieredMergeIterator {
         sst_dir: PathBuf,
         range: SharedMvccRange,
         index: usize,
-        io: Option<Arc<crate::io::IoService>>,
+        io: Arc<crate::io::IoService>,
     ) {
         self.children.push(ChildHandle {
             iter: ChildIterator::L0Sst(L0SstIterator::new(meta, sst_dir, range, io)),
@@ -2081,7 +2075,7 @@ impl StorageEngine for LsmEngine {
                 sst_dir.clone(),
                 Arc::clone(&range),
                 idx,
-                self.io.clone(),
+                Arc::clone(&self.io),
             );
         }
 
@@ -2096,8 +2090,12 @@ impl StorageEngine for LsmEngine {
 
             if !ssts.is_empty() {
                 // LevelIterator is already lazy internally
-                let level_iter =
-                    LevelIterator::new(ssts, sst_dir.clone(), Arc::clone(&range), self.io.clone());
+                let level_iter = LevelIterator::new(
+                    ssts,
+                    sst_dir.clone(),
+                    Arc::clone(&range),
+                    Arc::clone(&self.io),
+                );
                 merge_iter.add_level(level_iter, level);
             }
         }
@@ -2296,6 +2294,10 @@ mod tests {
                 std::fs::create_dir_all(&sst_dir)?;
             }
 
+            // Create IoService for io_uring SST reads
+            let io_service = crate::io::IoService::new(32)
+                .map_err(|e| TiSqlError::Storage(format!("Failed to create IoService: {e}")))?;
+
             // Create initial state and version_set
             let initial_state = LsmState::new(1);
             let version_set = VersionSet::new(Version::new());
@@ -2318,7 +2320,7 @@ mod tests {
                 sv_number: AtomicU64::new(1),
                 lsn_provider: None,
                 ilog: None,
-                io: None, // Tests use standard I/O (no io_uring)
+                io: io_service,
                 current_sv: RwLock::new(initial_sv),
                 compaction_notify: RwLock::new(None),
             })
@@ -3166,7 +3168,7 @@ mod tests {
         assert!(!ssts.is_empty(), "Should have at least one SST");
 
         let sst_path = config.sst_dir().join(format!("{:08}.sst", ssts[0].id));
-        let reader = SstReaderRef::open(&sst_path).unwrap();
+        let reader = SstReaderRef::open(&sst_path, crate::io::IoService::new(32).unwrap()).unwrap();
         let mut iter = SstIterator::new(reader).unwrap();
         iter.seek_to_first().unwrap(); // Position the iterator
 

@@ -179,6 +179,67 @@ impl LogicalPlan {
                 | LogicalPlan::Rollback
         )
     }
+
+    /// Check if this plan produces a result set (rows).
+    ///
+    /// Read queries stream rows to the client via the MySQL protocol.
+    /// Write/DDL/session commands return affected counts or OK.
+    pub fn is_read_query(&self) -> bool {
+        matches!(
+            self,
+            LogicalPlan::Scan { .. }
+                | LogicalPlan::Project { .. }
+                | LogicalPlan::Filter { .. }
+                | LogicalPlan::Sort { .. }
+                | LogicalPlan::Limit { .. }
+                | LogicalPlan::Values { .. }
+                | LogicalPlan::Aggregate { .. }
+                | LogicalPlan::Empty { .. }
+                | LogicalPlan::Join { .. }
+        )
+    }
+
+    /// Extract output column names from the plan.
+    ///
+    /// Returns the column names that will appear in the result set.
+    /// For non-read plans, returns an empty vec.
+    pub fn output_columns(&self) -> Vec<String> {
+        match self {
+            LogicalPlan::Project { exprs, .. } => {
+                exprs.iter().map(|(_, alias)| alias.clone()).collect()
+            }
+            LogicalPlan::Scan {
+                table, projection, ..
+            } => {
+                if let Some(indices) = projection {
+                    indices
+                        .iter()
+                        .filter_map(|&i| table.columns().get(i))
+                        .map(|c| c.name().to_string())
+                        .collect()
+                } else {
+                    table
+                        .columns()
+                        .iter()
+                        .map(|c| c.name().to_string())
+                        .collect()
+                }
+            }
+            LogicalPlan::Values { schema, .. } | LogicalPlan::Empty { schema } => schema
+                .columns()
+                .iter()
+                .map(|c| c.name().to_string())
+                .collect(),
+            LogicalPlan::Filter { input, .. }
+            | LogicalPlan::Sort { input, .. }
+            | LogicalPlan::Limit { input, .. } => input.output_columns(),
+            LogicalPlan::Aggregate { agg_exprs, .. } => agg_exprs
+                .iter()
+                .map(|(_, _, alias)| alias.clone())
+                .collect(),
+            _ => vec![],
+        }
+    }
 }
 
 /// Expression tree

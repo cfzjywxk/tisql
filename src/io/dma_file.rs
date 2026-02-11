@@ -12,20 +12,22 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-//! DMA file descriptor with O_DIRECT support.
+//! DMA file descriptor with O_DIRECT support and automatic fallback.
 //!
-//! `DmaFile` wraps an `OwnedFd` opened with `O_DIRECT`, bypassing the
-//! kernel page cache. This is essential for io_uring-based I/O where
-//! TiSQL manages its own caching (block cache).
+//! `DmaFile` wraps an `OwnedFd` opened with `O_DIRECT` when possible,
+//! bypassing the kernel page cache. If the filesystem doesn't support
+//! O_DIRECT (e.g. tmpfs), it falls back to standard I/O. io_uring works
+//! fine without O_DIRECT — alignment is unnecessary but harmless.
 
 use std::io;
 use std::os::unix::io::{AsRawFd, FromRawFd, OwnedFd, RawFd};
 use std::path::{Path, PathBuf};
 
-/// A file descriptor opened with O_DIRECT.
+/// A file descriptor opened with O_DIRECT (with automatic fallback).
 ///
 /// Uses `libc::open()` directly because `std::fs::OpenOptions` does not
-/// expose the `O_DIRECT` flag.
+/// expose the `O_DIRECT` flag. If O_DIRECT fails with EINVAL (filesystem
+/// doesn't support it), retries without O_DIRECT.
 ///
 /// The file descriptor is owned and will be closed on drop.
 pub struct DmaFile {
@@ -35,15 +37,30 @@ pub struct DmaFile {
 }
 
 impl DmaFile {
-    /// Open an existing file for reading with O_DIRECT.
+    /// Open an existing file for reading with O_DIRECT (fallback to standard I/O).
     pub fn open_read(path: impl AsRef<Path>) -> io::Result<Self> {
         let path = path.as_ref();
         let c_path = path_to_cstring(path)?;
+
+        // Try O_DIRECT first
         let flags = libc::O_RDONLY | libc::O_DIRECT;
         let fd = unsafe { libc::open(c_path.as_ptr(), flags) };
-        if fd < 0 {
-            return Err(io::Error::last_os_error());
-        }
+        let fd = if fd < 0 {
+            let err = io::Error::last_os_error();
+            if err.raw_os_error() == Some(libc::EINVAL) {
+                // O_DIRECT not supported — retry without it
+                let fd = unsafe { libc::open(c_path.as_ptr(), libc::O_RDONLY) };
+                if fd < 0 {
+                    return Err(io::Error::last_os_error());
+                }
+                fd
+            } else {
+                return Err(err);
+            }
+        } else {
+            fd
+        };
+
         // SAFETY: fd is valid, we just opened it.
         let owned_fd = unsafe { OwnedFd::from_raw_fd(fd) };
         let file_size = file_size_from_fd(owned_fd.as_raw_fd())?;
@@ -54,16 +71,32 @@ impl DmaFile {
         })
     }
 
-    /// Open or create a file for writing with O_DIRECT.
+    /// Open or create a file for writing with O_DIRECT (fallback to standard I/O).
     pub fn open_write(path: impl AsRef<Path>) -> io::Result<Self> {
         let path = path.as_ref();
         let c_path = path_to_cstring(path)?;
-        let flags = libc::O_WRONLY | libc::O_CREAT | libc::O_TRUNC | libc::O_DIRECT;
         let mode = 0o644;
+
+        // Try O_DIRECT first
+        let flags = libc::O_WRONLY | libc::O_CREAT | libc::O_TRUNC | libc::O_DIRECT;
         let fd = unsafe { libc::open(c_path.as_ptr(), flags, mode) };
-        if fd < 0 {
-            return Err(io::Error::last_os_error());
-        }
+        let fd = if fd < 0 {
+            let err = io::Error::last_os_error();
+            if err.raw_os_error() == Some(libc::EINVAL) {
+                // O_DIRECT not supported — retry without it
+                let flags = libc::O_WRONLY | libc::O_CREAT | libc::O_TRUNC;
+                let fd = unsafe { libc::open(c_path.as_ptr(), flags, mode) };
+                if fd < 0 {
+                    return Err(io::Error::last_os_error());
+                }
+                fd
+            } else {
+                return Err(err);
+            }
+        } else {
+            fd
+        };
+
         let owned_fd = unsafe { OwnedFd::from_raw_fd(fd) };
         Ok(Self {
             fd: owned_fd,
@@ -72,16 +105,32 @@ impl DmaFile {
         })
     }
 
-    /// Open or create a file for reading and writing with O_DIRECT.
+    /// Open or create a file for reading and writing with O_DIRECT (fallback to standard I/O).
     pub fn open_read_write(path: impl AsRef<Path>) -> io::Result<Self> {
         let path = path.as_ref();
         let c_path = path_to_cstring(path)?;
-        let flags = libc::O_RDWR | libc::O_CREAT | libc::O_DIRECT;
         let mode = 0o644;
+
+        // Try O_DIRECT first
+        let flags = libc::O_RDWR | libc::O_CREAT | libc::O_DIRECT;
         let fd = unsafe { libc::open(c_path.as_ptr(), flags, mode) };
-        if fd < 0 {
-            return Err(io::Error::last_os_error());
-        }
+        let fd = if fd < 0 {
+            let err = io::Error::last_os_error();
+            if err.raw_os_error() == Some(libc::EINVAL) {
+                // O_DIRECT not supported — retry without it
+                let flags = libc::O_RDWR | libc::O_CREAT;
+                let fd = unsafe { libc::open(c_path.as_ptr(), flags, mode) };
+                if fd < 0 {
+                    return Err(io::Error::last_os_error());
+                }
+                fd
+            } else {
+                return Err(err);
+            }
+        } else {
+            fd
+        };
+
         let owned_fd = unsafe { OwnedFd::from_raw_fd(fd) };
         let file_size = file_size_from_fd(owned_fd.as_raw_fd())?;
         Ok(Self {
@@ -153,24 +202,11 @@ mod tests {
         let dir = tempdir().unwrap();
         let path = dir.path().join("test_dma.dat");
 
-        // Create a file with O_DIRECT for writing
-        let file = DmaFile::open_write(&path);
-        match file {
-            Ok(f) => {
-                assert_eq!(f.file_size(), 0);
-                assert!(f.fd() >= 0);
-                assert_eq!(f.path(), path);
-            }
-            Err(e) => {
-                // O_DIRECT may not be supported on all filesystems (e.g., tmpfs)
-                // This is expected in some CI environments
-                if e.raw_os_error() == Some(libc::EINVAL) {
-                    eprintln!("O_DIRECT not supported on this filesystem, skipping test");
-                    return;
-                }
-                panic!("unexpected error: {e}");
-            }
-        }
+        // Create a file with O_DIRECT for writing (falls back on tmpfs)
+        let f = DmaFile::open_write(&path).unwrap();
+        assert_eq!(f.file_size(), 0);
+        assert!(f.fd() >= 0);
+        assert_eq!(f.path(), path);
     }
 
     #[test]

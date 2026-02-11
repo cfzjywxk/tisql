@@ -24,9 +24,7 @@ use std::sync::Arc;
 use clap::Parser as ClapParser;
 use tisql::util::LogLevel;
 use tisql::{log_error, log_info};
-use tisql::{
-    Database, DatabaseConfig, MySqlServer, WorkerPool, WorkerPoolConfig, MYSQL_DEFAULT_PORT,
-};
+use tisql::{Database, DatabaseConfig, MySqlServer, MYSQL_DEFAULT_PORT};
 
 #[derive(ClapParser, Debug)]
 #[command(name = "tisql")]
@@ -48,14 +46,6 @@ struct Args {
     /// Log level (trace, debug, info, warn, error)
     #[arg(short = 'L', long, default_value = "info")]
     log_level: String,
-
-    /// Minimum number of worker threads for database operations
-    #[arg(long, default_value_t = 4)]
-    worker_min_threads: usize,
-
-    /// Maximum number of worker threads for database operations (default: CPU count)
-    #[arg(long)]
-    worker_max_threads: Option<usize>,
 }
 
 fn main() {
@@ -64,14 +54,6 @@ fn main() {
     let addr: SocketAddr = format!("{}:{}", args.host, args.port)
         .parse()
         .expect("Invalid address");
-
-    // Create worker pool for database operations
-    let worker_config = WorkerPoolConfig {
-        name: "tisql-worker".to_string(),
-        min_threads: args.worker_min_threads,
-        max_threads: args.worker_max_threads.unwrap_or_else(num_cpus::get),
-    };
-    let worker_pool = Arc::new(WorkerPool::new(worker_config));
 
     // Open database with persistence
     let db_config = DatabaseConfig::with_data_dir(&args.data_dir);
@@ -82,7 +64,8 @@ fn main() {
             std::process::exit(1);
         }
     };
-    let server = MySqlServer::new(db, addr, worker_pool);
+
+    let server = MySqlServer::new(Arc::clone(&db), addr);
 
     println!("TiSQL v0.1.0 - MySQL Protocol Server");
     println!("Data directory: {}", args.data_dir);

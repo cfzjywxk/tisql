@@ -17,16 +17,10 @@
 //! ## Usage
 //!
 //! ```ignore
-//! // Open with IoService (production — io_uring + O_DIRECT)
-//! let reader = SstReader::open_with_io(path, io)?;
+//! let reader = SstReader::open(path, io)?;
 //! let block = reader.read_block(0)?;   // &self — no Mutex needed
-//!
-//! // Open without IoService (tests — standard I/O)
-//! let reader = SstReader::open(path)?;
-//! let block = reader.read_block(0)?;   // &self — uses pread64
 //! ```
 
-use std::os::unix::io::AsRawFd;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
@@ -40,38 +34,21 @@ use super::builder::{Footer, FOOTER_SIZE};
 // SstReader
 // ============================================================================
 
-/// Backend for SST file reads.
-///
-/// - `IoUring`: Positional reads via IoService + DmaFile (production path).
-/// - `StdFile`: Positional reads via pread64 on a standard file (test fallback).
-enum ReadBackend {
-    IoUring { file: DmaFile, io: Arc<IoService> },
-    StdFile { file: std::fs::File },
-}
-
-impl std::fmt::Debug for ReadBackend {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        match self {
-            ReadBackend::IoUring { file, .. } => f.debug_tuple("IoUring").field(file).finish(),
-            ReadBackend::StdFile { .. } => f.write_str("StdFile"),
-        }
-    }
-}
-
 /// Reader for SST files.
 ///
 /// The reader loads the footer and index block into memory on open,
 /// then reads data blocks on demand using positional reads (`&self`).
 ///
-/// With IoService, reads go through io_uring with O_DIRECT.
-/// Without IoService, reads use pread64 (standard file, no seek state).
-/// Both paths are `&self` — no Mutex needed in `SstReaderRef`.
+/// Reads go through io_uring via IoService with O_DIRECT (or automatic
+/// fallback on filesystems that don't support it).
 #[derive(Debug)]
 pub struct SstReader {
     /// File path
     path: PathBuf,
-    /// Read backend (io_uring or std pread64)
-    backend: ReadBackend,
+    /// DMA file for io_uring reads
+    file: DmaFile,
+    /// io_uring I/O service
+    io: Arc<IoService>,
     /// File size in bytes
     file_size: u64,
     /// Footer information
@@ -81,8 +58,8 @@ pub struct SstReader {
 }
 
 impl SstReader {
-    /// Open an SST file with io_uring backend (production path).
-    pub fn open_with_io<P: AsRef<Path>>(path: P, io: Arc<IoService>) -> Result<Self> {
+    /// Open an SST file for reading.
+    pub fn open<P: AsRef<Path>>(path: P, io: Arc<IoService>) -> Result<Self> {
         let path = path.as_ref().to_path_buf();
         let file = DmaFile::open_read(&path).map_err(|e| {
             TiSqlError::Storage(format!("Failed to open SST {}: {e}", path.display()))
@@ -98,7 +75,8 @@ impl SstReader {
         // Read footer via io_uring
         let footer_offset = file_size - FOOTER_SIZE as u64;
         let footer_data = io
-            .read_at_sync(&file, footer_offset, FOOTER_SIZE)
+            .read_at(&file, footer_offset, FOOTER_SIZE)
+            .wait()
             .map_err(|e| TiSqlError::Storage(format!("Failed to read SST footer: {e}")))?;
         let footer_buf: [u8; FOOTER_SIZE] = footer_data[..FOOTER_SIZE]
             .try_into()
@@ -111,51 +89,15 @@ impl SstReader {
 
         // Read index block via io_uring
         let index_buf = io
-            .read_at_sync(&file, footer.index_offset, footer.index_size as usize)
+            .read_at(&file, footer.index_offset, footer.index_size as usize)
+            .wait()
             .map_err(|e| TiSqlError::Storage(format!("Failed to read SST index: {e}")))?;
         let index = IndexBlock::decode(&index_buf)?;
 
         Ok(Self {
             path,
-            backend: ReadBackend::IoUring { file, io },
-            file_size,
-            footer,
-            index,
-        })
-    }
-
-    /// Open an SST file with standard I/O (test fallback — no IoService needed).
-    ///
-    /// Uses pread64 for positional reads, which is `&self`-safe (no seek state).
-    pub fn open<P: AsRef<Path>>(path: P) -> Result<Self> {
-        let path = path.as_ref().to_path_buf();
-        let file = std::fs::File::open(&path)?;
-
-        let file_size = file.metadata()?.len();
-        if file_size < FOOTER_SIZE as u64 {
-            return Err(TiSqlError::Storage(format!(
-                "SST file too small: {file_size} bytes"
-            )));
-        }
-
-        // Read footer using pread64
-        let mut footer_buf = [0u8; FOOTER_SIZE];
-        let footer_offset = file_size - FOOTER_SIZE as u64;
-        pread_exact(&file, &mut footer_buf, footer_offset)?;
-        let footer = Footer::decode(&footer_buf)?;
-
-        // Validate index block bounds
-        let data_end = file_size - FOOTER_SIZE as u64;
-        Self::validate_index_bounds(&footer, data_end)?;
-
-        // Read index block using pread64
-        let mut index_buf = vec![0u8; footer.index_size as usize];
-        pread_exact(&file, &mut index_buf, footer.index_offset)?;
-        let index = IndexBlock::decode(&index_buf)?;
-
-        Ok(Self {
-            path,
-            backend: ReadBackend::StdFile { file },
+            file,
+            io,
             file_size,
             footer,
             index,
@@ -233,7 +175,7 @@ impl SstReader {
 
     /// Read a data block by index.
     ///
-    /// This is `&self` — no Mutex needed. Both backends use positional reads.
+    /// This is `&self` — no Mutex needed. Uses positional reads via io_uring.
     pub fn read_block(&self, block_idx: usize) -> Result<DataBlock> {
         let entry = self.index.get_entry(block_idx).ok_or_else(|| {
             TiSqlError::Storage(format!(
@@ -247,22 +189,13 @@ impl SstReader {
     }
 
     /// Read a data block at the given offset and size.
-    ///
-    /// Uses positional reads — `&self`, no seek state.
     fn read_block_at(&self, offset: u64, size: u32) -> Result<DataBlock> {
-        match &self.backend {
-            ReadBackend::IoUring { file, io } => {
-                let buf = io
-                    .read_at_sync(file, offset, size as usize)
-                    .map_err(|e| TiSqlError::Storage(format!("io_uring read_block failed: {e}")))?;
-                DataBlock::decode(&buf)
-            }
-            ReadBackend::StdFile { file } => {
-                let mut buf = vec![0u8; size as usize];
-                pread_exact(file, &mut buf, offset)?;
-                DataBlock::decode(&buf)
-            }
-        }
+        let buf = self
+            .io
+            .read_at(&self.file, offset, size as usize)
+            .wait()
+            .map_err(|e| TiSqlError::Storage(format!("io_uring read_block failed: {e}")))?;
+        DataBlock::decode(&buf)
     }
 
     /// Find the block that may contain the given key using binary search.
@@ -304,8 +237,9 @@ impl SstReader {
 
 /// A shareable SST reader wrapped in Arc.
 ///
-/// Since `SstReader::read_block()` is now `&self` (positional reads, no seek state),
-/// `SstReaderRef` no longer needs a Mutex. Multiple threads can read concurrently.
+/// Since `SstReader::read_block()` is `&self` (positional reads via io_uring,
+/// no seek state), `SstReaderRef` doesn't need a Mutex. Multiple threads can
+/// read concurrently.
 #[derive(Clone)]
 pub struct SstReaderRef {
     inner: Arc<SstReader>,
@@ -319,15 +253,9 @@ impl SstReaderRef {
         }
     }
 
-    /// Open an SST file and create a shared reader (standard I/O).
-    pub fn open<P: AsRef<Path>>(path: P) -> Result<Self> {
-        let reader = SstReader::open(path)?;
-        Ok(Self::new(reader))
-    }
-
-    /// Open an SST file and create a shared reader (io_uring).
-    pub fn open_with_io<P: AsRef<Path>>(path: P, io: Arc<IoService>) -> Result<Self> {
-        let reader = SstReader::open_with_io(path, io)?;
+    /// Open an SST file and create a shared reader.
+    pub fn open<P: AsRef<Path>>(path: P, io: Arc<IoService>) -> Result<Self> {
+        let reader = SstReader::open(path, io)?;
         Ok(Self::new(reader))
     }
 
@@ -363,43 +291,6 @@ impl SstReaderRef {
 }
 
 // ============================================================================
-// pread64 helper — positional read without seek state
-// ============================================================================
-
-/// Read exactly `buf.len()` bytes at `offset` using pread64.
-///
-/// Unlike seek+read_exact, pread64 is atomic and `&self`-safe — no file
-/// offset state is modified. Multiple threads can read concurrently.
-fn pread_exact(file: &std::fs::File, buf: &mut [u8], offset: u64) -> Result<()> {
-    let mut total = 0;
-    while total < buf.len() {
-        let n = unsafe {
-            libc::pread64(
-                file.as_raw_fd(),
-                buf[total..].as_mut_ptr() as *mut libc::c_void,
-                buf.len() - total,
-                (offset + total as u64) as i64,
-            )
-        };
-        if n < 0 {
-            return Err(TiSqlError::Storage(format!(
-                "pread64 failed: {}",
-                std::io::Error::last_os_error()
-            )));
-        }
-        if n == 0 {
-            return Err(TiSqlError::Storage(format!(
-                "pread64: unexpected EOF at offset {} (read {total}/{} bytes)",
-                offset + total as u64,
-                buf.len()
-            )));
-        }
-        total += n as usize;
-    }
-    Ok(())
-}
-
-// ============================================================================
 // Tests
 // ============================================================================
 
@@ -414,6 +305,11 @@ mod tests {
         let mut result = key_bytes.to_vec();
         result.extend_from_slice(&(!ts).to_be_bytes());
         result
+    }
+
+    // Helper to create IoService for tests
+    fn test_io() -> Arc<IoService> {
+        IoService::new(32).unwrap()
     }
 
     // Helper to create an SST file with test data
@@ -434,13 +330,14 @@ mod tests {
     fn test_reader_open_empty_sst() {
         let dir = tempdir().unwrap();
         let path = dir.path().join("empty.sst");
+        let io = test_io();
 
         // Create empty SST
         let builder = SstBuilder::new(&path, SstBuilderOptions::default()).unwrap();
         builder.finish(1, 0).unwrap();
 
         // Open and verify
-        let reader = SstReader::open(&path).unwrap();
+        let reader = SstReader::open(&path, io).unwrap();
         assert_eq!(reader.num_blocks(), 0);
         assert_eq!(reader.num_entries(), 0);
     }
@@ -449,11 +346,12 @@ mod tests {
     fn test_reader_open_single_entry() {
         let dir = tempdir().unwrap();
         let path = dir.path().join("single.sst");
+        let io = test_io();
 
         let key = mvcc_key(b"key", 100);
         create_test_sst(&path, &[(&key, b"value")]).unwrap();
 
-        let reader = SstReader::open(&path).unwrap();
+        let reader = SstReader::open(&path, io).unwrap();
         assert_eq!(reader.num_entries(), 1);
         assert_eq!(reader.num_blocks(), 1);
     }
@@ -462,6 +360,7 @@ mod tests {
     fn test_reader_open_multiple_entries() {
         let dir = tempdir().unwrap();
         let path = dir.path().join("multi.sst");
+        let io = test_io();
 
         let keys: Vec<_> = (0..100)
             .map(|i| format!("key_{i:05}").into_bytes())
@@ -473,7 +372,7 @@ mod tests {
 
         create_test_sst(&path, &entries).unwrap();
 
-        let reader = SstReader::open(&path).unwrap();
+        let reader = SstReader::open(&path, io).unwrap();
         assert_eq!(reader.num_entries(), 100);
     }
 
@@ -481,11 +380,12 @@ mod tests {
     fn test_reader_open_invalid_file() {
         let dir = tempdir().unwrap();
         let path = dir.path().join("invalid.sst");
+        let io = test_io();
 
         // Create a file with invalid content
         std::fs::write(&path, b"invalid data").unwrap();
 
-        let result = SstReader::open(&path);
+        let result = SstReader::open(&path, io);
         assert!(result.is_err());
     }
 
@@ -493,11 +393,12 @@ mod tests {
     fn test_reader_open_too_small() {
         let dir = tempdir().unwrap();
         let path = dir.path().join("small.sst");
+        let io = test_io();
 
         // Create a file smaller than footer size
         std::fs::write(&path, b"x").unwrap();
 
-        let result = SstReader::open(&path);
+        let result = SstReader::open(&path, io);
         assert!(result.is_err());
         assert!(result.unwrap_err().to_string().contains("too small"));
     }
@@ -510,6 +411,7 @@ mod tests {
     fn test_reader_read_block() {
         let dir = tempdir().unwrap();
         let path = dir.path().join("block.sst");
+        let io = test_io();
 
         let entries: Vec<_> = (0..10)
             .map(|i| {
@@ -525,7 +427,7 @@ mod tests {
 
         create_test_sst(&path, &entry_refs).unwrap();
 
-        let reader = SstReader::open(&path).unwrap();
+        let reader = SstReader::open(&path, io).unwrap();
         let block = reader.read_block(0).unwrap();
 
         // Block should contain the entries
@@ -536,10 +438,11 @@ mod tests {
     fn test_reader_read_block_out_of_range() {
         let dir = tempdir().unwrap();
         let path = dir.path().join("range.sst");
+        let io = test_io();
 
         create_test_sst(&path, &[(b"key", b"value")]).unwrap();
 
-        let reader = SstReader::open(&path).unwrap();
+        let reader = SstReader::open(&path, io).unwrap();
         let result = reader.read_block(100);
         assert!(result.is_err());
     }
@@ -548,6 +451,7 @@ mod tests {
     fn test_reader_multiple_blocks() {
         let dir = tempdir().unwrap();
         let path = dir.path().join("multiblock.sst");
+        let io = test_io();
 
         // Use small block size to force multiple blocks
         let options = SstBuilderOptions::with_block_size(128);
@@ -560,7 +464,7 @@ mod tests {
         }
         builder.finish(1, 0).unwrap();
 
-        let reader = SstReader::open(&path).unwrap();
+        let reader = SstReader::open(&path, io).unwrap();
         assert!(reader.num_blocks() > 1);
 
         // Read all blocks
@@ -578,6 +482,7 @@ mod tests {
     fn test_reader_get_found() {
         let dir = tempdir().unwrap();
         let path = dir.path().join("get.sst");
+        let io = test_io();
 
         let entries: Vec<_> = (0..10)
             .map(|i| {
@@ -593,7 +498,7 @@ mod tests {
 
         create_test_sst(&path, &entry_refs).unwrap();
 
-        let reader = SstReader::open(&path).unwrap();
+        let reader = SstReader::open(&path, io).unwrap();
 
         // Find existing keys
         for i in 0..10 {
@@ -608,10 +513,11 @@ mod tests {
     fn test_reader_get_not_found() {
         let dir = tempdir().unwrap();
         let path = dir.path().join("notfound.sst");
+        let io = test_io();
 
         create_test_sst(&path, &[(b"key_a", b"value_a"), (b"key_c", b"value_c")]).unwrap();
 
-        let reader = SstReader::open(&path).unwrap();
+        let reader = SstReader::open(&path, io).unwrap();
 
         // Key before all entries
         assert_eq!(reader.get(b"key_0").unwrap(), None);
@@ -627,11 +533,12 @@ mod tests {
     fn test_reader_get_empty_sst() {
         let dir = tempdir().unwrap();
         let path = dir.path().join("empty_get.sst");
+        let io = test_io();
 
         let builder = SstBuilder::new(&path, SstBuilderOptions::default()).unwrap();
         builder.finish(1, 0).unwrap();
 
-        let reader = SstReader::open(&path).unwrap();
+        let reader = SstReader::open(&path, io).unwrap();
         assert_eq!(reader.get(b"any_key").unwrap(), None);
     }
 
@@ -639,6 +546,7 @@ mod tests {
     fn test_reader_get_multiblock() {
         let dir = tempdir().unwrap();
         let path = dir.path().join("get_multiblock.sst");
+        let io = test_io();
 
         // Use small block size
         let options = SstBuilderOptions::with_block_size(128);
@@ -651,7 +559,7 @@ mod tests {
         }
         builder.finish(1, 0).unwrap();
 
-        let reader = SstReader::open(&path).unwrap();
+        let reader = SstReader::open(&path, io).unwrap();
 
         // Find keys across different blocks
         for i in [0, 25, 50, 75, 99] {
@@ -670,6 +578,7 @@ mod tests {
     fn test_reader_find_block() {
         let dir = tempdir().unwrap();
         let path = dir.path().join("find.sst");
+        let io = test_io();
 
         // Use small block size
         let options = SstBuilderOptions::with_block_size(64);
@@ -682,7 +591,7 @@ mod tests {
         }
         builder.finish(1, 0).unwrap();
 
-        let reader = SstReader::open(&path).unwrap();
+        let reader = SstReader::open(&path, io).unwrap();
 
         // First key should be in first block
         let idx = reader.find_block(b"key_00000");
@@ -701,10 +610,11 @@ mod tests {
     fn test_reader_ref_basic() {
         let dir = tempdir().unwrap();
         let path = dir.path().join("ref.sst");
+        let io = test_io();
 
         create_test_sst(&path, &[(b"key", b"value")]).unwrap();
 
-        let reader = SstReaderRef::open(&path).unwrap();
+        let reader = SstReaderRef::open(&path, io).unwrap();
         assert_eq!(reader.num_entries().unwrap(), 1);
         assert_eq!(reader.get(b"key").unwrap(), Some(b"value".to_vec()));
     }
@@ -713,10 +623,11 @@ mod tests {
     fn test_reader_ref_clone() {
         let dir = tempdir().unwrap();
         let path = dir.path().join("clone.sst");
+        let io = test_io();
 
         create_test_sst(&path, &[(b"key", b"value")]).unwrap();
 
-        let reader1 = SstReaderRef::open(&path).unwrap();
+        let reader1 = SstReaderRef::open(&path, Arc::clone(&io)).unwrap();
         let reader2 = reader1.clone();
 
         // Both should work
@@ -732,6 +643,7 @@ mod tests {
     fn test_reader_timestamp_tracking() {
         let dir = tempdir().unwrap();
         let path = dir.path().join("ts.sst");
+        let io = test_io();
 
         let mut builder = SstBuilder::new(&path, SstBuilderOptions::default()).unwrap();
 
@@ -742,7 +654,7 @@ mod tests {
 
         builder.finish(1, 0).unwrap();
 
-        let reader = SstReader::open(&path).unwrap();
+        let reader = SstReader::open(&path, io).unwrap();
         assert_eq!(reader.min_ts(), 50);
         assert_eq!(reader.max_ts(), 200);
     }
@@ -755,6 +667,7 @@ mod tests {
     fn test_reader_roundtrip() {
         let dir = tempdir().unwrap();
         let path = dir.path().join("roundtrip.sst");
+        let io = test_io();
 
         // Create entries with various sizes
         let entries: Vec<_> = (0..50)
@@ -773,7 +686,7 @@ mod tests {
         builder.finish(1, 0).unwrap();
 
         // Read and verify
-        let reader = SstReader::open(&path).unwrap();
+        let reader = SstReader::open(&path, io).unwrap();
         assert_eq!(reader.num_entries(), 50);
 
         for (key, expected_value) in &entries {
@@ -786,6 +699,7 @@ mod tests {
     fn test_reader_large_values() {
         let dir = tempdir().unwrap();
         let path = dir.path().join("large.sst");
+        let io = test_io();
 
         let key = b"large_key".to_vec();
         let value = vec![b'x'; 100_000]; // 100KB value
@@ -794,7 +708,7 @@ mod tests {
         builder.add(&key, &value).unwrap();
         builder.finish(1, 0).unwrap();
 
-        let reader = SstReader::open(&path).unwrap();
+        let reader = SstReader::open(&path, io).unwrap();
         let result = reader.get(&key).unwrap();
         assert_eq!(result, Some(value));
     }
@@ -809,6 +723,7 @@ mod tests {
 
         let dir = tempdir().unwrap();
         let path = dir.path().join("corrupt_offset.sst");
+        let io = test_io();
 
         // Create a valid SST
         let key = mvcc_key(b"key", 100);
@@ -828,7 +743,7 @@ mod tests {
 
         std::fs::write(&path, &data).unwrap();
 
-        let result = SstReader::open(&path);
+        let result = SstReader::open(&path, io);
         assert!(result.is_err());
         let err = result.unwrap_err().to_string();
         assert!(err.contains("index_offset") || err.contains("corrupted"));
@@ -840,6 +755,7 @@ mod tests {
 
         let dir = tempdir().unwrap();
         let path = dir.path().join("corrupt_size_overflow.sst");
+        let io = test_io();
 
         // Create a valid SST
         let key = mvcc_key(b"key", 100);
@@ -864,7 +780,7 @@ mod tests {
 
         std::fs::write(&path, &data).unwrap();
 
-        let result = SstReader::open(&path);
+        let result = SstReader::open(&path, io);
         assert!(result.is_err());
         let err = result.unwrap_err().to_string();
         assert!(err.contains("overflow") || err.contains("corrupted"));
@@ -876,6 +792,7 @@ mod tests {
 
         let dir = tempdir().unwrap();
         let path = dir.path().join("corrupt_index_end.sst");
+        let io = test_io();
 
         // Create a valid SST
         let key = mvcc_key(b"key", 100);
@@ -899,7 +816,7 @@ mod tests {
 
         std::fs::write(&path, &data).unwrap();
 
-        let result = SstReader::open(&path);
+        let result = SstReader::open(&path, io);
         assert!(result.is_err());
         let err = result.unwrap_err().to_string();
         assert!(err.contains("exceeds") || err.contains("corrupted"));
@@ -911,6 +828,7 @@ mod tests {
 
         let dir = tempdir().unwrap();
         let path = dir.path().join("corrupt_max_size.sst");
+        let io = test_io();
 
         // Create a file with fake large data to make index_size validation trigger
         // We need a file large enough that the index_size check fires before bounds check
@@ -931,7 +849,7 @@ mod tests {
 
         std::fs::write(&path, &data).unwrap();
 
-        let result = SstReader::open(&path);
+        let result = SstReader::open(&path, io);
         assert!(result.is_err());
         let err = result.unwrap_err().to_string();
         assert!(err.contains("exceeds maximum") || err.contains("index_size"));
@@ -944,11 +862,12 @@ mod tests {
     fn test_reader_file_size_getter() {
         let dir = tempdir().unwrap();
         let path = dir.path().join("size_test.sst");
+        let io = test_io();
 
         let key = mvcc_key(b"key", 100);
         create_test_sst(&path, &[(&key, b"value")]).unwrap();
 
-        let reader = SstReader::open(&path).unwrap();
+        let reader = SstReader::open(&path, io).unwrap();
         assert!(reader.file_size() > 0);
         assert!(reader.file_size() >= FOOTER_SIZE as u64);
     }
@@ -957,11 +876,12 @@ mod tests {
     fn test_reader_path_getter() {
         let dir = tempdir().unwrap();
         let path = dir.path().join("path_test.sst");
+        let io = test_io();
 
         let key = mvcc_key(b"key", 100);
         create_test_sst(&path, &[(&key, b"value")]).unwrap();
 
-        let reader = SstReader::open(&path).unwrap();
+        let reader = SstReader::open(&path, io).unwrap();
         assert_eq!(reader.path(), path);
     }
 
@@ -969,11 +889,12 @@ mod tests {
     fn test_reader_footer_and_index_getters() {
         let dir = tempdir().unwrap();
         let path = dir.path().join("getters.sst");
+        let io = test_io();
 
         let key = mvcc_key(b"key", 100);
         create_test_sst(&path, &[(&key, b"value")]).unwrap();
 
-        let reader = SstReader::open(&path).unwrap();
+        let reader = SstReader::open(&path, io).unwrap();
 
         // Test footer getter
         let footer = reader.footer();
@@ -988,6 +909,7 @@ mod tests {
     fn test_reader_min_max_ts() {
         let dir = tempdir().unwrap();
         let path = dir.path().join("ts_test.sst");
+        let io = test_io();
 
         // Create SST with specific timestamps
         let mut builder = SstBuilder::new(&path, SstBuilderOptions::default()).unwrap();
@@ -995,7 +917,7 @@ mod tests {
         builder.add(&mvcc_key(b"key2", 200), b"v2").unwrap();
         builder.finish(1, 0).unwrap();
 
-        let reader = SstReader::open(&path).unwrap();
+        let reader = SstReader::open(&path, io).unwrap();
         // min_ts and max_ts depend on the MVCC key encoding
         assert!(reader.min_ts() <= reader.max_ts());
     }

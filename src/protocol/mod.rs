@@ -22,7 +22,6 @@ use std::sync::Arc;
 use opensrv_mysql::AsyncMysqlIntermediary;
 use tokio::net::TcpListener;
 
-use crate::worker::WorkerPool;
 use crate::{log_error, log_info, Database};
 use mysql::MySqlBackend;
 
@@ -33,17 +32,12 @@ pub const MYSQL_DEFAULT_PORT: u16 = 4000;
 pub struct MySqlServer {
     db: Arc<Database>,
     addr: SocketAddr,
-    worker_pool: Arc<WorkerPool>,
 }
 
 impl MySqlServer {
-    /// Create a new MySQL server
-    pub fn new(db: Arc<Database>, addr: SocketAddr, worker_pool: Arc<WorkerPool>) -> Self {
-        Self {
-            db,
-            addr,
-            worker_pool,
-        }
+    /// Create a new MySQL server.
+    pub fn new(db: Arc<Database>, addr: SocketAddr) -> Self {
+        Self { db, addr }
     }
 
     /// Run the MySQL server
@@ -54,12 +48,11 @@ impl MySqlServer {
         loop {
             let (stream, peer_addr) = listener.accept().await?;
             let db = Arc::clone(&self.db);
-            let worker_pool = Arc::clone(&self.worker_pool);
 
             log_info!("New connection from {}", peer_addr);
 
             tokio::spawn(async move {
-                let backend = MySqlBackend::new(db, worker_pool);
+                let backend = MySqlBackend::new(db);
                 let session_id = backend.session_id();
                 log_info!(
                     "Session {} established for connection from {}",

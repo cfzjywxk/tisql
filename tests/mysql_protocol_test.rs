@@ -28,7 +28,7 @@ use tempfile::TempDir;
 use tokio::net::TcpListener;
 use tokio::task::JoinHandle;
 
-use tisql::{Database, DatabaseConfig, MySqlServer, WorkerPool, WorkerPoolConfig};
+use tisql::{Database, DatabaseConfig, MySqlServer};
 
 // ============================================================================
 // Test Infrastructure
@@ -58,16 +58,8 @@ impl TestContext {
         let db_config = DatabaseConfig::with_data_dir(temp_dir.path());
         let db = Arc::new(Database::open(db_config).expect("Failed to open database"));
 
-        // Create worker pool
-        let worker_config = WorkerPoolConfig {
-            name: "test-worker".to_string(),
-            min_threads: 2,
-            max_threads: 4,
-        };
-        let worker_pool = Arc::new(WorkerPool::new(worker_config));
-
         // Create and start server
-        let server = MySqlServer::new(Arc::clone(&db), addr, worker_pool);
+        let server = MySqlServer::new(Arc::clone(&db), addr);
         let server_handle = tokio::spawn(async move {
             let _ = server.run().await;
         });
