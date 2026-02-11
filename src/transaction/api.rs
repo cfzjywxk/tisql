@@ -280,7 +280,7 @@ pub trait TxnService: Send + Sync {
     ///
     /// Using an associated type avoids boxing and dynamic dispatch overhead.
     /// Each transaction service implementation defines its own concrete iterator type.
-    type ScanIter: MvccIterator;
+    type ScanIter: MvccIterator + 'static;
 
     // === Factory ===
 

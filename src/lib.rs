@@ -289,10 +289,12 @@ impl SQLEngine {
         let binder = Binder::new(catalog, &exec_ctx.current_db);
         let plan = binder.bind(stmt)?;
 
-        // Execute with the unified executor method
-        self.executor
+        // Execute with the unified executor method, then materialize
+        let (output, ctx) = self
+            .executor
             .execute_unified(plan, exec_ctx, txn_service, catalog, txn_ctx)
-            .await
+            .await?;
+        Ok((output.into_result().await?, ctx))
     }
 }
 
@@ -659,8 +661,7 @@ impl Database {
         exec_ctx: &session::ExecutionCtx,
         txn_ctx: Option<transaction::TxnCtx>,
     ) -> Result<(ExecutionOutput, Option<transaction::TxnCtx>)> {
-        let (result, ctx) = self
-            .sql_engine
+        self.sql_engine
             .executor
             .execute_unified(
                 plan,
@@ -669,8 +670,7 @@ impl Database {
                 &self.catalog,
                 txn_ctx,
             )
-            .await?;
-        Ok((result.into(), ctx))
+            .await
     }
 
     /// Handle a query with execution context and optional transaction context.

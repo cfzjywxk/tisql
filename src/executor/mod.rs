@@ -17,6 +17,9 @@ mod simple;
 // Crate-internal implementation
 pub(crate) use simple::SimpleExecutor;
 
+use std::future::Future;
+use std::pin::Pin;
+
 use crate::catalog::Catalog;
 use crate::error::Result;
 use crate::session::{ExecutionCtx, Session};
@@ -38,48 +41,92 @@ pub enum ExecutionResult {
 // Volcano-Style Execution (Streaming)
 // ============================================================================
 
-/// Lazy row-producing execution handle (volcano-style).
+/// Type-erased async row producer for the volcano-style pipeline.
 ///
-/// Wraps a materialized result set and yields rows one at a time via `next()`.
-/// Created and consumed inside a single blocking task — not `Send`.
+/// `Operator<I>` is generic over `I: MvccIterator`. To return it through
+/// the non-generic `Execution`, we erase the type via this trait.
+pub(crate) trait RowPuller: Send {
+    fn next(&mut self) -> Pin<Box<dyn Future<Output = Result<Option<Row>>> + Send + '_>>;
+}
+
+/// Backward-compat row puller wrapping a materialized `Vec<Row>`.
 ///
-/// Future optimization: replace the inner `Vec<Row>` with a true pull-based
-/// iterator over the storage engine (no materialization).
+/// Used for `From<ExecutionResult>` conversion (write results). In production,
+/// write results are always `Affected`/`Ok`, so this is effectively dead code
+/// in the hot path.
+struct VecPuller(std::vec::IntoIter<Row>);
+
+impl RowPuller for VecPuller {
+    fn next(&mut self) -> Pin<Box<dyn Future<Output = Result<Option<Row>>> + Send + '_>> {
+        Box::pin(std::future::ready(Ok(self.0.next())))
+    }
+}
+
+/// Lazy row-producing execution handle (volcano-style, async).
+///
+/// Wraps a `RowPuller` that yields rows one at a time via async `next()`.
+/// In the production path, the puller is a live operator tree backed by
+/// storage iterators — zero materialization.
 pub struct Execution {
-    rows: std::vec::IntoIter<Row>,
+    puller: Box<dyn RowPuller>,
 }
 
 impl Execution {
-    pub(crate) fn new(rows: Vec<Row>) -> Self {
+    /// Create from a type-erased row puller (production path — streaming).
+    pub(crate) fn from_puller(puller: Box<dyn RowPuller>) -> Self {
+        Self { puller }
+    }
+
+    /// Create from a materialized row vec (backward-compat / test path).
+    pub(crate) fn from_rows(rows: Vec<Row>) -> Self {
         Self {
-            rows: rows.into_iter(),
+            puller: Box::new(VecPuller(rows.into_iter())),
         }
     }
 
-    /// Pull the next row (volcano-style).
-    #[inline]
-    pub fn next(&mut self) -> Option<Row> {
-        self.rows.next()
+    /// Pull the next row (volcano-style, async).
+    pub async fn next(&mut self) -> Result<Option<Row>> {
+        self.puller.next().await
     }
 }
 
 /// Output from plan execution.
 ///
 /// Unlike `ExecutionResult` (which materializes all rows), `ExecutionOutput`
-/// wraps an `Execution` handle that yields rows lazily.
+/// wraps an `Execution` handle that yields rows lazily via async `next()`.
 pub enum ExecutionOutput {
     /// Read query — stream rows via Execution.
-    Rows(Execution),
+    Rows { schema: Schema, exec: Execution },
     /// DML — affected row count.
     Affected { count: u64 },
     /// DDL/session command.
     Ok,
 }
 
+impl ExecutionOutput {
+    /// Materialize into an `ExecutionResult` (test / legacy paths only).
+    pub(crate) async fn into_result(self) -> Result<ExecutionResult> {
+        match self {
+            ExecutionOutput::Rows { schema, mut exec } => {
+                let mut rows = Vec::new();
+                while let Some(row) = exec.next().await? {
+                    rows.push(row);
+                }
+                Ok(ExecutionResult::Rows { schema, rows })
+            }
+            ExecutionOutput::Affected { count } => Ok(ExecutionResult::Affected { count }),
+            ExecutionOutput::Ok => Ok(ExecutionResult::Ok),
+        }
+    }
+}
+
 impl From<ExecutionResult> for ExecutionOutput {
     fn from(result: ExecutionResult) -> Self {
         match result {
-            ExecutionResult::Rows { rows, .. } => ExecutionOutput::Rows(Execution::new(rows)),
+            ExecutionResult::Rows { schema, rows } => ExecutionOutput::Rows {
+                schema,
+                exec: Execution::from_rows(rows),
+            },
             ExecutionResult::Affected { count } => ExecutionOutput::Affected { count },
             ExecutionResult::Ok => ExecutionOutput::Ok,
         }
@@ -151,5 +198,5 @@ pub trait Executor: Send + Sync {
         txn_service: &T,
         catalog: &C,
         txn_ctx: Option<TxnCtx>,
-    ) -> impl std::future::Future<Output = Result<(ExecutionResult, Option<TxnCtx>)>> + Send;
+    ) -> impl std::future::Future<Output = Result<(ExecutionOutput, Option<TxnCtx>)>> + Send;
 }

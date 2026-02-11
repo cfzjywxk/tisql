@@ -36,7 +36,7 @@ use crate::storage::{
 use crate::transaction::{TxnCtx, TxnService};
 use crate::types::{ColumnId, ColumnInfo, DataType, Row, Schema, Value};
 
-use super::{ExecutionResult, Executor};
+use super::{Execution, ExecutionOutput, ExecutionResult, Executor, RowPuller};
 
 // ============================================================================
 // Expression Evaluation (free functions)
@@ -505,6 +505,12 @@ impl<I: MvccIterator> Operator<I> {
     }
 }
 
+impl<I: MvccIterator> RowPuller for Operator<I> {
+    fn next(&mut self) -> Pin<Box<dyn Future<Output = Result<Option<Row>>> + Send + '_>> {
+        Operator::next(self)
+    }
+}
+
 // ============================================================================
 // Individual Operator Implementations
 // ============================================================================
@@ -861,7 +867,10 @@ impl Executor for SimpleExecutor {
             } else {
                 // For reads in explicit transaction, use the session's transaction context
                 let ctx = session.current_txn().unwrap();
-                self.execute_with_ctx(plan, ctx, txn_service, catalog).await
+                let output = self
+                    .execute_with_ctx(plan, ctx, txn_service, catalog)
+                    .await?;
+                output.into_result().await
             }
         } else {
             // No active transaction - use auto-commit mode (implicit transactions)
@@ -876,10 +885,10 @@ impl Executor for SimpleExecutor {
         txn_service: &T,
         catalog: &C,
         txn_ctx: Option<TxnCtx>,
-    ) -> Result<(ExecutionResult, Option<TxnCtx>)> {
+    ) -> Result<(ExecutionOutput, Option<TxnCtx>)> {
         // Handle session-level commands (USE database is handled at protocol layer)
         if let LogicalPlan::UseDatabase { .. } = &plan {
-            return Ok((ExecutionResult::Ok, txn_ctx));
+            return Ok((ExecutionOutput::Ok, txn_ctx));
         }
 
         // Transaction control statements should NOT be dispatched here.
@@ -890,15 +899,9 @@ impl Executor for SimpleExecutor {
             ));
         }
 
-        // Note: exec_ctx provides access to session variables like isolation_level.
-        // Currently unused, but available for future use (e.g., implementing
-        // different isolation levels, timeout handling, etc.)
-
         match txn_ctx {
             Some(mut ctx) => {
-                // Execute within the provided explicit transaction
                 if plan.is_write() {
-                    // DDL operations should commit current transaction first (MySQL behavior)
                     if plan.is_ddl() {
                         return Err(TiSqlError::Internal(
                             "DDL statements are not allowed within explicit transactions. Use COMMIT first."
@@ -906,23 +909,30 @@ impl Executor for SimpleExecutor {
                         ));
                     }
 
-                    // Execute write within the transaction (no auto-commit)
                     let result = self
                         .execute_write_with_ctx(plan, &mut ctx, txn_service, catalog)
                         .await?;
-                    Ok((result, Some(ctx)))
+                    Ok((result.into(), Some(ctx)))
                 } else {
-                    // Execute read using the transaction's snapshot
-                    let result = self
+                    // Streaming read in explicit txn — no materialization
+                    let output = self
                         .execute_with_ctx(plan, &ctx, txn_service, catalog)
                         .await?;
-                    Ok((result, Some(ctx)))
+                    Ok((output, Some(ctx)))
                 }
             }
             None => {
-                // No explicit transaction - use auto-commit mode
-                let result = self.execute(plan, txn_service, catalog).await?;
-                Ok((result, None))
+                if plan.is_write() {
+                    let result = self.execute_write(plan, txn_service, catalog).await?;
+                    Ok((result.into(), None))
+                } else {
+                    // Auto-commit streaming read — no materialization
+                    let ctx = txn_service.begin(true)?;
+                    let output = self
+                        .execute_with_ctx(plan, &ctx, txn_service, catalog)
+                        .await?;
+                    Ok((output, None))
+                }
             }
         }
     }
@@ -1018,29 +1028,26 @@ impl SimpleExecutor {
     // Auto-Commit Mode Methods (Implicit Transactions)
     // ========================================================================
 
-    /// Execute a read-only plan using a read-only transaction.
+    /// Execute a read-only plan using a read-only transaction (materializes).
     ///
-    /// Creates a transaction with read_only=true, which allocates start_ts
-    /// from TSO for consistent reads.
+    /// Creates a transaction with read_only=true. Materializes all rows
+    /// for the `execute()` / `execute_with_session()` callers that expect
+    /// `ExecutionResult`.
     async fn execute_read<T: TxnService, C: Catalog>(
         &self,
         plan: LogicalPlan,
         txn_service: &T,
         catalog: &C,
     ) -> Result<ExecutionResult> {
-        // Handle USE database - session-level command, no transaction needed
-        // Note: The actual database change is handled at the protocol layer (Session).
-        // Here we just validate and return OK so the command doesn't error.
-        if let LogicalPlan::UseDatabase { db_name: _ } = &plan {
+        if let LogicalPlan::UseDatabase { .. } = &plan {
             return Ok(ExecutionResult::Ok);
         }
 
-        // Begin a read-only transaction (allocates start_ts)
         let ctx = txn_service.begin(true)?;
-
-        // Execute the read plan using the transaction context
-        self.execute_with_ctx(plan, &ctx, txn_service, catalog)
-            .await
+        let output = self
+            .execute_with_ctx(plan, &ctx, txn_service, catalog)
+            .await?;
+        output.into_result().await
     }
 
     /// Execute a write plan using a read-write transaction.
@@ -1142,25 +1149,24 @@ impl SimpleExecutor {
         }
     }
 
-    /// Execute read operations using a transaction context.
+    /// Execute read operations using a transaction context (streaming).
     ///
-    /// Builds a volcano-style operator tree from the plan, then pulls
-    /// rows one at a time via the `next()` interface.
+    /// Builds a volcano-style operator tree from the plan, opens it,
+    /// and returns a live `ExecutionOutput` — zero materialization.
     async fn execute_with_ctx<T: TxnService, C: Catalog>(
         &self,
         plan: LogicalPlan,
         ctx: &TxnCtx,
         txn_service: &T,
         _catalog: &C,
-    ) -> Result<ExecutionResult> {
+    ) -> Result<ExecutionOutput> {
         let mut op = build_read_operator(plan, txn_service, ctx)?;
         op.open().await?;
         let schema = op.schema().clone();
-        let mut rows = Vec::new();
-        while let Some(row) = op.next().await? {
-            rows.push(row);
-        }
-        Ok(ExecutionResult::Rows { schema, rows })
+        Ok(ExecutionOutput::Rows {
+            schema,
+            exec: Execution::from_puller(Box::new(op)),
+        })
     }
 
     /// Execute write operations using a transaction context.

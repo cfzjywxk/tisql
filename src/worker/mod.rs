@@ -119,25 +119,44 @@ pub async fn dispatch_full_query(
             let exec_result = db.execute_plan(plan, &exec_ctx, txn_ctx).await;
 
             match exec_result {
-                Ok((ExecutionOutput::Rows(mut exec), returned_ctx)) => {
-                    // CPU: stream materialized rows via channel
+                Ok((ExecutionOutput::Rows { mut exec, .. }, returned_ctx)) => {
+                    // Stream rows from live operator tree via channel
                     let mut batch = Vec::with_capacity(BATCH_SIZE);
-                    while let Some(row) = exec.next() {
-                        batch.push(row);
-                        if batch.len() >= BATCH_SIZE {
-                            if batch_tx.send(std::mem::take(&mut batch)).await.is_err() {
-                                return; // receiver dropped (client disconnected)
+                    loop {
+                        match exec.next().await {
+                            Ok(Some(row)) => {
+                                batch.push(row);
+                                if batch.len() >= BATCH_SIZE {
+                                    if batch_tx
+                                        .send(std::mem::take(&mut batch))
+                                        .await
+                                        .is_err()
+                                    {
+                                        return; // receiver dropped (client disconnected)
+                                    }
+                                    batch = Vec::with_capacity(BATCH_SIZE);
+                                }
                             }
-                            batch = Vec::with_capacity(BATCH_SIZE);
+                            Ok(None) => {
+                                if !batch.is_empty() {
+                                    let _ = batch_tx.send(batch).await;
+                                }
+                                drop(batch_tx);
+                                let _ = done_tx.send(QueryDone::Success {
+                                    txn_ctx: returned_ctx,
+                                });
+                                return;
+                            }
+                            Err(e) => {
+                                drop(batch_tx);
+                                let _ = done_tx.send(QueryDone::Error {
+                                    error: e,
+                                    txn_ctx: returned_ctx,
+                                });
+                                return;
+                            }
                         }
                     }
-                    if !batch.is_empty() {
-                        let _ = batch_tx.send(batch).await;
-                    }
-                    drop(batch_tx);
-                    let _ = done_tx.send(QueryDone::Success {
-                        txn_ctx: returned_ctx,
-                    });
                 }
                 Ok((_, returned_ctx)) => {
                     drop(batch_tx);
@@ -167,7 +186,7 @@ pub async fn dispatch_full_query(
                 Ok((ExecutionOutput::Ok, ctx)) => {
                     let _ = response_tx.send(QueryResponse::Ok { txn_ctx: ctx });
                 }
-                Ok((ExecutionOutput::Rows(_), ctx)) => {
+                Ok((ExecutionOutput::Rows { .. }, ctx)) => {
                     let _ = response_tx.send(QueryResponse::Ok { txn_ctx: ctx });
                 }
                 Err(e) => {
