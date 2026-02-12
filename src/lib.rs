@@ -45,6 +45,7 @@ pub mod worker;
 mod catalog;
 mod clog;
 mod executor;
+pub(crate) mod inner_table;
 mod sql;
 pub mod storage;
 mod transaction;
@@ -601,6 +602,17 @@ impl Database {
     /// List all schemas (databases).
     pub fn list_schemas(&self) -> Result<Vec<String>> {
         self.catalog.list_schemas()
+    }
+
+    // ========================================================================
+    // Inner Session Factory
+    // ========================================================================
+
+    /// Create a new inner session for internal SQL execution.
+    ///
+    /// Requires Database to be Arc-wrapped by the caller.
+    pub fn new_inner_session(self: &Arc<Self>, current_db: &str) -> inner_table::InnerSession {
+        inner_table::InnerSession::new(Arc::clone(self), current_db)
     }
 
     // ========================================================================

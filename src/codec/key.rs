@@ -37,19 +37,6 @@ use crate::types::{IndexId, TableId, Value};
 /// Table prefix byte: 't'
 pub const TABLE_PREFIX: u8 = b't';
 
-/// Meta prefix byte: 'm'
-pub const META_PREFIX: u8 = b'm';
-
-// Meta key category constants
-/// Schema metadata category
-pub const META_SCHEMA: u8 = 0x01;
-/// Table definition category
-pub const META_TABLE: u8 = 0x02;
-/// Table ID to name mapping category
-pub const META_TABLE_ID: u8 = 0x03;
-/// Global counters category
-pub const META_GLOBAL: u8 = 0x04;
-
 /// Record prefix separator: "_r"
 pub const RECORD_PREFIX_SEP: &[u8] = b"_r";
 
@@ -398,102 +385,6 @@ pub fn decode_table_id(key: &[u8]) -> Result<TableId> {
     Ok(table_id as TableId)
 }
 
-// ============================================================================
-// Meta Key Encoding
-// ============================================================================
-
-/// Encode a schema meta key.
-///
-/// Format: 'm' + META_SCHEMA + schema_name
-pub fn encode_schema_key(schema: &str) -> Vec<u8> {
-    let mut buf = Vec::with_capacity(2 + schema.len());
-    buf.push(META_PREFIX);
-    buf.push(META_SCHEMA);
-    buf.extend_from_slice(schema.as_bytes());
-    buf
-}
-
-/// Encode a table meta key.
-///
-/// Format: 'm' + META_TABLE + schema_len(1 byte) + schema + table_name
-pub fn encode_table_key(schema: &str, table: &str) -> Vec<u8> {
-    let schema_len = schema.len() as u8;
-    let mut buf = Vec::with_capacity(3 + schema.len() + table.len());
-    buf.push(META_PREFIX);
-    buf.push(META_TABLE);
-    buf.push(schema_len);
-    buf.extend_from_slice(schema.as_bytes());
-    buf.extend_from_slice(table.as_bytes());
-    buf
-}
-
-/// Decode a table meta key to extract schema and table names.
-pub fn decode_table_key(key: &[u8]) -> Result<(String, String)> {
-    if key.len() < 4 {
-        return Err(TiSqlError::Codec("table key too short".into()));
-    }
-    if key[0] != META_PREFIX || key[1] != META_TABLE {
-        return Err(TiSqlError::Codec("invalid table key prefix".into()));
-    }
-    let schema_len = key[2] as usize;
-    if key.len() < 3 + schema_len {
-        return Err(TiSqlError::Codec(
-            "invalid table key: schema too long".into(),
-        ));
-    }
-    let schema = String::from_utf8(key[3..3 + schema_len].to_vec())
-        .map_err(|_| TiSqlError::Codec("invalid schema name encoding".into()))?;
-    let table = String::from_utf8(key[3 + schema_len..].to_vec())
-        .map_err(|_| TiSqlError::Codec("invalid table name encoding".into()))?;
-    Ok((schema, table))
-}
-
-/// Encode a table ID mapping key.
-///
-/// Format: 'm' + META_TABLE_ID + table_id (8 bytes, big-endian)
-pub fn encode_table_id_key(table_id: TableId) -> Vec<u8> {
-    let mut buf = Vec::with_capacity(10);
-    buf.push(META_PREFIX);
-    buf.push(META_TABLE_ID);
-    buf.extend_from_slice(&table_id.to_be_bytes());
-    buf
-}
-
-/// Encode a global counter key.
-///
-/// Format: 'm' + META_GLOBAL + counter_name
-pub fn encode_global_key(name: &str) -> Vec<u8> {
-    let mut buf = Vec::with_capacity(2 + name.len());
-    buf.push(META_PREFIX);
-    buf.push(META_GLOBAL);
-    buf.extend_from_slice(name.as_bytes());
-    buf
-}
-
-/// Generate prefix for scanning all tables in a schema.
-///
-/// Format: 'm' + META_TABLE + schema_len(1 byte) + schema
-pub fn gen_table_prefix(schema: &str) -> Vec<u8> {
-    let schema_len = schema.len() as u8;
-    let mut buf = Vec::with_capacity(3 + schema.len());
-    buf.push(META_PREFIX);
-    buf.push(META_TABLE);
-    buf.push(schema_len);
-    buf.extend_from_slice(schema.as_bytes());
-    buf
-}
-
-/// Generate prefix for scanning all meta keys.
-pub fn gen_meta_prefix() -> Vec<u8> {
-    vec![META_PREFIX]
-}
-
-/// Check if a key is a meta key.
-#[inline]
-pub fn is_meta_key(key: &[u8]) -> bool {
-    !key.is_empty() && key[0] == META_PREFIX
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -645,56 +536,5 @@ mod tests {
 
         let empty_common = Handle::Common(vec![]);
         assert!(empty_common.is_empty());
-    }
-
-    #[test]
-    fn test_meta_schema_key() {
-        let key = encode_schema_key("default");
-        assert_eq!(key[0], META_PREFIX);
-        assert_eq!(key[1], META_SCHEMA);
-        assert_eq!(&key[2..], b"default");
-    }
-
-    #[test]
-    fn test_meta_table_key_roundtrip() {
-        let key = encode_table_key("default", "users");
-        assert_eq!(key[0], META_PREFIX);
-        assert_eq!(key[1], META_TABLE);
-
-        let (schema, table) = decode_table_key(&key).unwrap();
-        assert_eq!(schema, "default");
-        assert_eq!(table, "users");
-    }
-
-    #[test]
-    fn test_meta_table_id_key() {
-        let key = encode_table_id_key(42);
-        assert_eq!(key[0], META_PREFIX);
-        assert_eq!(key[1], META_TABLE_ID);
-        assert_eq!(key.len(), 10);
-    }
-
-    #[test]
-    fn test_meta_global_key() {
-        let key = encode_global_key("next_table_id");
-        assert_eq!(key[0], META_PREFIX);
-        assert_eq!(key[1], META_GLOBAL);
-        assert_eq!(&key[2..], b"next_table_id");
-    }
-
-    #[test]
-    fn test_gen_table_prefix() {
-        let prefix = gen_table_prefix("default");
-        let key = encode_table_key("default", "users");
-        assert!(key.starts_with(&prefix));
-    }
-
-    #[test]
-    fn test_is_meta_key() {
-        let meta_key = encode_schema_key("default");
-        let record_key = encode_record_key_with_handle(1, 100);
-
-        assert!(is_meta_key(&meta_key));
-        assert!(!is_meta_key(&record_key));
     }
 }

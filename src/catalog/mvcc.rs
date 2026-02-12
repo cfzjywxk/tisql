@@ -12,59 +12,71 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-//! MVCC-based persistent catalog implementation.
+//! MVCC-based persistent catalog using inner system tables.
 //!
-//! This module provides a catalog implementation that persists schema metadata
-//! using the same MVCC storage as user data. Schema metadata is stored with
-//! 'm' prefix keys and recovered automatically via clog replay.
+//! Schema metadata is stored in normalized inner SQL tables (`__all_table`,
+//! `__all_column`, etc.) and cached in memory for fast lookups. DDL operations
+//! write rows to inner tables and update the cache atomically.
 
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::{Arc, RwLock};
+use std::sync::RwLock;
 
-use crate::codec::key::{
-    encode_global_key, encode_schema_key, encode_table_id_key, encode_table_key, gen_table_prefix,
-    META_PREFIX, META_SCHEMA,
-};
+use crate::codec::key::encode_record_key_with_handle;
+use crate::codec::row::encode_row;
 use crate::error::{Result, TiSqlError};
-use crate::storage::MvccIterator;
+use crate::inner_table::bootstrap::{
+    self, delete_column_rows, delete_index_rows, update_meta_row, write_index_row,
+    write_user_column_rows, write_user_table_row,
+};
+use crate::inner_table::catalog_loader::{self, CatalogCache};
+use crate::inner_table::core_tables::*;
 use crate::transaction::{CommitInfo, TxnCtx, TxnService};
-use crate::types::{IndexId, TableId, Timestamp};
+use crate::types::{IndexId, TableId, Timestamp, Value};
 
 use super::{Catalog, IndexDef, TableDef};
 
 /// Schema state protected by RwLock for DDL/DML concurrency control.
 ///
-/// DDL operations hold write lock during commit (atomic version update).
+/// DDL operations hold write lock during commit (atomic version update + cache update).
 /// DML operations hold read lock briefly to check version (no contention between DMLs).
 struct SchemaState {
     /// Schema version, incremented on each DDL commit.
     version: u64,
+    /// In-memory cache of all schema metadata.
+    cache: CatalogCache,
 }
 
-/// MVCC-based catalog implementation.
+/// MVCC-based catalog backed by inner system tables.
 ///
-/// Uses the same storage engine and transaction service as user data.
-/// Schema metadata is stored with 'm' prefix keys and recovered
-/// automatically via clog replay.
+/// ## Storage Model
+///
+/// All schema metadata is stored in 5 core inner tables:
+/// - `__all_meta` — global counters (schema_version, next_table_id, etc.)
+/// - `__all_schema` — schema definitions
+/// - `__all_table` — table definitions
+/// - `__all_column` — column definitions
+/// - `__all_index` — index definitions
 ///
 /// ## DDL/DML Concurrency Control
 ///
-/// Uses RwLock to ensure atomicity between DDL commit and schema version update:
-/// - DDL holds write lock during entire commit + version increment
+/// Uses RwLock to ensure atomicity between DDL commit and cache update:
+/// - DDL holds write lock during: inner table writes → commit → cache update
 /// - DML holds read lock briefly to check version at commit time
 ///
 /// ## ID Generation
 ///
-/// Uses atomic counters for table_id and index_id to avoid transaction conflicts
-/// during concurrent DDL operations. IDs are persisted to storage for durability.
+/// Uses atomic counters for table_id, index_id, schema_id to avoid transaction
+/// conflicts during concurrent DDL operations. IDs are persisted to `__all_meta`.
 pub struct MvccCatalog<T: TxnService> {
-    txn_service: Arc<T>,
-    /// Schema state protected by RwLock for DDL/DML concurrency control.
+    txn_service: std::sync::Arc<T>,
+    /// Schema state + cache protected by RwLock for DDL/DML concurrency.
     schema_state: RwLock<SchemaState>,
-    /// Atomic counter for table IDs (no transaction conflicts).
+    /// Atomic counter for table IDs.
     next_table_id: AtomicU64,
-    /// Atomic counter for index IDs (no transaction conflicts).
+    /// Atomic counter for index IDs.
     next_index_id: AtomicU64,
+    /// Atomic counter for schema IDs.
+    next_schema_id: AtomicU64,
 }
 
 impl<T: TxnService> MvccCatalog<T> {
@@ -72,179 +84,122 @@ impl<T: TxnService> MvccCatalog<T> {
     ///
     /// For fresh databases, call `bootstrap()` after creation.
     /// For existing databases, call `load_schema_version()` to recover state.
-    pub fn new(txn_service: Arc<T>) -> Self {
+    pub fn new(txn_service: std::sync::Arc<T>) -> Self {
         Self {
             txn_service,
-            schema_state: RwLock::new(SchemaState { version: 0 }),
-            next_table_id: AtomicU64::new(1),
+            schema_state: RwLock::new(SchemaState {
+                version: 0,
+                cache: CatalogCache {
+                    schemas: Default::default(),
+                    schema_names: Default::default(),
+                    tables: Default::default(),
+                    table_id_map: Default::default(),
+                },
+            }),
+            next_table_id: AtomicU64::new(USER_TABLE_ID_START),
             next_index_id: AtomicU64::new(1),
+            next_schema_id: AtomicU64::new(USER_SCHEMA_ID_START),
         }
     }
 
-    /// Bootstrap the catalog (create default schema, initialize counters).
+    /// Bootstrap the catalog by writing core system tables to storage.
     ///
     /// Call this only for fresh databases where no metadata exists.
     pub fn bootstrap(&self) -> Result<()> {
-        // Hold write lock during bootstrap to ensure atomicity
-        let mut state = self.schema_state.write().unwrap();
-
-        // Initialize schema_version counter to 1
-        let mut ctx = self.txn_service.begin(false)?;
-        let key = encode_global_key("schema_version");
-        self.txn_service
-            .put(&mut ctx, key, 1u64.to_be_bytes().to_vec())?;
-
-        // Initialize next_table_id counter to 1
-        let key = encode_global_key("next_table_id");
-        self.txn_service
-            .put(&mut ctx, key, 1u64.to_be_bytes().to_vec())?;
-
-        // Initialize next_index_id counter to 1
-        let key = encode_global_key("next_index_id");
-        self.txn_service
-            .put(&mut ctx, key, 1u64.to_be_bytes().to_vec())?;
-
-        self.txn_service.commit(ctx)?;
-
-        // Initialize atomic counters
-        self.next_table_id.store(1, Ordering::SeqCst);
-        self.next_index_id.store(1, Ordering::SeqCst);
-
-        // Create default schema (this will increment version to 2)
-        // Release lock first since create_schema needs it
-        drop(state);
-        self.create_schema("default")?;
-
-        // Create test schema for MySQL compatibility (e.g., E2E tests expect it)
-        self.create_schema("test")?;
-
-        // Reload the version after bootstrap
-        state = self.schema_state.write().unwrap();
-        state.version = self.load_schema_version_from_storage()?;
-
-        Ok(())
+        bootstrap::bootstrap_core_tables(self.txn_service.as_ref())?;
+        self.load_schema_version()
     }
 
-    /// Check if the catalog has been bootstrapped (i.e., default schema exists).
+    /// Check if the catalog has been bootstrapped.
     pub fn is_bootstrapped(&self) -> Result<bool> {
-        self.schema_exists("default")
+        bootstrap::is_bootstrapped(self.txn_service.as_ref())
     }
 
-    /// Load schema version and ID counters from storage (for recovery).
+    /// Load schema version, counters, and cache from inner tables.
     ///
     /// Call this after opening an existing database to recover state.
     pub fn load_schema_version(&self) -> Result<()> {
-        let version = self.load_schema_version_from_storage()?;
-        let mut state = self.schema_state.write().unwrap();
-        state.version = version;
+        let (cache, counters) = catalog_loader::load_catalog(self.txn_service.as_ref())?;
 
-        // Load ID counters
-        let table_id = self.load_counter_from_storage("next_table_id")?;
-        let index_id = self.load_counter_from_storage("next_index_id")?;
-        self.next_table_id.store(table_id, Ordering::SeqCst);
-        self.next_index_id.store(index_id, Ordering::SeqCst);
+        let mut state = self.schema_state.write().unwrap();
+        state.version = counters.schema_version;
+        state.cache = cache;
+
+        self.next_table_id
+            .store(counters.next_table_id, Ordering::SeqCst);
+        self.next_index_id
+            .store(counters.next_index_id, Ordering::SeqCst);
+        self.next_schema_id
+            .store(counters.next_schema_id, Ordering::SeqCst);
 
         Ok(())
     }
 
-    /// Read schema version from storage.
-    fn load_schema_version_from_storage(&self) -> Result<u64> {
-        let ctx = self.txn_service.begin(true)?;
-        let key = encode_global_key("schema_version");
-        match self.txn_service.get(&ctx, &key)? {
-            Some(v) => {
-                if v.len() != 8 {
-                    return Err(TiSqlError::Catalog(
-                        "Invalid schema_version value".to_string(),
-                    ));
-                }
-                Ok(u64::from_be_bytes(v.try_into().unwrap()))
-            }
-            None => Ok(0), // Not bootstrapped yet
-        }
-    }
-
-    /// Read a counter value from storage.
-    fn load_counter_from_storage(&self, name: &str) -> Result<u64> {
-        let ctx = self.txn_service.begin(true)?;
-        let key = encode_global_key(name);
-        match self.txn_service.get(&ctx, &key)? {
-            Some(v) => {
-                if v.len() != 8 {
-                    return Err(TiSqlError::Catalog(format!(
-                        "Invalid counter value for '{name}'"
-                    )));
-                }
-                Ok(u64::from_be_bytes(v.try_into().unwrap()))
-            }
-            None => Ok(1), // Default to 1 if not found
-        }
-    }
-
-    /// Increment schema version in storage and memory.
+    /// Increment schema version in `__all_meta` and memory.
     /// Must be called while holding write lock on schema_state.
     fn increment_schema_version(&self, ctx: &mut TxnCtx, state: &mut SchemaState) -> Result<()> {
         state.version += 1;
-        let key = encode_global_key("schema_version");
-        self.txn_service
-            .put(ctx, key, state.version.to_be_bytes().to_vec())
+        update_meta_row(
+            ctx,
+            self.txn_service.as_ref(),
+            META_SCHEMA_VERSION,
+            state.version,
+        )
     }
 
-    /// Persist the current table ID counter to storage.
-    /// Called as part of DDL transaction to ensure durability.
-    fn persist_table_id_counter(&self, ctx: &mut TxnCtx, value: u64) -> Result<()> {
-        let key = encode_global_key("next_table_id");
-        self.txn_service.put(ctx, key, value.to_be_bytes().to_vec())
-    }
-
-    /// Persist the current index ID counter to storage.
-    /// Called as part of DDL transaction to ensure durability.
-    fn persist_index_id_counter(&self, ctx: &mut TxnCtx, value: u64) -> Result<()> {
-        let key = encode_global_key("next_index_id");
-        self.txn_service.put(ctx, key, value.to_be_bytes().to_vec())
-    }
-
-    /// Begin an internal transaction for DDL operations.
     fn begin_internal(&self) -> Result<TxnCtx> {
         self.txn_service.begin(false)
     }
 
-    /// Commit an internal transaction.
     fn commit_internal(&self, ctx: TxnCtx) -> Result<CommitInfo> {
         self.txn_service.commit(ctx)
-    }
-
-    /// Read a value at a specific timestamp.
-    fn get_at(&self, key: &[u8], ts: Timestamp) -> Result<Option<Vec<u8>>> {
-        // Create a read-only context at the specified timestamp
-        let ctx = TxnCtx::new(0, ts, true);
-        self.txn_service.get(&ctx, key)
     }
 }
 
 impl<T: TxnService> Catalog for MvccCatalog<T> {
     fn create_schema(&self, name: &str) -> Result<()> {
-        // Hold write lock during entire DDL commit for atomicity
         let mut state = self.schema_state.write().unwrap();
 
-        let mut ctx = self.begin_internal()?;
-        let key = encode_schema_key(name);
-
         // Check if schema already exists
-        if self.txn_service.get(&ctx, &key)?.is_some() {
+        if state.cache.schemas.contains_key(name) {
             return Err(TiSqlError::Catalog(format!(
                 "Schema '{name}' already exists"
             )));
         }
 
-        // Write schema marker (just a flag, empty value is fine)
-        self.txn_service.put(&mut ctx, key, vec![1])?;
+        // Allocate schema_id
+        let schema_id = self.next_schema_id.fetch_add(1, Ordering::SeqCst);
 
-        // Increment schema version as part of this transaction
+        let mut ctx = self.begin_internal()?;
+
+        // INSERT into __all_schema
+        let key = encode_record_key_with_handle(ALL_SCHEMA_TABLE_ID, schema_id as i64);
+        let col_ids = &[0, 1];
+        let values = &[
+            Value::BigInt(schema_id as i64),
+            Value::String(name.to_string()),
+        ];
+        let row_data = encode_row(col_ids, values);
+        self.txn_service.put(&mut ctx, key, row_data)?;
+
+        // Persist next_schema_id counter
+        let current_next = self.next_schema_id.load(Ordering::SeqCst);
+        update_meta_row(
+            &mut ctx,
+            self.txn_service.as_ref(),
+            META_NEXT_SCHEMA_ID,
+            current_next,
+        )?;
+
+        // Increment schema version
         self.increment_schema_version(&mut ctx, &mut state)?;
 
         self.commit_internal(ctx)?;
-        // Write lock released here - DML can now see new version
+
+        // Update cache
+        state.cache.schemas.insert(name.to_string(), schema_id);
+        state.cache.schema_names.insert(schema_id, name.to_string());
+
         Ok(())
     }
 
@@ -255,76 +210,61 @@ impl<T: TxnService> Catalog for MvccCatalog<T> {
             ));
         }
 
-        // Hold write lock during entire DDL commit for atomicity
         let mut state = self.schema_state.write().unwrap();
 
-        let mut ctx = self.begin_internal()?;
-        let key = encode_schema_key(name);
+        let schema_id = match state.cache.schemas.get(name) {
+            Some(&id) => id,
+            None => return Err(TiSqlError::Catalog(format!("Schema '{name}' not found"))),
+        };
 
-        // Check if schema exists
-        if self.txn_service.get(&ctx, &key)?.is_none() {
-            return Err(TiSqlError::Catalog(format!("Schema '{name}' not found")));
-        }
-
-        // Check if schema has tables (need to release lock temporarily)
-        drop(state);
-        let tables = self.list_tables(name)?;
-        if !tables.is_empty() {
+        // Check if schema has tables
+        let has_tables = state.cache.tables.keys().any(|(s, _)| s == name);
+        if has_tables {
             return Err(TiSqlError::Catalog(format!(
                 "Schema '{name}' is not empty, drop tables first"
             )));
         }
-        // Re-acquire write lock
-        state = self.schema_state.write().unwrap();
 
-        // Delete schema marker
+        let mut ctx = self.begin_internal()?;
+
+        // DELETE from __all_schema
+        let key = encode_record_key_with_handle(ALL_SCHEMA_TABLE_ID, schema_id as i64);
         self.txn_service.delete(&mut ctx, key)?;
 
-        // Increment schema version as part of this transaction
+        // Increment schema version
         self.increment_schema_version(&mut ctx, &mut state)?;
 
         self.commit_internal(ctx)?;
+
+        // Update cache
+        state.cache.schemas.remove(name);
+        state.cache.schema_names.remove(&schema_id);
+
         Ok(())
     }
 
     fn list_schemas(&self) -> Result<Vec<String>> {
-        let ctx = self.txn_service.begin(true)?;
-
-        // Scan for schema keys: 'm' + META_SCHEMA + name
-        let start = vec![META_PREFIX, META_SCHEMA];
-        let end = vec![META_PREFIX, META_SCHEMA + 1];
-
-        let mut iter = self.txn_service.scan_iter(&ctx, start..end)?;
-        let mut schemas: Vec<String> = Vec::new();
-        crate::io::block_on_sync(iter.advance())?;
-        while iter.valid() {
-            let key = iter.user_key();
-            if key.len() > 2 && key[0] == META_PREFIX && key[1] == META_SCHEMA {
-                if let Ok(name) = String::from_utf8(key[2..].to_vec()) {
-                    schemas.push(name);
-                }
-            }
-            crate::io::block_on_sync(iter.advance())?;
-        }
-
-        Ok(schemas)
+        let state = self.schema_state.read().unwrap();
+        Ok(state
+            .cache
+            .schemas
+            .keys()
+            .filter(|name| !name.starts_with("__"))
+            .cloned()
+            .collect())
     }
 
     fn schema_exists(&self, name: &str) -> Result<bool> {
-        let ctx = self.txn_service.begin(true)?;
-        let key = encode_schema_key(name);
-        Ok(self.txn_service.get(&ctx, &key)?.is_some())
+        let state = self.schema_state.read().unwrap();
+        Ok(state.cache.schemas.contains_key(name))
     }
 
     fn create_table(&self, table: TableDef) -> Result<TableId> {
-        // Hold write lock during entire DDL commit for atomicity
         let mut state = self.schema_state.write().unwrap();
 
-        let mut ctx = self.begin_internal()?;
-
         // Check if table already exists
-        let key = encode_table_key(table.schema(), table.name());
-        if self.txn_service.get(&ctx, &key)?.is_some() {
+        let key = (table.schema().to_string(), table.name().to_string());
+        if state.cache.tables.contains_key(&key) {
             return Err(TiSqlError::Catalog(format!(
                 "Table '{}' already exists in schema '{}'",
                 table.name(),
@@ -332,187 +272,142 @@ impl<T: TxnService> Catalog for MvccCatalog<T> {
             )));
         }
 
-        // Check if schema exists
-        let schema_key = encode_schema_key(table.schema());
-        if self.txn_service.get(&ctx, &schema_key)?.is_none() {
-            return Err(TiSqlError::Catalog(format!(
-                "Schema '{}' not found",
-                table.schema()
-            )));
-        }
+        // Resolve schema_id
+        let schema_id = match state.cache.schemas.get(table.schema()) {
+            Some(&id) => id,
+            None => {
+                return Err(TiSqlError::Catalog(format!(
+                    "Schema '{}' not found",
+                    table.schema()
+                )));
+            }
+        };
 
-        // Serialize and write table definition
         let table_id = table.id();
-        let value = bincode::serialize(&table).map_err(|e| TiSqlError::Catalog(e.to_string()))?;
-        self.txn_service.put(&mut ctx, key, value)?;
 
-        // Write table ID mapping
-        let id_key = encode_table_id_key(table_id);
-        let id_value = format!("{}:{}", table.schema(), table.name());
-        self.txn_service
-            .put(&mut ctx, id_key, id_value.into_bytes())?;
+        let mut ctx = self.begin_internal()?;
 
-        // Persist the current table ID counter for durability
-        let current_next_id = self.next_table_id.load(Ordering::SeqCst);
-        self.persist_table_id_counter(&mut ctx, current_next_id)?;
+        // INSERT into __all_table
+        write_user_table_row(&mut ctx, self.txn_service.as_ref(), &table, schema_id)?;
 
-        // Increment schema version as part of this transaction
+        // INSERT into __all_column for each column
+        write_user_column_rows(
+            &mut ctx,
+            self.txn_service.as_ref(),
+            table_id,
+            table.columns(),
+        )?;
+
+        // Persist next_table_id counter
+        let current_next = self.next_table_id.load(Ordering::SeqCst);
+        update_meta_row(
+            &mut ctx,
+            self.txn_service.as_ref(),
+            META_NEXT_TABLE_ID,
+            current_next,
+        )?;
+
+        // Increment schema version
         self.increment_schema_version(&mut ctx, &mut state)?;
 
         self.commit_internal(ctx)?;
+
+        // Update cache
+        state.cache.table_id_map.insert(table_id, key.clone());
+        state.cache.tables.insert(key, table);
+
         Ok(table_id)
     }
 
     fn drop_table(&self, schema: &str, table: &str) -> Result<()> {
-        // Hold write lock during entire DDL commit for atomicity
         let mut state = self.schema_state.write().unwrap();
 
-        let mut ctx = self.begin_internal()?;
-        let key = encode_table_key(schema, table);
-
-        // Get table to find its ID
-        let table_def = match self.txn_service.get(&ctx, &key)? {
-            Some(v) => bincode::deserialize::<TableDef>(&v)
-                .map_err(|e| TiSqlError::Catalog(e.to_string()))?,
+        let key = (schema.to_string(), table.to_string());
+        let table_def = match state.cache.tables.get(&key) {
+            Some(t) => t.clone(),
             None => {
                 return Err(TiSqlError::TableNotFound(format!("{schema}.{table}")));
             }
         };
 
-        // Delete table definition
-        self.txn_service.delete(&mut ctx, key)?;
+        let table_id = table_def.id();
 
-        // Delete table ID mapping
-        let id_key = encode_table_id_key(table_def.id());
-        self.txn_service.delete(&mut ctx, id_key)?;
+        let mut ctx = self.begin_internal()?;
 
-        // Increment schema version as part of this transaction
+        // DELETE from __all_table
+        let table_key = encode_record_key_with_handle(ALL_TABLE_TABLE_ID, table_id as i64);
+        self.txn_service.delete(&mut ctx, table_key)?;
+
+        // DELETE from __all_column
+        delete_column_rows(
+            &mut ctx,
+            self.txn_service.as_ref(),
+            table_id,
+            table_def.columns(),
+        )?;
+
+        // DELETE from __all_index
+        delete_index_rows(
+            &mut ctx,
+            self.txn_service.as_ref(),
+            table_id,
+            table_def.indexes(),
+        )?;
+
+        // Increment schema version
         self.increment_schema_version(&mut ctx, &mut state)?;
 
         self.commit_internal(ctx)?;
+
+        // Update cache
+        state.cache.tables.remove(&key);
+        state.cache.table_id_map.remove(&table_id);
+
         Ok(())
     }
 
     fn get_table(&self, schema: &str, table: &str) -> Result<Option<TableDef>> {
-        let ctx = self.txn_service.begin(true)?;
-        let key = encode_table_key(schema, table);
-
-        match self.txn_service.get(&ctx, &key)? {
-            Some(v) => {
-                let table_def = bincode::deserialize::<TableDef>(&v)
-                    .map_err(|e| TiSqlError::Catalog(e.to_string()))?;
-                Ok(Some(table_def))
-            }
-            None => Ok(None),
-        }
+        let state = self.schema_state.read().unwrap();
+        let key = (schema.to_string(), table.to_string());
+        Ok(state.cache.tables.get(&key).cloned())
     }
 
     fn get_table_by_id(&self, id: TableId) -> Result<Option<TableDef>> {
-        let ctx = self.txn_service.begin(true)?;
-        let id_key = encode_table_id_key(id);
-
-        // First get schema:table from ID mapping
-        let mapping = match self.txn_service.get(&ctx, &id_key)? {
-            Some(v) => String::from_utf8(v).map_err(|_| {
-                TiSqlError::Catalog("Invalid table ID mapping encoding".to_string())
-            })?,
-            None => return Ok(None),
-        };
-
-        // Parse schema:table
-        let parts: Vec<&str> = mapping.splitn(2, ':').collect();
-        if parts.len() != 2 {
-            return Err(TiSqlError::Catalog(
-                "Invalid table ID mapping format".to_string(),
-            ));
-        }
-        let (schema, table) = (parts[0], parts[1]);
-
-        // Get table definition
-        let table_key = encode_table_key(schema, table);
-        match self.txn_service.get(&ctx, &table_key)? {
-            Some(v) => {
-                let table_def = bincode::deserialize::<TableDef>(&v)
-                    .map_err(|e| TiSqlError::Catalog(e.to_string()))?;
-                Ok(Some(table_def))
-            }
+        let state = self.schema_state.read().unwrap();
+        match state.cache.table_id_map.get(&id) {
+            Some(key) => Ok(state.cache.tables.get(key).cloned()),
             None => Ok(None),
         }
     }
 
     fn list_tables(&self, schema: &str) -> Result<Vec<TableDef>> {
-        let ctx = self.txn_service.begin(true)?;
-
-        // Generate key range for all tables in the schema
-        let prefix = gen_table_prefix(schema);
-        let mut end = prefix.clone();
-        // Increment last byte to get exclusive end
-        if let Some(last) = end.last_mut() {
-            *last = last.saturating_add(1);
-        }
-
-        let mut iter = self.txn_service.scan_iter(&ctx, prefix.clone()..end)?;
-        let mut tables = Vec::new();
-
-        crate::io::block_on_sync(iter.advance())?;
-        while iter.valid() {
-            let key = iter.user_key();
-            let value = iter.value();
-            // Verify key starts with our prefix
-            if key.starts_with(&prefix) {
-                match bincode::deserialize::<TableDef>(value) {
-                    Ok(table_def) => tables.push(table_def),
-                    Err(e) => {
-                        return Err(TiSqlError::Catalog(format!(
-                            "Failed to deserialize table: {e}"
-                        )));
-                    }
-                }
-            }
-            crate::io::block_on_sync(iter.advance())?;
-        }
-
-        Ok(tables)
+        let state = self.schema_state.read().unwrap();
+        Ok(state
+            .cache
+            .tables
+            .iter()
+            .filter(|((s, _), _)| s == schema)
+            .map(|(_, t)| t.clone())
+            .collect())
     }
 
     fn create_index(&self, table_id: TableId, index: IndexDef) -> Result<IndexId> {
-        // Hold write lock during entire DDL commit for atomicity
         let mut state = self.schema_state.write().unwrap();
 
-        let mut ctx = self.begin_internal()?;
-
-        // Get table by ID
-        let id_key = encode_table_id_key(table_id);
-        let mapping = match self.txn_service.get(&ctx, &id_key)? {
-            Some(v) => String::from_utf8(v).map_err(|_| {
-                TiSqlError::Catalog("Invalid table ID mapping encoding".to_string())
-            })?,
+        // Find table in cache
+        let table_key = match state.cache.table_id_map.get(&table_id) {
+            Some(k) => k.clone(),
             None => {
                 return Err(TiSqlError::Catalog(format!(
                     "Table with ID {table_id} not found"
-                )))
+                )));
             }
         };
 
-        let parts: Vec<&str> = mapping.splitn(2, ':').collect();
-        if parts.len() != 2 {
-            return Err(TiSqlError::Catalog(
-                "Invalid table ID mapping format".to_string(),
-            ));
-        }
-        let (schema, table) = (parts[0], parts[1]);
-
-        // Get and update table definition
-        let table_key = encode_table_key(schema, table);
-        let mut table_def = match self.txn_service.get(&ctx, &table_key)? {
-            Some(v) => bincode::deserialize::<TableDef>(&v)
-                .map_err(|e| TiSqlError::Catalog(e.to_string()))?,
-            None => {
-                return Err(TiSqlError::Catalog(format!(
-                    "Table with ID {table_id} not found"
-                )))
-            }
-        };
+        let table_def =
+            state.cache.tables.get(&table_key).cloned().ok_or_else(|| {
+                TiSqlError::Catalog(format!("Table with ID {table_id} not found"))
+            })?;
 
         // Check for duplicate index name
         if table_def.indexes().iter().any(|i| i.name() == index.name()) {
@@ -523,218 +418,152 @@ impl<T: TxnService> Catalog for MvccCatalog<T> {
         }
 
         let index_id = index.id();
-        table_def.add_index(index);
 
-        // Write updated table definition
-        let value =
-            bincode::serialize(&table_def).map_err(|e| TiSqlError::Catalog(e.to_string()))?;
-        self.txn_service.put(&mut ctx, table_key, value)?;
+        let mut ctx = self.begin_internal()?;
 
-        // Persist the current index ID counter for durability
-        let current_next_id = self.next_index_id.load(Ordering::SeqCst);
-        self.persist_index_id_counter(&mut ctx, current_next_id)?;
+        // INSERT into __all_index
+        write_index_row(&mut ctx, self.txn_service.as_ref(), table_id, &index)?;
 
-        // Increment schema version as part of this transaction
+        // Persist next_index_id counter
+        let current_next = self.next_index_id.load(Ordering::SeqCst);
+        update_meta_row(
+            &mut ctx,
+            self.txn_service.as_ref(),
+            META_NEXT_INDEX_ID,
+            current_next,
+        )?;
+
+        // Increment schema version
         self.increment_schema_version(&mut ctx, &mut state)?;
 
         self.commit_internal(ctx)?;
+
+        // Update cache
+        if let Some(cached_table) = state.cache.tables.get_mut(&table_key) {
+            cached_table.add_index(index);
+        }
+
         Ok(index_id)
     }
 
     fn drop_index(&self, table_id: TableId, index_name: &str) -> Result<()> {
-        // Hold write lock during entire DDL commit for atomicity
         let mut state = self.schema_state.write().unwrap();
+
+        // Find table in cache
+        let table_key = match state.cache.table_id_map.get(&table_id) {
+            Some(k) => k.clone(),
+            None => {
+                return Err(TiSqlError::Catalog(format!(
+                    "Table with ID {table_id} not found"
+                )));
+            }
+        };
+
+        let table_def =
+            state.cache.tables.get(&table_key).cloned().ok_or_else(|| {
+                TiSqlError::Catalog(format!("Table with ID {table_id} not found"))
+            })?;
+
+        // Find the index to get its ID
+        let index = table_def
+            .indexes()
+            .iter()
+            .find(|i| i.name() == index_name)
+            .ok_or_else(|| TiSqlError::Catalog(format!("Index '{index_name}' not found")))?;
+
+        let index_key = table_id * 10000 + index.id();
 
         let mut ctx = self.begin_internal()?;
 
-        // Get table by ID
-        let id_key = encode_table_id_key(table_id);
-        let mapping = match self.txn_service.get(&ctx, &id_key)? {
-            Some(v) => String::from_utf8(v).map_err(|_| {
-                TiSqlError::Catalog("Invalid table ID mapping encoding".to_string())
-            })?,
-            None => {
-                return Err(TiSqlError::Catalog(format!(
-                    "Table with ID {table_id} not found"
-                )))
-            }
-        };
+        // DELETE from __all_index
+        let key = encode_record_key_with_handle(ALL_INDEX_TABLE_ID, index_key as i64);
+        self.txn_service.delete(&mut ctx, key)?;
 
-        let parts: Vec<&str> = mapping.splitn(2, ':').collect();
-        if parts.len() != 2 {
-            return Err(TiSqlError::Catalog(
-                "Invalid table ID mapping format".to_string(),
-            ));
-        }
-        let (schema, table) = (parts[0], parts[1]);
-
-        // Get and update table definition
-        let table_key = encode_table_key(schema, table);
-        let mut table_def = match self.txn_service.get(&ctx, &table_key)? {
-            Some(v) => bincode::deserialize::<TableDef>(&v)
-                .map_err(|e| TiSqlError::Catalog(e.to_string()))?,
-            None => {
-                return Err(TiSqlError::Catalog(format!(
-                    "Table with ID {table_id} not found"
-                )))
-            }
-        };
-
-        // Remove index
-        table_def
-            .remove_index(index_name)
-            .ok_or_else(|| TiSqlError::Catalog(format!("Index '{index_name}' not found")))?;
-
-        // Write updated table definition
-        let value =
-            bincode::serialize(&table_def).map_err(|e| TiSqlError::Catalog(e.to_string()))?;
-        self.txn_service.put(&mut ctx, table_key, value)?;
-
-        // Increment schema version as part of this transaction
+        // Increment schema version
         self.increment_schema_version(&mut ctx, &mut state)?;
 
         self.commit_internal(ctx)?;
+
+        // Update cache
+        if let Some(cached_table) = state.cache.tables.get_mut(&table_key) {
+            cached_table.remove_index(index_name);
+        }
+
         Ok(())
     }
 
     fn next_auto_increment(&self, table_id: TableId) -> Result<u64> {
-        let mut ctx = self.begin_internal()?;
+        let mut state = self.schema_state.write().unwrap();
 
-        // Get table by ID
-        let id_key = encode_table_id_key(table_id);
-        let mapping = match self.txn_service.get(&ctx, &id_key)? {
-            Some(v) => String::from_utf8(v).map_err(|_| {
-                TiSqlError::Catalog("Invalid table ID mapping encoding".to_string())
-            })?,
+        let table_key = match state.cache.table_id_map.get(&table_id) {
+            Some(k) => k.clone(),
             None => {
                 return Err(TiSqlError::Catalog(format!(
                     "Table with ID {table_id} not found"
-                )))
+                )));
             }
         };
 
-        let parts: Vec<&str> = mapping.splitn(2, ':').collect();
-        if parts.len() != 2 {
-            return Err(TiSqlError::Catalog(
-                "Invalid table ID mapping format".to_string(),
-            ));
-        }
-        let (schema, table) = (parts[0], parts[1]);
-
-        // Get and update table definition
-        let table_key = encode_table_key(schema, table);
-        let mut table_def = match self.txn_service.get(&ctx, &table_key)? {
-            Some(v) => bincode::deserialize::<TableDef>(&v)
-                .map_err(|e| TiSqlError::Catalog(e.to_string()))?,
+        // Look up schema_id first (before mutable borrow of tables)
+        let schema_name = table_key.0.clone();
+        let schema_id = match state.cache.schemas.get(&schema_name) {
+            Some(&id) => id,
             None => {
                 return Err(TiSqlError::Catalog(format!(
-                    "Table with ID {table_id} not found"
-                )))
+                    "Schema '{schema_name}' not found"
+                )));
             }
         };
+
+        let table_def =
+            state.cache.tables.get_mut(&table_key).ok_or_else(|| {
+                TiSqlError::Catalog(format!("Table with ID {table_id} not found"))
+            })?;
 
         // Increment auto_increment_id
         let new_id = table_def.increment_auto_id();
 
-        // Write updated table definition
-        let value =
-            bincode::serialize(&table_def).map_err(|e| TiSqlError::Catalog(e.to_string()))?;
-        self.txn_service.put(&mut ctx, table_key, value)?;
-
+        // Update __all_table row with new auto_increment_id
+        let mut ctx = self.begin_internal()?;
+        write_user_table_row(&mut ctx, self.txn_service.as_ref(), table_def, schema_id)?;
         self.commit_internal(ctx)?;
+
         Ok(new_id)
     }
 
     fn next_table_id(&self) -> Result<TableId> {
-        // Atomically allocate ID - no transaction conflict
         Ok(self.next_table_id.fetch_add(1, Ordering::SeqCst))
     }
 
     fn next_index_id(&self) -> Result<IndexId> {
-        // Atomically allocate ID - no transaction conflict
         Ok(self.next_index_id.fetch_add(1, Ordering::SeqCst))
     }
 
-    // MVCC-aware reads
+    // MVCC-aware reads (bypass cache, scan inner tables at timestamp)
 
     fn get_table_at(&self, schema: &str, table: &str, ts: Timestamp) -> Result<Option<TableDef>> {
-        let key = encode_table_key(schema, table);
-
-        match self.get_at(&key, ts)? {
-            Some(v) => {
-                let table_def = bincode::deserialize::<TableDef>(&v)
-                    .map_err(|e| TiSqlError::Catalog(e.to_string()))?;
-                Ok(Some(table_def))
-            }
-            None => Ok(None),
-        }
+        catalog_loader::get_table_at(self.txn_service.as_ref(), schema, table, ts)
     }
 
     fn get_table_by_id_at(&self, id: TableId, ts: Timestamp) -> Result<Option<TableDef>> {
-        let id_key = encode_table_id_key(id);
-
-        // First get schema:table from ID mapping
-        let mapping = match self.get_at(&id_key, ts)? {
-            Some(v) => String::from_utf8(v).map_err(|_| {
-                TiSqlError::Catalog("Invalid table ID mapping encoding".to_string())
-            })?,
-            None => return Ok(None),
-        };
-
-        // Parse schema:table
-        let parts: Vec<&str> = mapping.splitn(2, ':').collect();
-        if parts.len() != 2 {
-            return Err(TiSqlError::Catalog(
-                "Invalid table ID mapping format".to_string(),
-            ));
-        }
-        let (schema, table) = (parts[0], parts[1]);
-
-        // Get table definition at the same timestamp
-        self.get_table_at(schema, table, ts)
+        catalog_loader::get_table_by_id_at(self.txn_service.as_ref(), id, ts)
     }
 
     fn list_tables_at(&self, schema: &str, ts: Timestamp) -> Result<Vec<TableDef>> {
-        // For list_tables_at, we need to scan with a specific timestamp
-        // This requires creating a TxnCtx at the specific timestamp
-        let ctx = TxnCtx::new(0, ts, true);
-
-        let prefix = gen_table_prefix(schema);
-        let mut end = prefix.clone();
-        if let Some(last) = end.last_mut() {
-            *last = last.saturating_add(1);
-        }
-
-        let mut iter = self.txn_service.scan_iter(&ctx, prefix.clone()..end)?;
-        let mut tables = Vec::new();
-
-        crate::io::block_on_sync(iter.advance())?;
-        while iter.valid() {
-            let key = iter.user_key();
-            let value = iter.value();
-            if key.starts_with(&prefix) {
-                match bincode::deserialize::<TableDef>(value) {
-                    Ok(table_def) => tables.push(table_def),
-                    Err(e) => {
-                        return Err(TiSqlError::Catalog(format!(
-                            "Failed to deserialize table: {e}"
-                        )));
-                    }
-                }
-            }
-            crate::io::block_on_sync(iter.advance())?;
-        }
-
-        Ok(tables)
+        let state = self.schema_state.read().unwrap();
+        let schema_id = match state.cache.schemas.get(schema) {
+            Some(&id) => id,
+            None => return Ok(Vec::new()),
+        };
+        drop(state);
+        catalog_loader::scan_tables_at(self.txn_service.as_ref(), schema_id, ts)
     }
 
     fn schema_exists_at(&self, name: &str, ts: Timestamp) -> Result<bool> {
-        let key = encode_schema_key(name);
-        Ok(self.get_at(&key, ts)?.is_some())
+        catalog_loader::schema_exists_at(self.txn_service.as_ref(), name, ts)
     }
 
     fn current_schema_version(&self) -> u64 {
-        // Read lock - concurrent with other DMLs, blocked by DDL commit
         let state = self.schema_state.read().unwrap();
         state.version
     }
@@ -856,11 +685,12 @@ mod tests {
         catalog.create_schema("myschema").unwrap();
         assert!(catalog.schema_exists("myschema").unwrap());
 
-        // List schemas
+        // List schemas (should not include __tisql_inner)
         let schemas = catalog.list_schemas().unwrap();
         assert!(schemas.contains(&"default".to_string()));
         assert!(schemas.contains(&"test".to_string()));
         assert!(schemas.contains(&"myschema".to_string()));
+        assert!(!schemas.contains(&INNER_SCHEMA.to_string()));
 
         // Drop schema
         catalog.drop_schema("myschema").unwrap();
@@ -888,9 +718,10 @@ mod tests {
         let id2 = catalog.next_table_id().unwrap();
         let id3 = catalog.next_table_id().unwrap();
 
-        assert_eq!(id1, 1);
-        assert_eq!(id2, 2);
-        assert_eq!(id3, 3);
+        // User IDs start at USER_TABLE_ID_START
+        assert_eq!(id1, USER_TABLE_ID_START);
+        assert_eq!(id2, USER_TABLE_ID_START + 1);
+        assert_eq!(id3, USER_TABLE_ID_START + 2);
     }
 
     #[test]
@@ -1021,5 +852,22 @@ mod tests {
                 "Version should increment from recovered value"
             );
         }
+    }
+
+    #[test]
+    fn test_bootstrap_creates_inner_tables_in_cache() {
+        let (catalog, _dir) = create_test_catalog();
+
+        // Inner tables should be in cache but hidden from list_schemas
+        let schemas = catalog.list_schemas().unwrap();
+        assert!(!schemas.contains(&INNER_SCHEMA.to_string()));
+
+        // But the inner schema should exist
+        assert!(catalog.schema_exists(INNER_SCHEMA).unwrap());
+
+        // Core tables should be accessible via get_table
+        let all_table = catalog.get_table(INNER_SCHEMA, "__all_table").unwrap();
+        assert!(all_table.is_some());
+        assert_eq!(all_table.unwrap().columns().len(), 5);
     }
 }
