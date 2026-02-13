@@ -133,6 +133,10 @@ pub async fn dispatch_full_query(
             Ok((ExecutionOutput::Ok, ctx)) => {
                 let _ = response_tx.send(QueryResponse::Ok { txn_ctx: ctx });
             }
+            Ok((ExecutionOutput::OkWithEffect(_), ctx)) => {
+                // Effect already handled in Database::execute_plan
+                let _ = response_tx.send(QueryResponse::Ok { txn_ctx: ctx });
+            }
             Err(e) => {
                 let _ = response_tx.send(QueryResponse::Error {
                     error: e,

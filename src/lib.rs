@@ -99,6 +99,12 @@ pub mod testkit {
     pub use crate::transaction::{ConcurrencyManager, TransactionService};
     pub use crate::tso::LocalTso;
 
+    // Executor types for testing
+    pub use crate::executor::ExecutionResult;
+
+    // Inner table infrastructure for testing
+    pub use crate::inner_table::InnerSession;
+
     // Test helper extension trait for TransactionService
     use crate::clog::ClogService;
     use crate::error::Result;
@@ -313,6 +319,8 @@ pub struct Database {
     flush_scheduler: FlushScheduler,
     /// Background compaction scheduler (Drop stops the worker)
     compaction_scheduler: CompactionScheduler,
+    /// Background GC worker for drop-table data cleanup (Drop stops the worker)
+    gc_worker: inner_table::gc_worker::GcWorker<DbTxnService>,
     /// Dedicated worker runtime for query execution (separate from protocol I/O).
     /// Created in `open()` for production; `None` in tests (falls back to tokio::spawn).
     worker_runtime: Option<tokio::runtime::Runtime>,
@@ -381,6 +389,42 @@ impl Database {
             catalog.load_schema_version()?;
         }
 
+        // Load pending GC tasks from inner tables and register with storage engine
+        {
+            use inner_table::catalog_loader::load_gc_tasks;
+            match load_gc_tasks(txn_service.as_ref()) {
+                Ok(tasks) => {
+                    let mut pending_count = 0u32;
+                    for task in tasks {
+                        if task.status == "done" {
+                            continue;
+                        }
+                        if task.drop_commit_ts > 0 {
+                            storage.add_dropped_table(task.table_id, task.drop_commit_ts);
+                            pending_count += 1;
+                        } else {
+                            // drop_commit_ts=0 means the commit happened but the
+                            // follow-up update didn't complete. Use TSO as upper bound.
+                            let ts = tso.get_ts();
+                            storage.add_dropped_table(task.table_id, ts);
+                            pending_count += 1;
+                        }
+                    }
+                    if pending_count > 0 {
+                        log_info!("Recovered {} pending GC delete-range tasks", pending_count);
+                    }
+                }
+                Err(e) => {
+                    log_warn!("Failed to load GC tasks (non-fatal): {}", e);
+                }
+            }
+        }
+
+        // Start background GC worker for drop-table cleanup
+        let gc_worker =
+            inner_table::gc_worker::GcWorker::new(Arc::clone(&storage), Arc::clone(&txn_service));
+        gc_worker.start();
+
         // Create dedicated worker runtime for query execution.
         // Sized to available parallelism (defaults to CPU count).
         let worker_threads = std::thread::available_parallelism()
@@ -424,6 +468,7 @@ impl Database {
             storage,
             flush_scheduler,
             compaction_scheduler,
+            gc_worker,
             worker_runtime: Some(worker_runtime),
             session_registry,
         })
@@ -514,7 +559,7 @@ impl Database {
                 );
                 QueryResult::Affected(count)
             }
-            ExecutionResult::Ok => {
+            ExecutionResult::Ok | ExecutionResult::OkWithEffect(_) => {
                 log_trace!(
                     "SQL: {} | elapsed={:.3}ms",
                     truncate_sql(sql, 50),
@@ -580,7 +625,7 @@ impl Database {
                 );
                 QueryResult::Affected(count)
             }
-            ExecutionResult::Ok => {
+            ExecutionResult::Ok | ExecutionResult::OkWithEffect(_) => {
                 log_trace!(
                     "SQL: {} | elapsed={:.3}ms",
                     truncate_sql(sql, 50),
@@ -681,7 +726,8 @@ impl Database {
         exec_ctx: &session::ExecutionCtx,
         txn_ctx: Option<transaction::TxnCtx>,
     ) -> Result<(ExecutionOutput, Option<transaction::TxnCtx>)> {
-        self.sql_engine
+        let (output, ctx) = self
+            .sql_engine
             .executor
             .execute_unified(
                 plan,
@@ -690,7 +736,19 @@ impl Database {
                 &self.catalog,
                 txn_ctx,
             )
-            .await
+            .await?;
+
+        // Intercept DDL effects to register dropped tables for GC
+        if let ExecutionOutput::OkWithEffect(executor::DdlEffect::TableDropped {
+            table_id,
+            commit_ts,
+        }) = &output
+        {
+            self.storage.add_dropped_table(*table_id, *commit_ts);
+            self.gc_worker.notify();
+        }
+
+        Ok((output, ctx))
     }
 
     /// Close the database (flush memtables and sync logs).
@@ -718,6 +776,9 @@ impl Drop for Database {
         if let Some(rt) = self.worker_runtime.take() {
             rt.shutdown_background();
         }
+
+        // Stop GC worker before background schedulers
+        self.gc_worker.stop();
 
         // Stop background schedulers (flush before compaction)
         self.flush_scheduler.stop();

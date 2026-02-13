@@ -66,6 +66,7 @@ pub struct CatalogCounters {
     pub next_table_id: u64,
     pub next_index_id: u64,
     pub next_schema_id: u64,
+    pub next_gc_task_id: u64,
 }
 
 // ============================================================================
@@ -127,6 +128,7 @@ fn load_counters<T: TxnService>(txn: &T, ctx: &TxnCtx) -> Result<CatalogCounters
     let mut next_table_id = USER_TABLE_ID_START;
     let mut next_index_id = 1u64;
     let mut next_schema_id = USER_SCHEMA_ID_START;
+    let mut next_gc_task_id = 1u64;
 
     // Read each well-known meta row
     for meta_id in [
@@ -135,6 +137,7 @@ fn load_counters<T: TxnService>(txn: &T, ctx: &TxnCtx) -> Result<CatalogCounters
         META_NEXT_INDEX_ID,
         META_SCHEMA_VERSION,
         META_NEXT_SCHEMA_ID,
+        META_NEXT_GC_TASK_ID,
     ] {
         let key = encode_record_key_with_handle(ALL_META_TABLE_ID, meta_id);
         if let Some(data) = txn.get(ctx, &key)? {
@@ -156,6 +159,7 @@ fn load_counters<T: TxnService>(txn: &T, ctx: &TxnCtx) -> Result<CatalogCounters
                     META_NEXT_INDEX_ID => next_index_id = v,
                     META_SCHEMA_VERSION => schema_version = v,
                     META_NEXT_SCHEMA_ID => next_schema_id = v,
+                    META_NEXT_GC_TASK_ID => next_gc_task_id = v,
                     _ => {} // bootstrap_version — ignored for now
                 }
             }
@@ -167,6 +171,7 @@ fn load_counters<T: TxnService>(txn: &T, ctx: &TxnCtx) -> Result<CatalogCounters
         next_table_id,
         next_index_id,
         next_schema_id,
+        next_gc_task_id,
     })
 }
 
@@ -868,6 +873,78 @@ fn reconstruct_table_def(
     Ok(Some(table_def))
 }
 
+// ============================================================================
+// GC Task Loading
+// ============================================================================
+
+/// A GC delete-range task loaded from `__all_gc_delete_range`.
+pub struct GcTask {
+    pub task_id: i64,
+    pub table_id: u64,
+    pub start_key_hex: String,
+    pub end_key_hex: String,
+    pub drop_commit_ts: u64,
+    pub status: String,
+}
+
+/// Load all GC tasks from `__all_gc_delete_range`.
+///
+/// Returns all tasks (including 'done' ones for completeness;
+/// callers should filter by status as needed).
+pub fn load_gc_tasks<T: TxnService>(txn: &T) -> Result<Vec<GcTask>> {
+    let ctx = txn.begin(true)?;
+    let col_ids = &[0, 1, 2, 3, 4, 5];
+    let data_types = &[
+        DataType::BigInt,       // task_id
+        DataType::BigInt,       // table_id
+        DataType::Varchar(512), // start_key
+        DataType::Varchar(512), // end_key
+        DataType::BigInt,       // drop_commit_ts
+        DataType::Varchar(16),  // status
+    ];
+
+    let rows = scan_table_rows(txn, &ctx, ALL_GC_DELETE_RANGE_TABLE_ID, col_ids, data_types)?;
+
+    let mut tasks = Vec::new();
+    for row in rows {
+        let task_id = match row[0] {
+            Value::BigInt(v) => v,
+            _ => continue,
+        };
+        let table_id = match row[1] {
+            Value::BigInt(v) => v as u64,
+            _ => continue,
+        };
+        let start_key_hex = match &row[2] {
+            Value::String(s) => s.clone(),
+            _ => continue,
+        };
+        let end_key_hex = match &row[3] {
+            Value::String(s) => s.clone(),
+            _ => continue,
+        };
+        let drop_commit_ts = match row[4] {
+            Value::BigInt(v) => v as u64,
+            _ => 0,
+        };
+        let status = match &row[5] {
+            Value::String(s) => s.clone(),
+            _ => continue,
+        };
+
+        tasks.push(GcTask {
+            task_id,
+            table_id,
+            start_key_hex,
+            end_key_hex,
+            drop_commit_ts,
+            status,
+        });
+    }
+
+    Ok(tasks)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -920,7 +997,7 @@ mod tests {
         assert_eq!(counters.next_schema_id, USER_SCHEMA_ID_START);
 
         // Check core tables are loaded
-        assert_eq!(cache.tables.len(), 5);
+        assert_eq!(cache.tables.len(), 6);
         assert!(cache
             .tables
             .contains_key(&(INNER_SCHEMA.to_string(), "__all_meta".to_string())));
@@ -961,8 +1038,8 @@ mod tests {
 
         let (cache, _) = load_catalog(txn.as_ref()).unwrap();
 
-        // All 5 core tables should be in table_id_map
-        assert_eq!(cache.table_id_map.len(), 5);
+        // All 6 core tables should be in table_id_map
+        assert_eq!(cache.table_id_map.len(), 6);
         assert_eq!(
             cache.table_id_map[&ALL_META_TABLE_ID],
             (INNER_SCHEMA.to_string(), "__all_meta".to_string())

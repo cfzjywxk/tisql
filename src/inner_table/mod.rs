@@ -41,6 +41,7 @@
 pub(crate) mod bootstrap;
 pub(crate) mod catalog_loader;
 pub(crate) mod core_tables;
+pub(crate) mod gc_worker;
 
 use std::sync::Arc;
 

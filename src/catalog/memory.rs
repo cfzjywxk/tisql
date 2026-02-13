@@ -125,7 +125,7 @@ impl Catalog for MemoryCatalog {
         Ok(table_id)
     }
 
-    fn drop_table(&self, schema: &str, table: &str) -> Result<()> {
+    fn drop_table(&self, schema: &str, table: &str) -> Result<super::DropTableInfo> {
         let mut schemas = self.schemas.write();
         let mut tables_by_id = self.tables_by_id.write();
 
@@ -134,8 +134,12 @@ impl Catalog for MemoryCatalog {
             .ok_or_else(|| TiSqlError::Catalog(format!("Schema '{schema}' not found")))?;
 
         if let Some(table_def) = schema_tables.remove(table) {
-            tables_by_id.remove(&table_def.id());
-            Ok(())
+            let table_id = table_def.id();
+            tables_by_id.remove(&table_id);
+            Ok(super::DropTableInfo {
+                table_id,
+                commit_ts: 0,
+            })
         } else {
             Err(TiSqlError::TableNotFound(format!("{schema}.{table}")))
         }

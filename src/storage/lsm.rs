@@ -42,7 +42,7 @@
 //! - Flush and compaction run in background threads
 //! - Version changes are atomic (swap pointer)
 
-use std::collections::VecDeque;
+use std::collections::{HashMap, VecDeque};
 use std::ops::Range;
 use std::sync::atomic::{AtomicU64, Ordering as AtomicOrdering};
 use std::sync::Arc;
@@ -173,6 +173,11 @@ pub struct LsmEngine {
     /// Callback to compute the current GC safe point from active sessions/TSO.
     /// Called before each compaction round to advance the safe point.
     gc_safe_point_updater: RwLock<Option<Arc<dyn Fn() -> u64 + Send + Sync>>>,
+
+    /// Table IDs that have been dropped and await GC during compaction.
+    /// Maps table_id → drop_commit_ts. During compaction, all keys belonging
+    /// to a dropped table with drop_ts <= gc_safe_point are filtered out.
+    dropped_table_ids: RwLock<HashMap<u64, Timestamp>>,
 }
 
 impl LsmEngine {
@@ -227,6 +232,7 @@ impl LsmEngine {
             compaction_notify: RwLock::new(None),
             gc_safe_point: AtomicU64::new(0),
             gc_safe_point_updater: RwLock::new(None),
+            dropped_table_ids: RwLock::new(HashMap::new()),
         })
     }
 
@@ -525,10 +531,18 @@ impl LsmEngine {
         // We need to update this to work with MVCC keys, but for now iterate all SSTs
         let candidates = version.find_ssts_for_key(key);
 
+        // Snapshot dropped tables for read-path filtering
+        let dropped_tables = self.dropped_table_ids();
+        let gc_safe_point = self.gc_safe_point();
+
         // Track best match: (entry_ts, value) where entry_ts <= ts
         let mut best_match: Option<(Timestamp, RawValue)> = None;
 
         for sst_meta in candidates {
+            // Skip SSTs that belong entirely to a dropped table past GC safe point
+            if sst_meta.belongs_to_dropped_table(&dropped_tables, gc_safe_point) {
+                continue;
+            }
             let sst_path = self
                 .config
                 .sst_dir()
@@ -708,6 +722,100 @@ impl LsmEngine {
         }
     }
 
+    /// Register a dropped table for GC during compaction.
+    ///
+    /// All keys belonging to this table with drop_ts <= gc_safe_point
+    /// will be filtered out during the next compaction.
+    pub fn add_dropped_table(&self, table_id: u64, drop_commit_ts: Timestamp) {
+        self.dropped_table_ids
+            .write()
+            .insert(table_id, drop_commit_ts);
+    }
+
+    /// Remove a dropped table from the GC set (task completed).
+    pub fn remove_dropped_table(&self, table_id: u64) {
+        self.dropped_table_ids.write().remove(&table_id);
+    }
+
+    /// Snapshot the current set of dropped table IDs.
+    pub fn dropped_table_ids(&self) -> HashMap<u64, Timestamp> {
+        self.dropped_table_ids.read().clone()
+    }
+
+    /// Remove SST files that belong entirely to dropped tables past GC safe point.
+    ///
+    /// This is a deletion-only version update — no compaction I/O needed.
+    /// Uses the same crash-safe protocol as `do_compaction()`:
+    /// CompactCommit (ilog) → apply_delta → install_super_version → delete files.
+    ///
+    /// Returns the number of SSTs removed.
+    pub fn remove_obsolete_dropped_table_ssts(&self) -> Result<usize> {
+        let dropped_tables = self.dropped_table_ids();
+        let gc_safe_point = self.gc_safe_point();
+
+        if dropped_tables.is_empty() || gc_safe_point == 0 {
+            return Ok(0);
+        }
+
+        let version = self.current_version();
+
+        // Scan all levels for SSTs belonging entirely to dropped tables
+        let mut obsolete_ssts: Vec<(u32, u64)> = Vec::new();
+        for level in 0..self.config.max_levels {
+            for sst in version.level(level) {
+                if sst.belongs_to_dropped_table(&dropped_tables, gc_safe_point) {
+                    obsolete_ssts.push((level as u32, sst.id));
+                }
+            }
+        }
+
+        if obsolete_ssts.is_empty() {
+            return Ok(0);
+        }
+
+        let count = obsolete_ssts.len();
+
+        // Build deletion-only ManifestDelta
+        let mut delta = ManifestDelta::new();
+        for (level, sst_id) in &obsolete_ssts {
+            delta.delete_sst(*level, *sst_id);
+        }
+
+        // Write CompactCommit to ilog (if durable) — CompactCommit supports empty new_ssts
+        if let Some(ref ilog) = self.ilog {
+            ilog.write_compact_commit(obsolete_ssts, vec![])?;
+        }
+
+        // Apply delta to VersionSet
+        let new_version = self.version_set.apply_delta(&delta);
+
+        // Install new SuperVersion
+        {
+            #[allow(clippy::readonly_write_lock)]
+            let state = self.state.write();
+            self.install_super_version(&state);
+        }
+
+        // Delete physical SST files
+        self.delete_obsolete_ssts(&delta)?;
+
+        // Checkpoint if needed
+        if let Some(ref ilog) = self.ilog {
+            if ilog.needs_checkpoint() {
+                ilog.write_checkpoint(&new_version)?;
+            }
+        }
+
+        Ok(count)
+    }
+
+    /// Notify the compaction scheduler to check for work.
+    pub fn trigger_compaction(&self) {
+        if let Some(ref notify) = *self.compaction_notify.read() {
+            notify();
+        }
+    }
+
     /// Check write backpressure conditions and return error or sleep briefly.
     ///
     /// Two tiers:
@@ -771,14 +879,16 @@ impl LsmEngine {
         let version = self.current_version();
         let picker = CompactionPicker::new(Arc::clone(&self.config));
 
-        // Phase 0: Pick
-        let task = match picker.pick(&version) {
+        // Compute GC parameters (needed for both picking and execution)
+        let gc_safe_point = self.gc_safe_point();
+        let dropped_tables = self.dropped_table_ids();
+
+        // Phase 0: Pick (with dropped table priority boost)
+        let task = match picker.pick(&version, &dropped_tables, gc_safe_point) {
             Some(task) => task,
             None => return Ok(false),
         };
 
-        // Compute GC parameters for this compaction
-        let gc_safe_point = self.gc_safe_point();
         let is_bottommost = task.check_bottommost(&version, self.config.max_levels);
 
         // Handle trivial move separately (no SST I/O needed)
@@ -794,6 +904,7 @@ impl LsmEngine {
                     Arc::clone(&self.io),
                     gc_safe_point,
                     is_bottommost,
+                    &dropped_tables,
                 )
                 .await?;
 
@@ -839,6 +950,7 @@ impl LsmEngine {
                 Arc::clone(&self.io),
                 gc_safe_point,
                 is_bottommost,
+                &dropped_tables,
             )
             .await?;
 
@@ -2121,6 +2233,10 @@ impl StorageEngine for LsmEngine {
         // Get version snapshot (separate from memtable state)
         let version = self.version_set.current();
 
+        // Snapshot dropped tables and GC safe point for read-path filtering
+        let dropped_tables = self.dropped_table_ids();
+        let gc_safe_point = self.gc_safe_point();
+
         let sst_dir = self.config.sst_dir();
         let mut merge_iter = TieredMergeIterator::new();
 
@@ -2142,6 +2258,7 @@ impl StorageEngine for LsmEngine {
             .ssts_at_level(0)
             .iter()
             .filter(|sst| sst.overlaps_mvcc(range.start.as_bytes(), range.end.as_bytes()))
+            .filter(|sst| !sst.belongs_to_dropped_table(&dropped_tables, gc_safe_point))
             .cloned()
             .collect();
         l0_ssts.sort_by(|a, b| b.id.cmp(&a.id)); // Newest first
@@ -2163,6 +2280,7 @@ impl StorageEngine for LsmEngine {
                 .ssts_at_level(level as u32)
                 .iter()
                 .filter(|sst| sst.overlaps_mvcc(range.start.as_bytes(), range.end.as_bytes()))
+                .filter(|sst| !sst.belongs_to_dropped_table(&dropped_tables, gc_safe_point))
                 .cloned()
                 .collect();
 
@@ -2419,6 +2537,7 @@ mod tests {
                 compaction_notify: RwLock::new(None),
                 gc_safe_point: AtomicU64::new(0),
                 gc_safe_point_updater: RwLock::new(None),
+                dropped_table_ids: RwLock::new(HashMap::new()),
             })
         }
     }

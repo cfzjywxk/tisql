@@ -36,7 +36,7 @@ use crate::storage::{
 use crate::transaction::{TxnCtx, TxnService};
 use crate::types::{ColumnId, ColumnInfo, DataType, Row, Schema, Value};
 
-use super::{Execution, ExecutionOutput, ExecutionResult, Executor, RowPuller};
+use super::{DdlEffect, Execution, ExecutionOutput, ExecutionResult, Executor, RowPuller};
 
 // ============================================================================
 // Expression Evaluation (free functions)
@@ -1162,8 +1162,11 @@ impl SimpleExecutor {
                     return Err(TiSqlError::TableNotFound(format!("{schema}.{table}")));
                 }
 
-                catalog.drop_table(&schema, &table)?;
-                Ok(ExecutionResult::Ok)
+                let info = catalog.drop_table(&schema, &table)?;
+                Ok(ExecutionResult::OkWithEffect(DdlEffect::TableDropped {
+                    table_id: info.table_id,
+                    commit_ts: info.commit_ts,
+                }))
             }
 
             _ => Err(TiSqlError::Execution("Not a DDL operation".into())),

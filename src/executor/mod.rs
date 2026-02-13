@@ -25,7 +25,16 @@ use crate::error::Result;
 use crate::session::{ExecutionCtx, Session};
 use crate::sql::LogicalPlan;
 use crate::transaction::{TxnCtx, TxnService};
-use crate::types::{Row, Schema};
+use crate::types::{Row, Schema, TableId, Timestamp};
+
+/// Side effect from a DDL operation that requires post-execution action.
+pub enum DdlEffect {
+    /// A table was dropped — register its data range for GC.
+    TableDropped {
+        table_id: TableId,
+        commit_ts: Timestamp,
+    },
+}
 
 /// Query execution result (materialized — all rows in memory).
 pub enum ExecutionResult {
@@ -35,6 +44,8 @@ pub enum ExecutionResult {
     Affected { count: u64 },
     /// DDL success
     Ok,
+    /// DDL success with a side effect requiring post-execution action.
+    OkWithEffect(DdlEffect),
 }
 
 // ============================================================================
@@ -101,6 +112,8 @@ pub enum ExecutionOutput {
     Affected { count: u64 },
     /// DDL/session command.
     Ok,
+    /// DDL success with side effect.
+    OkWithEffect(DdlEffect),
 }
 
 impl ExecutionOutput {
@@ -116,6 +129,7 @@ impl ExecutionOutput {
             }
             ExecutionOutput::Affected { count } => Ok(ExecutionResult::Affected { count }),
             ExecutionOutput::Ok => Ok(ExecutionResult::Ok),
+            ExecutionOutput::OkWithEffect(effect) => Ok(ExecutionResult::OkWithEffect(effect)),
         }
     }
 }
@@ -129,6 +143,7 @@ impl From<ExecutionResult> for ExecutionOutput {
             },
             ExecutionResult::Affected { count } => ExecutionOutput::Affected { count },
             ExecutionResult::Ok => ExecutionOutput::Ok,
+            ExecutionResult::OkWithEffect(effect) => ExecutionOutput::OkWithEffect(effect),
         }
     }
 }

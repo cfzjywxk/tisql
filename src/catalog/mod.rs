@@ -294,6 +294,15 @@ impl TableDef {
 // Catalog Trait
 // ============================================================================
 
+/// Information returned from a successful `drop_table` operation.
+///
+/// Contains the table ID and the commit timestamp of the DDL transaction,
+/// used to register a GC delete-range task for physical data cleanup.
+pub struct DropTableInfo {
+    pub table_id: TableId,
+    pub commit_ts: Timestamp,
+}
+
 /// Catalog interface - metadata management.
 ///
 /// The Catalog trait defines operations for managing database schema metadata.
@@ -319,7 +328,10 @@ pub trait Catalog: Send + Sync {
     fn create_table(&self, table: TableDef) -> Result<TableId>;
 
     /// Drop a table.
-    fn drop_table(&self, schema: &str, table: &str) -> Result<()>;
+    ///
+    /// Returns `DropTableInfo` with the table ID and commit timestamp,
+    /// enabling GC infrastructure to physically clean up data keys.
+    fn drop_table(&self, schema: &str, table: &str) -> Result<DropTableInfo>;
 
     /// Get a table by name.
     fn get_table(&self, schema: &str, table: &str) -> Result<Option<TableDef>>;

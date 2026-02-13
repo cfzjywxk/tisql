@@ -21,12 +21,12 @@
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::RwLock;
 
-use crate::codec::key::encode_record_key_with_handle;
+use crate::codec::key::{encode_record_key_with_handle, gen_table_record_prefix};
 use crate::codec::row::encode_row;
 use crate::error::{Result, TiSqlError};
 use crate::inner_table::bootstrap::{
-    self, delete_column_rows, delete_index_rows, update_meta_row, write_index_row,
-    write_user_column_rows, write_user_table_row,
+    self, delete_column_rows, delete_index_rows, update_meta_row, write_gc_task_row,
+    write_index_row, write_user_column_rows, write_user_table_row,
 };
 use crate::inner_table::catalog_loader::{self, CatalogCache};
 use crate::inner_table::core_tables::*;
@@ -77,6 +77,8 @@ pub struct MvccCatalog<T: TxnService> {
     next_index_id: AtomicU64,
     /// Atomic counter for schema IDs.
     next_schema_id: AtomicU64,
+    /// Atomic counter for GC task IDs.
+    next_gc_task_id: AtomicU64,
 }
 
 impl<T: TxnService> MvccCatalog<T> {
@@ -99,6 +101,7 @@ impl<T: TxnService> MvccCatalog<T> {
             next_table_id: AtomicU64::new(USER_TABLE_ID_START),
             next_index_id: AtomicU64::new(1),
             next_schema_id: AtomicU64::new(USER_SCHEMA_ID_START),
+            next_gc_task_id: AtomicU64::new(1),
         }
     }
 
@@ -131,6 +134,8 @@ impl<T: TxnService> MvccCatalog<T> {
             .store(counters.next_index_id, Ordering::SeqCst);
         self.next_schema_id
             .store(counters.next_schema_id, Ordering::SeqCst);
+        self.next_gc_task_id
+            .store(counters.next_gc_task_id, Ordering::SeqCst);
 
         Ok(())
     }
@@ -319,7 +324,7 @@ impl<T: TxnService> Catalog for MvccCatalog<T> {
         Ok(table_id)
     }
 
-    fn drop_table(&self, schema: &str, table: &str) -> Result<()> {
+    fn drop_table(&self, schema: &str, table: &str) -> Result<super::DropTableInfo> {
         let mut state = self.schema_state.write().unwrap();
 
         let key = (schema.to_string(), table.to_string());
@@ -331,6 +336,24 @@ impl<T: TxnService> Catalog for MvccCatalog<T> {
         };
 
         let table_id = table_def.id();
+
+        // Compute key range for GC delete-range task
+        let start_key = gen_table_record_prefix(table_id);
+        let mut end_key = start_key.clone();
+        if let Some(last) = end_key.last_mut() {
+            *last = last.saturating_add(1);
+        }
+        let start_key_hex = start_key
+            .iter()
+            .map(|b| format!("{b:02x}"))
+            .collect::<String>();
+        let end_key_hex = end_key
+            .iter()
+            .map(|b| format!("{b:02x}"))
+            .collect::<String>();
+
+        // Allocate GC task ID
+        let gc_task_id = self.next_gc_task_id.fetch_add(1, Ordering::SeqCst) as i64;
 
         let mut ctx = self.begin_internal()?;
 
@@ -354,16 +377,57 @@ impl<T: TxnService> Catalog for MvccCatalog<T> {
             table_def.indexes(),
         )?;
 
+        // Write GC task row (drop_commit_ts=0, will be updated after commit)
+        write_gc_task_row(
+            &mut ctx,
+            self.txn_service.as_ref(),
+            gc_task_id,
+            table_id,
+            &start_key_hex,
+            &end_key_hex,
+            0,
+            "pending",
+        )?;
+
+        // Persist next_gc_task_id counter
+        let current_next = self.next_gc_task_id.load(Ordering::SeqCst);
+        update_meta_row(
+            &mut ctx,
+            self.txn_service.as_ref(),
+            META_NEXT_GC_TASK_ID,
+            current_next,
+        )?;
+
         // Increment schema version
         self.increment_schema_version(&mut ctx, &mut state)?;
 
-        self.commit_internal(ctx)?;
+        let commit_info = self.commit_internal(ctx)?;
+        let commit_ts = commit_info.commit_ts;
+
+        // Update GC task with the real drop_commit_ts in a new auto-commit txn
+        {
+            let mut ctx2 = self.begin_internal()?;
+            write_gc_task_row(
+                &mut ctx2,
+                self.txn_service.as_ref(),
+                gc_task_id,
+                table_id,
+                &start_key_hex,
+                &end_key_hex,
+                commit_ts,
+                "pending",
+            )?;
+            self.commit_internal(ctx2)?;
+        }
 
         // Update cache
         state.cache.tables.remove(&key);
         state.cache.table_id_map.remove(&table_id);
 
-        Ok(())
+        Ok(super::DropTableInfo {
+            table_id,
+            commit_ts,
+        })
     }
 
     fn get_table(&self, schema: &str, table: &str) -> Result<Option<TableDef>> {

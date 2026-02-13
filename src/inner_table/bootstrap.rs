@@ -84,6 +84,7 @@ pub fn bootstrap_core_tables<T: TxnService>(txn: &T) -> Result<()> {
         "next_schema_id",
         &USER_SCHEMA_ID_START.to_string(),
     )?;
+    write_meta_row(&mut ctx, txn, META_NEXT_GC_TASK_ID, "next_gc_task_id", "1")?;
 
     txn.commit(ctx)?;
     Ok(())
@@ -289,6 +290,56 @@ pub(crate) fn delete_index_rows<T: TxnService>(
     Ok(())
 }
 
+/// Write a row into `__all_gc_delete_range` (table_id=6).
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn write_gc_task_row<T: TxnService>(
+    ctx: &mut TxnCtx,
+    txn: &T,
+    task_id: i64,
+    table_id: u64,
+    start_key_hex: &str,
+    end_key_hex: &str,
+    drop_commit_ts: u64,
+    status: &str,
+) -> Result<()> {
+    let key = encode_record_key_with_handle(ALL_GC_DELETE_RANGE_TABLE_ID, task_id);
+    let col_ids = &[0, 1, 2, 3, 4, 5];
+    let values = &[
+        Value::BigInt(task_id),
+        Value::BigInt(table_id as i64),
+        Value::String(start_key_hex.to_string()),
+        Value::String(end_key_hex.to_string()),
+        Value::BigInt(drop_commit_ts as i64),
+        Value::String(status.to_string()),
+    ];
+    let row_data = encode_row(col_ids, values);
+    txn.put(ctx, key, row_data)
+}
+
+/// Update the status of a GC task in `__all_gc_delete_range`.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn update_gc_task_status<T: TxnService>(
+    ctx: &mut TxnCtx,
+    txn: &T,
+    task_id: i64,
+    table_id: u64,
+    start_key_hex: &str,
+    end_key_hex: &str,
+    drop_commit_ts: u64,
+    status: &str,
+) -> Result<()> {
+    write_gc_task_row(
+        ctx,
+        txn,
+        task_id,
+        table_id,
+        start_key_hex,
+        end_key_hex,
+        drop_commit_ts,
+        status,
+    )
+}
+
 /// Update a meta row in `__all_meta` (overwrite existing row).
 pub(crate) fn update_meta_row<T: TxnService>(
     ctx: &mut TxnCtx,
@@ -357,9 +408,9 @@ mod tests {
         let (txn, _dir) = create_test_txn();
         bootstrap_core_tables(txn.as_ref()).unwrap();
 
-        // Verify all 5 meta rows exist
+        // Verify all 6 meta rows exist
         let ctx = txn.begin(true).unwrap();
-        for meta_id in 1..=5i64 {
+        for meta_id in 1..=6i64 {
             let key = encode_record_key_with_handle(ALL_META_TABLE_ID, meta_id);
             assert!(
                 txn.get(&ctx, &key).unwrap().is_some(),

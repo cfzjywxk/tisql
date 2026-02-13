@@ -51,6 +51,8 @@ use std::path::{Path, PathBuf};
 
 use serde::{Deserialize, Serialize};
 
+use std::collections::HashMap;
+
 use crate::error::{Result, TiSqlError};
 use crate::storage::mvcc::extract_key;
 use crate::types::Timestamp;
@@ -155,6 +157,43 @@ impl SstMeta {
         // Query range: [start, end)
         // Overlaps if: smallest < end AND largest >= start
         smallest < end && largest >= start
+    }
+
+    /// Check if this SST belongs entirely to a single dropped table eligible for GC.
+    ///
+    /// Extracts user keys from both MVCC key endpoints, decodes table_id from
+    /// each. If both endpoints decode to the same table_id, and that table_id
+    /// appears in the dropped_tables map with drop_ts <= gc_safe_point, the
+    /// entire SST can be skipped/deleted.
+    pub fn belongs_to_dropped_table(
+        &self,
+        dropped_tables: &HashMap<u64, Timestamp>,
+        gc_safe_point: u64,
+    ) -> bool {
+        if dropped_tables.is_empty() || gc_safe_point == 0 {
+            return false;
+        }
+
+        let start_user_key = extract_key(&self.smallest_key);
+        let end_user_key = extract_key(&self.largest_key);
+
+        let start_table_id = match crate::codec::key::decode_table_id(start_user_key) {
+            Ok(id) => id,
+            Err(_) => return false,
+        };
+        let end_table_id = match crate::codec::key::decode_table_id(end_user_key) {
+            Ok(id) => id,
+            Err(_) => return false,
+        };
+
+        if start_table_id != end_table_id {
+            return false;
+        }
+
+        match dropped_tables.get(&start_table_id) {
+            Some(&drop_ts) => drop_ts > 0 && drop_ts <= gc_safe_point,
+            None => false,
+        }
     }
 
     /// Check if this SST's MVCC key range overlaps with another range.
@@ -942,5 +981,151 @@ mod tests {
         // Verify file exists and has correct size
         let file_meta = std::fs::metadata(&path).unwrap();
         assert_eq!(file_meta.len(), meta.file_size);
+    }
+
+    // ------------------------------------------------------------------------
+    // belongs_to_dropped_table Tests
+    // ------------------------------------------------------------------------
+
+    /// Helper to create a table-encoded user key (matching TiDB format).
+    fn table_record_key(table_id: u64, handle: i64) -> Vec<u8> {
+        crate::codec::key::encode_record_key_with_handle(table_id, handle)
+    }
+
+    /// Helper to create an MVCC key for a table record.
+    fn table_mvcc_key(table_id: u64, handle: i64, ts: u64) -> Vec<u8> {
+        mvcc_key(&table_record_key(table_id, handle), ts)
+    }
+
+    #[test]
+    fn test_belongs_to_dropped_table_single_table_sst() {
+        let meta = SstMeta {
+            id: 1,
+            level: 0,
+            smallest_key: table_mvcc_key(42, 1, 100),
+            largest_key: table_mvcc_key(42, 999, 50),
+            file_size: 1000,
+            entry_count: 100,
+            block_count: 5,
+            min_ts: 50,
+            max_ts: 100,
+            created_at: 0,
+        };
+
+        let mut dropped = HashMap::new();
+        dropped.insert(42, 200u64); // Table 42 dropped at ts=200
+
+        // drop_ts=200 <= gc_safe_point=300 → true
+        assert!(meta.belongs_to_dropped_table(&dropped, 300));
+    }
+
+    #[test]
+    fn test_belongs_to_dropped_table_multi_table_sst() {
+        let meta = SstMeta {
+            id: 1,
+            level: 0,
+            smallest_key: table_mvcc_key(42, 1, 100),
+            largest_key: table_mvcc_key(43, 1, 50), // Different table!
+            file_size: 1000,
+            entry_count: 100,
+            block_count: 5,
+            min_ts: 50,
+            max_ts: 100,
+            created_at: 0,
+        };
+
+        let mut dropped = HashMap::new();
+        dropped.insert(42, 200u64);
+        dropped.insert(43, 200u64);
+
+        // SST spans two tables → false
+        assert!(!meta.belongs_to_dropped_table(&dropped, 300));
+    }
+
+    #[test]
+    fn test_belongs_to_dropped_table_not_dropped() {
+        let meta = SstMeta {
+            id: 1,
+            level: 0,
+            smallest_key: table_mvcc_key(42, 1, 100),
+            largest_key: table_mvcc_key(42, 999, 50),
+            file_size: 1000,
+            entry_count: 100,
+            block_count: 5,
+            min_ts: 50,
+            max_ts: 100,
+            created_at: 0,
+        };
+
+        let dropped = HashMap::new(); // No dropped tables
+
+        assert!(!meta.belongs_to_dropped_table(&dropped, 300));
+    }
+
+    #[test]
+    fn test_belongs_to_dropped_table_not_past_safe_point() {
+        let meta = SstMeta {
+            id: 1,
+            level: 0,
+            smallest_key: table_mvcc_key(42, 1, 100),
+            largest_key: table_mvcc_key(42, 999, 50),
+            file_size: 1000,
+            entry_count: 100,
+            block_count: 5,
+            min_ts: 50,
+            max_ts: 100,
+            created_at: 0,
+        };
+
+        let mut dropped = HashMap::new();
+        dropped.insert(42, 500u64); // Table dropped at ts=500
+
+        // drop_ts=500 > gc_safe_point=300 → false (not yet eligible)
+        assert!(!meta.belongs_to_dropped_table(&dropped, 300));
+    }
+
+    #[test]
+    fn test_belongs_to_dropped_table_non_table_key() {
+        // SST with non-table-encoded keys (e.g. raw bytes)
+        let meta = SstMeta {
+            id: 1,
+            level: 0,
+            smallest_key: mvcc_key(b"raw_key_a", 100),
+            largest_key: mvcc_key(b"raw_key_z", 50),
+            file_size: 1000,
+            entry_count: 100,
+            block_count: 5,
+            min_ts: 50,
+            max_ts: 100,
+            created_at: 0,
+        };
+
+        let mut dropped = HashMap::new();
+        dropped.insert(42, 200u64);
+
+        // Can't decode table ID from raw keys → false
+        assert!(!meta.belongs_to_dropped_table(&dropped, 300));
+    }
+
+    #[test]
+    fn test_belongs_to_dropped_table_zero_gc_safe_point() {
+        let meta = SstMeta {
+            id: 1,
+            level: 0,
+            smallest_key: table_mvcc_key(42, 1, 100),
+            largest_key: table_mvcc_key(42, 999, 50),
+            file_size: 1000,
+            entry_count: 100,
+            block_count: 5,
+            min_ts: 50,
+            max_ts: 100,
+            created_at: 0,
+        };
+
+        let mut dropped = HashMap::new();
+        dropped.insert(42, 200u64);
+
+        // gc_safe_point=0 → GC disabled → false
+        assert!(!meta.belongs_to_dropped_table(&dropped, 0));
     }
 }
