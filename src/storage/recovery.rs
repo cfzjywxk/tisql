@@ -133,7 +133,9 @@ impl LsmRecovery {
     /// Perform recovery.
     ///
     /// Returns the recovered LSM engine along with clog and ilog services.
-    pub fn recover(self) -> Result<RecoveryResult> {
+    /// `io_handle` is the I/O runtime handle for spawning GroupCommitWriter
+    /// and IoService tasks.
+    pub fn recover(self, io_handle: &tokio::runtime::Handle) -> Result<RecoveryResult> {
         let mut stats = RecoveryStats::default();
 
         // Create shared LSN provider
@@ -144,8 +146,11 @@ impl LsmRecovery {
             "Starting ilog recovery from {:?}",
             self.ilog_config.ilog_path()
         );
-        let (ilog, version, orphan_ssts) =
-            IlogService::recover(self.ilog_config.clone(), Arc::clone(&lsn_provider))?;
+        let (ilog, version, orphan_ssts) = IlogService::recover(
+            self.ilog_config.clone(),
+            Arc::clone(&lsn_provider),
+            io_handle,
+        )?;
         let ilog = Arc::new(ilog);
 
         let flushed_lsn = version.flushed_lsn();
@@ -186,6 +191,7 @@ impl LsmRecovery {
         let (clog, clog_entries) = FileClogService::recover_with_lsn_provider(
             self.clog_config,
             Arc::clone(&lsn_provider),
+            io_handle,
         )?;
         let clog = Arc::new(clog);
 
@@ -378,7 +384,7 @@ mod tests {
             let mut batch = ClogBatch::new();
             batch.add_put(i as u64 + 1, key.clone(), value.clone());
             batch.add_commit(i as u64 + 1, i as Timestamp + 100);
-            clog.write(&mut batch, true).unwrap();
+            crate::io::block_on_sync(clog.write(&mut batch, true).unwrap()).unwrap();
 
             // Write to engine
             let mut wb = WriteBatch::new();
@@ -395,9 +401,14 @@ mod tests {
     #[test]
     fn test_recovery_empty() {
         let tmp = TempDir::new().unwrap();
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        let io_handle = rt.handle().clone();
 
         let recovery = LsmRecovery::new(tmp.path());
-        let result = recovery.recover().unwrap();
+        let result = recovery.recover(&io_handle).unwrap();
 
         assert_eq!(result.stats.clog_entries, 0);
         assert_eq!(result.stats.txn_count, 0);
@@ -435,6 +446,11 @@ mod tests {
     #[test]
     fn test_recovery_with_flushed_data() {
         let tmp = TempDir::new().unwrap();
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        let io_handle = rt.handle().clone();
 
         // First session: write and flush
         let written = {
@@ -446,7 +462,9 @@ mod tests {
 
             let lsn_provider = new_lsn_provider();
             let ilog_config = IlogConfig::new(tmp.path());
-            let ilog = Arc::new(IlogService::open(ilog_config, Arc::clone(&lsn_provider)).unwrap());
+            let ilog = Arc::new(
+                IlogService::open(ilog_config, Arc::clone(&lsn_provider), &io_handle).unwrap(),
+            );
 
             let engine = LsmEngine::open_with_recovery(
                 lsm_config,
@@ -458,9 +476,12 @@ mod tests {
 
             // Use shared LSN provider for clog too
             let clog_config = FileClogConfig::with_dir(tmp.path());
-            let clog =
-                FileClogService::open_with_lsn_provider(clog_config, Arc::clone(&lsn_provider))
-                    .unwrap();
+            let clog = FileClogService::open_with_lsn_provider(
+                clog_config,
+                Arc::clone(&lsn_provider),
+                &io_handle,
+            )
+            .unwrap();
 
             let written = write_test_data(&engine, &clog, 5);
 
@@ -474,7 +495,7 @@ mod tests {
         // Second session: recover and verify
         {
             let recovery = LsmRecovery::new(tmp.path());
-            let result = recovery.recover().unwrap();
+            let result = recovery.recover(&io_handle).unwrap();
 
             // Data should be readable from SST (not replayed from clog)
             for (key, expected_value) in &written {
@@ -498,6 +519,11 @@ mod tests {
     #[test]
     fn test_recovery_with_unflushed_data() {
         let tmp = TempDir::new().unwrap();
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        let io_handle = rt.handle().clone();
 
         // First session: write but don't flush
         let written = {
@@ -509,7 +535,9 @@ mod tests {
 
             let lsn_provider = new_lsn_provider();
             let ilog_config = IlogConfig::new(tmp.path());
-            let ilog = Arc::new(IlogService::open(ilog_config, Arc::clone(&lsn_provider)).unwrap());
+            let ilog = Arc::new(
+                IlogService::open(ilog_config, Arc::clone(&lsn_provider), &io_handle).unwrap(),
+            );
 
             let engine = LsmEngine::open_with_recovery(
                 lsm_config,
@@ -521,9 +549,12 @@ mod tests {
 
             // Use shared LSN provider for clog
             let clog_config = FileClogConfig::with_dir(tmp.path());
-            let clog =
-                FileClogService::open_with_lsn_provider(clog_config, Arc::clone(&lsn_provider))
-                    .unwrap();
+            let clog = FileClogService::open_with_lsn_provider(
+                clog_config,
+                Arc::clone(&lsn_provider),
+                &io_handle,
+            )
+            .unwrap();
 
             let written = write_test_data(&engine, &clog, 3);
 
@@ -535,7 +566,7 @@ mod tests {
         // Second session: recover and verify
         {
             let recovery = LsmRecovery::new(tmp.path());
-            let result = recovery.recover().unwrap();
+            let result = recovery.recover(&io_handle).unwrap();
 
             // Data should be recovered from clog replay
             for (key, expected_value) in &written {
@@ -558,11 +589,16 @@ mod tests {
     #[test]
     fn test_recovery_uncommitted_discarded() {
         let tmp = TempDir::new().unwrap();
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        let io_handle = rt.handle().clone();
 
         // First session: write uncommitted data
         {
             let clog_config = FileClogConfig::with_dir(tmp.path());
-            let clog = FileClogService::open(clog_config).unwrap();
+            let clog = FileClogService::open(clog_config, &io_handle).unwrap();
 
             // Write uncommitted transaction (no Commit record)
             let mut batch = ClogBatch::new();
@@ -571,13 +607,13 @@ mod tests {
                 b"uncommitted_key".to_vec(),
                 b"uncommitted_value".to_vec(),
             );
-            clog.write(&mut batch, true).unwrap();
+            crate::io::block_on_sync(clog.write(&mut batch, true).unwrap()).unwrap();
 
             // Write committed transaction
             let mut batch = ClogBatch::new();
             batch.add_put(2, b"committed_key".to_vec(), b"committed_value".to_vec());
             batch.add_commit(2, 100);
-            clog.write(&mut batch, true).unwrap();
+            crate::io::block_on_sync(clog.write(&mut batch, true).unwrap()).unwrap();
 
             clog.close().unwrap();
         }
@@ -585,7 +621,7 @@ mod tests {
         // Second session: recover and verify
         {
             let recovery = LsmRecovery::new(tmp.path());
-            let result = recovery.recover().unwrap();
+            let result = recovery.recover(&io_handle).unwrap();
 
             // Uncommitted data should be discarded
             assert_eq!(
@@ -608,6 +644,11 @@ mod tests {
     #[test]
     fn test_recovery_partial_flush() {
         let tmp = TempDir::new().unwrap();
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        let io_handle = rt.handle().clone();
 
         // First session: write some data, flush some, write more
         let (flushed, unflushed) = {
@@ -619,7 +660,9 @@ mod tests {
 
             let lsn_provider = new_lsn_provider();
             let ilog_config = IlogConfig::new(tmp.path());
-            let ilog = Arc::new(IlogService::open(ilog_config, Arc::clone(&lsn_provider)).unwrap());
+            let ilog = Arc::new(
+                IlogService::open(ilog_config, Arc::clone(&lsn_provider), &io_handle).unwrap(),
+            );
 
             let engine = LsmEngine::open_with_recovery(
                 lsm_config,
@@ -631,9 +674,12 @@ mod tests {
 
             // Use shared LSN provider for clog
             let clog_config = FileClogConfig::with_dir(tmp.path());
-            let clog =
-                FileClogService::open_with_lsn_provider(clog_config, Arc::clone(&lsn_provider))
-                    .unwrap();
+            let clog = FileClogService::open_with_lsn_provider(
+                clog_config,
+                Arc::clone(&lsn_provider),
+                &io_handle,
+            )
+            .unwrap();
 
             // Write first batch and flush
             let flushed = write_test_data(&engine, &clog, 2);
@@ -649,7 +695,7 @@ mod tests {
                     let mut batch = ClogBatch::new();
                     batch.add_put(i as u64, key.clone(), value.clone());
                     batch.add_commit(i as u64, i as Timestamp + 100);
-                    clog.write(&mut batch, true).unwrap();
+                    crate::io::block_on_sync(clog.write(&mut batch, true).unwrap()).unwrap();
 
                     let mut wb = WriteBatch::new();
                     wb.set_commit_ts(i as Timestamp + 100);
@@ -668,7 +714,7 @@ mod tests {
         // Second session: recover and verify
         {
             let recovery = LsmRecovery::new(tmp.path());
-            let result = recovery.recover().unwrap();
+            let result = recovery.recover(&io_handle).unwrap();
 
             // Flushed data should be readable from SST
             for (key, expected_value) in &flushed {
@@ -703,6 +749,11 @@ mod tests {
     #[test]
     fn test_unified_lsn_provider() {
         let tmp = TempDir::new().unwrap();
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        let io_handle = rt.handle().clone();
 
         // First session: interleave clog and ilog operations
         {
@@ -710,7 +761,9 @@ mod tests {
 
             // Open ilog and clog with shared provider
             let ilog_config = IlogConfig::new(tmp.path());
-            let ilog = Arc::new(IlogService::open(ilog_config, Arc::clone(&lsn_provider)).unwrap());
+            let ilog = Arc::new(
+                IlogService::open(ilog_config, Arc::clone(&lsn_provider), &io_handle).unwrap(),
+            );
 
             let lsm_config = LsmConfig::builder(tmp.path())
                 .memtable_size(50) // Small to trigger flush
@@ -727,9 +780,12 @@ mod tests {
             .unwrap();
 
             let clog_config = FileClogConfig::with_dir(tmp.path());
-            let clog =
-                FileClogService::open_with_lsn_provider(clog_config, Arc::clone(&lsn_provider))
-                    .unwrap();
+            let clog = FileClogService::open_with_lsn_provider(
+                clog_config,
+                Arc::clone(&lsn_provider),
+                &io_handle,
+            )
+            .unwrap();
 
             // Write some data - IMPORTANT: thread CLOG LSN to storage
             for i in 0..5 {
@@ -740,7 +796,8 @@ mod tests {
                 let mut batch = ClogBatch::new();
                 batch.add_put(i as u64 + 1, key.clone(), value.clone());
                 batch.add_commit(i as u64 + 1, i as Timestamp + 100);
-                let clog_lsn = clog.write(&mut batch, true).unwrap();
+                let clog_lsn =
+                    crate::io::block_on_sync(clog.write(&mut batch, true).unwrap()).unwrap();
 
                 // Write to engine WITH CLOG LSN (this is critical for correct recovery!)
                 // TransactionService does this to ensure storage LSN matches CLOG LSN
@@ -771,7 +828,7 @@ mod tests {
         // Second session: verify recovery sees correct LSN ordering
         {
             let recovery = LsmRecovery::new(tmp.path());
-            let result = recovery.recover().unwrap();
+            let result = recovery.recover(&io_handle).unwrap();
 
             // Verify data is recovered
             for i in 0..5 {
@@ -811,6 +868,11 @@ mod tests {
     fn test_recovery_with_custom_configs() {
         // Test LsmRecovery::with_configs() constructor
         let tmp = TempDir::new().unwrap();
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        let io_handle = rt.handle().clone();
 
         let lsm_config = LsmConfig::builder(tmp.path())
             .memtable_size(1024)
@@ -821,7 +883,7 @@ mod tests {
         let ilog_config = IlogConfig::new(tmp.path());
 
         let recovery = LsmRecovery::with_configs(lsm_config, clog_config, ilog_config);
-        let result = recovery.recover().unwrap();
+        let result = recovery.recover(&io_handle).unwrap();
 
         assert_eq!(result.stats.clog_entries, 0);
         assert_eq!(result.stats.txn_count, 0);
@@ -830,29 +892,34 @@ mod tests {
     #[test]
     fn test_recovery_with_delete_operations() {
         let tmp = TempDir::new().unwrap();
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        let io_handle = rt.handle().clone();
 
         // First session: write data and then delete some
         {
             let clog_config = FileClogConfig::with_dir(tmp.path());
-            let clog = FileClogService::open(clog_config).unwrap();
+            let clog = FileClogService::open(clog_config, &io_handle).unwrap();
 
             // Insert key1
             let mut batch = ClogBatch::new();
             batch.add_put(1, b"key1".to_vec(), b"value1".to_vec());
             batch.add_commit(1, 100);
-            clog.write(&mut batch, true).unwrap();
+            crate::io::block_on_sync(clog.write(&mut batch, true).unwrap()).unwrap();
 
             // Insert key2
             let mut batch = ClogBatch::new();
             batch.add_put(2, b"key2".to_vec(), b"value2".to_vec());
             batch.add_commit(2, 200);
-            clog.write(&mut batch, true).unwrap();
+            crate::io::block_on_sync(clog.write(&mut batch, true).unwrap()).unwrap();
 
             // Delete key1
             let mut batch = ClogBatch::new();
             batch.add_delete(3, b"key1".to_vec());
             batch.add_commit(3, 300);
-            clog.write(&mut batch, true).unwrap();
+            crate::io::block_on_sync(clog.write(&mut batch, true).unwrap()).unwrap();
 
             clog.close().unwrap();
         }
@@ -860,7 +927,7 @@ mod tests {
         // Second session: recover and verify
         {
             let recovery = LsmRecovery::new(tmp.path());
-            let result = recovery.recover().unwrap();
+            let result = recovery.recover(&io_handle).unwrap();
 
             // key1 should be deleted (tombstone)
             assert_eq!(
@@ -883,22 +950,27 @@ mod tests {
     #[test]
     fn test_recovery_with_rollback_operations() {
         let tmp = TempDir::new().unwrap();
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        let io_handle = rt.handle().clone();
 
         // First session: write data and rollback some
         {
             let clog_config = FileClogConfig::with_dir(tmp.path());
-            let clog = FileClogService::open(clog_config).unwrap();
+            let clog = FileClogService::open(clog_config, &io_handle).unwrap();
 
             // Transaction 1: committed
             let mut batch = ClogBatch::new();
             batch.add_put(1, b"committed_key".to_vec(), b"value".to_vec());
             batch.add_commit(1, 100);
-            clog.write(&mut batch, true).unwrap();
+            crate::io::block_on_sync(clog.write(&mut batch, true).unwrap()).unwrap();
 
             // Transaction 2: rolled back
             let mut batch = ClogBatch::new();
             batch.add_put(2, b"rolled_back_key".to_vec(), b"value".to_vec());
-            clog.write(&mut batch, true).unwrap();
+            crate::io::block_on_sync(clog.write(&mut batch, true).unwrap()).unwrap();
 
             let mut batch = ClogBatch::new();
             batch.add(ClogEntry {
@@ -906,7 +978,7 @@ mod tests {
                 txn_id: 2,
                 op: ClogOp::Rollback,
             });
-            clog.write(&mut batch, true).unwrap();
+            crate::io::block_on_sync(clog.write(&mut batch, true).unwrap()).unwrap();
 
             clog.close().unwrap();
         }
@@ -914,7 +986,7 @@ mod tests {
         // Second session: recover and verify
         {
             let recovery = LsmRecovery::new(tmp.path());
-            let result = recovery.recover().unwrap();
+            let result = recovery.recover(&io_handle).unwrap();
 
             // Committed transaction should be recovered
             assert_eq!(
@@ -938,29 +1010,34 @@ mod tests {
     #[test]
     fn test_recovery_stats_max_commit_ts() {
         let tmp = TempDir::new().unwrap();
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        let io_handle = rt.handle().clone();
 
         // First session: write data with various commit timestamps
         {
             let clog_config = FileClogConfig::with_dir(tmp.path());
-            let clog = FileClogService::open(clog_config).unwrap();
+            let clog = FileClogService::open(clog_config, &io_handle).unwrap();
 
             // Commit at ts=100
             let mut batch = ClogBatch::new();
             batch.add_put(1, b"key1".to_vec(), b"v1".to_vec());
             batch.add_commit(1, 100);
-            clog.write(&mut batch, true).unwrap();
+            crate::io::block_on_sync(clog.write(&mut batch, true).unwrap()).unwrap();
 
             // Commit at ts=500 (highest)
             let mut batch = ClogBatch::new();
             batch.add_put(2, b"key2".to_vec(), b"v2".to_vec());
             batch.add_commit(2, 500);
-            clog.write(&mut batch, true).unwrap();
+            crate::io::block_on_sync(clog.write(&mut batch, true).unwrap()).unwrap();
 
             // Commit at ts=300
             let mut batch = ClogBatch::new();
             batch.add_put(3, b"key3".to_vec(), b"v3".to_vec());
             batch.add_commit(3, 300);
-            clog.write(&mut batch, true).unwrap();
+            crate::io::block_on_sync(clog.write(&mut batch, true).unwrap()).unwrap();
 
             clog.close().unwrap();
         }
@@ -968,7 +1045,7 @@ mod tests {
         // Second session: verify max_commit_ts
         {
             let recovery = LsmRecovery::new(tmp.path());
-            let result = recovery.recover().unwrap();
+            let result = recovery.recover(&io_handle).unwrap();
 
             assert_eq!(
                 result.stats.max_commit_ts, 500,
@@ -980,30 +1057,35 @@ mod tests {
     #[test]
     fn test_recovery_interleaved_transactions() {
         let tmp = TempDir::new().unwrap();
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        let io_handle = rt.handle().clone();
 
         // First session: interleaved transaction writes
         {
             let clog_config = FileClogConfig::with_dir(tmp.path());
-            let clog = FileClogService::open(clog_config).unwrap();
+            let clog = FileClogService::open(clog_config, &io_handle).unwrap();
 
             // Start both transactions
             let mut batch = ClogBatch::new();
             batch.add_put(1, b"txn1_key".to_vec(), b"txn1_value".to_vec());
-            clog.write(&mut batch, true).unwrap();
+            crate::io::block_on_sync(clog.write(&mut batch, true).unwrap()).unwrap();
 
             let mut batch = ClogBatch::new();
             batch.add_put(2, b"txn2_key".to_vec(), b"txn2_value".to_vec());
-            clog.write(&mut batch, true).unwrap();
+            crate::io::block_on_sync(clog.write(&mut batch, true).unwrap()).unwrap();
 
             // Commit txn2 first (out of order)
             let mut batch = ClogBatch::new();
             batch.add_commit(2, 200);
-            clog.write(&mut batch, true).unwrap();
+            crate::io::block_on_sync(clog.write(&mut batch, true).unwrap()).unwrap();
 
             // Then commit txn1
             let mut batch = ClogBatch::new();
             batch.add_commit(1, 100);
-            clog.write(&mut batch, true).unwrap();
+            crate::io::block_on_sync(clog.write(&mut batch, true).unwrap()).unwrap();
 
             clog.close().unwrap();
         }
@@ -1011,7 +1093,7 @@ mod tests {
         // Second session: both should be recovered
         {
             let recovery = LsmRecovery::new(tmp.path());
-            let result = recovery.recover().unwrap();
+            let result = recovery.recover(&io_handle).unwrap();
 
             assert_eq!(
                 get_for_test(&result.engine, b"txn1_key"),
@@ -1029,11 +1111,16 @@ mod tests {
     #[test]
     fn test_recovery_multi_key_transaction() {
         let tmp = TempDir::new().unwrap();
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        let io_handle = rt.handle().clone();
 
         // First session: transaction with multiple keys
         {
             let clog_config = FileClogConfig::with_dir(tmp.path());
-            let clog = FileClogService::open(clog_config).unwrap();
+            let clog = FileClogService::open(clog_config, &io_handle).unwrap();
 
             // Single transaction writing multiple keys
             let mut batch = ClogBatch::new();
@@ -1041,7 +1128,7 @@ mod tests {
             batch.add_put(1, b"key_b".to_vec(), b"value_b".to_vec());
             batch.add_put(1, b"key_c".to_vec(), b"value_c".to_vec());
             batch.add_commit(1, 100);
-            clog.write(&mut batch, true).unwrap();
+            crate::io::block_on_sync(clog.write(&mut batch, true).unwrap()).unwrap();
 
             clog.close().unwrap();
         }
@@ -1049,7 +1136,7 @@ mod tests {
         // Second session: all keys should be recovered
         {
             let recovery = LsmRecovery::new(tmp.path());
-            let result = recovery.recover().unwrap();
+            let result = recovery.recover(&io_handle).unwrap();
 
             assert_eq!(
                 get_for_test(&result.engine, b"key_a"),
@@ -1072,6 +1159,11 @@ mod tests {
     fn test_recovery_max_commit_ts_from_sst() {
         // Test that max_commit_ts is taken from SST metadata when clog is truncated
         let tmp = TempDir::new().unwrap();
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        let io_handle = rt.handle().clone();
 
         // First session: write and flush data with high timestamp
         {
@@ -1083,7 +1175,9 @@ mod tests {
 
             let lsn_provider = new_lsn_provider();
             let ilog_config = IlogConfig::new(tmp.path());
-            let ilog = Arc::new(IlogService::open(ilog_config, Arc::clone(&lsn_provider)).unwrap());
+            let ilog = Arc::new(
+                IlogService::open(ilog_config, Arc::clone(&lsn_provider), &io_handle).unwrap(),
+            );
 
             let engine = LsmEngine::open_with_recovery(
                 lsm_config,
@@ -1094,9 +1188,12 @@ mod tests {
             .unwrap();
 
             let clog_config = FileClogConfig::with_dir(tmp.path());
-            let clog =
-                FileClogService::open_with_lsn_provider(clog_config, Arc::clone(&lsn_provider))
-                    .unwrap();
+            let clog = FileClogService::open_with_lsn_provider(
+                clog_config,
+                Arc::clone(&lsn_provider),
+                &io_handle,
+            )
+            .unwrap();
 
             // Write data with high timestamp
             let key = b"high_ts_key".to_vec();
@@ -1105,7 +1202,7 @@ mod tests {
             let mut batch = ClogBatch::new();
             batch.add_put(1, key.clone(), value.clone());
             batch.add_commit(1, 9999);
-            let clog_lsn = clog.write(&mut batch, true).unwrap();
+            let clog_lsn = crate::io::block_on_sync(clog.write(&mut batch, true).unwrap()).unwrap();
 
             let mut wb = WriteBatch::new();
             wb.set_commit_ts(9999);
@@ -1122,7 +1219,7 @@ mod tests {
         // Second session: verify max_commit_ts is recovered from SST
         {
             let recovery = LsmRecovery::new(tmp.path());
-            let result = recovery.recover().unwrap();
+            let result = recovery.recover(&io_handle).unwrap();
 
             // max_commit_ts should be at least 9999 (from SST metadata)
             assert!(
@@ -1137,28 +1234,33 @@ mod tests {
     fn test_recovery_empty_transaction() {
         // Transaction with no writes followed by commit should be ignored
         let tmp = TempDir::new().unwrap();
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        let io_handle = rt.handle().clone();
 
         {
             let clog_config = FileClogConfig::with_dir(tmp.path());
-            let clog = FileClogService::open(clog_config).unwrap();
+            let clog = FileClogService::open(clog_config, &io_handle).unwrap();
 
             // Empty transaction (commit without any puts)
             let mut batch = ClogBatch::new();
             batch.add_commit(1, 100);
-            clog.write(&mut batch, true).unwrap();
+            crate::io::block_on_sync(clog.write(&mut batch, true).unwrap()).unwrap();
 
             // Normal transaction
             let mut batch = ClogBatch::new();
             batch.add_put(2, b"key".to_vec(), b"value".to_vec());
             batch.add_commit(2, 200);
-            clog.write(&mut batch, true).unwrap();
+            crate::io::block_on_sync(clog.write(&mut batch, true).unwrap()).unwrap();
 
             clog.close().unwrap();
         }
 
         {
             let recovery = LsmRecovery::new(tmp.path());
-            let result = recovery.recover().unwrap();
+            let result = recovery.recover(&io_handle).unwrap();
 
             // Only 1 transaction with data should be counted
             assert_eq!(result.stats.txn_count, 1);
@@ -1178,6 +1280,11 @@ mod tests {
     #[test]
     fn test_recovery_flushed_lsn_boundary() {
         let tmp = TempDir::new().unwrap();
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        let io_handle = rt.handle().clone();
 
         let flushed_lsn;
 
@@ -1191,7 +1298,9 @@ mod tests {
 
             let lsn_provider = new_lsn_provider();
             let ilog_config = IlogConfig::new(tmp.path());
-            let ilog = Arc::new(IlogService::open(ilog_config, Arc::clone(&lsn_provider)).unwrap());
+            let ilog = Arc::new(
+                IlogService::open(ilog_config, Arc::clone(&lsn_provider), &io_handle).unwrap(),
+            );
 
             let engine = LsmEngine::open_with_recovery(
                 lsm_config,
@@ -1202,9 +1311,12 @@ mod tests {
             .unwrap();
 
             let clog_config = FileClogConfig::with_dir(tmp.path());
-            let clog =
-                FileClogService::open_with_lsn_provider(clog_config, Arc::clone(&lsn_provider))
-                    .unwrap();
+            let clog = FileClogService::open_with_lsn_provider(
+                clog_config,
+                Arc::clone(&lsn_provider),
+                &io_handle,
+            )
+            .unwrap();
 
             // Write first batch (will be flushed to SST)
             for i in 0..3 {
@@ -1214,7 +1326,8 @@ mod tests {
                 let mut batch = ClogBatch::new();
                 batch.add_put(i as u64 + 1, key.clone(), value.clone());
                 batch.add_commit(i as u64 + 1, i as Timestamp + 100);
-                let clog_lsn = clog.write(&mut batch, true).unwrap();
+                let clog_lsn =
+                    crate::io::block_on_sync(clog.write(&mut batch, true).unwrap()).unwrap();
 
                 let mut wb = WriteBatch::new();
                 wb.set_commit_ts(i as Timestamp + 100);
@@ -1236,7 +1349,8 @@ mod tests {
                 let mut batch = ClogBatch::new();
                 batch.add_put(i as u64 + 100, key.clone(), value.clone());
                 batch.add_commit(i as u64 + 100, i as Timestamp + 200);
-                let clog_lsn = clog.write(&mut batch, true).unwrap();
+                let clog_lsn =
+                    crate::io::block_on_sync(clog.write(&mut batch, true).unwrap()).unwrap();
 
                 // Verify these clog entries have LSN > flushed_lsn
                 assert!(
@@ -1257,7 +1371,7 @@ mod tests {
         // Second session: recover and verify boundary
         {
             let recovery = LsmRecovery::new(tmp.path());
-            let result = recovery.recover().unwrap();
+            let result = recovery.recover(&io_handle).unwrap();
 
             // Flushed data should be in SSTs (recovered from ilog)
             for i in 0..3 {
@@ -1296,12 +1410,18 @@ mod tests {
     #[test]
     fn test_recovery_orphan_ssts_cleaned_stat() {
         let tmp = TempDir::new().unwrap();
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        let io_handle = rt.handle().clone();
 
         // First create an incomplete flush intent (which creates an orphan)
         {
             let lsn_provider = new_lsn_provider();
             let ilog_config = IlogConfig::new(tmp.path());
-            let ilog = IlogService::open(ilog_config, Arc::clone(&lsn_provider)).unwrap();
+            let ilog =
+                IlogService::open(ilog_config, Arc::clone(&lsn_provider), &io_handle).unwrap();
 
             // Write flush intent but no commit (simulating crash before SST creation)
             ilog.write_flush_intent(99, 100, 50).unwrap();
@@ -1315,7 +1435,7 @@ mod tests {
 
         {
             let recovery = LsmRecovery::new(tmp.path());
-            let result = recovery.recover().unwrap();
+            let result = recovery.recover(&io_handle).unwrap();
 
             // Should have cleaned up the orphan (from incomplete intent)
             assert_eq!(result.stats.orphan_ssts_cleaned, 1);

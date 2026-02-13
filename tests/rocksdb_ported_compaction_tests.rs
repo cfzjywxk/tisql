@@ -111,7 +111,8 @@ fn scan_for_test(engine: &LsmEngine, range: &std::ops::Range<Key>) -> Vec<(Key, 
 fn create_engine(dir: &TempDir) -> LsmEngine {
     let lsn_provider = new_lsn_provider();
     let ilog_config = IlogConfig::new(dir.path());
-    let ilog = Arc::new(IlogService::open(ilog_config, Arc::clone(&lsn_provider)).unwrap());
+    let ilog =
+        Arc::new(IlogService::open_with_thread(ilog_config, Arc::clone(&lsn_provider)).unwrap());
 
     let config = LsmConfigBuilder::new(dir.path())
         .memtable_size(4096)
@@ -123,7 +124,8 @@ fn create_engine(dir: &TempDir) -> LsmEngine {
 fn create_durable_engine(dir: &TempDir) -> (LsmEngine, Arc<IlogService>) {
     let lsn_provider = new_lsn_provider();
     let ilog_config = IlogConfig::new(dir.path());
-    let ilog = Arc::new(IlogService::open(ilog_config, Arc::clone(&lsn_provider)).unwrap());
+    let ilog =
+        Arc::new(IlogService::open_with_thread(ilog_config, Arc::clone(&lsn_provider)).unwrap());
 
     let config = LsmConfigBuilder::new(dir.path())
         .memtable_size(256)
@@ -1099,7 +1101,11 @@ fn test_do_compaction_with_ilog_recovery() {
 
         let recovery =
             tisql::testkit::LsmRecovery::with_configs(lsm_config, clog_config, ilog_config);
-        let result = recovery.recover().unwrap();
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        let result = recovery.recover(rt.handle()).unwrap();
         let engine = result.engine;
 
         // Verify data survived recovery
@@ -1166,7 +1172,8 @@ fn test_l0_write_backpressure() {
     let dir = TempDir::new().unwrap();
     let lsn_provider = new_lsn_provider();
     let ilog_config = IlogConfig::new(dir.path());
-    let ilog = Arc::new(IlogService::open(ilog_config, Arc::clone(&lsn_provider)).unwrap());
+    let ilog =
+        Arc::new(IlogService::open_with_thread(ilog_config, Arc::clone(&lsn_provider)).unwrap());
 
     // Very low stop trigger for testing
     let config = LsmConfigBuilder::new(dir.path())
@@ -1223,7 +1230,8 @@ fn test_compaction_scheduler_automatic() {
     let dir = TempDir::new().unwrap();
     let lsn_provider = new_lsn_provider();
     let ilog_config = IlogConfig::new(dir.path());
-    let ilog = Arc::new(IlogService::open(ilog_config, Arc::clone(&lsn_provider)).unwrap());
+    let ilog =
+        Arc::new(IlogService::open_with_thread(ilog_config, Arc::clone(&lsn_provider)).unwrap());
 
     let config = LsmConfigBuilder::new(dir.path())
         .memtable_size(100) // Very small
@@ -1240,8 +1248,13 @@ fn test_compaction_scheduler_automatic() {
             .unwrap(),
     );
 
+    let rt = tokio::runtime::Builder::new_multi_thread()
+        .worker_threads(2)
+        .enable_all()
+        .build()
+        .unwrap();
     let scheduler = CompactionScheduler::new(Arc::clone(&engine));
-    scheduler.start();
+    scheduler.start(rt.handle());
 
     // Write and flush enough data to create L0 files above compaction trigger
     for i in 0..20 {
@@ -1451,7 +1464,8 @@ fn test_write_stall_e2e() {
     let tmp = TempDir::new().unwrap();
     let lsn_provider = new_lsn_provider();
     let ilog_config = IlogConfig::new(tmp.path());
-    let ilog = Arc::new(IlogService::open(ilog_config, Arc::clone(&lsn_provider)).unwrap());
+    let ilog =
+        Arc::new(IlogService::open_with_thread(ilog_config, Arc::clone(&lsn_provider)).unwrap());
 
     let config = LsmConfigBuilder::new(tmp.path())
         .memtable_size(200) // Tiny to trigger frequent rotations
@@ -1466,8 +1480,13 @@ fn test_write_stall_e2e() {
     );
 
     // Start flush scheduler so frozen memtables get drained
+    let rt = tokio::runtime::Builder::new_multi_thread()
+        .worker_threads(2)
+        .enable_all()
+        .build()
+        .unwrap();
     let scheduler = FlushScheduler::new(Arc::clone(&engine));
-    scheduler.start();
+    scheduler.start(rt.handle());
 
     // Spawn 4 writer threads, each writing 50 entries with retry on stall
     let mut handles = vec![];
@@ -1944,7 +1963,8 @@ fn test_multi_level_cascading() {
     let dir = TempDir::new().unwrap();
     let lsn_provider = new_lsn_provider();
     let ilog_config = IlogConfig::new(dir.path());
-    let ilog = Arc::new(IlogService::open(ilog_config, Arc::clone(&lsn_provider)).unwrap());
+    let ilog =
+        Arc::new(IlogService::open_with_thread(ilog_config, Arc::clone(&lsn_provider)).unwrap());
 
     let config = LsmConfigBuilder::new(dir.path())
         .memtable_size(200)

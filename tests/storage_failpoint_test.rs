@@ -36,16 +36,24 @@ use tisql::testkit::{
 use tisql::StorageEngine;
 
 /// Helper to create a test LSM engine with ilog for durability tests.
-fn create_test_lsm_engine(
+async fn create_test_lsm_engine(
     dir: &TempDir,
 ) -> (Arc<LsmEngine>, Arc<IlogService>, Arc<FileClogService>) {
     let lsn_provider = new_lsn_provider();
 
     let ilog_config = IlogConfig::new(dir.path());
-    let ilog = Arc::new(IlogService::open(ilog_config, Arc::clone(&lsn_provider)).unwrap());
+    let ilog = Arc::new(
+        IlogService::open(
+            ilog_config,
+            Arc::clone(&lsn_provider),
+            &tokio::runtime::Handle::current(),
+        )
+        .unwrap(),
+    );
 
     let clog_config = FileClogConfig::with_dir(dir.path());
-    let clog = Arc::new(FileClogService::open(clog_config).unwrap());
+    let clog =
+        Arc::new(FileClogService::open(clog_config, &tokio::runtime::Handle::current()).unwrap());
 
     let config = LsmConfigBuilder::new(dir.path())
         .memtable_size(256) // Very small for testing to trigger rotations
@@ -71,9 +79,11 @@ fn write_test_data(engine: &LsmEngine, key: &[u8], value: &[u8], ts: u64) {
 }
 
 /// Helper to recover an LSM engine from crash.
-fn recover_engine(dir: &TempDir) -> RecoveryResult {
+async fn recover_engine(dir: &TempDir) -> RecoveryResult {
     let recovery = LsmRecovery::new(dir.path());
-    recovery.recover().unwrap()
+    recovery
+        .recover(&tokio::runtime::Handle::current())
+        .unwrap()
 }
 
 // ============================================================================
@@ -81,12 +91,12 @@ fn recover_engine(dir: &TempDir) -> RecoveryResult {
 // ============================================================================
 
 /// Test that data in memtable is preserved after crash before freeze.
-#[test]
-fn test_crash_before_freeze() {
+#[tokio::test]
+async fn test_crash_before_freeze() {
     let scenario = fail::FailScenario::setup();
     let dir = tempfile::tempdir().unwrap();
 
-    let (engine, _ilog, _clog) = create_test_lsm_engine(&dir);
+    let (engine, _ilog, _clog) = create_test_lsm_engine(&dir).await;
 
     // Write some data
     write_test_data(&engine, b"key1", b"value1", 1);
@@ -108,14 +118,14 @@ fn test_crash_before_freeze() {
 /// Verifies the failpoint actually fires during rotation. After the panic,
 /// the RwLock is poisoned (as expected for a real crash), so we just verify
 /// the failpoint was triggered.
-#[test]
-fn test_crash_after_freeze_before_insert() {
+#[tokio::test]
+async fn test_crash_after_freeze_before_insert() {
     use std::panic;
 
     let scenario = fail::FailScenario::setup();
     let dir = tempfile::tempdir().unwrap();
 
-    let (engine, _ilog, _clog) = create_test_lsm_engine(&dir);
+    let (engine, _ilog, _clog) = create_test_lsm_engine(&dir).await;
 
     // Write data just under the threshold (memtable_size=256)
     for i in 0..10 {
@@ -159,14 +169,14 @@ fn test_crash_after_freeze_before_insert() {
 ///
 /// Uses freeze_active() to guarantee a frozen memtable exists, and "panic"
 /// action to verify the failpoint fires during flush_memtable().
-#[test]
-fn test_crash_before_sst_build() {
+#[tokio::test]
+async fn test_crash_before_sst_build() {
     use std::panic;
 
     let scenario = fail::FailScenario::setup();
     let dir = tempfile::tempdir().unwrap();
 
-    let (engine, _ilog, _clog) = create_test_lsm_engine(&dir);
+    let (engine, _ilog, _clog) = create_test_lsm_engine(&dir).await;
 
     // Write data
     write_test_data(&engine, b"test_key", b"test_value", 1);
@@ -201,14 +211,14 @@ fn test_crash_before_sst_build() {
 ///
 /// The SST file is written but the ilog commit never happens, creating an orphan.
 /// Recovery should clean up the orphan and data should be recoverable from clog.
-#[test]
-fn test_crash_after_sst_write_before_ilog() {
+#[tokio::test]
+async fn test_crash_after_sst_write_before_ilog() {
     use std::panic;
 
     let scenario = fail::FailScenario::setup();
     let dir = tempfile::tempdir().unwrap();
 
-    let (engine, ilog, clog) = create_test_lsm_engine(&dir);
+    let (engine, ilog, clog) = create_test_lsm_engine(&dir).await;
 
     // Write data and record in clog for recovery
     write_test_data(&engine, b"orphan_key", b"orphan_value", 1);
@@ -219,7 +229,7 @@ fn test_crash_after_sst_write_before_ilog() {
         let mut batch = tisql::testkit::ClogBatch::new();
         batch.add_put(1, b"orphan_key".to_vec(), b"orphan_value".to_vec());
         batch.add_commit(1, 1);
-        clog.write(&mut batch, true).unwrap();
+        tisql::io::block_on_sync(clog.write(&mut batch, true).unwrap()).unwrap();
     }
 
     // Use freeze_active() to guarantee frozen memtable
@@ -259,7 +269,7 @@ fn test_crash_after_sst_write_before_ilog() {
     drop(clog);
 
     // Recover - orphan SST should be cleaned up
-    let result = recover_engine(&dir);
+    let result = recover_engine(&dir).await;
     assert_eq!(
         result.engine.current_version().level(0).len(),
         0,
@@ -273,15 +283,15 @@ fn test_crash_after_sst_write_before_ilog() {
 ///
 /// The SST is written and ilog is committed, but the version update doesn't happen
 /// because we crash. On recovery, the ilog should rebuild the version correctly.
-#[test]
-fn test_crash_after_ilog_commit() {
+#[tokio::test]
+async fn test_crash_after_ilog_commit() {
     use std::panic;
 
     let scenario = fail::FailScenario::setup();
     let dir = tempfile::tempdir().unwrap();
 
     {
-        let (engine, ilog, _clog) = create_test_lsm_engine(&dir);
+        let (engine, ilog, _clog) = create_test_lsm_engine(&dir).await;
 
         // Write data
         write_test_data(&engine, b"committed_key", b"committed_value", 1);
@@ -310,7 +320,7 @@ fn test_crash_after_ilog_commit() {
     }
 
     // Recovery should rebuild version from ilog and find the SST
-    let result = recover_engine(&dir);
+    let result = recover_engine(&dir).await;
     let value = tisql::io::block_on_sync(result.engine.get(b"committed_key")).unwrap();
     assert_eq!(
         value,
@@ -322,8 +332,8 @@ fn test_crash_after_ilog_commit() {
 }
 
 /// Test crash after version update - everything should be consistent.
-#[test]
-fn test_crash_after_version_update() {
+#[tokio::test]
+async fn test_crash_after_version_update() {
     use std::panic;
 
     let scenario = fail::FailScenario::setup();
@@ -331,7 +341,7 @@ fn test_crash_after_version_update() {
 
     // Phase 1: Write data and flush, crash after version update
     {
-        let (engine, ilog, _clog) = create_test_lsm_engine(&dir);
+        let (engine, ilog, _clog) = create_test_lsm_engine(&dir).await;
 
         // Write enough data to trigger rotation (memtable_size = 256)
         for i in 0..5 {
@@ -361,7 +371,7 @@ fn test_crash_after_version_update() {
     // Phase 2: Recover and verify partial data recovery
     // Only data from the FIRST flush (before panic) is recoverable
     // This verifies that completed flushes survive crashes
-    let result = recover_engine(&dir);
+    let result = recover_engine(&dir).await;
 
     // At least some data should be recoverable (the first SST that was flushed)
     let mut recovered_count = 0;
@@ -395,8 +405,8 @@ fn test_crash_after_version_update() {
 // ============================================================================
 
 /// Test crash after flush intent write - SST should be orphaned.
-#[test]
-fn test_crash_after_flush_intent() {
+#[tokio::test]
+async fn test_crash_after_flush_intent() {
     use std::panic;
 
     let scenario = fail::FailScenario::setup();
@@ -406,7 +416,12 @@ fn test_crash_after_flush_intent() {
     {
         let lsn_provider = new_lsn_provider();
         let ilog_config = IlogConfig::new(dir.path());
-        let ilog = IlogService::open(ilog_config.clone(), Arc::clone(&lsn_provider)).unwrap();
+        let ilog = IlogService::open(
+            ilog_config.clone(),
+            Arc::clone(&lsn_provider),
+            &tokio::runtime::Handle::current(),
+        )
+        .unwrap();
 
         // Configure failpoint to panic (simulating crash)
         fail::cfg("ilog_after_flush_intent", "panic").unwrap();
@@ -431,8 +446,8 @@ fn test_crash_after_flush_intent() {
 }
 
 /// Test crash during checkpoint write.
-#[test]
-fn test_crash_during_checkpoint() {
+#[tokio::test]
+async fn test_crash_during_checkpoint() {
     use std::panic;
 
     let scenario = fail::FailScenario::setup();
@@ -442,7 +457,12 @@ fn test_crash_during_checkpoint() {
     {
         let lsn_provider = new_lsn_provider();
         let ilog_config = IlogConfig::new(dir.path());
-        let ilog = IlogService::open(ilog_config, Arc::clone(&lsn_provider)).unwrap();
+        let ilog = IlogService::open(
+            ilog_config,
+            Arc::clone(&lsn_provider),
+            &tokio::runtime::Handle::current(),
+        )
+        .unwrap();
 
         let version = Version::new();
 
@@ -474,14 +494,14 @@ fn test_crash_during_checkpoint() {
 ///
 /// Creates enough L0 SSTs to trigger compaction, then verifies the failpoint
 /// fires when do_compaction() is called.
-#[test]
-fn test_crash_before_merge() {
+#[tokio::test]
+async fn test_crash_before_merge() {
     use std::panic;
 
     let scenario = fail::FailScenario::setup();
     let dir = tempfile::tempdir().unwrap();
 
-    let (engine, _ilog, _clog) = create_test_lsm_engine(&dir);
+    let (engine, _ilog, _clog) = create_test_lsm_engine(&dir).await;
 
     // Write and flush multiple times to create multiple L0 SSTs
     for i in 0..3 {
@@ -532,14 +552,14 @@ fn test_crash_before_merge() {
 /// Creates multiple L0 SSTs, triggers compaction, and panics mid-write.
 /// Data remains intact because the original SSTs are not removed until
 /// compaction commits.
-#[test]
-fn test_crash_mid_compaction() {
+#[tokio::test]
+async fn test_crash_mid_compaction() {
     use std::panic;
 
     let scenario = fail::FailScenario::setup();
     let dir = tempfile::tempdir().unwrap();
 
-    let (engine, _ilog, _clog) = create_test_lsm_engine(&dir);
+    let (engine, _ilog, _clog) = create_test_lsm_engine(&dir).await;
 
     // Write and flush multiple times to create enough L0 SSTs for compaction
     for i in 0..3 {
@@ -591,14 +611,14 @@ fn test_crash_mid_compaction() {
 ///
 /// All SSTs are written, but the manifest delta is not applied. Original SSTs
 /// remain in the version, so data is still readable.
-#[test]
-fn test_crash_after_compaction_finish() {
+#[tokio::test]
+async fn test_crash_after_compaction_finish() {
     use std::panic;
 
     let scenario = fail::FailScenario::setup();
     let dir = tempfile::tempdir().unwrap();
 
-    let (engine, _ilog, _clog) = create_test_lsm_engine(&dir);
+    let (engine, _ilog, _clog) = create_test_lsm_engine(&dir).await;
 
     // Create multiple L0 SSTs for compaction
     for i in 0..3 {
@@ -659,8 +679,8 @@ fn test_crash_after_compaction_finish() {
 ///
 /// Writes to clog with sync=true, but the failpoint panics before the fsync.
 /// Data written but not synced may be lost on recovery (depending on OS buffer).
-#[test]
-fn test_crash_before_clog_sync() {
+#[tokio::test]
+async fn test_crash_before_clog_sync() {
     use std::panic;
     use tisql::ClogService;
 
@@ -668,7 +688,7 @@ fn test_crash_before_clog_sync() {
     let dir = tempfile::tempdir().unwrap();
 
     let clog_config = FileClogConfig::with_dir(dir.path());
-    let clog = FileClogService::open(clog_config).unwrap();
+    let clog = FileClogService::open(clog_config, &tokio::runtime::Handle::current()).unwrap();
 
     // Configure failpoint to crash before fsync
     fail::cfg("clog_before_sync", "panic").unwrap();
@@ -677,7 +697,9 @@ fn test_crash_before_clog_sync() {
     let mut batch = tisql::testkit::ClogBatch::new();
     batch.add_put(1, b"key".to_vec(), b"value".to_vec());
     batch.add_commit(1, 100);
-    let result = panic::catch_unwind(panic::AssertUnwindSafe(|| clog.write(&mut batch, true)));
+    let result = panic::catch_unwind(panic::AssertUnwindSafe(|| {
+        tisql::io::block_on_sync(clog.write(&mut batch, true).unwrap()).unwrap()
+    }));
     assert!(
         result.is_err(),
         "Failpoint should have triggered a panic before fsync"
@@ -693,8 +715,8 @@ fn test_crash_before_clog_sync() {
 ///
 /// After fsync completes, the data is durable on disk. A crash after fsync
 /// should not lose the written data.
-#[test]
-fn test_crash_after_clog_sync() {
+#[tokio::test]
+async fn test_crash_after_clog_sync() {
     use std::panic;
     use tisql::ClogService;
 
@@ -702,13 +724,13 @@ fn test_crash_after_clog_sync() {
     let dir = tempfile::tempdir().unwrap();
 
     let clog_config = FileClogConfig::with_dir(dir.path());
-    let clog = FileClogService::open(clog_config).unwrap();
+    let clog = FileClogService::open(clog_config, &tokio::runtime::Handle::current()).unwrap();
 
     // First write without failpoint to establish baseline
     let mut batch = tisql::testkit::ClogBatch::new();
     batch.add_put(1, b"durable_key".to_vec(), b"durable_value".to_vec());
     batch.add_commit(1, 100);
-    clog.write(&mut batch, true).unwrap();
+    tisql::io::block_on_sync(clog.write(&mut batch, true).unwrap()).unwrap();
 
     // Configure failpoint to crash after fsync (data is already durable)
     fail::cfg("clog_after_sync", "panic").unwrap();
@@ -717,7 +739,9 @@ fn test_crash_after_clog_sync() {
     let mut batch = tisql::testkit::ClogBatch::new();
     batch.add_put(2, b"also_durable".to_vec(), b"also_value".to_vec());
     batch.add_commit(2, 200);
-    let result = panic::catch_unwind(panic::AssertUnwindSafe(|| clog.write(&mut batch, true)));
+    let result = panic::catch_unwind(panic::AssertUnwindSafe(|| {
+        tisql::io::block_on_sync(clog.write(&mut batch, true).unwrap()).unwrap()
+    }));
     assert!(
         result.is_err(),
         "Failpoint should have triggered a panic after fsync"
@@ -729,7 +753,8 @@ fn test_crash_after_clog_sync() {
     // Drop clog and recover
     drop(clog);
     let clog_config = FileClogConfig::with_dir(dir.path());
-    let (recovered_clog, entries) = FileClogService::recover(clog_config).unwrap();
+    let (recovered_clog, entries) =
+        FileClogService::recover(clog_config, &tokio::runtime::Handle::current()).unwrap();
 
     // First write should be recoverable (was synced before failpoint was set)
     assert!(
@@ -748,14 +773,14 @@ fn test_crash_after_clog_sync() {
 // ============================================================================
 
 /// Test full recovery cycle after simulated crash.
-#[test]
-fn test_recovery_after_clean_shutdown() {
+#[tokio::test]
+async fn test_recovery_after_clean_shutdown() {
     let scenario = fail::FailScenario::setup();
     let dir = tempfile::tempdir().unwrap();
 
     // Write data and flush
     {
-        let (engine, ilog, _clog) = create_test_lsm_engine(&dir);
+        let (engine, ilog, _clog) = create_test_lsm_engine(&dir).await;
 
         for i in 0..10 {
             let key = format!("recovery_key_{i:04}");
@@ -771,7 +796,7 @@ fn test_recovery_after_clean_shutdown() {
     }
 
     // Recover
-    let result = recover_engine(&dir);
+    let result = recover_engine(&dir).await;
 
     // Verify all data
     for i in 0..10 {
@@ -785,13 +810,13 @@ fn test_recovery_after_clean_shutdown() {
 }
 
 /// Test recovery with interleaved transactions.
-#[test]
-fn test_recovery_interleaved_txns() {
+#[tokio::test]
+async fn test_recovery_interleaved_txns() {
     let scenario = fail::FailScenario::setup();
     let dir = tempfile::tempdir().unwrap();
 
     {
-        let (engine, ilog, _clog) = create_test_lsm_engine(&dir);
+        let (engine, ilog, _clog) = create_test_lsm_engine(&dir).await;
 
         // Simulate interleaved writes with different timestamps
         write_test_data(&engine, b"key_a", b"value_a_1", 1);
@@ -806,7 +831,7 @@ fn test_recovery_interleaved_txns() {
     }
 
     // Recover and verify latest values
-    let result = recover_engine(&dir);
+    let result = recover_engine(&dir).await;
 
     assert_eq!(
         tisql::io::block_on_sync(result.engine.get(b"key_a")).unwrap(),
@@ -825,13 +850,13 @@ fn test_recovery_interleaved_txns() {
 }
 
 /// Test recovery handles tombstones correctly.
-#[test]
-fn test_recovery_with_tombstones() {
+#[tokio::test]
+async fn test_recovery_with_tombstones() {
     let scenario = fail::FailScenario::setup();
     let dir = tempfile::tempdir().unwrap();
 
     {
-        let (engine, ilog, _clog) = create_test_lsm_engine(&dir);
+        let (engine, ilog, _clog) = create_test_lsm_engine(&dir).await;
 
         // Write then delete
         write_test_data(&engine, b"delete_me", b"temp_value", 1);
@@ -851,7 +876,7 @@ fn test_recovery_with_tombstones() {
     }
 
     // Recover
-    let result = recover_engine(&dir);
+    let result = recover_engine(&dir).await;
 
     // Deleted key should not be visible
     let deleted = tisql::io::block_on_sync(result.engine.get(b"delete_me")).unwrap();
@@ -869,12 +894,12 @@ fn test_recovery_with_tombstones() {
 // ============================================================================
 
 /// Test empty memtable flush (should be a no-op or handled gracefully).
-#[test]
-fn test_flush_empty_memtable() {
+#[tokio::test]
+async fn test_flush_empty_memtable() {
     let scenario = fail::FailScenario::setup();
     let dir = tempfile::tempdir().unwrap();
 
-    let (engine, _ilog, _clog) = create_test_lsm_engine(&dir);
+    let (engine, _ilog, _clog) = create_test_lsm_engine(&dir).await;
 
     // Try to flush without writing anything
     // First need a frozen memtable
@@ -889,12 +914,12 @@ fn test_flush_empty_memtable() {
 }
 
 /// Test multiple consecutive flushes.
-#[test]
-fn test_multiple_consecutive_flushes() {
+#[tokio::test]
+async fn test_multiple_consecutive_flushes() {
     let scenario = fail::FailScenario::setup();
     let dir = tempfile::tempdir().unwrap();
 
-    let (engine, _ilog, _clog) = create_test_lsm_engine(&dir);
+    let (engine, _ilog, _clog) = create_test_lsm_engine(&dir).await;
 
     // Do multiple write-rotate-flush cycles
     for cycle in 0..3 {
@@ -933,12 +958,12 @@ fn test_multiple_consecutive_flushes() {
 // ============================================================================
 
 /// Test truncation at checkpoint boundary - recovery should still work.
-#[test]
-fn test_truncate_at_checkpoint_boundary() {
+#[tokio::test]
+async fn test_truncate_at_checkpoint_boundary() {
     let scenario = fail::FailScenario::setup();
     let dir = tempfile::tempdir().unwrap();
 
-    let (engine, ilog, _clog) = create_test_lsm_engine(&dir);
+    let (engine, ilog, _clog) = create_test_lsm_engine(&dir).await;
 
     // Write data and flush
     for i in 0..10 {
@@ -956,7 +981,7 @@ fn test_truncate_at_checkpoint_boundary() {
 
     // Create new clog service for truncation
     let clog_config = FileClogConfig::with_dir(dir.path());
-    let clog = FileClogService::open(clog_config).unwrap();
+    let clog = FileClogService::open(clog_config, &tokio::runtime::Handle::current()).unwrap();
 
     // Truncate to flushed_lsn
     let _stats = clog.truncate_to(flushed_lsn).unwrap();
@@ -969,7 +994,7 @@ fn test_truncate_at_checkpoint_boundary() {
     drop(ilog);
 
     // Recover should work
-    let result = recover_engine(&dir);
+    let result = recover_engine(&dir).await;
 
     // All data should still be readable from SST
     for i in 0..10 {
@@ -982,12 +1007,12 @@ fn test_truncate_at_checkpoint_boundary() {
 }
 
 /// Test truncation preserves uncommitted transactions.
-#[test]
-fn test_truncate_with_uncommitted_txn() {
+#[tokio::test]
+async fn test_truncate_with_uncommitted_txn() {
     let scenario = fail::FailScenario::setup();
     let dir = tempfile::tempdir().unwrap();
 
-    let (engine, ilog, _clog) = create_test_lsm_engine(&dir);
+    let (engine, ilog, _clog) = create_test_lsm_engine(&dir).await;
 
     // Write some data and flush
     write_test_data(&engine, b"committed_key", b"committed_value", 1);
@@ -1003,7 +1028,7 @@ fn test_truncate_with_uncommitted_txn() {
 
     // Truncate to flushed_lsn - should keep unflushed entries
     let clog_config = FileClogConfig::with_dir(dir.path());
-    let clog = FileClogService::open(clog_config).unwrap();
+    let clog = FileClogService::open(clog_config, &tokio::runtime::Handle::current()).unwrap();
 
     let stats = clog.truncate_to(flushed_lsn).unwrap();
 
@@ -1016,12 +1041,12 @@ fn test_truncate_with_uncommitted_txn() {
 }
 
 /// Test concurrent truncate and write doesn't corrupt data.
-#[test]
-fn test_concurrent_truncate_and_write() {
+#[tokio::test]
+async fn test_concurrent_truncate_and_write() {
     let scenario = fail::FailScenario::setup();
     let dir = tempfile::tempdir().unwrap();
 
-    let (engine, ilog, _clog) = create_test_lsm_engine(&dir);
+    let (engine, ilog, _clog) = create_test_lsm_engine(&dir).await;
 
     // Write initial data and flush
     for i in 0..5 {
@@ -1045,7 +1070,7 @@ fn test_concurrent_truncate_and_write() {
 
     // Truncate
     let clog_config = FileClogConfig::with_dir(dir.path());
-    let clog = FileClogService::open(clog_config).unwrap();
+    let clog = FileClogService::open(clog_config, &tokio::runtime::Handle::current()).unwrap();
     let _ = clog.truncate_to(flushed_lsn);
 
     // Verify data integrity
@@ -1066,13 +1091,13 @@ fn test_concurrent_truncate_and_write() {
 }
 
 /// Test truncate then crash then recover.
-#[test]
-fn test_truncate_then_crash_then_recover() {
+#[tokio::test]
+async fn test_truncate_then_crash_then_recover() {
     let scenario = fail::FailScenario::setup();
     let dir = tempfile::tempdir().unwrap();
 
     {
-        let (engine, ilog, _clog) = create_test_lsm_engine(&dir);
+        let (engine, ilog, _clog) = create_test_lsm_engine(&dir).await;
 
         // Write and flush
         for i in 0..20 {
@@ -1087,14 +1112,14 @@ fn test_truncate_then_crash_then_recover() {
 
         // Truncate
         let clog_config = FileClogConfig::with_dir(dir.path());
-        let clog = FileClogService::open(clog_config).unwrap();
+        let clog = FileClogService::open(clog_config, &tokio::runtime::Handle::current()).unwrap();
         clog.truncate_to(flushed_lsn).unwrap();
 
         // "Crash" by dropping without clean shutdown
     }
 
     // Recover
-    let result = recover_engine(&dir);
+    let result = recover_engine(&dir).await;
 
     // All data should be recoverable from SST
     for i in 0..20 {
@@ -1107,12 +1132,12 @@ fn test_truncate_then_crash_then_recover() {
 }
 
 /// Test flushed_lsn consistency across operations.
-#[test]
-fn test_flushed_lsn_consistency() {
+#[tokio::test]
+async fn test_flushed_lsn_consistency() {
     let scenario = fail::FailScenario::setup();
     let dir = tempfile::tempdir().unwrap();
 
-    let (engine, ilog, _clog) = create_test_lsm_engine(&dir);
+    let (engine, ilog, _clog) = create_test_lsm_engine(&dir).await;
 
     let mut last_flushed_lsn = 0;
 
@@ -1150,7 +1175,7 @@ fn test_flushed_lsn_consistency() {
     drop(engine);
     drop(ilog);
 
-    let result = recover_engine(&dir);
+    let result = recover_engine(&dir).await;
     let recovered_flushed_lsn = result.engine.current_version().flushed_lsn();
 
     assert!(
@@ -1162,15 +1187,15 @@ fn test_flushed_lsn_consistency() {
 }
 
 /// Test clog oldest_lsn and file_size APIs.
-#[test]
-fn test_clog_metadata_apis() {
+#[tokio::test]
+async fn test_clog_metadata_apis() {
     use tisql::ClogService;
 
     let scenario = fail::FailScenario::setup();
     let dir = tempfile::tempdir().unwrap();
 
     let clog_config = FileClogConfig::with_dir(dir.path());
-    let clog = FileClogService::open(clog_config).unwrap();
+    let clog = FileClogService::open(clog_config, &tokio::runtime::Handle::current()).unwrap();
 
     // Check initial state
     let initial_oldest = clog.oldest_lsn().unwrap();
@@ -1190,7 +1215,7 @@ fn test_clog_metadata_apis() {
             value: b"value".to_vec(),
         },
     });
-    clog.write(&mut batch, true).unwrap();
+    tisql::io::block_on_sync(clog.write(&mut batch, true).unwrap()).unwrap();
 
     // Check after write
     let after_write_oldest = clog.oldest_lsn().unwrap();
@@ -1215,14 +1240,14 @@ fn test_clog_metadata_apis() {
 /// Test L0SstIterator open_file failpoint.
 ///
 /// When SST file opening fails, the scan_iter should propagate the error.
-#[test]
-fn test_level_iterator_open_file_error() {
+#[tokio::test]
+async fn test_level_iterator_open_file_error() {
     use tisql::storage::mvcc::MvccIterator;
 
     let scenario = fail::FailScenario::setup();
     let dir = tempfile::tempdir().unwrap();
 
-    let (engine, _ilog, _clog) = create_test_lsm_engine(&dir);
+    let (engine, _ilog, _clog) = create_test_lsm_engine(&dir).await;
 
     // Write data to memtable first
     write_test_data(&engine, b"key1", b"value1", 1);
@@ -1260,14 +1285,14 @@ fn test_level_iterator_open_file_error() {
 }
 
 /// Test L0SstIterator seek failpoint.
-#[test]
-fn test_level_iterator_seek_error() {
+#[tokio::test]
+async fn test_level_iterator_seek_error() {
     use tisql::storage::mvcc::MvccIterator;
 
     let scenario = fail::FailScenario::setup();
     let dir = tempfile::tempdir().unwrap();
 
-    let (engine, _ilog, _clog) = create_test_lsm_engine(&dir);
+    let (engine, _ilog, _clog) = create_test_lsm_engine(&dir).await;
 
     // Write data and flush to SST in L0
     write_test_data(&engine, b"key1", b"value1", 1);
@@ -1304,14 +1329,14 @@ fn test_level_iterator_seek_error() {
 ///
 /// The TieredMergeIterator stores advance errors in pending_error and returns them
 /// on the next call to advance(). So we need to call advance twice to see the error.
-#[test]
-fn test_level_iterator_advance_error() {
+#[tokio::test]
+async fn test_level_iterator_advance_error() {
     use tisql::storage::mvcc::MvccIterator;
 
     let scenario = fail::FailScenario::setup();
     let dir = tempfile::tempdir().unwrap();
 
-    let (engine, _ilog, _clog) = create_test_lsm_engine(&dir);
+    let (engine, _ilog, _clog) = create_test_lsm_engine(&dir).await;
 
     // Write data and flush to SST in L0
     write_test_data(&engine, b"key1", b"value1", 1);
@@ -1349,12 +1374,12 @@ fn test_level_iterator_advance_error() {
 /// Test LsmEngine::get returns data from memtable first.
 ///
 /// This test verifies the point lookup path through memtables.
-#[test]
-fn test_get_from_memtable() {
+#[tokio::test]
+async fn test_get_from_memtable() {
     let scenario = fail::FailScenario::setup();
     let dir = tempfile::tempdir().unwrap();
 
-    let (engine, _ilog, _clog) = create_test_lsm_engine(&dir);
+    let (engine, _ilog, _clog) = create_test_lsm_engine(&dir).await;
 
     // Write data to active memtable
     write_test_data(&engine, b"key1", b"value1", 1);
@@ -1387,12 +1412,12 @@ fn test_get_from_memtable() {
 }
 
 /// Test that LsmEngine getters work correctly.
-#[test]
-fn test_lsm_engine_getters() {
+#[tokio::test]
+async fn test_lsm_engine_getters() {
     let scenario = fail::FailScenario::setup();
     let dir = tempfile::tempdir().unwrap();
 
-    let (engine, _ilog, _clog) = create_test_lsm_engine(&dir);
+    let (engine, _ilog, _clog) = create_test_lsm_engine(&dir).await;
 
     // Test config() getter
     let config = engine.config();
@@ -1424,14 +1449,14 @@ fn test_lsm_engine_getters() {
 }
 
 /// Test scan with data in both memtable and SST.
-#[test]
-fn test_scan_iter_memtable_and_sst() {
+#[tokio::test]
+async fn test_scan_iter_memtable_and_sst() {
     use tisql::storage::mvcc::MvccIterator;
 
     let scenario = fail::FailScenario::setup();
     let dir = tempfile::tempdir().unwrap();
 
-    let (engine, _ilog, _clog) = create_test_lsm_engine(&dir);
+    let (engine, _ilog, _clog) = create_test_lsm_engine(&dir).await;
 
     // Write data to memtable
     write_test_data(&engine, b"aaa", b"value_a", 1);

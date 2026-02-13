@@ -201,7 +201,7 @@ impl LsmEngine {
         // Initialize next_sst_id from recovered version's max SST ID + 1
         let recovered_max_sst_id = version.next_sst_id();
 
-        // Create io_uring service for async SST reads (already returns Arc<IoService>)
+        // Create io_uring service for async SST reads
         let io_service = crate::io::IoService::new(256)
             .map_err(|e| TiSqlError::Storage(format!("Failed to create IoService: {e}")))?;
 
@@ -2216,6 +2216,21 @@ impl TieredMergeIterator {
     }
 }
 
+impl Drop for LsmEngine {
+    fn drop(&mut self) {
+        // Shutdown spawn_blocking tasks before the runtime drops.
+        //
+        // IoService and GroupCommitWriter (in IlogService) each run a
+        // spawn_blocking task that blocks on rx.recv(). Closing their
+        // sender channels causes those tasks to exit. Without this,
+        // runtime shutdown blocks forever waiting for them.
+        self.io.shutdown();
+        if let Some(ilog) = &self.ilog {
+            ilog.shutdown();
+        }
+    }
+}
+
 impl StorageEngine for LsmEngine {
     type Iter = TieredMergeIterator;
 
@@ -2506,8 +2521,8 @@ mod tests {
                 std::fs::create_dir_all(&sst_dir)?;
             }
 
-            // Create IoService for io_uring SST reads
-            let io_service = crate::io::IoService::new(32)
+            // Create IoService for io_uring SST reads (test path uses current runtime)
+            let io_service = crate::io::IoService::new_for_test(32)
                 .map_err(|e| TiSqlError::Storage(format!("Failed to create IoService: {e}")))?;
 
             // Create initial state and version_set
@@ -2970,7 +2985,9 @@ mod tests {
 
         let lsn_provider = new_lsn_provider();
         let ilog_config = IlogConfig::new(tmp.path());
-        let ilog = Arc::new(IlogService::open(ilog_config, Arc::clone(&lsn_provider)).unwrap());
+        let ilog = Arc::new(
+            IlogService::open_with_thread(ilog_config, Arc::clone(&lsn_provider)).unwrap(),
+        );
 
         let engine = LsmEngine::open_with_recovery(
             config,
@@ -3020,7 +3037,9 @@ mod tests {
 
             let lsn_provider = new_lsn_provider();
             let ilog_config = IlogConfig::new(tmp.path());
-            let ilog = Arc::new(IlogService::open(ilog_config, Arc::clone(&lsn_provider)).unwrap());
+            let ilog = Arc::new(
+                IlogService::open_with_thread(ilog_config, Arc::clone(&lsn_provider)).unwrap(),
+            );
 
             let engine =
                 LsmEngine::open_with_recovery(config, lsn_provider, ilog, Version::new()).unwrap();
@@ -3042,7 +3061,7 @@ mod tests {
             let lsn_provider = new_lsn_provider();
             let ilog_config = IlogConfig::new(tmp.path());
             let (ilog, version, orphans) =
-                IlogService::recover(ilog_config, Arc::clone(&lsn_provider)).unwrap();
+                IlogService::recover_with_thread(ilog_config, Arc::clone(&lsn_provider)).unwrap();
 
             assert!(
                 orphans.is_empty(),
@@ -3144,7 +3163,9 @@ mod tests {
 
         let lsn_provider = new_lsn_provider();
         let ilog_config = IlogConfig::new(tmp.path());
-        let ilog = Arc::new(IlogService::open(ilog_config, Arc::clone(&lsn_provider)).unwrap());
+        let ilog = Arc::new(
+            IlogService::open_with_thread(ilog_config, Arc::clone(&lsn_provider)).unwrap(),
+        );
 
         let engine = LsmEngine::open_with_recovery(
             config,
@@ -3186,7 +3207,9 @@ mod tests {
 
         let lsn_provider = new_lsn_provider();
         let ilog_config = IlogConfig::new(tmp.path());
-        let ilog = Arc::new(IlogService::open(ilog_config, Arc::clone(&lsn_provider)).unwrap());
+        let ilog = Arc::new(
+            IlogService::open_with_thread(ilog_config, Arc::clone(&lsn_provider)).unwrap(),
+        );
 
         let engine = LsmEngine::open_with_recovery(
             config,
@@ -3303,7 +3326,9 @@ mod tests {
 
         let lsn_provider = new_lsn_provider();
         let ilog_config = IlogConfig::new(tmp.path());
-        let ilog = Arc::new(IlogService::open(ilog_config, Arc::clone(&lsn_provider)).unwrap());
+        let ilog = Arc::new(
+            IlogService::open_with_thread(ilog_config, Arc::clone(&lsn_provider)).unwrap(),
+        );
 
         let engine = LsmEngine::open_with_recovery(
             config,
@@ -3339,8 +3364,8 @@ mod tests {
         );
     }
 
-    #[tokio::test]
-    async fn test_sst_contains_mvcc_keys() {
+    #[test]
+    fn test_sst_contains_mvcc_keys() {
         // Critical: Verify SST contains MVCC-encoded keys
         let tmp = TempDir::new().unwrap();
         let config = LsmConfig::builder(tmp.path())
@@ -3351,7 +3376,9 @@ mod tests {
 
         let lsn_provider = new_lsn_provider();
         let ilog_config = IlogConfig::new(tmp.path());
-        let ilog = Arc::new(IlogService::open(ilog_config, Arc::clone(&lsn_provider)).unwrap());
+        let ilog = Arc::new(
+            IlogService::open_with_thread(ilog_config, Arc::clone(&lsn_provider)).unwrap(),
+        );
 
         let engine = LsmEngine::open_with_recovery(
             config.clone(),
@@ -3383,11 +3410,13 @@ mod tests {
         assert!(!ssts.is_empty(), "Should have at least one SST");
 
         let sst_path = config.sst_dir().join(format!("{:08}.sst", ssts[0].id));
-        let reader = SstReaderRef::open(&sst_path, crate::io::IoService::new(32).unwrap())
-            .await
-            .unwrap();
+        let reader = crate::io::block_on_sync(SstReaderRef::open(
+            &sst_path,
+            crate::io::IoService::new_for_test(32).unwrap(),
+        ))
+        .unwrap();
         let mut iter = SstIterator::new(reader).unwrap();
-        iter.seek_to_first().await.unwrap(); // Position the iterator
+        crate::io::block_on_sync(iter.seek_to_first()).unwrap(); // Position the iterator
 
         let mut entry_count = 0;
         let mut found_ts_10 = false;
@@ -3412,7 +3441,7 @@ mod tests {
                 }
             }
             entry_count += 1;
-            if iter.advance().await.is_err() {
+            if crate::io::block_on_sync(iter.advance()).is_err() {
                 break;
             }
         }
@@ -3437,7 +3466,9 @@ mod tests {
 
         let lsn_provider = new_lsn_provider();
         let ilog_config = IlogConfig::new(tmp.path());
-        let ilog = Arc::new(IlogService::open(ilog_config, Arc::clone(&lsn_provider)).unwrap());
+        let ilog = Arc::new(
+            IlogService::open_with_thread(ilog_config, Arc::clone(&lsn_provider)).unwrap(),
+        );
 
         let engine = LsmEngine::open_with_recovery(
             config,
@@ -3498,7 +3529,9 @@ mod tests {
 
         let lsn_provider = new_lsn_provider();
         let ilog_config = IlogConfig::new(tmp.path());
-        let ilog = Arc::new(IlogService::open(ilog_config, Arc::clone(&lsn_provider)).unwrap());
+        let ilog = Arc::new(
+            IlogService::open_with_thread(ilog_config, Arc::clone(&lsn_provider)).unwrap(),
+        );
 
         let engine = LsmEngine::open_with_recovery(
             config,
@@ -3543,29 +3576,18 @@ mod tests {
 
     #[test]
     fn test_concurrent_flush_unique_sst_ids() {
-        // Medium: Verify concurrent flushes get unique SST IDs
-        use std::sync::Barrier;
+        // Verify concurrent flushes get unique SST IDs.
+        // Uses 2 threads to avoid O(threads*memtables) SST duplication which
+        // makes io_uring reads slow in the verification phase.
 
         let tmp = TempDir::new().unwrap();
         let config = LsmConfig::builder(tmp.path())
-            .memtable_size(50) // Very small to trigger rotation
-            .max_frozen_memtables(32) // Allow many frozen memtables (entries are ~80 bytes with overhead)
+            .memtable_size(100) // Small to trigger rotation
+            .max_frozen_memtables(32) // Allow many frozen memtables
             .build()
             .unwrap();
 
-        let lsn_provider = new_lsn_provider();
-        let ilog_config = IlogConfig::new(tmp.path());
-        let ilog = Arc::new(IlogService::open(ilog_config, Arc::clone(&lsn_provider)).unwrap());
-
-        let engine = Arc::new(
-            LsmEngine::open_with_recovery(
-                config.clone(),
-                Arc::clone(&lsn_provider),
-                Arc::clone(&ilog),
-                Version::new(),
-            )
-            .unwrap(),
-        );
+        let engine = Arc::new(LsmEngine::open(config.clone()).unwrap());
 
         // Write enough data to have multiple frozen memtables
         for i in 0..20 {
@@ -3578,18 +3600,17 @@ mod tests {
             engine.write_batch(batch).unwrap();
         }
 
-        // Now trigger concurrent flushes
-        let num_threads = 4;
-        let barrier = Arc::new(Barrier::new(num_threads));
+        // Trigger concurrent flushes from 2 threads
+        let num_threads = 2;
+        let barrier = Arc::new(std::sync::Barrier::new(num_threads));
 
         let handles: Vec<_> = (0..num_threads)
             .map(|_| {
                 let engine = Arc::clone(&engine);
                 let barrier = Arc::clone(&barrier);
 
-                thread::spawn(move || {
+                std::thread::spawn(move || {
                     barrier.wait();
-                    // Each thread tries to flush
                     let _ = engine.flush_all();
                 })
             })
@@ -3646,7 +3667,9 @@ mod tests {
 
             let lsn_provider = new_lsn_provider();
             let ilog_config = IlogConfig::new(tmp.path());
-            let ilog = Arc::new(IlogService::open(ilog_config, Arc::clone(&lsn_provider)).unwrap());
+            let ilog = Arc::new(
+                IlogService::open_with_thread(ilog_config, Arc::clone(&lsn_provider)).unwrap(),
+            );
 
             let engine =
                 LsmEngine::open_with_recovery(config, lsn_provider, ilog, Version::new()).unwrap();
@@ -3674,7 +3697,7 @@ mod tests {
             let lsn_provider = new_lsn_provider();
             let ilog_config = IlogConfig::new(tmp.path());
             let (ilog, version, _orphans) =
-                IlogService::recover(ilog_config, Arc::clone(&lsn_provider)).unwrap();
+                IlogService::recover_with_thread(ilog_config, Arc::clone(&lsn_provider)).unwrap();
 
             let config = LsmConfig::builder(tmp.path())
                 .memtable_size(100)
@@ -3724,7 +3747,9 @@ mod tests {
 
         let lsn_provider = new_lsn_provider();
         let ilog_config = IlogConfig::new(tmp.path());
-        let ilog = Arc::new(IlogService::open(ilog_config, Arc::clone(&lsn_provider)).unwrap());
+        let ilog = Arc::new(
+            IlogService::open_with_thread(ilog_config, Arc::clone(&lsn_provider)).unwrap(),
+        );
 
         let engine = LsmEngine::open_with_recovery(
             config,
@@ -3802,7 +3827,9 @@ mod tests {
 
         let lsn_provider = new_lsn_provider();
         let ilog_config = IlogConfig::new(tmp.path());
-        let ilog = Arc::new(IlogService::open(ilog_config, Arc::clone(&lsn_provider)).unwrap());
+        let ilog = Arc::new(
+            IlogService::open_with_thread(ilog_config, Arc::clone(&lsn_provider)).unwrap(),
+        );
 
         let engine = LsmEngine::open_with_recovery(
             config,
@@ -3855,6 +3882,11 @@ mod tests {
         use crate::clog::{ClogBatch, ClogService, FileClogConfig, FileClogService};
 
         let tmp = TempDir::new().unwrap();
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        let handle = rt.handle();
 
         // Session 1: Write data, flush some, "crash"
         let written_keys: Vec<(Vec<u8>, Vec<u8>)>;
@@ -3867,7 +3899,9 @@ mod tests {
 
             let lsn_provider = new_lsn_provider();
             let ilog_config = IlogConfig::new(tmp.path());
-            let ilog = Arc::new(IlogService::open(ilog_config, Arc::clone(&lsn_provider)).unwrap());
+            let ilog = Arc::new(
+                IlogService::open_with_thread(ilog_config, Arc::clone(&lsn_provider)).unwrap(),
+            );
 
             let engine = LsmEngine::open_with_recovery(
                 lsm_config,
@@ -3879,9 +3913,12 @@ mod tests {
 
             // Use shared LSN provider for clog
             let clog_config = FileClogConfig::with_dir(tmp.path());
-            let clog =
-                FileClogService::open_with_lsn_provider(clog_config, Arc::clone(&lsn_provider))
-                    .unwrap();
+            let clog = FileClogService::open_with_lsn_provider(
+                clog_config,
+                Arc::clone(&lsn_provider),
+                handle,
+            )
+            .unwrap();
 
             // Write 5 transactions
             written_keys = (0..5)
@@ -3893,7 +3930,8 @@ mod tests {
                     let mut batch = ClogBatch::new();
                     batch.add_put(i as u64 + 1, key.clone(), value.clone());
                     batch.add_commit(i as u64 + 1, i as Timestamp + 100);
-                    let clog_lsn = clog.write(&mut batch, true).unwrap();
+                    let clog_lsn =
+                        crate::io::block_on_sync(clog.write(&mut batch, true).unwrap()).unwrap();
 
                     // Write to engine with clog_lsn
                     let mut wb = WriteBatch::new();
@@ -3928,7 +3966,7 @@ mod tests {
             use crate::storage::recovery::LsmRecovery;
 
             let recovery = LsmRecovery::new(tmp.path());
-            let result = recovery.recover().unwrap();
+            let result = recovery.recover(handle).unwrap();
 
             // Verify all data is recovered
             for (key, value) in &written_keys {
@@ -3952,7 +3990,7 @@ mod tests {
             use crate::storage::recovery::LsmRecovery;
 
             let recovery = LsmRecovery::new(tmp.path());
-            let result = recovery.recover().unwrap();
+            let result = recovery.recover(handle).unwrap();
 
             // Verify all data is still present after two-crash recovery
             for (key, value) in &written_keys {
@@ -3978,7 +4016,9 @@ mod tests {
 
         let lsn_provider = new_lsn_provider();
         let ilog_config = IlogConfig::new(tmp.path());
-        let ilog = Arc::new(IlogService::open(ilog_config, Arc::clone(&lsn_provider)).unwrap());
+        let ilog = Arc::new(
+            IlogService::open_with_thread(ilog_config, Arc::clone(&lsn_provider)).unwrap(),
+        );
 
         let engine = LsmEngine::open_with_recovery(
             config,

@@ -36,16 +36,10 @@ use crate::inner_table::catalog_loader::{load_gc_tasks, GcTask};
 use crate::storage::lsm::LsmEngine;
 use crate::transaction::TxnService;
 
-/// Handle for the worker — either a tokio task or a std thread.
-enum WorkerHandle {
-    Tokio(tokio::task::JoinHandle<()>),
-    Thread(std::thread::JoinHandle<()>),
-}
-
 /// Background GC worker that marks completed drop-table tasks as done.
 pub struct GcWorker<T: TxnService + 'static> {
     inner: Arc<GcWorkerInner<T>>,
-    worker_handle: parking_lot::Mutex<Option<WorkerHandle>>,
+    worker_handle: parking_lot::Mutex<Option<tokio::task::JoinHandle<()>>>,
 }
 
 struct GcWorkerInner<T: TxnService + 'static> {
@@ -69,23 +63,17 @@ impl<T: TxnService + 'static> GcWorker<T> {
         }
     }
 
-    /// Start the background GC worker.
-    pub fn start(&self) {
-        let mut handle = self.worker_handle.lock();
-        if handle.is_some() {
+    /// Start the background GC worker on the given runtime.
+    pub fn start(&self, handle: &tokio::runtime::Handle) {
+        let mut worker = self.worker_handle.lock();
+        if worker.is_some() {
             return;
         }
 
         let inner = Arc::clone(&self.inner);
-        if let Ok(rt_handle) = tokio::runtime::Handle::try_current() {
-            *handle = Some(WorkerHandle::Tokio(rt_handle.spawn(async move {
-                inner.gc_worker_loop().await;
-            })));
-        } else {
-            *handle = Some(WorkerHandle::Thread(std::thread::spawn(move || {
-                inner.gc_worker_loop_sync();
-            })));
-        }
+        *worker = Some(handle.spawn(async move {
+            inner.gc_worker_loop().await;
+        }));
     }
 
     /// Stop the background GC worker.
@@ -94,15 +82,8 @@ impl<T: TxnService + 'static> GcWorker<T> {
         self.inner.notify.notify_one();
 
         let mut handle = self.worker_handle.lock();
-        if let Some(h) = handle.take() {
-            match h {
-                WorkerHandle::Tokio(jh) => jh.abort(),
-                WorkerHandle::Thread(jh) => {
-                    if jh.join().is_err() {
-                        tracing::warn!("GC worker thread panicked");
-                    }
-                }
-            }
+        if let Some(jh) = handle.take() {
+            jh.abort();
         }
     }
 
@@ -130,18 +111,6 @@ impl<T: TxnService + 'static> GcWorkerInner<T> {
                 _ = self.notify.notified() => {}
                 _ = tokio::time::sleep(Duration::from_secs(30)) => {}
             }
-        }
-
-        tracing::info!("GC worker stopped");
-    }
-
-    /// Main loop (sync — std::thread fallback).
-    fn gc_worker_loop_sync(&self) {
-        tracing::info!("GC worker started (sync fallback)");
-
-        while !self.shutdown.load(Ordering::Relaxed) {
-            self.process_gc_tasks();
-            std::thread::sleep(Duration::from_secs(30));
         }
 
         tracing::info!("GC worker stopped");
@@ -252,7 +221,7 @@ impl<T: TxnService + 'static> GcWorkerInner<T> {
             task.drop_commit_ts,
             "done",
         )?;
-        self.txn_service.commit(ctx)?;
+        crate::io::block_on_sync(self.txn_service.commit(ctx))?;
         Ok(())
     }
 }

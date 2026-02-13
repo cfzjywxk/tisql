@@ -157,7 +157,7 @@ impl<T: TxnService> MvccCatalog<T> {
     }
 
     fn commit_internal(&self, ctx: TxnCtx) -> Result<CommitInfo> {
-        self.txn_service.commit(ctx)
+        crate::io::block_on_sync(self.txn_service.commit(ctx))
     }
 }
 
@@ -650,7 +650,8 @@ mod tests {
     fn create_test_catalog() -> (MvccCatalog<TestTxnService>, tempfile::TempDir) {
         let dir = tempdir().unwrap();
         let clog_config = FileClogConfig::with_dir(dir.path());
-        let (clog_service, _) = FileClogService::recover(clog_config).unwrap();
+        let io_handle = tokio::runtime::Handle::current();
+        let (clog_service, _) = FileClogService::recover(clog_config, &io_handle).unwrap();
         let clog_service = Arc::new(clog_service);
 
         let tso = Arc::new(LocalTso::new(1));
@@ -691,8 +692,8 @@ mod tests {
         )
     }
 
-    #[test]
-    fn test_create_get_table() {
+    #[tokio::test]
+    async fn test_create_get_table() {
         let (catalog, _dir) = create_test_catalog();
         let table = make_test_table(&catalog, "users");
         let table_id = table.id();
@@ -707,8 +708,8 @@ mod tests {
         assert_eq!(by_id.name(), "users");
     }
 
-    #[test]
-    fn test_drop_table() {
+    #[tokio::test]
+    async fn test_drop_table() {
         let (catalog, _dir) = create_test_catalog();
         let table = make_test_table(&catalog, "users");
 
@@ -719,8 +720,8 @@ mod tests {
         assert!(catalog.get_table("default", "users").unwrap().is_none());
     }
 
-    #[test]
-    fn test_list_tables() {
+    #[tokio::test]
+    async fn test_list_tables() {
         let (catalog, _dir) = create_test_catalog();
 
         let t1 = make_test_table(&catalog, "users");
@@ -737,8 +738,8 @@ mod tests {
         assert!(names.contains(&"orders"));
     }
 
-    #[test]
-    fn test_schema_operations() {
+    #[tokio::test]
+    async fn test_schema_operations() {
         let (catalog, _dir) = create_test_catalog();
 
         // Default and test schemas should exist after bootstrap
@@ -761,8 +762,8 @@ mod tests {
         assert!(!catalog.schema_exists("myschema").unwrap());
     }
 
-    #[test]
-    fn test_auto_increment() {
+    #[tokio::test]
+    async fn test_auto_increment() {
         let (catalog, _dir) = create_test_catalog();
         let table = make_test_table(&catalog, "users");
         let table_id = table.id();
@@ -774,8 +775,8 @@ mod tests {
         assert_eq!(catalog.next_auto_increment(table_id).unwrap(), 3);
     }
 
-    #[test]
-    fn test_table_id_generation() {
+    #[tokio::test]
+    async fn test_table_id_generation() {
         let (catalog, _dir) = create_test_catalog();
 
         let id1 = catalog.next_table_id().unwrap();
@@ -788,8 +789,8 @@ mod tests {
         assert_eq!(id3, USER_TABLE_ID_START + 2);
     }
 
-    #[test]
-    fn test_duplicate_table_error() {
+    #[tokio::test]
+    async fn test_duplicate_table_error() {
         let (catalog, _dir) = create_test_catalog();
         let table = make_test_table(&catalog, "users");
 
@@ -800,8 +801,8 @@ mod tests {
         assert!(result.is_err());
     }
 
-    #[test]
-    fn test_schema_version_increments_on_ddl() {
+    #[tokio::test]
+    async fn test_schema_version_increments_on_ddl() {
         let (catalog, _dir) = create_test_catalog();
 
         // After bootstrap, version should be > 0
@@ -840,15 +841,16 @@ mod tests {
         );
     }
 
-    #[test]
-    fn test_schema_version_persists_across_reload() {
+    #[tokio::test]
+    async fn test_schema_version_persists_across_reload() {
         let dir = tempdir().unwrap();
         let initial_version;
+        let io_handle = tokio::runtime::Handle::current();
 
         // First session: create catalog and tables
         {
             let clog_config = FileClogConfig::with_dir(dir.path());
-            let (clog_service, _) = FileClogService::recover(clog_config).unwrap();
+            let (clog_service, _) = FileClogService::recover(clog_config, &io_handle).unwrap();
             let clog_service = Arc::new(clog_service);
 
             let tso = Arc::new(LocalTso::new(1));
@@ -881,7 +883,8 @@ mod tests {
         // Second session: reload and verify version
         {
             let clog_config = FileClogConfig::with_dir(dir.path());
-            let (clog_service, entries) = FileClogService::recover(clog_config).unwrap();
+            let (clog_service, entries) =
+                FileClogService::recover(clog_config, &io_handle).unwrap();
             let clog_service = Arc::new(clog_service);
 
             let tso = Arc::new(LocalTso::new(1));
@@ -918,8 +921,8 @@ mod tests {
         }
     }
 
-    #[test]
-    fn test_bootstrap_creates_inner_tables_in_cache() {
+    #[tokio::test]
+    async fn test_bootstrap_creates_inner_tables_in_cache() {
         let (catalog, _dir) = create_test_catalog();
 
         // Inner tables should be in cache but hidden from list_schemas

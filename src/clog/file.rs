@@ -35,7 +35,7 @@ use crate::types::{Lsn, Timestamp, TxnId};
 use crate::util::fs::{rename_durable, sync_dir};
 use crate::{log_info, log_trace, log_warn};
 
-use super::{ClogBatch, ClogEntry, ClogEntryRef, ClogService};
+use super::{ClogBatch, ClogEntry, ClogEntryRef, ClogFsyncFuture, ClogService};
 
 /// File header magic bytes: "CLOG"
 const FILE_MAGIC: &[u8; 4] = b"CLOG";
@@ -119,14 +119,16 @@ pub struct FileClogService {
     /// Wrapped in Mutex so `truncate_to` can replace it after file rewrite.
     /// The mutex is only held briefly to call `submit()` (channel send),
     /// so contention is minimal. The real fsync batching happens in the
-    /// writer thread.
+    /// async writer task.
     group_writer: Mutex<super::group_commit::GroupCommitWriter>,
+    /// Runtime handle for spawning new GroupCommitWriter tasks (e.g. on clog rotation).
+    io_handle: tokio::runtime::Handle,
 }
 
 impl FileClogService {
     /// Open or create a new commit log file (standalone mode with local LSN counter)
-    pub fn open(config: FileClogConfig) -> Result<Self> {
-        Self::open_internal(config, None)
+    pub fn open(config: FileClogConfig, io_handle: &tokio::runtime::Handle) -> Result<Self> {
+        Self::open_internal(config, None, io_handle)
     }
 
     /// Open or create a new commit log file with a shared LSN provider.
@@ -136,14 +138,16 @@ impl FileClogService {
     pub fn open_with_lsn_provider(
         config: FileClogConfig,
         lsn_provider: SharedLsnProvider,
+        io_handle: &tokio::runtime::Handle,
     ) -> Result<Self> {
-        Self::open_internal(config, Some(lsn_provider))
+        Self::open_internal(config, Some(lsn_provider), io_handle)
     }
 
     /// Internal open implementation
     fn open_internal(
         config: FileClogConfig,
         shared_provider: Option<SharedLsnProvider>,
+        io_handle: &tokio::runtime::Handle,
     ) -> Result<Self> {
         // Ensure directory exists
         std::fs::create_dir_all(&config.clog_dir)?;
@@ -230,18 +234,22 @@ impl FileClogService {
         );
 
         let group_writer =
-            super::group_commit::GroupCommitWriter::new(BufWriter::new(file_for_write));
+            super::group_commit::GroupCommitWriter::new(BufWriter::new(file_for_write), io_handle);
 
         Ok(Self {
             config,
             lsn_provider,
             group_writer: Mutex::new(group_writer),
+            io_handle: io_handle.clone(),
         })
     }
 
     /// Recover entries from commit log file (standalone mode)
-    pub fn recover(config: FileClogConfig) -> Result<(Self, Vec<ClogEntry>)> {
-        Self::recover_internal(config, None)
+    pub fn recover(
+        config: FileClogConfig,
+        io_handle: &tokio::runtime::Handle,
+    ) -> Result<(Self, Vec<ClogEntry>)> {
+        Self::recover_internal(config, None, io_handle)
     }
 
     /// Recover entries with a shared LSN provider.
@@ -251,20 +259,22 @@ impl FileClogService {
     pub fn recover_with_lsn_provider(
         config: FileClogConfig,
         lsn_provider: SharedLsnProvider,
+        io_handle: &tokio::runtime::Handle,
     ) -> Result<(Self, Vec<ClogEntry>)> {
-        Self::recover_internal(config, Some(lsn_provider))
+        Self::recover_internal(config, Some(lsn_provider), io_handle)
     }
 
     /// Internal recover implementation
     fn recover_internal(
         config: FileClogConfig,
         shared_provider: Option<SharedLsnProvider>,
+        io_handle: &tokio::runtime::Handle,
     ) -> Result<(Self, Vec<ClogEntry>)> {
         let clog_path = config.clog_path();
 
         if !clog_path.exists() {
             // No commit log file, start fresh
-            let service = Self::open_internal(config, shared_provider)?;
+            let service = Self::open_internal(config, shared_provider, io_handle)?;
             return Ok((service, vec![]));
         }
 
@@ -281,7 +291,7 @@ impl FileClogService {
         );
 
         // Open service at recovered position
-        let service = Self::open_internal(config, shared_provider)?;
+        let service = Self::open_internal(config, shared_provider, io_handle)?;
 
         Ok((service, entries))
     }
@@ -525,8 +535,7 @@ struct PreparedWriteBatch {
 impl FileClogService {
     /// Prepare a WriteBatch for clog writing: allocate LSNs, build entries, serialize.
     ///
-    /// This is the shared logic between the sync `write_batch()` and async
-    /// `write_batch_async()` paths. No I/O is performed here.
+    /// Shared serialization logic for `write_batch()`. No I/O is performed here.
     fn prepare_write_batch(
         &self,
         txn_id: TxnId,
@@ -578,9 +587,11 @@ impl FileClogService {
 }
 
 impl ClogService for FileClogService {
-    fn write(&self, batch: &mut ClogBatch, sync: bool) -> Result<Lsn> {
+    fn write(&self, batch: &mut ClogBatch, sync: bool) -> Result<ClogFsyncFuture> {
         if batch.is_empty() {
-            return Ok(self.lsn_provider.current_lsn());
+            let (tx, rx) = tokio::sync::oneshot::channel();
+            let _ = tx.send(Ok(()));
+            return Ok(ClogFsyncFuture::new(self.lsn_provider.current_lsn(), rx));
         }
 
         // Assign LSNs atomically (LsnProvider is atomic, no lock needed for ordering)
@@ -602,9 +613,10 @@ impl ClogService for FileClogService {
         fail_point!("clog_before_sync");
 
         // Submit to group commit writer (batches fsync with concurrent writers)
-        self.group_writer
+        let rx = self
+            .group_writer
             .lock()
-            .submit_with_sync(record_bytes, sync)
+            .submit(record_bytes, sync)
             .map_err(|e| TiSqlError::Internal(format!("Clog group commit failed: {e}")))?;
 
         // Failpoint: crash after clog fsync
@@ -618,7 +630,7 @@ impl ClogService for FileClogService {
             end_lsn
         );
 
-        Ok(end_lsn)
+        Ok(ClogFsyncFuture::new(end_lsn, rx))
     }
 
     fn write_batch(
@@ -627,20 +639,24 @@ impl ClogService for FileClogService {
         batch: &WriteBatch,
         commit_ts: Timestamp,
         sync: bool,
-    ) -> Result<Lsn> {
+    ) -> Result<ClogFsyncFuture> {
         if batch.is_empty() {
-            return Ok(self.lsn_provider.current_lsn());
+            let (tx, rx) = tokio::sync::oneshot::channel();
+            let _ = tx.send(Ok(()));
+            return Ok(ClogFsyncFuture::new(self.lsn_provider.current_lsn(), rx));
         }
 
         let prepared = self.prepare_write_batch(txn_id, batch, commit_ts)?;
+        let end_lsn = prepared.end_lsn;
 
         #[cfg(feature = "failpoints")]
         fail_point!("clog_before_sync");
 
         // Submit to group commit writer (batches fsync with concurrent writers)
-        self.group_writer
+        let rx = self
+            .group_writer
             .lock()
-            .submit_with_sync(prepared.record_bytes, sync)
+            .submit(prepared.record_bytes, sync)
             .map_err(|e| TiSqlError::Internal(format!("Clog group commit failed: {e}")))?;
 
         #[cfg(feature = "failpoints")]
@@ -652,16 +668,17 @@ impl ClogService for FileClogService {
             prepared.end_lsn
         );
 
-        Ok(prepared.end_lsn)
+        Ok(ClogFsyncFuture::new(end_lsn, rx))
     }
 
-    fn sync(&self) -> Result<()> {
+    fn sync(&self) -> Result<ClogFsyncFuture> {
         // Submit an empty write with sync=true to force a flush+fsync
-        self.group_writer
+        let rx = self
+            .group_writer
             .lock()
-            .submit_with_sync(Vec::new(), true)
+            .submit(Vec::new(), true)
             .map_err(|e| TiSqlError::Internal(format!("Clog group commit sync failed: {e}")))?;
-        Ok(())
+        Ok(ClogFsyncFuture::new(self.lsn_provider.current_lsn(), rx))
     }
 
     fn read_all(&self) -> Result<Vec<ClogEntry>> {
@@ -679,39 +696,13 @@ impl ClogService for FileClogService {
     fn close(&self) -> Result<()> {
         // Force a final sync through the group writer, then it will be
         // cleanly shut down when dropped.
-        self.sync()
+        let future = self.sync()?;
+        crate::io::block_on_sync(future)?;
+        Ok(())
     }
-}
 
-impl super::AsyncClogService for FileClogService {
-    fn write_batch_async(
-        &self,
-        txn_id: TxnId,
-        batch: &WriteBatch,
-        commit_ts: Timestamp,
-        sync: bool,
-    ) -> Result<super::ClogFsyncFuture> {
-        if batch.is_empty() {
-            // Empty batch: return an immediately-ready future.
-            let (tx, rx) = tokio::sync::oneshot::channel();
-            let _ = tx.send(Ok(()));
-            return Ok(super::ClogFsyncFuture::new(
-                self.lsn_provider.current_lsn(),
-                rx,
-            ));
-        }
-
-        let prepared = self.prepare_write_batch(txn_id, batch, commit_ts)?;
-        let end_lsn = prepared.end_lsn;
-
-        // Non-blocking submit — returns a oneshot receiver (Future)
-        let rx = self
-            .group_writer
-            .lock()
-            .submit_async(prepared.record_bytes, sync)
-            .map_err(|e| TiSqlError::Internal(format!("Clog group commit failed: {e}")))?;
-
-        Ok(super::ClogFsyncFuture::new(end_lsn, rx))
+    fn shutdown(&self) {
+        self.group_writer.lock().shutdown();
     }
 }
 
@@ -799,8 +790,11 @@ impl FileClogService {
             .open(&clog_path)?;
         file_for_write.seek(SeekFrom::End(0))?;
 
-        // Replace the group writer (old one is dropped, shutting down its thread)
-        *group_writer = super::group_commit::GroupCommitWriter::new(BufWriter::new(file_for_write));
+        // Replace the group writer (old one is dropped, shutting down its task)
+        *group_writer = super::group_commit::GroupCommitWriter::new(
+            BufWriter::new(file_for_write),
+            &self.io_handle,
+        );
 
         let new_size = std::fs::metadata(&clog_path).map(|m| m.len()).unwrap_or(0);
 
@@ -858,24 +852,25 @@ mod tests {
     use crate::clog::ClogOp;
     use tempfile::tempdir;
 
-    #[test]
-    fn test_open_and_write() {
+    #[tokio::test]
+    async fn test_open_and_write() {
         let dir = tempdir().unwrap();
         let config = FileClogConfig::with_dir(dir.path());
 
-        let service = FileClogService::open(config.clone()).unwrap();
+        let service =
+            FileClogService::open(config.clone(), &tokio::runtime::Handle::current()).unwrap();
 
         let mut batch = ClogBatch::new();
         batch.add_put(1, b"key1".to_vec(), b"value1".to_vec());
         batch.add_put(1, b"key2".to_vec(), b"value2".to_vec());
 
-        let lsn = service.write(&mut batch, true).unwrap();
+        let lsn = crate::io::block_on_sync(service.write(&mut batch, true).unwrap()).unwrap();
         assert_eq!(lsn, 2);
 
         service.close().unwrap();
 
         // Reopen and verify
-        let service2 = FileClogService::open(config).unwrap();
+        let service2 = FileClogService::open(config, &tokio::runtime::Handle::current()).unwrap();
         assert_eq!(service2.current_lsn(), 3);
 
         let entries = service2.read_all().unwrap();
@@ -884,24 +879,26 @@ mod tests {
         assert_eq!(entries[1].lsn, 2);
     }
 
-    #[test]
-    fn test_recover() {
+    #[tokio::test]
+    async fn test_recover() {
         let dir = tempdir().unwrap();
         let config = FileClogConfig::with_dir(dir.path());
 
         // Write some entries
         {
-            let service = FileClogService::open(config.clone()).unwrap();
+            let service =
+                FileClogService::open(config.clone(), &tokio::runtime::Handle::current()).unwrap();
             let mut batch = ClogBatch::new();
             batch.add_put(1, b"k1".to_vec(), b"v1".to_vec());
             batch.add_delete(1, b"k2".to_vec());
             batch.add_commit(1, 100);
-            service.write(&mut batch, true).unwrap();
+            crate::io::block_on_sync(service.write(&mut batch, true).unwrap()).unwrap();
             service.close().unwrap();
         }
 
         // Recover
-        let (service, entries) = FileClogService::recover(config).unwrap();
+        let (service, entries) =
+            FileClogService::recover(config, &tokio::runtime::Handle::current()).unwrap();
         assert_eq!(entries.len(), 3);
 
         match &entries[0].op {
@@ -943,19 +940,20 @@ mod tests {
 
     /// Test recovery with truncated record header (partial header write).
     /// Simulates crash during the 12-byte header write.
-    #[test]
-    fn test_recover_truncated_header() {
+    #[tokio::test]
+    async fn test_recover_truncated_header() {
         let dir = tempdir().unwrap();
         let config = FileClogConfig::with_dir(dir.path());
         let clog_path = config.clog_path();
 
         // Write one valid record
         {
-            let service = FileClogService::open(config.clone()).unwrap();
+            let service =
+                FileClogService::open(config.clone(), &tokio::runtime::Handle::current()).unwrap();
             let mut batch = ClogBatch::new();
             batch.add_put(1, b"valid_key".to_vec(), b"valid_value".to_vec());
             batch.add_commit(1, 100);
-            service.write(&mut batch, true).unwrap();
+            crate::io::block_on_sync(service.write(&mut batch, true).unwrap()).unwrap();
             service.close().unwrap();
         }
 
@@ -968,7 +966,8 @@ mod tests {
         }
 
         // Recovery should skip the truncated header and recover valid entries
-        let (service, entries) = FileClogService::recover(config).unwrap();
+        let (service, entries) =
+            FileClogService::recover(config, &tokio::runtime::Handle::current()).unwrap();
 
         // Should recover the 2 valid entries (Put + Commit)
         assert_eq!(
@@ -985,19 +984,20 @@ mod tests {
 
     /// Test recovery with truncated record data (header complete, data partial).
     /// Simulates crash during the data write after header was written.
-    #[test]
-    fn test_recover_truncated_data() {
+    #[tokio::test]
+    async fn test_recover_truncated_data() {
         let dir = tempdir().unwrap();
         let config = FileClogConfig::with_dir(dir.path());
         let clog_path = config.clog_path();
 
         // Write one valid record
         {
-            let service = FileClogService::open(config.clone()).unwrap();
+            let service =
+                FileClogService::open(config.clone(), &tokio::runtime::Handle::current()).unwrap();
             let mut batch = ClogBatch::new();
             batch.add_put(1, b"key1".to_vec(), b"value1".to_vec());
             batch.add_commit(1, 100);
-            service.write(&mut batch, true).unwrap();
+            crate::io::block_on_sync(service.write(&mut batch, true).unwrap()).unwrap();
             service.close().unwrap();
         }
 
@@ -1017,7 +1017,8 @@ mod tests {
         }
 
         // Recovery should skip the truncated record
-        let (service, entries) = FileClogService::recover(config).unwrap();
+        let (service, entries) =
+            FileClogService::recover(config, &tokio::runtime::Handle::current()).unwrap();
 
         assert_eq!(entries.len(), 2, "Should recover entries before truncation");
         assert_eq!(service.current_lsn(), 3);
@@ -1025,27 +1026,28 @@ mod tests {
 
     /// Test recovery with corrupted checksum.
     /// Simulates data corruption (bit flip) after write.
-    #[test]
-    fn test_recover_corrupted_checksum() {
+    #[tokio::test]
+    async fn test_recover_corrupted_checksum() {
         let dir = tempdir().unwrap();
         let config = FileClogConfig::with_dir(dir.path());
         let clog_path = config.clog_path();
 
         // Write two valid records
         {
-            let service = FileClogService::open(config.clone()).unwrap();
+            let service =
+                FileClogService::open(config.clone(), &tokio::runtime::Handle::current()).unwrap();
 
             // First batch
             let mut batch1 = ClogBatch::new();
             batch1.add_put(1, b"key1".to_vec(), b"value1".to_vec());
             batch1.add_commit(1, 100);
-            service.write(&mut batch1, true).unwrap();
+            crate::io::block_on_sync(service.write(&mut batch1, true).unwrap()).unwrap();
 
             // Second batch
             let mut batch2 = ClogBatch::new();
             batch2.add_put(2, b"key2".to_vec(), b"value2".to_vec());
             batch2.add_commit(2, 200);
-            service.write(&mut batch2, true).unwrap();
+            crate::io::block_on_sync(service.write(&mut batch2, true).unwrap()).unwrap();
 
             service.close().unwrap();
         }
@@ -1083,7 +1085,8 @@ mod tests {
         }
 
         // Recovery should stop at corrupted record
-        let (service, entries) = FileClogService::recover(config).unwrap();
+        let (service, entries) =
+            FileClogService::recover(config, &tokio::runtime::Handle::current()).unwrap();
 
         // Should only recover the first batch (2 entries)
         assert_eq!(entries.len(), 2, "Should stop at corrupted record");
@@ -1101,15 +1104,16 @@ mod tests {
 
     /// Test recovery after simulated crash with multiple valid batches.
     /// Verifies that all data before crash point is recovered.
-    #[test]
-    fn test_recover_multiple_batches_before_crash() {
+    #[tokio::test]
+    async fn test_recover_multiple_batches_before_crash() {
         let dir = tempdir().unwrap();
         let config = FileClogConfig::with_dir(dir.path());
         let clog_path = config.clog_path();
 
         // Write multiple batches
         {
-            let service = FileClogService::open(config.clone()).unwrap();
+            let service =
+                FileClogService::open(config.clone(), &tokio::runtime::Handle::current()).unwrap();
 
             for i in 1..=5 {
                 let mut batch = ClogBatch::new();
@@ -1119,7 +1123,7 @@ mod tests {
                     format!("value{i}").into_bytes(),
                 );
                 batch.add_commit(i, i * 100);
-                service.write(&mut batch, true).unwrap();
+                crate::io::block_on_sync(service.write(&mut batch, true).unwrap()).unwrap();
             }
             service.close().unwrap();
         }
@@ -1132,7 +1136,8 @@ mod tests {
         }
 
         // Recovery should get all 5 batches (10 entries)
-        let (service, entries) = FileClogService::recover(config).unwrap();
+        let (service, entries) =
+            FileClogService::recover(config, &tokio::runtime::Handle::current()).unwrap();
 
         assert_eq!(entries.len(), 10, "Should recover all valid entries");
         assert_eq!(service.current_lsn(), 11);
@@ -1147,34 +1152,37 @@ mod tests {
 
     /// Test that recovery can continue writing after crash.
     /// Simulates: write -> crash -> recover -> write more -> verify all data.
-    #[test]
-    fn test_recover_and_continue_writing() {
+    #[tokio::test]
+    async fn test_recover_and_continue_writing() {
         let dir = tempdir().unwrap();
         let config = FileClogConfig::with_dir(dir.path());
 
         // First session: write some data
         {
-            let service = FileClogService::open(config.clone()).unwrap();
+            let service =
+                FileClogService::open(config.clone(), &tokio::runtime::Handle::current()).unwrap();
             let mut batch = ClogBatch::new();
             batch.add_put(1, b"before_crash".to_vec(), b"v1".to_vec());
             batch.add_commit(1, 100);
-            service.write(&mut batch, true).unwrap();
+            crate::io::block_on_sync(service.write(&mut batch, true).unwrap()).unwrap();
             // Simulate crash - no close() call
         }
 
         // Second session: recover and write more
-        let (service, entries) = FileClogService::recover(config.clone()).unwrap();
+        let (service, entries) =
+            FileClogService::recover(config.clone(), &tokio::runtime::Handle::current()).unwrap();
         assert_eq!(entries.len(), 2);
 
         // Write more data after recovery
         let mut batch = ClogBatch::new();
         batch.add_put(2, b"after_crash".to_vec(), b"v2".to_vec());
         batch.add_commit(2, 200);
-        service.write(&mut batch, true).unwrap();
+        crate::io::block_on_sync(service.write(&mut batch, true).unwrap()).unwrap();
         service.close().unwrap();
 
         // Third session: verify all data
-        let (_, all_entries) = FileClogService::recover(config).unwrap();
+        let (_, all_entries) =
+            FileClogService::recover(config, &tokio::runtime::Handle::current()).unwrap();
         assert_eq!(
             all_entries.len(),
             4,
@@ -1204,19 +1212,20 @@ mod tests {
     ///
     /// The fix truncates the corrupted tail during open/recover, so subsequent
     /// writes are appended directly after the last valid record.
-    #[test]
-    fn test_truncate_corrupted_tail_before_write() {
+    #[tokio::test]
+    async fn test_truncate_corrupted_tail_before_write() {
         let dir = tempdir().unwrap();
         let config = FileClogConfig::with_dir(dir.path());
         let clog_path = config.clog_path();
 
         // Phase 1: Write initial valid data
         {
-            let service = FileClogService::open(config.clone()).unwrap();
+            let service =
+                FileClogService::open(config.clone(), &tokio::runtime::Handle::current()).unwrap();
             let mut batch = ClogBatch::new();
             batch.add_put(1, b"key1".to_vec(), b"value1".to_vec());
             batch.add_commit(1, 100);
-            service.write(&mut batch, true).unwrap();
+            crate::io::block_on_sync(service.write(&mut batch, true).unwrap()).unwrap();
             service.close().unwrap();
         }
 
@@ -1232,7 +1241,8 @@ mod tests {
         let file_size_with_garbage = std::fs::metadata(&clog_path).unwrap().len();
 
         // Phase 3: Recover and write more data
-        let (service, entries) = FileClogService::recover(config.clone()).unwrap();
+        let (service, entries) =
+            FileClogService::recover(config.clone(), &tokio::runtime::Handle::current()).unwrap();
         assert_eq!(entries.len(), 2, "Should recover 2 entries before garbage");
 
         // After recovery, garbage should be truncated
@@ -1246,11 +1256,12 @@ mod tests {
         let mut batch = ClogBatch::new();
         batch.add_put(2, b"key2".to_vec(), b"value2".to_vec());
         batch.add_commit(2, 200);
-        service.write(&mut batch, true).unwrap();
+        crate::io::block_on_sync(service.write(&mut batch, true).unwrap()).unwrap();
         service.close().unwrap();
 
         // Phase 4: Recover again and verify all data is present
-        let (_, all_entries) = FileClogService::recover(config).unwrap();
+        let (_, all_entries) =
+            FileClogService::recover(config, &tokio::runtime::Handle::current()).unwrap();
         assert_eq!(
             all_entries.len(),
             4,
@@ -1271,20 +1282,22 @@ mod tests {
 
     /// Test recovery with empty file (only header, no records).
     /// Simulates crash immediately after file creation.
-    #[test]
-    fn test_recover_empty_clog() {
+    #[tokio::test]
+    async fn test_recover_empty_clog() {
         let dir = tempdir().unwrap();
         let config = FileClogConfig::with_dir(dir.path());
 
         // Create file but don't write any records
         {
-            let service = FileClogService::open(config.clone()).unwrap();
+            let service =
+                FileClogService::open(config.clone(), &tokio::runtime::Handle::current()).unwrap();
             // Simulate crash before any writes
             service.close().unwrap();
         }
 
         // Recovery should succeed with empty entries
-        let (service, entries) = FileClogService::recover(config).unwrap();
+        let (service, entries) =
+            FileClogService::recover(config, &tokio::runtime::Handle::current()).unwrap();
         assert_eq!(entries.len(), 0);
         assert_eq!(service.current_lsn(), 1);
     }
@@ -1292,14 +1305,16 @@ mod tests {
     /// Test concurrent clog writes produce monotonic LSNs in file order.
     /// This verifies the fix for the LSN out-of-order issue where concurrent
     /// writers could produce entries with non-monotonic LSNs in the file.
-    #[test]
-    fn test_concurrent_writes_lsn_ordering() {
+    #[tokio::test]
+    async fn test_concurrent_writes_lsn_ordering() {
         use std::sync::{Arc, Barrier};
         use std::thread;
 
         let dir = tempdir().unwrap();
         let config = FileClogConfig::with_dir(dir.path());
-        let service = Arc::new(FileClogService::open(config.clone()).unwrap());
+        let service = Arc::new(
+            FileClogService::open(config.clone(), &tokio::runtime::Handle::current()).unwrap(),
+        );
 
         let num_threads = 8;
         let writes_per_thread = 100;
@@ -1320,7 +1335,7 @@ mod tests {
                         format!("key_{tid}_{i}").into_bytes(),
                         format!("value_{tid}_{i}").into_bytes(),
                     );
-                    service.write(&mut batch, false).unwrap();
+                    crate::io::block_on_sync(service.write(&mut batch, false).unwrap()).unwrap();
                 }
             }));
         }
@@ -1332,7 +1347,8 @@ mod tests {
         service.close().unwrap();
 
         // Recover and verify LSN ordering
-        let (recovered_service, entries) = FileClogService::recover(config).unwrap();
+        let (recovered_service, entries) =
+            FileClogService::recover(config, &tokio::runtime::Handle::current()).unwrap();
 
         // Verify all entries were written
         let expected_count = num_threads * writes_per_thread;
@@ -1371,8 +1387,8 @@ mod tests {
 
     /// Test clog with shared LSN provider.
     /// Verifies that clog uses the shared provider for LSN allocation.
-    #[test]
-    fn test_shared_lsn_provider() {
+    #[tokio::test]
+    async fn test_shared_lsn_provider() {
         use crate::lsn::new_lsn_provider;
 
         let dir = tempdir().unwrap();
@@ -1384,8 +1400,12 @@ mod tests {
         assert_eq!(provider.alloc_lsn(), 2);
 
         // Open clog with shared provider
-        let service =
-            FileClogService::open_with_lsn_provider(config.clone(), provider.clone()).unwrap();
+        let service = FileClogService::open_with_lsn_provider(
+            config.clone(),
+            provider.clone(),
+            &tokio::runtime::Handle::current(),
+        )
+        .unwrap();
 
         // Current LSN should be from provider
         assert_eq!(service.current_lsn(), 3);
@@ -1393,7 +1413,7 @@ mod tests {
         // Write to clog - should allocate LSN 3
         let mut batch = ClogBatch::new();
         batch.add_put(1, b"key1".to_vec(), b"value1".to_vec());
-        let lsn = service.write(&mut batch, true).unwrap();
+        let lsn = crate::io::block_on_sync(service.write(&mut batch, true).unwrap()).unwrap();
         assert_eq!(lsn, 3);
 
         // Provider should have advanced
@@ -1402,14 +1422,18 @@ mod tests {
         // Write more
         let mut batch2 = ClogBatch::new();
         batch2.add_put(2, b"key2".to_vec(), b"value2".to_vec());
-        let lsn2 = service.write(&mut batch2, true).unwrap();
+        let lsn2 = crate::io::block_on_sync(service.write(&mut batch2, true).unwrap()).unwrap();
         assert_eq!(lsn2, 4);
 
         service.close().unwrap();
 
         // Recover with same provider
-        let (recovered, entries) =
-            FileClogService::recover_with_lsn_provider(config, provider.clone()).unwrap();
+        let (recovered, entries) = FileClogService::recover_with_lsn_provider(
+            config,
+            provider.clone(),
+            &tokio::runtime::Handle::current(),
+        )
+        .unwrap();
         assert_eq!(entries.len(), 2);
         assert_eq!(entries[0].lsn, 3);
         assert_eq!(entries[1].lsn, 4);
@@ -1418,8 +1442,8 @@ mod tests {
     }
 
     /// Test that shared provider is updated when clog has higher LSN.
-    #[test]
-    fn test_shared_provider_updated_from_clog() {
+    #[tokio::test]
+    async fn test_shared_provider_updated_from_clog() {
         use crate::lsn::new_lsn_provider;
 
         let dir = tempdir().unwrap();
@@ -1427,12 +1451,13 @@ mod tests {
 
         // First: write to clog with standalone mode
         {
-            let service = FileClogService::open(config.clone()).unwrap();
+            let service =
+                FileClogService::open(config.clone(), &tokio::runtime::Handle::current()).unwrap();
             let mut batch = ClogBatch::new();
             batch.add_put(1, b"k1".to_vec(), b"v1".to_vec());
             batch.add_put(1, b"k2".to_vec(), b"v2".to_vec());
             batch.add_put(1, b"k3".to_vec(), b"v3".to_vec());
-            service.write(&mut batch, true).unwrap();
+            crate::io::block_on_sync(service.write(&mut batch, true).unwrap()).unwrap();
             // LSNs 1, 2, 3 are used
             service.close().unwrap();
         }
@@ -1442,20 +1467,25 @@ mod tests {
         assert_eq!(provider.current_lsn(), 1);
 
         // Recover with shared provider - it should be updated to 4
-        let (recovered, entries) =
-            FileClogService::recover_with_lsn_provider(config, provider.clone()).unwrap();
+        let (recovered, entries) = FileClogService::recover_with_lsn_provider(
+            config,
+            provider.clone(),
+            &tokio::runtime::Handle::current(),
+        )
+        .unwrap();
         assert_eq!(entries.len(), 3);
         assert_eq!(provider.current_lsn(), 4); // max(3) + 1
         assert_eq!(recovered.current_lsn(), 4);
     }
 
     /// Test read_from_lsn for partial replay during recovery.
-    #[test]
-    fn test_read_from_lsn() {
+    #[tokio::test]
+    async fn test_read_from_lsn() {
         let dir = tempdir().unwrap();
         let config = FileClogConfig::with_dir(dir.path());
 
-        let service = FileClogService::open(config.clone()).unwrap();
+        let service =
+            FileClogService::open(config.clone(), &tokio::runtime::Handle::current()).unwrap();
 
         // Write 5 entries with LSN 1-5
         for i in 1..=5 {
@@ -1465,7 +1495,7 @@ mod tests {
                 format!("key{i}").into_bytes(),
                 format!("val{i}").into_bytes(),
             );
-            service.write(&mut batch, true).unwrap();
+            crate::io::block_on_sync(service.write(&mut batch, true).unwrap()).unwrap();
         }
 
         // Read from LSN 3
@@ -1487,12 +1517,13 @@ mod tests {
     }
 
     /// Test max_lsn helper.
-    #[test]
-    fn test_max_lsn() {
+    #[tokio::test]
+    async fn test_max_lsn() {
         let dir = tempdir().unwrap();
         let config = FileClogConfig::with_dir(dir.path());
 
-        let service = FileClogService::open(config.clone()).unwrap();
+        let service =
+            FileClogService::open(config.clone(), &tokio::runtime::Handle::current()).unwrap();
 
         // Empty clog
         assert_eq!(service.max_lsn().unwrap(), 0);
@@ -1501,7 +1532,7 @@ mod tests {
         let mut batch = ClogBatch::new();
         batch.add_put(1, b"k1".to_vec(), b"v1".to_vec());
         batch.add_put(1, b"k2".to_vec(), b"v2".to_vec());
-        service.write(&mut batch, true).unwrap();
+        crate::io::block_on_sync(service.write(&mut batch, true).unwrap()).unwrap();
 
         assert_eq!(service.max_lsn().unwrap(), 2);
 
@@ -1514,13 +1545,14 @@ mod tests {
 
     /// Test write_batch() zero-copy serialization path.
     /// This is the preferred method for transaction commits.
-    #[test]
-    fn test_write_batch_zero_copy() {
+    #[tokio::test]
+    async fn test_write_batch_zero_copy() {
         use crate::storage::WriteBatch;
 
         let dir = tempdir().unwrap();
         let config = FileClogConfig::with_dir(dir.path());
-        let service = FileClogService::open(config.clone()).unwrap();
+        let service =
+            FileClogService::open(config.clone(), &tokio::runtime::Handle::current()).unwrap();
 
         // Create a WriteBatch with various operations
         let mut batch = WriteBatch::new();
@@ -1532,16 +1564,20 @@ mod tests {
         let commit_ts = 100;
 
         // Write using zero-copy path
-        let lsn = service
-            .write_batch(txn_id, &batch, commit_ts, true)
-            .unwrap();
+        let lsn = crate::io::block_on_sync(
+            service
+                .write_batch(txn_id, &batch, commit_ts, true)
+                .unwrap(),
+        )
+        .unwrap();
         // 3 ops + 1 commit = 4 entries, so last LSN is 4
         assert_eq!(lsn, 4);
 
         service.close().unwrap();
 
         // Recover and verify
-        let (_, entries) = FileClogService::recover(config).unwrap();
+        let (_, entries) =
+            FileClogService::recover(config, &tokio::runtime::Handle::current()).unwrap();
         assert_eq!(entries.len(), 4);
 
         // Verify Put 1
@@ -1586,31 +1622,35 @@ mod tests {
 
     /// Test that write_batch() and write() produce compatible on-disk formats.
     /// Both should be readable after recovery.
-    #[test]
-    fn test_write_batch_and_write_interleaved() {
+    #[tokio::test]
+    async fn test_write_batch_and_write_interleaved() {
         use crate::storage::WriteBatch;
 
         let dir = tempdir().unwrap();
         let config = FileClogConfig::with_dir(dir.path());
-        let service = FileClogService::open(config.clone()).unwrap();
+        let service =
+            FileClogService::open(config.clone(), &tokio::runtime::Handle::current()).unwrap();
 
         // Write using ClogBatch (owned path)
         let mut clog_batch = ClogBatch::new();
         clog_batch.add_put(1, b"owned_key".to_vec(), b"owned_value".to_vec());
         clog_batch.add_commit(1, 100);
-        let lsn1 = service.write(&mut clog_batch, true).unwrap();
+        let lsn1 = crate::io::block_on_sync(service.write(&mut clog_batch, true).unwrap()).unwrap();
         assert_eq!(lsn1, 2);
 
         // Write using WriteBatch (zero-copy path)
         let mut write_batch = WriteBatch::new();
         write_batch.put(b"zerocopy_key".to_vec(), b"zerocopy_value".to_vec());
-        let lsn2 = service.write_batch(2, &write_batch, 200, true).unwrap();
+        let lsn2 =
+            crate::io::block_on_sync(service.write_batch(2, &write_batch, 200, true).unwrap())
+                .unwrap();
         assert_eq!(lsn2, 4); // 1 put + 1 commit = 2 more entries
 
         service.close().unwrap();
 
         // Recover and verify all entries
-        let (_, entries) = FileClogService::recover(config).unwrap();
+        let (_, entries) =
+            FileClogService::recover(config, &tokio::runtime::Handle::current()).unwrap();
         assert_eq!(entries.len(), 4);
 
         // Verify first batch (owned)
@@ -1635,22 +1675,25 @@ mod tests {
     }
 
     /// Test write_batch() with empty WriteBatch returns current LSN.
-    #[test]
-    fn test_write_batch_empty() {
+    #[tokio::test]
+    async fn test_write_batch_empty() {
         use crate::storage::WriteBatch;
 
         let dir = tempdir().unwrap();
         let config = FileClogConfig::with_dir(dir.path());
-        let service = FileClogService::open(config.clone()).unwrap();
+        let service =
+            FileClogService::open(config.clone(), &tokio::runtime::Handle::current()).unwrap();
 
         // Write some entries first
         let mut batch = ClogBatch::new();
         batch.add_put(1, b"k".to_vec(), b"v".to_vec());
-        service.write(&mut batch, true).unwrap();
+        crate::io::block_on_sync(service.write(&mut batch, true).unwrap()).unwrap();
 
         // Now try write_batch with empty batch
         let empty_batch = WriteBatch::new();
-        let lsn = service.write_batch(2, &empty_batch, 100, true).unwrap();
+        let lsn =
+            crate::io::block_on_sync(service.write_batch(2, &empty_batch, 100, true).unwrap())
+                .unwrap();
 
         // Should return current LSN (2, since we wrote 1 entry)
         assert_eq!(lsn, 2);
@@ -1667,11 +1710,12 @@ mod tests {
     // ========================================================================
 
     /// Test write() with empty ClogBatch returns current LSN without writing.
-    #[test]
-    fn test_write_empty_clog_batch() {
+    #[tokio::test]
+    async fn test_write_empty_clog_batch() {
         let dir = tempdir().unwrap();
         let config = FileClogConfig::with_dir(dir.path());
-        let service = FileClogService::open(config.clone()).unwrap();
+        let service =
+            FileClogService::open(config.clone(), &tokio::runtime::Handle::current()).unwrap();
 
         // Initial LSN is 1
         assert_eq!(service.current_lsn(), 1);
@@ -1679,7 +1723,7 @@ mod tests {
         // Write empty batch
         let mut empty_batch = ClogBatch::new();
         assert!(empty_batch.is_empty());
-        let lsn = service.write(&mut empty_batch, true).unwrap();
+        let lsn = crate::io::block_on_sync(service.write(&mut empty_batch, true).unwrap()).unwrap();
 
         // Should return current LSN without incrementing
         assert_eq!(lsn, 1);
@@ -1697,19 +1741,20 @@ mod tests {
     // ========================================================================
 
     /// Test sync() flushes pending writes to disk.
-    #[test]
-    fn test_sync() {
+    #[tokio::test]
+    async fn test_sync() {
         let dir = tempdir().unwrap();
         let config = FileClogConfig::with_dir(dir.path());
-        let service = FileClogService::open(config.clone()).unwrap();
+        let service =
+            FileClogService::open(config.clone(), &tokio::runtime::Handle::current()).unwrap();
 
         // Write without sync
         let mut batch = ClogBatch::new();
         batch.add_put(1, b"key".to_vec(), b"value".to_vec());
-        service.write(&mut batch, false).unwrap(); // sync=false
+        crate::io::block_on_sync(service.write(&mut batch, false).unwrap()).unwrap(); // sync=false
 
         // Explicitly sync
-        service.sync().unwrap();
+        crate::io::block_on_sync(service.sync().unwrap()).unwrap();
 
         // Verify data is readable
         let entries = service.read_all().unwrap();
@@ -1719,23 +1764,25 @@ mod tests {
     }
 
     /// Test close() properly flushes and syncs.
-    #[test]
-    fn test_close() {
+    #[tokio::test]
+    async fn test_close() {
         let dir = tempdir().unwrap();
         let config = FileClogConfig::with_dir(dir.path());
 
         {
-            let service = FileClogService::open(config.clone()).unwrap();
+            let service =
+                FileClogService::open(config.clone(), &tokio::runtime::Handle::current()).unwrap();
             let mut batch = ClogBatch::new();
             batch.add_put(1, b"key".to_vec(), b"value".to_vec());
-            service.write(&mut batch, false).unwrap(); // No sync during write
+            crate::io::block_on_sync(service.write(&mut batch, false).unwrap()).unwrap(); // No sync during write
 
             // Close should flush and sync
             service.close().unwrap();
         }
 
         // Verify data persisted after close
-        let (_, entries) = FileClogService::recover(config).unwrap();
+        let (_, entries) =
+            FileClogService::recover(config, &tokio::runtime::Handle::current()).unwrap();
         assert_eq!(entries.len(), 1);
     }
 
@@ -1744,11 +1791,12 @@ mod tests {
     // ========================================================================
 
     /// Test oldest_lsn() returns correct value.
-    #[test]
-    fn test_oldest_lsn() {
+    #[tokio::test]
+    async fn test_oldest_lsn() {
         let dir = tempdir().unwrap();
         let config = FileClogConfig::with_dir(dir.path());
-        let service = FileClogService::open(config.clone()).unwrap();
+        let service =
+            FileClogService::open(config.clone(), &tokio::runtime::Handle::current()).unwrap();
 
         // Empty clog
         assert_eq!(service.oldest_lsn().unwrap(), 0);
@@ -1758,7 +1806,7 @@ mod tests {
         batch.add_put(1, b"k1".to_vec(), b"v1".to_vec());
         batch.add_put(1, b"k2".to_vec(), b"v2".to_vec());
         batch.add_put(1, b"k3".to_vec(), b"v3".to_vec());
-        service.write(&mut batch, true).unwrap();
+        crate::io::block_on_sync(service.write(&mut batch, true).unwrap()).unwrap();
 
         // Oldest should be 1
         assert_eq!(service.oldest_lsn().unwrap(), 1);
@@ -1767,11 +1815,12 @@ mod tests {
     }
 
     /// Test file_size() returns correct value.
-    #[test]
-    fn test_file_size() {
+    #[tokio::test]
+    async fn test_file_size() {
         let dir = tempdir().unwrap();
         let config = FileClogConfig::with_dir(dir.path());
-        let service = FileClogService::open(config.clone()).unwrap();
+        let service =
+            FileClogService::open(config.clone(), &tokio::runtime::Handle::current()).unwrap();
 
         // Initial file has just header (16 bytes)
         let initial_size = service.file_size().unwrap();
@@ -1780,7 +1829,7 @@ mod tests {
         // Write some data
         let mut batch = ClogBatch::new();
         batch.add_put(1, b"key".to_vec(), b"value".to_vec());
-        service.write(&mut batch, true).unwrap();
+        crate::io::block_on_sync(service.write(&mut batch, true).unwrap()).unwrap();
 
         // File should be larger now
         let new_size = service.file_size().unwrap();
@@ -1794,11 +1843,12 @@ mod tests {
     // ========================================================================
 
     /// Test truncate_to() removes entries with lsn <= safe_lsn.
-    #[test]
-    fn test_truncate_to() {
+    #[tokio::test]
+    async fn test_truncate_to() {
         let dir = tempdir().unwrap();
         let config = FileClogConfig::with_dir(dir.path());
-        let service = FileClogService::open(config.clone()).unwrap();
+        let service =
+            FileClogService::open(config.clone(), &tokio::runtime::Handle::current()).unwrap();
 
         // Write 5 entries (LSN 1-5)
         for i in 1..=5 {
@@ -1808,7 +1858,7 @@ mod tests {
                 format!("key{i}").into_bytes(),
                 format!("val{i}").into_bytes(),
             );
-            service.write(&mut batch, true).unwrap();
+            crate::io::block_on_sync(service.write(&mut batch, true).unwrap()).unwrap();
         }
 
         // Verify we have 5 entries
@@ -1833,18 +1883,19 @@ mod tests {
     }
 
     /// Test truncate_to() with safe_lsn higher than all entries (removes all).
-    #[test]
-    fn test_truncate_to_all() {
+    #[tokio::test]
+    async fn test_truncate_to_all() {
         let dir = tempdir().unwrap();
         let config = FileClogConfig::with_dir(dir.path());
-        let service = FileClogService::open(config.clone()).unwrap();
+        let service =
+            FileClogService::open(config.clone(), &tokio::runtime::Handle::current()).unwrap();
 
         // Write 3 entries
         let mut batch = ClogBatch::new();
         batch.add_put(1, b"k1".to_vec(), b"v1".to_vec());
         batch.add_put(1, b"k2".to_vec(), b"v2".to_vec());
         batch.add_put(1, b"k3".to_vec(), b"v3".to_vec());
-        service.write(&mut batch, true).unwrap();
+        crate::io::block_on_sync(service.write(&mut batch, true).unwrap()).unwrap();
 
         // Truncate all (safe_lsn >= max LSN)
         let stats = service.truncate_to(10).unwrap();
@@ -1861,18 +1912,19 @@ mod tests {
     }
 
     /// Test truncate_to() when nothing needs to be truncated.
-    #[test]
-    fn test_truncate_to_none() {
+    #[tokio::test]
+    async fn test_truncate_to_none() {
         let dir = tempdir().unwrap();
         let config = FileClogConfig::with_dir(dir.path());
-        let service = FileClogService::open(config.clone()).unwrap();
+        let service =
+            FileClogService::open(config.clone(), &tokio::runtime::Handle::current()).unwrap();
 
         // Write entries with LSN 1-3
         let mut batch = ClogBatch::new();
         batch.add_put(1, b"k1".to_vec(), b"v1".to_vec());
         batch.add_put(1, b"k2".to_vec(), b"v2".to_vec());
         batch.add_put(1, b"k3".to_vec(), b"v3".to_vec());
-        service.write(&mut batch, true).unwrap();
+        crate::io::block_on_sync(service.write(&mut batch, true).unwrap()).unwrap();
 
         let size_before = service.file_size().unwrap();
 
@@ -1890,18 +1942,19 @@ mod tests {
     }
 
     /// Test truncate_to() then continue writing.
-    #[test]
-    fn test_truncate_then_write() {
+    #[tokio::test]
+    async fn test_truncate_then_write() {
         let dir = tempdir().unwrap();
         let config = FileClogConfig::with_dir(dir.path());
-        let service = FileClogService::open(config.clone()).unwrap();
+        let service =
+            FileClogService::open(config.clone(), &tokio::runtime::Handle::current()).unwrap();
 
         // Write entries with LSN 1-3
         let mut batch = ClogBatch::new();
         batch.add_put(1, b"k1".to_vec(), b"v1".to_vec());
         batch.add_put(1, b"k2".to_vec(), b"v2".to_vec());
         batch.add_put(1, b"k3".to_vec(), b"v3".to_vec());
-        service.write(&mut batch, true).unwrap();
+        crate::io::block_on_sync(service.write(&mut batch, true).unwrap()).unwrap();
 
         // Truncate LSN 1-2
         service.truncate_to(2).unwrap();
@@ -1909,7 +1962,7 @@ mod tests {
         // Write more entries
         let mut batch2 = ClogBatch::new();
         batch2.add_put(2, b"k4".to_vec(), b"v4".to_vec());
-        let lsn = service.write(&mut batch2, true).unwrap();
+        let lsn = crate::io::block_on_sync(service.write(&mut batch2, true).unwrap()).unwrap();
         assert_eq!(lsn, 4); // LSN continues from 4
 
         // Verify entries
@@ -1926,11 +1979,12 @@ mod tests {
     // ========================================================================
 
     /// Test append() default trait method.
-    #[test]
-    fn test_append() {
+    #[tokio::test]
+    async fn test_append() {
         let dir = tempdir().unwrap();
         let config = FileClogConfig::with_dir(dir.path());
-        let service = FileClogService::open(config.clone()).unwrap();
+        let service =
+            FileClogService::open(config.clone(), &tokio::runtime::Handle::current()).unwrap();
 
         // Use append (default implementation wraps write)
         let entry = ClogEntry {
@@ -1941,7 +1995,7 @@ mod tests {
                 value: b"value".to_vec(),
             },
         };
-        let lsn = service.append(entry, true).unwrap();
+        let lsn = crate::io::block_on_sync(service.append(entry, true).unwrap()).unwrap();
         assert_eq!(lsn, 1);
 
         // Append another
@@ -1950,7 +2004,7 @@ mod tests {
             txn_id: 1,
             op: ClogOp::Commit { commit_ts: 100 },
         };
-        let lsn2 = service.append(entry2, true).unwrap();
+        let lsn2 = crate::io::block_on_sync(service.append(entry2, true).unwrap()).unwrap();
         assert_eq!(lsn2, 2);
 
         // Verify
@@ -2042,8 +2096,8 @@ mod tests {
     // ========================================================================
 
     /// Test recovery with invalid magic bytes.
-    #[test]
-    fn test_invalid_magic() {
+    #[tokio::test]
+    async fn test_invalid_magic() {
         let dir = tempdir().unwrap();
         let clog_path = dir.path().join("tisql.clog");
 
@@ -2057,7 +2111,7 @@ mod tests {
         }
 
         let config = FileClogConfig::with_dir(dir.path());
-        let result = FileClogService::open(config);
+        let result = FileClogService::open(config, &tokio::runtime::Handle::current());
 
         match result {
             Err(e) => {
@@ -2072,8 +2126,8 @@ mod tests {
     }
 
     /// Test recovery with unsupported version.
-    #[test]
-    fn test_unsupported_version() {
+    #[tokio::test]
+    async fn test_unsupported_version() {
         let dir = tempdir().unwrap();
         let clog_path = dir.path().join("tisql.clog");
 
@@ -2087,7 +2141,7 @@ mod tests {
         }
 
         let config = FileClogConfig::with_dir(dir.path());
-        let result = FileClogService::open(config);
+        let result = FileClogService::open(config, &tokio::runtime::Handle::current());
 
         match result {
             Err(e) => {
@@ -2102,18 +2156,19 @@ mod tests {
     }
 
     /// Test recovery with unknown record type.
-    #[test]
-    fn test_unknown_record_type() {
+    #[tokio::test]
+    async fn test_unknown_record_type() {
         let dir = tempdir().unwrap();
         let config = FileClogConfig::with_dir(dir.path());
         let clog_path = config.clog_path();
 
         // Create valid clog first
         {
-            let service = FileClogService::open(config.clone()).unwrap();
+            let service =
+                FileClogService::open(config.clone(), &tokio::runtime::Handle::current()).unwrap();
             let mut batch = ClogBatch::new();
             batch.add_put(1, b"key".to_vec(), b"value".to_vec());
-            service.write(&mut batch, true).unwrap();
+            crate::io::block_on_sync(service.write(&mut batch, true).unwrap()).unwrap();
             service.close().unwrap();
         }
 
@@ -2133,24 +2188,26 @@ mod tests {
         }
 
         // Recovery should stop at unknown record type
-        let (service, entries) = FileClogService::recover(config).unwrap();
+        let (service, entries) =
+            FileClogService::recover(config, &tokio::runtime::Handle::current()).unwrap();
         assert_eq!(entries.len(), 1); // Only the first valid entry
         assert_eq!(service.current_lsn(), 2);
     }
 
     /// Test recovery with record size exceeding MAX_RECORD_SIZE.
-    #[test]
-    fn test_record_size_exceeds_max() {
+    #[tokio::test]
+    async fn test_record_size_exceeds_max() {
         let dir = tempdir().unwrap();
         let config = FileClogConfig::with_dir(dir.path());
         let clog_path = config.clog_path();
 
         // Create valid clog first
         {
-            let service = FileClogService::open(config.clone()).unwrap();
+            let service =
+                FileClogService::open(config.clone(), &tokio::runtime::Handle::current()).unwrap();
             let mut batch = ClogBatch::new();
             batch.add_put(1, b"key".to_vec(), b"value".to_vec());
-            service.write(&mut batch, true).unwrap();
+            crate::io::block_on_sync(service.write(&mut batch, true).unwrap()).unwrap();
             service.close().unwrap();
         }
 
@@ -2169,7 +2226,8 @@ mod tests {
         }
 
         // Recovery should stop at the oversized record
-        let (service, entries) = FileClogService::recover(config).unwrap();
+        let (service, entries) =
+            FileClogService::recover(config, &tokio::runtime::Handle::current()).unwrap();
         assert_eq!(entries.len(), 1);
         assert_eq!(service.current_lsn(), 2);
     }
@@ -2179,13 +2237,14 @@ mod tests {
     // ========================================================================
 
     /// Test recover() when clog file doesn't exist.
-    #[test]
-    fn test_recover_nonexistent_file() {
+    #[tokio::test]
+    async fn test_recover_nonexistent_file() {
         let dir = tempdir().unwrap();
         let config = FileClogConfig::with_dir(dir.path());
 
         // Don't create any file - just recover
-        let (service, entries) = FileClogService::recover(config).unwrap();
+        let (service, entries) =
+            FileClogService::recover(config, &tokio::runtime::Handle::current()).unwrap();
         assert!(entries.is_empty());
         assert_eq!(service.current_lsn(), 1);
     }
@@ -2195,8 +2254,8 @@ mod tests {
     // ========================================================================
 
     /// Test that open() creates directory if it doesn't exist.
-    #[test]
-    fn test_auto_create_directory() {
+    #[tokio::test]
+    async fn test_auto_create_directory() {
         let dir = tempdir().unwrap();
         let nested_dir = dir.path().join("nested").join("path");
         let config = FileClogConfig::with_dir(&nested_dir);
@@ -2205,16 +2264,18 @@ mod tests {
         assert!(!nested_dir.exists());
 
         // Open should create it
-        let service = FileClogService::open(config.clone()).unwrap();
+        let service =
+            FileClogService::open(config.clone(), &tokio::runtime::Handle::current()).unwrap();
         assert!(nested_dir.exists());
 
         // Write and verify
         let mut batch = ClogBatch::new();
         batch.add_put(1, b"key".to_vec(), b"value".to_vec());
-        service.write(&mut batch, true).unwrap();
+        crate::io::block_on_sync(service.write(&mut batch, true).unwrap()).unwrap();
         service.close().unwrap();
 
-        let (_, entries) = FileClogService::recover(config).unwrap();
+        let (_, entries) =
+            FileClogService::recover(config, &tokio::runtime::Handle::current()).unwrap();
         assert_eq!(entries.len(), 1);
     }
 
@@ -2223,11 +2284,12 @@ mod tests {
     // ========================================================================
 
     /// Test Rollback operation serialization and recovery.
-    #[test]
-    fn test_rollback_operation() {
+    #[tokio::test]
+    async fn test_rollback_operation() {
         let dir = tempdir().unwrap();
         let config = FileClogConfig::with_dir(dir.path());
-        let service = FileClogService::open(config.clone()).unwrap();
+        let service =
+            FileClogService::open(config.clone(), &tokio::runtime::Handle::current()).unwrap();
 
         // Write a put followed by rollback
         let mut batch = ClogBatch::new();
@@ -2237,11 +2299,12 @@ mod tests {
             txn_id: 1,
             op: ClogOp::Rollback,
         });
-        service.write(&mut batch, true).unwrap();
+        crate::io::block_on_sync(service.write(&mut batch, true).unwrap()).unwrap();
         service.close().unwrap();
 
         // Recover and verify rollback
-        let (_, entries) = FileClogService::recover(config).unwrap();
+        let (_, entries) =
+            FileClogService::recover(config, &tokio::runtime::Handle::current()).unwrap();
         assert_eq!(entries.len(), 2);
 
         match &entries[1].op {
@@ -2255,15 +2318,17 @@ mod tests {
     // ========================================================================
 
     /// Test concurrent writes using write_batch() (zero-copy path).
-    #[test]
-    fn test_concurrent_write_batch() {
+    #[tokio::test]
+    async fn test_concurrent_write_batch() {
         use crate::storage::WriteBatch;
         use std::sync::{Arc, Barrier};
         use std::thread;
 
         let dir = tempdir().unwrap();
         let config = FileClogConfig::with_dir(dir.path());
-        let service = Arc::new(FileClogService::open(config.clone()).unwrap());
+        let service = Arc::new(
+            FileClogService::open(config.clone(), &tokio::runtime::Handle::current()).unwrap(),
+        );
 
         let num_threads = 4;
         let writes_per_thread = 50;
@@ -2283,9 +2348,12 @@ mod tests {
                         format!("key_{tid}_{i}").into_bytes(),
                         format!("value_{tid}_{i}").into_bytes(),
                     );
-                    service
-                        .write_batch(tid as u64, &batch, (tid * 1000 + i) as u64, false)
-                        .unwrap();
+                    crate::io::block_on_sync(
+                        service
+                            .write_batch(tid as u64, &batch, (tid * 1000 + i) as u64, false)
+                            .unwrap(),
+                    )
+                    .unwrap();
                 }
             }));
         }
@@ -2297,7 +2365,8 @@ mod tests {
         service.close().unwrap();
 
         // Recover and verify
-        let (_, entries) = FileClogService::recover(config).unwrap();
+        let (_, entries) =
+            FileClogService::recover(config, &tokio::runtime::Handle::current()).unwrap();
 
         // Each thread writes: 1 put + 1 commit = 2 entries per iteration
         let expected_count = num_threads * writes_per_thread * 2;
@@ -2318,11 +2387,12 @@ mod tests {
     // ========================================================================
 
     /// Test batch with multiple operation types.
-    #[test]
-    fn test_mixed_operations_batch() {
+    #[tokio::test]
+    async fn test_mixed_operations_batch() {
         let dir = tempdir().unwrap();
         let config = FileClogConfig::with_dir(dir.path());
-        let service = FileClogService::open(config.clone()).unwrap();
+        let service =
+            FileClogService::open(config.clone(), &tokio::runtime::Handle::current()).unwrap();
 
         // Create batch with all operation types
         let mut batch = ClogBatch::new();
@@ -2332,13 +2402,14 @@ mod tests {
         batch.add_put(1, b"key3".to_vec(), b"value3".to_vec());
         batch.add_commit(1, 1000);
 
-        let lsn = service.write(&mut batch, true).unwrap();
+        let lsn = crate::io::block_on_sync(service.write(&mut batch, true).unwrap()).unwrap();
         assert_eq!(lsn, 5);
 
         service.close().unwrap();
 
         // Recover and verify order
-        let (_, entries) = FileClogService::recover(config).unwrap();
+        let (_, entries) =
+            FileClogService::recover(config, &tokio::runtime::Handle::current()).unwrap();
         assert_eq!(entries.len(), 5);
 
         // Verify order and types
@@ -2360,18 +2431,19 @@ mod tests {
     // ========================================================================
 
     /// Test recovery with corrupted data that passes CRC but fails deserialization.
-    #[test]
-    fn test_corrupted_bincode_data() {
+    #[tokio::test]
+    async fn test_corrupted_bincode_data() {
         let dir = tempdir().unwrap();
         let config = FileClogConfig::with_dir(dir.path());
         let clog_path = config.clog_path();
 
         // Write valid data first
         {
-            let service = FileClogService::open(config.clone()).unwrap();
+            let service =
+                FileClogService::open(config.clone(), &tokio::runtime::Handle::current()).unwrap();
             let mut batch = ClogBatch::new();
             batch.add_put(1, b"key".to_vec(), b"value".to_vec());
-            service.write(&mut batch, true).unwrap();
+            crate::io::block_on_sync(service.write(&mut batch, true).unwrap()).unwrap();
             service.close().unwrap();
         }
 
@@ -2394,7 +2466,8 @@ mod tests {
         }
 
         // Recovery should stop at the bad record
-        let (service, entries) = FileClogService::recover(config).unwrap();
+        let (service, entries) =
+            FileClogService::recover(config, &tokio::runtime::Handle::current()).unwrap();
         assert_eq!(entries.len(), 1); // Only the first valid entry
         assert_eq!(service.current_lsn(), 2);
     }
@@ -2528,11 +2601,12 @@ mod tests {
     // ========================================================================
 
     /// Test writes with sync=false still work and data is recoverable.
-    #[test]
-    fn test_write_without_sync() {
+    #[tokio::test]
+    async fn test_write_without_sync() {
         let dir = tempdir().unwrap();
         let config = FileClogConfig::with_dir(dir.path());
-        let service = FileClogService::open(config.clone()).unwrap();
+        let service =
+            FileClogService::open(config.clone(), &tokio::runtime::Handle::current()).unwrap();
 
         // Write multiple batches without sync
         for i in 1..=5 {
@@ -2542,14 +2616,16 @@ mod tests {
                 format!("key{i}").into_bytes(),
                 format!("val{i}").into_bytes(),
             );
-            service.write(&mut batch, false).unwrap(); // sync=false
+            crate::io::block_on_sync(service.write(&mut batch, false).unwrap()).unwrap();
+            // sync=false
         }
 
         // Close (which flushes and syncs)
         service.close().unwrap();
 
         // Verify data is recoverable
-        let (_, entries) = FileClogService::recover(config).unwrap();
+        let (_, entries) =
+            FileClogService::recover(config, &tokio::runtime::Handle::current()).unwrap();
         assert_eq!(entries.len(), 5);
     }
 
@@ -2558,11 +2634,12 @@ mod tests {
     // ========================================================================
 
     /// Test recovery with many separate batches.
-    #[test]
-    fn test_many_batches_recovery() {
+    #[tokio::test]
+    async fn test_many_batches_recovery() {
         let dir = tempdir().unwrap();
         let config = FileClogConfig::with_dir(dir.path());
-        let service = FileClogService::open(config.clone()).unwrap();
+        let service =
+            FileClogService::open(config.clone(), &tokio::runtime::Handle::current()).unwrap();
 
         // Write 20 separate batches
         for i in 1..=20 {
@@ -2573,13 +2650,14 @@ mod tests {
                 format!("val{i}").into_bytes(),
             );
             batch.add_commit(i, i * 100);
-            service.write(&mut batch, true).unwrap();
+            crate::io::block_on_sync(service.write(&mut batch, true).unwrap()).unwrap();
         }
 
         service.close().unwrap();
 
         // Recover and verify all batches
-        let (service2, entries) = FileClogService::recover(config.clone()).unwrap();
+        let (service2, entries) =
+            FileClogService::recover(config.clone(), &tokio::runtime::Handle::current()).unwrap();
         assert_eq!(entries.len(), 40); // 20 puts + 20 commits
         assert_eq!(service2.current_lsn(), 41);
 
@@ -2593,11 +2671,12 @@ mod tests {
     // ========================================================================
 
     /// Test with larger key and value sizes.
-    #[test]
-    fn test_large_key_value() {
+    #[tokio::test]
+    async fn test_large_key_value() {
         let dir = tempdir().unwrap();
         let config = FileClogConfig::with_dir(dir.path());
-        let service = FileClogService::open(config.clone()).unwrap();
+        let service =
+            FileClogService::open(config.clone(), &tokio::runtime::Handle::current()).unwrap();
 
         // Create large key and value (1KB each)
         let large_key: Vec<u8> = (0..1024).map(|i| (i % 256) as u8).collect();
@@ -2606,11 +2685,12 @@ mod tests {
         let mut batch = ClogBatch::new();
         batch.add_put(1, large_key.clone(), large_value.clone());
         batch.add_commit(1, 100);
-        service.write(&mut batch, true).unwrap();
+        crate::io::block_on_sync(service.write(&mut batch, true).unwrap()).unwrap();
         service.close().unwrap();
 
         // Recover and verify
-        let (_, entries) = FileClogService::recover(config).unwrap();
+        let (_, entries) =
+            FileClogService::recover(config, &tokio::runtime::Handle::current()).unwrap();
         assert_eq!(entries.len(), 2);
 
         match &entries[0].op {

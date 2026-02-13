@@ -53,7 +53,7 @@ mod tso;
 
 // Re-export public interfaces (traits only) and commonly used types
 pub use catalog::Catalog;
-pub use clog::{AsyncClogService, ClogFsyncFuture, ClogService};
+pub use clog::{ClogFsyncFuture, ClogService};
 pub use lsn::{new_lsn_provider, LsnProvider, SharedLsnProvider};
 pub use protocol::{MySqlServer, MYSQL_DEFAULT_PORT};
 pub use session::{ExecutionCtx, Priority, QueryCtx, Session, SessionRegistry, SessionVars};
@@ -130,7 +130,7 @@ pub mod testkit {
         fn autocommit_put(&self, key: &[u8], value: &[u8]) -> Result<CommitInfo> {
             let mut ctx = self.begin(false)?;
             match self.put(&mut ctx, key.to_vec(), value.to_vec()) {
-                Ok(()) => self.commit(ctx),
+                Ok(()) => crate::io::block_on_sync(self.commit(ctx)),
                 Err(e) => {
                     let _ = self.rollback(ctx);
                     Err(e)
@@ -141,7 +141,7 @@ pub mod testkit {
         fn autocommit_delete(&self, key: &[u8]) -> Result<CommitInfo> {
             let mut ctx = self.begin(false)?;
             match self.delete(&mut ctx, key.to_vec()) {
-                Ok(()) => self.commit(ctx),
+                Ok(()) => crate::io::block_on_sync(self.commit(ctx)),
                 Err(e) => {
                     let _ = self.rollback(ctx);
                     Err(e)
@@ -324,6 +324,10 @@ pub struct Database {
     /// Dedicated worker runtime for query execution (separate from protocol I/O).
     /// Created in `open()` for production; `None` in tests (falls back to tokio::spawn).
     worker_runtime: Option<tokio::runtime::Runtime>,
+    /// Background runtime for flush, compaction, GC workers.
+    bg_runtime: Option<tokio::runtime::Runtime>,
+    /// I/O runtime for group commit (clog + ilog) and io_uring.
+    io_runtime: Option<tokio::runtime::Runtime>,
     /// Registry of active explicit transactions for GC safe point computation.
     session_registry: Arc<session::SessionRegistry>,
 }
@@ -336,9 +340,21 @@ impl Database {
     pub fn open(config: DatabaseConfig) -> Result<Self> {
         log_info!("Opening TiSQL database at {:?}", config.data_dir);
 
-        // Use LsmRecovery for coordinated recovery of storage and logs
+        // 1. Create I/O runtime FIRST — recovery needs it for GroupCommitWriter + IoService
+        let io_runtime = tokio::runtime::Builder::new_multi_thread()
+            .worker_threads(2)
+            .thread_name("tisql-io")
+            .enable_all()
+            .build()
+            .map_err(|e| {
+                crate::error::TiSqlError::Internal(format!("Failed to create I/O runtime: {e}"))
+            })?;
+
+        log_info!("I/O runtime created with 2 threads");
+
+        // 2. Recovery uses io_runtime handle for GroupCommitWriter + IoService
         let recovery = LsmRecovery::new(&config.data_dir);
-        let recovery_result = recovery.recover()?;
+        let recovery_result = recovery.recover(io_runtime.handle())?;
 
         log_info!(
             "LSM recovery complete: {} clog entries replayed, {} txns, flushed_lsn={}, max_commit_ts={}",
@@ -351,13 +367,27 @@ impl Database {
         // Wrap storage in Arc
         let storage = Arc::new(recovery_result.engine);
 
-        // Start background flush scheduler
-        let flush_scheduler = FlushScheduler::new(Arc::clone(&storage));
-        flush_scheduler.start();
+        // 3. Create background runtime for flush, compaction, GC
+        let bg_runtime = tokio::runtime::Builder::new_multi_thread()
+            .worker_threads(2)
+            .thread_name("tisql-bg")
+            .enable_all()
+            .build()
+            .map_err(|e| {
+                crate::error::TiSqlError::Internal(format!(
+                    "Failed to create background runtime: {e}"
+                ))
+            })?;
 
-        // Start background compaction scheduler
+        log_info!("Background runtime created with 2 threads");
+
+        // Start background flush scheduler on bg runtime
+        let flush_scheduler = FlushScheduler::new(Arc::clone(&storage));
+        flush_scheduler.start(bg_runtime.handle());
+
+        // Start background compaction scheduler on bg runtime
         let compaction_scheduler = CompactionScheduler::new(Arc::clone(&storage));
-        compaction_scheduler.start();
+        compaction_scheduler.start(bg_runtime.handle());
 
         // Wire: flush completion → notify compaction scheduler
         storage.set_compaction_notify(compaction_scheduler.notifier());
@@ -423,7 +453,7 @@ impl Database {
         // Start background GC worker for drop-table cleanup
         let gc_worker =
             inner_table::gc_worker::GcWorker::new(Arc::clone(&storage), Arc::clone(&txn_service));
-        gc_worker.start();
+        gc_worker.start(bg_runtime.handle());
 
         // Create dedicated worker runtime for query execution.
         // Sized to available parallelism (defaults to CPU count).
@@ -470,6 +500,8 @@ impl Database {
             compaction_scheduler,
             gc_worker,
             worker_runtime: Some(worker_runtime),
+            bg_runtime: Some(bg_runtime),
+            io_runtime: Some(io_runtime),
             session_registry,
         })
     }
@@ -480,6 +512,16 @@ impl Database {
     /// When `None`, `dispatch_full_query` falls back to `tokio::spawn`.
     pub fn worker_handle(&self) -> Option<&tokio::runtime::Handle> {
         self.worker_runtime.as_ref().map(|rt| rt.handle())
+    }
+
+    /// Get a handle to the background runtime, if available.
+    pub fn bg_handle(&self) -> Option<&tokio::runtime::Handle> {
+        self.bg_runtime.as_ref().map(|rt| rt.handle())
+    }
+
+    /// Get a handle to the I/O runtime, if available.
+    pub fn io_handle(&self) -> Option<&tokio::runtime::Handle> {
+        self.io_runtime.as_ref().map(|rt| rt.handle())
     }
 
     /// Get the session registry for tracking active transactions.
@@ -672,20 +714,12 @@ impl Database {
         self.txn_service.begin_explicit(read_only)
     }
 
-    /// Commit a transaction (synchronous — blocks on fsync).
+    /// Commit a transaction (blocks on clog fsync via block_on_sync).
     ///
-    /// This is called by the protocol layer when handling COMMIT.
-    /// Takes ownership of the TxnCtx from the Session.
+    /// This is called by inner-table operations and catalog DDL.
+    /// Worker-dispatched commits go through the async TxnService::commit() path.
     pub fn commit(&self, ctx: transaction::TxnCtx) -> Result<CommitInfo> {
-        self.txn_service.commit(ctx)
-    }
-
-    /// Commit a transaction asynchronously — yields while fsync completes.
-    ///
-    /// The clog write is submitted non-blocking and the caller `.await`s
-    /// the fsync future, freeing the worker thread for other tasks.
-    pub async fn commit_async(&self, ctx: transaction::TxnCtx) -> Result<CommitInfo> {
-        self.txn_service.commit_async(ctx).await
+        crate::io::block_on_sync(self.txn_service.commit(ctx))
     }
 
     /// Rollback a transaction.
@@ -771,23 +805,49 @@ impl Database {
 
 impl Drop for Database {
     fn drop(&mut self) {
-        // Shut down worker runtime first — drain in-flight queries before
-        // stopping background schedulers and flushing storage.
-        if let Some(rt) = self.worker_runtime.take() {
-            rt.shutdown_background();
-        }
-
-        // Stop GC worker before background schedulers
+        // 1. Stop background schedulers and GC worker
         self.gc_worker.stop();
-
-        // Stop background schedulers (flush before compaction)
         self.flush_scheduler.stop();
         self.compaction_scheduler.stop();
 
-        // Best-effort flush on drop
+        // 2. Final flush (needs I/O runtime — ilog writes go through group commit)
         let _ = self.storage.flush_all_with_active();
+
+        // 3. Close clog + ilog (sync pending writes)
         let _ = self.txn_service.clog_service().close();
         let _ = self.ilog.close();
+
+        // 4. Shutdown all spawn_blocking task channels BEFORE dropping io_runtime.
+        //
+        // GroupCommitWriter (clog + ilog) and IoService each run a spawn_blocking
+        // task on io_runtime that blocks on rx.recv(). Closing the sender channels
+        // causes recv() to return Err, exiting the loops. Without this,
+        // io_runtime.drop() blocks forever waiting for those tasks.
+        self.txn_service.clog_service().shutdown();
+        self.ilog.shutdown();
+        self.storage.io_service().shutdown();
+
+        // 5. Shut down runtimes.
+        //
+        // Tokio runtimes cannot be dropped from within an async context (panics).
+        // If we are inside a tokio runtime (tests, or nested drop), move the
+        // runtime objects to a dedicated thread for shutdown.
+        let worker_rt = self.worker_runtime.take();
+        let bg_rt = self.bg_runtime.take();
+        let io_rt = self.io_runtime.take();
+
+        let do_shutdown = move || {
+            drop(worker_rt);
+            drop(bg_rt);
+            drop(io_rt);
+        };
+
+        if tokio::runtime::Handle::try_current().is_ok() {
+            // Inside a tokio context — must not block. Spawn a thread for shutdown.
+            std::thread::spawn(do_shutdown);
+        } else {
+            do_shutdown();
+        }
     }
 }
 

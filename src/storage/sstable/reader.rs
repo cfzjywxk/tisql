@@ -310,7 +310,7 @@ mod tests {
 
     // Helper to create IoService for tests
     fn test_io() -> Arc<IoService> {
-        IoService::new(32).unwrap()
+        IoService::new_for_test(32).unwrap()
     }
 
     // Helper to create an SST file with test data

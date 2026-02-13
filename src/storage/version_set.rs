@@ -42,14 +42,16 @@
 //! ```
 
 use std::collections::VecDeque;
-use std::sync::{Arc, RwLock};
+use std::sync::Arc;
+
+use parking_lot::RwLock;
 
 use super::memtable::MemTable;
 use super::version::{ManifestDelta, Version};
 
 /// Minimal VersionSet - wraps Version with clean API.
 ///
-/// Currently uses RwLock (same semantics as before extraction).
+/// Uses parking_lot::RwLock for fair scheduling (no writer starvation of readers).
 /// Future optimization can add arc-swap for lock-free reads.
 pub struct VersionSet {
     current: RwLock<Arc<Version>>,
@@ -67,14 +69,14 @@ impl VersionSet {
     ///
     /// Acquires a read lock briefly to clone the Arc.
     pub fn current(&self) -> Arc<Version> {
-        Arc::clone(&self.current.read().unwrap())
+        Arc::clone(&self.current.read())
     }
 
     /// Apply a manifest delta and return the new version.
     ///
     /// Acquires a write lock to atomically update the current version.
     pub fn apply_delta(&self, delta: &ManifestDelta) -> Arc<Version> {
-        let mut current = self.current.write().unwrap();
+        let mut current = self.current.write();
         let new_version = current.apply(delta);
         let new_arc = Arc::new(new_version);
         *current = Arc::clone(&new_arc);

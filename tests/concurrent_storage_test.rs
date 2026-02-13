@@ -79,7 +79,8 @@ fn create_test_lsm_engine(dir: &TempDir) -> (Arc<LsmEngine>, Arc<IlogService>) {
     let lsn_provider = new_lsn_provider();
 
     let ilog_config = IlogConfig::new(dir.path());
-    let ilog = Arc::new(IlogService::open(ilog_config, Arc::clone(&lsn_provider)).unwrap());
+    let ilog =
+        Arc::new(IlogService::open_with_thread(ilog_config, Arc::clone(&lsn_provider)).unwrap());
 
     let config = LsmConfigBuilder::new(dir.path())
         .memtable_size(4096) // Small but large enough to hold multiple entries per memtable
@@ -106,8 +107,12 @@ fn write_test_data(engine: &LsmEngine, key: &[u8], value: &[u8], ts: u64) {
 
 /// Helper to recover an LSM engine.
 fn recover_engine(dir: &TempDir) -> RecoveryResult {
+    let rt = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .unwrap();
     let recovery = LsmRecovery::new(dir.path());
-    recovery.recover().unwrap()
+    recovery.recover(rt.handle()).unwrap()
 }
 
 // ============================================================================
@@ -1138,7 +1143,8 @@ fn test_scan_snapshot_isolation_during_rotation() {
     // Create engine with larger memtable to control rotation timing
     let lsn_provider = new_lsn_provider();
     let ilog_config = IlogConfig::new(dir.path());
-    let ilog = Arc::new(IlogService::open(ilog_config, Arc::clone(&lsn_provider)).unwrap());
+    let ilog =
+        Arc::new(IlogService::open_with_thread(ilog_config, Arc::clone(&lsn_provider)).unwrap());
 
     let config = LsmConfigBuilder::new(dir.path())
         .memtable_size(4096) // Larger to prevent auto-rotation
@@ -1316,7 +1322,8 @@ fn test_stress_rotations_with_concurrent_scans() {
 
     let lsn_provider = new_lsn_provider();
     let ilog_config = IlogConfig::new(dir.path());
-    let ilog = Arc::new(IlogService::open(ilog_config, Arc::clone(&lsn_provider)).unwrap());
+    let ilog =
+        Arc::new(IlogService::open_with_thread(ilog_config, Arc::clone(&lsn_provider)).unwrap());
 
     let config = LsmConfigBuilder::new(dir.path())
         .memtable_size(128) // Small to trigger frequent rotations
@@ -1499,7 +1506,8 @@ fn test_rotation_blocked_at_frozen_limit() {
 
     let lsn_provider = new_lsn_provider();
     let ilog_config = IlogConfig::new(dir.path());
-    let ilog = Arc::new(IlogService::open(ilog_config, Arc::clone(&lsn_provider)).unwrap());
+    let ilog =
+        Arc::new(IlogService::open_with_thread(ilog_config, Arc::clone(&lsn_provider)).unwrap());
 
     // Memtable large enough to hold test data without auto-rotation,
     // but small enough to demonstrate the concept
@@ -1583,7 +1591,8 @@ fn test_flush_unblocks_rotation() {
 
     let lsn_provider = new_lsn_provider();
     let ilog_config = IlogConfig::new(dir.path());
-    let ilog = Arc::new(IlogService::open(ilog_config, Arc::clone(&lsn_provider)).unwrap());
+    let ilog =
+        Arc::new(IlogService::open_with_thread(ilog_config, Arc::clone(&lsn_provider)).unwrap());
 
     let config = LsmConfigBuilder::new(dir.path())
         .memtable_size(2048) // Large enough to avoid auto-rotation
@@ -1661,7 +1670,8 @@ fn test_concurrent_writes_under_backpressure() {
 
     let lsn_provider = new_lsn_provider();
     let ilog_config = IlogConfig::new(dir.path());
-    let ilog = Arc::new(IlogService::open(ilog_config, Arc::clone(&lsn_provider)).unwrap());
+    let ilog =
+        Arc::new(IlogService::open_with_thread(ilog_config, Arc::clone(&lsn_provider)).unwrap());
 
     let config = LsmConfigBuilder::new(dir.path())
         .memtable_size(128)
@@ -1768,7 +1778,8 @@ fn test_slow_flush_causes_memtable_growth() {
 
     let lsn_provider = new_lsn_provider();
     let ilog_config = IlogConfig::new(dir.path());
-    let ilog = Arc::new(IlogService::open(ilog_config, Arc::clone(&lsn_provider)).unwrap());
+    let ilog =
+        Arc::new(IlogService::open_with_thread(ilog_config, Arc::clone(&lsn_provider)).unwrap());
 
     let config = LsmConfigBuilder::new(dir.path())
         .memtable_size(64)
@@ -1864,7 +1875,8 @@ fn test_large_batch_under_frozen_limit() {
 
     let lsn_provider = new_lsn_provider();
     let ilog_config = IlogConfig::new(dir.path());
-    let ilog = Arc::new(IlogService::open(ilog_config, Arc::clone(&lsn_provider)).unwrap());
+    let ilog =
+        Arc::new(IlogService::open_with_thread(ilog_config, Arc::clone(&lsn_provider)).unwrap());
 
     let config = LsmConfigBuilder::new(dir.path())
         .memtable_size(128)

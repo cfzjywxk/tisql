@@ -46,22 +46,16 @@ use tokio::sync::Notify;
 
 use super::lsm::LsmEngine;
 
-/// Handle for the worker — either a tokio task or a std thread.
-enum WorkerHandle {
-    Tokio(tokio::task::JoinHandle<()>),
-    Thread(std::thread::JoinHandle<()>),
-}
-
 /// Background flush scheduler for LSM storage engine.
 ///
-/// Runs a tokio task (preferred) or std::thread (fallback when no runtime)
-/// that flushes frozen memtables to SST files.
+/// Runs a tokio task on the provided runtime handle that flushes frozen
+/// memtables to SST files.
 pub struct FlushScheduler {
     /// Shared state between caller and worker task.
     inner: Arc<FlushSchedulerInner>,
 
     /// Worker handle (None if not started or already stopped).
-    worker_handle: parking_lot::Mutex<Option<WorkerHandle>>,
+    worker_handle: parking_lot::Mutex<Option<tokio::task::JoinHandle<()>>>,
 }
 
 /// Shared state for the flush scheduler.
@@ -95,26 +89,19 @@ impl FlushScheduler {
         }
     }
 
-    /// Start the background flush worker.
+    /// Start the background flush worker on the given runtime.
     ///
-    /// Uses `tokio::spawn` if a tokio runtime is available, otherwise falls
-    /// back to `std::thread::spawn`. Does nothing if already started.
-    pub fn start(&self) {
-        let mut handle = self.worker_handle.lock();
-        if handle.is_some() {
+    /// Does nothing if already started.
+    pub fn start(&self, handle: &tokio::runtime::Handle) {
+        let mut worker = self.worker_handle.lock();
+        if worker.is_some() {
             return; // Already started
         }
 
         let inner = Arc::clone(&self.inner);
-        if let Ok(rt_handle) = tokio::runtime::Handle::try_current() {
-            *handle = Some(WorkerHandle::Tokio(rt_handle.spawn(async move {
-                inner.flush_worker_loop().await;
-            })));
-        } else {
-            *handle = Some(WorkerHandle::Thread(std::thread::spawn(move || {
-                inner.flush_worker_loop_sync();
-            })));
-        }
+        *worker = Some(handle.spawn(async move {
+            inner.flush_worker_loop().await;
+        }));
     }
 
     /// Stop the background flush worker.
@@ -126,17 +113,10 @@ impl FlushScheduler {
         self.inner.shutdown.store(true, Ordering::SeqCst);
         self.inner.notify.notify_one();
 
-        // Take the handle and abort/join
+        // Take the handle and abort
         let mut handle = self.worker_handle.lock();
-        if let Some(h) = handle.take() {
-            match h {
-                WorkerHandle::Tokio(jh) => jh.abort(),
-                WorkerHandle::Thread(jh) => {
-                    if jh.join().is_err() {
-                        tracing::warn!("Flush worker thread panicked");
-                    }
-                }
-            }
+        if let Some(jh) = handle.take() {
+            jh.abort();
         }
     }
 
@@ -217,35 +197,6 @@ impl FlushSchedulerInner {
         tracing::info!("Flush worker stopped");
     }
 
-    /// Main loop for the flush worker (sync — std::thread fallback).
-    fn flush_worker_loop_sync(&self) {
-        tracing::info!("Flush worker started (sync fallback)");
-
-        while !self.shutdown.load(Ordering::Relaxed) {
-            let frozen_count = self.engine.frozen_count();
-
-            if frozen_count > 0 {
-                match self.engine.flush_all() {
-                    Ok(metas) => {
-                        if !metas.is_empty() {
-                            self.flush_count
-                                .fetch_add(metas.len() as u64, Ordering::Relaxed);
-                        }
-                    }
-                    Err(e) => {
-                        tracing::error!("Flush failed: {e}");
-                        std::thread::sleep(Duration::from_millis(100));
-                    }
-                }
-            } else {
-                std::thread::sleep(Duration::from_millis(100));
-            }
-        }
-
-        self.final_flush();
-        tracing::info!("Flush worker stopped");
-    }
-
     /// Final flush on shutdown — drain any remaining frozen memtables.
     fn final_flush(&self) {
         let frozen_count = self.engine.frozen_count();
@@ -272,8 +223,8 @@ mod tests {
             .unwrap()
     }
 
-    #[test]
-    fn test_flush_scheduler_new() {
+    #[tokio::test]
+    async fn test_flush_scheduler_new() {
         let tmp = TempDir::new().unwrap();
         let config = test_config(tmp.path());
         let engine = Arc::new(LsmEngine::open(config).unwrap());
@@ -292,7 +243,7 @@ mod tests {
         let scheduler = FlushScheduler::new(engine);
 
         // Start
-        scheduler.start();
+        scheduler.start(&tokio::runtime::Handle::current());
         assert!(scheduler.is_running());
 
         // Stop
@@ -309,10 +260,11 @@ mod tests {
         let engine = Arc::new(LsmEngine::open(config).unwrap());
 
         let scheduler = FlushScheduler::new(engine);
+        let handle = tokio::runtime::Handle::current();
 
         // Start twice - should be safe
-        scheduler.start();
-        scheduler.start();
+        scheduler.start(&handle);
+        scheduler.start(&handle);
         assert!(scheduler.is_running());
 
         scheduler.stop();
@@ -326,7 +278,7 @@ mod tests {
 
         let scheduler = FlushScheduler::new(engine);
 
-        scheduler.start();
+        scheduler.start(&tokio::runtime::Handle::current());
         scheduler.stop();
         scheduler.stop(); // Should be safe
         tokio::time::sleep(Duration::from_millis(50)).await;
@@ -344,7 +296,7 @@ mod tests {
         let engine = Arc::new(LsmEngine::open(config).unwrap());
 
         let scheduler = FlushScheduler::new(Arc::clone(&engine));
-        scheduler.start();
+        scheduler.start(&tokio::runtime::Handle::current());
 
         // Write enough data to trigger rotation
         for i in 0..10 {
@@ -381,7 +333,7 @@ mod tests {
 
         {
             let scheduler = FlushScheduler::new(engine);
-            scheduler.start();
+            scheduler.start(&tokio::runtime::Handle::current());
             assert!(scheduler.is_running());
             // scheduler dropped here
         }
@@ -406,18 +358,18 @@ mod tests {
         let engine = Arc::new(LsmEngine::open(config).unwrap());
 
         let scheduler = Arc::new(FlushScheduler::new(Arc::clone(&engine)));
-        scheduler.start();
+        scheduler.start(&tokio::runtime::Handle::current());
 
         let write_count = Arc::new(AtomicUsize::new(0));
         let mut handles = vec![];
 
-        // Spawn 4 writer threads
+        // Spawn 4 writer tasks
         for t in 0..4 {
             let eng = Arc::clone(&engine);
             let sched = Arc::clone(&scheduler);
             let count = Arc::clone(&write_count);
 
-            let handle = std::thread::spawn(move || {
+            let handle = tokio::task::spawn_blocking(move || {
                 for i in 0..25 {
                     let mut batch = WriteBatch::new();
                     batch.set_commit_ts((t * 1000 + i + 1) as u64);
@@ -434,7 +386,7 @@ mod tests {
 
         // Wait for writers
         for h in handles {
-            h.join().unwrap();
+            h.await.unwrap();
         }
 
         assert_eq!(write_count.load(Ordering::Relaxed), 100);

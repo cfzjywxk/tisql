@@ -23,7 +23,7 @@ use std::sync::Arc;
 #[cfg(feature = "failpoints")]
 use fail::fail_point;
 
-use crate::clog::{AsyncClogService, ClogEntry, ClogFsyncFuture, ClogOp, ClogService};
+use crate::clog::{ClogEntry, ClogOp, ClogService};
 use crate::error::{Result, TiSqlError};
 use crate::log_warn;
 use crate::tso::TsoService;
@@ -253,166 +253,6 @@ impl<S: PessimisticStorage + 'static, L: ClogService + 'static, T: TsoService>
         }
         Ok((locked_keys, batch))
     }
-
-    /// Execute the common commit protocol after locks are acquired.
-    ///
-    /// Steps: Preparing → commit_ts → Prepared → clog → finalize → Committed.
-    ///
-    /// On success, returns (commit_ts, lsn). On failure, the caller is responsible
-    /// for cleanup (abort_pending, abort_txn, remove_txn).
-    fn run_commit_protocol(
-        &self,
-        txn_id: TxnId,
-        start_ts: Timestamp,
-        locked_keys: &[Key],
-        storage_batch: &WriteBatch,
-    ) -> Result<(Timestamp, u64)> {
-        // FAILPOINT: After locks acquired (pending nodes written), before commit_ts computation
-        #[cfg(feature = "failpoints")]
-        fail_point!("txn_after_lock_before_commit_ts");
-
-        // Step 1: Signal that we're computing commit_ts.
-        // Readers encountering our pending nodes will spin-wait until Prepared.
-        self.concurrency_manager.set_preparing_txn(start_ts)?;
-
-        // Step 2: Compute commit_ts (safe: readers spin on Preparing)
-        let max_ts = self.concurrency_manager.max_ts();
-        let tso_ts = self.get_ts();
-        let commit_ts = std::cmp::max(max_ts + 1, tso_ts);
-
-        // Step 3: Set prepared_ts for readers to check visibility
-        self.concurrency_manager.prepare_txn(start_ts, commit_ts)?;
-
-        // Step 4: Write to clog for durability before finalizing.
-        // If we crash after clog write but before finalize, recovery
-        // replays the clog entry to reconstruct the committed data.
-        let lsn = self
-            .clog_service
-            .write_batch(txn_id, storage_batch, commit_ts, true)?;
-
-        // Step 5: Finalize all pending nodes by setting their commit_ts.
-        // This makes the writes visible to readers with read_ts >= commit_ts.
-        self.storage
-            .finalize_pending(locked_keys, start_ts, commit_ts);
-
-        // Step 6: Transition to Committed in state cache
-        self.concurrency_manager.commit_txn(start_ts, commit_ts)?;
-
-        Ok((commit_ts, lsn))
-    }
-}
-
-// Async commit protocol — requires AsyncClogService for non-blocking clog writes.
-impl<S: PessimisticStorage + 'static, L: AsyncClogService + 'static, T: TsoService>
-    TransactionService<S, L, T>
-{
-    /// Phase 1 of async commit: prepare + serialize + submit clog (no I/O wait).
-    ///
-    /// Returns (commit_ts, ClogFsyncFuture). The caller awaits the future,
-    /// then calls `commit_protocol_finalize` to complete the commit.
-    ///
-    /// On failure, the caller is responsible for cleanup (abort_pending, abort_txn).
-    fn commit_protocol_submit(
-        &self,
-        txn_id: TxnId,
-        start_ts: Timestamp,
-        storage_batch: &WriteBatch,
-    ) -> Result<(Timestamp, ClogFsyncFuture)> {
-        #[cfg(feature = "failpoints")]
-        fail_point!("txn_after_lock_before_commit_ts");
-
-        // Step 1: Signal that we're computing commit_ts.
-        self.concurrency_manager.set_preparing_txn(start_ts)?;
-
-        // Step 2: Compute commit_ts
-        let max_ts = self.concurrency_manager.max_ts();
-        let tso_ts = self.get_ts();
-        let commit_ts = std::cmp::max(max_ts + 1, tso_ts);
-
-        // Step 3: Set prepared_ts for readers to check visibility
-        self.concurrency_manager.prepare_txn(start_ts, commit_ts)?;
-
-        // Step 4: Submit to clog (non-blocking — returns future)
-        let fsync_future =
-            self.clog_service
-                .write_batch_async(txn_id, storage_batch, commit_ts, true)?;
-
-        Ok((commit_ts, fsync_future))
-    }
-
-    /// Phase 2 of async commit: finalize in-memory state after fsync confirmed.
-    fn commit_protocol_finalize(
-        &self,
-        locked_keys: &[Key],
-        start_ts: Timestamp,
-        commit_ts: Timestamp,
-    ) -> Result<()> {
-        // Step 5: Finalize all pending nodes by setting their commit_ts.
-        self.storage
-            .finalize_pending(locked_keys, start_ts, commit_ts);
-
-        // Step 6: Transition to Committed in state cache
-        self.concurrency_manager.commit_txn(start_ts, commit_ts)?;
-
-        Ok(())
-    }
-
-    /// Commit an explicit transaction asynchronously.
-    ///
-    /// The clog write is submitted non-blocking and the caller `.await`s the
-    /// fsync future, yielding the thread while the I/O thread performs the
-    /// write + fsync. This frees the yatp worker thread for other work.
-    ///
-    /// The sync `commit()` (via TxnService trait) remains available for
-    /// autocommit, tests, and recovery.
-    pub async fn commit_async(&self, mut ctx: TxnCtx) -> Result<CommitInfo> {
-        Self::check_active(&ctx)?;
-
-        let txn_id = ctx.txn_id;
-        let start_ts = ctx.start_ts;
-
-        // Build locked_keys and storage_batch from pending nodes in storage.
-        let (locked_keys, storage_batch) = self.prepare_explicit_batch(&mut ctx)?;
-
-        // No-write transaction: clean up and return
-        if locked_keys.is_empty() {
-            if ctx.registered {
-                self.concurrency_manager.remove_txn(start_ts);
-            }
-            ctx.state = TxnState::Committed {
-                commit_ts: start_ts,
-            };
-            return Ok(CommitInfo {
-                txn_id,
-                commit_ts: start_ts,
-                lsn: 0,
-            });
-        }
-
-        // Phase 1: prepare + submit clog (no I/O wait)
-        match self.commit_protocol_submit(txn_id, start_ts, &storage_batch) {
-            Ok((commit_ts, fsync_future)) => {
-                // YIELD HERE — thread is free while fsync completes
-                let lsn = fsync_future.await?;
-
-                // Phase 2: finalize in-memory state
-                self.commit_protocol_finalize(&locked_keys, start_ts, commit_ts)?;
-                self.concurrency_manager.remove_txn(start_ts);
-                ctx.state = TxnState::Committed { commit_ts };
-                Ok(CommitInfo {
-                    txn_id,
-                    commit_ts,
-                    lsn,
-                })
-            }
-            Err(e) => {
-                self.storage.abort_pending(&locked_keys, start_ts);
-                self.concurrency_manager.abort_txn(start_ts).ok();
-                self.concurrency_manager.remove_txn(start_ts);
-                Err(e)
-            }
-        }
-    }
 }
 
 /// Implement TxnService trait for TransactionService
@@ -564,7 +404,7 @@ impl<S: PessimisticStorage + 'static, L: ClogService + 'static, T: TsoService> T
         }
     }
 
-    fn commit(&self, mut ctx: TxnCtx) -> Result<CommitInfo> {
+    async fn commit(&self, mut ctx: TxnCtx) -> Result<CommitInfo> {
         Self::check_active(&ctx)?;
 
         let txn_id = ctx.txn_id;
@@ -588,9 +428,36 @@ impl<S: PessimisticStorage + 'static, L: ClogService + 'static, T: TsoService> T
             });
         }
 
-        // Common commit protocol (Preparing → Prepared → clog → finalize → Committed)
-        match self.run_commit_protocol(txn_id, start_ts, &locked_keys, &storage_batch) {
-            Ok((commit_ts, lsn)) => {
+        // FAILPOINT: After locks acquired (pending nodes written), before commit_ts computation
+        #[cfg(feature = "failpoints")]
+        fail_point!("txn_after_lock_before_commit_ts");
+
+        // Step 1: Signal that we're computing commit_ts.
+        // Readers encountering our pending nodes will spin-wait until Prepared.
+        self.concurrency_manager.set_preparing_txn(start_ts)?;
+
+        // Step 2: Compute commit_ts (safe: readers spin on Preparing)
+        let max_ts = self.concurrency_manager.max_ts();
+        let tso_ts = self.get_ts();
+        let commit_ts = std::cmp::max(max_ts + 1, tso_ts);
+
+        // Step 3: Set prepared_ts for readers to check visibility
+        self.concurrency_manager.prepare_txn(start_ts, commit_ts)?;
+
+        // Step 4: Write to clog for durability — await fsync (yields worker thread)
+        match self
+            .clog_service
+            .write_batch(txn_id, &storage_batch, commit_ts, true)
+        {
+            Ok(fsync_future) => {
+                let lsn = fsync_future.await?; // YIELD HERE
+
+                // Step 5: Finalize all pending nodes by setting their commit_ts.
+                self.storage
+                    .finalize_pending(&locked_keys, start_ts, commit_ts);
+
+                // Step 6: Transition to Committed in state cache
+                self.concurrency_manager.commit_txn(start_ts, commit_ts)?;
                 self.concurrency_manager.remove_txn(start_ts);
                 ctx.state = TxnState::Committed { commit_ts };
                 Ok(CommitInfo {
@@ -949,7 +816,8 @@ mod tests {
     ) {
         let dir = tempdir().unwrap();
         let config = FileClogConfig::with_dir(dir.path());
-        let clog_service = Arc::new(FileClogService::open(config).unwrap());
+        let io_handle = tokio::runtime::Handle::current();
+        let clog_service = Arc::new(FileClogService::open(config, &io_handle).unwrap());
         let tso = Arc::new(LocalTso::new(1));
         let cm = Arc::new(ConcurrencyManager::new(0));
         let storage = Arc::new(MemTableEngine::new());
@@ -1020,10 +888,11 @@ mod tests {
     async fn test_recover() {
         let dir = tempdir().unwrap();
         let config = FileClogConfig::with_dir(dir.path());
+        let io_handle = tokio::runtime::Handle::current();
 
         // Write some data
         {
-            let clog_service = Arc::new(FileClogService::open(config.clone()).unwrap());
+            let clog_service = Arc::new(FileClogService::open(config.clone(), &io_handle).unwrap());
             let tso = Arc::new(LocalTso::new(1));
             let cm = Arc::new(ConcurrencyManager::new(0));
             let storage = Arc::new(MemTableEngine::new());
@@ -1037,7 +906,7 @@ mod tests {
         }
 
         // Recover
-        let (clog_service, entries) = FileClogService::recover(config).unwrap();
+        let (clog_service, entries) = FileClogService::recover(config, &io_handle).unwrap();
         let clog_service = Arc::new(clog_service);
         let tso = Arc::new(LocalTso::new(1));
         let cm = Arc::new(ConcurrencyManager::new(0));
@@ -1123,7 +992,7 @@ mod tests {
             .unwrap();
 
         // Commit
-        let info = txn_service.commit(ctx).unwrap();
+        let info = txn_service.commit(ctx).await.unwrap();
         assert!(info.commit_ts > 0);
         assert!(info.lsn > 0);
 
@@ -1143,7 +1012,7 @@ mod tests {
         // Delete via transaction
         let mut ctx = txn_service.begin(false).unwrap();
         txn_service.delete(&mut ctx, b"key1".to_vec()).unwrap();
-        txn_service.commit(ctx).unwrap();
+        txn_service.commit(ctx).await.unwrap();
 
         // Should be deleted in storage
         assert!(get_for_test(&*storage, b"key1").is_none());
@@ -1216,7 +1085,7 @@ mod tests {
         ));
 
         // Commit should succeed (no-op for read-only)
-        let info = txn_service.commit(ctx).unwrap();
+        let info = txn_service.commit(ctx).await.unwrap();
         assert_eq!(info.lsn, 0); // No log written
 
         // Nothing in storage
@@ -1612,7 +1481,7 @@ mod tests {
         assert_eq!(ctx.locked_keys[0], b"key1".to_vec());
 
         // Commit
-        let info = txn_service.commit(ctx).unwrap();
+        let info = txn_service.commit(ctx).await.unwrap();
         assert!(info.commit_ts > 0);
 
         // Data should be visible in storage
@@ -1655,7 +1524,7 @@ mod tests {
         txn_service.delete(&mut ctx, b"key1".to_vec()).unwrap();
 
         // Commit
-        txn_service.commit(ctx).unwrap();
+        txn_service.commit(ctx).await.unwrap();
 
         // Data should be deleted
         let value = get_for_test(&*storage, b"key1");
@@ -1684,7 +1553,7 @@ mod tests {
         assert_eq!(ctx.locked_keys.len(), 3);
 
         // Commit
-        txn_service.commit(ctx).unwrap();
+        txn_service.commit(ctx).await.unwrap();
 
         // All data should be visible
         assert_eq!(get_for_test(&*storage, b"key1"), Some(b"value1".to_vec()));
@@ -1711,7 +1580,7 @@ mod tests {
         assert_eq!(ctx.locked_keys.len(), 1);
 
         // Commit
-        txn_service.commit(ctx).unwrap();
+        txn_service.commit(ctx).await.unwrap();
 
         // Should see latest value
         let value = get_for_test(&*storage, b"key1");
@@ -1736,7 +1605,7 @@ mod tests {
         assert!(ctx.locked_keys.is_empty());
 
         // Commit should succeed (no-op for read-only)
-        let info = txn_service.commit(ctx).unwrap();
+        let info = txn_service.commit(ctx).await.unwrap();
         assert_eq!(info.lsn, 0);
     }
 
@@ -1749,7 +1618,7 @@ mod tests {
         assert!(ctx.locked_keys.is_empty());
 
         // Commit should succeed (no-op)
-        let info = txn_service.commit(ctx).unwrap();
+        let info = txn_service.commit(ctx).await.unwrap();
         assert_eq!(info.lsn, 0);
     }
 
@@ -1820,7 +1689,7 @@ mod tests {
         txn_service
             .put(&mut setup_ctx, b"key1".to_vec(), b"initial".to_vec())
             .unwrap();
-        txn_service.commit(setup_ctx).unwrap();
+        txn_service.commit(setup_ctx).await.unwrap();
 
         // Start new transaction
         let mut ctx = txn_service.begin_explicit(false).unwrap();
@@ -1911,7 +1780,7 @@ mod tests {
         txn_service
             .put(&mut setup_ctx, b"key1".to_vec(), b"committed".to_vec())
             .unwrap();
-        txn_service.commit(setup_ctx).unwrap();
+        txn_service.commit(setup_ctx).await.unwrap();
 
         // Start new transaction
         let mut ctx = txn_service.begin_explicit(false).unwrap();
@@ -1938,7 +1807,7 @@ mod tests {
         txn_service
             .put(&mut setup_ctx, b"key1".to_vec(), b"original".to_vec())
             .unwrap();
-        txn_service.commit(setup_ctx).unwrap();
+        txn_service.commit(setup_ctx).await.unwrap();
 
         // Start new transaction
         let mut ctx = txn_service.begin_explicit(false).unwrap();
@@ -2003,7 +1872,7 @@ mod tests {
         txn_service
             .put(&mut ctx, b"key1".to_vec(), b"value1".to_vec())
             .unwrap();
-        let commit_info = txn_service.commit(ctx).unwrap();
+        let commit_info = txn_service.commit(ctx).await.unwrap();
 
         // Manually create a committed context
         let mut committed_ctx =
@@ -2026,7 +1895,7 @@ mod tests {
         let (_storage, txn_service, _dir) = create_test_service();
 
         let ctx = txn_service.begin(false).unwrap();
-        let commit_info = txn_service.commit(ctx).unwrap();
+        let commit_info = txn_service.commit(ctx).await.unwrap();
 
         // Create committed context
         let mut committed_ctx =
@@ -2087,7 +1956,7 @@ mod tests {
         aborted_ctx.state = TxnState::Aborted;
 
         // Try to commit aborted transaction - should fail
-        let result = txn_service.commit(aborted_ctx);
+        let result = txn_service.commit(aborted_ctx).await;
         assert!(result.is_err());
     }
 
@@ -2100,7 +1969,7 @@ mod tests {
         committed_ctx.state = TxnState::Committed { commit_ts: 10 };
 
         // Try to commit again - should fail
-        let result = txn_service.commit(committed_ctx);
+        let result = txn_service.commit(committed_ctx).await;
         assert!(result.is_err());
     }
 
@@ -2109,9 +1978,10 @@ mod tests {
         // Test recovery where some transactions are not committed (rolled back)
         let dir = tempdir().unwrap();
         let config = FileClogConfig::with_dir(dir.path());
+        let io_handle = tokio::runtime::Handle::current();
 
         {
-            let clog_service = Arc::new(FileClogService::open(config.clone()).unwrap());
+            let clog_service = Arc::new(FileClogService::open(config.clone(), &io_handle).unwrap());
 
             // Write entries directly to clog without commit record
             // This simulates a crash before commit
@@ -2158,7 +2028,7 @@ mod tests {
         }
 
         // Recover
-        let (clog_service, entries) = FileClogService::recover(config).unwrap();
+        let (clog_service, entries) = FileClogService::recover(config, &io_handle).unwrap();
         let clog_service = Arc::new(clog_service);
         let tso = Arc::new(LocalTso::new(1));
         let cm = Arc::new(ConcurrencyManager::new(0));
@@ -2315,9 +2185,10 @@ mod tests {
     async fn test_recover_with_delete_operation() {
         let dir = tempdir().unwrap();
         let config = FileClogConfig::with_dir(dir.path());
+        let io_handle = tokio::runtime::Handle::current();
 
         {
-            let clog_service = Arc::new(FileClogService::open(config.clone()).unwrap());
+            let clog_service = Arc::new(FileClogService::open(config.clone(), &io_handle).unwrap());
             let tso = Arc::new(LocalTso::new(1));
             let cm = Arc::new(ConcurrencyManager::new(0));
             let storage = Arc::new(MemTableEngine::new());
@@ -2331,7 +2202,7 @@ mod tests {
         }
 
         // Recover
-        let (clog_service, entries) = FileClogService::recover(config).unwrap();
+        let (clog_service, entries) = FileClogService::recover(config, &io_handle).unwrap();
         let clog_service = Arc::new(clog_service);
         let tso = Arc::new(LocalTso::new(1));
         let cm = Arc::new(ConcurrencyManager::new(0));
@@ -2352,7 +2223,8 @@ mod tests {
     async fn test_recover_empty_entries() {
         let dir = tempdir().unwrap();
         let config = FileClogConfig::with_dir(dir.path());
-        let clog_service = Arc::new(FileClogService::open(config).unwrap());
+        let io_handle = tokio::runtime::Handle::current();
+        let clog_service = Arc::new(FileClogService::open(config, &io_handle).unwrap());
         let tso = Arc::new(LocalTso::new(1));
         let cm = Arc::new(ConcurrencyManager::new(0));
         let storage = Arc::new(MemTableEngine::new());
@@ -2443,7 +2315,7 @@ mod tests {
         txn_service
             .put(&mut ctx, b"key1".to_vec(), b"value1".to_vec())
             .unwrap();
-        let info = txn_service.commit(ctx).unwrap();
+        let info = txn_service.commit(ctx).await.unwrap();
         assert!(info.lsn > 0, "explicit txn should produce non-zero LSN");
 
         // Verify clog contains Put + Commit entries
@@ -2471,7 +2343,7 @@ mod tests {
         let mut ctx = txn_service.begin_explicit(false).unwrap();
         let txn_id = ctx.txn_id();
         txn_service.delete(&mut ctx, b"key1".to_vec()).unwrap();
-        let info = txn_service.commit(ctx).unwrap();
+        let info = txn_service.commit(ctx).await.unwrap();
         assert!(info.lsn > 0);
 
         // Verify clog contains Delete entry (not LOCK)
@@ -2500,7 +2372,7 @@ mod tests {
         txn_service
             .put(&mut ctx, b"key3".to_vec(), b"v3".to_vec())
             .unwrap();
-        txn_service.commit(ctx).unwrap();
+        txn_service.commit(ctx).await.unwrap();
 
         let entries = txn_service.clog_service().read_all().unwrap();
         let data = clog_data_entries(&entries, txn_id);
@@ -2523,7 +2395,7 @@ mod tests {
         txn_service
             .delete(&mut ctx, b"nonexistent".to_vec())
             .unwrap();
-        txn_service.commit(ctx).unwrap();
+        txn_service.commit(ctx).await.unwrap();
 
         // Verify NO data entries in clog (LOCK keys are skipped)
         let entries = txn_service.clog_service().read_all().unwrap();
@@ -2547,7 +2419,7 @@ mod tests {
             .put(&mut ctx, b"key1".to_vec(), b"value1".to_vec())
             .unwrap();
         txn_service.delete(&mut ctx, b"key1".to_vec()).unwrap();
-        txn_service.commit(ctx).unwrap();
+        txn_service.commit(ctx).await.unwrap();
 
         // TOMBSTONE → Delete entry in clog
         let entries = txn_service.clog_service().read_all().unwrap();
@@ -2578,7 +2450,7 @@ mod tests {
         txn_service
             .put(&mut ctx, b"key1".to_vec(), b"v2".to_vec())
             .unwrap();
-        txn_service.commit(ctx).unwrap();
+        txn_service.commit(ctx).await.unwrap();
 
         // Final state is PUT v2, so clog should have 1 Put entry
         let entries = txn_service.clog_service().read_all().unwrap();
@@ -2689,7 +2561,7 @@ mod tests {
         );
 
         // Commit should succeed (transitions through Preparing -> Prepared -> Committed)
-        let info = txn_service.commit(writer).unwrap();
+        let info = txn_service.commit(writer).await.unwrap();
         assert!(info.commit_ts > 0);
 
         // After commit: txn is removed from state cache (cleaned up).
@@ -2714,7 +2586,7 @@ mod tests {
         txn_service
             .put(&mut writer, b"key1".to_vec(), b"v2".to_vec())
             .unwrap();
-        let commit_info = txn_service.commit(writer).unwrap();
+        let commit_info = txn_service.commit(writer).await.unwrap();
 
         // Reader with start_ts > commit_ts should see v2
         let reader = txn_service.begin(true).unwrap();
@@ -2798,7 +2670,7 @@ mod tests {
         txn_service
             .put(&mut writer, b"key1".to_vec(), b"v2".to_vec())
             .unwrap();
-        let commit_info = txn_service.commit(writer).unwrap();
+        let commit_info = txn_service.commit(writer).await.unwrap();
 
         // Reader that started after commit sees v2
         let reader = txn_service.begin(true).unwrap();

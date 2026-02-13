@@ -31,7 +31,7 @@ pub(crate) mod group_commit;
 // Available via testkit for integration tests
 pub use file::{FileClogConfig, FileClogService, TruncateStats};
 pub(crate) use group_commit::GroupCommitWriter;
-// Note: ClogFsyncFuture and AsyncClogService are defined below in this file
+// Note: ClogFsyncFuture is defined below in this file
 
 use std::future::Future;
 use std::pin::Pin;
@@ -150,38 +150,36 @@ impl ClogBatch {
     }
 }
 
-/// Commit log service interface
+/// Commit log service interface.
+///
+/// All write methods return a `ClogFsyncFuture` that resolves when the
+/// write (+ optional fsync) is durable. Callers in async contexts `.await`
+/// the future; sync callers use `crate::io::block_on_sync()`.
 pub trait ClogService: Send + Sync {
-    /// Append batch atomically, returns last LSN
-    fn write(&self, batch: &mut ClogBatch, sync: bool) -> Result<Lsn>;
+    /// Append batch atomically, returns future that yields the last LSN.
+    fn write(&self, batch: &mut ClogBatch, sync: bool) -> Result<ClogFsyncFuture>;
 
     /// Write a transaction's WriteBatch directly to clog without cloning.
     ///
     /// This is the preferred method for the commit path - it serializes directly
     /// from the WriteBatch's references, avoiding unnecessary allocations.
-    ///
-    /// # Arguments
-    /// * `txn_id` - Transaction ID
-    /// * `batch` - The storage WriteBatch (borrowed, not consumed)
-    /// * `commit_ts` - Commit timestamp for the transaction
-    /// * `sync` - Whether to fsync after write
     fn write_batch(
         &self,
         txn_id: TxnId,
         batch: &WriteBatch,
         commit_ts: Timestamp,
         sync: bool,
-    ) -> Result<Lsn>;
+    ) -> Result<ClogFsyncFuture>;
 
-    /// Append single entry, returns LSN
-    fn append(&self, entry: ClogEntry, sync: bool) -> Result<Lsn> {
+    /// Append single entry, returns future that yields the LSN.
+    fn append(&self, entry: ClogEntry, sync: bool) -> Result<ClogFsyncFuture> {
         let mut batch = ClogBatch::new();
         batch.add(entry);
         self.write(&mut batch, sync)
     }
 
-    /// Sync all pending writes to disk
-    fn sync(&self) -> Result<()>;
+    /// Sync all pending writes to disk.
+    fn sync(&self) -> Result<ClogFsyncFuture>;
 
     /// Read all entries (for recovery)
     fn read_all(&self) -> Result<Vec<ClogEntry>>;
@@ -191,6 +189,12 @@ pub trait ClogService: Send + Sync {
 
     /// Close the commit log service
     fn close(&self) -> Result<()>;
+
+    /// Shutdown the group commit writer channel.
+    ///
+    /// Must be called before the io_runtime is dropped, otherwise the runtime
+    /// drop blocks waiting for the writer loop (spawn_blocking task) to exit.
+    fn shutdown(&self);
 }
 
 /// Future that resolves when a clog fsync completes, yielding the assigned LSN.
@@ -229,24 +233,4 @@ impl Future for ClogFsyncFuture {
             Poll::Pending => Poll::Pending,
         }
     }
-}
-
-/// Async extension for ClogService — non-blocking write path.
-///
-/// Callers get back a `ClogFsyncFuture` that they `.await`, yielding the
-/// thread while the group commit writer performs I/O. The synchronous
-/// `ClogService::write_batch()` remains available for callers that need
-/// blocking semantics (autocommit, recovery, tests).
-pub trait AsyncClogService: ClogService {
-    /// Write a transaction's WriteBatch to clog without blocking on fsync.
-    ///
-    /// Serialization happens eagerly (before returning). The returned future
-    /// resolves when fsync completes, yielding the assigned LSN.
-    fn write_batch_async(
-        &self,
-        txn_id: TxnId,
-        batch: &WriteBatch,
-        commit_ts: Timestamp,
-        sync: bool,
-    ) -> Result<ClogFsyncFuture>;
 }

@@ -704,8 +704,8 @@ mod tests {
     use crate::storage::sstable::SstBuilder;
     use tempfile::TempDir;
 
-    async fn test_io() -> Arc<crate::io::IoService> {
-        crate::io::IoService::new(32).unwrap()
+    fn test_io() -> Arc<crate::io::IoService> {
+        crate::io::IoService::new_for_test(32).unwrap()
     }
 
     async fn test_config(dir: &Path) -> Arc<LsmConfig> {
@@ -852,9 +852,7 @@ mod tests {
         builder.finish(1, 0).unwrap();
 
         // Create merge iterator
-        let reader = SstReaderRef::open(&sst_path, test_io().await)
-            .await
-            .unwrap();
+        let reader = SstReaderRef::open(&sst_path, test_io()).await.unwrap();
         let mut iter = MergeIterator::new(vec![reader]).unwrap();
         iter.seek_to_first().await.unwrap();
 
@@ -897,7 +895,7 @@ mod tests {
         builder.finish(2, 0).unwrap();
 
         // Merge both
-        let io = test_io().await;
+        let io = test_io();
         let reader1 = SstReaderRef::open(&sst1_path, Arc::clone(&io))
             .await
             .unwrap();
@@ -943,7 +941,7 @@ mod tests {
         builder.finish(2, 0).unwrap();
 
         // Merge with newer first
-        let io = test_io().await;
+        let io = test_io();
         let reader1 = SstReaderRef::open(&sst1_path, Arc::clone(&io))
             .await
             .unwrap();
@@ -1006,7 +1004,7 @@ mod tests {
                 &version,
                 &config.sst_dir(),
                 &pre_allocated_ids,
-                test_io().await,
+                test_io(),
                 0, // gc_safe_point = 0 → no GC
                 false,
                 &no_dropped,
@@ -1040,9 +1038,7 @@ mod tests {
         let builder = SstBuilder::new(&sst_path, SstBuilderOptions::default()).unwrap();
         builder.finish(1, 0).unwrap();
 
-        let reader = SstReaderRef::open(&sst_path, test_io().await)
-            .await
-            .unwrap();
+        let reader = SstReaderRef::open(&sst_path, test_io()).await.unwrap();
         let mut iter = MergeIterator::new(vec![reader]).unwrap();
         iter.seek_to_first().await.unwrap();
 
@@ -1058,9 +1054,7 @@ mod tests {
         builder.add(b"key", b"value").unwrap();
         builder.finish(1, 0).unwrap();
 
-        let reader = SstReaderRef::open(&sst_path, test_io().await)
-            .await
-            .unwrap();
+        let reader = SstReaderRef::open(&sst_path, test_io()).await.unwrap();
         let iter = MergeIterator::new(vec![reader]).unwrap();
 
         // Iterator should not be valid until seek_to_first
@@ -1076,9 +1070,7 @@ mod tests {
         builder.add(b"key", b"value").unwrap();
         builder.finish(1, 0).unwrap();
 
-        let reader = SstReaderRef::open(&sst_path, test_io().await)
-            .await
-            .unwrap();
+        let reader = SstReaderRef::open(&sst_path, test_io()).await.unwrap();
         let mut iter = MergeIterator::new(vec![reader]).unwrap();
         iter.seek_to_first().await.unwrap();
 
@@ -1107,7 +1099,7 @@ mod tests {
         builder.add(b"key", b"older").unwrap();
         builder.finish(2, 0).unwrap();
 
-        let io = test_io().await;
+        let io = test_io();
         let reader1 = SstReaderRef::open(&sst1_path, Arc::clone(&io))
             .await
             .unwrap();
@@ -1137,7 +1129,7 @@ mod tests {
         let tmp = TempDir::new().unwrap();
 
         // Create 10 SSTs with interleaved keys
-        let io = test_io().await;
+        let io = test_io();
         let mut readers = Vec::new();
         for sst_idx in 0..10u32 {
             let sst_path = tmp.path().join(format!("sst{sst_idx}.sst"));
@@ -1200,9 +1192,7 @@ mod tests {
         builder.add(&mvcc(b"key2", 100), b"v2_100").unwrap();
         builder.finish(1, 0).unwrap();
 
-        let reader = SstReaderRef::open(&sst_path, test_io().await)
-            .await
-            .unwrap();
+        let reader = SstReaderRef::open(&sst_path, test_io()).await.unwrap();
         let mut iter = MergeIterator::new(vec![reader]).unwrap();
         iter.seek_to_first().await.unwrap();
 
@@ -1234,9 +1224,7 @@ mod tests {
         builder.add(&mvcc(b"only_key", 50), b"v50").unwrap();
         builder.finish(1, 0).unwrap();
 
-        let reader = SstReaderRef::open(&sst_path, test_io().await)
-            .await
-            .unwrap();
+        let reader = SstReaderRef::open(&sst_path, test_io()).await.unwrap();
         let mut iter = MergeIterator::new(vec![reader]).unwrap();
         iter.seek_to_first().await.unwrap();
 
@@ -1258,9 +1246,7 @@ mod tests {
         builder.add(b"b", b"vb").unwrap();
         builder.finish(1, 0).unwrap();
 
-        let reader = SstReaderRef::open(&sst_path, test_io().await)
-            .await
-            .unwrap();
+        let reader = SstReaderRef::open(&sst_path, test_io()).await.unwrap();
         let mut iter = MergeIterator::new(vec![reader]).unwrap();
         iter.seek_to_first().await.unwrap();
 
@@ -1294,7 +1280,7 @@ mod tests {
         builder.add(b"d", b"d2").unwrap();
         builder.finish(2, 0).unwrap();
 
-        let io = test_io().await;
+        let io = test_io();
         let reader1 = SstReaderRef::open(&sst1_path, Arc::clone(&io))
             .await
             .unwrap();
@@ -1328,9 +1314,7 @@ mod tests {
         builder.add(b"key", b"value").unwrap();
         builder.finish(1, 0).unwrap();
 
-        let reader = SstReaderRef::open(&sst_path, test_io().await)
-            .await
-            .unwrap();
+        let reader = SstReaderRef::open(&sst_path, test_io()).await.unwrap();
         let iter = MergeIterator::new(vec![reader]).unwrap();
 
         // Before seek_to_first, current should be None
@@ -1471,7 +1455,7 @@ mod tests {
                 &version,
                 &config.sst_dir(),
                 &pre_allocated_ids,
-                test_io().await,
+                test_io(),
                 0, // gc_safe_point = 0 → no GC
                 false,
                 &no_dropped,

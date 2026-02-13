@@ -961,7 +961,8 @@ mod tests {
     fn create_test_txn() -> (Arc<TestTxnService>, tempfile::TempDir) {
         let dir = tempdir().unwrap();
         let clog_config = FileClogConfig::with_dir(dir.path());
-        let (clog_service, _) = FileClogService::recover(clog_config).unwrap();
+        let io_handle = tokio::runtime::Handle::current();
+        let (clog_service, _) = FileClogService::recover(clog_config, &io_handle).unwrap();
         let clog_service = Arc::new(clog_service);
         let tso = Arc::new(LocalTso::new(1));
         let concurrency_manager = Arc::new(ConcurrencyManager::new(0));
@@ -975,8 +976,8 @@ mod tests {
         (txn_service, dir)
     }
 
-    #[test]
-    fn test_load_catalog_after_bootstrap() {
+    #[tokio::test]
+    async fn test_load_catalog_after_bootstrap() {
         let (txn, _dir) = create_test_txn();
         bootstrap::bootstrap_core_tables(txn.as_ref()).unwrap();
 
@@ -1006,8 +1007,8 @@ mod tests {
             .contains_key(&(INNER_SCHEMA.to_string(), "__all_table".to_string())));
     }
 
-    #[test]
-    fn test_load_catalog_core_table_columns() {
+    #[tokio::test]
+    async fn test_load_catalog_core_table_columns() {
         let (txn, _dir) = create_test_txn();
         bootstrap::bootstrap_core_tables(txn.as_ref()).unwrap();
 
@@ -1031,8 +1032,8 @@ mod tests {
         assert_eq!(all_column.columns().len(), 9);
     }
 
-    #[test]
-    fn test_load_catalog_table_id_map() {
+    #[tokio::test]
+    async fn test_load_catalog_table_id_map() {
         let (txn, _dir) = create_test_txn();
         bootstrap::bootstrap_core_tables(txn.as_ref()).unwrap();
 

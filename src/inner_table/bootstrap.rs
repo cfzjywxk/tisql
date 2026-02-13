@@ -86,7 +86,7 @@ pub fn bootstrap_core_tables<T: TxnService>(txn: &T) -> Result<()> {
     )?;
     write_meta_row(&mut ctx, txn, META_NEXT_GC_TASK_ID, "next_gc_task_id", "1")?;
 
-    txn.commit(ctx)?;
+    crate::io::block_on_sync(txn.commit(ctx))?;
     Ok(())
 }
 
@@ -366,7 +366,8 @@ mod tests {
     fn create_test_txn() -> (Arc<TestTxnService>, tempfile::TempDir) {
         let dir = tempdir().unwrap();
         let clog_config = FileClogConfig::with_dir(dir.path());
-        let (clog_service, _) = FileClogService::recover(clog_config).unwrap();
+        let io_handle = tokio::runtime::Handle::current();
+        let (clog_service, _) = FileClogService::recover(clog_config, &io_handle).unwrap();
         let clog_service = Arc::new(clog_service);
         let tso = Arc::new(LocalTso::new(1));
         let concurrency_manager = Arc::new(ConcurrencyManager::new(0));
@@ -380,22 +381,22 @@ mod tests {
         (txn_service, dir)
     }
 
-    #[test]
-    fn test_not_bootstrapped_initially() {
+    #[tokio::test]
+    async fn test_not_bootstrapped_initially() {
         let (txn, _dir) = create_test_txn();
         assert!(!is_bootstrapped(txn.as_ref()).unwrap());
     }
 
-    #[test]
-    fn test_bootstrap_then_detect() {
+    #[tokio::test]
+    async fn test_bootstrap_then_detect() {
         let (txn, _dir) = create_test_txn();
         assert!(!is_bootstrapped(txn.as_ref()).unwrap());
         bootstrap_core_tables(txn.as_ref()).unwrap();
         assert!(is_bootstrapped(txn.as_ref()).unwrap());
     }
 
-    #[test]
-    fn test_bootstrap_idempotent_detection() {
+    #[tokio::test]
+    async fn test_bootstrap_idempotent_detection() {
         let (txn, _dir) = create_test_txn();
         bootstrap_core_tables(txn.as_ref()).unwrap();
         // Calling is_bootstrapped multiple times should always return true
@@ -403,8 +404,8 @@ mod tests {
         assert!(is_bootstrapped(txn.as_ref()).unwrap());
     }
 
-    #[test]
-    fn test_bootstrap_writes_meta_rows() {
+    #[tokio::test]
+    async fn test_bootstrap_writes_meta_rows() {
         let (txn, _dir) = create_test_txn();
         bootstrap_core_tables(txn.as_ref()).unwrap();
 
@@ -419,8 +420,8 @@ mod tests {
         }
     }
 
-    #[test]
-    fn test_bootstrap_writes_schema_rows() {
+    #[tokio::test]
+    async fn test_bootstrap_writes_schema_rows() {
         let (txn, _dir) = create_test_txn();
         bootstrap_core_tables(txn.as_ref()).unwrap();
 
@@ -435,8 +436,8 @@ mod tests {
         }
     }
 
-    #[test]
-    fn test_bootstrap_writes_table_rows() {
+    #[tokio::test]
+    async fn test_bootstrap_writes_table_rows() {
         let (txn, _dir) = create_test_txn();
         bootstrap_core_tables(txn.as_ref()).unwrap();
 

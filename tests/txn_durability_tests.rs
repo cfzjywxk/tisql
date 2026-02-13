@@ -59,6 +59,7 @@ fn get_value(engine: &LsmEngine, key: &[u8], read_ts: Timestamp) -> Option<Vec<u
 }
 
 /// Create a fresh LsmEngine + TransactionService environment.
+/// Uses `Handle::current()` for the clog GroupCommitWriter (spawn_blocking).
 fn create_txn_env(
     dir: &Path,
 ) -> (
@@ -66,20 +67,23 @@ fn create_txn_env(
     TransactionService<LsmEngine, FileClogService, LocalTso>,
     Arc<FileClogService>,
 ) {
+    let handle = tokio::runtime::Handle::current();
     let lsn_provider = new_lsn_provider();
     let lsm_config = LsmConfig::builder(dir)
         .memtable_size(1 << 20)
         .build()
         .unwrap();
     let ilog_config = IlogConfig::new(dir);
-    let ilog = Arc::new(IlogService::open(ilog_config, Arc::clone(&lsn_provider)).unwrap());
+    let ilog =
+        Arc::new(IlogService::open_with_thread(ilog_config, Arc::clone(&lsn_provider)).unwrap());
     let engine = Arc::new(
         LsmEngine::open_with_recovery(lsm_config, Arc::clone(&lsn_provider), ilog, Version::new())
             .unwrap(),
     );
     let clog_config = FileClogConfig::with_dir(dir);
     let clog = Arc::new(
-        FileClogService::open_with_lsn_provider(clog_config, Arc::clone(&lsn_provider)).unwrap(),
+        FileClogService::open_with_lsn_provider(clog_config, Arc::clone(&lsn_provider), &handle)
+            .unwrap(),
     );
     let tso = Arc::new(LocalTso::new(1));
     let cm = Arc::new(ConcurrencyManager::new(0));
@@ -94,8 +98,9 @@ fn recover_txn_env(
     Arc<LsmEngine>,
     TransactionService<LsmEngine, FileClogService, LocalTso>,
 ) {
+    let handle = tokio::runtime::Handle::current();
     let recovery = LsmRecovery::new(dir);
-    let result = recovery.recover().unwrap();
+    let result = recovery.recover(&handle).unwrap();
 
     let engine = Arc::new(result.engine);
     let tso = Arc::new(LocalTso::new(result.stats.max_commit_ts + 1));
@@ -106,8 +111,8 @@ fn recover_txn_env(
     (engine, txn_service)
 }
 
-#[test]
-fn test_implicit_txn_crash_recovery() {
+#[tokio::test]
+async fn test_implicit_txn_crash_recovery() {
     let dir = tempdir().unwrap();
     let max_ts;
 
@@ -120,7 +125,7 @@ fn test_implicit_txn_crash_recovery() {
         let info = txn_service.autocommit_put(b"k3", b"v3").unwrap();
         max_ts = info.commit_ts;
 
-        clog.sync().unwrap();
+        tisql::io::block_on_sync(clog.sync().unwrap()).unwrap();
     }
 
     // Phase 2: Recover and verify
@@ -145,8 +150,8 @@ fn test_implicit_txn_crash_recovery() {
     }
 }
 
-#[test]
-fn test_explicit_txn_crash_recovery() {
+#[tokio::test]
+async fn test_explicit_txn_crash_recovery() {
     let dir = tempdir().unwrap();
     let max_ts;
 
@@ -164,10 +169,10 @@ fn test_explicit_txn_crash_recovery() {
         txn_service
             .put(&mut ctx, b"ek3".to_vec(), b"ev3".to_vec())
             .unwrap();
-        let info = txn_service.commit(ctx).unwrap();
+        let info = txn_service.commit(ctx).await.unwrap();
         max_ts = info.commit_ts;
 
-        clog.sync().unwrap();
+        tisql::io::block_on_sync(clog.sync().unwrap()).unwrap();
     }
 
     // Phase 2: Recover and verify
@@ -192,8 +197,8 @@ fn test_explicit_txn_crash_recovery() {
     }
 }
 
-#[test]
-fn test_explicit_txn_delete_crash_recovery() {
+#[tokio::test]
+async fn test_explicit_txn_delete_crash_recovery() {
     let dir = tempdir().unwrap();
     let max_ts;
 
@@ -205,10 +210,10 @@ fn test_explicit_txn_delete_crash_recovery() {
 
         let mut ctx = txn_service.begin_explicit(false).unwrap();
         txn_service.delete(&mut ctx, b"key1".to_vec()).unwrap();
-        let info = txn_service.commit(ctx).unwrap();
+        let info = txn_service.commit(ctx).await.unwrap();
         max_ts = info.commit_ts;
 
-        clog.sync().unwrap();
+        tisql::io::block_on_sync(clog.sync().unwrap()).unwrap();
     }
 
     // Phase 2: Recover and verify key1 is deleted
@@ -223,8 +228,8 @@ fn test_explicit_txn_delete_crash_recovery() {
     }
 }
 
-#[test]
-fn test_mixed_implicit_explicit_crash_recovery() {
+#[tokio::test]
+async fn test_mixed_implicit_explicit_crash_recovery() {
     let dir = tempdir().unwrap();
     let max_ts;
 
@@ -241,13 +246,13 @@ fn test_mixed_implicit_explicit_crash_recovery() {
             .put(&mut ctx, b"key2".to_vec(), b"v2".to_vec())
             .unwrap();
         txn_service.delete(&mut ctx, b"key1".to_vec()).unwrap();
-        txn_service.commit(ctx).unwrap();
+        txn_service.commit(ctx).await.unwrap();
 
         // Implicit put key3
         let info = txn_service.autocommit_put(b"key3", b"v3").unwrap();
         max_ts = info.commit_ts;
 
-        clog.sync().unwrap();
+        tisql::io::block_on_sync(clog.sync().unwrap()).unwrap();
     }
 
     // Phase 2: Recover and verify
@@ -272,8 +277,8 @@ fn test_mixed_implicit_explicit_crash_recovery() {
     }
 }
 
-#[test]
-fn test_explicit_txn_rollback_not_recovered() {
+#[tokio::test]
+async fn test_explicit_txn_rollback_not_recovered() {
     let dir = tempdir().unwrap();
     let max_ts;
 
@@ -293,10 +298,10 @@ fn test_explicit_txn_rollback_not_recovered() {
         txn_service
             .put(&mut ctx2, b"key2".to_vec(), b"v2".to_vec())
             .unwrap();
-        let info = txn_service.commit(ctx2).unwrap();
+        let info = txn_service.commit(ctx2).await.unwrap();
         max_ts = info.commit_ts;
 
-        clog.sync().unwrap();
+        tisql::io::block_on_sync(clog.sync().unwrap()).unwrap();
     }
 
     // Phase 2: Recover and verify

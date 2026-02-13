@@ -86,8 +86,9 @@ type TestServiceTuple = (
 
 fn create_test_service() -> TestServiceTuple {
     let dir = tempfile::tempdir().unwrap();
+    let handle = tokio::runtime::Handle::current();
     let config = FileClogConfig::with_dir(dir.path());
-    let clog_service = Arc::new(FileClogService::open(config).unwrap());
+    let clog_service = Arc::new(FileClogService::open(config, &handle).unwrap());
     let tso = Arc::new(LocalTso::new(1));
     let cm = Arc::new(ConcurrencyManager::new(0));
     let storage = Arc::new(MemTableEngine::new());
@@ -105,8 +106,8 @@ fn create_test_service() -> TestServiceTuple {
 // ============================================================================
 
 /// Verify TSO produces strictly monotonic timestamps under concurrent load.
-#[test]
-fn test_tso_strict_ordering_concurrent() {
+#[tokio::test]
+async fn test_tso_strict_ordering_concurrent() {
     use tisql::TsoService;
 
     let tso = Arc::new(LocalTso::new(1));
@@ -149,8 +150,8 @@ fn test_tso_strict_ordering_concurrent() {
 }
 
 /// Verify per-thread timestamps are locally monotonic.
-#[test]
-fn test_tso_per_thread_monotonic() {
+#[tokio::test]
+async fn test_tso_per_thread_monotonic() {
     use tisql::TsoService;
 
     let tso = Arc::new(LocalTso::new(1));
@@ -180,8 +181,8 @@ fn test_tso_per_thread_monotonic() {
 }
 
 /// Verify max_ts tracking under concurrent updates.
-#[test]
-fn test_max_ts_concurrent_updates() {
+#[tokio::test]
+async fn test_max_ts_concurrent_updates() {
     let cm = Arc::new(ConcurrencyManager::new(0));
     let num_threads = 8;
     let updates_per_thread = 1000;
@@ -218,8 +219,8 @@ fn test_max_ts_concurrent_updates() {
 // ============================================================================
 
 /// Test concurrent writers to different keys succeed.
-#[test]
-fn test_concurrent_writes_different_keys() {
+#[tokio::test]
+async fn test_concurrent_writes_different_keys() {
     let (_storage, txn_service, _tso, _cm, _dir) = create_test_service();
     let num_threads = 4;
     let writes_per_thread = 100;
@@ -254,8 +255,8 @@ fn test_concurrent_writes_different_keys() {
 }
 
 /// Test concurrent writers to same key - one should get lock conflict.
-#[test]
-fn test_concurrent_writes_same_key() {
+#[tokio::test]
+async fn test_concurrent_writes_same_key() {
     let (_storage, txn_service, _tso, _cm, _dir) = create_test_service();
     let num_threads = 10;
     let key = b"shared_key";
@@ -311,8 +312,8 @@ fn test_concurrent_writes_same_key() {
 // ============================================================================
 
 /// Test that MVCC read at specific timestamp works correctly.
-#[test]
-fn test_mvcc_read_at_timestamp() {
+#[tokio::test]
+async fn test_mvcc_read_at_timestamp() {
     let (storage, txn_service, _tso, _cm, _dir) = create_test_service();
 
     let key = b"version_key";
@@ -351,8 +352,8 @@ fn test_mvcc_read_at_timestamp() {
 }
 
 /// Test multiple readers don't interfere with each other.
-#[test]
-fn test_concurrent_readers_no_interference() {
+#[tokio::test]
+async fn test_concurrent_readers_no_interference() {
     let (storage, txn_service, _tso, _cm, _dir) = create_test_service();
     let key = b"shared_read_key";
 
@@ -393,8 +394,8 @@ fn test_concurrent_readers_no_interference() {
 }
 
 /// Test delete creates proper tombstone and is visible to concurrent readers.
-#[test]
-fn test_concurrent_read_after_delete() {
+#[tokio::test]
+async fn test_concurrent_read_after_delete() {
     let (storage, txn_service, _tso, _cm, _dir) = create_test_service();
     let key = b"delete_key";
 
@@ -423,8 +424,8 @@ fn test_concurrent_read_after_delete() {
 /// Test that multiple puts to the same key in one transaction commits only the last value.
 ///
 /// Each put writes a pending node that replaces the previous pending node.
-#[test]
-fn test_implicit_multiple_puts_same_key() {
+#[tokio::test]
+async fn test_implicit_multiple_puts_same_key() {
     use tisql::TxnService;
 
     let (_storage, txn_service, _tso, _cm, _dir) = create_test_service();
@@ -447,7 +448,7 @@ fn test_implicit_multiple_puts_same_key() {
         .unwrap();
 
     // Commit the transaction
-    txn_service.commit(ctx).unwrap();
+    txn_service.commit(ctx).await.unwrap();
 
     // Read after commit should see the last value
     let read_ctx = txn_service.begin(true).unwrap();
@@ -462,8 +463,8 @@ fn test_implicit_multiple_puts_same_key() {
 /// Test that put followed by delete in the same transaction commits as delete.
 ///
 /// Put writes a pending value node, then delete sees the pending value and writes TOMBSTONE.
-#[test]
-fn test_implicit_put_then_delete() {
+#[tokio::test]
+async fn test_implicit_put_then_delete() {
     use tisql::TxnService;
 
     let (_storage, txn_service, _tso, _cm, _dir) = create_test_service();
@@ -479,7 +480,7 @@ fn test_implicit_put_then_delete() {
     txn_service.delete(&mut ctx, key.to_vec()).unwrap();
 
     // Commit the transaction
-    txn_service.commit(ctx).unwrap();
+    txn_service.commit(ctx).await.unwrap();
 
     // Read after commit should see None (delete wins)
     let read_ctx = txn_service.begin(true).unwrap();
@@ -490,8 +491,8 @@ fn test_implicit_put_then_delete() {
 /// Test that delete followed by put in the same transaction commits the put.
 ///
 /// Delete writes TOMBSTONE/LOCK, then put replaces it with a value pending node.
-#[test]
-fn test_implicit_delete_then_put() {
+#[tokio::test]
+async fn test_implicit_delete_then_put() {
     use tisql::TxnService;
 
     let (_storage, txn_service, _tso, _cm, _dir) = create_test_service();
@@ -504,7 +505,7 @@ fn test_implicit_delete_then_put() {
     txn_service
         .put(&mut setup_ctx, key.to_vec(), b"initial".to_vec())
         .unwrap();
-    txn_service.commit(setup_ctx).unwrap();
+    txn_service.commit(setup_ctx).await.unwrap();
 
     // Start a new transaction, delete then put
     let mut ctx = txn_service.begin(false).unwrap();
@@ -514,7 +515,7 @@ fn test_implicit_delete_then_put() {
         .unwrap();
 
     // Commit the transaction
-    txn_service.commit(ctx).unwrap();
+    txn_service.commit(ctx).await.unwrap();
 
     // Read after commit should see the new value (put wins)
     let read_ctx = txn_service.begin(true).unwrap();
@@ -527,8 +528,8 @@ fn test_implicit_delete_then_put() {
 }
 
 /// Test that only the final state of each key is committed.
-#[test]
-fn test_implicit_dedup_commit() {
+#[tokio::test]
+async fn test_implicit_dedup_commit() {
     use tisql::TxnService;
 
     let (_storage, txn_service, _tso, _cm, _dir) = create_test_service();
@@ -556,7 +557,7 @@ fn test_implicit_dedup_commit() {
         .unwrap();
 
     // Commit the transaction
-    txn_service.commit(ctx).unwrap();
+    txn_service.commit(ctx).await.unwrap();
 
     // Scan after commit should show: a=a2, c=c1 (b is deleted/absent)
     let read_ctx = txn_service.begin(true).unwrap();
@@ -588,8 +589,8 @@ mod failpoint_tests {
     use std::time::Duration;
 
     /// Test multiple writers with controlled ordering.
-    #[test]
-    fn test_serialized_writes_with_failpoint() {
+    #[tokio::test]
+    async fn test_serialized_writes_with_failpoint() {
         let scenario = fail::FailScenario::setup();
 
         let (storage, txn_service, _tso, _cm, _dir) = create_test_service();
@@ -641,8 +642,8 @@ mod failpoint_tests {
     ///
     /// The key insight is that by acquiring locks BEFORE getting commit_ts,
     /// we ensure commit_ts > any concurrent reader's start_ts.
-    #[test]
-    fn test_no_commit_in_the_past_anomaly() {
+    #[tokio::test]
+    async fn test_no_commit_in_the_past_anomaly() {
         use tisql::TxnService;
 
         let scenario = fail::FailScenario::setup();
@@ -717,8 +718,8 @@ mod failpoint_tests {
     ///
     /// Multiple readers starting while a writer holds locks should all
     /// have start_ts < commit_ts (when the writer eventually commits).
-    #[test]
-    fn test_multiple_readers_during_write_no_anomaly() {
+    #[tokio::test]
+    async fn test_multiple_readers_during_write_no_anomaly() {
         use tisql::TxnService;
 
         let scenario = fail::FailScenario::setup();
@@ -779,8 +780,8 @@ mod ddl_concurrency {
     use tisql::{Database, DatabaseConfig, QueryResult};
 
     /// Test that concurrent DDLs are serialized (no conflicts).
-    #[test]
-    fn test_concurrent_create_different_tables() {
+    #[tokio::test]
+    async fn test_concurrent_create_different_tables() {
         let dir = tempdir().unwrap();
         let config = DatabaseConfig::with_data_dir(dir.path());
         let db = Arc::new(Database::open(config).unwrap());
@@ -837,8 +838,8 @@ mod ddl_concurrency {
     }
 
     /// Test that concurrent DDLs creating the same table result in exactly one success.
-    #[test]
-    fn test_concurrent_create_same_table() {
+    #[tokio::test]
+    async fn test_concurrent_create_same_table() {
         let dir = tempdir().unwrap();
         let config = DatabaseConfig::with_data_dir(dir.path());
         let db = Arc::new(Database::open(config).unwrap());
@@ -901,8 +902,8 @@ mod ddl_concurrency {
     }
 
     /// Test DDL and DML concurrency - DML should detect schema change.
-    #[test]
-    fn test_ddl_during_dml_causes_retry() {
+    #[tokio::test]
+    async fn test_ddl_during_dml_causes_retry() {
         let dir = tempdir().unwrap();
         let config = DatabaseConfig::with_data_dir(dir.path());
         let db = Arc::new(Database::open(config).unwrap());
@@ -948,8 +949,8 @@ mod ddl_concurrency {
     }
 
     /// Test schema version increments correctly with concurrent DDLs.
-    #[test]
-    fn test_schema_version_with_concurrent_ddl() {
+    #[tokio::test]
+    async fn test_schema_version_with_concurrent_ddl() {
         let dir = tempdir().unwrap();
         let config = DatabaseConfig::with_data_dir(dir.path());
         let db = Arc::new(Database::open(config).unwrap());
@@ -1005,8 +1006,8 @@ mod ddl_concurrency {
     }
 
     /// Test drop table with concurrent create.
-    #[test]
-    fn test_drop_and_recreate_table() {
+    #[tokio::test]
+    async fn test_drop_and_recreate_table() {
         let dir = tempdir().unwrap();
         let config = DatabaseConfig::with_data_dir(dir.path());
         let db = Arc::new(Database::open(config).unwrap());
@@ -1049,8 +1050,8 @@ mod ddl_concurrency {
 /// - Scan iterators maintain snapshot isolation during concurrent writes
 /// - Range filtering works correctly under contention
 /// - No data corruption or iterator invalidation during concurrent access
-#[test]
-fn test_concurrent_scan_while_writers_run() {
+#[tokio::test]
+async fn test_concurrent_scan_while_writers_run() {
     use tisql::TxnService;
 
     let (_storage, txn_service, _tso, _cm, _dir) = create_test_service();
@@ -1173,8 +1174,8 @@ fn test_concurrent_scan_while_writers_run() {
 /// This is a critical MVCC invariant: for the same user key, newer versions
 /// (higher timestamps) must appear before older versions. Across different keys,
 /// keys must be in ascending lexicographic order.
-#[test]
-fn test_mvcc_iterator_ordering_invariant() {
+#[tokio::test]
+async fn test_mvcc_iterator_ordering_invariant() {
     let (_storage, txn_service, _tso, _cm, _dir) = create_test_service();
 
     // Create multiple versions of multiple keys
@@ -1278,8 +1279,8 @@ fn test_mvcc_iterator_ordering_invariant() {
 
 /// Test that MvccScanIterator (transaction layer) returns only latest visible versions
 /// in user_key ascending order.
-#[test]
-fn test_mvcc_scan_iterator_returns_latest_visible_only() {
+#[tokio::test]
+async fn test_mvcc_scan_iterator_returns_latest_visible_only() {
     use tisql::TxnService;
 
     let (_storage, txn_service, _tso, _cm, _dir) = create_test_service();
@@ -1335,8 +1336,8 @@ fn test_mvcc_scan_iterator_returns_latest_visible_only() {
 /// This tests the full path from SQL layer through transaction layer to storage layer,
 /// verifying that concurrent writes to the same primary key result in proper lock
 /// conflict errors.
-#[test]
-fn test_e2e_key_is_locked_concurrent_inserts() {
+#[tokio::test]
+async fn test_e2e_key_is_locked_concurrent_inserts() {
     use tisql::{Database, DatabaseConfig, QueryResult};
 
     let dir = tempfile::tempdir().unwrap();
@@ -1429,8 +1430,8 @@ fn test_e2e_key_is_locked_concurrent_inserts() {
 ///
 /// Similar to the INSERT test, but tests UPDATE operations where multiple threads
 /// try to update the same row concurrently.
-#[test]
-fn test_e2e_key_is_locked_concurrent_updates() {
+#[tokio::test]
+async fn test_e2e_key_is_locked_concurrent_updates() {
     use tisql::{Database, DatabaseConfig, QueryResult};
 
     let dir = tempfile::tempdir().unwrap();
@@ -1543,8 +1544,8 @@ mod explicit_transaction_tests {
     use tisql::{Database, DatabaseConfig, QueryResult, Session};
 
     /// Test that BEGIN starts an explicit transaction.
-    #[test]
-    fn test_begin_starts_transaction() {
+    #[tokio::test]
+    async fn test_begin_starts_transaction() {
         let dir = tempdir().unwrap();
         let config = DatabaseConfig::with_data_dir(dir.path());
         let db = Database::open(config).unwrap();
@@ -1577,8 +1578,8 @@ mod explicit_transaction_tests {
     }
 
     /// Test that START TRANSACTION works like BEGIN.
-    #[test]
-    fn test_start_transaction_starts_transaction() {
+    #[tokio::test]
+    async fn test_start_transaction_starts_transaction() {
         let dir = tempdir().unwrap();
         let config = DatabaseConfig::with_data_dir(dir.path());
         let db = Database::open(config).unwrap();
@@ -1603,8 +1604,8 @@ mod explicit_transaction_tests {
     }
 
     /// Test that COMMIT commits changes.
-    #[test]
-    fn test_commit_persists_changes() {
+    #[tokio::test]
+    async fn test_commit_persists_changes() {
         let dir = tempdir().unwrap();
         let config = DatabaseConfig::with_data_dir(dir.path());
         let db = Database::open(config).unwrap();
@@ -1654,8 +1655,8 @@ mod explicit_transaction_tests {
     }
 
     /// Test that ROLLBACK discards changes.
-    #[test]
-    fn test_rollback_discards_changes() {
+    #[tokio::test]
+    async fn test_rollback_discards_changes() {
         let dir = tempdir().unwrap();
         let config = DatabaseConfig::with_data_dir(dir.path());
         let db = Database::open(config).unwrap();
@@ -1713,8 +1714,8 @@ mod explicit_transaction_tests {
     /// Note: Read-your-writes is not yet supported, so UPDATE/DELETE within the same
     /// transaction cannot see uncommitted INSERTs. This test verifies that multiple
     /// INSERTs work correctly and are atomically committed.
-    #[test]
-    fn test_multiple_inserts_in_transaction() {
+    #[tokio::test]
+    async fn test_multiple_inserts_in_transaction() {
         let dir = tempdir().unwrap();
         let config = DatabaseConfig::with_data_dir(dir.path());
         let db = Database::open(config).unwrap();
@@ -1782,8 +1783,8 @@ mod explicit_transaction_tests {
     ///
     /// The storage layer passes owner_ts for explicit transactions, making pending
     /// nodes owned by the current transaction visible to its own reads.
-    #[test]
-    fn test_read_your_writes_in_transaction() {
+    #[tokio::test]
+    async fn test_read_your_writes_in_transaction() {
         let dir = tempdir().unwrap();
         let config = DatabaseConfig::with_data_dir(dir.path());
         let db = Database::open(config).unwrap();
@@ -1848,8 +1849,8 @@ mod explicit_transaction_tests {
     }
 
     /// Test that COMMIT without active transaction is a no-op (MySQL behavior).
-    #[test]
-    fn test_commit_without_transaction_is_noop() {
+    #[tokio::test]
+    async fn test_commit_without_transaction_is_noop() {
         let dir = tempdir().unwrap();
         let config = DatabaseConfig::with_data_dir(dir.path());
         let db = Database::open(config).unwrap();
@@ -1868,8 +1869,8 @@ mod explicit_transaction_tests {
     }
 
     /// Test that ROLLBACK without active transaction is a no-op (MySQL behavior).
-    #[test]
-    fn test_rollback_without_transaction_is_noop() {
+    #[tokio::test]
+    async fn test_rollback_without_transaction_is_noop() {
         let dir = tempdir().unwrap();
         let config = DatabaseConfig::with_data_dir(dir.path());
         let db = Database::open(config).unwrap();
@@ -1893,8 +1894,8 @@ mod explicit_transaction_tests {
     ///
     /// Unlike MySQL which implicitly commits on nested BEGIN, we currently return
     /// an error to prevent accidental loss of uncommitted work.
-    #[test]
-    fn test_nested_begin_errors() {
+    #[tokio::test]
+    async fn test_nested_begin_errors() {
         let dir = tempdir().unwrap();
         let config = DatabaseConfig::with_data_dir(dir.path());
         let db = Database::open(config).unwrap();

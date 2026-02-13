@@ -47,22 +47,16 @@ use tokio::sync::Notify;
 
 use super::lsm::LsmEngine;
 
-/// Handle for the worker — either a tokio task or a std thread.
-enum WorkerHandle {
-    Tokio(tokio::task::JoinHandle<()>),
-    Thread(std::thread::JoinHandle<()>),
-}
-
 /// Background compaction scheduler for LSM storage engine.
 ///
-/// Runs a tokio task (preferred) or std::thread (fallback when no runtime)
-/// that compacts SST files when level thresholds are met.
+/// Runs a tokio task on the provided runtime handle that compacts SST files
+/// when level thresholds are met.
 pub struct CompactionScheduler {
     /// Shared state between caller and worker task.
     inner: Arc<CompactionSchedulerInner>,
 
     /// Worker handle (None if not started or already stopped).
-    worker_handle: parking_lot::Mutex<Option<WorkerHandle>>,
+    worker_handle: parking_lot::Mutex<Option<tokio::task::JoinHandle<()>>>,
 }
 
 /// Shared state for the compaction scheduler.
@@ -96,49 +90,34 @@ impl CompactionScheduler {
         }
     }
 
-    /// Start the background compaction worker.
+    /// Start the background compaction worker on the given runtime.
     ///
-    /// Uses `tokio::spawn` if a tokio runtime is available, otherwise falls
-    /// back to `std::thread::spawn`. Does nothing if already started.
-    pub fn start(&self) {
-        let mut handle = self.worker_handle.lock();
-        if handle.is_some() {
+    /// Does nothing if already started.
+    pub fn start(&self, handle: &tokio::runtime::Handle) {
+        let mut worker = self.worker_handle.lock();
+        if worker.is_some() {
             return; // Already started
         }
 
         let inner = Arc::clone(&self.inner);
-        if let Ok(rt_handle) = tokio::runtime::Handle::try_current() {
-            *handle = Some(WorkerHandle::Tokio(rt_handle.spawn(async move {
-                inner.compaction_worker_loop().await;
-            })));
-        } else {
-            *handle = Some(WorkerHandle::Thread(std::thread::spawn(move || {
-                inner.compaction_worker_loop_sync();
-            })));
-        }
+        *worker = Some(handle.spawn(async move {
+            inner.compaction_worker_loop().await;
+        }));
     }
 
     /// Stop the background compaction worker.
     ///
-    /// Signals the worker to stop and waits for it to finish.
-    /// Unlike `FlushScheduler`, compaction is not drained on shutdown
+    /// Signals the worker to stop. Compaction is not drained on shutdown
     /// since it can safely resume on next startup.
     pub fn stop(&self) {
         // Signal shutdown
         self.inner.shutdown.store(true, Ordering::SeqCst);
         self.inner.notify.notify_one();
 
-        // Take the handle and abort/join
+        // Take the handle and abort
         let mut handle = self.worker_handle.lock();
-        if let Some(h) = handle.take() {
-            match h {
-                WorkerHandle::Tokio(jh) => jh.abort(),
-                WorkerHandle::Thread(jh) => {
-                    if jh.join().is_err() {
-                        tracing::warn!("Compaction worker thread panicked");
-                    }
-                }
-            }
+        if let Some(jh) = handle.take() {
+            jh.abort();
         }
     }
 
@@ -224,32 +203,6 @@ impl CompactionSchedulerInner {
 
         tracing::info!("Compaction worker stopped");
     }
-
-    /// Main loop for the compaction worker (sync — std::thread fallback).
-    fn compaction_worker_loop_sync(&self) {
-        tracing::info!("Compaction worker started (sync fallback)");
-
-        while !self.shutdown.load(Ordering::Relaxed) {
-            // Advance GC safe point before each compaction attempt
-            self.engine.update_gc_safe_point();
-
-            match crate::io::block_on_sync(self.engine.do_compaction()) {
-                Ok(true) => {
-                    self.compaction_count.fetch_add(1, Ordering::Relaxed);
-                    continue;
-                }
-                Ok(false) => {
-                    std::thread::sleep(Duration::from_secs(1));
-                }
-                Err(e) => {
-                    tracing::error!("Compaction failed: {e}");
-                    std::thread::sleep(Duration::from_millis(500));
-                }
-            }
-        }
-
-        tracing::info!("Compaction worker stopped");
-    }
 }
 
 #[cfg(test)]
@@ -269,8 +222,8 @@ mod tests {
             .unwrap()
     }
 
-    #[test]
-    fn test_compaction_scheduler_new() {
+    #[tokio::test]
+    async fn test_compaction_scheduler_new() {
         let tmp = TempDir::new().unwrap();
         let config = test_config(tmp.path());
         let engine = Arc::new(LsmEngine::open(config).unwrap());
@@ -289,7 +242,7 @@ mod tests {
         let scheduler = CompactionScheduler::new(engine);
 
         // Start
-        scheduler.start();
+        scheduler.start(&tokio::runtime::Handle::current());
         assert!(scheduler.is_running());
 
         // Stop
@@ -305,10 +258,11 @@ mod tests {
         let engine = Arc::new(LsmEngine::open(config).unwrap());
 
         let scheduler = CompactionScheduler::new(engine);
+        let handle = tokio::runtime::Handle::current();
 
         // Start twice - should be safe
-        scheduler.start();
-        scheduler.start();
+        scheduler.start(&handle);
+        scheduler.start(&handle);
         assert!(scheduler.is_running());
 
         scheduler.stop();
@@ -322,7 +276,7 @@ mod tests {
 
         {
             let scheduler = CompactionScheduler::new(engine);
-            scheduler.start();
+            scheduler.start(&tokio::runtime::Handle::current());
             assert!(scheduler.is_running());
             // scheduler dropped here
         }
@@ -346,7 +300,7 @@ mod tests {
         let engine = Arc::new(LsmEngine::open(config).unwrap());
 
         let scheduler = CompactionScheduler::new(Arc::clone(&engine));
-        scheduler.start();
+        scheduler.start(&tokio::runtime::Handle::current());
 
         // Write and flush enough data to create L0 files above compaction trigger
         for i in 0..20 {

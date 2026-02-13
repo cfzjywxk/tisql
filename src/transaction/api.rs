@@ -40,6 +40,7 @@
 //! let info = txn_service.commit(ctx)?;
 //! ```
 
+use std::future::Future;
 use std::ops::Range;
 
 use crate::error::Result;
@@ -340,10 +341,10 @@ pub trait TxnService: Send + Sync {
     /// For read-only transactions with no writes, returns immediately.
     /// For read-write transactions:
     /// 1. Acquire in-memory locks
-    /// 2. Write to commit log
+    /// 2. Write to commit log (async — yields while fsync completes)
     /// 3. Apply to storage with commit_ts
     /// 4. Release locks
-    fn commit(&self, ctx: TxnCtx) -> Result<CommitInfo>;
+    fn commit(&self, ctx: TxnCtx) -> impl Future<Output = Result<CommitInfo>> + Send + '_;
 
     /// Rollback the transaction.
     ///

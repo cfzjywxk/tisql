@@ -850,7 +850,9 @@ impl Executor for SimpleExecutor {
     ) -> Result<ExecutionResult> {
         // Handle transaction control statements
         if plan.is_transaction_control() {
-            return self.execute_transaction_control(plan, txn_service, session);
+            return self
+                .execute_transaction_control(plan, txn_service, session)
+                .await;
         }
 
         // Handle session-level commands (USE database is handled at protocol layer)
@@ -906,7 +908,7 @@ impl Executor for SimpleExecutor {
                 }
                 LogicalPlan::Commit => {
                     if let Some(ctx) = txn_ctx {
-                        txn_service.commit(ctx)?;
+                        txn_service.commit(ctx).await?;
                     }
                     Ok((ExecutionOutput::Ok, None))
                 }
@@ -965,7 +967,7 @@ impl SimpleExecutor {
     // ========================================================================
 
     /// Execute transaction control statements (BEGIN, COMMIT, ROLLBACK).
-    fn execute_transaction_control<T: TxnService>(
+    async fn execute_transaction_control<T: TxnService>(
         &self,
         plan: LogicalPlan,
         txn_service: &T,
@@ -993,7 +995,7 @@ impl SimpleExecutor {
                 // Take the transaction from the session
                 if let Some(ctx) = session.take_current_txn() {
                     // Commit the transaction
-                    txn_service.commit(ctx)?;
+                    txn_service.commit(ctx).await?;
                 }
                 // If no active transaction, COMMIT is a no-op (MySQL behavior)
                 Ok(ExecutionResult::Ok)
@@ -1116,7 +1118,7 @@ impl SimpleExecutor {
         }
 
         // Commit the transaction
-        txn_service.commit(ctx)?;
+        txn_service.commit(ctx).await?;
 
         Ok(result)
     }

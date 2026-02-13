@@ -12,12 +12,13 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-//! io_uring-based I/O service with dedicated event loop thread.
+//! io_uring-based I/O service running on a dedicated tokio runtime.
 //!
 //! ## Design
 //!
-//! A single dedicated thread owns the io_uring ring. Callers submit requests
-//! via a crossbeam channel and receive results through `IoFuture<T>`:
+//! A `spawn_blocking` task on the I/O runtime owns the io_uring ring.
+//! Callers submit requests via a crossbeam channel and receive results
+//! through `IoFuture<T>`:
 //!
 //! - **Async callers**: `.await` the IoFuture in tokio tasks
 //! - **Sync callers**: `.wait()` using `blocking_recv()` (for iterators,
@@ -105,11 +106,17 @@ enum IoOp {
 
 /// io_uring-backed I/O service.
 ///
-/// Spawns a dedicated thread with an io_uring ring. All SST file I/O
-/// (reads, writes, fsyncs) goes through this service.
+/// Spawns a dedicated thread with an io_uring event loop.
+/// All SST file I/O (reads, writes, fsyncs) goes through this service.
 pub struct IoService {
+    /// Sender for the hot path — lock-free, used by read_at/write_at/fsync.
     tx: crossbeam_channel::Sender<IoOp>,
-    thread: Option<std::thread::JoinHandle<()>>,
+    /// Extra sender clone used only by `shutdown()` to close the channel.
+    /// When `shutdown()` takes this, one sender remains (`tx`). The channel
+    /// only closes when IoService is dropped (dropping both senders).
+    /// To force close before Drop, `shutdown()` drops this AND we need Drop
+    /// to be a no-op if already shut down.
+    shutdown_tx: parking_lot::Mutex<Option<crossbeam_channel::Sender<IoOp>>>,
 }
 
 impl std::fmt::Debug for IoService {
@@ -119,25 +126,43 @@ impl std::fmt::Debug for IoService {
 }
 
 impl IoService {
-    /// Create a new IoService with the given ring size.
+    /// Create a new IoService with the given io_uring ring size.
     ///
     /// `ring_size` determines the io_uring submission queue depth (e.g., 256).
+    /// Spawns a dedicated OS thread for the io_uring event loop. The thread
+    /// exits when the channel is closed (all senders dropped via Drop or `shutdown()`).
     pub fn new(ring_size: u32) -> Result<Arc<Self>, String> {
         let (tx, rx) = crossbeam_channel::unbounded::<IoOp>();
+        let shutdown_tx = tx.clone();
 
-        let thread = std::thread::Builder::new()
+        std::thread::Builder::new()
             .name("tisql-io-uring".into())
             .spawn(move || {
                 if let Err(e) = io_thread_main(rx, ring_size) {
                     tracing::error!("io_uring thread failed: {e}");
                 }
             })
-            .map_err(|e| format!("failed to spawn io thread: {e}"))?;
+            .map_err(|e| format!("Failed to spawn io_uring thread: {e}"))?;
 
         Ok(Arc::new(Self {
             tx,
-            thread: Some(thread),
+            shutdown_tx: parking_lot::Mutex::new(Some(shutdown_tx)),
         }))
+    }
+
+    /// Create an IoService for tests (alias for `new()`).
+    #[cfg(test)]
+    pub fn new_for_test(ring_size: u32) -> Result<Arc<Self>, String> {
+        Self::new(ring_size)
+    }
+
+    /// Shutdown the io_uring thread by closing the channel early.
+    ///
+    /// Drops the extra sender clone. Combined with `LsmEngine::drop()` which
+    /// drops the main `tx`, this closes the channel and the io_uring thread exits.
+    /// Safe to call multiple times — subsequent calls are no-ops.
+    pub fn shutdown(&self) {
+        self.shutdown_tx.lock().take();
     }
 
     /// Read `len` bytes at `offset` from the file.
@@ -205,25 +230,8 @@ impl IoService {
     }
 }
 
-impl Drop for IoService {
-    fn drop(&mut self) {
-        // Dropping tx causes recv() in the IO thread to return Err, which exits the loop.
-        // We need to drop tx explicitly first by replacing the sender.
-        // Since we can't easily drop tx without consuming self, we just join the thread.
-        // The thread will exit when all senders are dropped (which happens when IoService is dropped).
-        if let Some(thread) = self.thread.take() {
-            // tx will be dropped after this Drop impl returns, so we need to
-            // not join here — the thread will exit asynchronously.
-            // But for clean shutdown we should wait. Let's use a timeout approach:
-            // drop the sender first by forgetting about it, then join.
-            drop(self.tx.clone()); // no-op, original tx still alive
-                                   // The thread will exit when all Senders are dropped. Since we're in Drop,
-                                   // self.tx will be dropped after this method returns. We can't easily
-                                   // synchronize that. Just detach the thread.
-            let _ = thread; // Thread is detached.
-        }
-    }
-}
+// Drop: Both `tx` and `shutdown_tx` are dropped, closing the channel.
+// The io_uring thread's rx.recv() returns Err, exiting the loop.
 
 // ============================================================================
 // IO Thread Main Loop
@@ -450,36 +458,36 @@ mod tests {
     use crate::io::DmaFile;
     use tempfile::tempdir;
 
-    #[test]
-    fn test_io_service_create() {
-        let service = IoService::new(32);
+    #[tokio::test]
+    async fn test_io_service_create() {
+        let service = IoService::new_for_test(32);
         assert!(service.is_ok(), "IoService creation should succeed");
     }
 
-    #[test]
-    fn test_io_service_write_and_read() {
+    #[tokio::test]
+    async fn test_io_service_write_and_read() {
         let dir = tempdir().unwrap();
-        let io = IoService::new(32).unwrap();
+        let io = IoService::new_for_test(32).unwrap();
         let path = dir.path().join("test_io.dat");
 
         // Write aligned data
         let file = DmaFile::open_write(&path).unwrap();
         let data = AlignedBuf::from_slice(&[0xAA; 4096], DMA_ALIGNMENT);
-        io.write_at(&file, 0, data).wait().unwrap();
-        io.fsync(&file).wait().unwrap();
+        io.write_at(&file, 0, data).await.unwrap();
+        io.fsync(&file).await.unwrap();
         drop(file);
 
         // Read it back
         let file = DmaFile::open_read(&path).unwrap();
-        let buf = io.read_at(&file, 0, 4096).wait().unwrap();
+        let buf = io.read_at(&file, 0, 4096).await.unwrap();
         assert_eq!(buf.len(), 4096);
         assert!(buf.iter().all(|&b| b == 0xAA));
     }
 
-    #[test]
-    fn test_io_service_unaligned_read() {
+    #[tokio::test]
+    async fn test_io_service_unaligned_read() {
         let dir = tempdir().unwrap();
-        let io = IoService::new(32).unwrap();
+        let io = IoService::new_for_test(32).unwrap();
         let path = dir.path().join("test_unaligned.dat");
 
         // Write 8192 bytes of known data
@@ -488,38 +496,38 @@ mod tests {
         for (i, byte) in data.iter_mut().enumerate() {
             *byte = (i % 256) as u8;
         }
-        io.write_at(&file, 0, data).wait().unwrap();
-        io.fsync(&file).wait().unwrap();
+        io.write_at(&file, 0, data).await.unwrap();
+        io.fsync(&file).await.unwrap();
         drop(file);
 
         // Read 100 bytes starting at offset 1000 (unaligned)
         let file = DmaFile::open_read(&path).unwrap();
-        let buf = io.read_at(&file, 1000, 100).wait().unwrap();
+        let buf = io.read_at(&file, 1000, 100).await.unwrap();
         assert_eq!(buf.len(), 100);
         for (i, &byte) in buf.iter().enumerate() {
             assert_eq!(byte, ((1000 + i) % 256) as u8);
         }
     }
 
-    #[test]
-    fn test_io_service_multiple_writes() {
+    #[tokio::test]
+    async fn test_io_service_multiple_writes() {
         let dir = tempdir().unwrap();
-        let io = IoService::new(32).unwrap();
+        let io = IoService::new_for_test(32).unwrap();
         let path = dir.path().join("test_multi_write.dat");
 
         // Write two aligned blocks
         let file = DmaFile::open_write(&path).unwrap();
         let block1 = AlignedBuf::from_slice(&[0x11; 4096], DMA_ALIGNMENT);
         let block2 = AlignedBuf::from_slice(&[0x22; 4096], DMA_ALIGNMENT);
-        io.write_at(&file, 0, block1).wait().unwrap();
-        io.write_at(&file, 4096, block2).wait().unwrap();
-        io.fsync(&file).wait().unwrap();
+        io.write_at(&file, 0, block1).await.unwrap();
+        io.write_at(&file, 4096, block2).await.unwrap();
+        io.fsync(&file).await.unwrap();
         drop(file);
 
         // Read both back
         let file = DmaFile::open_read(&path).unwrap();
-        let buf1 = io.read_at(&file, 0, 4096).wait().unwrap();
-        let buf2 = io.read_at(&file, 4096, 4096).wait().unwrap();
+        let buf1 = io.read_at(&file, 0, 4096).await.unwrap();
+        let buf2 = io.read_at(&file, 4096, 4096).await.unwrap();
         assert!(buf1.iter().all(|&b| b == 0x11));
         assert!(buf2.iter().all(|&b| b == 0x22));
     }
