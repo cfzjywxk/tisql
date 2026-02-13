@@ -154,7 +154,7 @@ impl ClogBatch {
 ///
 /// All write methods return a `ClogFsyncFuture` that resolves when the
 /// write (+ optional fsync) is durable. Callers in async contexts `.await`
-/// the future; sync callers use `crate::io::block_on_sync()`.
+/// the future.
 pub trait ClogService: Send + Sync {
     /// Append batch atomically, returns future that yields the last LSN.
     fn write(&self, batch: &mut ClogBatch, sync: bool) -> Result<ClogFsyncFuture>;
@@ -188,7 +188,7 @@ pub trait ClogService: Send + Sync {
     fn current_lsn(&self) -> Lsn;
 
     /// Close the commit log service
-    fn close(&self) -> Result<()>;
+    fn close(&self) -> impl std::future::Future<Output = Result<()>> + Send;
 
     /// Shutdown the group commit writer channel.
     ///

@@ -27,10 +27,10 @@ use crate::types::Value;
 
 /// Check if the database has been bootstrapped by reading the `__all_meta`
 /// bootstrap_version row (meta_id=1) via direct KV read.
-pub fn is_bootstrapped<T: TxnService>(txn: &T) -> Result<bool> {
+pub async fn is_bootstrapped<T: TxnService>(txn: &T) -> Result<bool> {
     let ctx = txn.begin(true)?;
     let key = encode_record_key_with_handle(ALL_META_TABLE_ID, META_BOOTSTRAP_VERSION);
-    Ok(txn.get(&ctx, &key)?.is_some())
+    Ok(txn.get(&ctx, &key).await?.is_some())
 }
 
 /// Bootstrap all core system tables via direct KV writes in a single transaction.
@@ -40,23 +40,23 @@ pub fn is_bootstrapped<T: TxnService>(txn: &T) -> Result<bool> {
 /// 2. `__all_table` rows (one per core table)
 /// 3. `__all_column` rows (columns of all 5 core tables)
 /// 4. `__all_meta` rows (bootstrap_version, next_table_id, next_index_id, schema_version, next_schema_id)
-pub fn bootstrap_core_tables<T: TxnService>(txn: &T) -> Result<()> {
+pub async fn bootstrap_core_tables<T: TxnService>(txn: &T) -> Result<()> {
     let mut ctx = txn.begin(false)?;
 
     // 1. Write __all_schema rows
-    write_schema_row(&mut ctx, txn, INNER_SCHEMA_ID, INNER_SCHEMA)?;
-    write_schema_row(&mut ctx, txn, DEFAULT_SCHEMA_ID, "default")?;
-    write_schema_row(&mut ctx, txn, TEST_SCHEMA_ID, "test")?;
+    write_schema_row(&mut ctx, txn, INNER_SCHEMA_ID, INNER_SCHEMA).await?;
+    write_schema_row(&mut ctx, txn, DEFAULT_SCHEMA_ID, "default").await?;
+    write_schema_row(&mut ctx, txn, TEST_SCHEMA_ID, "test").await?;
 
     // 2. Write __all_table rows for all 5 core tables
     for table_def in core_table_defs() {
-        write_table_row(&mut ctx, txn, &table_def)?;
+        write_table_row(&mut ctx, txn, &table_def).await?;
     }
 
     // 3. Write __all_column rows for all columns of all 5 core tables
     for table_def in core_table_defs() {
         for (ordinal, col) in table_def.columns().iter().enumerate() {
-            write_column_row(&mut ctx, txn, table_def.id(), col, ordinal)?;
+            write_column_row(&mut ctx, txn, table_def.id(), col, ordinal).await?;
         }
     }
 
@@ -67,26 +67,26 @@ pub fn bootstrap_core_tables<T: TxnService>(txn: &T) -> Result<()> {
         META_BOOTSTRAP_VERSION,
         "bootstrap_version",
         "1",
-    )?;
+    ).await?;
     write_meta_row(
         &mut ctx,
         txn,
         META_NEXT_TABLE_ID,
         "next_table_id",
         &USER_TABLE_ID_START.to_string(),
-    )?;
-    write_meta_row(&mut ctx, txn, META_NEXT_INDEX_ID, "next_index_id", "1")?;
-    write_meta_row(&mut ctx, txn, META_SCHEMA_VERSION, "schema_version", "1")?;
+    ).await?;
+    write_meta_row(&mut ctx, txn, META_NEXT_INDEX_ID, "next_index_id", "1").await?;
+    write_meta_row(&mut ctx, txn, META_SCHEMA_VERSION, "schema_version", "1").await?;
     write_meta_row(
         &mut ctx,
         txn,
         META_NEXT_SCHEMA_ID,
         "next_schema_id",
         &USER_SCHEMA_ID_START.to_string(),
-    )?;
-    write_meta_row(&mut ctx, txn, META_NEXT_GC_TASK_ID, "next_gc_task_id", "1")?;
+    ).await?;
+    write_meta_row(&mut ctx, txn, META_NEXT_GC_TASK_ID, "next_gc_task_id", "1").await?;
 
-    crate::io::block_on_sync(txn.commit(ctx))?;
+    txn.commit(ctx).await?;
     Ok(())
 }
 
@@ -95,7 +95,7 @@ pub fn bootstrap_core_tables<T: TxnService>(txn: &T) -> Result<()> {
 // ============================================================================
 
 /// Write a row into `__all_meta` (table_id=1).
-fn write_meta_row<T: TxnService>(
+async fn write_meta_row<T: TxnService>(
     ctx: &mut TxnCtx,
     txn: &T,
     meta_id: i64,
@@ -111,11 +111,11 @@ fn write_meta_row<T: TxnService>(
         Value::BigInt(0), // updated_ts placeholder
     ];
     let row_data = encode_row(col_ids, values);
-    txn.put(ctx, key, row_data)
+    txn.put(ctx, key, row_data).await
 }
 
 /// Write a row into `__all_schema` (table_id=2).
-fn write_schema_row<T: TxnService>(
+async fn write_schema_row<T: TxnService>(
     ctx: &mut TxnCtx,
     txn: &T,
     schema_id: u64,
@@ -128,11 +128,11 @@ fn write_schema_row<T: TxnService>(
         Value::String(schema_name.to_string()),
     ];
     let row_data = encode_row(col_ids, values);
-    txn.put(ctx, key, row_data)
+    txn.put(ctx, key, row_data).await
 }
 
 /// Write a row into `__all_table` (table_id=3).
-fn write_table_row<T: TxnService>(
+async fn write_table_row<T: TxnService>(
     ctx: &mut TxnCtx,
     txn: &T,
     table: &crate::catalog::TableDef,
@@ -155,13 +155,13 @@ fn write_table_row<T: TxnService>(
         Value::BigInt(table.auto_increment_id() as i64),
     ];
     let row_data = encode_row(col_ids, values);
-    txn.put(ctx, key, row_data)
+    txn.put(ctx, key, row_data).await
 }
 
 /// Write a row into `__all_column` (table_id=4).
 ///
 /// Synthetic PK: `table_id * 10000 + column_id`.
-fn write_column_row<T: TxnService>(
+async fn write_column_row<T: TxnService>(
     ctx: &mut TxnCtx,
     txn: &T,
     table_id: u64,
@@ -187,11 +187,11 @@ fn write_column_row<T: TxnService>(
         Value::Int(col.auto_increment() as i32),
     ];
     let row_data = encode_row(col_ids, values);
-    txn.put(ctx, key, row_data)
+    txn.put(ctx, key, row_data).await
 }
 
 /// Write a row into `__all_table` for a user table with an explicit schema_id.
-pub(crate) fn write_user_table_row<T: TxnService>(
+pub(crate) async fn write_user_table_row<T: TxnService>(
     ctx: &mut TxnCtx,
     txn: &T,
     table: &crate::catalog::TableDef,
@@ -214,18 +214,18 @@ pub(crate) fn write_user_table_row<T: TxnService>(
         Value::BigInt(table.auto_increment_id() as i64),
     ];
     let row_data = encode_row(col_ids, values);
-    txn.put(ctx, key, row_data)
+    txn.put(ctx, key, row_data).await
 }
 
 /// Write column rows into `__all_column` for a user table.
-pub(crate) fn write_user_column_rows<T: TxnService>(
+pub(crate) async fn write_user_column_rows<T: TxnService>(
     ctx: &mut TxnCtx,
     txn: &T,
     table_id: u64,
     columns: &[crate::catalog::ColumnDef],
 ) -> Result<()> {
     for (ordinal, col) in columns.iter().enumerate() {
-        write_column_row(ctx, txn, table_id, col, ordinal)?;
+        write_column_row(ctx, txn, table_id, col, ordinal).await?;
     }
     Ok(())
 }
@@ -233,7 +233,7 @@ pub(crate) fn write_user_column_rows<T: TxnService>(
 /// Write an index row into `__all_index` (table_id=5).
 ///
 /// Synthetic PK: `table_id * 10000 + index_id`.
-pub(crate) fn write_index_row<T: TxnService>(
+pub(crate) async fn write_index_row<T: TxnService>(
     ctx: &mut TxnCtx,
     txn: &T,
     table_id: u64,
@@ -257,11 +257,11 @@ pub(crate) fn write_index_row<T: TxnService>(
         Value::Int(index.unique() as i32),
     ];
     let row_data = encode_row(col_ids, values);
-    txn.put(ctx, key, row_data)
+    txn.put(ctx, key, row_data).await
 }
 
 /// Delete all column rows for a table from `__all_column`.
-pub(crate) fn delete_column_rows<T: TxnService>(
+pub(crate) async fn delete_column_rows<T: TxnService>(
     ctx: &mut TxnCtx,
     txn: &T,
     table_id: u64,
@@ -270,13 +270,13 @@ pub(crate) fn delete_column_rows<T: TxnService>(
     for col in columns {
         let column_key = table_id * 10000 + col.id() as u64;
         let key = encode_record_key_with_handle(ALL_COLUMN_TABLE_ID, column_key as i64);
-        txn.delete(ctx, key)?;
+        txn.delete(ctx, key).await?;
     }
     Ok(())
 }
 
 /// Delete all index rows for a table from `__all_index`.
-pub(crate) fn delete_index_rows<T: TxnService>(
+pub(crate) async fn delete_index_rows<T: TxnService>(
     ctx: &mut TxnCtx,
     txn: &T,
     table_id: u64,
@@ -285,14 +285,14 @@ pub(crate) fn delete_index_rows<T: TxnService>(
     for index in indexes {
         let index_key = table_id * 10000 + index.id();
         let key = encode_record_key_with_handle(ALL_INDEX_TABLE_ID, index_key as i64);
-        txn.delete(ctx, key)?;
+        txn.delete(ctx, key).await?;
     }
     Ok(())
 }
 
 /// Write a row into `__all_gc_delete_range` (table_id=6).
 #[allow(clippy::too_many_arguments)]
-pub(crate) fn write_gc_task_row<T: TxnService>(
+pub(crate) async fn write_gc_task_row<T: TxnService>(
     ctx: &mut TxnCtx,
     txn: &T,
     task_id: i64,
@@ -313,12 +313,12 @@ pub(crate) fn write_gc_task_row<T: TxnService>(
         Value::String(status.to_string()),
     ];
     let row_data = encode_row(col_ids, values);
-    txn.put(ctx, key, row_data)
+    txn.put(ctx, key, row_data).await
 }
 
 /// Update the status of a GC task in `__all_gc_delete_range`.
 #[allow(clippy::too_many_arguments)]
-pub(crate) fn update_gc_task_status<T: TxnService>(
+pub(crate) async fn update_gc_task_status<T: TxnService>(
     ctx: &mut TxnCtx,
     txn: &T,
     task_id: i64,
@@ -337,18 +337,18 @@ pub(crate) fn update_gc_task_status<T: TxnService>(
         end_key_hex,
         drop_commit_ts,
         status,
-    )
+    ).await
 }
 
 /// Update a meta row in `__all_meta` (overwrite existing row).
-pub(crate) fn update_meta_row<T: TxnService>(
+pub(crate) async fn update_meta_row<T: TxnService>(
     ctx: &mut TxnCtx,
     txn: &T,
     meta_id: i64,
     value: u64,
 ) -> Result<()> {
     let meta_key = META_KEYS[meta_id as usize];
-    write_meta_row(ctx, txn, meta_id, meta_key, &value.to_string())
+    write_meta_row(ctx, txn, meta_id, meta_key, &value.to_string()).await
 }
 
 #[cfg(test)]
@@ -384,37 +384,37 @@ mod tests {
     #[tokio::test]
     async fn test_not_bootstrapped_initially() {
         let (txn, _dir) = create_test_txn();
-        assert!(!is_bootstrapped(txn.as_ref()).unwrap());
+        assert!(!is_bootstrapped(txn.as_ref()).await.unwrap());
     }
 
     #[tokio::test]
     async fn test_bootstrap_then_detect() {
         let (txn, _dir) = create_test_txn();
-        assert!(!is_bootstrapped(txn.as_ref()).unwrap());
-        bootstrap_core_tables(txn.as_ref()).unwrap();
-        assert!(is_bootstrapped(txn.as_ref()).unwrap());
+        assert!(!is_bootstrapped(txn.as_ref()).await.unwrap());
+        bootstrap_core_tables(txn.as_ref()).await.unwrap();
+        assert!(is_bootstrapped(txn.as_ref()).await.unwrap());
     }
 
     #[tokio::test]
     async fn test_bootstrap_idempotent_detection() {
         let (txn, _dir) = create_test_txn();
-        bootstrap_core_tables(txn.as_ref()).unwrap();
+        bootstrap_core_tables(txn.as_ref()).await.unwrap();
         // Calling is_bootstrapped multiple times should always return true
-        assert!(is_bootstrapped(txn.as_ref()).unwrap());
-        assert!(is_bootstrapped(txn.as_ref()).unwrap());
+        assert!(is_bootstrapped(txn.as_ref()).await.unwrap());
+        assert!(is_bootstrapped(txn.as_ref()).await.unwrap());
     }
 
     #[tokio::test]
     async fn test_bootstrap_writes_meta_rows() {
         let (txn, _dir) = create_test_txn();
-        bootstrap_core_tables(txn.as_ref()).unwrap();
+        bootstrap_core_tables(txn.as_ref()).await.unwrap();
 
         // Verify all 6 meta rows exist
         let ctx = txn.begin(true).unwrap();
         for meta_id in 1..=6i64 {
             let key = encode_record_key_with_handle(ALL_META_TABLE_ID, meta_id);
             assert!(
-                txn.get(&ctx, &key).unwrap().is_some(),
+                txn.get(&ctx, &key).await.unwrap().is_some(),
                 "Meta row {meta_id} missing"
             );
         }
@@ -423,14 +423,14 @@ mod tests {
     #[tokio::test]
     async fn test_bootstrap_writes_schema_rows() {
         let (txn, _dir) = create_test_txn();
-        bootstrap_core_tables(txn.as_ref()).unwrap();
+        bootstrap_core_tables(txn.as_ref()).await.unwrap();
 
         let ctx = txn.begin(true).unwrap();
         // inner, default, test schemas
         for schema_id in [INNER_SCHEMA_ID, DEFAULT_SCHEMA_ID, TEST_SCHEMA_ID] {
             let key = encode_record_key_with_handle(ALL_SCHEMA_TABLE_ID, schema_id as i64);
             assert!(
-                txn.get(&ctx, &key).unwrap().is_some(),
+                txn.get(&ctx, &key).await.unwrap().is_some(),
                 "Schema row {schema_id} missing"
             );
         }
@@ -439,13 +439,13 @@ mod tests {
     #[tokio::test]
     async fn test_bootstrap_writes_table_rows() {
         let (txn, _dir) = create_test_txn();
-        bootstrap_core_tables(txn.as_ref()).unwrap();
+        bootstrap_core_tables(txn.as_ref()).await.unwrap();
 
         let ctx = txn.begin(true).unwrap();
         for table_id in 1..=5u64 {
             let key = encode_record_key_with_handle(ALL_TABLE_TABLE_ID, table_id as i64);
             assert!(
-                txn.get(&ctx, &key).unwrap().is_some(),
+                txn.get(&ctx, &key).await.unwrap().is_some(),
                 "Table row {table_id} missing"
             );
         }

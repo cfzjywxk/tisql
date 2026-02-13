@@ -228,7 +228,7 @@ impl<S: PessimisticStorage + 'static, L: ClogService + 'static, T: TsoService>
     ///
     /// Pending writes are already in storage. This reads them back to
     /// build the clog WriteBatch.
-    fn prepare_explicit_batch(&self, ctx: &mut TxnCtx) -> Result<(Vec<Key>, WriteBatch)> {
+    async fn prepare_explicit_batch(&self, ctx: &mut TxnCtx) -> Result<(Vec<Key>, WriteBatch)> {
         let locked_keys = std::mem::take(&mut ctx.locked_keys);
         if locked_keys.is_empty() {
             return Ok((vec![], WriteBatch::new()));
@@ -240,7 +240,7 @@ impl<S: PessimisticStorage + 'static, L: ClogService + 'static, T: TsoService>
             if lock_keys.contains(key) {
                 continue; // LOCK key — nothing to persist in clog
             }
-            match self.storage.get_with_owner(key, ctx.start_ts, ctx.start_ts) {
+            match self.storage.get_with_owner(key, ctx.start_ts, ctx.start_ts).await {
                 Some(value) if !is_tombstone(&value) => {
                     batch.put(key.clone(), value);
                 }
@@ -281,10 +281,10 @@ impl<S: PessimisticStorage + 'static, L: ClogService + 'static, T: TsoService> T
         Ok(ctx)
     }
 
-    fn get(&self, ctx: &TxnCtx, key: &[u8]) -> Result<Option<RawValue>> {
+    async fn get(&self, ctx: &TxnCtx, key: &[u8]) -> Result<Option<RawValue>> {
         // Use get_with_owner with owner_ts=start_ts for read-your-writes.
         // This sees own pending writes and committed data at start_ts.
-        let value = self.storage.get_with_owner(key, ctx.start_ts, ctx.start_ts);
+        let value = self.storage.get_with_owner(key, ctx.start_ts, ctx.start_ts).await;
         Ok(value.filter(|v| !is_tombstone(v)))
     }
 
@@ -314,7 +314,7 @@ impl<S: PessimisticStorage + 'static, L: ClogService + 'static, T: TsoService> T
         Ok(MvccScanIterator::new(storage_iter, ctx.start_ts, range, cm))
     }
 
-    fn put(&self, ctx: &mut TxnCtx, key: Key, value: RawValue) -> Result<()> {
+    async fn put(&self, ctx: &mut TxnCtx, key: Key, value: RawValue) -> Result<()> {
         if ctx.state != TxnState::Running {
             return Err(TiSqlError::TransactionNotActive(format!("{:?}", ctx.state)));
         }
@@ -347,7 +347,7 @@ impl<S: PessimisticStorage + 'static, L: ClogService + 'static, T: TsoService> T
         }
     }
 
-    fn delete(&self, ctx: &mut TxnCtx, key: Key) -> Result<()> {
+    async fn delete(&self, ctx: &mut TxnCtx, key: Key) -> Result<()> {
         if ctx.state != TxnState::Running {
             return Err(TiSqlError::TransactionNotActive(format!("{:?}", ctx.state)));
         }
@@ -366,6 +366,7 @@ impl<S: PessimisticStorage + 'static, L: ClogService + 'static, T: TsoService> T
         let value_exists = self
             .storage
             .get_with_owner(&key, ctx.start_ts, ctx.start_ts)
+            .await
             .is_some();
 
         if value_exists {
@@ -411,7 +412,7 @@ impl<S: PessimisticStorage + 'static, L: ClogService + 'static, T: TsoService> T
         let start_ts = ctx.start_ts;
 
         // Build locked_keys and storage_batch from pending nodes in storage.
-        let (locked_keys, storage_batch) = self.prepare_explicit_batch(&mut ctx)?;
+        let (locked_keys, storage_batch) = self.prepare_explicit_batch(&mut ctx).await?;
 
         // No-write transaction: clean up and return
         if locked_keys.is_empty() {
@@ -829,7 +830,7 @@ mod tests {
     // Test Helpers Using MvccKey
     // ========================================================================
 
-    fn get_at_for_test<S: StorageEngine>(
+    async fn get_at_for_test<S: StorageEngine>(
         storage: &S,
         key: &[u8],
         ts: Timestamp,
@@ -841,7 +842,7 @@ mod tests {
         let range = seek_key..end_key;
 
         let mut iter = storage.scan_iter(range, 0).unwrap();
-        crate::io::block_on_sync(iter.advance()).unwrap(); // Position on first entry
+        iter.advance().await.unwrap(); // Position on first entry
 
         while iter.valid() {
             let decoded_key = iter.user_key();
@@ -853,13 +854,13 @@ mod tests {
                 }
                 return Some(value.to_vec());
             }
-            crate::io::block_on_sync(iter.advance()).unwrap();
+            iter.advance().await.unwrap();
         }
         None
     }
 
-    fn get_for_test<S: StorageEngine>(storage: &S, key: &[u8]) -> Option<RawValue> {
-        get_at_for_test(storage, key, Timestamp::MAX)
+    async fn get_for_test<S: StorageEngine>(storage: &S, key: &[u8]) -> Option<RawValue> {
+        get_at_for_test(storage, key, Timestamp::MAX).await
     }
 
     // Import test extension trait for autocommit helpers
@@ -870,17 +871,17 @@ mod tests {
         let (storage, txn_service, _dir) = create_test_service();
 
         // Execute writes using proper transaction flow
-        let info = txn_service.autocommit_put(b"key1", b"value1").unwrap();
+        let info = txn_service.autocommit_put(b"key1", b"value1").await.unwrap();
         assert!(info.txn_id > 0);
         assert!(info.commit_ts > 0);
         assert!(info.lsn > 0);
 
-        txn_service.autocommit_put(b"key2", b"value2").unwrap();
+        txn_service.autocommit_put(b"key2", b"value2").await.unwrap();
 
         // Verify storage
-        let v1 = get_for_test(&*storage, b"key1");
+        let v1 = get_for_test(&*storage, b"key1").await;
         assert_eq!(v1, Some(b"value1".to_vec()));
-        let v2 = get_for_test(&*storage, b"key2");
+        let v2 = get_for_test(&*storage, b"key2").await;
         assert_eq!(v2, Some(b"value2".to_vec()));
     }
 
@@ -898,11 +899,11 @@ mod tests {
             let storage = Arc::new(MemTableEngine::new());
             let txn_service = TransactionService::new(storage, clog_service.clone(), tso, cm);
 
-            txn_service.autocommit_put(b"k1", b"v1").unwrap();
-            txn_service.autocommit_put(b"k2", b"v2").unwrap();
-            txn_service.autocommit_delete(b"k1").unwrap();
+            txn_service.autocommit_put(b"k1", b"v1").await.unwrap();
+            txn_service.autocommit_put(b"k2", b"v2").await.unwrap();
+            txn_service.autocommit_delete(b"k1").await.unwrap();
 
-            clog_service.close().unwrap();
+            clog_service.close().await.unwrap();
         }
 
         // Recover
@@ -919,8 +920,8 @@ mod tests {
         assert_eq!(stats.applied_deletes, 1);
 
         // Verify recovered state
-        assert!(get_for_test(&*storage, b"k1").is_none()); // Was deleted
-        assert_eq!(get_for_test(&*storage, b"k2"), Some(b"v2".to_vec()));
+        assert!(get_for_test(&*storage, b"k1").await.is_none()); // Was deleted
+        assert_eq!(get_for_test(&*storage, b"k2").await, Some(b"v2".to_vec()));
 
         // Verify TSO advanced (use tso().last_ts() to check state)
         assert!(txn_service.tso().last_ts() > 3);
@@ -931,23 +932,23 @@ mod tests {
         let (storage, txn_service, _dir) = create_test_service();
 
         // Write v1
-        let info1 = txn_service.autocommit_put(b"key", b"v1").unwrap();
+        let info1 = txn_service.autocommit_put(b"key", b"v1").await.unwrap();
         let ts1 = info1.commit_ts;
 
         // Write v2
-        let info2 = txn_service.autocommit_put(b"key", b"v2").unwrap();
+        let info2 = txn_service.autocommit_put(b"key", b"v2").await.unwrap();
         let ts2 = info2.commit_ts;
 
         // Reading at latest should see v2
-        let v = get_for_test(&*storage, b"key");
+        let v = get_for_test(&*storage, b"key").await;
         assert_eq!(v, Some(b"v2".to_vec()));
 
         // Reading at ts1 should see v1 (MVCC visibility)
-        let v = get_at_for_test(&*storage, b"key", ts1);
+        let v = get_at_for_test(&*storage, b"key", ts1).await;
         assert_eq!(v, Some(b"v1".to_vec()));
 
         // Reading at ts2 should see v2
-        let v = get_at_for_test(&*storage, b"key", ts2);
+        let v = get_at_for_test(&*storage, b"key", ts2).await;
         assert_eq!(v, Some(b"v2".to_vec()));
     }
 
@@ -989,6 +990,7 @@ mod tests {
         // Put via transaction — writes pending node directly to storage
         txn_service
             .put(&mut ctx, b"key1".to_vec(), b"value1".to_vec())
+            .await
             .unwrap();
 
         // Commit
@@ -997,7 +999,7 @@ mod tests {
         assert!(info.lsn > 0);
 
         // Now visible in storage
-        let storage_value = get_for_test(&*storage, b"key1");
+        let storage_value = get_for_test(&*storage, b"key1").await;
         assert_eq!(storage_value, Some(b"value1".to_vec()));
     }
 
@@ -1006,16 +1008,19 @@ mod tests {
         let (storage, txn_service, _dir) = create_test_service();
 
         // First commit a value
-        txn_service.autocommit_put(b"key1", b"value1").unwrap();
-        assert_eq!(get_for_test(&*storage, b"key1"), Some(b"value1".to_vec()));
+        txn_service.autocommit_put(b"key1", b"value1").await.unwrap();
+        assert_eq!(
+            get_for_test(&*storage, b"key1").await,
+            Some(b"value1".to_vec())
+        );
 
         // Delete via transaction
         let mut ctx = txn_service.begin(false).unwrap();
-        txn_service.delete(&mut ctx, b"key1".to_vec()).unwrap();
+        txn_service.delete(&mut ctx, b"key1".to_vec()).await.unwrap();
         txn_service.commit(ctx).await.unwrap();
 
         // Should be deleted in storage
-        assert!(get_for_test(&*storage, b"key1").is_none());
+        assert!(get_for_test(&*storage, b"key1").await.is_none());
     }
 
     #[tokio::test]
@@ -1026,13 +1031,14 @@ mod tests {
 
         txn_service
             .put(&mut ctx, b"key1".to_vec(), b"value1".to_vec())
+            .await
             .unwrap();
 
         // Rollback
         txn_service.rollback(ctx).unwrap();
 
         // Data should NOT be in storage
-        let value = get_for_test(&*storage, b"key1");
+        let value = get_for_test(&*storage, b"key1").await;
         assert!(value.is_none());
     }
 
@@ -1041,24 +1047,24 @@ mod tests {
         let (_storage, txn_service, _dir) = create_test_service();
 
         // Write initial data
-        txn_service.autocommit_put(b"key", b"v1").unwrap();
+        txn_service.autocommit_put(b"key", b"v1").await.unwrap();
 
         // Begin transaction
         let ctx = txn_service.begin(true).unwrap();
 
         // Transaction should see v1
-        let value = txn_service.get(&ctx, b"key").unwrap();
+        let value = txn_service.get(&ctx, b"key").await.unwrap();
         assert_eq!(value, Some(b"v1".to_vec()));
 
         // Write v2 via autocommit (outside the transaction)
-        txn_service.autocommit_put(b"key", b"v2").unwrap();
+        txn_service.autocommit_put(b"key", b"v2").await.unwrap();
 
         // Transaction should still see v1 (snapshot isolation)
-        let value = txn_service.get(&ctx, b"key").unwrap();
+        let value = txn_service.get(&ctx, b"key").await.unwrap();
         assert_eq!(value, Some(b"v1".to_vec()));
 
         // But reading via storage should see v2
-        let latest = get_for_test(txn_service.storage(), b"key");
+        let latest = get_for_test(txn_service.storage(), b"key").await;
         assert_eq!(latest, Some(b"v2".to_vec()));
     }
 
@@ -1069,7 +1075,7 @@ mod tests {
         let mut ctx = txn_service.begin(true).unwrap();
 
         // Put should error for read-only transaction
-        let result = txn_service.put(&mut ctx, b"key1".to_vec(), b"value1".to_vec());
+        let result = txn_service.put(&mut ctx, b"key1".to_vec(), b"value1".to_vec()).await;
         assert!(result.is_err());
         assert!(matches!(
             result.unwrap_err(),
@@ -1077,7 +1083,7 @@ mod tests {
         ));
 
         // Delete should also error
-        let result = txn_service.delete(&mut ctx, b"key1".to_vec());
+        let result = txn_service.delete(&mut ctx, b"key1".to_vec()).await;
         assert!(result.is_err());
         assert!(matches!(
             result.unwrap_err(),
@@ -1089,7 +1095,7 @@ mod tests {
         assert_eq!(info.lsn, 0); // No log written
 
         // Nothing in storage
-        let value = get_for_test(&*storage, b"key1");
+        let value = get_for_test(&*storage, b"key1").await;
         assert!(value.is_none());
     }
 
@@ -1098,9 +1104,9 @@ mod tests {
         let (_storage, txn_service, _dir) = create_test_service();
 
         // Write some data via autocommit
-        txn_service.autocommit_put(b"a", b"1").unwrap();
-        txn_service.autocommit_put(b"b", b"2").unwrap();
-        txn_service.autocommit_put(b"c", b"3").unwrap();
+        txn_service.autocommit_put(b"a", b"1").await.unwrap();
+        txn_service.autocommit_put(b"b", b"2").await.unwrap();
+        txn_service.autocommit_put(b"c", b"3").await.unwrap();
 
         // Begin a read-only transaction
         let ctx = txn_service.begin(true).unwrap();
@@ -1131,9 +1137,9 @@ mod tests {
         let (_storage, txn_service, _dir) = create_test_service();
 
         // Commit some data first
-        txn_service.autocommit_put(b"m", b"m_value").unwrap();
-        txn_service.autocommit_put(b"n", b"n_value").unwrap();
-        txn_service.autocommit_put(b"o", b"o_value").unwrap();
+        txn_service.autocommit_put(b"m", b"m_value").await.unwrap();
+        txn_service.autocommit_put(b"n", b"n_value").await.unwrap();
+        txn_service.autocommit_put(b"o", b"o_value").await.unwrap();
 
         // Begin a read-only transaction
         let ctx = txn_service.begin(true).unwrap();
@@ -1161,8 +1167,8 @@ mod tests {
         let (_storage, txn_service, _dir) = create_test_service();
 
         // Commit data outside range
-        txn_service.autocommit_put(b"aaa", b"before").unwrap();
-        txn_service.autocommit_put(b"zzz", b"after").unwrap();
+        txn_service.autocommit_put(b"aaa", b"before").await.unwrap();
+        txn_service.autocommit_put(b"zzz", b"after").await.unwrap();
 
         let ctx = txn_service.begin(true).unwrap();
 
@@ -1180,9 +1186,9 @@ mod tests {
         let (_storage, txn_service, _dir) = create_test_service();
 
         // Storage: "aaa", "bbb", "ccc" (lexicographically ordered)
-        txn_service.autocommit_put(b"aaa", b"a_val").unwrap();
-        txn_service.autocommit_put(b"bbb", b"b_val").unwrap();
-        txn_service.autocommit_put(b"ccc", b"c_val").unwrap();
+        txn_service.autocommit_put(b"aaa", b"a_val").await.unwrap();
+        txn_service.autocommit_put(b"bbb", b"b_val").await.unwrap();
+        txn_service.autocommit_put(b"ccc", b"c_val").await.unwrap();
 
         let ctx = txn_service.begin(true).unwrap();
 
@@ -1474,6 +1480,7 @@ mod tests {
         // Put via explicit transaction (pessimistic: writes go to storage immediately)
         txn_service
             .put(&mut ctx, b"key1".to_vec(), b"value1".to_vec())
+            .await
             .unwrap();
 
         // Key should be tracked
@@ -1485,7 +1492,7 @@ mod tests {
         assert!(info.commit_ts > 0);
 
         // Data should be visible in storage
-        let value = get_for_test(&*storage, b"key1");
+        let value = get_for_test(&*storage, b"key1").await;
         assert_eq!(value, Some(b"value1".to_vec()));
     }
 
@@ -1499,13 +1506,14 @@ mod tests {
         // Put via explicit transaction
         txn_service
             .put(&mut ctx, b"key1".to_vec(), b"value1".to_vec())
+            .await
             .unwrap();
 
         // Rollback
         txn_service.rollback(ctx).unwrap();
 
         // Data should NOT be visible in storage (pending node is aborted)
-        let value = get_for_test(&*storage, b"key1");
+        let value = get_for_test(&*storage, b"key1").await;
         assert!(value.is_none());
     }
 
@@ -1514,20 +1522,23 @@ mod tests {
         let (storage, txn_service, _dir) = create_test_service();
 
         // First commit a value (via implicit txn)
-        txn_service.autocommit_put(b"key1", b"value1").unwrap();
-        assert_eq!(get_for_test(&*storage, b"key1"), Some(b"value1".to_vec()));
+        txn_service.autocommit_put(b"key1", b"value1").await.unwrap();
+        assert_eq!(
+            get_for_test(&*storage, b"key1").await,
+            Some(b"value1".to_vec())
+        );
 
         // Start explicit transaction
         let mut ctx = txn_service.begin_explicit(false).unwrap();
 
         // Delete via explicit transaction
-        txn_service.delete(&mut ctx, b"key1".to_vec()).unwrap();
+        txn_service.delete(&mut ctx, b"key1".to_vec()).await.unwrap();
 
         // Commit
         txn_service.commit(ctx).await.unwrap();
 
         // Data should be deleted
-        let value = get_for_test(&*storage, b"key1");
+        let value = get_for_test(&*storage, b"key1").await;
         assert!(value.is_none());
     }
 
@@ -1541,12 +1552,15 @@ mod tests {
         // Multiple puts
         txn_service
             .put(&mut ctx, b"key1".to_vec(), b"value1".to_vec())
+            .await
             .unwrap();
         txn_service
             .put(&mut ctx, b"key2".to_vec(), b"value2".to_vec())
+            .await
             .unwrap();
         txn_service
             .put(&mut ctx, b"key3".to_vec(), b"value3".to_vec())
+            .await
             .unwrap();
 
         // All keys should be tracked
@@ -1556,9 +1570,18 @@ mod tests {
         txn_service.commit(ctx).await.unwrap();
 
         // All data should be visible
-        assert_eq!(get_for_test(&*storage, b"key1"), Some(b"value1".to_vec()));
-        assert_eq!(get_for_test(&*storage, b"key2"), Some(b"value2".to_vec()));
-        assert_eq!(get_for_test(&*storage, b"key3"), Some(b"value3".to_vec()));
+        assert_eq!(
+            get_for_test(&*storage, b"key1").await,
+            Some(b"value1".to_vec())
+        );
+        assert_eq!(
+            get_for_test(&*storage, b"key2").await,
+            Some(b"value2".to_vec())
+        );
+        assert_eq!(
+            get_for_test(&*storage, b"key3").await,
+            Some(b"value3".to_vec())
+        );
     }
 
     #[tokio::test]
@@ -1571,9 +1594,11 @@ mod tests {
         // Write key twice within same transaction
         txn_service
             .put(&mut ctx, b"key1".to_vec(), b"v1".to_vec())
+            .await
             .unwrap();
         txn_service
             .put(&mut ctx, b"key1".to_vec(), b"v2".to_vec())
+            .await
             .unwrap();
 
         // Key should only be tracked once
@@ -1583,7 +1608,7 @@ mod tests {
         txn_service.commit(ctx).await.unwrap();
 
         // Should see latest value
-        let value = get_for_test(&*storage, b"key1");
+        let value = get_for_test(&*storage, b"key1").await;
         assert_eq!(value, Some(b"v2".to_vec()));
     }
 
@@ -1594,7 +1619,7 @@ mod tests {
         let mut ctx = txn_service.begin_explicit(true).unwrap();
 
         // Put should error for read-only explicit transaction
-        let result = txn_service.put(&mut ctx, b"key1".to_vec(), b"value1".to_vec());
+        let result = txn_service.put(&mut ctx, b"key1".to_vec(), b"value1".to_vec()).await;
         assert!(result.is_err());
         assert!(matches!(
             result.unwrap_err(),
@@ -1645,10 +1670,11 @@ mod tests {
         // Write a value
         txn_service
             .put(&mut ctx, b"key1".to_vec(), b"value1".to_vec())
+            .await
             .unwrap();
 
         // Read it back (read-your-writes)
-        let value = txn_service.get(&ctx, b"key1").unwrap();
+        let value = txn_service.get(&ctx, b"key1").await.unwrap();
         assert_eq!(value, Some(b"value1".to_vec()));
 
         // Clean up
@@ -1665,15 +1691,17 @@ mod tests {
         // Write initial value
         txn_service
             .put(&mut ctx, b"key1".to_vec(), b"v1".to_vec())
+            .await
             .unwrap();
 
         // Update it
         txn_service
             .put(&mut ctx, b"key1".to_vec(), b"v2".to_vec())
+            .await
             .unwrap();
 
         // Read should return the updated value
-        let value = txn_service.get(&ctx, b"key1").unwrap();
+        let value = txn_service.get(&ctx, b"key1").await.unwrap();
         assert_eq!(value, Some(b"v2".to_vec()));
 
         // Clean up
@@ -1688,6 +1716,7 @@ mod tests {
         let mut setup_ctx = txn_service.begin_explicit(false).unwrap();
         txn_service
             .put(&mut setup_ctx, b"key1".to_vec(), b"initial".to_vec())
+            .await
             .unwrap();
         txn_service.commit(setup_ctx).await.unwrap();
 
@@ -1695,10 +1724,10 @@ mod tests {
         let mut ctx = txn_service.begin_explicit(false).unwrap();
 
         // Delete the key
-        txn_service.delete(&mut ctx, b"key1".to_vec()).unwrap();
+        txn_service.delete(&mut ctx, b"key1".to_vec()).await.unwrap();
 
         // Read should return None (deleted)
-        let value = txn_service.get(&ctx, b"key1").unwrap();
+        let value = txn_service.get(&ctx, b"key1").await.unwrap();
         assert_eq!(value, None);
 
         // Clean up
@@ -1715,12 +1744,15 @@ mod tests {
         // Write multiple values
         txn_service
             .put(&mut ctx, b"key1".to_vec(), b"value1".to_vec())
+            .await
             .unwrap();
         txn_service
             .put(&mut ctx, b"key2".to_vec(), b"value2".to_vec())
+            .await
             .unwrap();
         txn_service
             .put(&mut ctx, b"key3".to_vec(), b"value3".to_vec())
+            .await
             .unwrap();
 
         // Scan should see all pending writes
@@ -1756,14 +1788,15 @@ mod tests {
         // Txn1 writes a value
         txn_service
             .put(&mut ctx1, b"key1".to_vec(), b"from_txn1".to_vec())
+            .await
             .unwrap();
 
         // Txn1 should see its own write
-        let value1 = txn_service.get(&ctx1, b"key1").unwrap();
+        let value1 = txn_service.get(&ctx1, b"key1").await.unwrap();
         assert_eq!(value1, Some(b"from_txn1".to_vec()));
 
         // Txn2 should NOT see txn1's pending write
-        let value2 = txn_service.get(&ctx2, b"key1").unwrap();
+        let value2 = txn_service.get(&ctx2, b"key1").await.unwrap();
         assert_eq!(value2, None);
 
         // Clean up
@@ -1779,6 +1812,7 @@ mod tests {
         let mut setup_ctx = txn_service.begin_explicit(false).unwrap();
         txn_service
             .put(&mut setup_ctx, b"key1".to_vec(), b"committed".to_vec())
+            .await
             .unwrap();
         txn_service.commit(setup_ctx).await.unwrap();
 
@@ -1788,10 +1822,11 @@ mod tests {
         // Update the key
         txn_service
             .put(&mut ctx, b"key1".to_vec(), b"pending".to_vec())
+            .await
             .unwrap();
 
         // Read should return the pending value, not the committed one
-        let value = txn_service.get(&ctx, b"key1").unwrap();
+        let value = txn_service.get(&ctx, b"key1").await.unwrap();
         assert_eq!(value, Some(b"pending".to_vec()));
 
         // Clean up
@@ -1806,6 +1841,7 @@ mod tests {
         let mut setup_ctx = txn_service.begin_explicit(false).unwrap();
         txn_service
             .put(&mut setup_ctx, b"key1".to_vec(), b"original".to_vec())
+            .await
             .unwrap();
         txn_service.commit(setup_ctx).await.unwrap();
 
@@ -1813,19 +1849,20 @@ mod tests {
         let mut ctx = txn_service.begin_explicit(false).unwrap();
 
         // Delete
-        txn_service.delete(&mut ctx, b"key1".to_vec()).unwrap();
+        txn_service.delete(&mut ctx, b"key1".to_vec()).await.unwrap();
 
         // Should see None
-        let value = txn_service.get(&ctx, b"key1").unwrap();
+        let value = txn_service.get(&ctx, b"key1").await.unwrap();
         assert_eq!(value, None);
 
         // Re-insert with new value
         txn_service
             .put(&mut ctx, b"key1".to_vec(), b"reinserted".to_vec())
+            .await
             .unwrap();
 
         // Should see the new value
-        let value = txn_service.get(&ctx, b"key1").unwrap();
+        let value = txn_service.get(&ctx, b"key1").await.unwrap();
         assert_eq!(value, Some(b"reinserted".to_vec()));
 
         // Clean up
@@ -1857,7 +1894,7 @@ mod tests {
         let clog = txn_service.clog_service();
 
         // Write something to test the getter works
-        txn_service.autocommit_put(b"test", b"value").unwrap();
+        txn_service.autocommit_put(b"test", b"value").await.unwrap();
 
         // After write, clog should have entries
         assert!(clog.max_lsn().unwrap() >= 1);
@@ -1871,6 +1908,7 @@ mod tests {
         let mut ctx = txn_service.begin(false).unwrap();
         txn_service
             .put(&mut ctx, b"key1".to_vec(), b"value1".to_vec())
+            .await
             .unwrap();
         let commit_info = txn_service.commit(ctx).await.unwrap();
 
@@ -1882,7 +1920,7 @@ mod tests {
         };
 
         // Try to put on committed transaction - should fail
-        let result = txn_service.put(&mut committed_ctx, b"key2".to_vec(), b"value2".to_vec());
+        let result = txn_service.put(&mut committed_ctx, b"key2".to_vec(), b"value2".to_vec()).await;
         assert!(result.is_err());
         assert!(matches!(
             result.unwrap_err(),
@@ -1905,7 +1943,7 @@ mod tests {
         };
 
         // Try to delete on committed transaction - should fail
-        let result = txn_service.delete(&mut committed_ctx, b"key1".to_vec());
+        let result = txn_service.delete(&mut committed_ctx, b"key1".to_vec()).await;
         assert!(result.is_err());
         assert!(matches!(
             result.unwrap_err(),
@@ -1922,7 +1960,7 @@ mod tests {
         aborted_ctx.state = TxnState::Aborted;
 
         // Try to put on aborted transaction - should fail
-        let result = txn_service.put(&mut aborted_ctx, b"key1".to_vec(), b"value1".to_vec());
+        let result = txn_service.put(&mut aborted_ctx, b"key1".to_vec(), b"value1".to_vec()).await;
         assert!(result.is_err());
         assert!(matches!(
             result.unwrap_err(),
@@ -1939,7 +1977,7 @@ mod tests {
         aborted_ctx.state = TxnState::Aborted;
 
         // Try to delete on aborted transaction - should fail
-        let result = txn_service.delete(&mut aborted_ctx, b"key1".to_vec());
+        let result = txn_service.delete(&mut aborted_ctx, b"key1".to_vec()).await;
         assert!(result.is_err());
         assert!(matches!(
             result.unwrap_err(),
@@ -2024,7 +2062,7 @@ mod tests {
                 )
                 .unwrap();
 
-            clog_service.close().unwrap();
+            clog_service.close().await.unwrap();
         }
 
         // Recover
@@ -2043,9 +2081,9 @@ mod tests {
         assert_eq!(stats.applied_puts, 1);
 
         // Only committed key should be present
-        assert!(get_for_test(&*storage, b"uncommitted_key").is_none());
+        assert!(get_for_test(&*storage, b"uncommitted_key").await.is_none());
         assert_eq!(
-            get_for_test(&*storage, b"committed_key"),
+            get_for_test(&*storage, b"committed_key").await,
             Some(b"committed_value".to_vec())
         );
     }
@@ -2055,9 +2093,9 @@ mod tests {
         let (_storage, txn_service, _dir) = create_test_service();
 
         // Write some data
-        txn_service.autocommit_put(b"key1", b"value1").unwrap();
-        txn_service.autocommit_put(b"key2", b"value2").unwrap();
-        txn_service.autocommit_put(b"key3", b"value3").unwrap();
+        txn_service.autocommit_put(b"key1", b"value1").await.unwrap();
+        txn_service.autocommit_put(b"key2", b"value2").await.unwrap();
+        txn_service.autocommit_put(b"key3", b"value3").await.unwrap();
 
         let ctx = txn_service.begin(true).unwrap();
 
@@ -2084,21 +2122,21 @@ mod tests {
         let (_storage, txn_service, _dir) = create_test_service();
 
         // Write multiple versions of same key
-        let info1 = txn_service.autocommit_put(b"key", b"v1").unwrap();
-        let info2 = txn_service.autocommit_put(b"key", b"v2").unwrap();
-        let info3 = txn_service.autocommit_put(b"key", b"v3").unwrap();
+        let info1 = txn_service.autocommit_put(b"key", b"v1").await.unwrap();
+        let info2 = txn_service.autocommit_put(b"key", b"v2").await.unwrap();
+        let info3 = txn_service.autocommit_put(b"key", b"v3").await.unwrap();
 
         // Read at different timestamps
         let ctx1 = TxnCtx::new(0, info1.commit_ts, true);
-        let value1 = txn_service.get(&ctx1, b"key").unwrap();
+        let value1 = txn_service.get(&ctx1, b"key").await.unwrap();
         assert_eq!(value1, Some(b"v1".to_vec()));
 
         let ctx2 = TxnCtx::new(0, info2.commit_ts, true);
-        let value2 = txn_service.get(&ctx2, b"key").unwrap();
+        let value2 = txn_service.get(&ctx2, b"key").await.unwrap();
         assert_eq!(value2, Some(b"v2".to_vec()));
 
         let ctx3 = TxnCtx::new(0, info3.commit_ts, true);
-        let value3 = txn_service.get(&ctx3, b"key").unwrap();
+        let value3 = txn_service.get(&ctx3, b"key").await.unwrap();
         assert_eq!(value3, Some(b"v3".to_vec()));
     }
 
@@ -2107,18 +2145,18 @@ mod tests {
         let (_storage, txn_service, _dir) = create_test_service();
 
         // Write, delete, write again
-        let _info1 = txn_service.autocommit_put(b"key", b"v1").unwrap();
-        let info2 = txn_service.autocommit_delete(b"key").unwrap();
-        let info3 = txn_service.autocommit_put(b"key", b"v3").unwrap();
+        let _info1 = txn_service.autocommit_put(b"key", b"v1").await.unwrap();
+        let info2 = txn_service.autocommit_delete(b"key").await.unwrap();
+        let info3 = txn_service.autocommit_put(b"key", b"v3").await.unwrap();
 
         // At delete timestamp, should see None
         let ctx2 = TxnCtx::new(0, info2.commit_ts, true);
-        let value2 = txn_service.get(&ctx2, b"key").unwrap();
+        let value2 = txn_service.get(&ctx2, b"key").await.unwrap();
         assert_eq!(value2, None);
 
         // At v3 timestamp, should see v3
         let ctx3 = TxnCtx::new(0, info3.commit_ts, true);
-        let value3 = txn_service.get(&ctx3, b"key").unwrap();
+        let value3 = txn_service.get(&ctx3, b"key").await.unwrap();
         assert_eq!(value3, Some(b"v3".to_vec()));
     }
 
@@ -2130,11 +2168,12 @@ mod tests {
         let mut ctx1 = txn_service.begin_explicit(false).unwrap();
         txn_service
             .put(&mut ctx1, b"conflict_key".to_vec(), b"value1".to_vec())
+            .await
             .unwrap();
 
         // Transaction 2: Try to write same key - should fail
         let mut ctx2 = txn_service.begin_explicit(false).unwrap();
-        let result = txn_service.put(&mut ctx2, b"conflict_key".to_vec(), b"value2".to_vec());
+        let result = txn_service.put(&mut ctx2, b"conflict_key".to_vec(), b"value2".to_vec()).await;
 
         assert!(result.is_err());
         match result.unwrap_err() {
@@ -2155,17 +2194,18 @@ mod tests {
         let (_storage, txn_service, _dir) = create_test_service();
 
         // Commit initial value
-        txn_service.autocommit_put(b"delete_key", b"value").unwrap();
+        txn_service.autocommit_put(b"delete_key", b"value").await.unwrap();
 
         // Transaction 1: Lock key with delete
         let mut ctx1 = txn_service.begin_explicit(false).unwrap();
         txn_service
             .delete(&mut ctx1, b"delete_key".to_vec())
+            .await
             .unwrap();
 
         // Transaction 2: Try to delete same key - should fail
         let mut ctx2 = txn_service.begin_explicit(false).unwrap();
-        let result = txn_service.delete(&mut ctx2, b"delete_key".to_vec());
+        let result = txn_service.delete(&mut ctx2, b"delete_key".to_vec()).await;
 
         assert!(result.is_err());
         match result.unwrap_err() {
@@ -2195,10 +2235,10 @@ mod tests {
             let txn_service = TransactionService::new(storage, clog_service.clone(), tso, cm);
 
             // Put then delete
-            txn_service.autocommit_put(b"del_key", b"value").unwrap();
-            txn_service.autocommit_delete(b"del_key").unwrap();
+            txn_service.autocommit_put(b"del_key", b"value").await.unwrap();
+            txn_service.autocommit_delete(b"del_key").await.unwrap();
 
-            clog_service.close().unwrap();
+            clog_service.close().await.unwrap();
         }
 
         // Recover
@@ -2216,7 +2256,7 @@ mod tests {
         assert_eq!(stats.applied_deletes, 1);
 
         // Key should be deleted
-        assert!(get_for_test(&*storage, b"del_key").is_none());
+        assert!(get_for_test(&*storage, b"del_key").await.is_none());
     }
 
     #[tokio::test]
@@ -2247,11 +2287,12 @@ mod tests {
         let storage_ref = txn_service.storage();
         txn_service
             .autocommit_put(b"test_key", b"test_value")
+            .await
             .unwrap();
 
         // Should be able to read from both references
-        let value1 = get_for_test(&*storage, b"test_key");
-        let value2 = get_for_test(storage_ref, b"test_key");
+        let value1 = get_for_test(&*storage, b"test_key").await;
+        let value2 = get_for_test(storage_ref, b"test_key").await;
         assert_eq!(value1, value2);
         assert_eq!(value1, Some(b"test_value".to_vec()));
     }
@@ -2289,7 +2330,7 @@ mod tests {
     async fn test_implicit_txn_commit_writes_clog() {
         let (_storage, txn_service, _dir) = create_test_service();
 
-        let info = txn_service.autocommit_put(b"key1", b"value1").unwrap();
+        let info = txn_service.autocommit_put(b"key1", b"value1").await.unwrap();
         assert!(info.lsn > 0, "implicit txn should produce non-zero LSN");
 
         // Verify clog contains Put + Commit entries
@@ -2314,6 +2355,7 @@ mod tests {
         let txn_id = ctx.txn_id();
         txn_service
             .put(&mut ctx, b"key1".to_vec(), b"value1".to_vec())
+            .await
             .unwrap();
         let info = txn_service.commit(ctx).await.unwrap();
         assert!(info.lsn > 0, "explicit txn should produce non-zero LSN");
@@ -2337,12 +2379,12 @@ mod tests {
         let (_storage, txn_service, _dir) = create_test_service();
 
         // First, commit a value via autocommit
-        txn_service.autocommit_put(b"key1", b"value1").unwrap();
+        txn_service.autocommit_put(b"key1", b"value1").await.unwrap();
 
         // Now delete it via explicit transaction
         let mut ctx = txn_service.begin_explicit(false).unwrap();
         let txn_id = ctx.txn_id();
-        txn_service.delete(&mut ctx, b"key1".to_vec()).unwrap();
+        txn_service.delete(&mut ctx, b"key1".to_vec()).await.unwrap();
         let info = txn_service.commit(ctx).await.unwrap();
         assert!(info.lsn > 0);
 
@@ -2365,12 +2407,15 @@ mod tests {
         let txn_id = ctx.txn_id();
         txn_service
             .put(&mut ctx, b"key1".to_vec(), b"v1".to_vec())
+            .await
             .unwrap();
         txn_service
             .put(&mut ctx, b"key2".to_vec(), b"v2".to_vec())
+            .await
             .unwrap();
         txn_service
             .put(&mut ctx, b"key3".to_vec(), b"v3".to_vec())
+            .await
             .unwrap();
         txn_service.commit(ctx).await.unwrap();
 
@@ -2394,6 +2439,7 @@ mod tests {
         let txn_id = ctx.txn_id();
         txn_service
             .delete(&mut ctx, b"nonexistent".to_vec())
+            .await
             .unwrap();
         txn_service.commit(ctx).await.unwrap();
 
@@ -2417,8 +2463,9 @@ mod tests {
         let txn_id = ctx.txn_id();
         txn_service
             .put(&mut ctx, b"key1".to_vec(), b"value1".to_vec())
+            .await
             .unwrap();
-        txn_service.delete(&mut ctx, b"key1".to_vec()).unwrap();
+        txn_service.delete(&mut ctx, b"key1".to_vec()).await.unwrap();
         txn_service.commit(ctx).await.unwrap();
 
         // TOMBSTONE → Delete entry in clog
@@ -2445,10 +2492,12 @@ mod tests {
         let txn_id = ctx.txn_id();
         txn_service
             .put(&mut ctx, b"key1".to_vec(), b"v1".to_vec())
+            .await
             .unwrap();
-        txn_service.delete(&mut ctx, b"key1".to_vec()).unwrap();
+        txn_service.delete(&mut ctx, b"key1".to_vec()).await.unwrap();
         txn_service
             .put(&mut ctx, b"key1".to_vec(), b"v2".to_vec())
+            .await
             .unwrap();
         txn_service.commit(ctx).await.unwrap();
 
@@ -2475,12 +2524,13 @@ mod tests {
         let (_storage, txn_service, _dir) = create_test_service();
 
         // Commit a base value
-        txn_service.autocommit_put(b"key1", b"v1").unwrap();
+        txn_service.autocommit_put(b"key1", b"v1").await.unwrap();
 
         // Start an explicit txn and write a pending value
         let mut writer = txn_service.begin_explicit(false).unwrap();
         txn_service
             .put(&mut writer, b"key1".to_vec(), b"v2".to_vec())
+            .await
             .unwrap();
 
         // Writer is Running in TxnStateCache.
@@ -2493,7 +2543,7 @@ mod tests {
 
         // Reader should see the committed v1 (pending from Running txn is skipped)
         let reader = txn_service.begin(true).unwrap();
-        let val = txn_service.get(&reader, b"key1").unwrap();
+        let val = txn_service.get(&reader, b"key1").await.unwrap();
         assert_eq!(val.as_deref(), Some(b"v1".as_slice()));
 
         // Cleanup
@@ -2506,18 +2556,19 @@ mod tests {
         let (_storage, txn_service, _dir) = create_test_service();
 
         // Commit a base value
-        txn_service.autocommit_put(b"key1", b"v1").unwrap();
+        txn_service.autocommit_put(b"key1", b"v1").await.unwrap();
 
         // Start an explicit txn, write, then rollback (abort)
         let mut writer = txn_service.begin_explicit(false).unwrap();
         txn_service
             .put(&mut writer, b"key1".to_vec(), b"v2".to_vec())
+            .await
             .unwrap();
         txn_service.rollback(writer).unwrap();
 
         // Reader should see v1 (aborted pending skipped)
         let reader = txn_service.begin(true).unwrap();
-        let val = txn_service.get(&reader, b"key1").unwrap();
+        let val = txn_service.get(&reader, b"key1").await.unwrap();
         assert_eq!(val.as_deref(), Some(b"v1".as_slice()));
     }
 
@@ -2531,14 +2582,14 @@ mod tests {
         assert_eq!(txn_service.concurrency_manager().active_txn_count(), 0);
 
         // Autocommit write - should register, commit, and remove from cache
-        txn_service.autocommit_put(b"key1", b"v1").unwrap();
+        txn_service.autocommit_put(b"key1", b"v1").await.unwrap();
 
         // After: should be cleaned up
         assert_eq!(txn_service.concurrency_manager().active_txn_count(), 0);
 
         // Verify data is committed
         let reader = txn_service.begin(true).unwrap();
-        let val = txn_service.get(&reader, b"key1").unwrap();
+        let val = txn_service.get(&reader, b"key1").await.unwrap();
         assert_eq!(val.as_deref(), Some(b"v1".as_slice()));
     }
 
@@ -2552,6 +2603,7 @@ mod tests {
         let start_ts = writer.start_ts;
         txn_service
             .put(&mut writer, b"key1".to_vec(), b"v1".to_vec())
+            .await
             .unwrap();
 
         // Before commit: txn is Running
@@ -2579,19 +2631,20 @@ mod tests {
         let (_storage, txn_service, _dir) = create_test_service();
 
         // Commit base value
-        txn_service.autocommit_put(b"key1", b"v1").unwrap();
+        txn_service.autocommit_put(b"key1", b"v1").await.unwrap();
 
         // Writer: explicit txn, write v2, commit
         let mut writer = txn_service.begin_explicit(false).unwrap();
         txn_service
             .put(&mut writer, b"key1".to_vec(), b"v2".to_vec())
+            .await
             .unwrap();
         let commit_info = txn_service.commit(writer).await.unwrap();
 
         // Reader with start_ts > commit_ts should see v2
         let reader = txn_service.begin(true).unwrap();
         assert!(reader.start_ts > commit_info.commit_ts);
-        let val = txn_service.get(&reader, b"key1").unwrap();
+        let val = txn_service.get(&reader, b"key1").await.unwrap();
         assert_eq!(val.as_deref(), Some(b"v2".as_slice()));
     }
 
@@ -2601,13 +2654,14 @@ mod tests {
         let (_storage, txn_service, _dir) = create_test_service();
 
         // Commit base values
-        txn_service.autocommit_put(b"a", b"v1").unwrap();
-        txn_service.autocommit_put(b"c", b"v3").unwrap();
+        txn_service.autocommit_put(b"a", b"v1").await.unwrap();
+        txn_service.autocommit_put(b"c", b"v3").await.unwrap();
 
         // Start explicit txn and write to key "b"
         let mut writer = txn_service.begin_explicit(false).unwrap();
         txn_service
             .put(&mut writer, b"b".to_vec(), b"pending".to_vec())
+            .await
             .unwrap();
 
         // Reader scan should see a=v1 and c=v3, but skip b (Running pending)
@@ -2639,18 +2693,19 @@ mod tests {
         let (_storage, txn_service, _dir) = create_test_service();
 
         // Commit base value
-        txn_service.autocommit_put(b"key1", b"v1").unwrap();
+        txn_service.autocommit_put(b"key1", b"v1").await.unwrap();
 
         // Start explicit txn (Running) and write a pending update
         let mut writer = txn_service.begin_explicit(false).unwrap();
         txn_service
             .put(&mut writer, b"key1".to_vec(), b"v2".to_vec())
+            .await
             .unwrap();
 
         // Non-explicit reader should resolve the pending node:
-        // Writer is Running → skip → return committed v1
+        // Writer is Running -> skip -> return committed v1
         let reader = txn_service.begin(true).unwrap();
-        let val = txn_service.get(&reader, b"key1").unwrap();
+        let val = txn_service.get(&reader, b"key1").await.unwrap();
         assert_eq!(val.as_deref(), Some(b"v1".as_slice()));
 
         // Cleanup
@@ -2660,22 +2715,23 @@ mod tests {
     #[tokio::test]
     async fn test_pending_resolution_committed_visible() {
         // Test: writer commits with commit_ts <= reader.start_ts
-        // → reader should see the committed value.
+        // -> reader should see the committed value.
         let (_storage, txn_service, _dir) = create_test_service();
 
-        txn_service.autocommit_put(b"key1", b"v1").unwrap();
+        txn_service.autocommit_put(b"key1", b"v1").await.unwrap();
 
         // Writer commits v2
         let mut writer = txn_service.begin_explicit(false).unwrap();
         txn_service
             .put(&mut writer, b"key1".to_vec(), b"v2".to_vec())
+            .await
             .unwrap();
         let commit_info = txn_service.commit(writer).await.unwrap();
 
         // Reader that started after commit sees v2
         let reader = txn_service.begin(true).unwrap();
         assert!(reader.start_ts > commit_info.commit_ts);
-        let val = txn_service.get(&reader, b"key1").unwrap();
+        let val = txn_service.get(&reader, b"key1").await.unwrap();
         assert_eq!(val.as_deref(), Some(b"v2".as_slice()));
     }
 }

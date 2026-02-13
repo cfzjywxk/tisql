@@ -44,7 +44,7 @@ use tisql::StorageEngine;
 
 // ==================== Test Helpers Using MvccKey ====================
 
-fn get_at_for_test(engine: &LsmEngine, key: &[u8], ts: Timestamp) -> Option<RawValue> {
+async fn get_at_for_test(engine: &LsmEngine, key: &[u8], ts: Timestamp) -> Option<RawValue> {
     let start = MvccKey::encode(key, ts);
     let end = MvccKey::encode(key, 0)
         .next_key()
@@ -53,7 +53,7 @@ fn get_at_for_test(engine: &LsmEngine, key: &[u8], ts: Timestamp) -> Option<RawV
 
     // Use streaming scan_iter() - process one entry at a time
     let mut iter = engine.scan_iter(range, 0).unwrap();
-    tisql::io::block_on_sync(iter.advance()).unwrap(); // Position on first entry
+    iter.advance().await.unwrap(); // Position on first entry
 
     while iter.valid() {
         let decoded_key = iter.user_key();
@@ -65,13 +65,13 @@ fn get_at_for_test(engine: &LsmEngine, key: &[u8], ts: Timestamp) -> Option<RawV
             }
             return Some(value);
         }
-        tisql::io::block_on_sync(iter.advance()).unwrap();
+        iter.advance().await.unwrap();
     }
     None
 }
 
-fn get_for_test(engine: &LsmEngine, key: &[u8]) -> Option<RawValue> {
-    get_at_for_test(engine, key, Timestamp::MAX)
+async fn get_for_test(engine: &LsmEngine, key: &[u8]) -> Option<RawValue> {
+    get_at_for_test(engine, key, Timestamp::MAX).await
 }
 
 /// Helper to create a test LSM engine with ilog for durability tests.
@@ -125,8 +125,8 @@ fn recover_engine(dir: &TempDir) -> RecoveryResult {
 /// - All writes complete successfully
 /// - No writes are lost
 /// - No duplicates appear
-#[test]
-fn test_concurrent_write_during_flush() {
+#[tokio::test]
+async fn test_concurrent_write_during_flush() {
     let dir = tempfile::tempdir().unwrap();
     let (engine, _ilog) = create_test_lsm_engine(&dir);
 
@@ -201,7 +201,7 @@ fn test_concurrent_write_during_flush() {
     // Verify all keys are readable
     let mut found_keys = 0;
     for key in &all_written_keys {
-        let value = get_for_test(&engine, key.as_bytes());
+        let value = get_for_test(&engine, key.as_bytes()).await;
         assert!(value.is_some(), "Key {key} should exist");
         found_keys += 1;
     }
@@ -218,8 +218,8 @@ fn test_concurrent_write_during_flush() {
 /// Test concurrent reads while flush is in progress.
 ///
 /// Verifies MVCC consistency - readers see a consistent snapshot.
-#[test]
-fn test_concurrent_read_during_flush() {
+#[tokio::test]
+async fn test_concurrent_read_during_flush() {
     let dir = tempfile::tempdir().unwrap();
     let (engine, _ilog) = create_test_lsm_engine(&dir);
 
@@ -235,23 +235,23 @@ fn test_concurrent_read_during_flush() {
     }
 
     let num_readers = 4;
-    let barrier = Arc::new(Barrier::new(num_readers + 1)); // +1 for flusher
+    let barrier = Arc::new(tokio::sync::Barrier::new(num_readers + 1)); // +1 for flusher
 
-    // Spawn reader threads
+    // Spawn reader tasks
     let mut reader_handles = vec![];
     for reader_id in 0..num_readers {
         let engine = Arc::clone(&engine);
         let barrier = Arc::clone(&barrier);
 
-        let handle = thread::spawn(move || {
-            barrier.wait(); // Synchronize start
+        let handle = tokio::spawn(async move {
+            barrier.wait().await; // Synchronize start
 
             let mut reads = 0;
             let mut errors = 0;
             for _ in 0..50 {
                 for i in 0..100 {
                     let key = format!("pre_key_{i:05}");
-                    match get_for_test(&engine, key.as_bytes()) {
+                    match get_for_test(&engine, key.as_bytes()).await {
                         Some(_) => reads += 1,
                         None => {
                             // Key should always exist - this would be an error
@@ -265,10 +265,10 @@ fn test_concurrent_read_during_flush() {
         reader_handles.push(handle);
     }
 
-    // Spawn flusher thread that also does writes
+    // Spawn flusher task that also does writes
     let engine_flusher = Arc::clone(&engine);
-    let flusher = thread::spawn(move || {
-        barrier.wait();
+    let flusher = tokio::spawn(async move {
+        barrier.wait().await;
 
         // Write and flush repeatedly
         for round in 0..5 {
@@ -285,12 +285,12 @@ fn test_concurrent_read_during_flush() {
 
     // Collect results
     for handle in reader_handles {
-        let (reader_id, reads, errors) = handle.join().unwrap();
+        let (reader_id, reads, errors) = handle.await.unwrap();
         assert_eq!(errors, 0, "Reader {reader_id} should have no errors");
         assert!(reads > 0, "Reader {reader_id} should have completed reads");
     }
 
-    flusher.join().unwrap();
+    flusher.await.unwrap();
 }
 
 // ============================================================================
@@ -300,8 +300,8 @@ fn test_concurrent_read_during_flush() {
 /// Test concurrent writes while compaction would be triggered.
 ///
 /// Note: Actual compaction is background, this tests the infrastructure.
-#[test]
-fn test_concurrent_write_during_compaction() {
+#[tokio::test]
+async fn test_concurrent_write_during_compaction() {
     let dir = tempfile::tempdir().unwrap();
     let (engine, _ilog) = create_test_lsm_engine(&dir);
 
@@ -360,15 +360,15 @@ fn test_concurrent_write_during_compaction() {
     for writer_id in 0..num_writers {
         for i in 0..writes_per_writer {
             let key = format!("concurrent_{writer_id}_key_{i:04}");
-            let value = get_for_test(&engine, key.as_bytes());
+            let value = get_for_test(&engine, key.as_bytes()).await;
             assert!(value.is_some(), "Key {key} should exist");
         }
     }
 }
 
 /// Test concurrent reads while compaction would be triggered.
-#[test]
-fn test_concurrent_read_during_compaction() {
+#[tokio::test]
+async fn test_concurrent_read_during_compaction() {
     let dir = tempfile::tempdir().unwrap();
     let (engine, _ilog) = create_test_lsm_engine(&dir);
 
@@ -387,22 +387,22 @@ fn test_concurrent_read_during_compaction() {
     // Concurrent readers
     let num_readers = 8;
     let reads_per_reader = 100;
-    let barrier = Arc::new(Barrier::new(num_readers));
+    let barrier = Arc::new(tokio::sync::Barrier::new(num_readers));
 
     let mut handles = vec![];
     for reader_id in 0..num_readers {
         let engine = Arc::clone(&engine);
         let barrier = Arc::clone(&barrier);
 
-        let handle = thread::spawn(move || {
-            barrier.wait();
+        let handle = tokio::spawn(async move {
+            barrier.wait().await;
 
             let mut found = 0;
             for _ in 0..reads_per_reader {
                 for batch in 0..5 {
                     let idx = (reader_id * 7 + batch) % 50; // Varied access pattern
                     let key = format!("read_batch_{batch}_key_{idx:03}");
-                    if get_for_test(&engine, key.as_bytes()).is_some() {
+                    if get_for_test(&engine, key.as_bytes()).await.is_some() {
                         found += 1;
                     }
                 }
@@ -412,7 +412,10 @@ fn test_concurrent_read_during_compaction() {
         handles.push(handle);
     }
 
-    let total_found: usize = handles.into_iter().map(|h| h.join().unwrap()).sum();
+    let mut total_found = 0;
+    for h in handles {
+        total_found += h.await.unwrap();
+    }
 
     // Each reader reads 5 keys * reads_per_reader times
     let expected = num_readers * reads_per_reader * 5;
@@ -427,9 +430,9 @@ fn test_concurrent_read_during_compaction() {
 // ============================================================================
 
 /// Stress test with mixed operations - writes, reads, and flushes.
-#[test]
+#[tokio::test]
 #[ignore] // Long-running test, enable explicitly
-fn test_stress_mixed_operations() {
+async fn test_stress_mixed_operations() {
     let dir = tempfile::tempdir().unwrap();
     let (engine, _ilog) = create_test_lsm_engine(&dir);
 
@@ -468,14 +471,15 @@ fn test_stress_mixed_operations() {
         handles.push(handle);
     }
 
-    // 16 reader threads
-    for reader_id in 0..16 {
+    // 16 reader tasks
+    let mut reader_handles = vec![];
+    for reader_id in 0..16usize {
         let engine = Arc::clone(&engine);
         let stop_flag = Arc::clone(&stop_flag);
         let reads_done = Arc::clone(&reads_done);
 
-        let handle = thread::spawn(move || {
-            let mut local_reads = 0;
+        let handle = tokio::spawn(async move {
+            let mut local_reads = 0u64;
             let mut rng_seed: usize = reader_id;
             while !stop_flag.load(Ordering::Relaxed) {
                 // Random key access
@@ -483,16 +487,16 @@ fn test_stress_mixed_operations() {
                 let writer_id = rng_seed % 8;
                 let key_id = (rng_seed / 8) % 10000;
                 let key = format!("stress_w{writer_id}_k{key_id}");
-                let _ = get_for_test(&engine, key.as_bytes());
+                let _ = get_for_test(&engine, key.as_bytes()).await;
                 local_reads += 1;
 
                 if local_reads % 1000 == 0 {
-                    thread::yield_now();
+                    tokio::task::yield_now().await;
                 }
             }
             reads_done.fetch_add(local_reads, Ordering::SeqCst);
         });
-        handles.push(handle);
+        reader_handles.push(handle);
     }
 
     // 1 flusher thread
@@ -517,12 +521,17 @@ fn test_stress_mixed_operations() {
     }
 
     // Run for duration
-    thread::sleep(duration);
+    tokio::time::sleep(duration).await;
     stop_flag.store(true, Ordering::SeqCst);
 
     // Wait for all threads
     for handle in handles {
         handle.join().unwrap();
+    }
+
+    // Wait for all reader tasks
+    for handle in reader_handles {
+        handle.await.unwrap();
     }
 
     let writes = writes_done.load(Ordering::SeqCst);
@@ -540,8 +549,8 @@ fn test_stress_mixed_operations() {
 // ============================================================================
 
 /// Test that write timestamps are properly ordered.
-#[test]
-fn test_write_ordering() {
+#[tokio::test]
+async fn test_write_ordering() {
     let dir = tempfile::tempdir().unwrap();
     let (engine, _ilog) = create_test_lsm_engine(&dir);
 
@@ -554,20 +563,20 @@ fn test_write_ordering() {
     }
 
     // Latest version should be ts=10
-    let value = get_for_test(&engine, key);
+    let value = get_for_test(&engine, key).await;
     assert_eq!(value, Some(b"value_at_10".to_vec()));
 
     // Read at specific timestamps
     for ts in 1..=10 {
         let expected = format!("value_at_{ts}");
-        let value = get_at_for_test(&engine, key, ts);
+        let value = get_at_for_test(&engine, key, ts).await;
         assert_eq!(value, Some(expected.into_bytes()), "Value at ts={ts}");
     }
 }
 
 /// Test that MVCC reads see consistent snapshots.
-#[test]
-fn test_snapshot_isolation() {
+#[tokio::test]
+async fn test_snapshot_isolation() {
     let dir = tempfile::tempdir().unwrap();
     let (engine, _ilog) = create_test_lsm_engine(&dir);
 
@@ -576,8 +585,8 @@ fn test_snapshot_isolation() {
     write_test_data(&engine, b"key2", b"v2_initial", 2);
 
     // Snapshot at ts=2 should see both
-    let v1_at_2 = get_at_for_test(&engine, b"key1", 2);
-    let v2_at_2 = get_at_for_test(&engine, b"key2", 2);
+    let v1_at_2 = get_at_for_test(&engine, b"key1", 2).await;
+    let v2_at_2 = get_at_for_test(&engine, b"key2", 2).await;
     assert_eq!(v1_at_2, Some(b"v1_initial".to_vec()));
     assert_eq!(v2_at_2, Some(b"v2_initial".to_vec()));
 
@@ -586,14 +595,14 @@ fn test_snapshot_isolation() {
     write_test_data(&engine, b"key2", b"v2_updated", 6);
 
     // Snapshot at ts=2 should still see initial values
-    let v1_at_2_after = get_at_for_test(&engine, b"key1", 2);
-    let v2_at_2_after = get_at_for_test(&engine, b"key2", 2);
+    let v1_at_2_after = get_at_for_test(&engine, b"key1", 2).await;
+    let v2_at_2_after = get_at_for_test(&engine, b"key2", 2).await;
     assert_eq!(v1_at_2_after, Some(b"v1_initial".to_vec()));
     assert_eq!(v2_at_2_after, Some(b"v2_initial".to_vec()));
 
     // Snapshot at ts=10 should see updated values
-    let v1_at_10 = get_at_for_test(&engine, b"key1", 10);
-    let v2_at_10 = get_at_for_test(&engine, b"key2", 10);
+    let v1_at_10 = get_at_for_test(&engine, b"key1", 10).await;
+    let v2_at_10 = get_at_for_test(&engine, b"key2", 10).await;
     assert_eq!(v1_at_10, Some(b"v1_updated".to_vec()));
     assert_eq!(v2_at_10, Some(b"v2_updated".to_vec()));
 }
@@ -603,8 +612,8 @@ fn test_snapshot_isolation() {
 // ============================================================================
 
 /// Test that tombstones are properly visible in concurrent scenarios.
-#[test]
-fn test_tombstone_visibility() {
+#[tokio::test]
+async fn test_tombstone_visibility() {
     let dir = tempfile::tempdir().unwrap();
     let (engine, _ilog) = create_test_lsm_engine(&dir);
 
@@ -617,21 +626,21 @@ fn test_tombstone_visibility() {
     engine.write_batch(batch).unwrap();
 
     // Get should not find the key
-    let value = get_for_test(&engine, b"to_delete");
+    let value = get_for_test(&engine, b"to_delete").await;
     assert!(value.is_none(), "Deleted key should not be visible");
 
     // Get at ts=1 should find it
-    let value_at_1 = get_at_for_test(&engine, b"to_delete", 1);
+    let value_at_1 = get_at_for_test(&engine, b"to_delete", 1).await;
     assert_eq!(value_at_1, Some(b"exists".to_vec()));
 
     // Get at ts=2+ should not find it
-    let value_at_2 = get_at_for_test(&engine, b"to_delete", 2);
+    let value_at_2 = get_at_for_test(&engine, b"to_delete", 2).await;
     assert!(value_at_2.is_none());
 }
 
 /// Test tombstones across SST boundary.
-#[test]
-fn test_tombstone_across_sst() {
+#[tokio::test]
+async fn test_tombstone_across_sst() {
     let dir = tempfile::tempdir().unwrap();
     let (engine, _ilog) = create_test_lsm_engine(&dir);
 
@@ -652,17 +661,17 @@ fn test_tombstone_across_sst() {
     }
 
     // Key should be deleted
-    let value = get_for_test(&engine, b"cross_sst_key");
+    let value = get_for_test(&engine, b"cross_sst_key").await;
     assert!(
         value.is_none(),
         "Tombstone should mask value in earlier SST"
     );
 
     // Verify via MVCC read
-    let value_at_1 = get_at_for_test(&engine, b"cross_sst_key", 1);
+    let value_at_1 = get_at_for_test(&engine, b"cross_sst_key", 1).await;
     assert_eq!(value_at_1, Some(b"initial_value".to_vec()));
 
-    let value_at_2 = get_at_for_test(&engine, b"cross_sst_key", 2);
+    let value_at_2 = get_at_for_test(&engine, b"cross_sst_key", 2).await;
     assert!(value_at_2.is_none());
 }
 
@@ -671,8 +680,8 @@ fn test_tombstone_across_sst() {
 // ============================================================================
 
 /// Test that flushed_lsn increases monotonically.
-#[test]
-fn test_flushed_lsn_monotonic() {
+#[tokio::test]
+async fn test_flushed_lsn_monotonic() {
     let dir = tempfile::tempdir().unwrap();
     let (engine, _ilog) = create_test_lsm_engine(&dir);
 
@@ -718,8 +727,8 @@ fn test_flushed_lsn_monotonic() {
 }
 
 /// Test version SST count matches actual files.
-#[test]
-fn test_version_sst_count_matches_files() {
+#[tokio::test]
+async fn test_version_sst_count_matches_files() {
     let dir = tempfile::tempdir().unwrap();
     let (engine, _ilog) = create_test_lsm_engine(&dir);
 
@@ -768,8 +777,8 @@ fn test_version_sst_count_matches_files() {
 // ============================================================================
 
 /// Test recovery preserves all data from concurrent writes.
-#[test]
-fn test_recovery_preserves_concurrent_writes() {
+#[tokio::test]
+async fn test_recovery_preserves_concurrent_writes() {
     let dir = tempfile::tempdir().unwrap();
 
     let expected_keys: HashSet<String>;
@@ -833,7 +842,7 @@ fn test_recovery_preserves_concurrent_writes() {
             // There are SSTs, so we should have some data
             let mut found_count = 0;
             for key in &expected_keys {
-                if get_for_test(&result.engine, key.as_bytes()).is_some() {
+                if get_for_test(&result.engine, key.as_bytes()).await.is_some() {
                     found_count += 1;
                 }
             }
@@ -853,8 +862,8 @@ fn test_recovery_preserves_concurrent_writes() {
 /// 2. Data written after rotation is in active memtable
 /// 3. A scan sees data from both sources merged correctly
 /// 4. MVCC ordering is maintained (user_key ASC, ts DESC)
-#[test]
-fn test_scan_across_frozen_and_active_memtables() {
+#[tokio::test]
+async fn test_scan_across_frozen_and_active_memtables() {
     let dir = tempfile::tempdir().unwrap();
     let (engine, _ilog) = create_test_lsm_engine(&dir);
 
@@ -888,7 +897,7 @@ fn test_scan_across_frozen_and_active_memtables() {
     let range = start..end;
 
     let mut iter = engine.scan_iter(range, 0).unwrap();
-    tisql::io::block_on_sync(iter.advance()).unwrap();
+    iter.advance().await.unwrap();
 
     let mut results: Vec<(Vec<u8>, Vec<u8>)> = Vec::new();
     let mut prev_key: Option<Vec<u8>> = None;
@@ -908,7 +917,7 @@ fn test_scan_across_frozen_and_active_memtables() {
         }
         prev_key = Some(key.clone());
         results.push((key, value));
-        tisql::io::block_on_sync(iter.advance()).unwrap();
+        iter.advance().await.unwrap();
     }
 
     // Should have 20 entries total (10 from frozen + 10 from active)
@@ -961,8 +970,8 @@ fn test_scan_across_frozen_and_active_memtables() {
 /// 1. Scan iterator sees a consistent snapshot
 /// 2. Concurrent writes don't corrupt the iterator
 /// 3. Data from both frozen and active memtables is correctly merged
-#[test]
-fn test_scan_with_concurrent_writes_across_frozen_active() {
+#[tokio::test]
+async fn test_scan_with_concurrent_writes_across_frozen_active() {
     let dir = tempfile::tempdir().unwrap();
     let (engine, _ilog) = create_test_lsm_engine(&dir);
 
@@ -993,7 +1002,8 @@ fn test_scan_with_concurrent_writes_across_frozen_active() {
     let scan_success = Arc::new(AtomicU64::new(0));
     let total_writes = Arc::new(AtomicU64::new(0));
 
-    let mut handles: Vec<thread::JoinHandle<()>> = vec![];
+    let mut writer_handles = vec![];
+    let mut scanner_handles = vec![];
 
     // Spawn writer threads - write to "writer_*" keys
     for writer_id in 0..num_writers {
@@ -1016,16 +1026,16 @@ fn test_scan_with_concurrent_writes_across_frozen_active() {
             }
             total_writes.fetch_add(writes, Ordering::Relaxed);
         });
-        handles.push(handle);
+        writer_handles.push(handle);
     }
 
-    // Spawn scanner threads - scan across all data
+    // Spawn scanner tasks - scan across all data
     for _scanner_id in 0..num_scanners {
         let engine = Arc::clone(&engine);
         let scan_errors = Arc::clone(&scan_errors);
         let scan_success = Arc::clone(&scan_success);
 
-        let handle = thread::spawn(move || {
+        let handle = tokio::spawn(async move {
             for _ in 0..scans_per_scanner {
                 // Scan the frozen + active range
                 let start = MvccKey::encode(b"", Timestamp::MAX);
@@ -1034,7 +1044,7 @@ fn test_scan_with_concurrent_writes_across_frozen_active() {
 
                 match engine.scan_iter(range, 0) {
                     Ok(mut iter) => {
-                        if tisql::io::block_on_sync(iter.advance()).is_err() {
+                        if iter.advance().await.is_err() {
                             scan_errors.fetch_add(1, Ordering::Relaxed);
                             continue;
                         }
@@ -1075,7 +1085,7 @@ fn test_scan_with_concurrent_writes_across_frozen_active() {
                             prev_ts = Some(ts);
                             count += 1;
 
-                            if tisql::io::block_on_sync(iter.advance()).is_err() {
+                            if iter.advance().await.is_err() {
                                 break;
                             }
                         }
@@ -1090,16 +1100,21 @@ fn test_scan_with_concurrent_writes_across_frozen_active() {
                         scan_errors.fetch_add(1, Ordering::Relaxed);
                     }
                 }
-                thread::yield_now();
+                tokio::task::yield_now().await;
             }
         });
-        handles.push(handle);
+        scanner_handles.push(handle);
     }
 
-    // Wait for all threads
+    // Wait for all writer threads
     stop_flag.store(true, Ordering::Relaxed);
-    for handle in handles {
+    for handle in writer_handles {
         handle.join().unwrap();
+    }
+
+    // Wait for all scanner tasks
+    for handle in scanner_handles {
+        handle.await.unwrap();
     }
 
     let writes = total_writes.load(Ordering::Relaxed);
@@ -1118,11 +1133,11 @@ fn test_scan_with_concurrent_writes_across_frozen_active() {
         let start = MvccKey::encode(b"frozen_", Timestamp::MAX);
         let end = MvccKey::encode(b"frozen_\xff", 0);
         let mut iter = engine.scan_iter(start..end, 0).unwrap();
-        tisql::io::block_on_sync(iter.advance()).unwrap();
+        iter.advance().await.unwrap();
         let mut count = 0;
         while iter.valid() {
             count += 1;
-            tisql::io::block_on_sync(iter.advance()).unwrap();
+            iter.advance().await.unwrap();
         }
         count
     };
@@ -1136,8 +1151,8 @@ fn test_scan_with_concurrent_writes_across_frozen_active() {
 ///
 /// Verifies that a scan iterator created before rotation still sees
 /// a consistent view even if rotation happens during iteration.
-#[test]
-fn test_scan_snapshot_isolation_during_rotation() {
+#[tokio::test]
+async fn test_scan_snapshot_isolation_during_rotation() {
     let dir = tempfile::tempdir().unwrap();
 
     // Create engine with larger memtable to control rotation timing
@@ -1170,14 +1185,14 @@ fn test_scan_snapshot_isolation_during_rotation() {
     let start = MvccKey::encode(b"key_", Timestamp::MAX);
     let end = MvccKey::encode(b"key_\xff", 0);
     let mut iter = engine.scan_iter(start..end, 0).unwrap();
-    tisql::io::block_on_sync(iter.advance()).unwrap();
+    iter.advance().await.unwrap();
 
     // Read first 10 entries
     let mut pre_rotation_keys = Vec::new();
     for _ in 0..10 {
         if iter.valid() {
             pre_rotation_keys.push(iter.user_key().to_vec());
-            tisql::io::block_on_sync(iter.advance()).unwrap();
+            iter.advance().await.unwrap();
         }
     }
 
@@ -1195,7 +1210,7 @@ fn test_scan_snapshot_isolation_during_rotation() {
     let mut post_rotation_keys = Vec::new();
     while iter.valid() {
         post_rotation_keys.push(iter.user_key().to_vec());
-        tisql::io::block_on_sync(iter.advance()).unwrap();
+        iter.advance().await.unwrap();
     }
 
     // Total should be 50 (the original data), not 60
@@ -1222,12 +1237,12 @@ fn test_scan_snapshot_isolation_during_rotation() {
     let start = MvccKey::encode(b"key_", Timestamp::MAX);
     let end = MvccKey::encode(b"key_\xff", 0);
     let mut new_iter = engine.scan_iter(start..end, 0).unwrap();
-    tisql::io::block_on_sync(new_iter.advance()).unwrap();
+    new_iter.advance().await.unwrap();
 
     let mut new_scan_count = 0;
     while new_iter.valid() {
         new_scan_count += 1;
-        tisql::io::block_on_sync(new_iter.advance()).unwrap();
+        new_iter.advance().await.unwrap();
     }
 
     assert_eq!(
@@ -1240,8 +1255,8 @@ fn test_scan_snapshot_isolation_during_rotation() {
 ///
 /// When the same key is updated after rotation, the scan should
 /// return both versions in proper MVCC order (newer first).
-#[test]
-fn test_same_key_in_frozen_and_active_memtables() {
+#[tokio::test]
+async fn test_same_key_in_frozen_and_active_memtables() {
     let dir = tempfile::tempdir().unwrap();
     let (engine, _ilog) = create_test_lsm_engine(&dir);
 
@@ -1265,7 +1280,7 @@ fn test_same_key_in_frozen_and_active_memtables() {
     let start = MvccKey::encode(b"shared_key_", Timestamp::MAX);
     let end = MvccKey::encode(b"shared_key_\xff", 0);
     let mut iter = engine.scan_iter(start..end, 0).unwrap();
-    tisql::io::block_on_sync(iter.advance()).unwrap();
+    iter.advance().await.unwrap();
 
     let mut entries: Vec<(Vec<u8>, Timestamp, Vec<u8>)> = Vec::new();
     while iter.valid() {
@@ -1274,7 +1289,7 @@ fn test_same_key_in_frozen_and_active_memtables() {
             iter.timestamp(),
             iter.value().to_vec(),
         ));
-        tisql::io::block_on_sync(iter.advance()).unwrap();
+        iter.advance().await.unwrap();
     }
 
     // Should have 20 entries (2 versions per key * 10 keys)
@@ -1306,7 +1321,7 @@ fn test_same_key_in_frozen_and_active_memtables() {
     // Point read should return the latest version
     for i in 0..10 {
         let key = format!("shared_key_{i:02}");
-        let value = get_for_test(&engine, key.as_bytes());
+        let value = get_for_test(&engine, key.as_bytes()).await;
         assert_eq!(
             value,
             Some(b"v2_active".to_vec()),
@@ -1316,8 +1331,8 @@ fn test_same_key_in_frozen_and_active_memtables() {
 }
 
 /// Stress test: many rotations with concurrent scans and writes.
-#[test]
-fn test_stress_rotations_with_concurrent_scans() {
+#[tokio::test]
+async fn test_stress_rotations_with_concurrent_scans() {
     let dir = tempfile::tempdir().unwrap();
 
     let lsn_provider = new_lsn_provider();
@@ -1351,7 +1366,8 @@ fn test_stress_rotations_with_concurrent_scans() {
     let rotations_done = Arc::new(AtomicU64::new(0));
     let scan_errors = Arc::new(AtomicU64::new(0));
 
-    let mut handles: Vec<thread::JoinHandle<()>> = vec![];
+    let mut thread_handles = vec![];
+    let mut task_handles = vec![];
 
     // Writer threads
     for writer_id in 0..num_writers {
@@ -1360,7 +1376,7 @@ fn test_stress_rotations_with_concurrent_scans() {
         let ts_counter = Arc::clone(&ts_counter);
         let writes_done = Arc::clone(&writes_done);
 
-        handles.push(thread::spawn(move || {
+        thread_handles.push(thread::spawn(move || {
             let mut local_writes = 0u64;
             while !stop_flag.load(Ordering::Relaxed) {
                 let key = format!("stress_w{writer_id}_k{local_writes}");
@@ -1385,21 +1401,21 @@ fn test_stress_rotations_with_concurrent_scans() {
         }));
     }
 
-    // Scanner threads
+    // Scanner tasks
     for _ in 0..num_scanners {
         let engine = Arc::clone(&engine);
         let stop_flag = Arc::clone(&stop_flag);
         let scans_done = Arc::clone(&scans_done);
         let scan_errors = Arc::clone(&scan_errors);
 
-        handles.push(thread::spawn(move || {
+        task_handles.push(tokio::spawn(async move {
             while !stop_flag.load(Ordering::Relaxed) {
                 let start = MvccKey::encode(b"stress_", Timestamp::MAX);
                 let end = MvccKey::encode(b"stress_\xff", 0);
 
                 match engine.scan_iter(start..end, 0) {
                     Ok(mut iter) => {
-                        if tisql::io::block_on_sync(iter.advance()).is_err() {
+                        if iter.advance().await.is_err() {
                             scan_errors.fetch_add(1, Ordering::Relaxed);
                             continue;
                         }
@@ -1433,7 +1449,7 @@ fn test_stress_rotations_with_concurrent_scans() {
                             prev_user_key = Some(user_key);
                             prev_ts = Some(ts);
 
-                            if tisql::io::block_on_sync(iter.advance()).is_err() {
+                            if iter.advance().await.is_err() {
                                 break;
                             }
                         }
@@ -1448,7 +1464,7 @@ fn test_stress_rotations_with_concurrent_scans() {
                         scan_errors.fetch_add(1, Ordering::Relaxed);
                     }
                 }
-                thread::yield_now();
+                tokio::task::yield_now().await;
             }
         }));
     }
@@ -1459,7 +1475,7 @@ fn test_stress_rotations_with_concurrent_scans() {
         let stop_flag = Arc::clone(&stop_flag);
         let rotations_done = Arc::clone(&rotations_done);
 
-        handles.push(thread::spawn(move || {
+        thread_handles.push(thread::spawn(move || {
             while !stop_flag.load(Ordering::Relaxed) {
                 if let Some(frozen) = engine.maybe_rotate() {
                     // Optionally flush some frozen memtables
@@ -1472,12 +1488,17 @@ fn test_stress_rotations_with_concurrent_scans() {
     }
 
     // Run for duration
-    thread::sleep(duration);
+    tokio::time::sleep(duration).await;
     stop_flag.store(true, Ordering::Relaxed);
 
     // Wait for all threads
-    for handle in handles {
+    for handle in thread_handles {
         handle.join().unwrap();
+    }
+
+    // Wait for all tasks
+    for handle in task_handles {
+        handle.await.unwrap();
     }
 
     let writes = writes_done.load(Ordering::Relaxed);
@@ -1500,8 +1521,8 @@ fn test_stress_rotations_with_concurrent_scans() {
 ///
 /// When max_frozen_memtables is reached and no flush happens,
 /// maybe_rotate() should return None to signal backpressure.
-#[test]
-fn test_rotation_blocked_at_frozen_limit() {
+#[tokio::test]
+async fn test_rotation_blocked_at_frozen_limit() {
     let dir = tempfile::tempdir().unwrap();
 
     let lsn_provider = new_lsn_provider();
@@ -1571,7 +1592,7 @@ fn test_rotation_blocked_at_frozen_limit() {
     // Writes should still succeed (goes to active memtable)
     let key = b"after_limit_key";
     write_test_data(&engine, key, b"still_works", 100);
-    let value = get_for_test(&engine, key);
+    let value = get_for_test(&engine, key).await;
     assert_eq!(value, Some(b"still_works".to_vec()));
 
     // Active memtable should have data (no rotation happened)
@@ -1585,8 +1606,8 @@ fn test_rotation_blocked_at_frozen_limit() {
 /// Test that flushing a frozen memtable unblocks rotation.
 ///
 /// After hitting the frozen limit, flushing should allow new rotations.
-#[test]
-fn test_flush_unblocks_rotation() {
+#[tokio::test]
+async fn test_flush_unblocks_rotation() {
     let dir = tempfile::tempdir().unwrap();
 
     let lsn_provider = new_lsn_provider();
@@ -1647,14 +1668,14 @@ fn test_flush_unblocks_rotation() {
     for i in 0..5 {
         let key = format!("key_{i:02}");
         assert!(
-            get_for_test(&engine, key.as_bytes()).is_some(),
+            get_for_test(&engine, key.as_bytes()).await.is_some(),
             "Flushed key {key} should be readable from SST"
         );
     }
     for i in 0..5 {
         let key = format!("key2_{i:02}");
         assert!(
-            get_for_test(&engine, key.as_bytes()).is_some(),
+            get_for_test(&engine, key.as_bytes()).await.is_some(),
             "Active/frozen key {key} should be readable"
         );
     }
@@ -1664,8 +1685,8 @@ fn test_flush_unblocks_rotation() {
 ///
 /// When the frozen limit is reached, concurrent writers should still
 /// be able to write to the active memtable without blocking.
-#[test]
-fn test_concurrent_writes_under_backpressure() {
+#[tokio::test]
+async fn test_concurrent_writes_under_backpressure() {
     let dir = tempfile::tempdir().unwrap();
 
     let lsn_provider = new_lsn_provider();
@@ -1761,7 +1782,7 @@ fn test_concurrent_writes_under_backpressure() {
 
     let key = "after_flush_key";
     write_test_data(&engine, key.as_bytes(), b"recovered", 9999);
-    let value = get_for_test(&engine, key.as_bytes());
+    let value = get_for_test(&engine, key.as_bytes()).await;
     assert!(
         value.is_some(),
         "Writes should succeed after flush drains frozen"
@@ -1772,8 +1793,8 @@ fn test_concurrent_writes_under_backpressure() {
 ///
 /// This simulates a scenario where writes are faster than flushes,
 /// demonstrating the need for proper backpressure.
-#[test]
-fn test_slow_flush_causes_memtable_growth() {
+#[tokio::test]
+async fn test_slow_flush_causes_memtable_growth() {
     let dir = tempfile::tempdir().unwrap();
 
     let lsn_provider = new_lsn_provider();
@@ -1869,8 +1890,8 @@ fn test_slow_flush_causes_memtable_growth() {
 /// Test write stall behavior with explicit transaction-like writes.
 ///
 /// Verifies that large batch writes don't get stuck when frozen limit is reached.
-#[test]
-fn test_large_batch_under_frozen_limit() {
+#[tokio::test]
+async fn test_large_batch_under_frozen_limit() {
     let dir = tempfile::tempdir().unwrap();
 
     let lsn_provider = new_lsn_provider();
@@ -1923,7 +1944,7 @@ fn test_large_batch_under_frozen_limit() {
     // Flush frozen memtable → writes resume
     engine.flush_all().unwrap();
     write_test_data(&engine, b"after_flush", &large_value, 999);
-    let value = get_for_test(&engine, b"after_flush");
+    let value = get_for_test(&engine, b"after_flush").await;
     assert!(
         value.is_some(),
         "Write should succeed after flushing frozen"

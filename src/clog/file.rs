@@ -693,11 +693,11 @@ impl ClogService for FileClogService {
         self.lsn_provider.current_lsn()
     }
 
-    fn close(&self) -> Result<()> {
+    async fn close(&self) -> Result<()> {
         // Force a final sync through the group writer, then it will be
         // cleanly shut down when dropped.
         let future = self.sync()?;
-        crate::io::block_on_sync(future)?;
+        future.await?;
         Ok(())
     }
 
@@ -864,10 +864,10 @@ mod tests {
         batch.add_put(1, b"key1".to_vec(), b"value1".to_vec());
         batch.add_put(1, b"key2".to_vec(), b"value2".to_vec());
 
-        let lsn = crate::io::block_on_sync(service.write(&mut batch, true).unwrap()).unwrap();
+        let lsn = service.write(&mut batch, true).unwrap().await.unwrap();
         assert_eq!(lsn, 2);
 
-        service.close().unwrap();
+        service.close().await.unwrap();
 
         // Reopen and verify
         let service2 = FileClogService::open(config, &tokio::runtime::Handle::current()).unwrap();
@@ -892,8 +892,8 @@ mod tests {
             batch.add_put(1, b"k1".to_vec(), b"v1".to_vec());
             batch.add_delete(1, b"k2".to_vec());
             batch.add_commit(1, 100);
-            crate::io::block_on_sync(service.write(&mut batch, true).unwrap()).unwrap();
-            service.close().unwrap();
+            service.write(&mut batch, true).unwrap().await.unwrap();
+            service.close().await.unwrap();
         }
 
         // Recover
@@ -953,8 +953,8 @@ mod tests {
             let mut batch = ClogBatch::new();
             batch.add_put(1, b"valid_key".to_vec(), b"valid_value".to_vec());
             batch.add_commit(1, 100);
-            crate::io::block_on_sync(service.write(&mut batch, true).unwrap()).unwrap();
-            service.close().unwrap();
+            service.write(&mut batch, true).unwrap().await.unwrap();
+            service.close().await.unwrap();
         }
 
         // Append partial header (6 bytes of a 12-byte header) to simulate crash
@@ -997,8 +997,8 @@ mod tests {
             let mut batch = ClogBatch::new();
             batch.add_put(1, b"key1".to_vec(), b"value1".to_vec());
             batch.add_commit(1, 100);
-            crate::io::block_on_sync(service.write(&mut batch, true).unwrap()).unwrap();
-            service.close().unwrap();
+            service.write(&mut batch, true).unwrap().await.unwrap();
+            service.close().await.unwrap();
         }
 
         // Append a complete header but truncated data
@@ -1041,15 +1041,15 @@ mod tests {
             let mut batch1 = ClogBatch::new();
             batch1.add_put(1, b"key1".to_vec(), b"value1".to_vec());
             batch1.add_commit(1, 100);
-            crate::io::block_on_sync(service.write(&mut batch1, true).unwrap()).unwrap();
+            service.write(&mut batch1, true).unwrap().await.unwrap();
 
             // Second batch
             let mut batch2 = ClogBatch::new();
             batch2.add_put(2, b"key2".to_vec(), b"value2".to_vec());
             batch2.add_commit(2, 200);
-            crate::io::block_on_sync(service.write(&mut batch2, true).unwrap()).unwrap();
+            service.write(&mut batch2, true).unwrap().await.unwrap();
 
-            service.close().unwrap();
+            service.close().await.unwrap();
         }
 
         // Corrupt the checksum of the second record
@@ -1123,9 +1123,9 @@ mod tests {
                     format!("value{i}").into_bytes(),
                 );
                 batch.add_commit(i, i * 100);
-                crate::io::block_on_sync(service.write(&mut batch, true).unwrap()).unwrap();
+                service.write(&mut batch, true).unwrap().await.unwrap();
             }
-            service.close().unwrap();
+            service.close().await.unwrap();
         }
 
         // Append garbage to simulate partial write during crash
@@ -1164,7 +1164,7 @@ mod tests {
             let mut batch = ClogBatch::new();
             batch.add_put(1, b"before_crash".to_vec(), b"v1".to_vec());
             batch.add_commit(1, 100);
-            crate::io::block_on_sync(service.write(&mut batch, true).unwrap()).unwrap();
+            service.write(&mut batch, true).unwrap().await.unwrap();
             // Simulate crash - no close() call
         }
 
@@ -1177,8 +1177,8 @@ mod tests {
         let mut batch = ClogBatch::new();
         batch.add_put(2, b"after_crash".to_vec(), b"v2".to_vec());
         batch.add_commit(2, 200);
-        crate::io::block_on_sync(service.write(&mut batch, true).unwrap()).unwrap();
-        service.close().unwrap();
+        service.write(&mut batch, true).unwrap().await.unwrap();
+        service.close().await.unwrap();
 
         // Third session: verify all data
         let (_, all_entries) =
@@ -1225,8 +1225,8 @@ mod tests {
             let mut batch = ClogBatch::new();
             batch.add_put(1, b"key1".to_vec(), b"value1".to_vec());
             batch.add_commit(1, 100);
-            crate::io::block_on_sync(service.write(&mut batch, true).unwrap()).unwrap();
-            service.close().unwrap();
+            service.write(&mut batch, true).unwrap().await.unwrap();
+            service.close().await.unwrap();
         }
 
         // Phase 2: Append garbage to simulate crash during write
@@ -1256,8 +1256,8 @@ mod tests {
         let mut batch = ClogBatch::new();
         batch.add_put(2, b"key2".to_vec(), b"value2".to_vec());
         batch.add_commit(2, 200);
-        crate::io::block_on_sync(service.write(&mut batch, true).unwrap()).unwrap();
-        service.close().unwrap();
+        service.write(&mut batch, true).unwrap().await.unwrap();
+        service.close().await.unwrap();
 
         // Phase 4: Recover again and verify all data is present
         let (_, all_entries) =
@@ -1292,7 +1292,7 @@ mod tests {
             let service =
                 FileClogService::open(config.clone(), &tokio::runtime::Handle::current()).unwrap();
             // Simulate crash before any writes
-            service.close().unwrap();
+            service.close().await.unwrap();
         }
 
         // Recovery should succeed with empty entries
@@ -1344,7 +1344,7 @@ mod tests {
             h.join().unwrap();
         }
 
-        service.close().unwrap();
+        service.close().await.unwrap();
 
         // Recover and verify LSN ordering
         let (recovered_service, entries) =
@@ -1413,7 +1413,7 @@ mod tests {
         // Write to clog - should allocate LSN 3
         let mut batch = ClogBatch::new();
         batch.add_put(1, b"key1".to_vec(), b"value1".to_vec());
-        let lsn = crate::io::block_on_sync(service.write(&mut batch, true).unwrap()).unwrap();
+        let lsn = service.write(&mut batch, true).unwrap().await.unwrap();
         assert_eq!(lsn, 3);
 
         // Provider should have advanced
@@ -1422,10 +1422,10 @@ mod tests {
         // Write more
         let mut batch2 = ClogBatch::new();
         batch2.add_put(2, b"key2".to_vec(), b"value2".to_vec());
-        let lsn2 = crate::io::block_on_sync(service.write(&mut batch2, true).unwrap()).unwrap();
+        let lsn2 = service.write(&mut batch2, true).unwrap().await.unwrap();
         assert_eq!(lsn2, 4);
 
-        service.close().unwrap();
+        service.close().await.unwrap();
 
         // Recover with same provider
         let (recovered, entries) = FileClogService::recover_with_lsn_provider(
@@ -1457,9 +1457,9 @@ mod tests {
             batch.add_put(1, b"k1".to_vec(), b"v1".to_vec());
             batch.add_put(1, b"k2".to_vec(), b"v2".to_vec());
             batch.add_put(1, b"k3".to_vec(), b"v3".to_vec());
-            crate::io::block_on_sync(service.write(&mut batch, true).unwrap()).unwrap();
+            service.write(&mut batch, true).unwrap().await.unwrap();
             // LSNs 1, 2, 3 are used
-            service.close().unwrap();
+            service.close().await.unwrap();
         }
 
         // Create fresh provider starting at 1
@@ -1495,7 +1495,7 @@ mod tests {
                 format!("key{i}").into_bytes(),
                 format!("val{i}").into_bytes(),
             );
-            crate::io::block_on_sync(service.write(&mut batch, true).unwrap()).unwrap();
+            service.write(&mut batch, true).unwrap().await.unwrap();
         }
 
         // Read from LSN 3
@@ -1513,7 +1513,7 @@ mod tests {
         let none = service.read_from_lsn(6).unwrap();
         assert!(none.is_empty());
 
-        service.close().unwrap();
+        service.close().await.unwrap();
     }
 
     /// Test max_lsn helper.
@@ -1532,11 +1532,11 @@ mod tests {
         let mut batch = ClogBatch::new();
         batch.add_put(1, b"k1".to_vec(), b"v1".to_vec());
         batch.add_put(1, b"k2".to_vec(), b"v2".to_vec());
-        crate::io::block_on_sync(service.write(&mut batch, true).unwrap()).unwrap();
+        service.write(&mut batch, true).unwrap().await.unwrap();
 
         assert_eq!(service.max_lsn().unwrap(), 2);
 
-        service.close().unwrap();
+        service.close().await.unwrap();
     }
 
     // ========================================================================
@@ -1564,16 +1564,15 @@ mod tests {
         let commit_ts = 100;
 
         // Write using zero-copy path
-        let lsn = crate::io::block_on_sync(
-            service
-                .write_batch(txn_id, &batch, commit_ts, true)
-                .unwrap(),
-        )
-        .unwrap();
+        let lsn = service
+            .write_batch(txn_id, &batch, commit_ts, true)
+            .unwrap()
+            .await
+            .unwrap();
         // 3 ops + 1 commit = 4 entries, so last LSN is 4
         assert_eq!(lsn, 4);
 
-        service.close().unwrap();
+        service.close().await.unwrap();
 
         // Recover and verify
         let (_, entries) =
@@ -1635,18 +1634,20 @@ mod tests {
         let mut clog_batch = ClogBatch::new();
         clog_batch.add_put(1, b"owned_key".to_vec(), b"owned_value".to_vec());
         clog_batch.add_commit(1, 100);
-        let lsn1 = crate::io::block_on_sync(service.write(&mut clog_batch, true).unwrap()).unwrap();
+        let lsn1 = service.write(&mut clog_batch, true).unwrap().await.unwrap();
         assert_eq!(lsn1, 2);
 
         // Write using WriteBatch (zero-copy path)
         let mut write_batch = WriteBatch::new();
         write_batch.put(b"zerocopy_key".to_vec(), b"zerocopy_value".to_vec());
-        let lsn2 =
-            crate::io::block_on_sync(service.write_batch(2, &write_batch, 200, true).unwrap())
-                .unwrap();
+        let lsn2 = service
+            .write_batch(2, &write_batch, 200, true)
+            .unwrap()
+            .await
+            .unwrap();
         assert_eq!(lsn2, 4); // 1 put + 1 commit = 2 more entries
 
-        service.close().unwrap();
+        service.close().await.unwrap();
 
         // Recover and verify all entries
         let (_, entries) =
@@ -1687,13 +1688,15 @@ mod tests {
         // Write some entries first
         let mut batch = ClogBatch::new();
         batch.add_put(1, b"k".to_vec(), b"v".to_vec());
-        crate::io::block_on_sync(service.write(&mut batch, true).unwrap()).unwrap();
+        service.write(&mut batch, true).unwrap().await.unwrap();
 
         // Now try write_batch with empty batch
         let empty_batch = WriteBatch::new();
-        let lsn =
-            crate::io::block_on_sync(service.write_batch(2, &empty_batch, 100, true).unwrap())
-                .unwrap();
+        let lsn = service
+            .write_batch(2, &empty_batch, 100, true)
+            .unwrap()
+            .await
+            .unwrap();
 
         // Should return current LSN (2, since we wrote 1 entry)
         assert_eq!(lsn, 2);
@@ -1702,7 +1705,7 @@ mod tests {
         let entries = service.read_all().unwrap();
         assert_eq!(entries.len(), 1);
 
-        service.close().unwrap();
+        service.close().await.unwrap();
     }
 
     // ========================================================================
@@ -1723,7 +1726,7 @@ mod tests {
         // Write empty batch
         let mut empty_batch = ClogBatch::new();
         assert!(empty_batch.is_empty());
-        let lsn = crate::io::block_on_sync(service.write(&mut empty_batch, true).unwrap()).unwrap();
+        let lsn = service.write(&mut empty_batch, true).unwrap().await.unwrap();
 
         // Should return current LSN without incrementing
         assert_eq!(lsn, 1);
@@ -1733,7 +1736,7 @@ mod tests {
         let entries = service.read_all().unwrap();
         assert!(entries.is_empty());
 
-        service.close().unwrap();
+        service.close().await.unwrap();
     }
 
     // ========================================================================
@@ -1751,16 +1754,16 @@ mod tests {
         // Write without sync
         let mut batch = ClogBatch::new();
         batch.add_put(1, b"key".to_vec(), b"value".to_vec());
-        crate::io::block_on_sync(service.write(&mut batch, false).unwrap()).unwrap(); // sync=false
+        service.write(&mut batch, false).unwrap().await.unwrap(); // sync=false
 
         // Explicitly sync
-        crate::io::block_on_sync(service.sync().unwrap()).unwrap();
+        service.sync().unwrap().await.unwrap();
 
         // Verify data is readable
         let entries = service.read_all().unwrap();
         assert_eq!(entries.len(), 1);
 
-        service.close().unwrap();
+        service.close().await.unwrap();
     }
 
     /// Test close() properly flushes and syncs.
@@ -1774,10 +1777,10 @@ mod tests {
                 FileClogService::open(config.clone(), &tokio::runtime::Handle::current()).unwrap();
             let mut batch = ClogBatch::new();
             batch.add_put(1, b"key".to_vec(), b"value".to_vec());
-            crate::io::block_on_sync(service.write(&mut batch, false).unwrap()).unwrap(); // No sync during write
+            service.write(&mut batch, false).unwrap().await.unwrap(); // No sync during write
 
             // Close should flush and sync
-            service.close().unwrap();
+            service.close().await.unwrap();
         }
 
         // Verify data persisted after close
@@ -1806,12 +1809,12 @@ mod tests {
         batch.add_put(1, b"k1".to_vec(), b"v1".to_vec());
         batch.add_put(1, b"k2".to_vec(), b"v2".to_vec());
         batch.add_put(1, b"k3".to_vec(), b"v3".to_vec());
-        crate::io::block_on_sync(service.write(&mut batch, true).unwrap()).unwrap();
+        service.write(&mut batch, true).unwrap().await.unwrap();
 
         // Oldest should be 1
         assert_eq!(service.oldest_lsn().unwrap(), 1);
 
-        service.close().unwrap();
+        service.close().await.unwrap();
     }
 
     /// Test file_size() returns correct value.
@@ -1829,13 +1832,13 @@ mod tests {
         // Write some data
         let mut batch = ClogBatch::new();
         batch.add_put(1, b"key".to_vec(), b"value".to_vec());
-        crate::io::block_on_sync(service.write(&mut batch, true).unwrap()).unwrap();
+        service.write(&mut batch, true).unwrap().await.unwrap();
 
         // File should be larger now
         let new_size = service.file_size().unwrap();
         assert!(new_size > initial_size);
 
-        service.close().unwrap();
+        service.close().await.unwrap();
     }
 
     // ========================================================================
@@ -1858,7 +1861,7 @@ mod tests {
                 format!("key{i}").into_bytes(),
                 format!("val{i}").into_bytes(),
             );
-            crate::io::block_on_sync(service.write(&mut batch, true).unwrap()).unwrap();
+            service.write(&mut batch, true).unwrap().await.unwrap();
         }
 
         // Verify we have 5 entries
@@ -1879,7 +1882,7 @@ mod tests {
         // Oldest LSN should now be 4
         assert_eq!(service.oldest_lsn().unwrap(), 4);
 
-        service.close().unwrap();
+        service.close().await.unwrap();
     }
 
     /// Test truncate_to() with safe_lsn higher than all entries (removes all).
@@ -1895,7 +1898,7 @@ mod tests {
         batch.add_put(1, b"k1".to_vec(), b"v1".to_vec());
         batch.add_put(1, b"k2".to_vec(), b"v2".to_vec());
         batch.add_put(1, b"k3".to_vec(), b"v3".to_vec());
-        crate::io::block_on_sync(service.write(&mut batch, true).unwrap()).unwrap();
+        service.write(&mut batch, true).unwrap().await.unwrap();
 
         // Truncate all (safe_lsn >= max LSN)
         let stats = service.truncate_to(10).unwrap();
@@ -1908,7 +1911,7 @@ mod tests {
         assert_eq!(service.oldest_lsn().unwrap(), 0);
         assert_eq!(service.file_size().unwrap(), FILE_HEADER_SIZE as u64);
 
-        service.close().unwrap();
+        service.close().await.unwrap();
     }
 
     /// Test truncate_to() when nothing needs to be truncated.
@@ -1924,7 +1927,7 @@ mod tests {
         batch.add_put(1, b"k1".to_vec(), b"v1".to_vec());
         batch.add_put(1, b"k2".to_vec(), b"v2".to_vec());
         batch.add_put(1, b"k3".to_vec(), b"v3".to_vec());
-        crate::io::block_on_sync(service.write(&mut batch, true).unwrap()).unwrap();
+        service.write(&mut batch, true).unwrap().await.unwrap();
 
         let size_before = service.file_size().unwrap();
 
@@ -1938,7 +1941,7 @@ mod tests {
         // All entries still present
         assert_eq!(service.read_all().unwrap().len(), 3);
 
-        service.close().unwrap();
+        service.close().await.unwrap();
     }
 
     /// Test truncate_to() then continue writing.
@@ -1954,7 +1957,7 @@ mod tests {
         batch.add_put(1, b"k1".to_vec(), b"v1".to_vec());
         batch.add_put(1, b"k2".to_vec(), b"v2".to_vec());
         batch.add_put(1, b"k3".to_vec(), b"v3".to_vec());
-        crate::io::block_on_sync(service.write(&mut batch, true).unwrap()).unwrap();
+        service.write(&mut batch, true).unwrap().await.unwrap();
 
         // Truncate LSN 1-2
         service.truncate_to(2).unwrap();
@@ -1962,7 +1965,7 @@ mod tests {
         // Write more entries
         let mut batch2 = ClogBatch::new();
         batch2.add_put(2, b"k4".to_vec(), b"v4".to_vec());
-        let lsn = crate::io::block_on_sync(service.write(&mut batch2, true).unwrap()).unwrap();
+        let lsn = service.write(&mut batch2, true).unwrap().await.unwrap();
         assert_eq!(lsn, 4); // LSN continues from 4
 
         // Verify entries
@@ -1971,7 +1974,7 @@ mod tests {
         assert_eq!(entries[0].lsn, 3);
         assert_eq!(entries[1].lsn, 4);
 
-        service.close().unwrap();
+        service.close().await.unwrap();
     }
 
     // ========================================================================
@@ -1995,7 +1998,7 @@ mod tests {
                 value: b"value".to_vec(),
             },
         };
-        let lsn = crate::io::block_on_sync(service.append(entry, true).unwrap()).unwrap();
+        let lsn = service.append(entry, true).unwrap().await.unwrap();
         assert_eq!(lsn, 1);
 
         // Append another
@@ -2004,14 +2007,14 @@ mod tests {
             txn_id: 1,
             op: ClogOp::Commit { commit_ts: 100 },
         };
-        let lsn2 = crate::io::block_on_sync(service.append(entry2, true).unwrap()).unwrap();
+        let lsn2 = service.append(entry2, true).unwrap().await.unwrap();
         assert_eq!(lsn2, 2);
 
         // Verify
         let entries = service.read_all().unwrap();
         assert_eq!(entries.len(), 2);
 
-        service.close().unwrap();
+        service.close().await.unwrap();
     }
 
     // ========================================================================
@@ -2168,8 +2171,8 @@ mod tests {
                 FileClogService::open(config.clone(), &tokio::runtime::Handle::current()).unwrap();
             let mut batch = ClogBatch::new();
             batch.add_put(1, b"key".to_vec(), b"value".to_vec());
-            crate::io::block_on_sync(service.write(&mut batch, true).unwrap()).unwrap();
-            service.close().unwrap();
+            service.write(&mut batch, true).unwrap().await.unwrap();
+            service.close().await.unwrap();
         }
 
         // Append a record with unknown type
@@ -2207,8 +2210,8 @@ mod tests {
                 FileClogService::open(config.clone(), &tokio::runtime::Handle::current()).unwrap();
             let mut batch = ClogBatch::new();
             batch.add_put(1, b"key".to_vec(), b"value".to_vec());
-            crate::io::block_on_sync(service.write(&mut batch, true).unwrap()).unwrap();
-            service.close().unwrap();
+            service.write(&mut batch, true).unwrap().await.unwrap();
+            service.close().await.unwrap();
         }
 
         // Append a record with size > MAX_RECORD_SIZE
@@ -2271,8 +2274,8 @@ mod tests {
         // Write and verify
         let mut batch = ClogBatch::new();
         batch.add_put(1, b"key".to_vec(), b"value".to_vec());
-        crate::io::block_on_sync(service.write(&mut batch, true).unwrap()).unwrap();
-        service.close().unwrap();
+        service.write(&mut batch, true).unwrap().await.unwrap();
+        service.close().await.unwrap();
 
         let (_, entries) =
             FileClogService::recover(config, &tokio::runtime::Handle::current()).unwrap();
@@ -2299,8 +2302,8 @@ mod tests {
             txn_id: 1,
             op: ClogOp::Rollback,
         });
-        crate::io::block_on_sync(service.write(&mut batch, true).unwrap()).unwrap();
-        service.close().unwrap();
+        service.write(&mut batch, true).unwrap().await.unwrap();
+        service.close().await.unwrap();
 
         // Recover and verify rollback
         let (_, entries) =
@@ -2362,7 +2365,7 @@ mod tests {
             h.join().unwrap();
         }
 
-        service.close().unwrap();
+        service.close().await.unwrap();
 
         // Recover and verify
         let (_, entries) =
@@ -2402,10 +2405,10 @@ mod tests {
         batch.add_put(1, b"key3".to_vec(), b"value3".to_vec());
         batch.add_commit(1, 1000);
 
-        let lsn = crate::io::block_on_sync(service.write(&mut batch, true).unwrap()).unwrap();
+        let lsn = service.write(&mut batch, true).unwrap().await.unwrap();
         assert_eq!(lsn, 5);
 
-        service.close().unwrap();
+        service.close().await.unwrap();
 
         // Recover and verify order
         let (_, entries) =
@@ -2443,8 +2446,8 @@ mod tests {
                 FileClogService::open(config.clone(), &tokio::runtime::Handle::current()).unwrap();
             let mut batch = ClogBatch::new();
             batch.add_put(1, b"key".to_vec(), b"value".to_vec());
-            crate::io::block_on_sync(service.write(&mut batch, true).unwrap()).unwrap();
-            service.close().unwrap();
+            service.write(&mut batch, true).unwrap().await.unwrap();
+            service.close().await.unwrap();
         }
 
         // Append data with valid CRC but invalid bincode format
@@ -2616,12 +2619,12 @@ mod tests {
                 format!("key{i}").into_bytes(),
                 format!("val{i}").into_bytes(),
             );
-            crate::io::block_on_sync(service.write(&mut batch, false).unwrap()).unwrap();
+            service.write(&mut batch, false).unwrap().await.unwrap();
             // sync=false
         }
 
         // Close (which flushes and syncs)
-        service.close().unwrap();
+        service.close().await.unwrap();
 
         // Verify data is recoverable
         let (_, entries) =
@@ -2650,10 +2653,10 @@ mod tests {
                 format!("val{i}").into_bytes(),
             );
             batch.add_commit(i, i * 100);
-            crate::io::block_on_sync(service.write(&mut batch, true).unwrap()).unwrap();
+            service.write(&mut batch, true).unwrap().await.unwrap();
         }
 
-        service.close().unwrap();
+        service.close().await.unwrap();
 
         // Recover and verify all batches
         let (service2, entries) =
@@ -2685,8 +2688,8 @@ mod tests {
         let mut batch = ClogBatch::new();
         batch.add_put(1, large_key.clone(), large_value.clone());
         batch.add_commit(1, 100);
-        crate::io::block_on_sync(service.write(&mut batch, true).unwrap()).unwrap();
-        service.close().unwrap();
+        service.write(&mut batch, true).unwrap().await.unwrap();
+        service.close().await.unwrap();
 
         // Recover and verify
         let (_, entries) =

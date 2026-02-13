@@ -33,7 +33,7 @@ use tisql::storage::{is_tombstone, MvccIterator, MvccKey};
 use tisql::types::Timestamp;
 
 /// Helper: get value at read_ts from LsmEngine (for verification after recovery).
-fn get_value(engine: &LsmEngine, key: &[u8], read_ts: Timestamp) -> Option<Vec<u8>> {
+async fn get_value(engine: &LsmEngine, key: &[u8], read_ts: Timestamp) -> Option<Vec<u8>> {
     let seek_key = MvccKey::encode(key, read_ts);
     let end_key = MvccKey::encode(key, 0)
         .next_key()
@@ -41,7 +41,7 @@ fn get_value(engine: &LsmEngine, key: &[u8], read_ts: Timestamp) -> Option<Vec<u
     let range = seek_key..end_key;
 
     let mut iter = engine.scan_iter(range, 0).unwrap();
-    tisql::io::block_on_sync(iter.advance()).unwrap();
+    iter.advance().await.unwrap();
 
     while iter.valid() {
         let entry_key = iter.user_key();
@@ -53,7 +53,7 @@ fn get_value(engine: &LsmEngine, key: &[u8], read_ts: Timestamp) -> Option<Vec<u
             }
             return Some(value.to_vec());
         }
-        tisql::io::block_on_sync(iter.advance()).unwrap();
+        iter.advance().await.unwrap();
     }
     None
 }
@@ -120,12 +120,12 @@ async fn test_implicit_txn_crash_recovery() {
     {
         let (_engine, txn_service, clog) = create_txn_env(dir.path());
 
-        txn_service.autocommit_put(b"k1", b"v1").unwrap();
-        txn_service.autocommit_put(b"k2", b"v2").unwrap();
-        let info = txn_service.autocommit_put(b"k3", b"v3").unwrap();
+        txn_service.autocommit_put(b"k1", b"v1").await.unwrap();
+        txn_service.autocommit_put(b"k2", b"v2").await.unwrap();
+        let info = txn_service.autocommit_put(b"k3", b"v3").await.unwrap();
         max_ts = info.commit_ts;
 
-        tisql::io::block_on_sync(clog.sync().unwrap()).unwrap();
+        clog.sync().unwrap().await.unwrap();
     }
 
     // Phase 2: Recover and verify
@@ -133,17 +133,17 @@ async fn test_implicit_txn_crash_recovery() {
         let (engine, _txn_service) = recover_txn_env(dir.path());
 
         assert_eq!(
-            get_value(&engine, b"k1", max_ts + 100),
+            get_value(&engine, b"k1", max_ts + 100).await,
             Some(b"v1".to_vec()),
             "k1 should survive recovery"
         );
         assert_eq!(
-            get_value(&engine, b"k2", max_ts + 100),
+            get_value(&engine, b"k2", max_ts + 100).await,
             Some(b"v2".to_vec()),
             "k2 should survive recovery"
         );
         assert_eq!(
-            get_value(&engine, b"k3", max_ts + 100),
+            get_value(&engine, b"k3", max_ts + 100).await,
             Some(b"v3".to_vec()),
             "k3 should survive recovery"
         );
@@ -162,17 +162,20 @@ async fn test_explicit_txn_crash_recovery() {
         let mut ctx = txn_service.begin_explicit(false).unwrap();
         txn_service
             .put(&mut ctx, b"ek1".to_vec(), b"ev1".to_vec())
+            .await
             .unwrap();
         txn_service
             .put(&mut ctx, b"ek2".to_vec(), b"ev2".to_vec())
+            .await
             .unwrap();
         txn_service
             .put(&mut ctx, b"ek3".to_vec(), b"ev3".to_vec())
+            .await
             .unwrap();
         let info = txn_service.commit(ctx).await.unwrap();
         max_ts = info.commit_ts;
 
-        tisql::io::block_on_sync(clog.sync().unwrap()).unwrap();
+        clog.sync().unwrap().await.unwrap();
     }
 
     // Phase 2: Recover and verify
@@ -180,17 +183,17 @@ async fn test_explicit_txn_crash_recovery() {
         let (engine, _txn_service) = recover_txn_env(dir.path());
 
         assert_eq!(
-            get_value(&engine, b"ek1", max_ts + 100),
+            get_value(&engine, b"ek1", max_ts + 100).await,
             Some(b"ev1".to_vec()),
             "ek1 should survive recovery"
         );
         assert_eq!(
-            get_value(&engine, b"ek2", max_ts + 100),
+            get_value(&engine, b"ek2", max_ts + 100).await,
             Some(b"ev2".to_vec()),
             "ek2 should survive recovery"
         );
         assert_eq!(
-            get_value(&engine, b"ek3", max_ts + 100),
+            get_value(&engine, b"ek3", max_ts + 100).await,
             Some(b"ev3".to_vec()),
             "ek3 should survive recovery"
         );
@@ -206,14 +209,14 @@ async fn test_explicit_txn_delete_crash_recovery() {
     {
         let (_engine, txn_service, clog) = create_txn_env(dir.path());
 
-        txn_service.autocommit_put(b"key1", b"value1").unwrap();
+        txn_service.autocommit_put(b"key1", b"value1").await.unwrap();
 
         let mut ctx = txn_service.begin_explicit(false).unwrap();
-        txn_service.delete(&mut ctx, b"key1".to_vec()).unwrap();
+        txn_service.delete(&mut ctx, b"key1".to_vec()).await.unwrap();
         let info = txn_service.commit(ctx).await.unwrap();
         max_ts = info.commit_ts;
 
-        tisql::io::block_on_sync(clog.sync().unwrap()).unwrap();
+        clog.sync().unwrap().await.unwrap();
     }
 
     // Phase 2: Recover and verify key1 is deleted
@@ -221,7 +224,7 @@ async fn test_explicit_txn_delete_crash_recovery() {
         let (engine, _txn_service) = recover_txn_env(dir.path());
 
         assert_eq!(
-            get_value(&engine, b"key1", max_ts + 100),
+            get_value(&engine, b"key1", max_ts + 100).await,
             None,
             "key1 should be deleted after recovery"
         );
@@ -238,21 +241,22 @@ async fn test_mixed_implicit_explicit_crash_recovery() {
         let (_engine, txn_service, clog) = create_txn_env(dir.path());
 
         // Implicit put key1
-        txn_service.autocommit_put(b"key1", b"v1").unwrap();
+        txn_service.autocommit_put(b"key1", b"v1").await.unwrap();
 
         // Explicit: put key2, delete key1
         let mut ctx = txn_service.begin_explicit(false).unwrap();
         txn_service
             .put(&mut ctx, b"key2".to_vec(), b"v2".to_vec())
+            .await
             .unwrap();
-        txn_service.delete(&mut ctx, b"key1".to_vec()).unwrap();
+        txn_service.delete(&mut ctx, b"key1".to_vec()).await.unwrap();
         txn_service.commit(ctx).await.unwrap();
 
         // Implicit put key3
-        let info = txn_service.autocommit_put(b"key3", b"v3").unwrap();
+        let info = txn_service.autocommit_put(b"key3", b"v3").await.unwrap();
         max_ts = info.commit_ts;
 
-        tisql::io::block_on_sync(clog.sync().unwrap()).unwrap();
+        clog.sync().unwrap().await.unwrap();
     }
 
     // Phase 2: Recover and verify
@@ -260,17 +264,17 @@ async fn test_mixed_implicit_explicit_crash_recovery() {
         let (engine, _txn_service) = recover_txn_env(dir.path());
 
         assert_eq!(
-            get_value(&engine, b"key1", max_ts + 100),
+            get_value(&engine, b"key1", max_ts + 100).await,
             None,
             "key1 should be deleted"
         );
         assert_eq!(
-            get_value(&engine, b"key2", max_ts + 100),
+            get_value(&engine, b"key2", max_ts + 100).await,
             Some(b"v2".to_vec()),
             "key2 should survive"
         );
         assert_eq!(
-            get_value(&engine, b"key3", max_ts + 100),
+            get_value(&engine, b"key3", max_ts + 100).await,
             Some(b"v3".to_vec()),
             "key3 should survive"
         );
@@ -290,6 +294,7 @@ async fn test_explicit_txn_rollback_not_recovered() {
         let mut ctx1 = txn_service.begin_explicit(false).unwrap();
         txn_service
             .put(&mut ctx1, b"key1".to_vec(), b"v1".to_vec())
+            .await
             .unwrap();
         txn_service.rollback(ctx1).unwrap();
 
@@ -297,11 +302,12 @@ async fn test_explicit_txn_rollback_not_recovered() {
         let mut ctx2 = txn_service.begin_explicit(false).unwrap();
         txn_service
             .put(&mut ctx2, b"key2".to_vec(), b"v2".to_vec())
+            .await
             .unwrap();
         let info = txn_service.commit(ctx2).await.unwrap();
         max_ts = info.commit_ts;
 
-        tisql::io::block_on_sync(clog.sync().unwrap()).unwrap();
+        clog.sync().unwrap().await.unwrap();
     }
 
     // Phase 2: Recover and verify
@@ -309,12 +315,12 @@ async fn test_explicit_txn_rollback_not_recovered() {
         let (engine, _txn_service) = recover_txn_env(dir.path());
 
         assert_eq!(
-            get_value(&engine, b"key1", max_ts + 100),
+            get_value(&engine, b"key1", max_ts + 100).await,
             None,
             "key1 was rolled back, should not be present"
         );
         assert_eq!(
-            get_value(&engine, b"key2", max_ts + 100),
+            get_value(&engine, b"key2", max_ts + 100).await,
             Some(b"v2".to_vec()),
             "key2 was committed, should survive"
         );

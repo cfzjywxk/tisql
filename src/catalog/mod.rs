@@ -34,7 +34,7 @@ pub(crate) use memory::MemoryCatalog;
 pub(crate) use mvcc::MvccCatalog;
 
 use serde::{Deserialize, Serialize};
-
+use std::future::Future;
 use crate::error::Result;
 use crate::types::{ColumnId, DataType, IndexId, TableId, Timestamp};
 
@@ -311,10 +311,10 @@ pub trait Catalog: Send + Sync {
     // Schema (database) operations
 
     /// Create a new schema.
-    fn create_schema(&self, name: &str) -> Result<()>;
+    fn create_schema<'a>(&'a self, name: &'a str) -> impl Future<Output = Result<()>> + Send + 'a;
 
     /// Drop a schema.
-    fn drop_schema(&self, name: &str) -> Result<()>;
+    fn drop_schema<'a>(&'a self, name: &'a str) -> impl Future<Output = Result<()>> + Send + 'a;
 
     /// List all schemas.
     fn list_schemas(&self) -> Result<Vec<String>>;
@@ -325,13 +325,13 @@ pub trait Catalog: Send + Sync {
     // Table operations
 
     /// Create a new table.
-    fn create_table(&self, table: TableDef) -> Result<TableId>;
+    fn create_table(&self, table: TableDef) -> impl Future<Output = Result<TableId>> + Send + '_;
 
     /// Drop a table.
     ///
     /// Returns `DropTableInfo` with the table ID and commit timestamp,
     /// enabling GC infrastructure to physically clean up data keys.
-    fn drop_table(&self, schema: &str, table: &str) -> Result<DropTableInfo>;
+    fn drop_table<'a>(&'a self, schema: &'a str, table: &'a str) -> impl Future<Output = Result<DropTableInfo>> + Send + 'a;
 
     /// Get a table by name.
     fn get_table(&self, schema: &str, table: &str) -> Result<Option<TableDef>>;
@@ -345,10 +345,10 @@ pub trait Catalog: Send + Sync {
     // Index operations
 
     /// Create an index on a table.
-    fn create_index(&self, table_id: TableId, index: IndexDef) -> Result<IndexId>;
+    fn create_index(&self, table_id: TableId, index: IndexDef) -> impl Future<Output = Result<IndexId>> + Send + '_;
 
     /// Drop an index.
-    fn drop_index(&self, table_id: TableId, index_name: &str) -> Result<()>;
+    fn drop_index<'a>(&'a self, table_id: TableId, index_name: &'a str) -> impl Future<Output = Result<()>> + Send + 'a;
 
     // Auto-increment support
 

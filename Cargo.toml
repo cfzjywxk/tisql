@@ -66,6 +66,7 @@ optional = true
 criterion = "0.5"
 tempfile = "3"
 fail = "0.5"
+futures = "0.3"
 parking_lot = "0.12"
 mysql_async = "0.34"
 

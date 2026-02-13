@@ -58,7 +58,8 @@ struct TestResult {
     message: String,
 }
 
-fn main() {
+#[tokio::main]
+async fn main() {
     let args: Vec<String> = std::env::args().collect();
 
     let base_dir = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
@@ -95,7 +96,7 @@ fn main() {
     // Run tests
     let mut results = Vec::new();
     for test_case in test_cases {
-        let result = run_test(&config, &test_case);
+        let result = run_test(&config, &test_case).await;
         results.push(result);
     }
 
@@ -206,7 +207,7 @@ fn find_tests_recursive(
     }
 }
 
-fn run_test(config: &Config, test_case: &TestCase) -> TestResult {
+async fn run_test(config: &Config, test_case: &TestCase) -> TestResult {
     println!("\nRunning test: {}", test_case.name);
 
     // Parse test file
@@ -244,7 +245,7 @@ fn run_test(config: &Config, test_case: &TestCase) -> TestResult {
         output.push('\n');
 
         // Execute
-        match tisql::io::block_on_sync(db.handle_mp_query(&stmt.sql)) {
+        match db.handle_mp_query(&stmt.sql).await {
             Ok(result) => {
                 if stmt.expectations.expected_error.is_some() {
                     return TestResult {

@@ -47,12 +47,24 @@ impl MemoryCatalog {
         };
 
         // Create default schema
-        catalog.create_schema("default").unwrap();
+        catalog.create_schema_sync("default").unwrap();
 
         // Create test schema for MySQL compatibility (e.g., E2E tests expect it)
-        catalog.create_schema("test").unwrap();
+        catalog.create_schema_sync("test").unwrap();
 
         catalog
+    }
+
+    /// Synchronous schema creation for use in constructor.
+    fn create_schema_sync(&self, name: &str) -> Result<()> {
+        let mut schemas = self.schemas.write();
+        if schemas.contains_key(name) {
+            return Err(TiSqlError::Catalog(format!(
+                "Schema '{name}' already exists"
+            )));
+        }
+        schemas.insert(name.to_string(), HashMap::new());
+        Ok(())
     }
 }
 
@@ -63,18 +75,11 @@ impl Default for MemoryCatalog {
 }
 
 impl Catalog for MemoryCatalog {
-    fn create_schema(&self, name: &str) -> Result<()> {
-        let mut schemas = self.schemas.write();
-        if schemas.contains_key(name) {
-            return Err(TiSqlError::Catalog(format!(
-                "Schema '{name}' already exists"
-            )));
-        }
-        schemas.insert(name.to_string(), HashMap::new());
-        Ok(())
+    async fn create_schema(&self, name: &str) -> Result<()> {
+        self.create_schema_sync(name)
     }
 
-    fn drop_schema(&self, name: &str) -> Result<()> {
+    async fn drop_schema(&self, name: &str) -> Result<()> {
         let mut schemas = self.schemas.write();
         let mut tables_by_id = self.tables_by_id.write();
 
@@ -99,7 +104,7 @@ impl Catalog for MemoryCatalog {
         Ok(schemas.contains_key(name))
     }
 
-    fn create_table(&self, table: TableDef) -> Result<TableId> {
+    async fn create_table(&self, table: TableDef) -> Result<TableId> {
         let mut schemas = self.schemas.write();
         let mut tables_by_id = self.tables_by_id.write();
 
@@ -125,7 +130,7 @@ impl Catalog for MemoryCatalog {
         Ok(table_id)
     }
 
-    fn drop_table(&self, schema: &str, table: &str) -> Result<super::DropTableInfo> {
+    async fn drop_table(&self, schema: &str, table: &str) -> Result<super::DropTableInfo> {
         let mut schemas = self.schemas.write();
         let mut tables_by_id = self.tables_by_id.write();
 
@@ -173,7 +178,7 @@ impl Catalog for MemoryCatalog {
             .unwrap_or_default())
     }
 
-    fn create_index(&self, table_id: TableId, index: IndexDef) -> Result<IndexId> {
+    async fn create_index(&self, table_id: TableId, index: IndexDef) -> Result<IndexId> {
         let tables_by_id = self.tables_by_id.read();
         let mut schemas = self.schemas.write();
 
@@ -201,7 +206,7 @@ impl Catalog for MemoryCatalog {
         Ok(index_id)
     }
 
-    fn drop_index(&self, table_id: TableId, index_name: &str) -> Result<()> {
+    async fn drop_index(&self, table_id: TableId, index_name: &str) -> Result<()> {
         let tables_by_id = self.tables_by_id.read();
         let mut schemas = self.schemas.write();
 
@@ -275,13 +280,13 @@ mod tests {
         )
     }
 
-    #[test]
-    fn test_create_get_table() {
+    #[tokio::test]
+    async fn test_create_get_table() {
         let catalog = MemoryCatalog::new();
         let table = make_test_table(&catalog, "users");
         let table_id = table.id();
 
-        catalog.create_table(table).unwrap();
+        catalog.create_table(table).await.unwrap();
 
         let retrieved = catalog.get_table("default", "users").unwrap().unwrap();
         assert_eq!(retrieved.id(), table_id);
@@ -291,25 +296,25 @@ mod tests {
         assert_eq!(by_id.name(), "users");
     }
 
-    #[test]
-    fn test_drop_table() {
+    #[tokio::test]
+    async fn test_drop_table() {
         let catalog = MemoryCatalog::new();
         let table = make_test_table(&catalog, "users");
 
-        catalog.create_table(table).unwrap();
+        catalog.create_table(table).await.unwrap();
         assert!(catalog.get_table("default", "users").unwrap().is_some());
 
-        catalog.drop_table("default", "users").unwrap();
+        catalog.drop_table("default", "users").await.unwrap();
         assert!(catalog.get_table("default", "users").unwrap().is_none());
     }
 
-    #[test]
-    fn test_auto_increment() {
+    #[tokio::test]
+    async fn test_auto_increment() {
         let catalog = MemoryCatalog::new();
         let table = make_test_table(&catalog, "users");
         let table_id = table.id();
 
-        catalog.create_table(table).unwrap();
+        catalog.create_table(table).await.unwrap();
 
         assert_eq!(catalog.next_auto_increment(table_id).unwrap(), 1);
         assert_eq!(catalog.next_auto_increment(table_id).unwrap(), 2);

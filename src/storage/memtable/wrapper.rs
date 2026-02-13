@@ -326,6 +326,8 @@ fn estimate_batch_size(batch: &WriteBatch) -> usize {
 #[cfg(test)]
 mod tests {
     use std::ops::Range;
+    use std::sync::Arc;
+    use std::thread;
 
     use super::*;
     use crate::storage::mvcc::{is_tombstone, MvccIterator, MvccKey};
@@ -340,29 +342,27 @@ mod tests {
     // ==================== Test Helpers Using MvccKey ====================
 
     /// Scan MVCC keys in range using streaming iterator (test-only helper).
-    fn scan_mvcc(mt: &MemTable, range: Range<MvccKey>) -> Vec<(MvccKey, RawValue)> {
+    async fn scan_mvcc(mt: &MemTable, range: Range<MvccKey>) -> Vec<(MvccKey, RawValue)> {
         let mut results = Vec::new();
-        let mut iter = mt
-            .inner()
-            .create_streaming_iter(std::sync::Arc::new(range), 0);
-        crate::io::block_on_sync(iter.advance()).unwrap();
+        let mut iter = mt.inner().create_streaming_iter(Arc::new(range), 0);
+        iter.advance().await.unwrap();
         while iter.valid() {
             let key = MvccKey::encode(iter.user_key(), iter.timestamp());
             results.push((key, iter.value().to_vec()));
-            crate::io::block_on_sync(iter.advance()).unwrap();
+            iter.advance().await.unwrap();
         }
         results
     }
 
     /// Get the latest version of a key visible at the given timestamp.
-    fn get_at_for_test(mt: &MemTable, key: &[u8], ts: Timestamp) -> Option<RawValue> {
+    async fn get_at_for_test(mt: &MemTable, key: &[u8], ts: Timestamp) -> Option<RawValue> {
         let start = MvccKey::encode(key, ts);
         let end = MvccKey::encode(key, 0)
             .next_key()
             .unwrap_or_else(MvccKey::unbounded);
         let range = start..end;
 
-        let results = scan_mvcc(mt, range);
+        let results = scan_mvcc(mt, range).await;
 
         for (mvcc_key, value) in results {
             let (decoded_key, entry_ts) = mvcc_key.decode();
@@ -376,16 +376,16 @@ mod tests {
         None
     }
 
-    fn get_for_test(mt: &MemTable, key: &[u8]) -> Option<RawValue> {
-        get_at_for_test(mt, key, Timestamp::MAX)
+    async fn get_for_test(mt: &MemTable, key: &[u8]) -> Option<RawValue> {
+        get_at_for_test(mt, key, Timestamp::MAX).await
     }
 
-    fn scan_for_test(mt: &MemTable, range: &Range<Key>) -> Vec<(Key, RawValue)> {
+    async fn scan_for_test(mt: &MemTable, range: &Range<Key>) -> Vec<(Key, RawValue)> {
         let start = MvccKey::encode(&range.start, Timestamp::MAX);
         let end = MvccKey::encode(&range.end, 0);
         let mvcc_range = start..end;
 
-        let results = scan_mvcc(mt, mvcc_range);
+        let results = scan_mvcc(mt, mvcc_range).await;
 
         let mut seen_keys: std::collections::HashSet<Key> = std::collections::HashSet::new();
         let mut output = Vec::new();
@@ -419,8 +419,8 @@ mod tests {
         assert!(mt.is_empty());
     }
 
-    #[test]
-    fn test_memtable_write_and_read() {
+    #[tokio::test]
+    async fn test_memtable_write_and_read() {
         let mt = MemTable::new(1);
 
         let mut batch = new_batch(100);
@@ -429,8 +429,8 @@ mod tests {
 
         mt.write_batch_with_lsn(batch, 1).unwrap();
 
-        assert_eq!(get_for_test(&mt, b"key1"), Some(b"value1".to_vec()));
-        assert_eq!(get_for_test(&mt, b"key2"), Some(b"value2".to_vec()));
+        assert_eq!(get_for_test(&mt, b"key1").await, Some(b"value1".to_vec()));
+        assert_eq!(get_for_test(&mt, b"key2").await, Some(b"value2".to_vec()));
         assert!(mt.approximate_size() > 0);
         assert_eq!(mt.len(), 2);
     }
@@ -464,8 +464,8 @@ mod tests {
         assert_eq!(mt.max_lsn(), Some(10));
     }
 
-    #[test]
-    fn test_memtable_freeze() {
+    #[tokio::test]
+    async fn test_memtable_freeze() {
         let mt = MemTable::new(1);
 
         let mut batch = new_batch(100);
@@ -477,7 +477,7 @@ mod tests {
         assert!(mt.is_frozen());
 
         // Reads should still work
-        assert_eq!(get_for_test(&mt, b"key1"), Some(b"value1".to_vec()));
+        assert_eq!(get_for_test(&mt, b"key1").await, Some(b"value1".to_vec()));
 
         // Writes should fail
         let mut batch = new_batch(101);
@@ -486,8 +486,8 @@ mod tests {
         assert!(result.is_err());
     }
 
-    #[test]
-    fn test_memtable_mvcc_read() {
+    #[tokio::test]
+    async fn test_memtable_mvcc_read() {
         let mt = MemTable::new(1);
 
         // Write version at ts=10
@@ -501,15 +501,15 @@ mod tests {
         mt.write_batch_with_lsn(batch, 2).unwrap();
 
         // Read at different timestamps
-        assert_eq!(get_at_for_test(&mt, b"key", 5), None);
-        assert_eq!(get_at_for_test(&mt, b"key", 10), Some(b"v1".to_vec()));
-        assert_eq!(get_at_for_test(&mt, b"key", 15), Some(b"v1".to_vec()));
-        assert_eq!(get_at_for_test(&mt, b"key", 20), Some(b"v2".to_vec()));
-        assert_eq!(get_at_for_test(&mt, b"key", 25), Some(b"v2".to_vec()));
+        assert_eq!(get_at_for_test(&mt, b"key", 5).await, None);
+        assert_eq!(get_at_for_test(&mt, b"key", 10).await, Some(b"v1".to_vec()));
+        assert_eq!(get_at_for_test(&mt, b"key", 15).await, Some(b"v1".to_vec()));
+        assert_eq!(get_at_for_test(&mt, b"key", 20).await, Some(b"v2".to_vec()));
+        assert_eq!(get_at_for_test(&mt, b"key", 25).await, Some(b"v2".to_vec()));
     }
 
-    #[test]
-    fn test_memtable_scan() {
+    #[tokio::test]
+    async fn test_memtable_scan() {
         let mt = MemTable::new(1);
 
         let mut batch = new_batch(100);
@@ -520,7 +520,7 @@ mod tests {
         mt.write_batch_with_lsn(batch, 1).unwrap();
 
         let range = b"b".to_vec()..b"d".to_vec();
-        let results = scan_for_test(&mt, &range);
+        let results = scan_for_test(&mt, &range).await;
 
         assert_eq!(results.len(), 2);
     }
@@ -548,8 +548,8 @@ mod tests {
         assert!(size > 8 + 22, "Size should include overhead");
     }
 
-    #[test]
-    fn test_memtable_delete() {
+    #[tokio::test]
+    async fn test_memtable_delete() {
         let mt = MemTable::new(1);
 
         // Write a value
@@ -557,7 +557,7 @@ mod tests {
         batch.put(b"key".to_vec(), b"value".to_vec());
         mt.write_batch_with_lsn(batch, 1).unwrap();
 
-        assert_eq!(get_for_test(&mt, b"key"), Some(b"value".to_vec()));
+        assert_eq!(get_for_test(&mt, b"key").await, Some(b"value".to_vec()));
 
         // Delete the key
         let mut batch = new_batch(20);
@@ -565,23 +565,23 @@ mod tests {
         mt.write_batch_with_lsn(batch, 2).unwrap();
 
         // Should be deleted at latest
-        assert_eq!(get_for_test(&mt, b"key"), None);
+        assert_eq!(get_for_test(&mt, b"key").await, None);
 
         // Should still be visible at ts=15
-        assert_eq!(get_at_for_test(&mt, b"key", 15), Some(b"value".to_vec()));
+        assert_eq!(
+            get_at_for_test(&mt, b"key", 15).await,
+            Some(b"value".to_vec())
+        );
     }
 
     // ==================== Concurrent Tests ====================
-
-    use std::sync::{Arc, Barrier};
-    use std::thread;
 
     #[test]
     fn test_concurrent_writes() {
         let mt = Arc::new(MemTable::new(1));
         let num_threads = 4;
         let writes_per_thread = 1000;
-        let barrier = Arc::new(Barrier::new(num_threads));
+        let barrier = Arc::new(std::sync::Barrier::new(num_threads));
 
         let handles: Vec<_> = (0..num_threads)
             .map(|tid| {
@@ -614,8 +614,8 @@ mod tests {
         assert!(mt.approximate_size() > 0);
     }
 
-    #[test]
-    fn test_concurrent_reads_and_writes() {
+    #[tokio::test]
+    async fn test_concurrent_reads_and_writes() {
         let mt = Arc::new(MemTable::new(1));
 
         // Pre-populate
@@ -631,45 +631,46 @@ mod tests {
 
         let num_readers = 4;
         let num_writers = 2;
-        let barrier = Arc::new(Barrier::new(num_readers + num_writers));
+        let barrier = Arc::new(tokio::sync::Barrier::new(num_readers + num_writers));
 
-        let handles: Vec<_> = (0..num_readers)
-            .map(|_| {
-                let mt = Arc::clone(&mt);
-                let barrier = Arc::clone(&barrier);
+        let mut handles = Vec::new();
 
-                thread::spawn(move || {
-                    barrier.wait();
+        for _ in 0..num_readers {
+            let mt = Arc::clone(&mt);
+            let barrier = Arc::clone(&barrier);
 
-                    for i in 0..1000 {
-                        let key = format!("key{:03}", i % 100);
-                        let _ = get_for_test(&mt, key.as_bytes());
-                    }
-                })
-            })
-            .chain((0..num_writers).map(|tid| {
-                let mt = Arc::clone(&mt);
-                let barrier = Arc::clone(&barrier);
+            handles.push(tokio::spawn(async move {
+                barrier.wait().await;
 
-                thread::spawn(move || {
-                    barrier.wait();
+                for i in 0..1000 {
+                    let key = format!("key{:03}", i % 100);
+                    let _ = get_for_test(&mt, key.as_bytes()).await;
+                }
+            }));
+        }
 
-                    for i in 0..500 {
-                        let mut batch = WriteBatch::new();
-                        let ts = (100 + tid * 500 + i) as Timestamp;
-                        batch.set_commit_ts(ts);
-                        let key = format!("new_key_{tid}_{i}");
-                        batch.put(key.as_bytes().to_vec(), b"value".to_vec());
+        for tid in 0..num_writers {
+            let mt = Arc::clone(&mt);
+            let barrier = Arc::clone(&barrier);
 
-                        let lsn = (1 + tid * 500 + i) as u64;
-                        mt.write_batch_with_lsn(batch, lsn).unwrap();
-                    }
-                })
-            }))
-            .collect();
+            handles.push(tokio::spawn(async move {
+                barrier.wait().await;
+
+                for i in 0..500 {
+                    let mut batch = WriteBatch::new();
+                    let ts = (100 + tid * 500 + i) as Timestamp;
+                    batch.set_commit_ts(ts);
+                    let key = format!("new_key_{tid}_{i}");
+                    batch.put(key.as_bytes().to_vec(), b"value".to_vec());
+
+                    let lsn = (1 + tid * 500 + i) as u64;
+                    mt.write_batch_with_lsn(batch, lsn).unwrap();
+                }
+            }));
+        }
 
         for h in handles {
-            h.join().unwrap();
+            h.await.unwrap();
         }
     }
 
@@ -678,7 +679,7 @@ mod tests {
         let mt = Arc::new(MemTable::new(1));
         let num_threads = 8;
         let writes_per_thread = 100;
-        let barrier = Arc::new(Barrier::new(num_threads));
+        let barrier = Arc::new(std::sync::Barrier::new(num_threads));
 
         let handles: Vec<_> = (0..num_threads)
             .map(|tid| {
@@ -740,8 +741,8 @@ mod tests {
         assert_eq!(mt.get_lock_owner(b"key"), Some(100));
     }
 
-    #[test]
-    fn test_memtable_finalize_pending() {
+    #[tokio::test]
+    async fn test_memtable_finalize_pending() {
         let mt = MemTable::new(1);
 
         // Add pending write
@@ -754,12 +755,12 @@ mod tests {
         assert!(mt.get_lock_owner(b"key").is_none());
 
         // Value should be visible
-        let result = get_for_test(&mt, b"key");
+        let result = get_for_test(&mt, b"key").await;
         assert_eq!(result, Some(b"value".to_vec()));
     }
 
-    #[test]
-    fn test_memtable_abort_pending() {
+    #[tokio::test]
+    async fn test_memtable_abort_pending() {
         let mt = MemTable::new(1);
 
         // Add pending write
@@ -772,12 +773,12 @@ mod tests {
         assert!(mt.get_lock_owner(b"key").is_none());
 
         // Value should not be visible
-        let result = get_for_test(&mt, b"key");
+        let result = get_for_test(&mt, b"key").await;
         assert!(result.is_none());
     }
 
-    #[test]
-    fn test_memtable_delete_pending() {
+    #[tokio::test]
+    async fn test_memtable_delete_pending() {
         let mt = MemTable::new(1);
 
         // First write a committed value
@@ -794,7 +795,7 @@ mod tests {
         mt.finalize_pending(&[b"key".to_vec()], 200, 300);
 
         // Value should not be visible
-        let result = get_for_test(&mt, b"key");
+        let result = get_for_test(&mt, b"key").await;
         assert!(result.is_none());
     }
 

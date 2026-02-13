@@ -980,7 +980,7 @@ impl PessimisticStorage for VersionedMemTableEngine {
         VersionedMemTableEngine::delete_pending(self, key, owner_start_ts)
     }
 
-    fn get_with_owner(
+    async fn get_with_owner(
         &self,
         key: &[u8],
         read_ts: Timestamp,

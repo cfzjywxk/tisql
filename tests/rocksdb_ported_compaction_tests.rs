@@ -38,7 +38,7 @@ use tisql::StorageEngine;
 
 // ==================== Test Helpers Using MvccKey ====================
 
-fn get_at_for_test(engine: &LsmEngine, key: &[u8], ts: Timestamp) -> Option<RawValue> {
+async fn get_at_for_test(engine: &LsmEngine, key: &[u8], ts: Timestamp) -> Option<RawValue> {
     let start = MvccKey::encode(key, ts);
     let end = MvccKey::encode(key, 0)
         .next_key()
@@ -47,7 +47,7 @@ fn get_at_for_test(engine: &LsmEngine, key: &[u8], ts: Timestamp) -> Option<RawV
 
     // Use streaming scan_iter() - process one entry at a time
     let mut iter = engine.scan_iter(range, 0).unwrap();
-    tisql::io::block_on_sync(iter.advance()).unwrap(); // Position on first entry
+    iter.advance().await.unwrap(); // Position on first entry
 
     while iter.valid() {
         let decoded_key = iter.user_key();
@@ -59,23 +59,23 @@ fn get_at_for_test(engine: &LsmEngine, key: &[u8], ts: Timestamp) -> Option<RawV
             }
             return Some(value);
         }
-        tisql::io::block_on_sync(iter.advance()).unwrap();
+        iter.advance().await.unwrap();
     }
     None
 }
 
-fn get_for_test(engine: &LsmEngine, key: &[u8]) -> Option<RawValue> {
-    get_at_for_test(engine, key, Timestamp::MAX)
+async fn get_for_test(engine: &LsmEngine, key: &[u8]) -> Option<RawValue> {
+    get_at_for_test(engine, key, Timestamp::MAX).await
 }
 
-fn scan_for_test(engine: &LsmEngine, range: &std::ops::Range<Key>) -> Vec<(Key, RawValue)> {
+async fn scan_for_test(engine: &LsmEngine, range: &std::ops::Range<Key>) -> Vec<(Key, RawValue)> {
     let start = MvccKey::encode(&range.start, Timestamp::MAX);
     let end = MvccKey::encode(&range.end, 0);
     let mvcc_range = start..end;
 
     // Use streaming scan_iter() - process one entry at a time
     let mut iter = engine.scan_iter(mvcc_range, 0).unwrap();
-    tisql::io::block_on_sync(iter.advance()).unwrap(); // Position on first entry
+    iter.advance().await.unwrap(); // Position on first entry
 
     let mut seen_keys: std::collections::HashSet<Key> = std::collections::HashSet::new();
     let mut output = Vec::new();
@@ -85,7 +85,7 @@ fn scan_for_test(engine: &LsmEngine, range: &std::ops::Range<Key>) -> Vec<(Key, 
         let value = iter.value().to_vec();
 
         // Move to next before continue checks (so we don't get stuck)
-        tisql::io::block_on_sync(iter.advance()).unwrap();
+        iter.advance().await.unwrap();
 
         if decoded_key < range.start || decoded_key >= range.end {
             continue;
@@ -169,8 +169,8 @@ fn make_sst(id: u64, level: u32, smallest: &[u8], largest: &[u8]) -> SstMeta {
 
 /// Test that compaction picker doesn't trigger when L0 is below threshold.
 /// Ported from RocksDB's compaction_picker_test.cc.
-#[test]
-fn test_picker_l0_below_threshold() {
+#[tokio::test]
+async fn test_picker_l0_below_threshold() {
     let dir = TempDir::new().unwrap();
     let config = Arc::new(
         LsmConfigBuilder::new(dir.path())
@@ -193,8 +193,8 @@ fn test_picker_l0_below_threshold() {
 
 /// Test that L0 compaction includes all overlapping files.
 /// This is critical for correctness - missing overlap can cause data loss.
-#[test]
-fn test_picker_l0_includes_all_overlapping() {
+#[tokio::test]
+async fn test_picker_l0_includes_all_overlapping() {
     let dir = TempDir::new().unwrap();
     let config = Arc::new(
         LsmConfigBuilder::new(dir.path())
@@ -237,8 +237,8 @@ fn test_picker_l0_includes_all_overlapping() {
 
 /// Test that level compaction picks the oldest file.
 /// This ensures fairness and prevents starvation.
-#[test]
-fn test_picker_level_picks_oldest() {
+#[tokio::test]
+async fn test_picker_level_picks_oldest() {
     let dir = TempDir::new().unwrap();
     let config = Arc::new(
         LsmConfigBuilder::new(dir.path())
@@ -269,8 +269,8 @@ fn test_picker_level_picks_oldest() {
 }
 
 /// Test trivial move when there's no overlap with next level.
-#[test]
-fn test_picker_trivial_move_no_overlap() {
+#[tokio::test]
+async fn test_picker_trivial_move_no_overlap() {
     let dir = TempDir::new().unwrap();
     let config = Arc::new(
         LsmConfigBuilder::new(dir.path())
@@ -300,8 +300,8 @@ fn test_picker_trivial_move_no_overlap() {
 // ============================================================================
 
 /// Test compaction merges data correctly.
-#[test]
-fn test_executor_merge_keys() {
+#[tokio::test]
+async fn test_executor_merge_keys() {
     let dir = TempDir::new().unwrap();
     let sst_dir = dir.path().join("sst");
     std::fs::create_dir_all(&sst_dir).unwrap();
@@ -345,17 +345,19 @@ fn test_executor_merge_keys() {
 
     // Execute with pre-allocated IDs
     let pre_allocated_ids = vec![3, 4];
-    let delta = tisql::io::block_on_sync(executor.execute(
-        &task,
-        &version,
-        &sst_dir,
-        &pre_allocated_ids,
-        IoService::new(32).unwrap(),
-        0, // gc_safe_point = 0 → no GC
-        false,
-        &HashMap::new(),
-    ))
-    .unwrap();
+    let delta = executor
+        .execute(
+            &task,
+            &version,
+            &sst_dir,
+            &pre_allocated_ids,
+            IoService::new(32).unwrap(),
+            0, // gc_safe_point = 0 → no GC
+            false,
+            &HashMap::new(),
+        )
+        .await
+        .unwrap();
 
     // Verify output
     assert!(!delta.new_ssts.is_empty(), "Should produce output SSTs");
@@ -364,18 +366,16 @@ fn test_executor_merge_keys() {
     // Read output SST and verify keys are merged in order
     let output_sst = &delta.new_ssts[0];
     let output_path = sst_dir.join(format!("{:08}.sst", output_sst.id));
-    let reader = tisql::io::block_on_sync(SstReaderRef::open(
-        &output_path,
-        IoService::new(32).unwrap(),
-    ))
-    .unwrap();
+    let reader = SstReaderRef::open(&output_path, IoService::new(32).unwrap())
+        .await
+        .unwrap();
     let mut iter = tisql::testkit::SstIterator::new(reader).unwrap();
-    tisql::io::block_on_sync(iter.seek_to_first()).unwrap();
+    iter.seek_to_first().await.unwrap();
 
     let mut keys = Vec::new();
     while iter.valid() {
         keys.push(iter.key().to_vec());
-        tisql::io::block_on_sync(iter.advance()).unwrap();
+        iter.advance().await.unwrap();
     }
 
     // Should be in sorted order: a, b, c, d, e, f
@@ -394,8 +394,8 @@ fn test_executor_merge_keys() {
 
 /// Test that compaction handles duplicate MVCC keys correctly.
 /// Newer versions should appear before older versions in output.
-#[test]
-fn test_executor_mvcc_ordering() {
+#[tokio::test]
+async fn test_executor_mvcc_ordering() {
     let dir = TempDir::new().unwrap();
     let sst_dir = dir.path().join("sst");
     std::fs::create_dir_all(&sst_dir).unwrap();
@@ -440,32 +440,32 @@ fn test_executor_mvcc_ordering() {
     };
 
     let pre_allocated_ids = vec![3, 4];
-    let delta = tisql::io::block_on_sync(executor.execute(
-        &task,
-        &version,
-        &sst_dir,
-        &pre_allocated_ids,
-        IoService::new(32).unwrap(),
-        0, // gc_safe_point = 0 → no GC
-        false,
-        &HashMap::new(),
-    ))
-    .unwrap();
+    let delta = executor
+        .execute(
+            &task,
+            &version,
+            &sst_dir,
+            &pre_allocated_ids,
+            IoService::new(32).unwrap(),
+            0, // gc_safe_point = 0 → no GC
+            false,
+            &HashMap::new(),
+        )
+        .await
+        .unwrap();
 
     // Read and verify all versions are preserved in correct order
     let output_path = sst_dir.join(format!("{:08}.sst", delta.new_ssts[0].id));
-    let reader = tisql::io::block_on_sync(SstReaderRef::open(
-        &output_path,
-        IoService::new(32).unwrap(),
-    ))
-    .unwrap();
+    let reader = SstReaderRef::open(&output_path, IoService::new(32).unwrap())
+        .await
+        .unwrap();
     let mut iter = tisql::testkit::SstIterator::new(reader).unwrap();
-    tisql::io::block_on_sync(iter.seek_to_first()).unwrap();
+    iter.seek_to_first().await.unwrap();
 
     let mut values = Vec::new();
     while iter.valid() {
         values.push(iter.value().to_vec());
-        tisql::io::block_on_sync(iter.advance()).unwrap();
+        iter.advance().await.unwrap();
     }
 
     // All 3 versions should be preserved: v20, v10, v5 (in MVCC order)
@@ -476,8 +476,8 @@ fn test_executor_mvcc_ordering() {
 }
 
 /// Test compaction with tombstones.
-#[test]
-fn test_executor_tombstones() {
+#[tokio::test]
+async fn test_executor_tombstones() {
     let dir = TempDir::new().unwrap();
     let sst_dir = dir.path().join("sst");
     std::fs::create_dir_all(&sst_dir).unwrap();
@@ -514,32 +514,32 @@ fn test_executor_tombstones() {
     };
 
     let pre_allocated_ids = vec![3, 4];
-    let delta = tisql::io::block_on_sync(executor.execute(
-        &task,
-        &version,
-        &sst_dir,
-        &pre_allocated_ids,
-        IoService::new(32).unwrap(),
-        0, // gc_safe_point = 0 → no GC
-        false,
-        &HashMap::new(),
-    ))
-    .unwrap();
+    let delta = executor
+        .execute(
+            &task,
+            &version,
+            &sst_dir,
+            &pre_allocated_ids,
+            IoService::new(32).unwrap(),
+            0, // gc_safe_point = 0 → no GC
+            false,
+            &HashMap::new(),
+        )
+        .await
+        .unwrap();
 
     // Both versions should be in output (MVCC preserves all)
     let output_path = sst_dir.join(format!("{:08}.sst", delta.new_ssts[0].id));
-    let reader = tisql::io::block_on_sync(SstReaderRef::open(
-        &output_path,
-        IoService::new(32).unwrap(),
-    ))
-    .unwrap();
+    let reader = SstReaderRef::open(&output_path, IoService::new(32).unwrap())
+        .await
+        .unwrap();
     let mut iter = tisql::testkit::SstIterator::new(reader).unwrap();
-    tisql::io::block_on_sync(iter.seek_to_first()).unwrap();
+    iter.seek_to_first().await.unwrap();
 
     let mut entries = Vec::new();
     while iter.valid() {
         entries.push((iter.key().to_vec(), iter.value().to_vec()));
-        tisql::io::block_on_sync(iter.advance()).unwrap();
+        iter.advance().await.unwrap();
     }
 
     assert_eq!(entries.len(), 2, "Both versions should be preserved");
@@ -550,8 +550,8 @@ fn test_executor_tombstones() {
 // ============================================================================
 
 /// Test that multiple flushes followed by manual compaction produce correct results.
-#[test]
-fn test_flush_and_compaction_e2e() {
+#[tokio::test]
+async fn test_flush_and_compaction_e2e() {
     let dir = TempDir::new().unwrap();
     let (engine, _ilog) = create_durable_engine(&dir);
 
@@ -577,7 +577,7 @@ fn test_flush_and_compaction_e2e() {
     // Verify latest values
     for i in 0..10 {
         let key = format!("key_{i:03}");
-        let value = get_for_test(&engine, key.as_bytes());
+        let value = get_for_test(&engine, key.as_bytes()).await;
         assert_eq!(
             value,
             Some(b"batch_4".to_vec()),
@@ -586,7 +586,7 @@ fn test_flush_and_compaction_e2e() {
     }
 
     // Verify historical values
-    let value_at_15 = get_at_for_test(&engine, b"key_000", 15);
+    let value_at_15 = get_at_for_test(&engine, b"key_000", 15).await;
     assert_eq!(
         value_at_15,
         Some(b"batch_1".to_vec()),
@@ -595,8 +595,8 @@ fn test_flush_and_compaction_e2e() {
 }
 
 /// Test that interleaved writes and flushes maintain consistency.
-#[test]
-fn test_interleaved_writes_flushes() {
+#[tokio::test]
+async fn test_interleaved_writes_flushes() {
     let dir = TempDir::new().unwrap();
     let (engine, _ilog) = create_durable_engine(&dir);
 
@@ -626,7 +626,7 @@ fn test_interleaved_writes_flushes() {
     // Verify all keys exist with latest values
     for round in 0..10 {
         let key = format!("inter_key_{round}");
-        let value = get_for_test(&engine, key.as_bytes());
+        let value = get_for_test(&engine, key.as_bytes()).await;
         assert!(
             value.is_some(),
             "Key {key} should exist after interleaved operations"
@@ -635,8 +635,8 @@ fn test_interleaved_writes_flushes() {
 }
 
 /// Test scan correctness across memtable and SST.
-#[test]
-fn test_scan_across_memtable_and_sst() {
+#[tokio::test]
+async fn test_scan_across_memtable_and_sst() {
     let dir = TempDir::new().unwrap();
     let (engine, _ilog) = create_durable_engine(&dir);
 
@@ -657,7 +657,7 @@ fn test_scan_across_memtable_and_sst() {
 
     // Scan should merge both sources
     let range = b"a".to_vec()..b"g".to_vec();
-    let results = scan_for_test(&engine, &range);
+    let results = scan_for_test(&engine, &range).await;
 
     assert_eq!(results.len(), 6, "Should have 6 keys total");
 
@@ -685,8 +685,8 @@ fn test_scan_across_memtable_and_sst() {
 }
 
 /// Test that overwrites in memtable shadow SST values.
-#[test]
-fn test_memtable_shadows_sst() {
+#[tokio::test]
+async fn test_memtable_shadows_sst() {
     let dir = TempDir::new().unwrap();
     let (engine, _ilog) = create_durable_engine(&dir);
 
@@ -704,26 +704,26 @@ fn test_memtable_shadows_sst() {
 
     // key1 should return updated value (memtable shadows SST)
     assert_eq!(
-        get_for_test(&engine, b"key1"),
+        get_for_test(&engine, b"key1").await,
         Some(b"updated".to_vec()),
         "Memtable value should shadow SST"
     );
 
     // key2 should return original value (still in SST)
     assert_eq!(
-        get_for_test(&engine, b"key2"),
+        get_for_test(&engine, b"key2").await,
         Some(b"original".to_vec()),
         "Unchanged key should return SST value"
     );
 
     // Historical read should return correct versions
     assert_eq!(
-        get_at_for_test(&engine, b"key1", 15),
+        get_at_for_test(&engine, b"key1", 15).await,
         Some(b"original".to_vec()),
         "Historical read at ts=15 should return original"
     );
     assert_eq!(
-        get_at_for_test(&engine, b"key1", 25),
+        get_at_for_test(&engine, b"key1", 25).await,
         Some(b"updated".to_vec()),
         "Historical read at ts=25 should return updated"
     );
@@ -734,8 +734,8 @@ fn test_memtable_shadows_sst() {
 /// Note: When value is in SST and delete is in memtable, MVCC query at ts=MAX
 /// finds the newer delete first if properly ordered. This tests that scenario
 /// by flushing after the delete so both versions are in SST for consistent ordering.
-#[test]
-fn test_delete_shadows_sst() {
+#[tokio::test]
+async fn test_delete_shadows_sst() {
     let dir = TempDir::new().unwrap();
     let (engine, _ilog) = create_durable_engine(&dir);
 
@@ -753,21 +753,21 @@ fn test_delete_shadows_sst() {
 
     // Get should return None (deleted)
     assert_eq!(
-        get_for_test(&engine, b"to_delete"),
+        get_for_test(&engine, b"to_delete").await,
         None,
         "Deleted key should return None"
     );
 
     // Historical read should work
     assert_eq!(
-        get_at_for_test(&engine, b"to_delete", 15),
+        get_at_for_test(&engine, b"to_delete", 15).await,
         Some(b"exists".to_vec()),
         "Historical read before delete should return value"
     );
 
     // Scan should exclude deleted key
     let range = b"t".to_vec()..b"u".to_vec();
-    let results = scan_for_test(&engine, &range);
+    let results = scan_for_test(&engine, &range).await;
     assert!(results.is_empty(), "Scan should exclude deleted keys");
 }
 
@@ -776,8 +776,8 @@ fn test_delete_shadows_sst() {
 // ============================================================================
 
 /// Test version builder creates correct level structure.
-#[test]
-fn test_version_builder_levels() {
+#[tokio::test]
+async fn test_version_builder_levels() {
     let version = Version::builder()
         .add_sst(make_sst(1, 0, b"a", b"z"))
         .add_sst(make_sst(2, 0, b"b", b"y"))
@@ -793,8 +793,8 @@ fn test_version_builder_levels() {
 }
 
 /// Test version applies delta correctly.
-#[test]
-fn test_version_apply_delta() {
+#[tokio::test]
+async fn test_version_apply_delta() {
     let version = Version::builder()
         .add_sst(make_sst(1, 0, b"a", b"z"))
         .add_sst(make_sst(2, 0, b"b", b"y"))
@@ -815,8 +815,8 @@ fn test_version_apply_delta() {
 }
 
 /// Test find_overlapping_at_level finds correct files.
-#[test]
-fn test_version_find_overlapping() {
+#[tokio::test]
+async fn test_version_find_overlapping() {
     let version = Version::builder()
         .add_sst(make_sst(1, 1, b"a", b"f"))
         .add_sst(make_sst(2, 1, b"g", b"l"))
@@ -841,8 +841,8 @@ fn test_version_find_overlapping() {
 // ============================================================================
 
 /// Test manifest delta for flush operation.
-#[test]
-fn test_manifest_delta_flush() {
+#[tokio::test]
+async fn test_manifest_delta_flush() {
     let sst = make_sst(1, 0, b"a", b"z");
     let delta = ManifestDelta::flush(sst.clone(), 100);
 
@@ -853,8 +853,8 @@ fn test_manifest_delta_flush() {
 }
 
 /// Test manifest delta for compaction operation.
-#[test]
-fn test_manifest_delta_compaction() {
+#[tokio::test]
+async fn test_manifest_delta_compaction() {
     let outputs = vec![make_sst(10, 1, b"a", b"z")];
     let inputs = vec![(0, 1), (0, 2), (1, 3)];
     let delta = ManifestDelta::compaction(outputs, inputs);
@@ -868,18 +868,18 @@ fn test_manifest_delta_compaction() {
 // ============================================================================
 
 /// Test do_compaction() returns false on a fresh engine with no data.
-#[test]
-fn test_do_compaction_no_work() {
+#[tokio::test]
+async fn test_do_compaction_no_work() {
     let dir = TempDir::new().unwrap();
     let (engine, _ilog) = create_durable_engine(&dir);
 
-    let result = tisql::io::block_on_sync(engine.do_compaction()).unwrap();
+    let result = engine.do_compaction().await.unwrap();
     assert!(!result, "Fresh engine should have nothing to compact");
 }
 
 /// Test do_compaction() L0 → L1 compaction end-to-end.
-#[test]
-fn test_do_compaction_l0_to_l1() {
+#[tokio::test]
+async fn test_do_compaction_l0_to_l1() {
     let dir = TempDir::new().unwrap();
     let (engine, _ilog) = create_durable_engine(&dir);
 
@@ -904,7 +904,7 @@ fn test_do_compaction_l0_to_l1() {
     );
 
     // Run compaction
-    let compacted = tisql::io::block_on_sync(engine.do_compaction()).unwrap();
+    let compacted = engine.do_compaction().await.unwrap();
     assert!(compacted, "Should have compacted L0 → L1");
 
     let stats_after = engine.stats();
@@ -917,7 +917,7 @@ fn test_do_compaction_l0_to_l1() {
     // Verify data is still readable after compaction
     for i in 0..5 {
         let key = format!("compaction_key_{i:03}");
-        let value = get_for_test(&engine, key.as_bytes());
+        let value = get_for_test(&engine, key.as_bytes()).await;
         assert!(
             value.is_some(),
             "Key {key} should be readable after compaction"
@@ -932,8 +932,8 @@ fn test_do_compaction_l0_to_l1() {
 }
 
 /// Test that do_compaction() deletes old SST files from the filesystem.
-#[test]
-fn test_do_compaction_deletes_old_ssts() {
+#[tokio::test]
+async fn test_do_compaction_deletes_old_ssts() {
     let dir = TempDir::new().unwrap();
     let (engine, _ilog) = create_durable_engine(&dir);
 
@@ -958,7 +958,7 @@ fn test_do_compaction_deletes_old_ssts() {
     assert!(count_before >= 4, "Should have L0 SST files");
 
     // Compact
-    let compacted = tisql::io::block_on_sync(engine.do_compaction()).unwrap();
+    let compacted = engine.do_compaction().await.unwrap();
     assert!(compacted, "Should have compacted");
 
     // Count SST files after compaction
@@ -1004,8 +1004,8 @@ fn test_do_compaction_deletes_old_ssts() {
 }
 
 /// Test that all MVCC versions survive compaction.
-#[test]
-fn test_do_compaction_preserves_mvcc_versions() {
+#[tokio::test]
+async fn test_do_compaction_preserves_mvcc_versions() {
     let dir = TempDir::new().unwrap();
     let (engine, _ilog) = create_durable_engine(&dir);
 
@@ -1024,7 +1024,7 @@ fn test_do_compaction_preserves_mvcc_versions() {
     // Verify historical reads before compaction
     for version_num in 0..6 {
         let ts = (version_num + 1) as Timestamp;
-        let value = get_at_for_test(&engine, b"mvcc_key", ts);
+        let value = get_at_for_test(&engine, b"mvcc_key", ts).await;
         assert_eq!(
             value,
             Some(format!("version_{version_num}").into_bytes()),
@@ -1033,13 +1033,13 @@ fn test_do_compaction_preserves_mvcc_versions() {
     }
 
     // Compact
-    let compacted = tisql::io::block_on_sync(engine.do_compaction()).unwrap();
+    let compacted = engine.do_compaction().await.unwrap();
     assert!(compacted, "Should compact");
 
     // Verify all historical versions still readable after compaction
     for version_num in 0..6 {
         let ts = (version_num + 1) as Timestamp;
-        let value = get_at_for_test(&engine, b"mvcc_key", ts);
+        let value = get_at_for_test(&engine, b"mvcc_key", ts).await;
         assert_eq!(
             value,
             Some(format!("version_{version_num}").into_bytes()),
@@ -1048,7 +1048,7 @@ fn test_do_compaction_preserves_mvcc_versions() {
     }
 
     // Latest version should still be correct
-    let latest = get_for_test(&engine, b"mvcc_key");
+    let latest = get_for_test(&engine, b"mvcc_key").await;
     assert_eq!(
         latest,
         Some(b"version_5".to_vec()),
@@ -1057,8 +1057,8 @@ fn test_do_compaction_preserves_mvcc_versions() {
 }
 
 /// Test that do_compaction() with ilog recovery works correctly.
-#[test]
-fn test_do_compaction_with_ilog_recovery() {
+#[tokio::test]
+async fn test_do_compaction_with_ilog_recovery() {
     let dir = TempDir::new().unwrap();
 
     // Phase 1: Write, flush, compact, then drop engine
@@ -1077,7 +1077,7 @@ fn test_do_compaction_with_ilog_recovery() {
         }
 
         // Compact
-        let compacted = tisql::io::block_on_sync(engine.do_compaction()).unwrap();
+        let compacted = engine.do_compaction().await.unwrap();
         assert!(compacted, "Should compact");
 
         // Write checkpoint to persist state
@@ -1101,17 +1101,15 @@ fn test_do_compaction_with_ilog_recovery() {
 
         let recovery =
             tisql::testkit::LsmRecovery::with_configs(lsm_config, clog_config, ilog_config);
-        let rt = tokio::runtime::Builder::new_current_thread()
-            .enable_all()
-            .build()
+        let result = recovery
+            .recover(&tokio::runtime::Handle::current())
             .unwrap();
-        let result = recovery.recover(rt.handle()).unwrap();
         let engine = result.engine;
 
         // Verify data survived recovery
         for i in 0..3 {
             let key = format!("recovery_key_{i:03}");
-            let value = get_for_test(&engine, key.as_bytes());
+            let value = get_for_test(&engine, key.as_bytes()).await;
             assert!(
                 value.is_some(),
                 "Key {key} should survive compaction + recovery"
@@ -1122,8 +1120,8 @@ fn test_do_compaction_with_ilog_recovery() {
 
 /// Test concurrent read during compaction: a reader holding an old SuperVersion
 /// should still be able to read data while compaction runs.
-#[test]
-fn test_compaction_concurrent_read() {
+#[tokio::test]
+async fn test_compaction_concurrent_read() {
     let dir = TempDir::new().unwrap();
     let (engine, _ilog) = create_durable_engine(&dir);
 
@@ -1143,7 +1141,7 @@ fn test_compaction_concurrent_read() {
     let sv_before = engine.get_super_version();
 
     // Run compaction
-    let compacted = tisql::io::block_on_sync(engine.do_compaction()).unwrap();
+    let compacted = engine.do_compaction().await.unwrap();
     assert!(compacted, "Should compact");
 
     // Old SuperVersion should still work for reading
@@ -1158,7 +1156,7 @@ fn test_compaction_concurrent_read() {
     // Data should be readable with the new version
     for i in 0..5 {
         let key = format!("concurrent_key_{i:03}");
-        let value = get_for_test(&engine, key.as_bytes());
+        let value = get_for_test(&engine, key.as_bytes()).await;
         assert!(
             value.is_some(),
             "Key {key} should be readable after compaction"
@@ -1167,8 +1165,8 @@ fn test_compaction_concurrent_read() {
 }
 
 /// Test L0 write backpressure: writes should be rejected when L0 count >= l0_stop_trigger.
-#[test]
-fn test_l0_write_backpressure() {
+#[tokio::test]
+async fn test_l0_write_backpressure() {
     let dir = TempDir::new().unwrap();
     let lsn_provider = new_lsn_provider();
     let ilog_config = IlogConfig::new(dir.path());
@@ -1225,8 +1223,8 @@ fn test_l0_write_backpressure() {
 // ============================================================================
 
 /// Test that CompactionScheduler automatically compacts after enough L0 files.
-#[test]
-fn test_compaction_scheduler_automatic() {
+#[tokio::test]
+async fn test_compaction_scheduler_automatic() {
     let dir = TempDir::new().unwrap();
     let lsn_provider = new_lsn_provider();
     let ilog_config = IlogConfig::new(dir.path());
@@ -1248,13 +1246,8 @@ fn test_compaction_scheduler_automatic() {
             .unwrap(),
     );
 
-    let rt = tokio::runtime::Builder::new_multi_thread()
-        .worker_threads(2)
-        .enable_all()
-        .build()
-        .unwrap();
     let scheduler = CompactionScheduler::new(Arc::clone(&engine));
-    scheduler.start(rt.handle());
+    scheduler.start(&tokio::runtime::Handle::current());
 
     // Write and flush enough data to create L0 files above compaction trigger
     for i in 0..20 {
@@ -1282,7 +1275,7 @@ fn test_compaction_scheduler_automatic() {
     // Verify data is still readable
     for i in 0..20 {
         let key = format!("auto_key_{i:04}");
-        let value = get_for_test(&engine, key.as_bytes());
+        let value = get_for_test(&engine, key.as_bytes()).await;
         assert!(
             value.is_some(),
             "Key {key} should be readable after auto-compaction"
@@ -1293,8 +1286,8 @@ fn test_compaction_scheduler_automatic() {
 }
 
 /// Test do_compaction handles delete + put correctly through compaction.
-#[test]
-fn test_do_compaction_delete_then_put() {
+#[tokio::test]
+async fn test_do_compaction_delete_then_put() {
     let dir = TempDir::new().unwrap();
     let (engine, _ilog) = create_durable_engine(&dir);
 
@@ -1325,11 +1318,11 @@ fn test_do_compaction_delete_then_put() {
     }
 
     // Compact
-    let compacted = tisql::io::block_on_sync(engine.do_compaction()).unwrap();
+    let compacted = engine.do_compaction().await.unwrap();
     assert!(compacted, "Should compact");
 
     // Latest read should see "resurrected"
-    let latest = get_for_test(&engine, b"del_put_key");
+    let latest = get_for_test(&engine, b"del_put_key").await;
     assert_eq!(
         latest,
         Some(b"resurrected".to_vec()),
@@ -1338,25 +1331,25 @@ fn test_do_compaction_delete_then_put() {
 
     // Historical reads
     assert_eq!(
-        get_at_for_test(&engine, b"del_put_key", 1),
+        get_at_for_test(&engine, b"del_put_key", 1).await,
         Some(b"initial".to_vec()),
         "ts=1 should see initial"
     );
     assert_eq!(
-        get_at_for_test(&engine, b"del_put_key", 2),
+        get_at_for_test(&engine, b"del_put_key", 2).await,
         None,
         "ts=2 should see deletion"
     );
     assert_eq!(
-        get_at_for_test(&engine, b"del_put_key", 3),
+        get_at_for_test(&engine, b"del_put_key", 3).await,
         Some(b"resurrected".to_vec()),
         "ts=3 should see resurrected"
     );
 }
 
 /// Test that repeated compaction works (compact, write more, compact again).
-#[test]
-fn test_repeated_compaction() {
+#[tokio::test]
+async fn test_repeated_compaction() {
     let dir = TempDir::new().unwrap();
     let (engine, _ilog) = create_durable_engine(&dir);
 
@@ -1372,7 +1365,7 @@ fn test_repeated_compaction() {
         engine.flush_all_with_active().unwrap();
     }
 
-    let compacted = tisql::io::block_on_sync(engine.do_compaction()).unwrap();
+    let compacted = engine.do_compaction().await.unwrap();
     assert!(compacted, "Round 1 should compact");
 
     // Round 2: Write more, flush, compact again
@@ -1387,7 +1380,7 @@ fn test_repeated_compaction() {
         engine.flush_all_with_active().unwrap();
     }
 
-    let compacted = tisql::io::block_on_sync(engine.do_compaction()).unwrap();
+    let compacted = engine.do_compaction().await.unwrap();
     assert!(compacted, "Round 2 should compact");
 
     // Verify data from both rounds
@@ -1395,19 +1388,19 @@ fn test_repeated_compaction() {
         let key1 = format!("round1_key_{batch_num}");
         let key2 = format!("round2_key_{batch_num}");
         assert!(
-            get_for_test(&engine, key1.as_bytes()).is_some(),
+            get_for_test(&engine, key1.as_bytes()).await.is_some(),
             "Round 1 key {key1} should survive"
         );
         assert!(
-            get_for_test(&engine, key2.as_bytes()).is_some(),
+            get_for_test(&engine, key2.as_bytes()).await.is_some(),
             "Round 2 key {key2} should survive"
         );
     }
 }
 
 /// Test that scan works correctly after compaction.
-#[test]
-fn test_scan_after_compaction() {
+#[tokio::test]
+async fn test_scan_after_compaction() {
     let dir = TempDir::new().unwrap();
     let (engine, _ilog) = create_durable_engine(&dir);
 
@@ -1427,12 +1420,12 @@ fn test_scan_after_compaction() {
     engine.flush_all_with_active().unwrap();
 
     // Compact
-    let compacted = tisql::io::block_on_sync(engine.do_compaction()).unwrap();
+    let compacted = engine.do_compaction().await.unwrap();
     assert!(compacted, "Should compact");
 
     // Full range scan
     let range = b"a".to_vec()..b"k".to_vec();
-    let results = scan_for_test(&engine, &range);
+    let results = scan_for_test(&engine, &range).await;
     assert_eq!(
         results.len(),
         10,
@@ -1441,7 +1434,7 @@ fn test_scan_after_compaction() {
 
     // Partial range scan
     let range = b"c".to_vec()..b"g".to_vec();
-    let results = scan_for_test(&engine, &range);
+    let results = scan_for_test(&engine, &range).await;
     assert_eq!(results.len(), 4, "Should find c,d,e,f");
     let result_keys: Vec<_> = results.iter().map(|(k, _)| k.as_slice()).collect();
     assert_eq!(
@@ -1459,8 +1452,8 @@ fn test_scan_after_compaction() {
 
 /// End-to-end test: writes get stall errors, retry with flush scheduler draining,
 /// and all data is eventually written and readable.
-#[test]
-fn test_write_stall_e2e() {
+#[tokio::test]
+async fn test_write_stall_e2e() {
     let tmp = TempDir::new().unwrap();
     let lsn_provider = new_lsn_provider();
     let ilog_config = IlogConfig::new(tmp.path());
@@ -1480,19 +1473,14 @@ fn test_write_stall_e2e() {
     );
 
     // Start flush scheduler so frozen memtables get drained
-    let rt = tokio::runtime::Builder::new_multi_thread()
-        .worker_threads(2)
-        .enable_all()
-        .build()
-        .unwrap();
     let scheduler = FlushScheduler::new(Arc::clone(&engine));
-    scheduler.start(rt.handle());
+    scheduler.start(&tokio::runtime::Handle::current());
 
-    // Spawn 4 writer threads, each writing 50 entries with retry on stall
+    // Spawn 4 writer tasks, each writing 50 entries with retry on stall
     let mut handles = vec![];
     for t in 0..4u64 {
         let eng = Arc::clone(&engine);
-        let handle = std::thread::spawn(move || {
+        let handle = tokio::spawn(async move {
             for i in 0..50u64 {
                 let ts = t * 1000 + i + 1;
                 let key = format!("t{t}_key_{i:04}");
@@ -1505,7 +1493,7 @@ fn test_write_stall_e2e() {
                     match eng.write_batch(batch) {
                         Ok(()) => break,
                         Err(e) if e.to_string().contains("frozen memtables") => {
-                            std::thread::sleep(Duration::from_millis(1));
+                            tokio::time::sleep(Duration::from_millis(1)).await;
                         }
                         Err(e) => panic!("Unexpected error: {e}"),
                     }
@@ -1517,7 +1505,7 @@ fn test_write_stall_e2e() {
 
     // Wait for all writers
     for h in handles {
-        h.join().unwrap();
+        h.await.unwrap();
     }
 
     // Flush remaining frozen + active
@@ -1528,7 +1516,7 @@ fn test_write_stall_e2e() {
     for t in 0..4u64 {
         for i in 0..50u64 {
             let key = format!("t{t}_key_{i:04}");
-            let val = tisql::io::block_on_sync(engine.get(key.as_bytes())).unwrap();
+            let val = engine.get(key.as_bytes()).await.unwrap();
             assert!(
                 val.is_some(),
                 "Key {key} missing after write stall e2e test"
@@ -1554,8 +1542,8 @@ fn mvcc_key(user_key: &[u8], ts: u64) -> Vec<u8> {
 }
 
 /// Test: gc_safe_point=0 (default) preserves all versions — no GC.
-#[test]
-fn test_gc_safe_point_zero_no_gc() {
+#[tokio::test]
+async fn test_gc_safe_point_zero_no_gc() {
     let dir = TempDir::new().unwrap();
     let sst_dir = dir.path().join("sst");
     std::fs::create_dir_all(&sst_dir).unwrap();
@@ -1583,39 +1571,39 @@ fn test_gc_safe_point_zero_no_gc() {
     };
 
     let pre_allocated_ids = vec![2, 3];
-    let delta = tisql::io::block_on_sync(executor.execute(
-        &task,
-        &version,
-        &sst_dir,
-        &pre_allocated_ids,
-        IoService::new(32).unwrap(),
-        0, // gc_safe_point = 0 → no GC
-        true,
-        &HashMap::new(),
-    ))
-    .unwrap();
+    let delta = executor
+        .execute(
+            &task,
+            &version,
+            &sst_dir,
+            &pre_allocated_ids,
+            IoService::new(32).unwrap(),
+            0, // gc_safe_point = 0 → no GC
+            true,
+            &HashMap::new(),
+        )
+        .await
+        .unwrap();
 
     // Read output and count entries — all 3 should be preserved
     let output_path = sst_dir.join(format!("{:08}.sst", delta.new_ssts[0].id));
-    let reader = tisql::io::block_on_sync(SstReaderRef::open(
-        &output_path,
-        IoService::new(32).unwrap(),
-    ))
-    .unwrap();
+    let reader = SstReaderRef::open(&output_path, IoService::new(32).unwrap())
+        .await
+        .unwrap();
     let mut iter = tisql::testkit::SstIterator::new(reader).unwrap();
-    tisql::io::block_on_sync(iter.seek_to_first()).unwrap();
+    iter.seek_to_first().await.unwrap();
 
     let mut count = 0;
     while iter.valid() {
         count += 1;
-        tisql::io::block_on_sync(iter.advance()).unwrap();
+        iter.advance().await.unwrap();
     }
     assert_eq!(count, 3, "gc_safe_point=0 should preserve all 3 versions");
 }
 
 /// Test: versions below GC barrier are dropped, barrier + above kept.
-#[test]
-fn test_gc_drops_old_versions() {
+#[tokio::test]
+async fn test_gc_drops_old_versions() {
     let dir = TempDir::new().unwrap();
     let sst_dir = dir.path().join("sst");
     std::fs::create_dir_all(&sst_dir).unwrap();
@@ -1644,32 +1632,32 @@ fn test_gc_drops_old_versions() {
 
     // gc_safe_point=25: ts=30 is above, ts=20 is the GC barrier (keep), ts=10 is below (drop)
     let pre_allocated_ids = vec![2, 3];
-    let delta = tisql::io::block_on_sync(executor.execute(
-        &task,
-        &version,
-        &sst_dir,
-        &pre_allocated_ids,
-        IoService::new(32).unwrap(),
-        25, // gc_safe_point = 25
-        true,
-        &HashMap::new(),
-    ))
-    .unwrap();
+    let delta = executor
+        .execute(
+            &task,
+            &version,
+            &sst_dir,
+            &pre_allocated_ids,
+            IoService::new(32).unwrap(),
+            25, // gc_safe_point = 25
+            true,
+            &HashMap::new(),
+        )
+        .await
+        .unwrap();
 
     // Read output
     let output_path = sst_dir.join(format!("{:08}.sst", delta.new_ssts[0].id));
-    let reader = tisql::io::block_on_sync(SstReaderRef::open(
-        &output_path,
-        IoService::new(32).unwrap(),
-    ))
-    .unwrap();
+    let reader = SstReaderRef::open(&output_path, IoService::new(32).unwrap())
+        .await
+        .unwrap();
     let mut iter = tisql::testkit::SstIterator::new(reader).unwrap();
-    tisql::io::block_on_sync(iter.seek_to_first()).unwrap();
+    iter.seek_to_first().await.unwrap();
 
     let mut values = Vec::new();
     while iter.valid() {
         values.push(iter.value().to_vec());
-        tisql::io::block_on_sync(iter.advance()).unwrap();
+        iter.advance().await.unwrap();
     }
 
     // ts=30 (above safe point) + ts=20 (GC barrier) → keep 2, drop ts=10
@@ -1679,8 +1667,8 @@ fn test_gc_drops_old_versions() {
 }
 
 /// Test: tombstone at bottommost level drops itself and all older versions.
-#[test]
-fn test_gc_tombstone_at_bottommost() {
+#[tokio::test]
+async fn test_gc_tombstone_at_bottommost() {
     let dir = TempDir::new().unwrap();
     let sst_dir = dir.path().join("sst");
     std::fs::create_dir_all(&sst_dir).unwrap();
@@ -1710,31 +1698,31 @@ fn test_gc_tombstone_at_bottommost() {
 
     // gc_safe_point=25: ts=30 above, ts=20 is barrier tombstone at bottommost → drop + skip ts=10
     let pre_allocated_ids = vec![2, 3];
-    let delta = tisql::io::block_on_sync(executor.execute(
-        &task,
-        &version,
-        &sst_dir,
-        &pre_allocated_ids,
-        IoService::new(32).unwrap(),
-        25,
-        true, // is_bottommost
-        &HashMap::new(),
-    ))
-    .unwrap();
+    let delta = executor
+        .execute(
+            &task,
+            &version,
+            &sst_dir,
+            &pre_allocated_ids,
+            IoService::new(32).unwrap(),
+            25,
+            true, // is_bottommost
+            &HashMap::new(),
+        )
+        .await
+        .unwrap();
 
     let output_path = sst_dir.join(format!("{:08}.sst", delta.new_ssts[0].id));
-    let reader = tisql::io::block_on_sync(SstReaderRef::open(
-        &output_path,
-        IoService::new(32).unwrap(),
-    ))
-    .unwrap();
+    let reader = SstReaderRef::open(&output_path, IoService::new(32).unwrap())
+        .await
+        .unwrap();
     let mut iter = tisql::testkit::SstIterator::new(reader).unwrap();
-    tisql::io::block_on_sync(iter.seek_to_first()).unwrap();
+    iter.seek_to_first().await.unwrap();
 
     let mut values = Vec::new();
     while iter.valid() {
         values.push(iter.value().to_vec());
-        tisql::io::block_on_sync(iter.advance()).unwrap();
+        iter.advance().await.unwrap();
     }
 
     // Only ts=30 should survive: tombstone at barrier + bottommost → dropped, ts=10 also dropped
@@ -1747,8 +1735,8 @@ fn test_gc_tombstone_at_bottommost() {
 }
 
 /// Test: tombstone at non-bottommost level is preserved (masks data at lower levels).
-#[test]
-fn test_gc_tombstone_not_bottommost() {
+#[tokio::test]
+async fn test_gc_tombstone_not_bottommost() {
     let dir = TempDir::new().unwrap();
     let sst_dir = dir.path().join("sst");
     std::fs::create_dir_all(&sst_dir).unwrap();
@@ -1777,31 +1765,31 @@ fn test_gc_tombstone_not_bottommost() {
 
     // Same gc_safe_point=25, but NOT bottommost → tombstone preserved
     let pre_allocated_ids = vec![2, 3];
-    let delta = tisql::io::block_on_sync(executor.execute(
-        &task,
-        &version,
-        &sst_dir,
-        &pre_allocated_ids,
-        IoService::new(32).unwrap(),
-        25,
-        false, // NOT bottommost
-        &HashMap::new(),
-    ))
-    .unwrap();
+    let delta = executor
+        .execute(
+            &task,
+            &version,
+            &sst_dir,
+            &pre_allocated_ids,
+            IoService::new(32).unwrap(),
+            25,
+            false, // NOT bottommost
+            &HashMap::new(),
+        )
+        .await
+        .unwrap();
 
     let output_path = sst_dir.join(format!("{:08}.sst", delta.new_ssts[0].id));
-    let reader = tisql::io::block_on_sync(SstReaderRef::open(
-        &output_path,
-        IoService::new(32).unwrap(),
-    ))
-    .unwrap();
+    let reader = SstReaderRef::open(&output_path, IoService::new(32).unwrap())
+        .await
+        .unwrap();
     let mut iter = tisql::testkit::SstIterator::new(reader).unwrap();
-    tisql::io::block_on_sync(iter.seek_to_first()).unwrap();
+    iter.seek_to_first().await.unwrap();
 
     let mut values = Vec::new();
     while iter.valid() {
         values.push(iter.value().to_vec());
-        tisql::io::block_on_sync(iter.advance()).unwrap();
+        iter.advance().await.unwrap();
     }
 
     // ts=30 (above) + ts=20 tombstone (barrier, not bottommost → keep) = 2 entries
@@ -1816,8 +1804,8 @@ fn test_gc_tombstone_not_bottommost() {
 }
 
 /// Test: multiple keys with different version patterns in one compaction.
-#[test]
-fn test_gc_mixed_keys() {
+#[tokio::test]
+async fn test_gc_mixed_keys() {
     let dir = TempDir::new().unwrap();
     let sst_dir = dir.path().join("sst");
     std::fs::create_dir_all(&sst_dir).unwrap();
@@ -1855,31 +1843,31 @@ fn test_gc_mixed_keys() {
 
     // gc_safe_point=25, bottommost
     let pre_allocated_ids = vec![2, 3];
-    let delta = tisql::io::block_on_sync(executor.execute(
-        &task,
-        &version,
-        &sst_dir,
-        &pre_allocated_ids,
-        IoService::new(32).unwrap(),
-        25,
-        true, // bottommost
-        &HashMap::new(),
-    ))
-    .unwrap();
+    let delta = executor
+        .execute(
+            &task,
+            &version,
+            &sst_dir,
+            &pre_allocated_ids,
+            IoService::new(32).unwrap(),
+            25,
+            true, // bottommost
+            &HashMap::new(),
+        )
+        .await
+        .unwrap();
 
     let output_path = sst_dir.join(format!("{:08}.sst", delta.new_ssts[0].id));
-    let reader = tisql::io::block_on_sync(SstReaderRef::open(
-        &output_path,
-        IoService::new(32).unwrap(),
-    ))
-    .unwrap();
+    let reader = SstReaderRef::open(&output_path, IoService::new(32).unwrap())
+        .await
+        .unwrap();
     let mut iter = tisql::testkit::SstIterator::new(reader).unwrap();
-    tisql::io::block_on_sync(iter.seek_to_first()).unwrap();
+    iter.seek_to_first().await.unwrap();
 
     let mut entries = Vec::new();
     while iter.valid() {
         entries.push((iter.key().to_vec(), iter.value().to_vec()));
-        tisql::io::block_on_sync(iter.advance()).unwrap();
+        iter.advance().await.unwrap();
     }
 
     // Expected:
@@ -1914,8 +1902,8 @@ fn test_gc_mixed_keys() {
 }
 
 /// Test: `get_at()` returns correct values at all timestamps after GC compaction.
-#[test]
-fn test_gc_preserves_read_correctness() {
+#[tokio::test]
+async fn test_gc_preserves_read_correctness() {
     let dir = TempDir::new().unwrap();
     let (engine, _ilog) = create_durable_engine(&dir);
 
@@ -1936,12 +1924,12 @@ fn test_gc_preserves_read_correctness() {
     engine.set_gc_safe_point(3);
 
     // Compact
-    let compacted = tisql::io::block_on_sync(engine.do_compaction()).unwrap();
+    let compacted = engine.do_compaction().await.unwrap();
     assert!(compacted, "Should compact");
 
     // Versions above safe point should still be readable
     for ts in 3..=6 {
-        let value = get_at_for_test(&engine, b"gc_key", ts as Timestamp);
+        let value = get_at_for_test(&engine, b"gc_key", ts as Timestamp).await;
         assert!(
             value.is_some(),
             "Version at ts={ts} should survive GC (>= safe_point)"
@@ -1949,7 +1937,7 @@ fn test_gc_preserves_read_correctness() {
     }
 
     // Latest version should still be correct
-    let latest = get_for_test(&engine, b"gc_key");
+    let latest = get_for_test(&engine, b"gc_key").await;
     assert_eq!(
         latest,
         Some(b"version_5".to_vec()),
@@ -1958,8 +1946,8 @@ fn test_gc_preserves_read_correctness() {
 }
 
 /// Test: data flows to L2+ via cascading compaction, all keys survive.
-#[test]
-fn test_multi_level_cascading() {
+#[tokio::test]
+async fn test_multi_level_cascading() {
     let dir = TempDir::new().unwrap();
     let lsn_provider = new_lsn_provider();
     let ilog_config = IlogConfig::new(dir.path());
@@ -2000,7 +1988,7 @@ fn test_multi_level_cascading() {
     // Run multiple rounds of compaction until no more work
     let mut total_compactions = 0;
     loop {
-        match tisql::io::block_on_sync(engine.do_compaction()) {
+        match engine.do_compaction().await {
             Ok(true) => total_compactions += 1,
             Ok(false) => break,
             Err(e) => panic!("Compaction error: {e}"),
@@ -2014,7 +2002,7 @@ fn test_multi_level_cascading() {
     // Verify all keys are readable with their latest values
     for i in 0..10 {
         let key = format!("cascade_key_{i:03}");
-        let value = get_for_test(&engine, key.as_bytes());
+        let value = get_for_test(&engine, key.as_bytes()).await;
         assert!(
             value.is_some(),
             "Key {key} should survive cascading compaction"
@@ -2044,8 +2032,8 @@ fn table_record_key(table_id: u64, handle: i64) -> Vec<u8> {
 }
 
 /// Test: compaction with dropped table filters out all versions of keys belonging to that table.
-#[test]
-fn test_gc_dropped_table_filters_all_versions() {
+#[tokio::test]
+async fn test_gc_dropped_table_filters_all_versions() {
     let dir = TempDir::new().unwrap();
     let sst_dir = dir.path().join("sst");
     std::fs::create_dir_all(&sst_dir).unwrap();
@@ -2107,32 +2095,32 @@ fn test_gc_dropped_table_filters_all_versions() {
     dropped_tables.insert(1000u64, 15u64);
 
     let pre_allocated_ids = vec![2, 3];
-    let delta = tisql::io::block_on_sync(executor.execute(
-        &task,
-        &version,
-        &sst_dir,
-        &pre_allocated_ids,
-        IoService::new(32).unwrap(),
-        20, // gc_safe_point = 20
-        true,
-        &dropped_tables,
-    ))
-    .unwrap();
+    let delta = executor
+        .execute(
+            &task,
+            &version,
+            &sst_dir,
+            &pre_allocated_ids,
+            IoService::new(32).unwrap(),
+            20, // gc_safe_point = 20
+            true,
+            &dropped_tables,
+        )
+        .await
+        .unwrap();
 
     // Read output SST
     let output_path = sst_dir.join(format!("{:08}.sst", delta.new_ssts[0].id));
-    let reader = tisql::io::block_on_sync(SstReaderRef::open(
-        &output_path,
-        IoService::new(32).unwrap(),
-    ))
-    .unwrap();
+    let reader = SstReaderRef::open(&output_path, IoService::new(32).unwrap())
+        .await
+        .unwrap();
     let mut iter = tisql::testkit::SstIterator::new(reader).unwrap();
-    tisql::io::block_on_sync(iter.seek_to_first()).unwrap();
+    iter.seek_to_first().await.unwrap();
 
     let mut entries = Vec::new();
     while iter.valid() {
         entries.push((iter.key().to_vec(), iter.value().to_vec()));
-        tisql::io::block_on_sync(iter.advance()).unwrap();
+        iter.advance().await.unwrap();
     }
 
     // Table 1000 should be completely filtered out (3 entries removed)
@@ -2151,8 +2139,8 @@ fn test_gc_dropped_table_filters_all_versions() {
 
 /// Test: dropped table GC respects gc_safe_point — if drop_ts > gc_safe_point,
 /// the table data is NOT filtered.
-#[test]
-fn test_gc_dropped_table_respects_safe_point() {
+#[tokio::test]
+async fn test_gc_dropped_table_respects_safe_point() {
     let dir = TempDir::new().unwrap();
     let sst_dir = dir.path().join("sst");
     std::fs::create_dir_all(&sst_dir).unwrap();
@@ -2186,32 +2174,32 @@ fn test_gc_dropped_table_respects_safe_point() {
     dropped_tables.insert(2000u64, 30u64);
 
     let pre_allocated_ids = vec![2, 3];
-    let delta = tisql::io::block_on_sync(executor.execute(
-        &task,
-        &version,
-        &sst_dir,
-        &pre_allocated_ids,
-        IoService::new(32).unwrap(),
-        20, // gc_safe_point = 20
-        true,
-        &dropped_tables,
-    ))
-    .unwrap();
+    let delta = executor
+        .execute(
+            &task,
+            &version,
+            &sst_dir,
+            &pre_allocated_ids,
+            IoService::new(32).unwrap(),
+            20, // gc_safe_point = 20
+            true,
+            &dropped_tables,
+        )
+        .await
+        .unwrap();
 
     // Read output
     let output_path = sst_dir.join(format!("{:08}.sst", delta.new_ssts[0].id));
-    let reader = tisql::io::block_on_sync(SstReaderRef::open(
-        &output_path,
-        IoService::new(32).unwrap(),
-    ))
-    .unwrap();
+    let reader = SstReaderRef::open(&output_path, IoService::new(32).unwrap())
+        .await
+        .unwrap();
     let mut iter = tisql::testkit::SstIterator::new(reader).unwrap();
-    tisql::io::block_on_sync(iter.seek_to_first()).unwrap();
+    iter.seek_to_first().await.unwrap();
 
     let mut count = 0;
     while iter.valid() {
         count += 1;
-        tisql::io::block_on_sync(iter.advance()).unwrap();
+        iter.advance().await.unwrap();
     }
 
     // Table drop_ts (30) > gc_safe_point (20), so normal MVCC GC applies:
@@ -2223,8 +2211,8 @@ fn test_gc_dropped_table_respects_safe_point() {
 }
 
 /// Test: with gc_safe_point=0 (no GC), dropped table data is preserved.
-#[test]
-fn test_gc_dropped_table_no_gc_when_safe_point_zero() {
+#[tokio::test]
+async fn test_gc_dropped_table_no_gc_when_safe_point_zero() {
     let dir = TempDir::new().unwrap();
     let sst_dir = dir.path().join("sst");
     std::fs::create_dir_all(&sst_dir).unwrap();
@@ -2257,32 +2245,32 @@ fn test_gc_dropped_table_no_gc_when_safe_point_zero() {
     dropped_tables.insert(3000u64, 8u64);
 
     let pre_allocated_ids = vec![2, 3];
-    let delta = tisql::io::block_on_sync(executor.execute(
-        &task,
-        &version,
-        &sst_dir,
-        &pre_allocated_ids,
-        IoService::new(32).unwrap(),
-        0, // gc_safe_point = 0 (no GC)
-        true,
-        &dropped_tables,
-    ))
-    .unwrap();
+    let delta = executor
+        .execute(
+            &task,
+            &version,
+            &sst_dir,
+            &pre_allocated_ids,
+            IoService::new(32).unwrap(),
+            0, // gc_safe_point = 0 (no GC)
+            true,
+            &dropped_tables,
+        )
+        .await
+        .unwrap();
 
     // Read output
     let output_path = sst_dir.join(format!("{:08}.sst", delta.new_ssts[0].id));
-    let reader = tisql::io::block_on_sync(SstReaderRef::open(
-        &output_path,
-        IoService::new(32).unwrap(),
-    ))
-    .unwrap();
+    let reader = SstReaderRef::open(&output_path, IoService::new(32).unwrap())
+        .await
+        .unwrap();
     let mut iter = tisql::testkit::SstIterator::new(reader).unwrap();
-    tisql::io::block_on_sync(iter.seek_to_first()).unwrap();
+    iter.seek_to_first().await.unwrap();
 
     let mut count = 0;
     while iter.valid() {
         count += 1;
-        tisql::io::block_on_sync(iter.advance()).unwrap();
+        iter.advance().await.unwrap();
     }
 
     // gc_safe_point=0 means no GC at all — all versions preserved

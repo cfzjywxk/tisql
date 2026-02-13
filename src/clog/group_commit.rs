@@ -46,7 +46,7 @@ struct GroupCommitRequest {
 /// Group commit writer that batches fsync operations.
 ///
 /// Callers submit serialized records via `submit()` which returns a
-/// `tokio::sync::oneshot::Receiver`. The caller either `.await`s it (async)
+/// `tokio::sync::oneshot::Receiver`. The caller `.await`s it (async)
 /// or uses `block_on_sync()` (sync). A blocking task on the I/O runtime's
 /// thread pool collects pending records, writes them in one batch, then
 /// notifies all callers.
@@ -95,8 +95,7 @@ impl GroupCommitWriter {
     /// Submit a serialized record for writing, optionally with fsync.
     ///
     /// Returns a `tokio::sync::oneshot::Receiver` that resolves when the write
-    /// (+ optional fsync) is complete. The caller `.await`s or uses `block_on_sync()`
-    /// to wait for the result.
+    /// (+ optional fsync) is complete. The caller `.await`s the result.
     pub fn submit(
         &self,
         data: Vec<u8>,
@@ -223,7 +222,7 @@ mod tests {
         let gc = GroupCommitWriter::new_with_thread(writer);
 
         let rx = gc.submit(b"hello".to_vec(), true).unwrap();
-        crate::io::block_on_sync(rx).unwrap().unwrap();
+        rx.await.unwrap().unwrap();
         drop(gc);
 
         let content = std::fs::read(tmp.path()).unwrap();
@@ -237,7 +236,7 @@ mod tests {
 
         for data in [b"aaa".as_slice(), b"bbb", b"ccc"] {
             let rx = gc.submit(data.to_vec(), true).unwrap();
-            crate::io::block_on_sync(rx).unwrap().unwrap();
+            rx.await.unwrap().unwrap();
         }
         drop(gc);
 
@@ -253,10 +252,10 @@ mod tests {
         let mut handles = vec![];
         for i in 0..10 {
             let w = Arc::clone(&gc);
-            handles.push(tokio::task::spawn_blocking(move || {
+            handles.push(tokio::spawn(async move {
                 let data = format!("{i:02}");
                 let rx = w.submit(data.into_bytes(), true).unwrap();
-                crate::io::block_on_sync(rx).unwrap().unwrap();
+                rx.await.unwrap().unwrap();
             }));
         }
 
@@ -283,7 +282,7 @@ mod tests {
         let gc = GroupCommitWriter::new_with_thread(writer);
 
         let rx = gc.submit(b"data".to_vec(), false).unwrap();
-        crate::io::block_on_sync(rx).unwrap().unwrap();
+        rx.await.unwrap().unwrap();
         drop(gc);
 
         let content = std::fs::read(tmp.path()).unwrap();
@@ -307,15 +306,15 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_group_commit_mixed_sync_async() {
+    async fn test_group_commit_mixed_async() {
         let (writer, tmp) = make_writer();
         let gc = Arc::new(GroupCommitWriter::new_with_thread(writer));
 
-        // Sync-style write via block_on_sync
+        // First async write via .await
         let rx = gc.submit(b"sync".to_vec(), true).unwrap();
-        crate::io::block_on_sync(rx).unwrap().unwrap();
+        rx.await.unwrap().unwrap();
 
-        // Async-style write via .await
+        // Second async write via .await
         let rx = gc.submit(b"_async".to_vec(), true).unwrap();
         rx.await.unwrap().unwrap();
 

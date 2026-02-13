@@ -304,7 +304,7 @@ pub trait TxnService: Send + Sync {
     /// Reads from storage at `start_ts`, returning the latest visible version.
     /// Returns `None` if the key doesn't exist or was deleted.
     /// Sees own pending writes (read-your-writes).
-    fn get(&self, ctx: &TxnCtx, key: &[u8]) -> Result<Option<RawValue>>;
+    fn get<'a>(&'a self, ctx: &'a TxnCtx, key: &'a [u8]) -> impl Future<Output = Result<Option<RawValue>>> + Send + 'a;
 
     /// Scan a range of keys within the transaction (streaming).
     ///
@@ -317,22 +317,24 @@ pub trait TxnService: Send + Sync {
     /// Write a pending put to storage.
     ///
     /// The write is not visible to other transactions until commit.
+    /// May read from SSTs for conflict detection (async I/O).
     ///
     /// # Errors
     ///
     /// - `ReadOnlyTransaction` if the transaction was started with `read_only = true`
     /// - `TransactionNotActive` if the transaction is not in `Active` state
-    fn put(&self, ctx: &mut TxnCtx, key: Key, value: RawValue) -> Result<()>;
+    fn put<'a>(&'a self, ctx: &'a mut TxnCtx, key: Key, value: RawValue) -> impl Future<Output = Result<()>> + Send + 'a;
 
     /// Write a pending delete to storage.
     ///
     /// The delete is not visible to other transactions until commit.
+    /// May read from SSTs for conflict detection (async I/O).
     ///
     /// # Errors
     ///
     /// - `ReadOnlyTransaction` if the transaction was started with `read_only = true`
     /// - `TransactionNotActive` if the transaction is not in `Active` state
-    fn delete(&self, ctx: &mut TxnCtx, key: Key) -> Result<()>;
+    fn delete<'a>(&'a self, ctx: &'a mut TxnCtx, key: Key) -> impl Future<Output = Result<()>> + Send + 'a;
 
     // === Finalization ===
 

@@ -1086,7 +1086,7 @@ impl SimpleExecutor {
         // DDL operations don't need transaction (catalog operations)
         match &plan {
             LogicalPlan::CreateTable { .. } | LogicalPlan::DropTable { .. } => {
-                return self.execute_ddl(plan, catalog);
+                return self.execute_ddl(plan, catalog).await;
             }
             _ => {}
         }
@@ -1124,7 +1124,7 @@ impl SimpleExecutor {
     }
 
     /// Execute DDL operations (no transaction needed).
-    fn execute_ddl<C: Catalog>(&self, plan: LogicalPlan, catalog: &C) -> Result<ExecutionResult> {
+    async fn execute_ddl<C: Catalog>(&self, plan: LogicalPlan, catalog: &C) -> Result<ExecutionResult> {
         match plan {
             LogicalPlan::CreateTable {
                 table,
@@ -1148,7 +1148,7 @@ impl SimpleExecutor {
                     )));
                 }
 
-                catalog.create_table(table)?;
+                catalog.create_table(table).await?;
                 Ok(ExecutionResult::Ok)
             }
 
@@ -1164,7 +1164,7 @@ impl SimpleExecutor {
                     return Err(TiSqlError::TableNotFound(format!("{schema}.{table}")));
                 }
 
-                let info = catalog.drop_table(&schema, &table)?;
+                let info = catalog.drop_table(&schema, &table).await?;
                 Ok(ExecutionResult::OkWithEffect(DdlEffect::TableDropped {
                     table_id: info.table_id,
                     commit_ts: info.commit_ts,
@@ -1260,7 +1260,7 @@ impl SimpleExecutor {
                     };
 
                     // Check for duplicate primary key
-                    if txn_service.get(ctx, &key)?.is_some() {
+                    if txn_service.get(ctx, &key).await?.is_some() {
                         let pk_desc = if pk_indices.is_empty() {
                             format!("row_id={}", row_id_for_key.unwrap_or(0))
                         } else {
@@ -1279,7 +1279,7 @@ impl SimpleExecutor {
                     let value = encode_row(&col_ids, &row_values);
 
                     // Buffer write in transaction
-                    txn_service.put(ctx, key, value)?;
+                    txn_service.put(ctx, key, value).await?;
                     count += 1;
                 }
 
@@ -1322,7 +1322,7 @@ impl SimpleExecutor {
                     }
 
                     // Buffer delete in transaction (need to clone key for ownership)
-                    txn_service.delete(ctx, key.to_vec())?;
+                    txn_service.delete(ctx, key.to_vec()).await?;
                     count += 1;
                     iter.advance().await?;
                 }
@@ -1397,7 +1397,7 @@ impl SimpleExecutor {
                     // Check for duplicate key when PK changed
                     if !pk_indices.is_empty() && new_key.as_slice() != key_ref {
                         // Check if new key already exists (would conflict with another row)
-                        if txn_service.get(ctx, &new_key)?.is_some() {
+                        if txn_service.get(ctx, &new_key).await?.is_some() {
                             let pk_values: Vec<_> = pk_indices
                                 .iter()
                                 .map(|&i| row.get(i).cloned().unwrap_or(Value::Null))
@@ -1408,12 +1408,12 @@ impl SimpleExecutor {
                             )));
                         }
                         // Delete old key (need to clone for ownership)
-                        txn_service.delete(ctx, key_ref.to_vec())?;
+                        txn_service.delete(ctx, key_ref.to_vec()).await?;
                     }
 
                     // Write new row
                     let new_value = encode_row(&col_ids, row.values());
-                    txn_service.put(ctx, new_key, new_value)?;
+                    txn_service.put(ctx, new_key, new_value).await?;
                     count += 1;
                     iter.advance().await?;
                 }

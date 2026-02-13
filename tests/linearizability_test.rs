@@ -190,7 +190,7 @@ fn transfer(
 }
 
 /// Read balances of all accounts at a given snapshot timestamp.
-fn read_balances(
+async fn read_balances(
     engine: &VersionedMemTableEngine,
     accounts: &[u32],
     read_ts: Timestamp,
@@ -201,7 +201,7 @@ fn read_balances(
     // Scan all MVCC entries up to read_ts
     let range = MvccKey::unbounded()..MvccKey::unbounded();
     let mut iter = engine.scan_iter(range, 0).expect("scan should succeed");
-    tisql::io::block_on_sync(iter.advance()).expect("advance should succeed");
+    iter.advance().await.expect("advance should succeed");
 
     while iter.valid() {
         let ts = iter.timestamp();
@@ -213,7 +213,7 @@ fn read_balances(
                 }
             }
         }
-        tisql::io::block_on_sync(iter.advance()).expect("advance should succeed");
+        iter.advance().await.expect("advance should succeed");
     }
 
     let total: i64 = balances.values().sum();
@@ -338,7 +338,7 @@ fn verify(
 }
 
 /// Check atomicity by reading individual operation keys.
-fn verify_atomicity_detailed(
+async fn verify_atomicity_detailed(
     engine: &VersionedMemTableEngine,
     operations: &[Operation],
     read_ts: Timestamp,
@@ -353,8 +353,8 @@ fn verify_atomicity_detailed(
             let from_key = make_key(*from, op.op_id);
             let to_key = make_key(*to, op.op_id);
 
-            let from_visible = is_key_visible(engine, &from_key, read_ts);
-            let to_visible = is_key_visible(engine, &to_key, read_ts);
+            let from_visible = is_key_visible(engine, &from_key, read_ts).await;
+            let to_visible = is_key_visible(engine, &to_key, read_ts).await;
 
             if from_visible != to_visible {
                 return Err(format!(
@@ -368,7 +368,7 @@ fn verify_atomicity_detailed(
     Ok(())
 }
 
-fn is_key_visible(engine: &VersionedMemTableEngine, key: &[u8], read_ts: Timestamp) -> bool {
+async fn is_key_visible(engine: &VersionedMemTableEngine, key: &[u8], read_ts: Timestamp) -> bool {
     // Scan for this specific key
     let start = MvccKey::encode(key, Timestamp::MAX);
     let end = MvccKey::encode(key, 0);
@@ -376,13 +376,13 @@ fn is_key_visible(engine: &VersionedMemTableEngine, key: &[u8], read_ts: Timesta
     let mut iter = engine
         .scan_iter(start..end, 0)
         .expect("scan should succeed");
-    tisql::io::block_on_sync(iter.advance()).expect("advance should succeed");
+    iter.advance().await.expect("advance should succeed");
 
     while iter.valid() {
         if iter.user_key() == key && iter.timestamp() <= read_ts {
             return true;
         }
-        tisql::io::block_on_sync(iter.advance()).expect("advance should succeed");
+        iter.advance().await.expect("advance should succeed");
     }
 
     false
@@ -393,8 +393,8 @@ fn is_key_visible(engine: &VersionedMemTableEngine, key: &[u8], read_ts: Timesta
 // ============================================================================
 
 /// Basic test: 5 accounts, initial deposits, verify total.
-#[test]
-fn test_bank_initial_deposits() {
+#[tokio::test]
+async fn test_bank_initial_deposits() {
     let engine = VersionedMemTableEngine::new();
     let accounts: Vec<u32> = (1..=5).collect();
     let initial_balance = 1000i64;
@@ -417,7 +417,7 @@ fn test_bank_initial_deposits() {
     // Read at various timestamps (all >= 10 to see all deposits)
     let mut reads = Vec::new();
     for ts in [10, 15, 100] {
-        reads.push(read_balances(&engine, &accounts, ts));
+        reads.push(read_balances(&engine, &accounts, ts).await);
     }
 
     // Verify
@@ -425,7 +425,7 @@ fn test_bank_initial_deposits() {
     assert!(result.passed, "Verification failed: {result:?}");
 
     // Check individual balances at final snapshot
-    let final_read = read_balances(&engine, &accounts, 100);
+    let final_read = read_balances(&engine, &accounts, 100).await;
     for &account in &accounts {
         assert_eq!(
             final_read.balances.get(&account),
@@ -436,8 +436,8 @@ fn test_bank_initial_deposits() {
 }
 
 /// Test atomic transfers between accounts.
-#[test]
-fn test_bank_transfers() {
+#[tokio::test]
+async fn test_bank_transfers() {
     let engine = VersionedMemTableEngine::new();
     let accounts: Vec<u32> = (1..=5).collect();
     let initial_balance = 1000i64;
@@ -474,10 +474,10 @@ fn test_bank_transfers() {
 
     // Read at various points
     let reads = vec![
-        read_balances(&engine, &accounts, 5),  // Before all deposits
-        read_balances(&engine, &accounts, 15), // After deposits, before transfers
-        read_balances(&engine, &accounts, 22), // After some transfers
-        read_balances(&engine, &accounts, 50), // After all transfers
+        read_balances(&engine, &accounts, 5).await, // Before all deposits
+        read_balances(&engine, &accounts, 15).await, // After deposits, before transfers
+        read_balances(&engine, &accounts, 22).await, // After some transfers
+        read_balances(&engine, &accounts, 50).await, // After all transfers
     ];
 
     // Verify conservation at all snapshots
@@ -494,7 +494,7 @@ fn test_bank_transfers() {
 
     // Verify atomicity for each transfer
     for ts in [20, 21, 22, 23, 24, 50] {
-        let check = verify_atomicity_detailed(&engine, &ops, ts);
+        let check = verify_atomicity_detailed(&engine, &ops, ts).await;
         assert!(
             check.is_ok(),
             "Atomicity check failed at ts={ts}: {check:?}"
@@ -503,8 +503,8 @@ fn test_bank_transfers() {
 }
 
 /// Concurrent writers performing transfers.
-#[test]
-fn test_concurrent_transfers() {
+#[tokio::test]
+async fn test_concurrent_transfers() {
     let engine = Arc::new(VersionedMemTableEngine::new());
     let accounts: Vec<u32> = (1..=5).collect();
     let initial_balance = 10000i64;
@@ -558,11 +558,11 @@ fn test_concurrent_transfers() {
         handle.join().unwrap();
     }
 
-    let all_ops = ops.lock().unwrap();
+    let all_ops: Vec<Operation> = ops.lock().unwrap().clone();
 
     // Read at final snapshot
     let final_ts = next_ts.load(Ordering::SeqCst);
-    let final_read = read_balances(&engine, &accounts, final_ts);
+    let final_read = read_balances(&engine, &accounts, final_ts).await;
 
     // Conservation check
     assert_eq!(
@@ -572,7 +572,7 @@ fn test_concurrent_transfers() {
     );
 
     // Atomicity check for all operations
-    let atomicity_result = verify_atomicity_detailed(&engine, &all_ops, final_ts);
+    let atomicity_result = verify_atomicity_detailed(&engine, &all_ops, final_ts).await;
     assert!(
         atomicity_result.is_ok(),
         "Atomicity violation: {atomicity_result:?}"
@@ -586,8 +586,8 @@ fn test_concurrent_transfers() {
 }
 
 /// Concurrent readers and writers.
-#[test]
-fn test_concurrent_reads_and_writes() {
+#[tokio::test]
+async fn test_concurrent_reads_and_writes() {
     let engine = Arc::new(VersionedMemTableEngine::new());
     let accounts: Vec<u32> = (1..=5).collect();
     let initial_balance = 10000i64;
@@ -642,11 +642,12 @@ fn test_concurrent_reads_and_writes() {
         let accounts = accounts.clone();
 
         handles.push(thread::spawn(move || {
+            let rt = tokio::runtime::Runtime::new().unwrap();
             let start = Instant::now();
             while start.elapsed() < duration {
                 // Read at current timestamp
                 let read_ts = next_ts.load(Ordering::SeqCst);
-                let result = read_balances(&engine, &accounts, read_ts);
+                let result = rt.block_on(read_balances(&engine, &accounts, read_ts));
                 reads.lock().unwrap().push(result);
                 thread::sleep(Duration::from_micros(100));
             }
@@ -682,8 +683,8 @@ fn test_concurrent_reads_and_writes() {
 }
 
 /// Test snapshot isolation: reads see consistent point-in-time view.
-#[test]
-fn test_snapshot_isolation() {
+#[tokio::test]
+async fn test_snapshot_isolation() {
     let engine = VersionedMemTableEngine::new();
     let accounts: Vec<u32> = (1..=3).collect();
     let initial_balance = 1000i64;
@@ -700,19 +701,19 @@ fn test_snapshot_isolation() {
     transfer(&engine, 2, 3, 200, 101, 30);
 
     // Read at ts=15: Should see deposits only
-    let read_15 = read_balances(&engine, &accounts, 15);
+    let read_15 = read_balances(&engine, &accounts, 15).await;
     assert_eq!(read_15.balances.get(&1), Some(&1000));
     assert_eq!(read_15.balances.get(&2), Some(&1000));
     assert_eq!(read_15.balances.get(&3), Some(&1000));
 
     // Read at ts=25: Should see first transfer
-    let read_25 = read_balances(&engine, &accounts, 25);
+    let read_25 = read_balances(&engine, &accounts, 25).await;
     assert_eq!(read_25.balances.get(&1), Some(&900)); // 1000 - 100
     assert_eq!(read_25.balances.get(&2), Some(&1100)); // 1000 + 100
     assert_eq!(read_25.balances.get(&3), Some(&1000)); // unchanged
 
     // Read at ts=35: Should see both transfers
-    let read_35 = read_balances(&engine, &accounts, 35);
+    let read_35 = read_balances(&engine, &accounts, 35).await;
     assert_eq!(read_35.balances.get(&1), Some(&900)); // 1000 - 100
     assert_eq!(read_35.balances.get(&2), Some(&900)); // 1000 + 100 - 200
     assert_eq!(read_35.balances.get(&3), Some(&1200)); // 1000 + 200
@@ -725,8 +726,8 @@ fn test_snapshot_isolation() {
 }
 
 /// Stress test: Many accounts, many transfers.
-#[test]
-fn test_bank_stress() {
+#[tokio::test]
+async fn test_bank_stress() {
     let engine = Arc::new(VersionedMemTableEngine::new());
     let num_accounts = 20u32;
     let accounts: Vec<u32> = (1..=num_accounts).collect();
@@ -775,7 +776,7 @@ fn test_bank_stress() {
 
     // Final verification
     let final_ts = next_ts.load(Ordering::SeqCst);
-    let final_read = read_balances(&engine, &accounts, final_ts);
+    let final_read = read_balances(&engine, &accounts, final_ts).await;
 
     assert_eq!(
         final_read.total, expected_total,
@@ -797,8 +798,8 @@ fn test_bank_stress() {
 }
 
 /// Test that operations are correctly ordered by timestamp.
-#[test]
-fn test_timestamp_ordering() {
+#[tokio::test]
+async fn test_timestamp_ordering() {
     let engine = VersionedMemTableEngine::new();
     let account = 1u32;
 
@@ -811,25 +812,25 @@ fn test_timestamp_ordering() {
     // Read at various timestamps
     let accounts = vec![account];
 
-    let read_5 = read_balances(&engine, &accounts, 5);
+    let read_5 = read_balances(&engine, &accounts, 5).await;
     assert_eq!(read_5.balances.get(&account), Some(&0));
 
-    let read_15 = read_balances(&engine, &accounts, 15);
+    let read_15 = read_balances(&engine, &accounts, 15).await;
     assert_eq!(read_15.balances.get(&account), Some(&100));
 
-    let read_22 = read_balances(&engine, &accounts, 22);
+    let read_22 = read_balances(&engine, &accounts, 22).await;
     assert_eq!(read_22.balances.get(&account), Some(&300)); // 100 + 200
 
-    let read_27 = read_balances(&engine, &accounts, 27);
+    let read_27 = read_balances(&engine, &accounts, 27).await;
     assert_eq!(read_27.balances.get(&account), Some(&250)); // 100 + 200 + (-50)
 
-    let read_50 = read_balances(&engine, &accounts, 50);
+    let read_50 = read_balances(&engine, &accounts, 50).await;
     assert_eq!(read_50.balances.get(&account), Some(&550)); // 100 + 200 + 300 + (-50)
 }
 
 /// History verification: Build a history and check linearizability.
-#[test]
-fn test_history_verification() {
+#[tokio::test]
+async fn test_history_verification() {
     let engine = VersionedMemTableEngine::new();
     let accounts: Vec<u32> = (1..=3).collect();
     let initial_balance = 1000i64;
@@ -861,7 +862,7 @@ fn test_history_verification() {
     // Collect reads at various timestamps
     let mut reads = Vec::new();
     for ts in [15, 22, 27, 32, 45, 100] {
-        reads.push(read_balances(&engine, &accounts, ts));
+        reads.push(read_balances(&engine, &accounts, ts).await);
     }
 
     // Verify the history

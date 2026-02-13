@@ -41,7 +41,7 @@ use tisql::StorageEngine;
 
 // ==================== Test Helpers Using MvccKey ====================
 
-fn get_at_for_test(engine: &LsmEngine, key: &[u8], ts: Timestamp) -> Option<RawValue> {
+async fn get_at_for_test(engine: &LsmEngine, key: &[u8], ts: Timestamp) -> Option<RawValue> {
     let start = MvccKey::encode(key, ts);
     let end = MvccKey::encode(key, 0)
         .next_key()
@@ -50,7 +50,7 @@ fn get_at_for_test(engine: &LsmEngine, key: &[u8], ts: Timestamp) -> Option<RawV
 
     // Use streaming scan_iter() - process one entry at a time
     let mut iter = engine.scan_iter(range, 0).unwrap();
-    tisql::io::block_on_sync(iter.advance()).unwrap(); // Position on first entry
+    iter.advance().await.unwrap(); // Position on first entry
 
     while iter.valid() {
         let decoded_key = iter.user_key();
@@ -62,16 +62,16 @@ fn get_at_for_test(engine: &LsmEngine, key: &[u8], ts: Timestamp) -> Option<RawV
             }
             return Some(value);
         }
-        tisql::io::block_on_sync(iter.advance()).unwrap();
+        iter.advance().await.unwrap();
     }
     None
 }
 
-fn get_for_test(engine: &LsmEngine, key: &[u8]) -> Option<RawValue> {
-    get_at_for_test(engine, key, Timestamp::MAX)
+async fn get_for_test(engine: &LsmEngine, key: &[u8]) -> Option<RawValue> {
+    get_at_for_test(engine, key, Timestamp::MAX).await
 }
 
-fn scan_at_for_test(
+async fn scan_at_for_test(
     engine: &LsmEngine,
     range: &std::ops::Range<Vec<u8>>,
     ts: Timestamp,
@@ -82,7 +82,7 @@ fn scan_at_for_test(
 
     // Use streaming scan_iter() - process one entry at a time
     let mut iter = engine.scan_iter(mvcc_range, 0).unwrap();
-    tisql::io::block_on_sync(iter.advance()).unwrap(); // Position on first entry
+    iter.advance().await.unwrap(); // Position on first entry
 
     let mut seen_keys: std::collections::HashSet<Vec<u8>> = std::collections::HashSet::new();
     let mut output = Vec::new();
@@ -93,7 +93,7 @@ fn scan_at_for_test(
         let value = iter.value().to_vec();
 
         // Move to next before continue checks (so we don't get stuck)
-        tisql::io::block_on_sync(iter.advance()).unwrap();
+        iter.advance().await.unwrap();
 
         if decoded_key < range.start || decoded_key >= range.end {
             continue;
@@ -173,8 +173,8 @@ fn new_batch_with_lsn(commit_ts: Timestamp, lsn: u64) -> WriteBatch {
 /// This test verifies that:
 /// 1. Multiple versions of the same key can coexist
 /// 2. Reading at different timestamps returns correct versions
-#[test]
-fn test_memtable_duplicate_seq_mvcc() {
+#[tokio::test]
+async fn test_memtable_duplicate_seq_mvcc() {
     let dir = TempDir::new().unwrap();
     let engine = create_engine(&dir);
 
@@ -190,17 +190,17 @@ fn test_memtable_duplicate_seq_mvcc() {
 
     // Both versions should exist and be accessible at appropriate timestamps
     assert_eq!(
-        get_at_for_test(&engine, b"key", 10),
+        get_at_for_test(&engine, b"key", 10).await,
         Some(b"value_10".to_vec()),
         "Version at ts=10 should be accessible"
     );
     assert_eq!(
-        get_at_for_test(&engine, b"key", 20),
+        get_at_for_test(&engine, b"key", 20).await,
         Some(b"value_20".to_vec()),
         "Version at ts=20 should be accessible"
     );
     assert_eq!(
-        get_at_for_test(&engine, b"key", 15),
+        get_at_for_test(&engine, b"key", 15).await,
         Some(b"value_10".to_vec()),
         "ts=15 should see ts=10 version"
     );
@@ -208,8 +208,8 @@ fn test_memtable_duplicate_seq_mvcc() {
 
 /// Test duplicate keys under stress (ported from RocksDB's DuplicateSeq stress loop).
 /// This verifies memtable stability with many versions of the same key.
-#[test]
-fn test_memtable_duplicate_stress() {
+#[tokio::test]
+async fn test_memtable_duplicate_stress() {
     let dir = TempDir::new().unwrap();
     let engine = create_engine(&dir);
 
@@ -225,7 +225,7 @@ fn test_memtable_duplicate_stress() {
     // Verify all versions are accessible
     for ts in 1..=num_versions {
         let expected = format!("value_{ts}");
-        let actual = get_at_for_test(&engine, b"stress_key", ts as Timestamp);
+        let actual = get_at_for_test(&engine, b"stress_key", ts as Timestamp).await;
         assert_eq!(
             actual,
             Some(expected.into_bytes()),
@@ -234,14 +234,14 @@ fn test_memtable_duplicate_stress() {
     }
 
     // Latest should be the highest timestamp
-    let latest = get_for_test(&engine, b"stress_key");
+    let latest = get_for_test(&engine, b"stress_key").await;
     assert_eq!(latest, Some(format!("value_{num_versions}").into_bytes()));
 }
 
 /// Test concurrent merge writes (ported from RocksDB's ConcurrentMergeWrite).
 /// Verifies thread-safety of memtable writes.
-#[test]
-fn test_memtable_concurrent_writes() {
+#[tokio::test]
+async fn test_memtable_concurrent_writes() {
     let dir = TempDir::new().unwrap();
     let engine = Arc::new(create_engine(&dir));
 
@@ -279,7 +279,7 @@ fn test_memtable_concurrent_writes() {
         for i in 0..writes_per_thread {
             let key = format!("concurrent_key_{tid}_{i}");
             assert!(
-                get_for_test(&engine, key.as_bytes()).is_some(),
+                get_for_test(&engine, key.as_bytes()).await.is_some(),
                 "Key {key} should exist"
             );
         }
@@ -288,8 +288,8 @@ fn test_memtable_concurrent_writes() {
 
 /// Test concurrent reads and writes with MVCC snapshots.
 /// Verifies that readers see consistent snapshots while writers are active.
-#[test]
-fn test_memtable_concurrent_reads_writes_mvcc() {
+#[tokio::test]
+async fn test_memtable_concurrent_reads_writes_mvcc() {
     let dir = TempDir::new().unwrap();
     let engine = Arc::new(create_engine(&dir));
 
@@ -304,60 +304,64 @@ fn test_memtable_concurrent_reads_writes_mvcc() {
     let num_readers = 4;
     let num_writers = 2;
     let keys_per_writer = 50; // Each writer has its own key range
-    let barrier = Arc::new(Barrier::new(num_readers + num_writers));
+    let barrier = Arc::new(tokio::sync::Barrier::new(num_readers + num_writers));
     let errors = Arc::new(AtomicU64::new(0));
 
-    let handles: Vec<_> = (0..num_readers)
-        .map(|_| {
-            let engine = Arc::clone(&engine);
-            let barrier = Arc::clone(&barrier);
-            let errors = Arc::clone(&errors);
+    let mut reader_handles = Vec::new();
+    for _ in 0..num_readers {
+        let engine = Arc::clone(&engine);
+        let barrier = Arc::clone(&barrier);
+        let errors = Arc::clone(&errors);
 
-            thread::spawn(move || {
-                barrier.wait();
+        reader_handles.push(tokio::spawn(async move {
+            barrier.wait().await;
 
-                // Take a snapshot at ts=1
-                for _ in 0..100 {
-                    for i in 0..100 {
-                        let key = format!("mvcc_key_{i:04}");
-                        match get_at_for_test(&engine, key.as_bytes(), 1) {
-                            Some(v) if v == b"base_value".to_vec() => {}
-                            None => {
-                                errors.fetch_add(1, Ordering::SeqCst);
-                            }
-                            Some(_) => {
-                                // Should see base_value at ts=1, not updated value
-                                errors.fetch_add(1, Ordering::SeqCst);
-                            }
+            // Take a snapshot at ts=1
+            for _ in 0..100 {
+                for i in 0..100 {
+                    let key = format!("mvcc_key_{i:04}");
+                    match get_at_for_test(&engine, key.as_bytes(), 1).await {
+                        Some(v) if v == b"base_value".to_vec() => {}
+                        None => {
+                            errors.fetch_add(1, Ordering::SeqCst);
+                        }
+                        Some(_) => {
+                            // Should see base_value at ts=1, not updated value
+                            errors.fetch_add(1, Ordering::SeqCst);
                         }
                     }
                 }
-            })
-        })
-        .chain((0..num_writers).map(|tid| {
-            let engine = Arc::clone(&engine);
-            let barrier = Arc::clone(&barrier);
+            }
+        }));
+    }
 
-            thread::spawn(move || {
-                barrier.wait();
+    let mut writer_handles = Vec::new();
+    for tid in 0..num_writers {
+        let engine = Arc::clone(&engine);
+        let barrier = Arc::clone(&barrier);
 
-                // Each writer writes to its own distinct key range to avoid
-                // concurrent writes to the same key (which requires external locking)
-                let key_offset = tid * keys_per_writer;
-                for i in 0..100 {
-                    // Timestamps increase within each writer thread
-                    let ts = (100 + i) as Timestamp;
-                    let mut batch = new_batch(ts);
-                    let key = format!("mvcc_key_{:04}", key_offset + (i % keys_per_writer));
-                    batch.put(key.into_bytes(), format!("updated_{ts}").into_bytes());
-                    engine.write_batch(batch).unwrap();
-                }
-            })
-        }))
-        .collect();
+        writer_handles.push(tokio::spawn(async move {
+            barrier.wait().await;
 
-    for h in handles {
-        h.join().unwrap();
+            // Each writer writes to its own distinct key range to avoid
+            // concurrent writes to the same key (which requires external locking)
+            let key_offset = tid * keys_per_writer;
+            for i in 0..100 {
+                // Timestamps increase within each writer thread
+                let ts = (100 + i) as Timestamp;
+                let mut batch = new_batch(ts);
+                let key = format!("mvcc_key_{:04}", key_offset + (i % keys_per_writer));
+                batch.put(key.into_bytes(), format!("updated_{ts}").into_bytes());
+                engine.write_batch(batch).unwrap();
+            }
+        }));
+    }
+
+    for h in reader_handles {
+        h.await.unwrap();
+    }
+    for h in writer_handles {
+        h.await.unwrap();
     }
 
     // No errors should have occurred in readers
@@ -374,8 +378,8 @@ fn test_memtable_concurrent_reads_writes_mvcc() {
 
 /// Test simple deletion handling (ported from RocksDB's SimpleDeletion).
 /// Verifies that tombstones properly mask older values after flush.
-#[test]
-fn test_compaction_simple_deletion() {
+#[tokio::test]
+async fn test_compaction_simple_deletion() {
     let dir = TempDir::new().unwrap();
     let (engine, _ilog) = create_durable_engine(&dir);
 
@@ -399,21 +403,21 @@ fn test_compaction_simple_deletion() {
 
     // After flush, "c" should be deleted at latest ts
     assert_eq!(
-        get_for_test(&engine, b"c"),
+        get_for_test(&engine, b"c").await,
         None,
         "Key 'c' should be deleted at latest ts"
     );
 
     // But visible at ts=3
     assert_eq!(
-        get_at_for_test(&engine, b"c", 3),
+        get_at_for_test(&engine, b"c", 3).await,
         Some(b"val".to_vec()),
         "Key 'c' should be visible at ts=3"
     );
 
     // "b" should be visible
     assert_eq!(
-        get_for_test(&engine, b"b"),
+        get_for_test(&engine, b"b").await,
         Some(b"val".to_vec()),
         "Key 'b' should be visible"
     );
@@ -421,8 +425,8 @@ fn test_compaction_simple_deletion() {
 
 /// Test output nothing case (ported from RocksDB's OutputNothing).
 /// When all data is deleted, compaction should produce empty/no output.
-#[test]
-fn test_compaction_output_nothing() {
+#[tokio::test]
+async fn test_compaction_output_nothing() {
     let dir = TempDir::new().unwrap();
     let (engine, _ilog) = create_durable_engine(&dir);
 
@@ -441,14 +445,14 @@ fn test_compaction_output_nothing() {
 
     // Latest read should return None (deleted)
     assert_eq!(
-        get_for_test(&engine, b"a"),
+        get_for_test(&engine, b"a").await,
         None,
         "Deleted key should not be visible"
     );
 
     // But historical read should work
     assert_eq!(
-        get_at_for_test(&engine, b"a", 1),
+        get_at_for_test(&engine, b"a", 1).await,
         Some(b"val".to_vec()),
         "Historical version should be visible"
     );
@@ -456,8 +460,8 @@ fn test_compaction_output_nothing() {
 
 /// Test simple overwrite (ported from RocksDB's SimpleOverwrite).
 /// Newer values should overwrite older ones in compaction output.
-#[test]
-fn test_compaction_simple_overwrite() {
+#[tokio::test]
+async fn test_compaction_simple_overwrite() {
     let dir = TempDir::new().unwrap();
     let (engine, _ilog) = create_durable_engine(&dir);
 
@@ -478,24 +482,24 @@ fn test_compaction_simple_overwrite() {
 
     // Latest values should be the newer ones
     assert_eq!(
-        get_for_test(&engine, b"a"),
+        get_for_test(&engine, b"a").await,
         Some(b"val3".to_vec()),
         "Key 'a' should have newer value"
     );
     assert_eq!(
-        get_for_test(&engine, b"b"),
+        get_for_test(&engine, b"b").await,
         Some(b"val4".to_vec()),
         "Key 'b' should have newer value"
     );
 
     // Older values still accessible via MVCC
     assert_eq!(
-        get_at_for_test(&engine, b"a", 1),
+        get_at_for_test(&engine, b"a", 1).await,
         Some(b"val1".to_vec()),
         "Old value of 'a' should be accessible"
     );
     assert_eq!(
-        get_at_for_test(&engine, b"b", 2),
+        get_at_for_test(&engine, b"b", 2).await,
         Some(b"val2".to_vec()),
         "Old value of 'b' should be accessible"
     );
@@ -503,8 +507,8 @@ fn test_compaction_simple_overwrite() {
 
 /// Test snapshot visibility with deletions (ported from RocksDB's SingleDeleteSnapshots).
 /// Verifies that snapshots see correct versions during and after compaction.
-#[test]
-fn test_snapshot_visibility_with_deletions() {
+#[tokio::test]
+async fn test_snapshot_visibility_with_deletions() {
     let dir = TempDir::new().unwrap();
     let (engine, _ilog) = create_durable_engine(&dir);
 
@@ -537,30 +541,45 @@ fn test_snapshot_visibility_with_deletions() {
     engine.flush_all_with_active().unwrap();
 
     // Snapshot at ts=10: should see a_v1, b_v1, c_v1
-    assert_eq!(get_at_for_test(&engine, b"a", 10), Some(b"a_v1".to_vec()));
-    assert_eq!(get_at_for_test(&engine, b"b", 10), Some(b"b_v1".to_vec()));
-    assert_eq!(get_at_for_test(&engine, b"c", 10), Some(b"c_v1".to_vec()));
+    assert_eq!(
+        get_at_for_test(&engine, b"a", 10).await,
+        Some(b"a_v1".to_vec())
+    );
+    assert_eq!(
+        get_at_for_test(&engine, b"b", 10).await,
+        Some(b"b_v1".to_vec())
+    );
+    assert_eq!(
+        get_at_for_test(&engine, b"c", 10).await,
+        Some(b"c_v1".to_vec())
+    );
 
     // Snapshot at ts=20: should see None (deleted), b_v2, c_v1
     assert_eq!(
-        get_at_for_test(&engine, b"a", 20),
+        get_at_for_test(&engine, b"a", 20).await,
         None,
         "'a' should be deleted at ts=20"
     );
-    assert_eq!(get_at_for_test(&engine, b"b", 20), Some(b"b_v2".to_vec()));
-    assert_eq!(get_at_for_test(&engine, b"c", 20), Some(b"c_v1".to_vec()));
+    assert_eq!(
+        get_at_for_test(&engine, b"b", 20).await,
+        Some(b"b_v2".to_vec())
+    );
+    assert_eq!(
+        get_at_for_test(&engine, b"c", 20).await,
+        Some(b"c_v1".to_vec())
+    );
 
     // Latest: should see None, b_v2, c_v2
-    assert_eq!(get_for_test(&engine, b"a"), None);
-    assert_eq!(get_for_test(&engine, b"b"), Some(b"b_v2".to_vec()));
-    assert_eq!(get_for_test(&engine, b"c"), Some(b"c_v2".to_vec()));
+    assert_eq!(get_for_test(&engine, b"a").await, None);
+    assert_eq!(get_for_test(&engine, b"b").await, Some(b"b_v2".to_vec()));
+    assert_eq!(get_for_test(&engine, b"c").await, Some(b"c_v2".to_vec()));
 }
 
 /// Test tombstone visible in snapshot (ported from RocksDB's similar test).
 /// When a key is deleted, historical snapshots should still see the old value,
 /// but newer snapshots should see the deletion.
-#[test]
-fn test_tombstone_visible_in_snapshot() {
+#[tokio::test]
+async fn test_tombstone_visible_in_snapshot() {
     let dir = TempDir::new().unwrap();
     let (engine, _ilog) = create_durable_engine(&dir);
 
@@ -582,14 +601,14 @@ fn test_tombstone_visible_in_snapshot() {
 
     // Snapshot before delete (ts=15) should see value
     assert_eq!(
-        get_at_for_test(&engine, b"tombstone_key", 15),
+        get_at_for_test(&engine, b"tombstone_key", 15).await,
         Some(b"original_value".to_vec()),
         "Snapshot before delete should see value"
     );
 
     // Snapshot after delete (ts=25) should see None
     assert_eq!(
-        get_at_for_test(&engine, b"tombstone_key", 25),
+        get_at_for_test(&engine, b"tombstone_key", 25).await,
         None,
         "Snapshot after delete should see tombstone"
     );
@@ -601,9 +620,9 @@ fn test_tombstone_visible_in_snapshot() {
 
 /// Test concurrent flush operations don't corrupt data.
 /// Inspired by RocksDB's FlushWhileWritingManifest.
-#[test]
-#[ignore = "Pre-existing: block_on_sync spin with many sequential SST reads"]
-fn test_flush_while_writing() {
+#[tokio::test]
+#[ignore = "Pre-existing: many sequential SST reads cause slowness"]
+async fn test_flush_while_writing() {
     let dir = TempDir::new().unwrap();
     let engine = Arc::new({
         let config = LsmConfigBuilder::new(dir.path())
@@ -670,7 +689,7 @@ fn test_flush_while_writing() {
     for tid in 0..num_writers {
         for i in 0..writes_per_writer {
             let key = format!("flush_while_write_{tid}_{i}");
-            let value = get_for_test(&engine, key.as_bytes());
+            let value = get_for_test(&engine, key.as_bytes()).await;
             assert!(
                 value.is_some(),
                 "Key {key} should exist after concurrent flush/write"
@@ -681,9 +700,9 @@ fn test_flush_while_writing() {
 
 /// Test that flush produces correct statistics.
 /// Inspired by RocksDB's StatisticsGarbageBasic.
-#[test]
-#[ignore = "Pre-existing: block_on_sync spin with many sequential SST reads"]
-fn test_flush_statistics() {
+#[tokio::test]
+#[ignore = "Pre-existing: many sequential SST reads cause slowness"]
+async fn test_flush_statistics() {
     let dir = TempDir::new().unwrap();
     let (engine, _ilog) = create_durable_engine(&dir);
 
@@ -707,7 +726,7 @@ fn test_flush_statistics() {
     }
 
     // Verify data is readable before flush
-    let val = get_for_test(&engine, b"stat_key_1");
+    let val = get_for_test(&engine, b"stat_key_1").await;
     assert!(val.is_some(), "Memtable should have data");
 
     // Get stats before flush (SST count should be 0)
@@ -728,7 +747,7 @@ fn test_flush_statistics() {
     for round in 0..10 {
         let ts = (round + 1) as Timestamp;
         assert_eq!(
-            get_at_for_test(&engine, b"stat_key_1", ts),
+            get_at_for_test(&engine, b"stat_key_1", ts).await,
             Some(format!("value_{round}").into_bytes()),
             "Version at ts={ts} should be accessible"
         );
@@ -740,8 +759,8 @@ fn test_flush_statistics() {
 // ============================================================================
 
 /// Test SST iterator with various key patterns.
-#[test]
-fn test_sst_iterator_key_patterns() {
+#[tokio::test]
+async fn test_sst_iterator_key_patterns() {
     let dir = TempDir::new().unwrap();
     let sst_path = dir.path().join("test.sst");
 
@@ -771,16 +790,16 @@ fn test_sst_iterator_key_patterns() {
     builder.finish(1, 0).unwrap();
 
     // Read and verify
-    let reader =
-        tisql::io::block_on_sync(SstReaderRef::open(&sst_path, IoService::new(32).unwrap()))
-            .unwrap();
+    let reader = SstReaderRef::open(&sst_path, IoService::new(32).unwrap())
+        .await
+        .unwrap();
     let mut iter = SstIterator::new(reader).unwrap();
-    tisql::io::block_on_sync(iter.seek_to_first()).unwrap();
+    iter.seek_to_first().await.unwrap();
 
     let mut keys = Vec::new();
     while iter.valid() {
         keys.push(iter.key().to_vec());
-        tisql::io::block_on_sync(iter.advance()).unwrap();
+        iter.advance().await.unwrap();
     }
 
     // Keys should be in sorted order
@@ -796,8 +815,8 @@ fn test_sst_iterator_key_patterns() {
 }
 
 /// Test SST with many entries (stress test).
-#[test]
-fn test_sst_many_entries() {
+#[tokio::test]
+async fn test_sst_many_entries() {
     let dir = TempDir::new().unwrap();
     let sst_path = dir.path().join("large.sst");
 
@@ -817,11 +836,11 @@ fn test_sst_many_entries() {
     assert_eq!(meta.entry_count, num_entries as u64);
 
     // Read and count
-    let reader =
-        tisql::io::block_on_sync(SstReaderRef::open(&sst_path, IoService::new(32).unwrap()))
-            .unwrap();
+    let reader = SstReaderRef::open(&sst_path, IoService::new(32).unwrap())
+        .await
+        .unwrap();
     let mut iter = SstIterator::new(reader).unwrap();
-    tisql::io::block_on_sync(iter.seek_to_first()).unwrap();
+    iter.seek_to_first().await.unwrap();
 
     let mut count = 0;
     let mut prev_key: Option<Vec<u8>> = None;
@@ -838,15 +857,15 @@ fn test_sst_many_entries() {
 
         prev_key = Some(key);
         count += 1;
-        tisql::io::block_on_sync(iter.advance()).unwrap();
+        iter.advance().await.unwrap();
     }
 
     assert_eq!(count, num_entries);
 }
 
 /// Test SST with duplicate keys (MVCC scenario).
-#[test]
-fn test_sst_mvcc_keys() {
+#[tokio::test]
+async fn test_sst_mvcc_keys() {
     let dir = TempDir::new().unwrap();
     let sst_path = dir.path().join("mvcc.sst");
 
@@ -876,16 +895,16 @@ fn test_sst_mvcc_keys() {
     builder.finish(1, 0).unwrap();
 
     // Read and verify order
-    let reader =
-        tisql::io::block_on_sync(SstReaderRef::open(&sst_path, IoService::new(32).unwrap()))
-            .unwrap();
+    let reader = SstReaderRef::open(&sst_path, IoService::new(32).unwrap())
+        .await
+        .unwrap();
     let mut iter = SstIterator::new(reader).unwrap();
-    tisql::io::block_on_sync(iter.seek_to_first()).unwrap();
+    iter.seek_to_first().await.unwrap();
 
     let mut entries: Vec<(Vec<u8>, Vec<u8>)> = Vec::new();
     while iter.valid() {
         entries.push((iter.key().to_vec(), iter.value().to_vec()));
-        tisql::io::block_on_sync(iter.advance()).unwrap();
+        iter.advance().await.unwrap();
     }
 
     // Should have 5 entries
@@ -905,8 +924,8 @@ fn test_sst_mvcc_keys() {
 // ============================================================================
 
 /// Test that compaction preserves all MVCC versions.
-#[test]
-fn test_compaction_preserves_mvcc_versions() {
+#[tokio::test]
+async fn test_compaction_preserves_mvcc_versions() {
     let dir = TempDir::new().unwrap();
     let (engine, _ilog) = create_durable_engine(&dir);
 
@@ -922,7 +941,7 @@ fn test_compaction_preserves_mvcc_versions() {
 
     // Verify all versions are preserved
     for ts in 1..=5 {
-        let value = get_at_for_test(&engine, b"mvcc_test", ts as Timestamp);
+        let value = get_at_for_test(&engine, b"mvcc_test", ts as Timestamp).await;
         assert_eq!(
             value,
             Some(format!("value_ts_{ts}").into_bytes()),
@@ -932,8 +951,8 @@ fn test_compaction_preserves_mvcc_versions() {
 }
 
 /// Test scan with range and MVCC after flush.
-#[test]
-fn test_scan_range_after_flush() {
+#[tokio::test]
+async fn test_scan_range_after_flush() {
     let dir = TempDir::new().unwrap();
     let (engine, _ilog) = create_durable_engine(&dir);
 
@@ -956,21 +975,21 @@ fn test_scan_range_after_flush() {
 
     // Range scan at ts=15: should see v1 versions
     let range = b"b".to_vec()..b"d".to_vec();
-    let results: Vec<_> = scan_at_for_test(&engine, &range, 15);
+    let results: Vec<_> = scan_at_for_test(&engine, &range, 15).await;
     assert_eq!(results.len(), 2);
     assert!(results.iter().any(|(k, v)| k == b"b" && v == b"b_v1"));
     assert!(results.iter().any(|(k, v)| k == b"c" && v == b"c_v1"));
 
     // Range scan at ts=25: should see v2 versions where updated
-    let results: Vec<_> = scan_at_for_test(&engine, &range, 25);
+    let results: Vec<_> = scan_at_for_test(&engine, &range, 25).await;
     assert_eq!(results.len(), 2);
     assert!(results.iter().any(|(k, v)| k == b"b" && v == b"b_v2"));
     assert!(results.iter().any(|(k, v)| k == b"c" && v == b"c_v2"));
 }
 
 /// Test that deleted keys don't appear in scan.
-#[test]
-fn test_scan_excludes_deleted_keys() {
+#[tokio::test]
+async fn test_scan_excludes_deleted_keys() {
     let dir = TempDir::new().unwrap();
     let (engine, _ilog) = create_durable_engine(&dir);
 
@@ -992,7 +1011,7 @@ fn test_scan_excludes_deleted_keys() {
 
     // Scan at ts=25: should not include 'b' and 'd'
     let range = b"a".to_vec()..b"f".to_vec();
-    let results: Vec<_> = scan_at_for_test(&engine, &range, 25);
+    let results: Vec<_> = scan_at_for_test(&engine, &range, 25).await;
     let keys: HashSet<_> = results.iter().map(|(k, _)| k.clone()).collect();
 
     assert!(!keys.contains(b"b".as_slice()), "'b' should be excluded");
@@ -1002,7 +1021,7 @@ fn test_scan_excludes_deleted_keys() {
     assert!(keys.contains(b"e".as_slice()), "'e' should be included");
 
     // Scan at ts=15: should include all (before delete)
-    let results: Vec<_> = scan_at_for_test(&engine, &range, 15);
+    let results: Vec<_> = scan_at_for_test(&engine, &range, 15).await;
     assert_eq!(results.len(), 5, "All 5 keys should be visible at ts=15");
 }
 
@@ -1011,8 +1030,8 @@ fn test_scan_excludes_deleted_keys() {
 // ============================================================================
 
 /// Test that flushed data survives restart.
-#[test]
-fn test_recovery_flushed_data() {
+#[tokio::test]
+async fn test_recovery_flushed_data() {
     let dir = TempDir::new().unwrap();
 
     // First session: write and flush
@@ -1041,7 +1060,7 @@ fn test_recovery_flushed_data() {
         let engine =
             LsmEngine::open_with_recovery(config, lsn_provider, Arc::new(ilog), version).unwrap();
 
-        let value = get_for_test(&engine, b"recovery_key");
+        let value = get_for_test(&engine, b"recovery_key").await;
         assert_eq!(
             value,
             Some(b"recovery_value".to_vec()),
@@ -1051,8 +1070,8 @@ fn test_recovery_flushed_data() {
 }
 
 /// Test that multiple flushes and restart work correctly.
-#[test]
-fn test_recovery_multiple_flushes() {
+#[tokio::test]
+async fn test_recovery_multiple_flushes() {
     let dir = TempDir::new().unwrap();
 
     // First session: multiple writes and flushes
@@ -1094,7 +1113,7 @@ fn test_recovery_multiple_flushes() {
         // Latest values should be from round 4
         for i in 0..5 {
             let key = format!("multi_flush_key_{i}");
-            let value = get_for_test(&engine, key.as_bytes());
+            let value = get_for_test(&engine, key.as_bytes()).await;
             assert_eq!(
                 value,
                 Some(b"round_4".to_vec()),
@@ -1112,8 +1131,8 @@ fn test_recovery_multiple_flushes() {
 }
 
 /// Test that MVCC versions survive recovery.
-#[test]
-fn test_recovery_mvcc_versions() {
+#[tokio::test]
+async fn test_recovery_mvcc_versions() {
     let dir = TempDir::new().unwrap();
 
     // First session: write multiple versions
@@ -1149,7 +1168,7 @@ fn test_recovery_mvcc_versions() {
 
         // Verify each version is accessible
         for ts in [10, 20, 30, 40, 50] {
-            let value = get_at_for_test(&engine, b"mvcc_recovery", ts as Timestamp);
+            let value = get_at_for_test(&engine, b"mvcc_recovery", ts as Timestamp).await;
             assert_eq!(
                 value,
                 Some(format!("value_ts_{ts}").into_bytes()),
@@ -1164,8 +1183,8 @@ fn test_recovery_mvcc_versions() {
 // ============================================================================
 
 /// Test empty batch write.
-#[test]
-fn test_empty_batch() {
+#[tokio::test]
+async fn test_empty_batch() {
     let dir = TempDir::new().unwrap();
     let engine = create_engine(&dir);
 
@@ -1178,12 +1197,12 @@ fn test_empty_batch() {
     batch.put(b"key".to_vec(), b"value".to_vec());
     engine.write_batch(batch).unwrap();
 
-    assert_eq!(get_for_test(&engine, b"key"), Some(b"value".to_vec()));
+    assert_eq!(get_for_test(&engine, b"key").await, Some(b"value".to_vec()));
 }
 
 /// Test very large values.
-#[test]
-fn test_large_values() {
+#[tokio::test]
+async fn test_large_values() {
     let dir = TempDir::new().unwrap();
     let (engine, _ilog) = create_durable_engine(&dir);
 
@@ -1195,12 +1214,12 @@ fn test_large_values() {
     engine.write_batch(batch).unwrap();
 
     // Verify before flush
-    let value = get_for_test(&engine, b"large_key");
+    let value = get_for_test(&engine, b"large_key").await;
     assert_eq!(value.as_ref().map(|v| v.len()), Some(1024 * 1024));
 
     // Flush and verify
     engine.flush_all_with_active().unwrap();
-    let value = get_for_test(&engine, b"large_key");
+    let value = get_for_test(&engine, b"large_key").await;
     assert_eq!(value, Some(large_value));
 }
 
@@ -1208,8 +1227,8 @@ fn test_large_values() {
 ///
 /// Note: Keys starting with 0xFF have special handling in MVCC encoding
 /// for disambiguation with timestamp suffixes, so we test with regular keys.
-#[test]
-fn test_small_keys() {
+#[tokio::test]
+async fn test_small_keys() {
     let dir = TempDir::new().unwrap();
     let (engine, _ilog) = create_durable_engine(&dir);
 
@@ -1223,22 +1242,22 @@ fn test_small_keys() {
 
     // Verify before flush
     assert_eq!(
-        get_for_test(&engine, &[0x00]),
+        get_for_test(&engine, &[0x00]).await,
         Some(b"null_byte_value".to_vec()),
         "Null byte key should work"
     );
     assert_eq!(
-        get_for_test(&engine, &[0x01]),
+        get_for_test(&engine, &[0x01]).await,
         Some(b"one_byte_value".to_vec()),
         "Single byte key should work"
     );
     assert_eq!(
-        get_for_test(&engine, &[0x7F]),
+        get_for_test(&engine, &[0x7F]).await,
         Some(b"mid_byte_value".to_vec()),
         "0x7F byte key should work"
     );
     assert_eq!(
-        get_for_test(&engine, &[0xFE]),
+        get_for_test(&engine, &[0xFE]).await,
         Some(b"high_byte_value".to_vec()),
         "0xFE byte key should work"
     );
@@ -1246,21 +1265,21 @@ fn test_small_keys() {
     // Flush and verify
     engine.flush_all_with_active().unwrap();
     assert_eq!(
-        get_for_test(&engine, &[0x00]),
+        get_for_test(&engine, &[0x00]).await,
         Some(b"null_byte_value".to_vec()),
         "Null byte key should work after flush"
     );
     assert_eq!(
-        get_for_test(&engine, &[0xFE]),
+        get_for_test(&engine, &[0xFE]).await,
         Some(b"high_byte_value".to_vec()),
         "0xFE byte key should work after flush"
     );
 }
 
 /// Test binary keys with all byte values.
-#[test]
-#[ignore = "Pre-existing: block_on_sync spin with many sequential SST reads"]
-fn test_binary_keys() {
+#[tokio::test]
+#[ignore = "Pre-existing: many sequential SST reads cause slowness"]
+async fn test_binary_keys() {
     let dir = TempDir::new().unwrap();
     let (engine, _ilog) = create_durable_engine(&dir);
 
@@ -1277,7 +1296,7 @@ fn test_binary_keys() {
 
     // Verify all
     for byte in 0u8..=255 {
-        let value = get_for_test(&engine, &[byte]);
+        let value = get_for_test(&engine, &[byte]).await;
         assert_eq!(
             value,
             Some(vec![byte]),
@@ -1287,8 +1306,8 @@ fn test_binary_keys() {
 }
 
 /// Test timestamp edge cases.
-#[test]
-fn test_timestamp_edge_cases() {
+#[tokio::test]
+async fn test_timestamp_edge_cases() {
     let dir = TempDir::new().unwrap();
     let engine = create_engine(&dir);
 
@@ -1304,11 +1323,11 @@ fn test_timestamp_edge_cases() {
 
     // Verify
     assert_eq!(
-        get_at_for_test(&engine, b"ts_0", 0),
+        get_at_for_test(&engine, b"ts_0", 0).await,
         Some(b"value_0".to_vec())
     );
     assert_eq!(
-        get_at_for_test(&engine, b"ts_max", u64::MAX - 1),
+        get_at_for_test(&engine, b"ts_max", u64::MAX - 1).await,
         Some(b"value_max".to_vec())
     );
 }

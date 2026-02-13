@@ -269,7 +269,7 @@ fn populate<E: StorageEngine>(engine: &E, config: &WorkloadConfig, ts_counter: &
 }
 
 /// Run OLTP workload on a single thread
-fn worker_thread<E: StorageEngine>(
+async fn worker_thread<E: StorageEngine>(
     engine: &E,
     config: &WorkloadConfig,
     ts_counter: &AtomicU64,
@@ -315,7 +315,7 @@ fn worker_thread<E: StorageEngine>(
                     _found = true;
                     break;
                 }
-                tisql::io::block_on_sync(iter.advance()).unwrap();
+                iter.advance().await.unwrap();
             }
             stats.record_read(start.elapsed().as_nanos() as u64);
         } else if op_type < config.point_select_pct + config.update_pct {
@@ -373,7 +373,7 @@ fn worker_thread<E: StorageEngine>(
 // Benchmark Runner
 // ============================================================================
 
-fn run_benchmark<E: StorageEngine + Default + 'static>(engine_name: &str, args: &Args) {
+async fn run_benchmark<E: StorageEngine + Default + 'static>(engine_name: &str, args: &Args) {
     println!("\n{}", "=".repeat(70));
     println!("Engine: {engine_name}");
     println!("{}", "=".repeat(70));
@@ -421,7 +421,7 @@ fn run_benchmark<E: StorageEngine + Default + 'static>(engine_name: &str, args: 
         let running = Arc::clone(&running);
         let config = config.clone();
 
-        handles.push(std::thread::spawn(move || {
+        handles.push(tokio::spawn(async move {
             worker_thread(
                 engine.as_ref(),
                 &config,
@@ -430,7 +430,8 @@ fn run_benchmark<E: StorageEngine + Default + 'static>(engine_name: &str, args: 
                 &stats,
                 &running,
                 tid,
-            );
+            )
+            .await;
         }));
     }
 
@@ -445,7 +446,7 @@ fn run_benchmark<E: StorageEngine + Default + 'static>(engine_name: &str, args: 
     println!("{}", "-".repeat(90));
 
     for sec in 1..=args.time {
-        std::thread::sleep(Duration::from_secs(args.report_interval));
+        tokio::time::sleep(Duration::from_secs(args.report_interval)).await;
 
         let now = Instant::now();
         let elapsed = now.duration_since(last_time).as_secs_f64();
@@ -469,7 +470,7 @@ fn run_benchmark<E: StorageEngine + Default + 'static>(engine_name: &str, args: 
     // Stop workers
     running.store(false, Ordering::SeqCst);
     for h in handles {
-        h.join().unwrap();
+        h.await.unwrap();
     }
 
     let total_time = test_start.elapsed();
@@ -591,7 +592,8 @@ impl Clone for WorkloadConfig {
 // Main
 // ============================================================================
 
-fn main() {
+#[tokio::main]
+async fn main() {
     let args = Args::parse();
 
     println!();
@@ -618,7 +620,7 @@ fn main() {
         std::process::exit(1);
     }
 
-    run_benchmark::<VersionedMemTableEngine>("VersionedMemTableEngine", &args);
+    run_benchmark::<VersionedMemTableEngine>("VersionedMemTableEngine", &args).await;
 
     println!();
     println!("Benchmark complete!");

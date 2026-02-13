@@ -340,7 +340,7 @@ mod tests {
     use crate::types::RawValue;
     use tempfile::TempDir;
 
-    fn get_at_for_test(engine: &LsmEngine, key: &[u8], ts: Timestamp) -> Option<RawValue> {
+    async fn get_at_for_test(engine: &LsmEngine, key: &[u8], ts: Timestamp) -> Option<RawValue> {
         use crate::storage::StorageEngine;
         let start = MvccKey::encode(key, ts);
         let end = MvccKey::encode(key, 0)
@@ -349,7 +349,7 @@ mod tests {
         let range = start..end;
 
         let mut iter = engine.scan_iter(range, 0).unwrap();
-        crate::io::block_on_sync(iter.advance()).unwrap(); // Position on first entry
+        iter.advance().await.unwrap(); // Position on first entry
 
         while iter.valid() {
             let decoded_key = iter.user_key();
@@ -360,16 +360,16 @@ mod tests {
                 }
                 return Some(iter.value().to_vec());
             }
-            crate::io::block_on_sync(iter.advance()).unwrap();
+            iter.advance().await.unwrap();
         }
         None
     }
 
-    fn get_for_test(engine: &LsmEngine, key: &[u8]) -> Option<RawValue> {
-        get_at_for_test(engine, key, Timestamp::MAX)
+    async fn get_for_test(engine: &LsmEngine, key: &[u8]) -> Option<RawValue> {
+        get_at_for_test(engine, key, Timestamp::MAX).await
     }
 
-    fn write_test_data(
+    async fn write_test_data(
         engine: &LsmEngine,
         clog: &FileClogService,
         count: usize,
@@ -384,7 +384,7 @@ mod tests {
             let mut batch = ClogBatch::new();
             batch.add_put(i as u64 + 1, key.clone(), value.clone());
             batch.add_commit(i as u64 + 1, i as Timestamp + 100);
-            crate::io::block_on_sync(clog.write(&mut batch, true).unwrap()).unwrap();
+            clog.write(&mut batch, true).unwrap().await.unwrap();
 
             // Write to engine
             let mut wb = WriteBatch::new();
@@ -398,14 +398,10 @@ mod tests {
         written
     }
 
-    #[test]
-    fn test_recovery_empty() {
+    #[tokio::test]
+    async fn test_recovery_empty() {
         let tmp = TempDir::new().unwrap();
-        let rt = tokio::runtime::Builder::new_current_thread()
-            .enable_all()
-            .build()
-            .unwrap();
-        let io_handle = rt.handle().clone();
+        let io_handle = tokio::runtime::Handle::current();
 
         let recovery = LsmRecovery::new(tmp.path());
         let result = recovery.recover(&io_handle).unwrap();
@@ -427,7 +423,7 @@ mod tests {
 
         // Verify we can read back what we wrote
         assert_eq!(
-            get_for_test(&result.engine, &key),
+            get_for_test(&result.engine, &key).await,
             Some(value.clone()),
             "Engine should be usable after empty recovery"
         );
@@ -437,20 +433,16 @@ mod tests {
 
         // Verify data survives flush
         assert_eq!(
-            get_for_test(&result.engine, &key),
+            get_for_test(&result.engine, &key).await,
             Some(value),
             "Data should survive flush after empty recovery"
         );
     }
 
-    #[test]
-    fn test_recovery_with_flushed_data() {
+    #[tokio::test]
+    async fn test_recovery_with_flushed_data() {
         let tmp = TempDir::new().unwrap();
-        let rt = tokio::runtime::Builder::new_current_thread()
-            .enable_all()
-            .build()
-            .unwrap();
-        let io_handle = rt.handle().clone();
+        let io_handle = tokio::runtime::Handle::current();
 
         // First session: write and flush
         let written = {
@@ -483,12 +475,12 @@ mod tests {
             )
             .unwrap();
 
-            let written = write_test_data(&engine, &clog, 5);
+            let written = write_test_data(&engine, &clog, 5).await;
 
             // Flush all to SST
             engine.flush_all_with_active().unwrap();
 
-            clog.close().unwrap();
+            clog.close().await.unwrap();
             written
         };
 
@@ -500,7 +492,7 @@ mod tests {
             // Data should be readable from SST (not replayed from clog)
             for (key, expected_value) in &written {
                 assert_eq!(
-                    get_for_test(&result.engine, key),
+                    get_for_test(&result.engine, key).await,
                     Some(expected_value.clone()),
                     "Key {:?} should be readable after recovery",
                     String::from_utf8_lossy(key)
@@ -516,14 +508,10 @@ mod tests {
         }
     }
 
-    #[test]
-    fn test_recovery_with_unflushed_data() {
+    #[tokio::test]
+    async fn test_recovery_with_unflushed_data() {
         let tmp = TempDir::new().unwrap();
-        let rt = tokio::runtime::Builder::new_current_thread()
-            .enable_all()
-            .build()
-            .unwrap();
-        let io_handle = rt.handle().clone();
+        let io_handle = tokio::runtime::Handle::current();
 
         // First session: write but don't flush
         let written = {
@@ -556,10 +544,10 @@ mod tests {
             )
             .unwrap();
 
-            let written = write_test_data(&engine, &clog, 3);
+            let written = write_test_data(&engine, &clog, 3).await;
 
             // Don't flush - simulate crash before flush
-            clog.close().unwrap();
+            clog.close().await.unwrap();
             written
         };
 
@@ -571,7 +559,7 @@ mod tests {
             // Data should be recovered from clog replay
             for (key, expected_value) in &written {
                 assert_eq!(
-                    get_for_test(&result.engine, key),
+                    get_for_test(&result.engine, key).await,
                     Some(expected_value.clone()),
                     "Key {:?} should be recovered from clog",
                     String::from_utf8_lossy(key)
@@ -586,14 +574,10 @@ mod tests {
         }
     }
 
-    #[test]
-    fn test_recovery_uncommitted_discarded() {
+    #[tokio::test]
+    async fn test_recovery_uncommitted_discarded() {
         let tmp = TempDir::new().unwrap();
-        let rt = tokio::runtime::Builder::new_current_thread()
-            .enable_all()
-            .build()
-            .unwrap();
-        let io_handle = rt.handle().clone();
+        let io_handle = tokio::runtime::Handle::current();
 
         // First session: write uncommitted data
         {
@@ -607,15 +591,15 @@ mod tests {
                 b"uncommitted_key".to_vec(),
                 b"uncommitted_value".to_vec(),
             );
-            crate::io::block_on_sync(clog.write(&mut batch, true).unwrap()).unwrap();
+            clog.write(&mut batch, true).unwrap().await.unwrap();
 
             // Write committed transaction
             let mut batch = ClogBatch::new();
             batch.add_put(2, b"committed_key".to_vec(), b"committed_value".to_vec());
             batch.add_commit(2, 100);
-            crate::io::block_on_sync(clog.write(&mut batch, true).unwrap()).unwrap();
+            clog.write(&mut batch, true).unwrap().await.unwrap();
 
-            clog.close().unwrap();
+            clog.close().await.unwrap();
         }
 
         // Second session: recover and verify
@@ -625,14 +609,14 @@ mod tests {
 
             // Uncommitted data should be discarded
             assert_eq!(
-                get_for_test(&result.engine, b"uncommitted_key"),
+                get_for_test(&result.engine, b"uncommitted_key").await,
                 None,
                 "Uncommitted data should be discarded"
             );
 
             // Committed data should be recovered
             assert_eq!(
-                get_for_test(&result.engine, b"committed_key"),
+                get_for_test(&result.engine, b"committed_key").await,
                 Some(b"committed_value".to_vec()),
                 "Committed data should be recovered"
             );
@@ -641,14 +625,10 @@ mod tests {
         }
     }
 
-    #[test]
-    fn test_recovery_partial_flush() {
+    #[tokio::test]
+    async fn test_recovery_partial_flush() {
         let tmp = TempDir::new().unwrap();
-        let rt = tokio::runtime::Builder::new_current_thread()
-            .enable_all()
-            .build()
-            .unwrap();
-        let io_handle = rt.handle().clone();
+        let io_handle = tokio::runtime::Handle::current();
 
         // First session: write some data, flush some, write more
         let (flushed, unflushed) = {
@@ -682,7 +662,7 @@ mod tests {
             .unwrap();
 
             // Write first batch and flush
-            let flushed = write_test_data(&engine, &clog, 2);
+            let flushed = write_test_data(&engine, &clog, 2).await;
             engine.flush_all_with_active().unwrap();
 
             // Write second batch without flush
@@ -695,7 +675,7 @@ mod tests {
                     let mut batch = ClogBatch::new();
                     batch.add_put(i as u64, key.clone(), value.clone());
                     batch.add_commit(i as u64, i as Timestamp + 100);
-                    crate::io::block_on_sync(clog.write(&mut batch, true).unwrap()).unwrap();
+                    clog.write(&mut batch, true).unwrap().await.unwrap();
 
                     let mut wb = WriteBatch::new();
                     wb.set_commit_ts(i as Timestamp + 100);
@@ -707,7 +687,7 @@ mod tests {
                 written
             };
 
-            clog.close().unwrap();
+            clog.close().await.unwrap();
             (flushed, unflushed)
         };
 
@@ -719,7 +699,7 @@ mod tests {
             // Flushed data should be readable from SST
             for (key, expected_value) in &flushed {
                 assert_eq!(
-                    get_for_test(&result.engine, key),
+                    get_for_test(&result.engine, key).await,
                     Some(expected_value.clone()),
                     "Flushed key {:?} should be readable",
                     String::from_utf8_lossy(key)
@@ -729,7 +709,7 @@ mod tests {
             // Unflushed data should be recovered from clog
             for (key, expected_value) in &unflushed {
                 assert_eq!(
-                    get_for_test(&result.engine, key),
+                    get_for_test(&result.engine, key).await,
                     Some(expected_value.clone()),
                     "Unflushed key {:?} should be recovered",
                     String::from_utf8_lossy(key)
@@ -746,14 +726,10 @@ mod tests {
 
     /// Test that unified LSN provider ensures correct ordering across clog and ilog.
     /// This test specifically verifies that both logs use the same LSN space.
-    #[test]
-    fn test_unified_lsn_provider() {
+    #[tokio::test]
+    async fn test_unified_lsn_provider() {
         let tmp = TempDir::new().unwrap();
-        let rt = tokio::runtime::Builder::new_current_thread()
-            .enable_all()
-            .build()
-            .unwrap();
-        let io_handle = rt.handle().clone();
+        let io_handle = tokio::runtime::Handle::current();
 
         // First session: interleave clog and ilog operations
         {
@@ -796,8 +772,7 @@ mod tests {
                 let mut batch = ClogBatch::new();
                 batch.add_put(i as u64 + 1, key.clone(), value.clone());
                 batch.add_commit(i as u64 + 1, i as Timestamp + 100);
-                let clog_lsn =
-                    crate::io::block_on_sync(clog.write(&mut batch, true).unwrap()).unwrap();
+                let clog_lsn = clog.write(&mut batch, true).unwrap().await.unwrap();
 
                 // Write to engine WITH CLOG LSN (this is critical for correct recovery!)
                 // TransactionService does this to ensure storage LSN matches CLOG LSN
@@ -822,7 +797,7 @@ mod tests {
                 "LSN should advance after flush (ilog writes)"
             );
 
-            clog.close().unwrap();
+            clog.close().await.unwrap();
         }
 
         // Second session: verify recovery sees correct LSN ordering
@@ -835,7 +810,7 @@ mod tests {
                 let key = format!("key_{i:04}").into_bytes();
                 let expected_value = format!("value_{i:04}").into_bytes();
                 assert_eq!(
-                    get_for_test(&result.engine, &key),
+                    get_for_test(&result.engine, &key).await,
                     Some(expected_value),
                     "Key should be recovered"
                 );
@@ -864,15 +839,11 @@ mod tests {
         }
     }
 
-    #[test]
-    fn test_recovery_with_custom_configs() {
+    #[tokio::test]
+    async fn test_recovery_with_custom_configs() {
         // Test LsmRecovery::with_configs() constructor
         let tmp = TempDir::new().unwrap();
-        let rt = tokio::runtime::Builder::new_current_thread()
-            .enable_all()
-            .build()
-            .unwrap();
-        let io_handle = rt.handle().clone();
+        let io_handle = tokio::runtime::Handle::current();
 
         let lsm_config = LsmConfig::builder(tmp.path())
             .memtable_size(1024)
@@ -889,14 +860,10 @@ mod tests {
         assert_eq!(result.stats.txn_count, 0);
     }
 
-    #[test]
-    fn test_recovery_with_delete_operations() {
+    #[tokio::test]
+    async fn test_recovery_with_delete_operations() {
         let tmp = TempDir::new().unwrap();
-        let rt = tokio::runtime::Builder::new_current_thread()
-            .enable_all()
-            .build()
-            .unwrap();
-        let io_handle = rt.handle().clone();
+        let io_handle = tokio::runtime::Handle::current();
 
         // First session: write data and then delete some
         {
@@ -907,21 +874,21 @@ mod tests {
             let mut batch = ClogBatch::new();
             batch.add_put(1, b"key1".to_vec(), b"value1".to_vec());
             batch.add_commit(1, 100);
-            crate::io::block_on_sync(clog.write(&mut batch, true).unwrap()).unwrap();
+            clog.write(&mut batch, true).unwrap().await.unwrap();
 
             // Insert key2
             let mut batch = ClogBatch::new();
             batch.add_put(2, b"key2".to_vec(), b"value2".to_vec());
             batch.add_commit(2, 200);
-            crate::io::block_on_sync(clog.write(&mut batch, true).unwrap()).unwrap();
+            clog.write(&mut batch, true).unwrap().await.unwrap();
 
             // Delete key1
             let mut batch = ClogBatch::new();
             batch.add_delete(3, b"key1".to_vec());
             batch.add_commit(3, 300);
-            crate::io::block_on_sync(clog.write(&mut batch, true).unwrap()).unwrap();
+            clog.write(&mut batch, true).unwrap().await.unwrap();
 
-            clog.close().unwrap();
+            clog.close().await.unwrap();
         }
 
         // Second session: recover and verify
@@ -931,14 +898,14 @@ mod tests {
 
             // key1 should be deleted (tombstone)
             assert_eq!(
-                get_for_test(&result.engine, b"key1"),
+                get_for_test(&result.engine, b"key1").await,
                 None,
                 "key1 should be deleted"
             );
 
             // key2 should still exist
             assert_eq!(
-                get_for_test(&result.engine, b"key2"),
+                get_for_test(&result.engine, b"key2").await,
                 Some(b"value2".to_vec()),
                 "key2 should exist"
             );
@@ -947,14 +914,10 @@ mod tests {
         }
     }
 
-    #[test]
-    fn test_recovery_with_rollback_operations() {
+    #[tokio::test]
+    async fn test_recovery_with_rollback_operations() {
         let tmp = TempDir::new().unwrap();
-        let rt = tokio::runtime::Builder::new_current_thread()
-            .enable_all()
-            .build()
-            .unwrap();
-        let io_handle = rt.handle().clone();
+        let io_handle = tokio::runtime::Handle::current();
 
         // First session: write data and rollback some
         {
@@ -965,12 +928,12 @@ mod tests {
             let mut batch = ClogBatch::new();
             batch.add_put(1, b"committed_key".to_vec(), b"value".to_vec());
             batch.add_commit(1, 100);
-            crate::io::block_on_sync(clog.write(&mut batch, true).unwrap()).unwrap();
+            clog.write(&mut batch, true).unwrap().await.unwrap();
 
             // Transaction 2: rolled back
             let mut batch = ClogBatch::new();
             batch.add_put(2, b"rolled_back_key".to_vec(), b"value".to_vec());
-            crate::io::block_on_sync(clog.write(&mut batch, true).unwrap()).unwrap();
+            clog.write(&mut batch, true).unwrap().await.unwrap();
 
             let mut batch = ClogBatch::new();
             batch.add(ClogEntry {
@@ -978,9 +941,9 @@ mod tests {
                 txn_id: 2,
                 op: ClogOp::Rollback,
             });
-            crate::io::block_on_sync(clog.write(&mut batch, true).unwrap()).unwrap();
+            clog.write(&mut batch, true).unwrap().await.unwrap();
 
-            clog.close().unwrap();
+            clog.close().await.unwrap();
         }
 
         // Second session: recover and verify
@@ -990,14 +953,14 @@ mod tests {
 
             // Committed transaction should be recovered
             assert_eq!(
-                get_for_test(&result.engine, b"committed_key"),
+                get_for_test(&result.engine, b"committed_key").await,
                 Some(b"value".to_vec()),
                 "Committed data should be recovered"
             );
 
             // Rolled back transaction should not appear
             assert_eq!(
-                get_for_test(&result.engine, b"rolled_back_key"),
+                get_for_test(&result.engine, b"rolled_back_key").await,
                 None,
                 "Rolled back data should not appear"
             );
@@ -1007,14 +970,10 @@ mod tests {
         }
     }
 
-    #[test]
-    fn test_recovery_stats_max_commit_ts() {
+    #[tokio::test]
+    async fn test_recovery_stats_max_commit_ts() {
         let tmp = TempDir::new().unwrap();
-        let rt = tokio::runtime::Builder::new_current_thread()
-            .enable_all()
-            .build()
-            .unwrap();
-        let io_handle = rt.handle().clone();
+        let io_handle = tokio::runtime::Handle::current();
 
         // First session: write data with various commit timestamps
         {
@@ -1025,21 +984,21 @@ mod tests {
             let mut batch = ClogBatch::new();
             batch.add_put(1, b"key1".to_vec(), b"v1".to_vec());
             batch.add_commit(1, 100);
-            crate::io::block_on_sync(clog.write(&mut batch, true).unwrap()).unwrap();
+            clog.write(&mut batch, true).unwrap().await.unwrap();
 
             // Commit at ts=500 (highest)
             let mut batch = ClogBatch::new();
             batch.add_put(2, b"key2".to_vec(), b"v2".to_vec());
             batch.add_commit(2, 500);
-            crate::io::block_on_sync(clog.write(&mut batch, true).unwrap()).unwrap();
+            clog.write(&mut batch, true).unwrap().await.unwrap();
 
             // Commit at ts=300
             let mut batch = ClogBatch::new();
             batch.add_put(3, b"key3".to_vec(), b"v3".to_vec());
             batch.add_commit(3, 300);
-            crate::io::block_on_sync(clog.write(&mut batch, true).unwrap()).unwrap();
+            clog.write(&mut batch, true).unwrap().await.unwrap();
 
-            clog.close().unwrap();
+            clog.close().await.unwrap();
         }
 
         // Second session: verify max_commit_ts
@@ -1054,14 +1013,10 @@ mod tests {
         }
     }
 
-    #[test]
-    fn test_recovery_interleaved_transactions() {
+    #[tokio::test]
+    async fn test_recovery_interleaved_transactions() {
         let tmp = TempDir::new().unwrap();
-        let rt = tokio::runtime::Builder::new_current_thread()
-            .enable_all()
-            .build()
-            .unwrap();
-        let io_handle = rt.handle().clone();
+        let io_handle = tokio::runtime::Handle::current();
 
         // First session: interleaved transaction writes
         {
@@ -1071,23 +1026,23 @@ mod tests {
             // Start both transactions
             let mut batch = ClogBatch::new();
             batch.add_put(1, b"txn1_key".to_vec(), b"txn1_value".to_vec());
-            crate::io::block_on_sync(clog.write(&mut batch, true).unwrap()).unwrap();
+            clog.write(&mut batch, true).unwrap().await.unwrap();
 
             let mut batch = ClogBatch::new();
             batch.add_put(2, b"txn2_key".to_vec(), b"txn2_value".to_vec());
-            crate::io::block_on_sync(clog.write(&mut batch, true).unwrap()).unwrap();
+            clog.write(&mut batch, true).unwrap().await.unwrap();
 
             // Commit txn2 first (out of order)
             let mut batch = ClogBatch::new();
             batch.add_commit(2, 200);
-            crate::io::block_on_sync(clog.write(&mut batch, true).unwrap()).unwrap();
+            clog.write(&mut batch, true).unwrap().await.unwrap();
 
             // Then commit txn1
             let mut batch = ClogBatch::new();
             batch.add_commit(1, 100);
-            crate::io::block_on_sync(clog.write(&mut batch, true).unwrap()).unwrap();
+            clog.write(&mut batch, true).unwrap().await.unwrap();
 
-            clog.close().unwrap();
+            clog.close().await.unwrap();
         }
 
         // Second session: both should be recovered
@@ -1096,11 +1051,11 @@ mod tests {
             let result = recovery.recover(&io_handle).unwrap();
 
             assert_eq!(
-                get_for_test(&result.engine, b"txn1_key"),
+                get_for_test(&result.engine, b"txn1_key").await,
                 Some(b"txn1_value".to_vec())
             );
             assert_eq!(
-                get_for_test(&result.engine, b"txn2_key"),
+                get_for_test(&result.engine, b"txn2_key").await,
                 Some(b"txn2_value".to_vec())
             );
 
@@ -1108,14 +1063,10 @@ mod tests {
         }
     }
 
-    #[test]
-    fn test_recovery_multi_key_transaction() {
+    #[tokio::test]
+    async fn test_recovery_multi_key_transaction() {
         let tmp = TempDir::new().unwrap();
-        let rt = tokio::runtime::Builder::new_current_thread()
-            .enable_all()
-            .build()
-            .unwrap();
-        let io_handle = rt.handle().clone();
+        let io_handle = tokio::runtime::Handle::current();
 
         // First session: transaction with multiple keys
         {
@@ -1128,9 +1079,9 @@ mod tests {
             batch.add_put(1, b"key_b".to_vec(), b"value_b".to_vec());
             batch.add_put(1, b"key_c".to_vec(), b"value_c".to_vec());
             batch.add_commit(1, 100);
-            crate::io::block_on_sync(clog.write(&mut batch, true).unwrap()).unwrap();
+            clog.write(&mut batch, true).unwrap().await.unwrap();
 
-            clog.close().unwrap();
+            clog.close().await.unwrap();
         }
 
         // Second session: all keys should be recovered
@@ -1139,15 +1090,15 @@ mod tests {
             let result = recovery.recover(&io_handle).unwrap();
 
             assert_eq!(
-                get_for_test(&result.engine, b"key_a"),
+                get_for_test(&result.engine, b"key_a").await,
                 Some(b"value_a".to_vec())
             );
             assert_eq!(
-                get_for_test(&result.engine, b"key_b"),
+                get_for_test(&result.engine, b"key_b").await,
                 Some(b"value_b".to_vec())
             );
             assert_eq!(
-                get_for_test(&result.engine, b"key_c"),
+                get_for_test(&result.engine, b"key_c").await,
                 Some(b"value_c".to_vec())
             );
 
@@ -1155,15 +1106,11 @@ mod tests {
         }
     }
 
-    #[test]
-    fn test_recovery_max_commit_ts_from_sst() {
+    #[tokio::test]
+    async fn test_recovery_max_commit_ts_from_sst() {
         // Test that max_commit_ts is taken from SST metadata when clog is truncated
         let tmp = TempDir::new().unwrap();
-        let rt = tokio::runtime::Builder::new_current_thread()
-            .enable_all()
-            .build()
-            .unwrap();
-        let io_handle = rt.handle().clone();
+        let io_handle = tokio::runtime::Handle::current();
 
         // First session: write and flush data with high timestamp
         {
@@ -1202,7 +1149,7 @@ mod tests {
             let mut batch = ClogBatch::new();
             batch.add_put(1, key.clone(), value.clone());
             batch.add_commit(1, 9999);
-            let clog_lsn = crate::io::block_on_sync(clog.write(&mut batch, true).unwrap()).unwrap();
+            let clog_lsn = clog.write(&mut batch, true).unwrap().await.unwrap();
 
             let mut wb = WriteBatch::new();
             wb.set_commit_ts(9999);
@@ -1213,7 +1160,7 @@ mod tests {
             // Flush to SST
             engine.flush_all_with_active().unwrap();
 
-            clog.close().unwrap();
+            clog.close().await.unwrap();
         }
 
         // Second session: verify max_commit_ts is recovered from SST
@@ -1230,15 +1177,11 @@ mod tests {
         }
     }
 
-    #[test]
-    fn test_recovery_empty_transaction() {
+    #[tokio::test]
+    async fn test_recovery_empty_transaction() {
         // Transaction with no writes followed by commit should be ignored
         let tmp = TempDir::new().unwrap();
-        let rt = tokio::runtime::Builder::new_current_thread()
-            .enable_all()
-            .build()
-            .unwrap();
-        let io_handle = rt.handle().clone();
+        let io_handle = tokio::runtime::Handle::current();
 
         {
             let clog_config = FileClogConfig::with_dir(tmp.path());
@@ -1247,15 +1190,15 @@ mod tests {
             // Empty transaction (commit without any puts)
             let mut batch = ClogBatch::new();
             batch.add_commit(1, 100);
-            crate::io::block_on_sync(clog.write(&mut batch, true).unwrap()).unwrap();
+            clog.write(&mut batch, true).unwrap().await.unwrap();
 
             // Normal transaction
             let mut batch = ClogBatch::new();
             batch.add_put(2, b"key".to_vec(), b"value".to_vec());
             batch.add_commit(2, 200);
-            crate::io::block_on_sync(clog.write(&mut batch, true).unwrap()).unwrap();
+            clog.write(&mut batch, true).unwrap().await.unwrap();
 
-            clog.close().unwrap();
+            clog.close().await.unwrap();
         }
 
         {
@@ -1265,7 +1208,7 @@ mod tests {
             // Only 1 transaction with data should be counted
             assert_eq!(result.stats.txn_count, 1);
             assert_eq!(
-                get_for_test(&result.engine, b"key"),
+                get_for_test(&result.engine, b"key").await,
                 Some(b"value".to_vec())
             );
         }
@@ -1277,14 +1220,10 @@ mod tests {
     /// Entries with lsn > flushed_lsn must be replayed from clog.
     /// This test verifies the exact boundary: writes before flush are in SST,
     /// writes after flush are replayed from clog.
-    #[test]
-    fn test_recovery_flushed_lsn_boundary() {
+    #[tokio::test]
+    async fn test_recovery_flushed_lsn_boundary() {
         let tmp = TempDir::new().unwrap();
-        let rt = tokio::runtime::Builder::new_current_thread()
-            .enable_all()
-            .build()
-            .unwrap();
-        let io_handle = rt.handle().clone();
+        let io_handle = tokio::runtime::Handle::current();
 
         let flushed_lsn;
 
@@ -1326,8 +1265,7 @@ mod tests {
                 let mut batch = ClogBatch::new();
                 batch.add_put(i as u64 + 1, key.clone(), value.clone());
                 batch.add_commit(i as u64 + 1, i as Timestamp + 100);
-                let clog_lsn =
-                    crate::io::block_on_sync(clog.write(&mut batch, true).unwrap()).unwrap();
+                let clog_lsn = clog.write(&mut batch, true).unwrap().await.unwrap();
 
                 let mut wb = WriteBatch::new();
                 wb.set_commit_ts(i as Timestamp + 100);
@@ -1349,8 +1287,7 @@ mod tests {
                 let mut batch = ClogBatch::new();
                 batch.add_put(i as u64 + 100, key.clone(), value.clone());
                 batch.add_commit(i as u64 + 100, i as Timestamp + 200);
-                let clog_lsn =
-                    crate::io::block_on_sync(clog.write(&mut batch, true).unwrap()).unwrap();
+                let clog_lsn = clog.write(&mut batch, true).unwrap().await.unwrap();
 
                 // Verify these clog entries have LSN > flushed_lsn
                 assert!(
@@ -1365,7 +1302,7 @@ mod tests {
                 engine.write_batch(wb).unwrap();
             }
 
-            clog.close().unwrap();
+            clog.close().await.unwrap();
         }
 
         // Second session: recover and verify boundary
@@ -1378,7 +1315,7 @@ mod tests {
                 let key = format!("flushed_key_{i}").into_bytes();
                 let expected = format!("flushed_val_{i}").into_bytes();
                 assert_eq!(
-                    get_for_test(&result.engine, &key),
+                    get_for_test(&result.engine, &key).await,
                     Some(expected),
                     "Flushed key {i} should be recovered from SST"
                 );
@@ -1389,7 +1326,7 @@ mod tests {
                 let key = format!("unflushed_key_{i}").into_bytes();
                 let expected = format!("unflushed_val_{i}").into_bytes();
                 assert_eq!(
-                    get_for_test(&result.engine, &key),
+                    get_for_test(&result.engine, &key).await,
                     Some(expected),
                     "Unflushed key {i} should be recovered from clog"
                 );
@@ -1407,14 +1344,10 @@ mod tests {
         }
     }
 
-    #[test]
-    fn test_recovery_orphan_ssts_cleaned_stat() {
+    #[tokio::test]
+    async fn test_recovery_orphan_ssts_cleaned_stat() {
         let tmp = TempDir::new().unwrap();
-        let rt = tokio::runtime::Builder::new_current_thread()
-            .enable_all()
-            .build()
-            .unwrap();
-        let io_handle = rt.handle().clone();
+        let io_handle = tokio::runtime::Handle::current();
 
         // First create an incomplete flush intent (which creates an orphan)
         {

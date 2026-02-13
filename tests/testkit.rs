@@ -24,7 +24,6 @@
 
 use std::sync::Arc;
 use tempfile::TempDir;
-use tisql::io::block_on_sync;
 use tisql::{Database, DatabaseConfig, QueryResult};
 
 /// TestKit provides a convenient API for testing SQL execution
@@ -48,24 +47,24 @@ impl TestKit {
     }
 
     /// Execute SQL and panic on error
-    pub fn must_exec(&self, sql: &str) -> ExecResult {
-        match block_on_sync(self.db.handle_mp_query(sql)) {
+    pub async fn must_exec(&self, sql: &str) -> ExecResult {
+        match self.db.handle_mp_query(sql).await {
             Ok(result) => ExecResult { result },
             Err(e) => panic!("SQL execution failed: {e}\nSQL: {sql}"),
         }
     }
 
     /// Execute SQL and expect an error
-    pub fn must_exec_err(&self, sql: &str) -> String {
-        match block_on_sync(self.db.handle_mp_query(sql)) {
+    pub async fn must_exec_err(&self, sql: &str) -> String {
+        match self.db.handle_mp_query(sql).await {
             Ok(_) => panic!("Expected error but got success\nSQL: {sql}"),
             Err(e) => e.to_string(),
         }
     }
 
     /// Execute SQL that should return rows
-    pub fn must_query(&self, sql: &str) -> QueryChecker {
-        match block_on_sync(self.db.handle_mp_query(sql)) {
+    pub async fn must_query(&self, sql: &str) -> QueryChecker {
+        match self.db.handle_mp_query(sql).await {
             Ok(QueryResult::Rows { columns, data }) => QueryChecker { columns, data },
             Ok(other) => panic!("Expected rows but got: {other:?}\nSQL: {sql}"),
             Err(e) => panic!("Query failed: {e}\nSQL: {sql}"),
@@ -74,8 +73,11 @@ impl TestKit {
 
     /// Execute SQL without checking result
     #[allow(dead_code)]
-    pub fn exec(&self, sql: &str) -> Result<QueryResult, String> {
-        block_on_sync(self.db.handle_mp_query(sql)).map_err(|e| e.to_string())
+    pub async fn exec(&self, sql: &str) -> Result<QueryResult, String> {
+        self.db
+            .handle_mp_query(sql)
+            .await
+            .map_err(|e| e.to_string())
     }
 
     /// Get the underlying database
@@ -202,39 +204,44 @@ macro_rules! rows {
 mod tests {
     use super::*;
 
-    #[test]
-    fn test_testkit_basic() {
+    #[tokio::test]
+    async fn test_testkit_basic() {
         let tk = TestKit::new();
 
         tk.must_exec("CREATE TABLE t (id INT PRIMARY KEY, name VARCHAR(100))")
+            .await
             .check_ok();
         tk.must_exec("INSERT INTO t VALUES (1, 'Alice'), (2, 'Bob')")
+            .await
             .check_affected(2);
 
         tk.must_query("SELECT id, name FROM t ORDER BY id")
+            .await
             .check(rows![["1", "Alice"], ["2", "Bob"]]);
 
-        tk.must_exec("DROP TABLE t").check_ok();
+        tk.must_exec("DROP TABLE t").await.check_ok();
     }
 
-    #[test]
-    fn test_testkit_query_checker() {
+    #[tokio::test]
+    async fn test_testkit_query_checker() {
         let tk = TestKit::new();
 
-        tk.must_exec("CREATE TABLE t (a INT PRIMARY KEY, b INT)");
-        tk.must_exec("INSERT INTO t VALUES (1, 10), (2, 20), (3, 30)");
+        tk.must_exec("CREATE TABLE t (a INT PRIMARY KEY, b INT)")
+            .await;
+        tk.must_exec("INSERT INTO t VALUES (1, 10), (2, 20), (3, 30)")
+            .await;
 
-        let result = tk.must_query("SELECT a, b FROM t ORDER BY a");
+        let result = tk.must_query("SELECT a, b FROM t ORDER BY a").await;
         result.check_row_count(3);
         result.check_columns(vec!["a", "b"]);
         result.check(rows![["1", "10"], ["2", "20"], ["3", "30"]]);
     }
 
-    #[test]
-    fn test_testkit_error() {
+    #[tokio::test]
+    async fn test_testkit_error() {
         let tk = TestKit::new();
 
-        let err = tk.must_exec_err("SELECT * FROM non_existent_table");
+        let err = tk.must_exec_err("SELECT * FROM non_existent_table").await;
         assert!(err.contains("not found") || err.contains("Table"));
     }
 }

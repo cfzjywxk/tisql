@@ -24,16 +24,16 @@ use crate::types::{ColumnInfo, DataType, Schema, Timestamp, Value};
 use super::plan::{AggFunc, BinaryOp, Expr, JoinType, LogicalPlan, OrderByExpr, UnaryOp};
 
 /// SQL Binder - resolves names, checks types, produces logical plan
-pub struct Binder<'a> {
-    catalog: &'a dyn Catalog,
+pub struct Binder<'a, C: Catalog> {
+    catalog: &'a C,
     current_schema: String,
     /// Timestamp for MVCC schema reads. If None, uses latest schema.
     snapshot_ts: Option<Timestamp>,
 }
 
-impl<'a> Binder<'a> {
+impl<'a, C: Catalog> Binder<'a, C> {
     /// Create a new Binder that reads the latest schema (for DDL).
-    pub fn new(catalog: &'a dyn Catalog, current_schema: &str) -> Self {
+    pub fn new(catalog: &'a C, current_schema: &str) -> Self {
         Self {
             catalog,
             current_schema: current_schema.to_string(),
@@ -46,7 +46,7 @@ impl<'a> Binder<'a> {
     /// This enables MVCC schema visibility - the Binder will see the schema
     /// as it existed at the specified timestamp.
     #[allow(dead_code)]
-    pub fn with_snapshot_ts(catalog: &'a dyn Catalog, current_schema: &str, ts: Timestamp) -> Self {
+    pub fn with_snapshot_ts(catalog: &'a C, current_schema: &str, ts: Timestamp) -> Self {
         Self {
             catalog,
             current_schema: current_schema.to_string(),

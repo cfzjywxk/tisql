@@ -488,10 +488,7 @@ impl IlogService {
             .lock()
             .submit(Vec::new(), true)
             .map_err(|e| TiSqlError::Internal(format!("Ilog group commit sync failed: {e}")))?;
-        crate::io::block_on_sync(rx)
-            .map_err(|_| TiSqlError::Internal("Ilog writer dropped".into()))?
-            .map_err(|e| TiSqlError::Internal(format!("Ilog group commit sync failed: {e}")))?;
-        Ok(())
+        self.wait_for_reply(rx)
     }
 
     /// Clean up orphan SST files.
@@ -691,9 +688,7 @@ impl IlogService {
             .lock()
             .submit(buf, true)
             .map_err(|e| TiSqlError::Internal(format!("Ilog group commit failed: {e}")))?;
-        crate::io::block_on_sync(rx)
-            .map_err(|_| TiSqlError::Internal("Ilog writer dropped".into()))?
-            .map_err(|e| TiSqlError::Internal(format!("Ilog group commit failed: {e}")))?;
+        self.wait_for_reply(rx)?;
 
         // Failpoint: crash after fsync
         #[cfg(feature = "failpoints")]
@@ -701,6 +696,18 @@ impl IlogService {
 
         self.records_since_checkpoint.fetch_add(1, Ordering::SeqCst);
 
+        Ok(())
+    }
+
+    /// Wait for group commit reply. Uses `.await` in async context,
+    /// falls back to `block_on_sync` otherwise.
+    fn wait_for_reply(
+        &self,
+        rx: tokio::sync::oneshot::Receiver<std::result::Result<(), String>>,
+    ) -> Result<()> {
+        crate::io::block_on_sync(rx)
+            .map_err(|_| TiSqlError::Internal("Ilog writer dropped".into()))?
+            .map_err(|e| TiSqlError::Internal(format!("Ilog group commit failed: {e}")))?;
         Ok(())
     }
 

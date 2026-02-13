@@ -26,81 +26,102 @@ use testkit::TestKit;
 mod crud {
     use super::*;
 
-    #[test]
-    fn test_create_insert_select() {
+    #[tokio::test]
+    async fn test_create_insert_select() {
         let tk = TestKit::new();
 
         tk.must_exec(
             "CREATE TABLE users (id INT PRIMARY KEY, name VARCHAR(100), email VARCHAR(100))",
-        );
+        )
+        .await;
 
         // Single insert
         tk.must_exec(
             "INSERT INTO users (id, name, email) VALUES (1, 'Alice', 'alice@example.com')",
         )
+        .await
         .check_affected(1);
 
         // Multiple insert
-        tk.must_exec("INSERT INTO users VALUES (2, 'Bob', 'bob@example.com'), (3, 'Charlie', 'charlie@example.com')")
+        tk.must_exec("INSERT INTO users VALUES (2, 'Bob', 'bob@example.com'), (3, 'Charlie', 'charlie@example.com')").await
             .check_affected(2);
 
         // Select all
         tk.must_query("SELECT id, name FROM users ORDER BY id")
+            .await
             .check(rows![["1", "Alice"], ["2", "Bob"], ["3", "Charlie"]]);
 
         // Select with WHERE
         tk.must_query("SELECT name, email FROM users WHERE id = 2")
+            .await
             .check(rows![["Bob", "bob@example.com"]]);
     }
 
-    #[test]
-    fn test_update_single() {
+    #[tokio::test]
+    async fn test_update_single() {
         let tk = TestKit::new();
 
-        tk.must_exec("CREATE TABLE t (id INT PRIMARY KEY, val INT)");
-        tk.must_exec("INSERT INTO t VALUES (1, 100)");
+        tk.must_exec("CREATE TABLE t (id INT PRIMARY KEY, val INT)")
+            .await;
+        tk.must_exec("INSERT INTO t VALUES (1, 100)").await;
 
         // Update single row
         tk.must_exec("UPDATE t SET val = 150 WHERE id = 1")
+            .await
             .check_affected(1);
         tk.must_query("SELECT val FROM t WHERE id = 1")
+            .await
             .check(rows![["150"]]);
     }
 
-    #[test]
-    fn test_update_with_expression() {
+    #[tokio::test]
+    async fn test_update_with_expression() {
         let tk = TestKit::new();
 
-        tk.must_exec("CREATE TABLE t (a INT PRIMARY KEY, b INT)");
-        tk.must_exec("INSERT INTO t VALUES (1, 11)");
-        tk.must_exec("INSERT INTO t VALUES (2, 22)");
+        tk.must_exec("CREATE TABLE t (a INT PRIMARY KEY, b INT)")
+            .await;
+        tk.must_exec("INSERT INTO t VALUES (1, 11)").await;
+        tk.must_exec("INSERT INTO t VALUES (2, 22)").await;
 
         // Update using column reference in expression (e.g., b = b + 1)
-        tk.must_exec("UPDATE t SET b = b + 1").check_affected(2);
+        tk.must_exec("UPDATE t SET b = b + 1")
+            .await
+            .check_affected(2);
         tk.must_query("SELECT a, b FROM t ORDER BY a")
+            .await
             .check(rows![["1", "12"], ["2", "23"]]);
 
         // Update primary key column with expression
-        tk.must_exec("UPDATE t SET a = a + 10").check_affected(2);
+        tk.must_exec("UPDATE t SET a = a + 10")
+            .await
+            .check_affected(2);
         tk.must_query("SELECT a, b FROM t ORDER BY a")
+            .await
             .check(rows![["11", "12"], ["12", "23"]]);
     }
 
-    #[test]
-    fn test_delete() {
+    #[tokio::test]
+    async fn test_delete() {
         let tk = TestKit::new();
 
-        tk.must_exec("CREATE TABLE t (id INT PRIMARY KEY)");
-        tk.must_exec("INSERT INTO t VALUES (1), (2), (3), (4), (5)");
+        tk.must_exec("CREATE TABLE t (id INT PRIMARY KEY)").await;
+        tk.must_exec("INSERT INTO t VALUES (1), (2), (3), (4), (5)")
+            .await;
 
         // Delete single row
-        tk.must_exec("DELETE FROM t WHERE id = 3").check_affected(1);
+        tk.must_exec("DELETE FROM t WHERE id = 3")
+            .await
+            .check_affected(1);
         tk.must_query("SELECT id FROM t ORDER BY id")
+            .await
             .check(rows![["1"], ["2"], ["4"], ["5"]]);
 
         // Delete multiple rows
-        tk.must_exec("DELETE FROM t WHERE id > 2").check_affected(2);
+        tk.must_exec("DELETE FROM t WHERE id > 2")
+            .await
+            .check_affected(2);
         tk.must_query("SELECT id FROM t ORDER BY id")
+            .await
             .check(rows![["1"], ["2"]]);
     }
 }
@@ -109,61 +130,69 @@ mod crud {
 mod select {
     use super::*;
 
-    #[test]
-    fn test_order_by() {
+    #[tokio::test]
+    async fn test_order_by() {
         let tk = TestKit::new();
 
-        tk.must_exec("CREATE TABLE t (a INT PRIMARY KEY, b VARCHAR(10))");
-        tk.must_exec("INSERT INTO t VALUES (3, 'c'), (1, 'a'), (2, 'b')");
+        tk.must_exec("CREATE TABLE t (a INT PRIMARY KEY, b VARCHAR(10))")
+            .await;
+        tk.must_exec("INSERT INTO t VALUES (3, 'c'), (1, 'a'), (2, 'b')")
+            .await;
 
         // ORDER BY ASC
-        tk.must_query("SELECT a, b FROM t ORDER BY a").check(rows![
-            ["1", "a"],
-            ["2", "b"],
-            ["3", "c"]
-        ]);
+        tk.must_query("SELECT a, b FROM t ORDER BY a")
+            .await
+            .check(rows![["1", "a"], ["2", "b"], ["3", "c"]]);
 
         // ORDER BY DESC
         tk.must_query("SELECT a, b FROM t ORDER BY a DESC")
+            .await
             .check(rows![["3", "c"], ["2", "b"], ["1", "a"]]);
     }
 
-    #[test]
-    fn test_limit_offset() {
+    #[tokio::test]
+    async fn test_limit_offset() {
         let tk = TestKit::new();
 
-        tk.must_exec("CREATE TABLE t (id INT PRIMARY KEY)");
-        tk.must_exec("INSERT INTO t VALUES (1), (2), (3), (4), (5)");
+        tk.must_exec("CREATE TABLE t (id INT PRIMARY KEY)").await;
+        tk.must_exec("INSERT INTO t VALUES (1), (2), (3), (4), (5)")
+            .await;
 
         // LIMIT only
         tk.must_query("SELECT id FROM t ORDER BY id LIMIT 3")
+            .await
             .check(rows![["1"], ["2"], ["3"]]);
 
         // LIMIT with OFFSET
         tk.must_query("SELECT id FROM t ORDER BY id LIMIT 2 OFFSET 2")
+            .await
             .check(rows![["3"], ["4"]]);
     }
 
-    #[test]
-    fn test_projection() {
+    #[tokio::test]
+    async fn test_projection() {
         let tk = TestKit::new();
 
-        tk.must_exec("CREATE TABLE t (a INT PRIMARY KEY, b INT, c INT)");
-        tk.must_exec("INSERT INTO t VALUES (1, 2, 3)");
+        tk.must_exec("CREATE TABLE t (a INT PRIMARY KEY, b INT, c INT)")
+            .await;
+        tk.must_exec("INSERT INTO t VALUES (1, 2, 3)").await;
 
-        tk.must_query("SELECT a FROM t").check(rows![["1"]]);
-        tk.must_query("SELECT b, a FROM t").check(rows![["2", "1"]]);
+        tk.must_query("SELECT a FROM t").await.check(rows![["1"]]);
+        tk.must_query("SELECT b, a FROM t")
+            .await
+            .check(rows![["2", "1"]]);
         tk.must_query("SELECT c, b, a FROM t")
+            .await
             .check(rows![["3", "2", "1"]]);
     }
 
-    #[test]
-    fn test_literal_select() {
+    #[tokio::test]
+    async fn test_literal_select() {
         let tk = TestKit::new();
 
-        tk.must_query("SELECT 1").check(rows![["1"]]);
-        tk.must_query("SELECT 1 + 2").check(rows![["3"]]);
-        tk.must_query("SELECT 10 * 5").check(rows![["50"]]);
+        tk.must_query("SELECT 1").await.check(rows![["1"]]);
+        tk.must_query("SELECT 1 + 2").await.check(rows![["3"]]);
+        tk.must_query("SELECT 10 * 5").await.check(rows![["50"]]);
     }
 }
 
@@ -171,67 +200,83 @@ mod select {
 mod filter {
     use super::*;
 
-    #[test]
-    fn test_comparison_operators() {
+    #[tokio::test]
+    async fn test_comparison_operators() {
         let tk = TestKit::new();
 
-        tk.must_exec("CREATE TABLE t (id INT PRIMARY KEY, val INT)");
-        tk.must_exec("INSERT INTO t VALUES (1, 10), (2, 20), (3, 30), (4, 40)");
+        tk.must_exec("CREATE TABLE t (id INT PRIMARY KEY, val INT)")
+            .await;
+        tk.must_exec("INSERT INTO t VALUES (1, 10), (2, 20), (3, 30), (4, 40)")
+            .await;
 
         // Equality
         tk.must_query("SELECT id FROM t WHERE val = 20")
+            .await
             .check(rows![["2"]]);
 
         // Not equal
         tk.must_query("SELECT id FROM t WHERE val != 20 ORDER BY id")
+            .await
             .check(rows![["1"], ["3"], ["4"]]);
 
         // Less than
         tk.must_query("SELECT id FROM t WHERE val < 25 ORDER BY id")
+            .await
             .check(rows![["1"], ["2"]]);
 
         // Greater than
         tk.must_query("SELECT id FROM t WHERE val > 25 ORDER BY id")
+            .await
             .check(rows![["3"], ["4"]]);
 
         // Less than or equal
         tk.must_query("SELECT id FROM t WHERE val <= 20 ORDER BY id")
+            .await
             .check(rows![["1"], ["2"]]);
 
         // Greater than or equal
         tk.must_query("SELECT id FROM t WHERE val >= 30 ORDER BY id")
+            .await
             .check(rows![["3"], ["4"]]);
     }
 
-    #[test]
-    fn test_logical_operators() {
+    #[tokio::test]
+    async fn test_logical_operators() {
         let tk = TestKit::new();
 
         // Use composite primary key to allow (a, b) combinations
-        tk.must_exec("CREATE TABLE t (a INT, b INT, PRIMARY KEY (a, b))");
-        tk.must_exec("INSERT INTO t VALUES (1, 1), (1, 2), (2, 1), (2, 2)");
+        tk.must_exec("CREATE TABLE t (a INT, b INT, PRIMARY KEY (a, b))")
+            .await;
+        tk.must_exec("INSERT INTO t VALUES (1, 1), (1, 2), (2, 1), (2, 2)")
+            .await;
 
         // AND
         tk.must_query("SELECT a, b FROM t WHERE a = 1 AND b = 2")
+            .await
             .check(rows![["1", "2"]]);
 
         // OR
         tk.must_query("SELECT a, b FROM t WHERE a = 1 OR b = 1 ORDER BY a, b")
+            .await
             .check(rows![["1", "1"], ["1", "2"], ["2", "1"]]);
 
         // Combined
         tk.must_query("SELECT a, b FROM t WHERE (a = 1 AND b = 1) OR (a = 2 AND b = 2) ORDER BY a")
+            .await
             .check(rows![["1", "1"], ["2", "2"]]);
     }
 
-    #[test]
-    fn test_string_comparison() {
+    #[tokio::test]
+    async fn test_string_comparison() {
         let tk = TestKit::new();
 
-        tk.must_exec("CREATE TABLE t (id INT PRIMARY KEY, name VARCHAR(50))");
-        tk.must_exec("INSERT INTO t VALUES (1, 'Alice'), (2, 'Bob'), (3, 'Charlie')");
+        tk.must_exec("CREATE TABLE t (id INT PRIMARY KEY, name VARCHAR(50))")
+            .await;
+        tk.must_exec("INSERT INTO t VALUES (1, 'Alice'), (2, 'Bob'), (3, 'Charlie')")
+            .await;
 
         tk.must_query("SELECT id FROM t WHERE name = 'Bob'")
+            .await
             .check(rows![["2"]]);
     }
 }
@@ -240,46 +285,52 @@ mod filter {
 mod ddl {
     use super::*;
 
-    #[test]
-    fn test_create_drop_table() {
+    #[tokio::test]
+    async fn test_create_drop_table() {
         let tk = TestKit::new();
 
         tk.must_exec("CREATE TABLE t1 (id INT PRIMARY KEY)")
+            .await
             .check_ok();
         tk.must_exec("CREATE TABLE t2 (id INT PRIMARY KEY, name VARCHAR(100))")
+            .await
             .check_ok();
 
         // Insert and verify
-        tk.must_exec("INSERT INTO t1 VALUES (1)");
-        tk.must_exec("INSERT INTO t2 VALUES (1, 'test')");
+        tk.must_exec("INSERT INTO t1 VALUES (1)").await;
+        tk.must_exec("INSERT INTO t2 VALUES (1, 'test')").await;
 
-        tk.must_exec("DROP TABLE t1").check_ok();
-        tk.must_exec("DROP TABLE t2").check_ok();
+        tk.must_exec("DROP TABLE t1").await.check_ok();
+        tk.must_exec("DROP TABLE t2").await.check_ok();
     }
 
-    #[test]
-    fn test_create_if_not_exists() {
+    #[tokio::test]
+    async fn test_create_if_not_exists() {
         let tk = TestKit::new();
 
         tk.must_exec("CREATE TABLE t (id INT PRIMARY KEY)")
+            .await
             .check_ok();
         tk.must_exec("CREATE TABLE IF NOT EXISTS t (id INT PRIMARY KEY)")
+            .await
             .check_ok();
 
-        tk.must_exec("DROP TABLE t");
+        tk.must_exec("DROP TABLE t").await;
     }
 
-    #[test]
-    fn test_drop_if_exists() {
+    #[tokio::test]
+    async fn test_drop_if_exists() {
         let tk = TestKit::new();
 
         // Should not error on non-existent table
-        tk.must_exec("DROP TABLE IF EXISTS non_existent").check_ok();
+        tk.must_exec("DROP TABLE IF EXISTS non_existent")
+            .await
+            .check_ok();
 
         // Create and drop
-        tk.must_exec("CREATE TABLE t (id INT PRIMARY KEY)");
-        tk.must_exec("DROP TABLE IF EXISTS t").check_ok();
-        tk.must_exec("DROP TABLE IF EXISTS t").check_ok();
+        tk.must_exec("CREATE TABLE t (id INT PRIMARY KEY)").await;
+        tk.must_exec("DROP TABLE IF EXISTS t").await.check_ok();
+        tk.must_exec("DROP TABLE IF EXISTS t").await.check_ok();
     }
 }
 
@@ -287,42 +338,47 @@ mod ddl {
 mod data_types {
     use super::*;
 
-    #[test]
-    fn test_integer_types() {
+    #[tokio::test]
+    async fn test_integer_types() {
         let tk = TestKit::new();
 
         tk.must_exec(
             "CREATE TABLE t (tiny TINYINT PRIMARY KEY, small SMALLINT, normal INT, big BIGINT)",
-        );
-        tk.must_exec("INSERT INTO t VALUES (127, 32767, 2147483647, 9223372036854775807)");
+        )
+        .await;
+        tk.must_exec("INSERT INTO t VALUES (127, 32767, 2147483647, 9223372036854775807)")
+            .await;
 
         tk.must_query("SELECT tiny, small, normal, big FROM t")
+            .await
             .check(rows![["127", "32767", "2147483647", "9223372036854775807"]]);
     }
 
-    #[test]
-    fn test_string_types() {
+    #[tokio::test]
+    async fn test_string_types() {
         let tk = TestKit::new();
 
-        tk.must_exec("CREATE TABLE t (c CHAR(10) PRIMARY KEY, vc VARCHAR(100), txt TEXT)");
-        tk.must_exec("INSERT INTO t VALUES ('hello', 'world', 'long text content')");
+        tk.must_exec("CREATE TABLE t (c CHAR(10) PRIMARY KEY, vc VARCHAR(100), txt TEXT)")
+            .await;
+        tk.must_exec("INSERT INTO t VALUES ('hello', 'world', 'long text content')")
+            .await;
 
-        tk.must_query("SELECT c, vc, txt FROM t").check(rows![[
-            "hello",
-            "world",
-            "long text content"
-        ]]);
+        tk.must_query("SELECT c, vc, txt FROM t")
+            .await
+            .check(rows![["hello", "world", "long text content"]]);
     }
 
-    #[test]
-    fn test_null_handling() {
+    #[tokio::test]
+    async fn test_null_handling() {
         let tk = TestKit::new();
 
-        tk.must_exec("CREATE TABLE t (id INT PRIMARY KEY, val INT)");
-        tk.must_exec("INSERT INTO t (id) VALUES (1)");
-        tk.must_exec("INSERT INTO t VALUES (2, 100)");
+        tk.must_exec("CREATE TABLE t (id INT PRIMARY KEY, val INT)")
+            .await;
+        tk.must_exec("INSERT INTO t (id) VALUES (1)").await;
+        tk.must_exec("INSERT INTO t VALUES (2, 100)").await;
 
         tk.must_query("SELECT id, val FROM t ORDER BY id")
+            .await
             .check(rows![["1", "NULL"], ["2", "100"]]);
     }
 }
@@ -331,35 +387,42 @@ mod data_types {
 mod expressions {
     use super::*;
 
-    #[test]
-    fn test_arithmetic() {
+    #[tokio::test]
+    async fn test_arithmetic() {
         let tk = TestKit::new();
 
-        tk.must_query("SELECT 1 + 2").check(rows![["3"]]);
-        tk.must_query("SELECT 10 - 3").check(rows![["7"]]);
-        tk.must_query("SELECT 4 * 5").check(rows![["20"]]);
-        tk.must_query("SELECT 20 / 4").check(rows![["5"]]);
-        tk.must_query("SELECT 17 % 5").check(rows![["2"]]);
+        tk.must_query("SELECT 1 + 2").await.check(rows![["3"]]);
+        tk.must_query("SELECT 10 - 3").await.check(rows![["7"]]);
+        tk.must_query("SELECT 4 * 5").await.check(rows![["20"]]);
+        tk.must_query("SELECT 20 / 4").await.check(rows![["5"]]);
+        tk.must_query("SELECT 17 % 5").await.check(rows![["2"]]);
     }
 
-    #[test]
-    fn test_arithmetic_with_columns() {
+    #[tokio::test]
+    async fn test_arithmetic_with_columns() {
         let tk = TestKit::new();
 
-        tk.must_exec("CREATE TABLE t (a INT PRIMARY KEY, b INT)");
-        tk.must_exec("INSERT INTO t VALUES (10, 3)");
+        tk.must_exec("CREATE TABLE t (a INT PRIMARY KEY, b INT)")
+            .await;
+        tk.must_exec("INSERT INTO t VALUES (10, 3)").await;
 
-        tk.must_query("SELECT a + b FROM t").check(rows![["13"]]);
-        tk.must_query("SELECT a - b FROM t").check(rows![["7"]]);
-        tk.must_query("SELECT a * b FROM t").check(rows![["30"]]);
+        tk.must_query("SELECT a + b FROM t")
+            .await
+            .check(rows![["13"]]);
+        tk.must_query("SELECT a - b FROM t")
+            .await
+            .check(rows![["7"]]);
+        tk.must_query("SELECT a * b FROM t")
+            .await
+            .check(rows![["30"]]);
     }
 
-    #[test]
-    fn test_negative_numbers() {
+    #[tokio::test]
+    async fn test_negative_numbers() {
         let tk = TestKit::new();
 
-        tk.must_query("SELECT -5").check(rows![["-5"]]);
-        tk.must_query("SELECT 0 - 10").check(rows![["-10"]]);
+        tk.must_query("SELECT -5").await.check(rows![["-5"]]);
+        tk.must_query("SELECT 0 - 10").await.check(rows![["-10"]]);
     }
 }
 
@@ -367,21 +430,23 @@ mod expressions {
 mod errors {
     use super::*;
 
-    #[test]
-    fn test_table_not_found() {
+    #[tokio::test]
+    async fn test_table_not_found() {
         let tk = TestKit::new();
-        let err = tk.must_exec_err("SELECT * FROM non_existent");
+        let err = tk.must_exec_err("SELECT * FROM non_existent").await;
         assert!(
             err.contains("not found") || err.contains("Table"),
             "Error: {err}"
         );
     }
 
-    #[test]
-    fn test_duplicate_table() {
+    #[tokio::test]
+    async fn test_duplicate_table() {
         let tk = TestKit::new();
-        tk.must_exec("CREATE TABLE t (id INT PRIMARY KEY)");
-        let err = tk.must_exec_err("CREATE TABLE t (id INT PRIMARY KEY)");
+        tk.must_exec("CREATE TABLE t (id INT PRIMARY KEY)").await;
+        let err = tk
+            .must_exec_err("CREATE TABLE t (id INT PRIMARY KEY)")
+            .await;
         assert!(
             err.contains("exists") || err.contains("already"),
             "Error: {err}"
@@ -399,23 +464,24 @@ mod persistence {
     use tempfile::tempdir;
     use tisql::{Database, DatabaseConfig, QueryResult};
 
-    #[test]
-    fn test_catalog_survives_restart() {
+    #[tokio::test]
+    async fn test_catalog_survives_restart() {
         let dir = tempdir().unwrap();
         let config = DatabaseConfig::with_data_dir(dir.path());
 
         // First session: create table and insert data
         {
             let db = Database::open(config.clone()).unwrap();
-            tisql::io::block_on_sync(
-                db.handle_mp_query("CREATE TABLE users (id INT PRIMARY KEY, name VARCHAR(100))"),
-            )
-            .unwrap();
-            tisql::io::block_on_sync(db.handle_mp_query("INSERT INTO users VALUES (1, 'Alice')"))
+            db.handle_mp_query("CREATE TABLE users (id INT PRIMARY KEY, name VARCHAR(100))")
+                .await
                 .unwrap();
-            tisql::io::block_on_sync(db.handle_mp_query("INSERT INTO users VALUES (2, 'Bob')"))
+            db.handle_mp_query("INSERT INTO users VALUES (1, 'Alice')")
+                .await
                 .unwrap();
-            db.close().unwrap();
+            db.handle_mp_query("INSERT INTO users VALUES (2, 'Bob')")
+                .await
+                .unwrap();
+            db.close().await.unwrap();
         }
 
         // Second session: verify table and data exist
@@ -423,9 +489,9 @@ mod persistence {
             let db = Database::open(config.clone()).unwrap();
 
             // Table should exist
-            let result = tisql::io::block_on_sync(
-                db.handle_mp_query("SELECT id, name FROM users ORDER BY id"),
-            );
+            let result = db
+                .handle_mp_query("SELECT id, name FROM users ORDER BY id")
+                .await;
             match result {
                 Ok(QueryResult::Rows { data, columns }) => {
                     assert_eq!(columns, vec!["id", "name"]);
@@ -437,28 +503,31 @@ mod persistence {
                 }
                 other => panic!("Expected rows, got: {other:?}"),
             }
-            db.close().unwrap();
+            db.close().await.unwrap();
         }
     }
 
-    #[test]
-    fn test_multiple_tables_survive_restart() {
+    #[tokio::test]
+    async fn test_multiple_tables_survive_restart() {
         let dir = tempdir().unwrap();
         let config = DatabaseConfig::with_data_dir(dir.path());
 
         // First session: create multiple tables
         {
             let db = Database::open(config.clone()).unwrap();
-            tisql::io::block_on_sync(db.handle_mp_query("CREATE TABLE t1 (a INT PRIMARY KEY)"))
+            db.handle_mp_query("CREATE TABLE t1 (a INT PRIMARY KEY)")
+                .await
                 .unwrap();
-            tisql::io::block_on_sync(
-                db.handle_mp_query("CREATE TABLE t2 (b INT PRIMARY KEY, c INT)"),
-            )
-            .unwrap();
-            tisql::io::block_on_sync(db.handle_mp_query("INSERT INTO t1 VALUES (100)")).unwrap();
-            tisql::io::block_on_sync(db.handle_mp_query("INSERT INTO t2 VALUES (200, 300)"))
+            db.handle_mp_query("CREATE TABLE t2 (b INT PRIMARY KEY, c INT)")
+                .await
                 .unwrap();
-            db.close().unwrap();
+            db.handle_mp_query("INSERT INTO t1 VALUES (100)")
+                .await
+                .unwrap();
+            db.handle_mp_query("INSERT INTO t2 VALUES (200, 300)")
+                .await
+                .unwrap();
+            db.close().await.unwrap();
         }
 
         // Second session: verify both tables exist
@@ -466,7 +535,7 @@ mod persistence {
             let db = Database::open(config.clone()).unwrap();
 
             // Check t1
-            let result = tisql::io::block_on_sync(db.handle_mp_query("SELECT a FROM t1")).unwrap();
+            let result = db.handle_mp_query("SELECT a FROM t1").await.unwrap();
             match result {
                 QueryResult::Rows { data, .. } => {
                     assert_eq!(data.len(), 1);
@@ -476,8 +545,7 @@ mod persistence {
             }
 
             // Check t2
-            let result =
-                tisql::io::block_on_sync(db.handle_mp_query("SELECT b, c FROM t2")).unwrap();
+            let result = db.handle_mp_query("SELECT b, c FROM t2").await.unwrap();
             match result {
                 QueryResult::Rows { data, .. } => {
                     assert_eq!(data.len(), 1);
@@ -486,27 +554,33 @@ mod persistence {
                 }
                 other => panic!("Expected rows for t2, got: {other:?}"),
             }
-            db.close().unwrap();
+            db.close().await.unwrap();
         }
     }
 
-    #[test]
-    fn test_drop_table_persists() {
+    #[tokio::test]
+    async fn test_drop_table_persists() {
         let dir = tempdir().unwrap();
         let config = DatabaseConfig::with_data_dir(dir.path());
 
         // First session: create and drop a table
         {
             let db = Database::open(config.clone()).unwrap();
-            tisql::io::block_on_sync(db.handle_mp_query("CREATE TABLE temp (x INT PRIMARY KEY)"))
+            db.handle_mp_query("CREATE TABLE temp (x INT PRIMARY KEY)")
+                .await
                 .unwrap();
-            tisql::io::block_on_sync(db.handle_mp_query("INSERT INTO temp VALUES (1)")).unwrap();
-            tisql::io::block_on_sync(db.handle_mp_query("DROP TABLE temp")).unwrap();
+            db.handle_mp_query("INSERT INTO temp VALUES (1)")
+                .await
+                .unwrap();
+            db.handle_mp_query("DROP TABLE temp").await.unwrap();
             // Create another table to verify we can still create tables
-            tisql::io::block_on_sync(db.handle_mp_query("CREATE TABLE perm (y INT PRIMARY KEY)"))
+            db.handle_mp_query("CREATE TABLE perm (y INT PRIMARY KEY)")
+                .await
                 .unwrap();
-            tisql::io::block_on_sync(db.handle_mp_query("INSERT INTO perm VALUES (2)")).unwrap();
-            db.close().unwrap();
+            db.handle_mp_query("INSERT INTO perm VALUES (2)")
+                .await
+                .unwrap();
+            db.close().await.unwrap();
         }
 
         // Second session: verify temp is gone but perm exists
@@ -514,12 +588,11 @@ mod persistence {
             let db = Database::open(config.clone()).unwrap();
 
             // temp should not exist
-            let result = tisql::io::block_on_sync(db.handle_mp_query("SELECT * FROM temp"));
+            let result = db.handle_mp_query("SELECT * FROM temp").await;
             assert!(result.is_err(), "temp table should not exist after restart");
 
             // perm should exist
-            let result =
-                tisql::io::block_on_sync(db.handle_mp_query("SELECT y FROM perm")).unwrap();
+            let result = db.handle_mp_query("SELECT y FROM perm").await.unwrap();
             match result {
                 QueryResult::Rows { data, .. } => {
                     assert_eq!(data.len(), 1);
@@ -527,34 +600,39 @@ mod persistence {
                 }
                 other => panic!("Expected rows for perm, got: {other:?}"),
             }
-            db.close().unwrap();
+            db.close().await.unwrap();
         }
     }
 
-    #[test]
-    fn test_table_id_persists() {
+    #[tokio::test]
+    async fn test_table_id_persists() {
         let dir = tempdir().unwrap();
         let config = DatabaseConfig::with_data_dir(dir.path());
 
         // First session: create tables
         {
             let db = Database::open(config.clone()).unwrap();
-            tisql::io::block_on_sync(db.handle_mp_query("CREATE TABLE t1 (a INT PRIMARY KEY)"))
+            db.handle_mp_query("CREATE TABLE t1 (a INT PRIMARY KEY)")
+                .await
                 .unwrap();
-            tisql::io::block_on_sync(db.handle_mp_query("CREATE TABLE t2 (b INT PRIMARY KEY)"))
+            db.handle_mp_query("CREATE TABLE t2 (b INT PRIMARY KEY)")
+                .await
                 .unwrap();
-            db.close().unwrap();
+            db.close().await.unwrap();
         }
 
         // Second session: create more tables - IDs should continue from where we left off
         {
             let db = Database::open(config.clone()).unwrap();
             // This should succeed without ID conflict
-            tisql::io::block_on_sync(db.handle_mp_query("CREATE TABLE t3 (c INT PRIMARY KEY)"))
+            db.handle_mp_query("CREATE TABLE t3 (c INT PRIMARY KEY)")
+                .await
                 .unwrap();
-            tisql::io::block_on_sync(db.handle_mp_query("INSERT INTO t3 VALUES (333)")).unwrap();
+            db.handle_mp_query("INSERT INTO t3 VALUES (333)")
+                .await
+                .unwrap();
 
-            let result = tisql::io::block_on_sync(db.handle_mp_query("SELECT c FROM t3")).unwrap();
+            let result = db.handle_mp_query("SELECT c FROM t3").await.unwrap();
             match result {
                 QueryResult::Rows { data, .. } => {
                     assert_eq!(data.len(), 1);
@@ -562,36 +640,32 @@ mod persistence {
                 }
                 other => panic!("Expected rows, got: {other:?}"),
             }
-            db.close().unwrap();
+            db.close().await.unwrap();
         }
     }
 
     /// Test crash recovery without graceful shutdown (simulates kill -9).
     /// This test does NOT call db.close() to simulate an abrupt crash.
-    #[test]
-    fn test_crash_recovery_no_close() {
+    #[tokio::test]
+    async fn test_crash_recovery_no_close() {
         let dir = tempdir().unwrap();
         let config = DatabaseConfig::with_data_dir(dir.path());
 
         // First session: write data and "crash" (no close)
         {
             let db = Database::open(config.clone()).unwrap();
-            tisql::io::block_on_sync(db.handle_mp_query(
-                "CREATE TABLE crash_test (id INT PRIMARY KEY, data VARCHAR(100))",
-            ))
-            .unwrap();
-            tisql::io::block_on_sync(
-                db.handle_mp_query("INSERT INTO crash_test VALUES (1, 'first')"),
-            )
-            .unwrap();
-            tisql::io::block_on_sync(
-                db.handle_mp_query("INSERT INTO crash_test VALUES (2, 'second')"),
-            )
-            .unwrap();
-            tisql::io::block_on_sync(
-                db.handle_mp_query("INSERT INTO crash_test VALUES (3, 'third')"),
-            )
-            .unwrap();
+            db.handle_mp_query("CREATE TABLE crash_test (id INT PRIMARY KEY, data VARCHAR(100))")
+                .await
+                .unwrap();
+            db.handle_mp_query("INSERT INTO crash_test VALUES (1, 'first')")
+                .await
+                .unwrap();
+            db.handle_mp_query("INSERT INTO crash_test VALUES (2, 'second')")
+                .await
+                .unwrap();
+            db.handle_mp_query("INSERT INTO crash_test VALUES (3, 'third')")
+                .await
+                .unwrap();
             // NO close() - simulate kill -9
             // Database is dropped here, but close() is not called
         }
@@ -600,10 +674,10 @@ mod persistence {
         {
             let db = Database::open(config.clone()).unwrap();
 
-            let result = tisql::io::block_on_sync(
-                db.handle_mp_query("SELECT id, data FROM crash_test ORDER BY id"),
-            )
-            .unwrap();
+            let result = db
+                .handle_mp_query("SELECT id, data FROM crash_test ORDER BY id")
+                .await
+                .unwrap();
             match result {
                 QueryResult::Rows { data, columns } => {
                     assert_eq!(columns, vec!["id", "data"]);
@@ -617,38 +691,40 @@ mod persistence {
                 }
                 other => panic!("Expected rows, got: {other:?}"),
             }
-            db.close().unwrap();
+            db.close().await.unwrap();
         }
     }
 
     /// Test crash recovery with updates and deletes.
-    #[test]
-    fn test_crash_recovery_with_updates_deletes() {
+    #[tokio::test]
+    async fn test_crash_recovery_with_updates_deletes() {
         let dir = tempdir().unwrap();
         let config = DatabaseConfig::with_data_dir(dir.path());
 
         // First session: create, insert, update, delete, then crash
         {
             let db = Database::open(config.clone()).unwrap();
-            tisql::io::block_on_sync(
-                db.handle_mp_query("CREATE TABLE modify_test (id INT PRIMARY KEY, value INT)"),
-            )
-            .unwrap();
-            tisql::io::block_on_sync(db.handle_mp_query("INSERT INTO modify_test VALUES (1, 100)"))
+            db.handle_mp_query("CREATE TABLE modify_test (id INT PRIMARY KEY, value INT)")
+                .await
                 .unwrap();
-            tisql::io::block_on_sync(db.handle_mp_query("INSERT INTO modify_test VALUES (2, 200)"))
+            db.handle_mp_query("INSERT INTO modify_test VALUES (1, 100)")
+                .await
                 .unwrap();
-            tisql::io::block_on_sync(db.handle_mp_query("INSERT INTO modify_test VALUES (3, 300)"))
+            db.handle_mp_query("INSERT INTO modify_test VALUES (2, 200)")
+                .await
+                .unwrap();
+            db.handle_mp_query("INSERT INTO modify_test VALUES (3, 300)")
+                .await
                 .unwrap();
 
             // Update id=2
-            tisql::io::block_on_sync(
-                db.handle_mp_query("UPDATE modify_test SET value = 999 WHERE id = 2"),
-            )
-            .unwrap();
+            db.handle_mp_query("UPDATE modify_test SET value = 999 WHERE id = 2")
+                .await
+                .unwrap();
 
             // Delete id=1
-            tisql::io::block_on_sync(db.handle_mp_query("DELETE FROM modify_test WHERE id = 1"))
+            db.handle_mp_query("DELETE FROM modify_test WHERE id = 1")
+                .await
                 .unwrap();
 
             // NO close() - crash
@@ -658,10 +734,10 @@ mod persistence {
         {
             let db = Database::open(config.clone()).unwrap();
 
-            let result = tisql::io::block_on_sync(
-                db.handle_mp_query("SELECT id, value FROM modify_test ORDER BY id"),
-            )
-            .unwrap();
+            let result = db
+                .handle_mp_query("SELECT id, value FROM modify_test ORDER BY id")
+                .await
+                .unwrap();
             match result {
                 QueryResult::Rows { data, .. } => {
                     // Should have id=2 (updated) and id=3 (unchanged)
@@ -674,24 +750,24 @@ mod persistence {
                 }
                 other => panic!("Expected rows, got: {other:?}"),
             }
-            db.close().unwrap();
+            db.close().await.unwrap();
         }
     }
 
     /// Test crash recovery with multiple crash/recover cycles.
-    #[test]
-    fn test_multiple_crash_recovery_cycles() {
+    #[tokio::test]
+    async fn test_multiple_crash_recovery_cycles() {
         let dir = tempdir().unwrap();
         let config = DatabaseConfig::with_data_dir(dir.path());
 
         // Cycle 1: create and insert
         {
             let db = Database::open(config.clone()).unwrap();
-            tisql::io::block_on_sync(
-                db.handle_mp_query("CREATE TABLE cycle_test (id INT PRIMARY KEY)"),
-            )
-            .unwrap();
-            tisql::io::block_on_sync(db.handle_mp_query("INSERT INTO cycle_test VALUES (1)"))
+            db.handle_mp_query("CREATE TABLE cycle_test (id INT PRIMARY KEY)")
+                .await
+                .unwrap();
+            db.handle_mp_query("INSERT INTO cycle_test VALUES (1)")
+                .await
                 .unwrap();
             // crash - no close()
         }
@@ -701,10 +777,10 @@ mod persistence {
             let db = Database::open(config.clone()).unwrap();
 
             // Verify cycle 1 data
-            let result = tisql::io::block_on_sync(
-                db.handle_mp_query("SELECT id FROM cycle_test ORDER BY id"),
-            )
-            .unwrap();
+            let result = db
+                .handle_mp_query("SELECT id FROM cycle_test ORDER BY id")
+                .await
+                .unwrap();
             match &result {
                 QueryResult::Rows { data, .. } => {
                     assert_eq!(data.len(), 1, "Should have 1 row from cycle 1");
@@ -713,9 +789,11 @@ mod persistence {
                 _ => panic!("Expected rows"),
             }
 
-            tisql::io::block_on_sync(db.handle_mp_query("INSERT INTO cycle_test VALUES (2)"))
+            db.handle_mp_query("INSERT INTO cycle_test VALUES (2)")
+                .await
                 .unwrap();
-            tisql::io::block_on_sync(db.handle_mp_query("INSERT INTO cycle_test VALUES (3)"))
+            db.handle_mp_query("INSERT INTO cycle_test VALUES (3)")
+                .await
                 .unwrap();
             // crash - no close()
         }
@@ -725,10 +803,10 @@ mod persistence {
             let db = Database::open(config.clone()).unwrap();
 
             // Verify cycle 1+2 data
-            let result = tisql::io::block_on_sync(
-                db.handle_mp_query("SELECT id FROM cycle_test ORDER BY id"),
-            )
-            .unwrap();
+            let result = db
+                .handle_mp_query("SELECT id FROM cycle_test ORDER BY id")
+                .await
+                .unwrap();
             match &result {
                 QueryResult::Rows { data, .. } => {
                     assert_eq!(data.len(), 3, "Should have 3 rows from cycles 1+2");
@@ -739,7 +817,8 @@ mod persistence {
                 _ => panic!("Expected rows"),
             }
 
-            tisql::io::block_on_sync(db.handle_mp_query("INSERT INTO cycle_test VALUES (4)"))
+            db.handle_mp_query("INSERT INTO cycle_test VALUES (4)")
+                .await
                 .unwrap();
             // crash - no close()
         }
@@ -748,10 +827,10 @@ mod persistence {
         {
             let db = Database::open(config.clone()).unwrap();
 
-            let result = tisql::io::block_on_sync(
-                db.handle_mp_query("SELECT id FROM cycle_test ORDER BY id"),
-            )
-            .unwrap();
+            let result = db
+                .handle_mp_query("SELECT id FROM cycle_test ORDER BY id")
+                .await
+                .unwrap();
             match result {
                 QueryResult::Rows { data, .. } => {
                     assert_eq!(data.len(), 4, "Should have all 4 rows from 3 cycles");
@@ -762,38 +841,38 @@ mod persistence {
                 }
                 other => panic!("Expected rows, got: {other:?}"),
             }
-            db.close().unwrap();
+            db.close().await.unwrap();
         }
     }
 
     /// Test crash during DDL (DROP TABLE) - verify atomicity.
-    #[test]
-    fn test_crash_recovery_ddl_drop_table() {
+    #[tokio::test]
+    async fn test_crash_recovery_ddl_drop_table() {
         let dir = tempdir().unwrap();
         let config = DatabaseConfig::with_data_dir(dir.path());
 
         // Create two tables
         {
             let db = Database::open(config.clone()).unwrap();
-            tisql::io::block_on_sync(
-                db.handle_mp_query("CREATE TABLE keep_me (x INT PRIMARY KEY)"),
-            )
-            .unwrap();
-            tisql::io::block_on_sync(db.handle_mp_query("INSERT INTO keep_me VALUES (42)"))
+            db.handle_mp_query("CREATE TABLE keep_me (x INT PRIMARY KEY)")
+                .await
                 .unwrap();
-            tisql::io::block_on_sync(
-                db.handle_mp_query("CREATE TABLE drop_me (y INT PRIMARY KEY)"),
-            )
-            .unwrap();
-            tisql::io::block_on_sync(db.handle_mp_query("INSERT INTO drop_me VALUES (99)"))
+            db.handle_mp_query("INSERT INTO keep_me VALUES (42)")
+                .await
                 .unwrap();
-            db.close().unwrap();
+            db.handle_mp_query("CREATE TABLE drop_me (y INT PRIMARY KEY)")
+                .await
+                .unwrap();
+            db.handle_mp_query("INSERT INTO drop_me VALUES (99)")
+                .await
+                .unwrap();
+            db.close().await.unwrap();
         }
 
         // Drop one table and crash
         {
             let db = Database::open(config.clone()).unwrap();
-            tisql::io::block_on_sync(db.handle_mp_query("DROP TABLE drop_me")).unwrap();
+            db.handle_mp_query("DROP TABLE drop_me").await.unwrap();
             // crash
         }
 
@@ -802,8 +881,7 @@ mod persistence {
             let db = Database::open(config.clone()).unwrap();
 
             // keep_me should exist
-            let result =
-                tisql::io::block_on_sync(db.handle_mp_query("SELECT x FROM keep_me")).unwrap();
+            let result = db.handle_mp_query("SELECT x FROM keep_me").await.unwrap();
             match result {
                 QueryResult::Rows { data, .. } => {
                     assert_eq!(data[0][0], "42");
@@ -812,13 +890,13 @@ mod persistence {
             }
 
             // drop_me should not exist
-            let result = tisql::io::block_on_sync(db.handle_mp_query("SELECT * FROM drop_me"));
+            let result = db.handle_mp_query("SELECT * FROM drop_me").await;
             assert!(
                 result.is_err(),
                 "drop_me should not exist after crash recovery"
             );
 
-            db.close().unwrap();
+            db.close().await.unwrap();
         }
     }
 }
@@ -827,16 +905,18 @@ mod persistence {
 mod duplicate_key {
     use super::*;
 
-    #[test]
-    fn test_insert_duplicate_primary_key() {
+    #[tokio::test]
+    async fn test_insert_duplicate_primary_key() {
         let tk = TestKit::new();
 
-        tk.must_exec("CREATE TABLE t (id INT PRIMARY KEY, val INT)");
+        tk.must_exec("CREATE TABLE t (id INT PRIMARY KEY, val INT)")
+            .await;
         tk.must_exec("INSERT INTO t VALUES (1, 100)")
+            .await
             .check_affected(1);
 
         // Try to insert duplicate key - should fail
-        let err = tk.must_exec_err("INSERT INTO t VALUES (1, 200)");
+        let err = tk.must_exec_err("INSERT INTO t VALUES (1, 200)").await;
         assert!(
             err.contains("Duplicate") || err.contains("duplicate"),
             "Expected duplicate key error, got: {err}"
@@ -844,23 +924,28 @@ mod duplicate_key {
 
         // Original row should be unchanged
         tk.must_query("SELECT id, val FROM t")
+            .await
             .check(rows![["1", "100"]]);
     }
 
-    #[test]
-    fn test_insert_duplicate_composite_key() {
+    #[tokio::test]
+    async fn test_insert_duplicate_composite_key() {
         let tk = TestKit::new();
 
-        tk.must_exec("CREATE TABLE t (a INT PRIMARY KEY, b INT, c INT, PRIMARY KEY (a, b))");
+        tk.must_exec("CREATE TABLE t (a INT PRIMARY KEY, b INT, c INT, PRIMARY KEY (a, b))")
+            .await;
         tk.must_exec("INSERT INTO t VALUES (1, 1, 100)")
+            .await
             .check_affected(1);
         tk.must_exec("INSERT INTO t VALUES (1, 2, 200)")
+            .await
             .check_affected(1);
         tk.must_exec("INSERT INTO t VALUES (2, 1, 300)")
+            .await
             .check_affected(1);
 
         // Try to insert duplicate composite key - should fail
-        let err = tk.must_exec_err("INSERT INTO t VALUES (1, 1, 999)");
+        let err = tk.must_exec_err("INSERT INTO t VALUES (1, 1, 999)").await;
         assert!(
             err.contains("Duplicate") || err.contains("duplicate"),
             "Expected duplicate key error, got: {err}"
@@ -868,6 +953,7 @@ mod duplicate_key {
 
         // Check original data unchanged
         tk.must_query("SELECT a, b, c FROM t ORDER BY a, b")
+            .await
             .check(rows![
                 ["1", "1", "100"],
                 ["1", "2", "200"],
@@ -875,17 +961,18 @@ mod duplicate_key {
             ]);
     }
 
-    #[test]
-    fn test_update_to_duplicate_primary_key() {
+    #[tokio::test]
+    async fn test_update_to_duplicate_primary_key() {
         let tk = TestKit::new();
 
-        tk.must_exec("CREATE TABLE t (id INT PRIMARY KEY, name VARCHAR(100))");
-        tk.must_exec("INSERT INTO t VALUES (1, 'Alice')");
-        tk.must_exec("INSERT INTO t VALUES (2, 'Bob')");
-        tk.must_exec("INSERT INTO t VALUES (3, 'Charlie')");
+        tk.must_exec("CREATE TABLE t (id INT PRIMARY KEY, name VARCHAR(100))")
+            .await;
+        tk.must_exec("INSERT INTO t VALUES (1, 'Alice')").await;
+        tk.must_exec("INSERT INTO t VALUES (2, 'Bob')").await;
+        tk.must_exec("INSERT INTO t VALUES (3, 'Charlie')").await;
 
         // Update to existing PK - should fail
-        let err = tk.must_exec_err("UPDATE t SET id = 1 WHERE id = 2");
+        let err = tk.must_exec_err("UPDATE t SET id = 1 WHERE id = 2").await;
         assert!(
             err.contains("Duplicate") || err.contains("duplicate"),
             "Expected duplicate key error, got: {err}"
@@ -893,72 +980,83 @@ mod duplicate_key {
 
         // Data should be unchanged
         tk.must_query("SELECT id, name FROM t ORDER BY id")
+            .await
             .check(rows![["1", "Alice"], ["2", "Bob"], ["3", "Charlie"]]);
     }
 
-    #[test]
-    fn test_update_pk_to_new_value() {
+    #[tokio::test]
+    async fn test_update_pk_to_new_value() {
         let tk = TestKit::new();
 
-        tk.must_exec("CREATE TABLE t (id INT PRIMARY KEY, val INT)");
-        tk.must_exec("INSERT INTO t VALUES (1, 100)");
-        tk.must_exec("INSERT INTO t VALUES (2, 200)");
+        tk.must_exec("CREATE TABLE t (id INT PRIMARY KEY, val INT)")
+            .await;
+        tk.must_exec("INSERT INTO t VALUES (1, 100)").await;
+        tk.must_exec("INSERT INTO t VALUES (2, 200)").await;
 
         // Update to non-existing PK - should succeed
         tk.must_exec("UPDATE t SET id = 10 WHERE id = 2")
+            .await
             .check_affected(1);
 
         // Check the update was applied
         tk.must_query("SELECT id, val FROM t ORDER BY id")
+            .await
             .check(rows![["1", "100"], ["10", "200"]]);
     }
 
-    #[test]
-    fn test_insert_non_duplicate_succeeds() {
+    #[tokio::test]
+    async fn test_insert_non_duplicate_succeeds() {
         let tk = TestKit::new();
 
-        tk.must_exec("CREATE TABLE t (id INT PRIMARY KEY, val INT)");
+        tk.must_exec("CREATE TABLE t (id INT PRIMARY KEY, val INT)")
+            .await;
         tk.must_exec("INSERT INTO t VALUES (1, 100)")
+            .await
             .check_affected(1);
 
         // Insert with different PK - should succeed
         tk.must_exec("INSERT INTO t VALUES (2, 200)")
+            .await
             .check_affected(1);
         tk.must_exec("INSERT INTO t VALUES (3, 300)")
+            .await
             .check_affected(1);
 
         tk.must_query("SELECT id, val FROM t ORDER BY id")
+            .await
             .check(rows![["1", "100"], ["2", "200"], ["3", "300"]]);
     }
 
-    #[test]
-    fn test_table_without_pk_requires_error() {
+    #[tokio::test]
+    async fn test_table_without_pk_requires_error() {
         let tk = TestKit::new();
 
         // Table without explicit PK should be rejected (not supported yet)
-        let err = tk.must_exec_err("CREATE TABLE t (a INT, b INT)");
+        let err = tk.must_exec_err("CREATE TABLE t (a INT, b INT)").await;
         assert!(
             err.contains("PRIMARY KEY") || err.contains("primary key"),
             "Expected PRIMARY KEY required error, got: {err}"
         );
     }
 
-    #[test]
-    fn test_update_all_rows_pk_increment_collision() {
+    #[tokio::test]
+    async fn test_update_all_rows_pk_increment_collision() {
         // Reproduces the scenario from the user bug report:
         // When UPDATE SET a = a + 1 is run on a table with rows (a=1, a=2),
         // updating a=1 to a=2 should fail because a=2 already exists.
         let tk = TestKit::new();
 
-        tk.must_exec("CREATE TABLE t (a INT PRIMARY KEY, b INT)");
-        tk.must_exec("INSERT INTO t VALUES (1, 11)");
-        tk.must_exec("INSERT INTO t VALUES (2, 22)");
+        tk.must_exec("CREATE TABLE t (a INT PRIMARY KEY, b INT)")
+            .await;
+        tk.must_exec("INSERT INTO t VALUES (1, 11)").await;
+        tk.must_exec("INSERT INTO t VALUES (2, 22)").await;
 
         tk.must_query("SELECT a, b FROM t ORDER BY a")
+            .await
             .check(rows![["1", "11"], ["2", "22"]]);
 
-        // This should fail: a=1 → a=2 conflicts with existing a=2
-        let err = tk.must_exec_err("UPDATE t SET a = a + 1");
+        // This should fail: a=1 -> a=2 conflicts with existing a=2
+        let err = tk.must_exec_err("UPDATE t SET a = a + 1").await;
         assert!(
             err.contains("Duplicate") || err.contains("duplicate"),
             "Expected duplicate key error, got: {err}"
@@ -966,6 +1064,7 @@ mod duplicate_key {
 
         // Data should be unchanged
         tk.must_query("SELECT a, b FROM t ORDER BY a")
+            .await
             .check(rows![["1", "11"], ["2", "22"]]);
     }
 }

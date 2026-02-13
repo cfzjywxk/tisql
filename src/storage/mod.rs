@@ -512,10 +512,10 @@ pub trait PessimisticStorage: StorageEngine {
     ///
     /// * `Some(value)` - Value found (including pending value owned by this txn)
     /// * `None` - Not found, deleted, or pending LOCK
-    fn get_with_owner(
-        &self,
-        key: &[u8],
+    fn get_with_owner<'a>(
+        &'a self,
+        key: &'a [u8],
         read_ts: Timestamp,
         owner_start_ts: Timestamp,
-    ) -> Option<RawValue>;
+    ) -> impl std::future::Future<Output = Option<RawValue>> + Send + 'a;
 }

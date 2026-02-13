@@ -37,24 +37,25 @@ fn create_test_db() -> (Arc<Database>, tempfile::TempDir) {
 }
 
 /// Helper: query via handle_mp_query and return rows as Vec<Vec<String>>.
-fn query_rows(db: &Database, sql: &str) -> Vec<Vec<String>> {
-    match tisql::io::block_on_sync(db.handle_mp_query(sql)).unwrap() {
+async fn query_rows(db: &Database, sql: &str) -> Vec<Vec<String>> {
+    match db.handle_mp_query(sql).await.unwrap() {
         QueryResult::Rows { data, .. } => data,
         other => panic!("Expected rows, got: {other:?}"),
     }
 }
 
 /// Helper: execute SQL via handle_mp_query, expecting success.
-fn exec(db: &Database, sql: &str) {
-    tisql::io::block_on_sync(db.handle_mp_query(sql)).unwrap();
+async fn exec(db: &Database, sql: &str) {
+    db.handle_mp_query(sql).await.unwrap();
 }
 
 /// Query GC tasks from inner table and return rows.
-fn query_gc_tasks(db: &Arc<Database>) -> Vec<tisql::types::Row> {
+async fn query_gc_tasks(db: &Arc<Database>) -> Vec<tisql::types::Row> {
     let sess = db.new_inner_session("__tisql_inner");
-    let result = tisql::io::block_on_sync(sess.execute_inner_sql(
+    let result = sess.execute_inner_sql(
         "SELECT task_id, table_id, start_key, end_key, drop_commit_ts, status FROM __all_gc_delete_range ORDER BY task_id",
-    ))
+    )
+    .await
     .unwrap();
     match result {
         ExecutionResult::Rows { rows, .. } => rows,
@@ -63,18 +64,18 @@ fn query_gc_tasks(db: &Arc<Database>) -> Vec<tisql::types::Row> {
 }
 
 /// After DROP TABLE, a GC task row should exist in `__all_gc_delete_range`.
-#[test]
-fn test_drop_table_gc_task_persists() {
+#[tokio::test]
+async fn test_drop_table_gc_task_persists() {
     let (db, _dir) = create_test_db();
 
     // Create and populate a table
-    exec(&db, "CREATE TABLE gc_test (id INT PRIMARY KEY, val INT)");
-    exec(&db, "INSERT INTO gc_test VALUES (1, 100), (2, 200)");
+    exec(&db, "CREATE TABLE gc_test (id INT PRIMARY KEY, val INT)").await;
+    exec(&db, "INSERT INTO gc_test VALUES (1, 100), (2, 200)").await;
 
     // Drop the table — this should create a GC task
-    exec(&db, "DROP TABLE gc_test");
+    exec(&db, "DROP TABLE gc_test").await;
 
-    let rows = query_gc_tasks(&db);
+    let rows = query_gc_tasks(&db).await;
     assert!(!rows.is_empty(), "Should have at least one GC task");
     let row = &rows[0];
 
@@ -130,22 +131,22 @@ fn test_drop_table_gc_task_persists() {
 }
 
 /// After dropping multiple tables, multiple GC tasks should exist.
-#[test]
-fn test_drop_table_multiple_gc_tasks() {
+#[tokio::test]
+async fn test_drop_table_multiple_gc_tasks() {
     let (db, _dir) = create_test_db();
 
-    exec(&db, "CREATE TABLE t1 (id INT PRIMARY KEY)");
-    exec(&db, "INSERT INTO t1 VALUES (1)");
-    exec(&db, "CREATE TABLE t2 (id INT PRIMARY KEY)");
-    exec(&db, "INSERT INTO t2 VALUES (1)");
-    exec(&db, "CREATE TABLE t3 (id INT PRIMARY KEY)");
-    exec(&db, "INSERT INTO t3 VALUES (1)");
+    exec(&db, "CREATE TABLE t1 (id INT PRIMARY KEY)").await;
+    exec(&db, "INSERT INTO t1 VALUES (1)").await;
+    exec(&db, "CREATE TABLE t2 (id INT PRIMARY KEY)").await;
+    exec(&db, "INSERT INTO t2 VALUES (1)").await;
+    exec(&db, "CREATE TABLE t3 (id INT PRIMARY KEY)").await;
+    exec(&db, "INSERT INTO t3 VALUES (1)").await;
 
-    exec(&db, "DROP TABLE t1");
-    exec(&db, "DROP TABLE t2");
-    exec(&db, "DROP TABLE t3");
+    exec(&db, "DROP TABLE t1").await;
+    exec(&db, "DROP TABLE t2").await;
+    exec(&db, "DROP TABLE t3").await;
 
-    let rows = query_gc_tasks(&db);
+    let rows = query_gc_tasks(&db).await;
     assert_eq!(rows.len(), 3, "Should have 3 GC tasks");
     // Task IDs should be sequential: 1, 2, 3
     assert_eq!(*rows[0].get(0).unwrap(), Value::BigInt(1));
@@ -154,23 +155,23 @@ fn test_drop_table_multiple_gc_tasks() {
 }
 
 /// After DROP TABLE + restart, the GC task should still be present.
-#[test]
-fn test_drop_table_gc_recovery() {
+#[tokio::test]
+async fn test_drop_table_gc_recovery() {
     let dir = tempdir().unwrap();
     let config = DatabaseConfig::with_data_dir(dir.path());
 
     // First session: create table, insert data, drop table
     {
         let db = Arc::new(Database::open(config.clone()).unwrap());
-        exec(&db, "CREATE TABLE recover_me (id INT PRIMARY KEY, val INT)");
-        exec(&db, "INSERT INTO recover_me VALUES (1, 42), (2, 84)");
-        exec(&db, "DROP TABLE recover_me");
+        exec(&db, "CREATE TABLE recover_me (id INT PRIMARY KEY, val INT)").await;
+        exec(&db, "INSERT INTO recover_me VALUES (1, 42), (2, 84)").await;
+        exec(&db, "DROP TABLE recover_me").await;
 
-        let rows = query_gc_tasks(&db);
+        let rows = query_gc_tasks(&db).await;
         assert_eq!(rows.len(), 1);
         assert_eq!(*rows[0].get(5).unwrap(), Value::String("pending".into()));
 
-        db.close().unwrap();
+        db.close().await.unwrap();
     }
 
     // Second session: verify GC task survives restart
@@ -178,14 +179,14 @@ fn test_drop_table_gc_recovery() {
         let db = Arc::new(Database::open(config.clone()).unwrap());
 
         // Table should still be gone
-        let result = tisql::io::block_on_sync(db.handle_mp_query("SELECT * FROM recover_me"));
+        let result = db.handle_mp_query("SELECT * FROM recover_me").await;
         assert!(
             result.is_err(),
             "dropped table should not exist after restart"
         );
 
         // GC task should still be present in inner table
-        let rows = query_gc_tasks(&db);
+        let rows = query_gc_tasks(&db).await;
         assert_eq!(rows.len(), 1, "GC task should survive restart");
         assert_eq!(*rows[0].get(0).unwrap(), Value::BigInt(1));
         match rows[0].get(4).unwrap() {
@@ -196,28 +197,28 @@ fn test_drop_table_gc_recovery() {
         }
         assert_eq!(*rows[0].get(5).unwrap(), Value::String("pending".into()));
 
-        db.close().unwrap();
+        db.close().await.unwrap();
     }
 }
 
 /// After DROP TABLE + crash (no explicit close), the GC task should be recovered.
-#[test]
-fn test_drop_table_gc_crash_recovery() {
+#[tokio::test]
+async fn test_drop_table_gc_crash_recovery() {
     let dir = tempdir().unwrap();
     let config = DatabaseConfig::with_data_dir(dir.path());
 
     // First session: create and populate
     {
         let db = Arc::new(Database::open(config.clone()).unwrap());
-        exec(&db, "CREATE TABLE crash_test (id INT PRIMARY KEY)");
-        exec(&db, "INSERT INTO crash_test VALUES (1), (2), (3)");
-        db.close().unwrap();
+        exec(&db, "CREATE TABLE crash_test (id INT PRIMARY KEY)").await;
+        exec(&db, "INSERT INTO crash_test VALUES (1), (2), (3)").await;
+        db.close().await.unwrap();
     }
 
     // Second session: drop table + crash (no close)
     {
         let db = Arc::new(Database::open(config.clone()).unwrap());
-        exec(&db, "DROP TABLE crash_test");
+        exec(&db, "DROP TABLE crash_test").await;
         // Intentional crash — no db.close()
     }
 
@@ -226,73 +227,73 @@ fn test_drop_table_gc_crash_recovery() {
         let db = Arc::new(Database::open(config.clone()).unwrap());
 
         // Table should be gone
-        let result = tisql::io::block_on_sync(db.handle_mp_query("SELECT * FROM crash_test"));
+        let result = db.handle_mp_query("SELECT * FROM crash_test").await;
         assert!(
             result.is_err(),
             "dropped table should not exist after crash recovery"
         );
 
         // GC task should be recovered
-        let rows = query_gc_tasks(&db);
+        let rows = query_gc_tasks(&db).await;
         assert_eq!(rows.len(), 1, "GC task should survive crash recovery");
 
-        db.close().unwrap();
+        db.close().await.unwrap();
     }
 }
 
 /// Verify GC task ID counter persists across restarts.
-#[test]
-fn test_gc_task_id_counter_persists() {
+#[tokio::test]
+async fn test_gc_task_id_counter_persists() {
     let dir = tempdir().unwrap();
     let config = DatabaseConfig::with_data_dir(dir.path());
 
     // First session: create and drop two tables
     {
         let db = Arc::new(Database::open(config.clone()).unwrap());
-        exec(&db, "CREATE TABLE t1 (id INT PRIMARY KEY)");
-        exec(&db, "CREATE TABLE t2 (id INT PRIMARY KEY)");
-        exec(&db, "DROP TABLE t1");
-        exec(&db, "DROP TABLE t2");
-        db.close().unwrap();
+        exec(&db, "CREATE TABLE t1 (id INT PRIMARY KEY)").await;
+        exec(&db, "CREATE TABLE t2 (id INT PRIMARY KEY)").await;
+        exec(&db, "DROP TABLE t1").await;
+        exec(&db, "DROP TABLE t2").await;
+        db.close().await.unwrap();
     }
 
     // Second session: drop another table — task_id should continue from 3
     {
         let db = Arc::new(Database::open(config.clone()).unwrap());
-        exec(&db, "CREATE TABLE t3 (id INT PRIMARY KEY)");
-        exec(&db, "DROP TABLE t3");
+        exec(&db, "CREATE TABLE t3 (id INT PRIMARY KEY)").await;
+        exec(&db, "DROP TABLE t3").await;
 
-        let rows = query_gc_tasks(&db);
+        let rows = query_gc_tasks(&db).await;
         assert_eq!(rows.len(), 3, "Should have 3 GC tasks total");
         assert_eq!(*rows[0].get(0).unwrap(), Value::BigInt(1));
         assert_eq!(*rows[1].get(0).unwrap(), Value::BigInt(2));
         assert_eq!(*rows[2].get(0).unwrap(), Value::BigInt(3));
 
-        db.close().unwrap();
+        db.close().await.unwrap();
     }
 }
 
 /// After DROP TABLE, creating a new table with the same name should work.
-#[test]
-fn test_drop_and_recreate_table() {
+#[tokio::test]
+async fn test_drop_and_recreate_table() {
     let (db, _dir) = create_test_db();
 
-    exec(&db, "CREATE TABLE reuse (id INT PRIMARY KEY)");
-    exec(&db, "INSERT INTO reuse VALUES (1)");
-    exec(&db, "DROP TABLE reuse");
+    exec(&db, "CREATE TABLE reuse (id INT PRIMARY KEY)").await;
+    exec(&db, "INSERT INTO reuse VALUES (1)").await;
+    exec(&db, "DROP TABLE reuse").await;
 
     // Recreate with same name
-    exec(&db, "CREATE TABLE reuse (id INT PRIMARY KEY, val INT)");
-    exec(&db, "INSERT INTO reuse VALUES (10, 100)");
+    exec(&db, "CREATE TABLE reuse (id INT PRIMARY KEY, val INT)").await;
+    exec(&db, "INSERT INTO reuse VALUES (10, 100)").await;
 
     // New table should work
-    let rows = query_rows(&db, "SELECT id, val FROM reuse");
+    let rows = query_rows(&db, "SELECT id, val FROM reuse").await;
     assert_eq!(rows.len(), 1);
     assert_eq!(rows[0][0], "10");
     assert_eq!(rows[0][1], "100");
 
     // GC task for old table should still exist
-    let gc_rows = query_gc_tasks(&db);
+    let gc_rows = query_gc_tasks(&db).await;
     assert_eq!(gc_rows.len(), 1, "Should have 1 GC task for old table");
     assert_eq!(*gc_rows[0].get(5).unwrap(), Value::String("pending".into()));
 }

@@ -140,7 +140,7 @@ fn load_counters<T: TxnService>(txn: &T, ctx: &TxnCtx) -> Result<CatalogCounters
         META_NEXT_GC_TASK_ID,
     ] {
         let key = encode_record_key_with_handle(ALL_META_TABLE_ID, meta_id);
-        if let Some(data) = txn.get(ctx, &key)? {
+        if let Some(data) = crate::io::block_on_sync(txn.get(ctx, &key))? {
             let col_ids = &[0, 1, 2, 3];
             let data_types = &[
                 DataType::BigInt,
@@ -658,7 +658,7 @@ pub fn get_table_by_id_at<T: TxnService>(
 
     // Read the table row directly by handle
     let key = encode_record_key_with_handle(ALL_TABLE_TABLE_ID, id as i64);
-    let table_data = match txn.get(&ctx, &key)? {
+    let table_data = match crate::io::block_on_sync(txn.get(&ctx, &key))? {
         Some(data) => data,
         None => return Ok(None),
     };
@@ -979,7 +979,7 @@ mod tests {
     #[tokio::test]
     async fn test_load_catalog_after_bootstrap() {
         let (txn, _dir) = create_test_txn();
-        bootstrap::bootstrap_core_tables(txn.as_ref()).unwrap();
+        bootstrap::bootstrap_core_tables(txn.as_ref()).await.unwrap();
 
         let (cache, counters) = load_catalog(txn.as_ref()).unwrap();
 
@@ -1010,7 +1010,7 @@ mod tests {
     #[tokio::test]
     async fn test_load_catalog_core_table_columns() {
         let (txn, _dir) = create_test_txn();
-        bootstrap::bootstrap_core_tables(txn.as_ref()).unwrap();
+        bootstrap::bootstrap_core_tables(txn.as_ref()).await.unwrap();
 
         let (cache, _) = load_catalog(txn.as_ref()).unwrap();
 
@@ -1035,7 +1035,7 @@ mod tests {
     #[tokio::test]
     async fn test_load_catalog_table_id_map() {
         let (txn, _dir) = create_test_txn();
-        bootstrap::bootstrap_core_tables(txn.as_ref()).unwrap();
+        bootstrap::bootstrap_core_tables(txn.as_ref()).await.unwrap();
 
         let (cache, _) = load_catalog(txn.as_ref()).unwrap();
 

@@ -2422,40 +2422,49 @@ impl PessimisticStorage for LsmEngine {
         state.active.delete_pending(key, owner_start_ts)
     }
 
-    fn get_with_owner(
+    async fn get_with_owner(
         &self,
         key: &[u8],
         read_ts: Timestamp,
         owner_start_ts: Timestamp,
     ) -> Option<RawValue> {
-        let state = self.state.read();
+        // Check memtables under lock, then release before async SST I/O.
+        // Scoped block ensures RwLockReadGuard (not Send) is dropped before .await.
+        let memtable_result = {
+            let state = self.state.read();
 
-        // Check active memtable first
-        if let Some(value) = state.active.get_with_owner(key, read_ts, owner_start_ts) {
-            // Check if it's a tombstone
-            if is_tombstone(&value) {
-                return None;
-            }
-            return Some(value);
-        }
-
-        // Check frozen memtables (newest to oldest = iterate from back)
-        for frozen in state.frozen.iter().rev() {
-            if let Some(value) = frozen.get_with_owner(key, read_ts, owner_start_ts) {
+            // Check active memtable first
+            if let Some(value) = state.active.get_with_owner(key, read_ts, owner_start_ts) {
                 if is_tombstone(&value) {
-                    return None;
+                    Some(None) // Found tombstone
+                } else {
+                    Some(Some(value))
                 }
-                return Some(value);
+            } else {
+                // Check frozen memtables (newest to oldest = iterate from back)
+                let mut found = None;
+                for frozen in state.frozen.iter().rev() {
+                    if let Some(value) = frozen.get_with_owner(key, read_ts, owner_start_ts) {
+                        if is_tombstone(&value) {
+                            found = Some(None);
+                        } else {
+                            found = Some(Some(value));
+                        }
+                        break;
+                    }
+                }
+                found
             }
+            // state (RwLockReadGuard) dropped here
+        };
+
+        if let Some(result) = memtable_result {
+            return result;
         }
 
-        // Check SST files via scan (point lookup)
-        // For SST files, pending nodes don't exist, so we just do normal MVCC read
-        drop(state); // Release lock before I/O
-
-        // get_from_sst is async; use sync bridge since StorageEngine trait is sync.
-        // The scan path uses proper .await; this sync bridge is only for point lookups.
-        crate::io::block_on_sync(self.get_from_sst(key, read_ts))
+        // Check SST files via async point lookup
+        self.get_from_sst(key, read_ts)
+            .await
             .ok()
             .flatten()
     }
@@ -2579,21 +2588,21 @@ mod tests {
     // Tests should encode keys as MvccKey and use scan to find results.
 
     /// Scan MVCC keys in range using streaming iterator (test-only helper).
-    fn scan_mvcc(engine: &LsmEngine, range: Range<MvccKey>) -> Vec<(MvccKey, RawValue)> {
+    async fn scan_mvcc(engine: &LsmEngine, range: Range<MvccKey>) -> Vec<(MvccKey, RawValue)> {
         let mut results = Vec::new();
         let mut iter = engine.scan_iter(range, 0).unwrap();
-        crate::io::block_on_sync(iter.advance()).unwrap();
+        iter.advance().await.unwrap();
         while iter.valid() {
             let key = MvccKey::encode(iter.user_key(), iter.timestamp());
             results.push((key, iter.value().to_vec()));
-            crate::io::block_on_sync(iter.advance()).unwrap();
+            iter.advance().await.unwrap();
         }
         results
     }
 
     /// Get the latest version of a key visible at the given timestamp.
     /// Uses streaming iterator with MvccKey range.
-    fn get_at_for_test(engine: &LsmEngine, key: &[u8], ts: Timestamp) -> Option<RawValue> {
+    async fn get_at_for_test(engine: &LsmEngine, key: &[u8], ts: Timestamp) -> Option<RawValue> {
         // Create MVCC key range: from (key, ts) to next key
         let start = MvccKey::encode(key, ts);
         let end = MvccKey::encode(key, 0)
@@ -2601,7 +2610,7 @@ mod tests {
             .unwrap_or_else(MvccKey::unbounded);
         let range = start..end;
 
-        let results = scan_mvcc(engine, range);
+        let results = scan_mvcc(engine, range).await;
 
         // Find the first entry matching our key (latest visible version)
         for (mvcc_key, value) in results {
@@ -2617,12 +2626,12 @@ mod tests {
     }
 
     /// Get the latest version of a key (at MAX timestamp).
-    fn get_for_test(engine: &LsmEngine, key: &[u8]) -> Option<RawValue> {
-        get_at_for_test(engine, key, Timestamp::MAX)
+    async fn get_for_test(engine: &LsmEngine, key: &[u8]) -> Option<RawValue> {
+        get_at_for_test(engine, key, Timestamp::MAX).await
     }
 
     /// Scan a key range at the given timestamp, returning (key, value) pairs.
-    fn scan_at_for_test(
+    async fn scan_at_for_test(
         engine: &LsmEngine,
         range: &Range<Vec<u8>>,
         ts: Timestamp,
@@ -2632,7 +2641,7 @@ mod tests {
         let end = MvccKey::encode(&range.end, 0);
         let mvcc_range = start..end;
 
-        let results = scan_mvcc(engine, mvcc_range);
+        let results = scan_mvcc(engine, mvcc_range).await;
 
         // Deduplicate by key and filter by timestamp
         let mut seen_keys: std::collections::HashSet<Vec<u8>> = std::collections::HashSet::new();
@@ -2660,8 +2669,8 @@ mod tests {
     }
 
     /// Scan a key range at latest timestamp.
-    fn scan_for_test(engine: &LsmEngine, range: &Range<Vec<u8>>) -> Vec<(Vec<u8>, RawValue)> {
-        scan_at_for_test(engine, range, Timestamp::MAX)
+    async fn scan_for_test(engine: &LsmEngine, range: &Range<Vec<u8>>) -> Vec<(Vec<u8>, RawValue)> {
+        scan_at_for_test(engine, range, Timestamp::MAX).await
     }
 
     #[test]
@@ -2677,8 +2686,8 @@ mod tests {
         assert_eq!(stats.total_sst_count, 0);
     }
 
-    #[test]
-    fn test_lsm_engine_write_and_read() {
+    #[tokio::test]
+    async fn test_lsm_engine_write_and_read() {
         let tmp = TempDir::new().unwrap();
         let config = test_config(tmp.path());
         let engine = LsmEngine::open(config).unwrap();
@@ -2688,13 +2697,19 @@ mod tests {
         batch.put(b"key2".to_vec(), b"value2".to_vec());
         engine.write_batch(batch).unwrap();
 
-        assert_eq!(get_for_test(&engine, b"key1"), Some(b"value1".to_vec()));
-        assert_eq!(get_for_test(&engine, b"key2"), Some(b"value2".to_vec()));
-        assert_eq!(get_for_test(&engine, b"key3"), None);
+        assert_eq!(
+            get_for_test(&engine, b"key1").await,
+            Some(b"value1".to_vec())
+        );
+        assert_eq!(
+            get_for_test(&engine, b"key2").await,
+            Some(b"value2".to_vec())
+        );
+        assert_eq!(get_for_test(&engine, b"key3").await, None);
     }
 
-    #[test]
-    fn test_lsm_engine_mvcc_read() {
+    #[tokio::test]
+    async fn test_lsm_engine_mvcc_read() {
         let tmp = TempDir::new().unwrap();
         let config = test_config(tmp.path());
         let engine = LsmEngine::open(config).unwrap();
@@ -2710,15 +2725,27 @@ mod tests {
         engine.write_batch(batch).unwrap();
 
         // Read at different timestamps
-        assert_eq!(get_at_for_test(&engine, b"key", 5), None);
-        assert_eq!(get_at_for_test(&engine, b"key", 10), Some(b"v1".to_vec()));
-        assert_eq!(get_at_for_test(&engine, b"key", 15), Some(b"v1".to_vec()));
-        assert_eq!(get_at_for_test(&engine, b"key", 20), Some(b"v2".to_vec()));
-        assert_eq!(get_at_for_test(&engine, b"key", 25), Some(b"v2".to_vec()));
+        assert_eq!(get_at_for_test(&engine, b"key", 5).await, None);
+        assert_eq!(
+            get_at_for_test(&engine, b"key", 10).await,
+            Some(b"v1".to_vec())
+        );
+        assert_eq!(
+            get_at_for_test(&engine, b"key", 15).await,
+            Some(b"v1".to_vec())
+        );
+        assert_eq!(
+            get_at_for_test(&engine, b"key", 20).await,
+            Some(b"v2".to_vec())
+        );
+        assert_eq!(
+            get_at_for_test(&engine, b"key", 25).await,
+            Some(b"v2".to_vec())
+        );
     }
 
-    #[test]
-    fn test_lsm_engine_memtable_rotation() {
+    #[tokio::test]
+    async fn test_lsm_engine_memtable_rotation() {
         let tmp = TempDir::new().unwrap();
         let config = LsmConfig::builder(tmp.path())
             .memtable_size(200) // Very small
@@ -2745,14 +2772,14 @@ mod tests {
             let key = format!("key_{i:04}");
             let expected = format!("value_{i:04}");
             assert_eq!(
-                get_for_test(&engine, key.as_bytes()),
+                get_for_test(&engine, key.as_bytes()).await,
                 Some(expected.as_bytes().to_vec())
             );
         }
     }
 
-    #[test]
-    fn test_lsm_engine_flush() {
+    #[tokio::test]
+    async fn test_lsm_engine_flush() {
         let tmp = TempDir::new().unwrap();
         let config = LsmConfig::builder(tmp.path())
             .memtable_size(100) // Very small
@@ -2785,15 +2812,15 @@ mod tests {
             let key = format!("key_{i:04}");
             let expected = format!("value_{i:04}");
             assert_eq!(
-                get_for_test(&engine, key.as_bytes()),
+                get_for_test(&engine, key.as_bytes()).await,
                 Some(expected.as_bytes().to_vec()),
                 "Key {key} should be readable after flush"
             );
         }
     }
 
-    #[test]
-    fn test_lsm_engine_scan() {
+    #[tokio::test]
+    async fn test_lsm_engine_scan() {
         let tmp = TempDir::new().unwrap();
         let config = test_config(tmp.path());
         let engine = LsmEngine::open(config).unwrap();
@@ -2806,15 +2833,15 @@ mod tests {
         engine.write_batch(batch).unwrap();
 
         let range = b"b".to_vec()..b"d".to_vec();
-        let results = scan_for_test(&engine, &range);
+        let results = scan_for_test(&engine, &range).await;
 
         assert_eq!(results.len(), 2);
         assert!(results.iter().any(|(k, _)| k == b"b"));
         assert!(results.iter().any(|(k, _)| k == b"c"));
     }
 
-    #[test]
-    fn test_lsm_engine_delete() {
+    #[tokio::test]
+    async fn test_lsm_engine_delete() {
         let tmp = TempDir::new().unwrap();
         let config = test_config(tmp.path());
         let engine = LsmEngine::open(config).unwrap();
@@ -2824,7 +2851,7 @@ mod tests {
         batch.put(b"key".to_vec(), b"value".to_vec());
         engine.write_batch(batch).unwrap();
 
-        assert_eq!(get_for_test(&engine, b"key"), Some(b"value".to_vec()));
+        assert_eq!(get_for_test(&engine, b"key").await, Some(b"value".to_vec()));
 
         // Delete
         let mut batch = new_batch(20);
@@ -2832,11 +2859,11 @@ mod tests {
         engine.write_batch(batch).unwrap();
 
         // Should be deleted at latest
-        assert_eq!(get_for_test(&engine, b"key"), None);
+        assert_eq!(get_for_test(&engine, b"key").await, None);
 
         // Should still be visible at ts=15
         assert_eq!(
-            get_at_for_test(&engine, b"key", 15),
+            get_at_for_test(&engine, b"key", 15).await,
             Some(b"value".to_vec())
         );
     }
@@ -2861,8 +2888,8 @@ mod tests {
     use std::sync::Arc;
     use std::thread;
 
-    #[test]
-    fn test_lsm_concurrent_writes() {
+    #[tokio::test]
+    async fn test_lsm_concurrent_writes() {
         let tmp = TempDir::new().unwrap();
         let config = LsmConfig::builder(tmp.path())
             .memtable_size(4096)
@@ -2900,15 +2927,15 @@ mod tests {
             for i in 0..writes_per_thread {
                 let key = format!("key_{tid}_{i}");
                 assert!(
-                    get_for_test(&engine, key.as_bytes()).is_some(),
+                    get_for_test(&engine, key.as_bytes()).await.is_some(),
                     "Key {key} should exist"
                 );
             }
         }
     }
 
-    #[test]
-    fn test_lsm_concurrent_reads_and_writes() {
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn test_lsm_concurrent_reads_and_writes() {
         let tmp = TempDir::new().unwrap();
         let config = LsmConfig::builder(tmp.path())
             .memtable_size(4096)
@@ -2931,41 +2958,38 @@ mod tests {
         let num_readers = 4;
         let num_writers = 2;
 
-        let handles: Vec<_> = (0..num_readers)
-            .map(|_| {
-                let engine = Arc::clone(&engine);
-
-                thread::spawn(move || {
-                    for i in 0..500 {
-                        let key = format!("key{:03}", i % 100);
-                        let _ = get_for_test(&engine, key.as_bytes());
-                    }
-                })
-            })
-            .chain((0..num_writers).map(|tid| {
-                let engine = Arc::clone(&engine);
-
-                thread::spawn(move || {
-                    for i in 0..200 {
-                        let mut batch = WriteBatch::new();
-                        let ts = (100 + tid * 200 + i) as Timestamp;
-                        batch.set_commit_ts(ts);
-                        let key = format!("new_key_{tid}_{i}");
-                        batch.put(key.as_bytes().to_vec(), b"value".to_vec());
-                        engine.write_batch(batch).unwrap();
-                    }
-                })
-            }))
-            .collect();
+        let mut handles = Vec::new();
+        for _ in 0..num_readers {
+            let engine = Arc::clone(&engine);
+            handles.push(tokio::spawn(async move {
+                for i in 0..500 {
+                    let key = format!("key{:03}", i % 100);
+                    let _ = get_for_test(&engine, key.as_bytes()).await;
+                }
+            }));
+        }
+        for tid in 0..num_writers {
+            let engine = Arc::clone(&engine);
+            handles.push(tokio::spawn(async move {
+                for i in 0..200 {
+                    let mut batch = WriteBatch::new();
+                    let ts = (100 + tid * 200 + i) as Timestamp;
+                    batch.set_commit_ts(ts);
+                    let key = format!("new_key_{tid}_{i}");
+                    batch.put(key.as_bytes().to_vec(), b"value".to_vec());
+                    engine.write_batch(batch).unwrap();
+                }
+            }));
+        }
 
         for h in handles {
-            h.join().unwrap();
+            h.await.unwrap();
         }
 
         // Verify original data still readable
         for i in 0..100 {
             let key = format!("key{i:03}");
-            assert!(get_for_test(&engine, key.as_bytes()).is_some());
+            assert!(get_for_test(&engine, key.as_bytes()).await.is_some());
         }
     }
 
@@ -2974,8 +2998,8 @@ mod tests {
     use crate::lsn::new_lsn_provider;
     use crate::storage::ilog::{IlogConfig, IlogService};
 
-    #[test]
-    fn test_lsm_durable_flush() {
+    #[tokio::test]
+    async fn test_lsm_durable_flush() {
         let tmp = TempDir::new().unwrap();
         let config = LsmConfig::builder(tmp.path())
             .memtable_size(100) // Very small
@@ -3016,15 +3040,15 @@ mod tests {
             let key = format!("key_{i:04}");
             let expected = format!("value_{i:04}");
             assert_eq!(
-                get_for_test(&engine, key.as_bytes()),
+                get_for_test(&engine, key.as_bytes()).await,
                 Some(expected.as_bytes().to_vec()),
                 "Key {key} should be readable after durable flush"
             );
         }
     }
 
-    #[test]
-    fn test_lsm_durable_recovery() {
+    #[tokio::test]
+    async fn test_lsm_durable_recovery() {
         let tmp = TempDir::new().unwrap();
 
         // First session: write and flush
@@ -3083,7 +3107,7 @@ mod tests {
                 let key = format!("key_{i:04}");
                 let expected = format!("value_{i:04}");
                 assert_eq!(
-                    get_for_test(&engine, key.as_bytes()),
+                    get_for_test(&engine, key.as_bytes()).await,
                     Some(expected.as_bytes().to_vec()),
                     "Key {key} should be readable after recovery"
                 );
@@ -3093,8 +3117,8 @@ mod tests {
 
     // ==================== MVCC SST Storage Tests ====================
 
-    #[test]
-    fn test_mvcc_scan_at_timestamp_filtering() {
+    #[tokio::test]
+    async fn test_mvcc_scan_at_timestamp_filtering() {
         // Test that scan_at returns correct versions based on timestamp
         let tmp = TempDir::new().unwrap();
         let config = test_config(tmp.path());
@@ -3114,45 +3138,45 @@ mod tests {
         engine.write_batch(batch3).unwrap();
 
         // get_at should return the correct version
-        assert_eq!(get_at_for_test(&engine, b"key", 5), None); // Too early
+        assert_eq!(get_at_for_test(&engine, b"key", 5).await, None); // Too early
         assert_eq!(
-            get_at_for_test(&engine, b"key", 10),
+            get_at_for_test(&engine, b"key", 10).await,
             Some(b"value_10".to_vec())
         );
         assert_eq!(
-            get_at_for_test(&engine, b"key", 15),
+            get_at_for_test(&engine, b"key", 15).await,
             Some(b"value_10".to_vec())
         );
         assert_eq!(
-            get_at_for_test(&engine, b"key", 20),
+            get_at_for_test(&engine, b"key", 20).await,
             Some(b"value_20".to_vec())
         );
         assert_eq!(
-            get_at_for_test(&engine, b"key", 25),
+            get_at_for_test(&engine, b"key", 25).await,
             Some(b"value_20".to_vec())
         );
         assert_eq!(
-            get_at_for_test(&engine, b"key", 30),
+            get_at_for_test(&engine, b"key", 30).await,
             Some(b"value_30".to_vec())
         );
         assert_eq!(
-            get_at_for_test(&engine, b"key", 100),
+            get_at_for_test(&engine, b"key", 100).await,
             Some(b"value_30".to_vec())
         );
 
         // scan_at should also respect timestamp
         let range = b"key".to_vec()..b"key\xff".to_vec();
-        let results15 = scan_at_for_test(&engine, &range, 15);
+        let results15 = scan_at_for_test(&engine, &range, 15).await;
         assert_eq!(results15.len(), 1);
         assert_eq!(results15[0].1, b"value_10".to_vec());
 
-        let results25 = scan_at_for_test(&engine, &range, 25);
+        let results25 = scan_at_for_test(&engine, &range, 25).await;
         assert_eq!(results25.len(), 1);
         assert_eq!(results25[0].1, b"value_20".to_vec());
     }
 
-    #[test]
-    fn test_mvcc_scan_at_after_flush() {
+    #[tokio::test]
+    async fn test_mvcc_scan_at_after_flush() {
         // Test that MVCC works correctly when data is flushed to SST
         let tmp = TempDir::new().unwrap();
         let config = LsmConfig::builder(tmp.path())
@@ -3191,12 +3215,18 @@ mod tests {
         engine.flush_all_with_active().unwrap();
 
         // SST should contain MVCC keys - verify by reading at different timestamps
-        assert_eq!(get_at_for_test(&engine, b"key", 15), Some(b"v1".to_vec()));
-        assert_eq!(get_at_for_test(&engine, b"key", 25), Some(b"v2".to_vec()));
+        assert_eq!(
+            get_at_for_test(&engine, b"key", 15).await,
+            Some(b"v1".to_vec())
+        );
+        assert_eq!(
+            get_at_for_test(&engine, b"key", 25).await,
+            Some(b"v2".to_vec())
+        );
     }
 
-    #[test]
-    fn test_mvcc_tombstone_in_sst() {
+    #[tokio::test]
+    async fn test_mvcc_tombstone_in_sst() {
         // Test that tombstones in SST properly mask older values
         let tmp = TempDir::new().unwrap();
         let config = LsmConfig::builder(tmp.path())
@@ -3236,11 +3266,11 @@ mod tests {
 
         // Check MVCC visibility
         assert_eq!(
-            get_at_for_test(&engine, b"key", 15),
+            get_at_for_test(&engine, b"key", 15).await,
             Some(b"value".to_vec())
         );
-        assert_eq!(get_at_for_test(&engine, b"key", 25), None); // Deleted
-        assert_eq!(get_for_test(&engine, b"key"), None); // Latest is deleted
+        assert_eq!(get_at_for_test(&engine, b"key", 25).await, None); // Deleted
+        assert_eq!(get_for_test(&engine, b"key").await, None); // Latest is deleted
     }
 
     #[test]
@@ -3266,8 +3296,8 @@ mod tests {
         );
     }
 
-    #[test]
-    fn test_scan_at_multiple_keys_with_mvcc() {
+    #[tokio::test]
+    async fn test_scan_at_multiple_keys_with_mvcc() {
         // Test scanning multiple keys with different versions
         let tmp = TempDir::new().unwrap();
         let config = test_config(tmp.path());
@@ -3292,21 +3322,21 @@ mod tests {
 
         // Scan at ts=15: should see a_v1, b_v1, c_v1
         let range = b"a".to_vec()..b"d".to_vec();
-        let results15 = scan_at_for_test(&engine, &range, 15);
+        let results15 = scan_at_for_test(&engine, &range, 15).await;
         assert_eq!(results15.len(), 3);
         assert_eq!(results15[0], (b"a".to_vec(), b"a_v1".to_vec()));
         assert_eq!(results15[1], (b"b".to_vec(), b"b_v1".to_vec()));
         assert_eq!(results15[2], (b"c".to_vec(), b"c_v1".to_vec()));
 
         // Scan at ts=25: should see a_v1, b_v2, c_v1
-        let results25 = scan_at_for_test(&engine, &range, 25);
+        let results25 = scan_at_for_test(&engine, &range, 25).await;
         assert_eq!(results25.len(), 3);
         assert_eq!(results25[0], (b"a".to_vec(), b"a_v1".to_vec()));
         assert_eq!(results25[1], (b"b".to_vec(), b"b_v2".to_vec()));
         assert_eq!(results25[2], (b"c".to_vec(), b"c_v1".to_vec()));
 
         // Scan at ts=35: should see b_v2, c_v1 (a deleted)
-        let results35 = scan_at_for_test(&engine, &range, 35);
+        let results35 = scan_at_for_test(&engine, &range, 35).await;
         assert_eq!(results35.len(), 2);
         assert_eq!(results35[0], (b"b".to_vec(), b"b_v2".to_vec()));
         assert_eq!(results35[1], (b"c".to_vec(), b"c_v1".to_vec()));
@@ -3364,8 +3394,8 @@ mod tests {
         );
     }
 
-    #[test]
-    fn test_sst_contains_mvcc_keys() {
+    #[tokio::test]
+    async fn test_sst_contains_mvcc_keys() {
         // Critical: Verify SST contains MVCC-encoded keys
         let tmp = TempDir::new().unwrap();
         let config = LsmConfig::builder(tmp.path())
@@ -3410,13 +3440,14 @@ mod tests {
         assert!(!ssts.is_empty(), "Should have at least one SST");
 
         let sst_path = config.sst_dir().join(format!("{:08}.sst", ssts[0].id));
-        let reader = crate::io::block_on_sync(SstReaderRef::open(
+        let reader = SstReaderRef::open(
             &sst_path,
             crate::io::IoService::new_for_test(32).unwrap(),
-        ))
+        )
+        .await
         .unwrap();
         let mut iter = SstIterator::new(reader).unwrap();
-        crate::io::block_on_sync(iter.seek_to_first()).unwrap(); // Position the iterator
+        iter.seek_to_first().await.unwrap(); // Position the iterator
 
         let mut entry_count = 0;
         let mut found_ts_10 = false;
@@ -3441,7 +3472,7 @@ mod tests {
                 }
             }
             entry_count += 1;
-            if crate::io::block_on_sync(iter.advance()).is_err() {
+            if iter.advance().await.is_err() {
                 break;
             }
         }
@@ -3454,8 +3485,8 @@ mod tests {
         assert!(found_ts_20, "SST should contain version at ts=20");
     }
 
-    #[test]
-    fn test_tombstone_point_read_from_sst() {
+    #[tokio::test]
+    async fn test_tombstone_point_read_from_sst() {
         // Critical: Verify get_at returns None when visible version is tombstone in SST
         let tmp = TempDir::new().unwrap();
         let config = LsmConfig::builder(tmp.path())
@@ -3497,28 +3528,28 @@ mod tests {
 
         // Point read at ts=15 should return value (before delete)
         assert_eq!(
-            get_at_for_test(&engine, b"key", 15),
+            get_at_for_test(&engine, b"key", 15).await,
             Some(b"value".to_vec()),
             "get_at(ts=15) should return value from SST"
         );
 
         // Point read at ts=25 should return None (tombstone visible)
         assert_eq!(
-            get_at_for_test(&engine, b"key", 25),
+            get_at_for_test(&engine, b"key", 25).await,
             None,
             "get_at(ts=25) should return None due to tombstone in SST"
         );
 
         // Latest read should also return None
         assert_eq!(
-            get_for_test(&engine, b"key"),
+            get_for_test(&engine, b"key").await,
             None,
             "get() should return None due to tombstone in SST"
         );
     }
 
-    #[test]
-    fn test_long_key_with_0xff_prefix_flushes_correctly() {
+    #[tokio::test]
+    async fn test_long_key_with_0xff_prefix_flushes_correctly() {
         // Medium: Verify keys with 0xFF prefix bytes are properly flushed
         let tmp = TempDir::new().unwrap();
         let config = LsmConfig::builder(tmp.path())
@@ -3563,19 +3594,19 @@ mod tests {
 
         // Both keys should be readable from SST
         assert_eq!(
-            get_for_test(&engine, &long_key),
+            get_for_test(&engine, &long_key).await,
             Some(value),
             "Long key with 0xFF prefix should be readable after flush"
         );
         assert_eq!(
-            get_for_test(&engine, b"normal_key"),
+            get_for_test(&engine, b"normal_key").await,
             Some(b"normal_value".to_vec()),
             "Normal key should be readable after flush"
         );
     }
 
-    #[test]
-    fn test_concurrent_flush_unique_sst_ids() {
+    #[tokio::test]
+    async fn test_concurrent_flush_unique_sst_ids() {
         // Verify concurrent flushes get unique SST IDs.
         // Uses 2 threads to avoid O(threads*memtables) SST duplication which
         // makes io_uring reads slow in the verification phase.
@@ -3645,15 +3676,15 @@ mod tests {
             let key = format!("key_{i:04}");
             let expected = format!("value_{i:04}");
             assert_eq!(
-                get_for_test(&engine, key.as_bytes()),
+                get_for_test(&engine, key.as_bytes()).await,
                 Some(expected.as_bytes().to_vec()),
                 "Key {key} should be readable after concurrent flushes"
             );
         }
     }
 
-    #[test]
-    fn test_mvcc_visibility_after_flush_recovery() {
+    #[tokio::test]
+    async fn test_mvcc_visibility_after_flush_recovery() {
         // Critical: Verify MVCC visibility works correctly after flush and recovery
         let tmp = TempDir::new().unwrap();
 
@@ -3711,17 +3742,17 @@ mod tests {
 
             // MVCC visibility should work from SST
             assert_eq!(
-                get_at_for_test(&engine, b"key", 5),
+                get_at_for_test(&engine, b"key", 5).await,
                 None,
                 "Nothing visible at ts=5"
             );
             assert_eq!(
-                get_at_for_test(&engine, b"key", 15),
+                get_at_for_test(&engine, b"key", 15).await,
                 Some(b"v1".to_vec()),
                 "v1 visible at ts=15"
             );
             assert_eq!(
-                get_at_for_test(&engine, b"key", 25),
+                get_at_for_test(&engine, b"key", 25).await,
                 Some(b"v2".to_vec()),
                 "v2 visible at ts=25"
             );
@@ -3736,8 +3767,8 @@ mod tests {
     /// should mask older values in SST.
     ///
     /// Scenario: put→flush→delete (unflushed) then get_at(ts>=delete_ts) must return None
-    #[test]
-    fn test_delete_masking_across_levels() {
+    #[tokio::test]
+    async fn test_delete_masking_across_levels() {
         let tmp = TempDir::new().unwrap();
         let config = LsmConfig::builder(tmp.path())
             .memtable_size(100)
@@ -3771,7 +3802,7 @@ mod tests {
 
         // Verify value is readable from SST
         assert_eq!(
-            get_at_for_test(&engine, b"key", 15),
+            get_at_for_test(&engine, b"key", 15).await,
             Some(b"value_in_sst".to_vec()),
             "Value should be readable from SST before delete"
         );
@@ -3787,27 +3818,27 @@ mod tests {
         // This is the critical test: get_at(ts>=20) MUST return None,
         // NOT the old value from SST. The tombstone in memtable must stop the search.
         assert_eq!(
-            get_at_for_test(&engine, b"key", 25),
+            get_at_for_test(&engine, b"key", 25).await,
             None,
             "Delete in memtable MUST mask value in SST (ts=25 >= delete_ts=20)"
         );
 
         assert_eq!(
-            get_at_for_test(&engine, b"key", 20),
+            get_at_for_test(&engine, b"key", 20).await,
             None,
             "Delete in memtable MUST mask value in SST (ts=20 == delete_ts)"
         );
 
         // Value should still be visible before the delete timestamp
         assert_eq!(
-            get_at_for_test(&engine, b"key", 15),
+            get_at_for_test(&engine, b"key", 15).await,
             Some(b"value_in_sst".to_vec()),
             "Value should still be visible at ts=15 (before delete)"
         );
 
         // Latest read should also return None
         assert_eq!(
-            get_for_test(&engine, b"key"),
+            get_for_test(&engine, b"key").await,
             None,
             "Latest read should return None (deleted)"
         );
@@ -3816,8 +3847,8 @@ mod tests {
     /// Test: Delete masking in scan across levels.
     ///
     /// Similar to point read, but for range scans.
-    #[test]
-    fn test_delete_masking_in_scan_across_levels() {
+    #[tokio::test]
+    async fn test_delete_masking_in_scan_across_levels() {
         let tmp = TempDir::new().unwrap();
         let config = LsmConfig::builder(tmp.path())
             .memtable_size(100)
@@ -3859,7 +3890,7 @@ mod tests {
 
         // Scan at ts=25: should see a, c (but NOT b - it's deleted)
         let range = b"a".to_vec()..b"d".to_vec();
-        let results = scan_at_for_test(&engine, &range, 25);
+        let results = scan_at_for_test(&engine, &range, 25).await;
         assert_eq!(results.len(), 2, "Should see 2 keys after delete");
         assert!(
             results.iter().all(|(k, _)| k != b"b"),
@@ -3867,7 +3898,7 @@ mod tests {
         );
 
         // Scan at ts=15: should see all 3 keys (before delete)
-        let results = scan_at_for_test(&engine, &range, 15);
+        let results = scan_at_for_test(&engine, &range, 15).await;
         assert_eq!(results.len(), 3, "Should see 3 keys before delete");
     }
 
@@ -3877,19 +3908,15 @@ mod tests {
     /// recover again and verify no missing keys.
     ///
     /// This catches the missing clog_lsn + replay ordering issues.
-    #[test]
-    fn test_two_crash_recovery() {
+    #[tokio::test]
+    async fn test_two_crash_recovery() {
         use crate::clog::{ClogBatch, ClogService, FileClogConfig, FileClogService};
 
         let tmp = TempDir::new().unwrap();
-        let rt = tokio::runtime::Builder::new_current_thread()
-            .enable_all()
-            .build()
-            .unwrap();
-        let handle = rt.handle();
+        let handle = tokio::runtime::Handle::current();
 
         // Session 1: Write data, flush some, "crash"
-        let written_keys: Vec<(Vec<u8>, Vec<u8>)>;
+        let mut written_keys: Vec<(Vec<u8>, Vec<u8>)>;
         {
             let lsm_config = LsmConfig::builder(tmp.path())
                 .memtable_size(50) // Small to encourage rotation
@@ -3916,33 +3943,31 @@ mod tests {
             let clog = FileClogService::open_with_lsn_provider(
                 clog_config,
                 Arc::clone(&lsn_provider),
-                handle,
+                &handle,
             )
             .unwrap();
 
             // Write 5 transactions
-            written_keys = (0..5)
-                .map(|i| {
-                    let key = format!("key_{i:04}").into_bytes();
-                    let value = format!("value_{i:04}").into_bytes();
+            written_keys = Vec::new();
+            for i in 0..5 {
+                let key = format!("key_{i:04}").into_bytes();
+                let value = format!("value_{i:04}").into_bytes();
 
-                    // Write to clog
-                    let mut batch = ClogBatch::new();
-                    batch.add_put(i as u64 + 1, key.clone(), value.clone());
-                    batch.add_commit(i as u64 + 1, i as Timestamp + 100);
-                    let clog_lsn =
-                        crate::io::block_on_sync(clog.write(&mut batch, true).unwrap()).unwrap();
+                // Write to clog
+                let mut batch = ClogBatch::new();
+                batch.add_put(i as u64 + 1, key.clone(), value.clone());
+                batch.add_commit(i as u64 + 1, i as Timestamp + 100);
+                let clog_lsn = clog.write(&mut batch, true).unwrap().await.unwrap();
 
-                    // Write to engine with clog_lsn
-                    let mut wb = WriteBatch::new();
-                    wb.set_commit_ts(i as Timestamp + 100);
-                    wb.set_clog_lsn(clog_lsn);
-                    wb.put(key.clone(), value.clone());
-                    engine.write_batch(wb).unwrap();
+                // Write to engine with clog_lsn
+                let mut wb = WriteBatch::new();
+                wb.set_commit_ts(i as Timestamp + 100);
+                wb.set_clog_lsn(clog_lsn);
+                wb.put(key.clone(), value.clone());
+                engine.write_batch(wb).unwrap();
 
-                    (key, value)
-                })
-                .collect();
+                written_keys.push((key, value));
+            }
 
             // Flush some (but not all)
             engine.freeze_active();
@@ -3957,7 +3982,7 @@ mod tests {
                 }
             }
 
-            clog.close().unwrap();
+            clog.close().await.unwrap();
             // "Crash" - engine dropped
         }
 
@@ -3966,12 +3991,12 @@ mod tests {
             use crate::storage::recovery::LsmRecovery;
 
             let recovery = LsmRecovery::new(tmp.path());
-            let result = recovery.recover(handle).unwrap();
+            let result = recovery.recover(&handle).unwrap();
 
             // Verify all data is recovered
             for (key, value) in &written_keys {
                 assert_eq!(
-                    get_for_test(&result.engine, key),
+                    get_for_test(&result.engine, key).await,
                     Some(value.clone()),
                     "Key {:?} should be recovered in session 2",
                     String::from_utf8_lossy(key)
@@ -3981,7 +4006,7 @@ mod tests {
             // Flush all recovered memtables
             result.engine.flush_all_with_active().unwrap();
 
-            result.clog.close().unwrap();
+            result.clog.close().await.unwrap();
             // "Crash" again - engine dropped
         }
 
@@ -3990,12 +4015,12 @@ mod tests {
             use crate::storage::recovery::LsmRecovery;
 
             let recovery = LsmRecovery::new(tmp.path());
-            let result = recovery.recover(handle).unwrap();
+            let result = recovery.recover(&handle).unwrap();
 
             // Verify all data is still present after two-crash recovery
             for (key, value) in &written_keys {
                 assert_eq!(
-                    get_for_test(&result.engine, key),
+                    get_for_test(&result.engine, key).await,
                     Some(value.clone()),
                     "Key {:?} should be present after two-crash recovery",
                     String::from_utf8_lossy(key)
@@ -4005,8 +4030,8 @@ mod tests {
     }
 
     /// Test: All-0xFF keys are handled correctly.
-    #[test]
-    fn test_all_0xff_keys() {
+    #[tokio::test]
+    async fn test_all_0xff_keys() {
         let tmp = TempDir::new().unwrap();
         let config = LsmConfig::builder(tmp.path())
             .memtable_size(1000)
@@ -4044,17 +4069,17 @@ mod tests {
 
         // Verify all keys are readable from memtable
         assert_eq!(
-            get_for_test(&engine, &key_all_ff_short),
+            get_for_test(&engine, &key_all_ff_short).await,
             Some(b"short_ff_value".to_vec()),
             "Short 0xFF key should be readable from memtable"
         );
         assert_eq!(
-            get_for_test(&engine, &key_all_ff_long),
+            get_for_test(&engine, &key_all_ff_long).await,
             Some(b"long_ff_value".to_vec()),
             "Long 0xFF key should be readable from memtable"
         );
         assert_eq!(
-            get_for_test(&engine, &key_normal),
+            get_for_test(&engine, &key_normal).await,
             Some(b"normal_value".to_vec()),
             "Normal key should be readable from memtable"
         );
@@ -4064,17 +4089,17 @@ mod tests {
 
         // Verify all keys are readable from SST
         assert_eq!(
-            get_for_test(&engine, &key_all_ff_short),
+            get_for_test(&engine, &key_all_ff_short).await,
             Some(b"short_ff_value".to_vec()),
             "Short 0xFF key should be readable from SST"
         );
         assert_eq!(
-            get_for_test(&engine, &key_all_ff_long),
+            get_for_test(&engine, &key_all_ff_long).await,
             Some(b"long_ff_value".to_vec()),
             "Long 0xFF key should be readable from SST"
         );
         assert_eq!(
-            get_for_test(&engine, &key_normal),
+            get_for_test(&engine, &key_normal).await,
             Some(b"normal_value".to_vec()),
             "Normal key should be readable from SST"
         );
@@ -5089,8 +5114,8 @@ mod tests {
         );
     }
 
-    #[test]
-    fn test_sst_data_accessible_after_flush() {
+    #[tokio::test]
+    async fn test_sst_data_accessible_after_flush() {
         // Test that data flushed to SST is accessible via scan_iter
 
         let tmp = TempDir::new().unwrap();
@@ -5118,7 +5143,7 @@ mod tests {
         assert!(sst_path.exists(), "SST file should exist");
 
         // Verify data is readable from SST
-        let result = get_for_test(&engine, b"key");
+        let result = get_for_test(&engine, b"key").await;
         assert_eq!(
             result,
             Some(b"value".to_vec()),
@@ -6033,8 +6058,8 @@ mod tests {
         assert!(!iter.valid());
     }
 
-    #[test]
-    fn test_l0_sst_iterator_with_multiple_ssts() {
+    #[tokio::test]
+    async fn test_l0_sst_iterator_with_multiple_ssts() {
         let tmp = TempDir::new().unwrap();
         let config = LsmConfig::builder(tmp.path())
             .memtable_size(100) // Small to force multiple flushes
@@ -6060,7 +6085,7 @@ mod tests {
             let key = format!("key_{round}");
             let expected = format!("value_{round}");
             assert_eq!(
-                get_for_test(&engine, key.as_bytes()),
+                get_for_test(&engine, key.as_bytes()).await,
                 Some(expected.into_bytes()),
                 "Should find key_{round}"
             );
@@ -6069,8 +6094,8 @@ mod tests {
 
     // ==================== LevelIterator Tests (via integration) ====================
 
-    #[test]
-    fn test_multiple_l0_ssts_scan() {
+    #[tokio::test]
+    async fn test_multiple_l0_ssts_scan() {
         // Test that scanning works correctly with multiple L0 SSTs.
         let tmp = TempDir::new().unwrap();
         let config = LsmConfig::builder(tmp.path())
@@ -6093,7 +6118,7 @@ mod tests {
         for i in 0..4 {
             let key = format!("key_{i:02}");
             let expected = format!("value_{i}");
-            let result = get_for_test(&engine, key.as_bytes());
+            let result = get_for_test(&engine, key.as_bytes()).await;
             assert_eq!(
                 result,
                 Some(expected.into_bytes()),
@@ -6102,8 +6127,8 @@ mod tests {
         }
     }
 
-    #[test]
-    fn test_level_iterator_empty_level() {
+    #[tokio::test]
+    async fn test_level_iterator_empty_level() {
         let tmp = TempDir::new().unwrap();
         let config = test_config(tmp.path());
         let engine = LsmEngine::open(config).unwrap();
@@ -6114,13 +6139,13 @@ mod tests {
         engine.write_batch(batch).unwrap();
 
         // Query should work even with empty levels
-        assert_eq!(get_for_test(&engine, b"key"), Some(b"value".to_vec()));
+        assert_eq!(get_for_test(&engine, b"key").await, Some(b"value".to_vec()));
     }
 
     // ==================== Scan Iterator Range Tests ====================
 
-    #[test]
-    fn test_scan_iter_with_range_start() {
+    #[tokio::test]
+    async fn test_scan_iter_with_range_start() {
         let tmp = TempDir::new().unwrap();
         let config = test_config(tmp.path());
         let engine = LsmEngine::open(config).unwrap();
@@ -6137,7 +6162,7 @@ mod tests {
         let end = MvccKey::unbounded();
         let range = start..end;
 
-        let results = scan_mvcc(&engine, range);
+        let results = scan_mvcc(&engine, range).await;
         let keys: Vec<_> = results.iter().map(|(k, _)| k.key()).collect();
 
         assert!(keys.contains(&b"b".as_slice()));
@@ -6146,8 +6171,8 @@ mod tests {
         assert!(!keys.contains(&b"a".as_slice()));
     }
 
-    #[test]
-    fn test_scan_iter_with_range_end() {
+    #[tokio::test]
+    async fn test_scan_iter_with_range_end() {
         let tmp = TempDir::new().unwrap();
         let config = test_config(tmp.path());
         let engine = LsmEngine::open(config).unwrap();
@@ -6164,7 +6189,7 @@ mod tests {
         let end = MvccKey::encode(b"c", u64::MAX);
         let range = start..end;
 
-        let results = scan_mvcc(&engine, range);
+        let results = scan_mvcc(&engine, range).await;
         let keys: Vec<_> = results.iter().map(|(k, _)| k.key()).collect();
 
         assert!(keys.contains(&b"a".as_slice()));
@@ -6173,8 +6198,8 @@ mod tests {
         assert!(!keys.contains(&b"d".as_slice()));
     }
 
-    #[test]
-    fn test_scan_iter_across_memtable_and_sst() {
+    #[tokio::test]
+    async fn test_scan_iter_across_memtable_and_sst() {
         let tmp = TempDir::new().unwrap();
         let config = LsmConfig::builder(tmp.path())
             .memtable_size(200)
@@ -6198,7 +6223,7 @@ mod tests {
 
         // Scan should merge both
         let range = MvccKey::unbounded()..MvccKey::unbounded();
-        let results = scan_mvcc(&engine, range);
+        let results = scan_mvcc(&engine, range).await;
         let keys: Vec<_> = results.iter().map(|(k, _)| k.key()).collect();
 
         assert!(keys.contains(&b"sst_a".as_slice()));
@@ -6207,8 +6232,8 @@ mod tests {
         assert!(keys.contains(&b"mem_d".as_slice()));
     }
 
-    #[test]
-    fn test_scan_iter_with_updates_across_layers() {
+    #[tokio::test]
+    async fn test_scan_iter_with_updates_across_layers() {
         let tmp = TempDir::new().unwrap();
         let config = LsmConfig::builder(tmp.path())
             .memtable_size(200)
@@ -6230,7 +6255,7 @@ mod tests {
 
         // Both versions should be visible via MVCC scan
         let range = MvccKey::unbounded()..MvccKey::unbounded();
-        let results = scan_mvcc(&engine, range);
+        let results = scan_mvcc(&engine, range).await;
 
         // Should have both versions
         assert_eq!(results.len(), 2);
@@ -6244,8 +6269,8 @@ mod tests {
         assert_eq!(results[1].1, b"v1");
     }
 
-    #[test]
-    fn test_scan_iter_empty_range() {
+    #[tokio::test]
+    async fn test_scan_iter_empty_range() {
         let tmp = TempDir::new().unwrap();
         let config = test_config(tmp.path());
         let engine = LsmEngine::open(config).unwrap();
@@ -6259,7 +6284,7 @@ mod tests {
         let end = MvccKey::encode(b"a", u64::MAX);
         let range = start..end;
 
-        let results = scan_mvcc(&engine, range);
+        let results = scan_mvcc(&engine, range).await;
         assert!(results.is_empty());
     }
 
@@ -6334,8 +6359,8 @@ mod tests {
 
     // ==================== Additional Edge Cases ====================
 
-    #[test]
-    fn test_iterator_after_delete_and_reinsert() {
+    #[tokio::test]
+    async fn test_iterator_after_delete_and_reinsert() {
         let tmp = TempDir::new().unwrap();
         let config = test_config(tmp.path());
         let engine = LsmEngine::open(config).unwrap();
@@ -6356,17 +6381,20 @@ mod tests {
         engine.write_batch(batch).unwrap();
 
         // Latest value should be v2
-        assert_eq!(get_for_test(&engine, b"key"), Some(b"v2".to_vec()));
+        assert_eq!(get_for_test(&engine, b"key").await, Some(b"v2".to_vec()));
 
         // At ts=250 (after delete, before re-insert), should be None
-        assert_eq!(get_at_for_test(&engine, b"key", 250), None);
+        assert_eq!(get_at_for_test(&engine, b"key", 250).await, None);
 
         // At ts=150 (before delete), should be v1
-        assert_eq!(get_at_for_test(&engine, b"key", 150), Some(b"v1".to_vec()));
+        assert_eq!(
+            get_at_for_test(&engine, b"key", 150).await,
+            Some(b"v1".to_vec())
+        );
     }
 
-    #[test]
-    fn test_iterator_large_number_of_versions() {
+    #[tokio::test]
+    async fn test_iterator_large_number_of_versions() {
         let tmp = TempDir::new().unwrap();
         let config = test_config(tmp.path());
         let engine = LsmEngine::open(config).unwrap();
@@ -6380,23 +6408,22 @@ mod tests {
         }
 
         // Latest should be v100
-        assert_eq!(get_for_test(&engine, b"key"), Some(b"v100".to_vec()));
+        assert_eq!(get_for_test(&engine, b"key").await, Some(b"v100".to_vec()));
 
         // Each version should be visible at its timestamp
         for i in 1..=100u64 {
             let expected = format!("v{i}");
             assert_eq!(
-                get_at_for_test(&engine, b"key", i),
+                get_at_for_test(&engine, b"key", i).await,
                 Some(expected.into_bytes()),
                 "Should find v{i} at ts={i}"
             );
         }
     }
 
-    #[test]
-    fn test_concurrent_scan_and_write() {
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn test_concurrent_scan_and_write() {
         use std::sync::Arc;
-        use std::thread;
 
         let tmp = TempDir::new().unwrap();
         let config = LsmConfig::builder(tmp.path())
@@ -6416,23 +6443,23 @@ mod tests {
         let engine_reader = Arc::clone(&engine);
         let engine_writer = Arc::clone(&engine);
 
-        // Reader thread
-        let reader = thread::spawn(move || {
+        // Reader task
+        let reader = tokio::spawn(async move {
             for _ in 0..50 {
                 let range = MvccKey::unbounded()..MvccKey::unbounded();
                 let mut iter = engine_reader.scan_iter(range, 0).unwrap();
-                crate::io::block_on_sync(iter.advance()).unwrap();
+                iter.advance().await.unwrap();
                 let mut count = 0;
                 while iter.valid() {
                     count += 1;
-                    crate::io::block_on_sync(iter.advance()).unwrap();
+                    iter.advance().await.unwrap();
                 }
                 assert!(count >= 100, "Should see at least 100 entries");
             }
         });
 
-        // Writer thread
-        let writer = thread::spawn(move || {
+        // Writer task
+        let writer = tokio::spawn(async move {
             for i in 0..50 {
                 let mut batch = new_batch((100 + i) as u64);
                 batch.put(format!("new_key{i:03}").into_bytes(), b"new_value".to_vec());
@@ -6440,8 +6467,8 @@ mod tests {
             }
         });
 
-        reader.join().unwrap();
-        writer.join().unwrap();
+        reader.await.unwrap();
+        writer.await.unwrap();
     }
 
     // ==================== SuperVersion Tests ====================
@@ -6734,7 +6761,7 @@ mod tests {
 
     /// Helper: scan all raw MVCC entries for a key, including tombstones and LOCKs.
     /// Uses owner_ts to see pending nodes owned by that transaction.
-    fn scan_raw_for_key(
+    async fn scan_raw_for_key(
         engine: &LsmEngine,
         key: &[u8],
         owner_ts: Timestamp,
@@ -6747,12 +6774,12 @@ mod tests {
 
         let mut results = Vec::new();
         let mut iter = engine.scan_iter(range, owner_ts).unwrap();
-        crate::io::block_on_sync(iter.advance()).unwrap();
+        iter.advance().await.unwrap();
         while iter.valid() {
             if iter.user_key() == key {
                 results.push((iter.timestamp(), iter.value().to_vec()));
             }
-            crate::io::block_on_sync(iter.advance()).unwrap();
+            iter.advance().await.unwrap();
         }
         results
     }
@@ -6770,7 +6797,7 @@ mod tests {
             .unwrap();
 
         // Owner should see nothing useful (LOCK is skipped by iterator)
-        let entries = scan_raw_for_key(&engine, b"key1", owner_ts);
+        let entries = scan_raw_for_key(&engine, b"key1", owner_ts).await;
         assert!(
             entries.is_empty(),
             "LOCK should be invisible to owner scan, got {entries:?}"
@@ -6793,12 +6820,12 @@ mod tests {
 
         // After finalize, LOCK is marked aborted — still invisible
         engine.finalize_pending(&[b"key1".to_vec()], owner_ts, 200);
-        let value = get_for_test(&engine, b"key1");
+        let value = get_for_test(&engine, b"key1").await;
         assert!(value.is_none(), "LOCK after finalize should be invisible");
     }
 
-    #[test]
-    fn test_record_type_delete_your_write() {
+    #[tokio::test]
+    async fn test_record_type_delete_your_write() {
         // PUT then DELETE same key (no committed base) → second node should be LOCK
         let tmp = TempDir::new().unwrap();
         let config = test_config(tmp.path());
@@ -6812,7 +6839,7 @@ mod tests {
             .unwrap();
 
         // Owner should see the value
-        let val = engine.get_with_owner(b"key1", owner_ts, owner_ts);
+        let val = engine.get_with_owner(b"key1", owner_ts, owner_ts).await;
         assert_eq!(val, Some(b"value1".to_vec()));
 
         // DELETE (replaces value with LOCK since no committed base)
@@ -6821,17 +6848,17 @@ mod tests {
             .unwrap();
 
         // Owner should now see nothing (LOCK = "undo our write")
-        let val = engine.get_with_owner(b"key1", owner_ts, owner_ts);
+        let val = engine.get_with_owner(b"key1", owner_ts, owner_ts).await;
         assert!(val.is_none(), "LOCK should undo the pending PUT");
 
         // After finalize + commit, key should not exist
         engine.finalize_pending(&[b"key1".to_vec()], owner_ts, 200);
-        let value = get_for_test(&engine, b"key1");
+        let value = get_for_test(&engine, b"key1").await;
         assert!(value.is_none(), "LOCK finalized → key should not exist");
     }
 
-    #[test]
-    fn test_record_type_delete_existing_key() {
+    #[tokio::test]
+    async fn test_record_type_delete_existing_key() {
         // Commit a value, then DELETE in explicit txn → should produce TOMBSTONE
         let tmp = TempDir::new().unwrap();
         let config = test_config(tmp.path());
@@ -6841,7 +6868,10 @@ mod tests {
         let mut batch = new_batch(10);
         batch.put(b"key1".to_vec(), b"value1".to_vec());
         engine.write_batch(batch).unwrap();
-        assert_eq!(get_for_test(&engine, b"key1"), Some(b"value1".to_vec()));
+        assert_eq!(
+            get_for_test(&engine, b"key1").await,
+            Some(b"value1".to_vec())
+        );
 
         // Delete via pending TOMBSTONE (explicit txn pattern)
         let owner_ts: Timestamp = 100;
@@ -6850,24 +6880,24 @@ mod tests {
             .unwrap();
 
         // Owner should see None (tombstone)
-        let val = engine.get_with_owner(b"key1", owner_ts, owner_ts);
+        let val = engine.get_with_owner(b"key1", owner_ts, owner_ts).await;
         assert!(
             val.is_none(),
             "TOMBSTONE should make key invisible to owner"
         );
 
         // Non-owner should still see committed value
-        let val = engine.get_with_owner(b"key1", Timestamp::MAX, 0);
+        let val = engine.get_with_owner(b"key1", Timestamp::MAX, 0).await;
         assert_eq!(val, Some(b"value1".to_vec()), "non-owner sees committed");
 
         // After finalize, TOMBSTONE is committed — key is deleted for all
         engine.finalize_pending(&[b"key1".to_vec()], owner_ts, 200);
-        let value = get_for_test(&engine, b"key1");
+        let value = get_for_test(&engine, b"key1").await;
         assert!(value.is_none(), "TOMBSTONE committed → key deleted");
     }
 
-    #[test]
-    fn test_record_type_insert_after_delete() {
+    #[tokio::test]
+    async fn test_record_type_insert_after_delete() {
         // Commit value, DELETE (TOMBSTONE), then PUT new value
         let tmp = TempDir::new().unwrap();
         let config = test_config(tmp.path());
@@ -6886,7 +6916,7 @@ mod tests {
             .unwrap();
 
         // Owner sees None
-        let val = engine.get_with_owner(b"key1", owner_ts, owner_ts);
+        let val = engine.get_with_owner(b"key1", owner_ts, owner_ts).await;
         assert!(val.is_none());
 
         // PUT new value → replaces TOMBSTONE with real value
@@ -6895,17 +6925,17 @@ mod tests {
             .unwrap();
 
         // Owner sees the new value
-        let val = engine.get_with_owner(b"key1", owner_ts, owner_ts);
+        let val = engine.get_with_owner(b"key1", owner_ts, owner_ts).await;
         assert_eq!(val, Some(b"reinserted".to_vec()));
 
         // Finalize and verify
         engine.finalize_pending(&[b"key1".to_vec()], owner_ts, 200);
-        let value = get_at_for_test(&engine, b"key1", 200);
+        let value = get_at_for_test(&engine, b"key1", 200).await;
         assert_eq!(value, Some(b"reinserted".to_vec()));
     }
 
-    #[test]
-    fn test_record_type_insert_update_delete_sequence() {
+    #[tokio::test]
+    async fn test_record_type_insert_update_delete_sequence() {
         // Full sequence: INSERT → UPDATE → DELETE on same key within one txn
         let tmp = TempDir::new().unwrap();
         let config = test_config(tmp.path());
@@ -6918,7 +6948,7 @@ mod tests {
             .put_pending(b"key1", b"v1".to_vec(), owner_ts)
             .unwrap();
         assert_eq!(
-            engine.get_with_owner(b"key1", owner_ts, owner_ts),
+            engine.get_with_owner(b"key1", owner_ts, owner_ts).await,
             Some(b"v1".to_vec())
         );
 
@@ -6927,7 +6957,7 @@ mod tests {
             .put_pending(b"key1", b"v2".to_vec(), owner_ts)
             .unwrap();
         assert_eq!(
-            engine.get_with_owner(b"key1", owner_ts, owner_ts),
+            engine.get_with_owner(b"key1", owner_ts, owner_ts).await,
             Some(b"v2".to_vec())
         );
 
@@ -6935,19 +6965,19 @@ mod tests {
         engine
             .put_pending(b"key1", LOCK.to_vec(), owner_ts)
             .unwrap();
-        assert!(engine.get_with_owner(b"key1", owner_ts, owner_ts).is_none());
+        assert!(engine.get_with_owner(b"key1", owner_ts, owner_ts).await.is_none());
 
         // After finalize, LOCK is aborted → key doesn't exist
         engine.finalize_pending(&[b"key1".to_vec()], owner_ts, 200);
-        assert!(get_for_test(&engine, b"key1").is_none());
+        assert!(get_for_test(&engine, b"key1").await.is_none());
     }
 
     // ========================================================================
     // Tombstone Preservation: Flush and Compaction
     // ========================================================================
 
-    #[test]
-    fn test_tombstone_preserved_through_flush() {
+    #[tokio::test]
+    async fn test_tombstone_preserved_through_flush() {
         // Write key, delete key (tombstone), flush, verify tombstone in SST
         let tmp = TempDir::new().unwrap();
         let config = LsmConfig::builder(tmp.path())
@@ -6968,9 +6998,9 @@ mod tests {
         engine.write_batch(batch).unwrap();
 
         // Verify pre-flush: key1 is deleted
-        assert!(get_for_test(&engine, b"key1").is_none());
+        assert!(get_for_test(&engine, b"key1").await.is_none());
         assert_eq!(
-            get_at_for_test(&engine, b"key1", 10),
+            get_at_for_test(&engine, b"key1", 10).await,
             Some(b"v1".to_vec()),
             "key1 visible at ts=10"
         );
@@ -6980,13 +7010,13 @@ mod tests {
 
         // Verify post-flush: key1 still deleted at latest ts
         assert!(
-            get_for_test(&engine, b"key1").is_none(),
+            get_for_test(&engine, b"key1").await.is_none(),
             "tombstone must survive flush"
         );
 
         // Verify post-flush: key1 still visible at ts=10 (MVCC)
         assert_eq!(
-            get_at_for_test(&engine, b"key1", 10),
+            get_at_for_test(&engine, b"key1", 10).await,
             Some(b"v1".to_vec()),
             "old version must survive flush"
         );
@@ -6996,7 +7026,7 @@ mod tests {
         let end = MvccKey::encode(b"key1", 0)
             .next_key()
             .unwrap_or_else(MvccKey::unbounded);
-        let results = scan_mvcc(&engine, start..end);
+        let results = scan_mvcc(&engine, start..end).await;
 
         // Should have 2 entries: tombstone at ts=20 and value at ts=10
         assert_eq!(
@@ -7038,8 +7068,11 @@ mod tests {
         engine.flush_all_with_active().unwrap();
 
         // Before compaction: key1 deleted at latest
-        assert!(get_for_test(&engine, b"key1").is_none());
-        assert_eq!(get_at_for_test(&engine, b"key1", 10), Some(b"v1".to_vec()));
+        assert!(get_for_test(&engine, b"key1").await.is_none());
+        assert_eq!(
+            get_at_for_test(&engine, b"key1", 10).await,
+            Some(b"v1".to_vec())
+        );
 
         // Trigger compaction
         let compacted = engine.do_compaction().await.unwrap();
@@ -7047,18 +7080,18 @@ mod tests {
 
         // After compaction: tombstone + old value should still be correct
         assert!(
-            get_for_test(&engine, b"key1").is_none(),
+            get_for_test(&engine, b"key1").await.is_none(),
             "tombstone must survive compaction"
         );
         assert_eq!(
-            get_at_for_test(&engine, b"key1", 10),
+            get_at_for_test(&engine, b"key1", 10).await,
             Some(b"v1".to_vec()),
             "old version must survive compaction"
         );
     }
 
-    #[test]
-    fn test_tombstone_read_visibility_across_layers() {
+    #[tokio::test]
+    async fn test_tombstone_read_visibility_across_layers() {
         // Tombstone in memtable hides value in SST
         let tmp = TempDir::new().unwrap();
         let config = LsmConfig::builder(tmp.path())
@@ -7074,7 +7107,7 @@ mod tests {
         engine.flush_all_with_active().unwrap();
 
         // key1 should be in SST
-        assert_eq!(get_for_test(&engine, b"key1"), Some(b"v1".to_vec()));
+        assert_eq!(get_for_test(&engine, b"key1").await, Some(b"v1".to_vec()));
 
         // Delete key1 (tombstone now in memtable, value in SST)
         let mut batch = new_batch(20);
@@ -7083,13 +7116,13 @@ mod tests {
 
         // Tombstone in memtable should hide value in SST
         assert!(
-            get_for_test(&engine, b"key1").is_none(),
+            get_for_test(&engine, b"key1").await.is_none(),
             "memtable tombstone should hide SST value"
         );
 
         // But old snapshot should still see the value
         assert_eq!(
-            get_at_for_test(&engine, b"key1", 10),
+            get_at_for_test(&engine, b"key1", 10).await,
             Some(b"v1".to_vec()),
             "snapshot at ts=10 should see the value before tombstone"
         );
@@ -7099,8 +7132,8 @@ mod tests {
     // LOCK Ignored in Flush, Skipped in Read
     // ========================================================================
 
-    #[test]
-    fn test_lock_not_flushed_to_sst() {
+    #[tokio::test]
+    async fn test_lock_not_flushed_to_sst() {
         // LOCK nodes should be invisible in flush (only committed data is flushed)
         let tmp = TempDir::new().unwrap();
         let config = LsmConfig::builder(tmp.path())
@@ -7131,7 +7164,8 @@ mod tests {
         let all_entries = scan_mvcc(
             &engine,
             MvccKey::encode(b"", Timestamp::MAX)..MvccKey::unbounded(),
-        );
+        )
+        .await;
 
         // Should only have key1's entry, NOT key2's LOCK
         let key2_entries: Vec<_> = all_entries
@@ -7167,15 +7201,15 @@ mod tests {
             .unwrap();
 
         // Owner should NOT see the LOCK (it's invisible)
-        let val = engine.get_with_owner(b"key1", owner_ts, owner_ts);
+        let val = engine.get_with_owner(b"key1", owner_ts, owner_ts).await;
         assert!(val.is_none(), "LOCK should be invisible to owner get");
 
         // Non-owner should NOT see it via get_with_owner
-        let val = engine.get_with_owner(b"key1", Timestamp::MAX, 0);
+        let val = engine.get_with_owner(b"key1", Timestamp::MAX, 0).await;
         assert!(val.is_none(), "LOCK invisible to non-owner get");
 
         // Owner scan should not return it (own LOCKs are skipped)
-        let entries = scan_raw_for_key(&engine, b"key1", owner_ts);
+        let entries = scan_raw_for_key(&engine, b"key1", owner_ts).await;
         assert!(entries.is_empty(), "LOCK invisible in owner scan");
 
         // Non-owner scan returns it as pending (for txn layer resolution)
@@ -7190,8 +7224,8 @@ mod tests {
         assert_eq!(iter.pending_owner(), owner_ts);
     }
 
-    #[test]
-    fn test_lock_does_not_hide_committed_value() {
+    #[tokio::test]
+    async fn test_lock_does_not_hide_committed_value() {
         // LOCK should not hide a committed value underneath
         let tmp = TempDir::new().unwrap();
         let config = test_config(tmp.path());
@@ -7218,7 +7252,7 @@ mod tests {
             .unwrap();
 
         // Owner should see the committed value (LOCK skips, falls through to committed)
-        let val = engine.get_with_owner(b"key1", owner_ts, owner_ts);
+        let val = engine.get_with_owner(b"key1", owner_ts, owner_ts).await;
         assert_eq!(
             val,
             Some(b"v1".to_vec()),
@@ -7226,12 +7260,12 @@ mod tests {
         );
 
         // Non-owner should also see committed value (pending LOCK invisible)
-        let val = engine.get_with_owner(b"key1", Timestamp::MAX, 0);
+        let val = engine.get_with_owner(b"key1", Timestamp::MAX, 0).await;
         assert_eq!(val, Some(b"v1".to_vec()));
     }
 
-    #[test]
-    fn test_lock_aborted_after_finalize_not_in_flush() {
+    #[tokio::test]
+    async fn test_lock_aborted_after_finalize_not_in_flush() {
         // After finalize_pending, LOCK is marked aborted.
         // Verify it doesn't appear in flush output.
         let tmp = TempDir::new().unwrap();
@@ -7262,7 +7296,8 @@ mod tests {
         let all_entries = scan_mvcc(
             &engine,
             MvccKey::encode(b"", Timestamp::MAX)..MvccKey::unbounded(),
-        );
+        )
+        .await;
 
         let lock_entries: Vec<_> = all_entries
             .iter()

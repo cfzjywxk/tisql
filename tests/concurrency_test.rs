@@ -26,7 +26,6 @@
 
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::Arc;
-use std::thread;
 
 use tisql::error::TiSqlError;
 use tisql::storage::mvcc::{is_tombstone, MvccIterator, MvccKey};
@@ -39,7 +38,7 @@ use tisql::StorageEngine;
 
 // ==================== Test Helpers Using MvccKey ====================
 
-fn get_at_for_test(storage: &MemTableEngine, key: &[u8], ts: Timestamp) -> Option<RawValue> {
+async fn get_at_for_test(storage: &MemTableEngine, key: &[u8], ts: Timestamp) -> Option<RawValue> {
     let start = MvccKey::encode(key, ts);
     let end = MvccKey::encode(key, 0)
         .next_key()
@@ -48,7 +47,7 @@ fn get_at_for_test(storage: &MemTableEngine, key: &[u8], ts: Timestamp) -> Optio
 
     // Use streaming scan_iter() - process one entry at a time
     let mut iter = storage.scan_iter(range, 0).unwrap();
-    tisql::io::block_on_sync(iter.advance()).unwrap(); // Position on first entry
+    iter.advance().await.unwrap(); // Position on first entry
 
     while iter.valid() {
         let decoded_key = iter.user_key();
@@ -60,13 +59,13 @@ fn get_at_for_test(storage: &MemTableEngine, key: &[u8], ts: Timestamp) -> Optio
             }
             return Some(value);
         }
-        tisql::io::block_on_sync(iter.advance()).unwrap();
+        iter.advance().await.unwrap();
     }
     None
 }
 
-fn get_for_test(storage: &MemTableEngine, key: &[u8]) -> Option<RawValue> {
-    get_at_for_test(storage, key, Timestamp::MAX)
+async fn get_for_test(storage: &MemTableEngine, key: &[u8]) -> Option<RawValue> {
+    get_at_for_test(storage, key, Timestamp::MAX).await
 }
 
 /// Type alias for the test storage engine
@@ -118,7 +117,7 @@ async fn test_tso_strict_ordering_concurrent() {
 
     for _ in 0..num_threads {
         let tso = Arc::clone(&tso);
-        handles.push(thread::spawn(move || {
+        handles.push(tokio::spawn(async move {
             let mut timestamps = Vec::with_capacity(timestamps_per_thread);
             for _ in 0..timestamps_per_thread {
                 timestamps.push(tso.get_ts());
@@ -130,7 +129,7 @@ async fn test_tso_strict_ordering_concurrent() {
     // Collect all timestamps
     let mut all_timestamps = vec![];
     for handle in handles {
-        all_timestamps.extend(handle.join().unwrap());
+        all_timestamps.extend(handle.await.unwrap());
     }
 
     // Verify all timestamps are unique (strict ordering)
@@ -162,7 +161,7 @@ async fn test_tso_per_thread_monotonic() {
 
     for _ in 0..num_threads {
         let tso = Arc::clone(&tso);
-        handles.push(thread::spawn(move || {
+        handles.push(tokio::spawn(async move {
             let mut prev = 0u64;
             for _ in 0..timestamps_per_thread {
                 let ts = tso.get_ts();
@@ -176,7 +175,7 @@ async fn test_tso_per_thread_monotonic() {
     }
 
     for handle in handles {
-        handle.join().unwrap();
+        handle.await.unwrap();
     }
 }
 
@@ -193,7 +192,7 @@ async fn test_max_ts_concurrent_updates() {
     for i in 0..num_threads {
         let cm = Arc::clone(&cm);
         let max_seen = Arc::clone(&max_seen);
-        handles.push(thread::spawn(move || {
+        handles.push(tokio::spawn(async move {
             for j in 0..updates_per_thread {
                 // Create a unique timestamp for this thread
                 let ts = ((i as u64) * updates_per_thread + j + 1) * 1000;
@@ -206,7 +205,7 @@ async fn test_max_ts_concurrent_updates() {
     }
 
     for handle in handles {
-        handle.join().unwrap();
+        handle.await.unwrap();
     }
 
     // max_ts should reflect the highest value seen
@@ -231,12 +230,13 @@ async fn test_concurrent_writes_different_keys() {
     for i in 0..num_threads {
         let txn_service = Arc::clone(&txn_service);
         let success_count = Arc::clone(&success_count);
-        handles.push(thread::spawn(move || {
+        handles.push(tokio::spawn(async move {
             for j in 0..writes_per_thread {
                 let key = format!("key_{i}_{j}");
                 let value = format!("value_{i}_{j}");
                 if txn_service
                     .autocommit_put(key.as_bytes(), value.as_bytes())
+                    .await
                     .is_ok()
                 {
                     success_count.fetch_add(1, Ordering::Relaxed);
@@ -246,7 +246,7 @@ async fn test_concurrent_writes_different_keys() {
     }
 
     for handle in handles {
-        handle.join().unwrap();
+        handle.await.unwrap();
     }
 
     // All writes should succeed since they're to different keys
@@ -263,7 +263,7 @@ async fn test_concurrent_writes_same_key() {
 
     let success_count = Arc::new(AtomicU64::new(0));
     let conflict_count = Arc::new(AtomicU64::new(0));
-    let barrier = Arc::new(std::sync::Barrier::new(num_threads));
+    let barrier = Arc::new(tokio::sync::Barrier::new(num_threads));
     let mut handles = vec![];
 
     for i in 0..num_threads {
@@ -271,12 +271,12 @@ async fn test_concurrent_writes_same_key() {
         let success_count = Arc::clone(&success_count);
         let conflict_count = Arc::clone(&conflict_count);
         let barrier = Arc::clone(&barrier);
-        handles.push(thread::spawn(move || {
-            // Synchronize all threads to maximize contention
-            barrier.wait();
+        handles.push(tokio::spawn(async move {
+            // Synchronize all tasks to maximize contention
+            barrier.wait().await;
 
             let value = format!("value_{i}");
-            match txn_service.autocommit_put(key, value.as_bytes()) {
+            match txn_service.autocommit_put(key, value.as_bytes()).await {
                 Ok(_) => {
                     success_count.fetch_add(1, Ordering::Relaxed);
                 }
@@ -291,7 +291,7 @@ async fn test_concurrent_writes_same_key() {
     }
 
     for handle in handles {
-        handle.join().unwrap();
+        handle.await.unwrap();
     }
 
     // Total should equal num_threads
@@ -319,35 +319,35 @@ async fn test_mvcc_read_at_timestamp() {
     let key = b"version_key";
 
     // Write version 1
-    let ts1 = txn_service.autocommit_put(key, b"v1").unwrap().commit_ts;
+    let ts1 = txn_service.autocommit_put(key, b"v1").await.unwrap().commit_ts;
 
     // Write version 2
-    let ts2 = txn_service.autocommit_put(key, b"v2").unwrap().commit_ts;
+    let ts2 = txn_service.autocommit_put(key, b"v2").await.unwrap().commit_ts;
 
     // Write version 3
-    let ts3 = txn_service.autocommit_put(key, b"v3").unwrap().commit_ts;
+    let ts3 = txn_service.autocommit_put(key, b"v3").await.unwrap().commit_ts;
 
     assert!(ts1 < ts2);
     assert!(ts2 < ts3);
 
     // Read at ts3 should see v3
-    let v = get_at_for_test(&storage, key, ts3);
+    let v = get_at_for_test(&storage, key, ts3).await;
     assert_eq!(v, Some(b"v3".to_vec()));
 
     // Read at ts2 should see v2
-    let v = get_at_for_test(&storage, key, ts2);
+    let v = get_at_for_test(&storage, key, ts2).await;
     assert_eq!(v, Some(b"v2".to_vec()));
 
     // Read at ts1 should see v1
-    let v = get_at_for_test(&storage, key, ts1);
+    let v = get_at_for_test(&storage, key, ts1).await;
     assert_eq!(v, Some(b"v1".to_vec()));
 
     // Read at timestamp before ts1 should see nothing
-    let v = get_at_for_test(&storage, key, ts1 - 1);
+    let v = get_at_for_test(&storage, key, ts1 - 1).await;
     assert!(v.is_none());
 
     // Read at latest should see v3
-    let v = get_for_test(&storage, key);
+    let v = get_for_test(&storage, key).await;
     assert_eq!(v, Some(b"v3".to_vec()));
 }
 
@@ -358,7 +358,7 @@ async fn test_concurrent_readers_no_interference() {
     let key = b"shared_read_key";
 
     // Write initial value
-    txn_service.autocommit_put(key, b"initial_value").unwrap();
+    txn_service.autocommit_put(key, b"initial_value").await.unwrap();
 
     let num_readers = 10;
     let reads_per_thread = 100;
@@ -368,9 +368,9 @@ async fn test_concurrent_readers_no_interference() {
     for _ in 0..num_readers {
         let storage = Arc::clone(&storage);
         let success_count = Arc::clone(&success_count);
-        handles.push(thread::spawn(move || {
+        handles.push(tokio::spawn(async move {
             for _ in 0..reads_per_thread {
-                match get_for_test(&storage, key) {
+                match get_for_test(&storage, key).await {
                     Some(v) if v == b"initial_value" => {
                         success_count.fetch_add(1, Ordering::Relaxed);
                     }
@@ -382,7 +382,7 @@ async fn test_concurrent_readers_no_interference() {
     }
 
     for handle in handles {
-        handle.join().unwrap();
+        handle.await.unwrap();
     }
 
     let total_reads = num_readers * reads_per_thread;
@@ -400,20 +400,20 @@ async fn test_concurrent_read_after_delete() {
     let key = b"delete_key";
 
     // Write initial value
-    let ts1 = txn_service.autocommit_put(key, b"value").unwrap().commit_ts;
+    let ts1 = txn_service.autocommit_put(key, b"value").await.unwrap().commit_ts;
 
     // Verify value exists
-    assert!(get_for_test(&storage, key).is_some());
+    assert!(get_for_test(&storage, key).await.is_some());
 
     // Delete
-    let ts2 = txn_service.autocommit_delete(key).unwrap().commit_ts;
+    let ts2 = txn_service.autocommit_delete(key).await.unwrap().commit_ts;
     assert!(ts2 > ts1);
 
     // Read at latest should see nothing (deleted)
-    assert!(get_for_test(&storage, key).is_none());
+    assert!(get_for_test(&storage, key).await.is_none());
 
     // Read at ts1 should still see the value (MVCC)
-    let v = get_at_for_test(&storage, key, ts1);
+    let v = get_at_for_test(&storage, key, ts1).await;
     assert_eq!(v, Some(b"value".to_vec()));
 }
 
@@ -439,12 +439,15 @@ async fn test_implicit_multiple_puts_same_key() {
     let mut ctx = txn_service.begin(false).unwrap();
     txn_service
         .put(&mut ctx, key.to_vec(), value1.to_vec())
+        .await
         .unwrap();
     txn_service
         .put(&mut ctx, key.to_vec(), value2.to_vec())
+        .await
         .unwrap();
     txn_service
         .put(&mut ctx, key.to_vec(), value3.to_vec())
+        .await
         .unwrap();
 
     // Commit the transaction
@@ -452,7 +455,7 @@ async fn test_implicit_multiple_puts_same_key() {
 
     // Read after commit should see the last value
     let read_ctx = txn_service.begin(true).unwrap();
-    let result = txn_service.get(&read_ctx, key).unwrap();
+    let result = txn_service.get(&read_ctx, key).await.unwrap();
     assert_eq!(
         result,
         Some(value3.to_vec()),
@@ -476,15 +479,16 @@ async fn test_implicit_put_then_delete() {
     let mut ctx = txn_service.begin(false).unwrap();
     txn_service
         .put(&mut ctx, key.to_vec(), value.to_vec())
+        .await
         .unwrap();
-    txn_service.delete(&mut ctx, key.to_vec()).unwrap();
+    txn_service.delete(&mut ctx, key.to_vec()).await.unwrap();
 
     // Commit the transaction
     txn_service.commit(ctx).await.unwrap();
 
     // Read after commit should see None (delete wins)
     let read_ctx = txn_service.begin(true).unwrap();
-    let result = txn_service.get(&read_ctx, key).unwrap();
+    let result = txn_service.get(&read_ctx, key).await.unwrap();
     assert_eq!(result, None, "Committed result should be delete (None)");
 }
 
@@ -504,14 +508,16 @@ async fn test_implicit_delete_then_put() {
     let mut setup_ctx = txn_service.begin(false).unwrap();
     txn_service
         .put(&mut setup_ctx, key.to_vec(), b"initial".to_vec())
+        .await
         .unwrap();
     txn_service.commit(setup_ctx).await.unwrap();
 
     // Start a new transaction, delete then put
     let mut ctx = txn_service.begin(false).unwrap();
-    txn_service.delete(&mut ctx, key.to_vec()).unwrap();
+    txn_service.delete(&mut ctx, key.to_vec()).await.unwrap();
     txn_service
         .put(&mut ctx, key.to_vec(), value.to_vec())
+        .await
         .unwrap();
 
     // Commit the transaction
@@ -519,7 +525,7 @@ async fn test_implicit_delete_then_put() {
 
     // Read after commit should see the new value (put wins)
     let read_ctx = txn_service.begin(true).unwrap();
-    let result = txn_service.get(&read_ctx, key).unwrap();
+    let result = txn_service.get(&read_ctx, key).await.unwrap();
     assert_eq!(
         result,
         Some(value.to_vec()),
@@ -540,20 +546,24 @@ async fn test_implicit_dedup_commit() {
     // Key "a" - multiple puts, last should win
     txn_service
         .put(&mut ctx, b"a".to_vec(), b"a1".to_vec())
+        .await
         .unwrap();
     txn_service
         .put(&mut ctx, b"a".to_vec(), b"a2".to_vec())
+        .await
         .unwrap();
 
     // Key "b" - put then delete, should be absent
     txn_service
         .put(&mut ctx, b"b".to_vec(), b"b1".to_vec())
+        .await
         .unwrap();
-    txn_service.delete(&mut ctx, b"b".to_vec()).unwrap();
+    txn_service.delete(&mut ctx, b"b".to_vec()).await.unwrap();
 
     // Key "c" - single put
     txn_service
         .put(&mut ctx, b"c".to_vec(), b"c1".to_vec())
+        .await
         .unwrap();
 
     // Commit the transaction
@@ -564,10 +574,10 @@ async fn test_implicit_dedup_commit() {
     let range = b"a".to_vec()..b"d".to_vec();
     let mut iter = txn_service.scan_iter(&read_ctx, range).unwrap();
     let mut results = Vec::new();
-    tisql::io::block_on_sync(iter.advance()).unwrap();
+    iter.advance().await.unwrap();
     while iter.valid() {
         results.push((iter.user_key().to_vec(), iter.value().to_vec()));
-        tisql::io::block_on_sync(iter.advance()).unwrap();
+        iter.advance().await.unwrap();
     }
 
     assert_eq!(results.len(), 2, "Should have 2 keys (a and c, not b)");
@@ -606,6 +616,7 @@ mod failpoint_tests {
             // Each write will succeed in order since they wait for previous
             let ts = txn_service
                 .autocommit_put(key, value.as_bytes())
+                .await
                 .unwrap()
                 .commit_ts;
             results.lock().unwrap().push((i, ts));
@@ -622,7 +633,7 @@ mod failpoint_tests {
         }
 
         // Final value should be v2
-        let v = get_for_test(&storage, key);
+        let v = get_for_test(&storage, key).await;
         assert_eq!(v, Some(b"v2".to_vec()));
 
         scenario.teardown();
@@ -655,15 +666,15 @@ mod failpoint_tests {
         fail::cfg("txn_after_lock_before_commit_ts", "pause").unwrap();
 
         let txn_service_clone = Arc::clone(&txn_service);
-        let writer = thread::spawn(move || {
+        let writer = tokio::spawn(async move {
             // This will pause right after acquiring locks but BEFORE setting commit_ts
             // At the failpoint, locks are held but commit_ts = max(max_ts+1, tso_ts)
             // hasn't been computed yet
-            txn_service_clone.autocommit_put(key, b"value").unwrap()
+            txn_service_clone.autocommit_put(key, b"value").await.unwrap()
         });
 
         // Give writer time to reach failpoint (pending locks acquired)
-        thread::sleep(Duration::from_millis(50));
+        tokio::time::sleep(Duration::from_millis(50)).await;
 
         // Phase 2: Reader starts a transaction - this updates max_ts
         // In a buggy implementation, if commit_ts was picked before locks,
@@ -681,7 +692,7 @@ mod failpoint_tests {
         // Phase 3: Resume writer
         fail::cfg("txn_after_lock_before_commit_ts", "off").unwrap();
 
-        let writer_result = writer.join().unwrap();
+        let writer_result = writer.await.unwrap();
         let writer_commit_ts = writer_result.commit_ts;
 
         // THE KEY ASSERTION: commit_ts must be > reader's start_ts
@@ -696,7 +707,7 @@ mod failpoint_tests {
         // Now verify snapshot isolation works correctly:
         // Reader with start_ts < commit_ts should NOT see the committed data
         // (correct behavior - reader started before the logical commit point)
-        let value = txn_service.get(&reader_ctx, key).unwrap();
+        let value = txn_service.get(&reader_ctx, key).await.unwrap();
         assert!(
             value.is_none(),
             "Reader with start_ts < commit_ts should not see the data"
@@ -704,7 +715,7 @@ mod failpoint_tests {
 
         // A new reader starting now should see the data
         let new_reader_ctx = txn_service.begin(true).unwrap();
-        let value = txn_service.get(&new_reader_ctx, key).unwrap();
+        let value = txn_service.get(&new_reader_ctx, key).await.unwrap();
         assert_eq!(
             value,
             Some(b"value".to_vec()),
@@ -731,9 +742,9 @@ mod failpoint_tests {
 
         let txn_service_clone = Arc::clone(&txn_service);
         let writer =
-            thread::spawn(move || txn_service_clone.autocommit_put(key, b"value").unwrap());
+            tokio::spawn(async move { txn_service_clone.autocommit_put(key, b"value").await.unwrap() });
 
-        thread::sleep(Duration::from_millis(50));
+        tokio::time::sleep(Duration::from_millis(50)).await;
 
         // Start multiple readers while writer holds lock
         let mut reader_contexts = vec![];
@@ -744,7 +755,7 @@ mod failpoint_tests {
 
         // Resume writer
         fail::cfg("txn_after_lock_before_commit_ts", "off").unwrap();
-        let writer_result = writer.join().unwrap();
+        let writer_result = writer.await.unwrap();
         let writer_commit_ts = writer_result.commit_ts;
 
         // ALL readers should have start_ts < commit_ts
@@ -756,7 +767,7 @@ mod failpoint_tests {
             );
 
             // None of them should see the data
-            let value = txn_service.get(ctx, key).unwrap();
+            let value = txn_service.get(ctx, key).await.unwrap();
             assert!(
                 value.is_none(),
                 "Reader {i} should not see data committed after its start_ts"
@@ -774,8 +785,7 @@ mod failpoint_tests {
 /// Tests for DDL/DDL and DDL/DML concurrency control.
 mod ddl_concurrency {
     use std::sync::atomic::{AtomicUsize, Ordering};
-    use std::sync::{Arc, Barrier};
-    use std::thread;
+    use std::sync::Arc;
     use tempfile::tempdir;
     use tisql::{Database, DatabaseConfig, QueryResult};
 
@@ -787,7 +797,7 @@ mod ddl_concurrency {
         let db = Arc::new(Database::open(config).unwrap());
 
         let num_threads = 4;
-        let barrier = Arc::new(Barrier::new(num_threads));
+        let barrier = Arc::new(tokio::sync::Barrier::new(num_threads));
         let success_count = Arc::new(AtomicUsize::new(0));
 
         let handles: Vec<_> = (0..num_threads)
@@ -796,13 +806,13 @@ mod ddl_concurrency {
                 let barrier = Arc::clone(&barrier);
                 let success_count = Arc::clone(&success_count);
 
-                thread::spawn(move || {
-                    // Wait for all threads to be ready
-                    barrier.wait();
+                tokio::spawn(async move {
+                    // Wait for all tasks to be ready
+                    barrier.wait().await;
 
-                    // Each thread creates a different table
+                    // Each task creates a different table
                     let sql = format!("CREATE TABLE t{i} (id INT PRIMARY KEY, name VARCHAR(100))");
-                    match tisql::io::block_on_sync(db.handle_mp_query(&sql)) {
+                    match db.handle_mp_query(&sql).await {
                         Ok(_) => {
                             success_count.fetch_add(1, Ordering::SeqCst);
                         }
@@ -815,7 +825,7 @@ mod ddl_concurrency {
             .collect();
 
         for handle in handles {
-            handle.join().unwrap();
+            handle.await.unwrap();
         }
 
         // All creates should succeed
@@ -829,12 +839,12 @@ mod ddl_concurrency {
         for i in 0..num_threads {
             let sql = format!("SELECT * FROM t{i}");
             assert!(
-                tisql::io::block_on_sync(db.handle_mp_query(&sql)).is_ok(),
+                db.handle_mp_query(&sql).await.is_ok(),
                 "Table t{i} should exist"
             );
         }
 
-        db.close().unwrap();
+        db.close().await.unwrap();
     }
 
     /// Test that concurrent DDLs creating the same table result in exactly one success.
@@ -845,7 +855,7 @@ mod ddl_concurrency {
         let db = Arc::new(Database::open(config).unwrap());
 
         let num_threads = 4;
-        let barrier = Arc::new(Barrier::new(num_threads));
+        let barrier = Arc::new(tokio::sync::Barrier::new(num_threads));
         let success_count = Arc::new(AtomicUsize::new(0));
         let error_count = Arc::new(AtomicUsize::new(0));
 
@@ -856,13 +866,14 @@ mod ddl_concurrency {
                 let success_count = Arc::clone(&success_count);
                 let error_count = Arc::clone(&error_count);
 
-                thread::spawn(move || {
-                    barrier.wait();
+                tokio::spawn(async move {
+                    barrier.wait().await;
 
-                    // All threads try to create the same table
-                    match tisql::io::block_on_sync(
-                        db.handle_mp_query("CREATE TABLE conflict_table (id INT PRIMARY KEY)"),
-                    ) {
+                    // All tasks try to create the same table
+                    match db
+                        .handle_mp_query("CREATE TABLE conflict_table (id INT PRIMARY KEY)")
+                        .await
+                    {
                         Ok(_) => {
                             success_count.fetch_add(1, Ordering::SeqCst);
                         }
@@ -883,7 +894,7 @@ mod ddl_concurrency {
             .collect();
 
         for handle in handles {
-            handle.join().unwrap();
+            handle.await.unwrap();
         }
 
         // Exactly one should succeed
@@ -898,7 +909,7 @@ mod ddl_concurrency {
             "Others should get 'already exists' error"
         );
 
-        db.close().unwrap();
+        db.close().await.unwrap();
     }
 
     /// Test DDL and DML concurrency - DML should detect schema change.
@@ -909,11 +920,11 @@ mod ddl_concurrency {
         let db = Arc::new(Database::open(config).unwrap());
 
         // Create initial table
-        tisql::io::block_on_sync(
-            db.handle_mp_query("CREATE TABLE users (id INT PRIMARY KEY, name VARCHAR(100))"),
-        )
-        .unwrap();
-        tisql::io::block_on_sync(db.handle_mp_query("INSERT INTO users VALUES (1, 'Alice')"))
+        db.handle_mp_query("CREATE TABLE users (id INT PRIMARY KEY, name VARCHAR(100))")
+            .await
+            .unwrap();
+        db.handle_mp_query("INSERT INTO users VALUES (1, 'Alice')")
+            .await
             .unwrap();
 
         // This test verifies that schema version is checked.
@@ -923,19 +934,20 @@ mod ddl_concurrency {
         // For now, verify that the schema version mechanism works by checking
         // that after a DDL, subsequent operations see the updated schema.
         // Execute a query to exercise the catalog
-        tisql::io::block_on_sync(db.handle_mp_query("SELECT * FROM users")).unwrap();
+        db.handle_mp_query("SELECT * FROM users").await.unwrap();
 
         // DDL changes schema
-        tisql::io::block_on_sync(db.handle_mp_query("CREATE TABLE orders (id INT PRIMARY KEY)"))
+        db.handle_mp_query("CREATE TABLE orders (id INT PRIMARY KEY)")
+            .await
             .unwrap();
 
         // DML on original table should still work (schema of 'users' didn't change)
-        tisql::io::block_on_sync(db.handle_mp_query("INSERT INTO users VALUES (2, 'Bob')"))
+        db.handle_mp_query("INSERT INTO users VALUES (2, 'Bob')")
+            .await
             .unwrap();
 
         // Verify data
-        let result =
-            tisql::io::block_on_sync(db.handle_mp_query("SELECT id FROM users ORDER BY id"));
+        let result = db.handle_mp_query("SELECT id FROM users ORDER BY id").await;
         match result {
             Ok(QueryResult::Rows { data, .. }) => {
                 assert_eq!(data.len(), 2);
@@ -945,7 +957,7 @@ mod ddl_concurrency {
             other => panic!("Expected rows, got: {other:?}"),
         }
 
-        db.close().unwrap();
+        db.close().await.unwrap();
     }
 
     /// Test schema version increments correctly with concurrent DDLs.
@@ -957,52 +969,52 @@ mod ddl_concurrency {
 
         // Create tables sequentially to establish baseline
         for i in 0..5 {
-            tisql::io::block_on_sync(
-                db.handle_mp_query(&format!("CREATE TABLE seq_t{i} (id INT PRIMARY KEY)")),
-            )
-            .unwrap();
+            db.handle_mp_query(&format!("CREATE TABLE seq_t{i} (id INT PRIMARY KEY)"))
+                .await
+                .unwrap();
         }
 
         // Now create more tables concurrently
         let num_threads = 4;
-        let barrier = Arc::new(Barrier::new(num_threads));
+        let barrier = Arc::new(tokio::sync::Barrier::new(num_threads));
 
         let handles: Vec<_> = (0..num_threads)
             .map(|i| {
                 let db = Arc::clone(&db);
                 let barrier = Arc::clone(&barrier);
 
-                thread::spawn(move || {
-                    barrier.wait();
-                    tisql::io::block_on_sync(
-                        db.handle_mp_query(&format!("CREATE TABLE conc_t{i} (id INT PRIMARY KEY)")),
-                    )
-                    .unwrap();
+                tokio::spawn(async move {
+                    barrier.wait().await;
+                    db.handle_mp_query(&format!("CREATE TABLE conc_t{i} (id INT PRIMARY KEY)"))
+                        .await
+                        .unwrap();
                 })
             })
             .collect();
 
         for handle in handles {
-            handle.join().unwrap();
+            handle.await.unwrap();
         }
 
         // Verify all 9 tables exist (5 sequential + 4 concurrent)
         for i in 0..5 {
             assert!(
-                tisql::io::block_on_sync(db.handle_mp_query(&format!("SELECT * FROM seq_t{i}")))
+                db.handle_mp_query(&format!("SELECT * FROM seq_t{i}"))
+                    .await
                     .is_ok(),
                 "seq_t{i} should exist"
             );
         }
         for i in 0..num_threads {
             assert!(
-                tisql::io::block_on_sync(db.handle_mp_query(&format!("SELECT * FROM conc_t{i}")))
+                db.handle_mp_query(&format!("SELECT * FROM conc_t{i}"))
+                    .await
                     .is_ok(),
                 "conc_t{i} should exist"
             );
         }
 
-        db.close().unwrap();
+        db.close().await.unwrap();
     }
 
     /// Test drop table with concurrent create.
@@ -1013,19 +1025,22 @@ mod ddl_concurrency {
         let db = Arc::new(Database::open(config).unwrap());
 
         // Create, drop, recreate in sequence
-        tisql::io::block_on_sync(db.handle_mp_query("CREATE TABLE temp (id INT PRIMARY KEY)"))
+        db.handle_mp_query("CREATE TABLE temp (id INT PRIMARY KEY)")
+            .await
             .unwrap();
-        tisql::io::block_on_sync(db.handle_mp_query("INSERT INTO temp VALUES (1)")).unwrap();
-        tisql::io::block_on_sync(db.handle_mp_query("DROP TABLE temp")).unwrap();
-        tisql::io::block_on_sync(
-            db.handle_mp_query("CREATE TABLE temp (id INT PRIMARY KEY, name VARCHAR(50))"),
-        )
-        .unwrap();
-        tisql::io::block_on_sync(db.handle_mp_query("INSERT INTO temp VALUES (2, 'test')"))
+        db.handle_mp_query("INSERT INTO temp VALUES (1)")
+            .await
+            .unwrap();
+        db.handle_mp_query("DROP TABLE temp").await.unwrap();
+        db.handle_mp_query("CREATE TABLE temp (id INT PRIMARY KEY, name VARCHAR(50))")
+            .await
+            .unwrap();
+        db.handle_mp_query("INSERT INTO temp VALUES (2, 'test')")
+            .await
             .unwrap();
 
         // Verify new schema is in effect
-        let result = tisql::io::block_on_sync(db.handle_mp_query("SELECT id, name FROM temp"));
+        let result = db.handle_mp_query("SELECT id, name FROM temp").await;
         match result {
             Ok(QueryResult::Rows { data, columns }) => {
                 assert_eq!(columns.len(), 2);
@@ -1036,7 +1051,7 @@ mod ddl_concurrency {
             other => panic!("Expected rows, got: {other:?}"),
         }
 
-        db.close().unwrap();
+        db.close().await.unwrap();
     }
 }
 
@@ -1050,7 +1065,7 @@ mod ddl_concurrency {
 /// - Scan iterators maintain snapshot isolation during concurrent writes
 /// - Range filtering works correctly under contention
 /// - No data corruption or iterator invalidation during concurrent access
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn test_concurrent_scan_while_writers_run() {
     use tisql::TxnService;
 
@@ -1063,6 +1078,7 @@ async fn test_concurrent_scan_while_writers_run() {
         let value = format!("initial_{i}");
         txn_service
             .autocommit_put(key.as_bytes(), value.as_bytes())
+            .await
             .unwrap();
     }
 
@@ -1074,11 +1090,11 @@ async fn test_concurrent_scan_while_writers_run() {
     let stop_flag = Arc::new(AtomicBool::new(false));
     let mut handles = vec![];
 
-    // Spawn writer threads - write to "write_*" keys (different range from scan)
+    // Spawn writer tasks - write to "write_*" keys (different range from scan)
     for w in 0..num_writers {
         let txn_service = Arc::clone(&txn_service);
         let stop_flag = Arc::clone(&stop_flag);
-        handles.push(thread::spawn(move || {
+        handles.push(tokio::spawn(async move {
             let mut success = 0u64;
             for i in 0..writes_per_thread {
                 if stop_flag.load(Ordering::Relaxed) {
@@ -1087,21 +1103,21 @@ async fn test_concurrent_scan_while_writers_run() {
                 // Write to a different key range to reduce lock conflicts with scanners
                 let key = format!("write_{:02}_{:02}", w, i % 10);
                 let value = format!("writer_{w}_iter_{i}");
-                match txn_service.autocommit_put(key.as_bytes(), value.as_bytes()) {
+                match txn_service.autocommit_put(key.as_bytes(), value.as_bytes()).await {
                     Ok(_) => success += 1,
                     Err(TiSqlError::KeyIsLocked { .. }) => {} // Expected under contention
                     Err(e) => panic!("Unexpected error: {e:?}"),
                 }
-                thread::yield_now();
+                tokio::task::yield_now().await;
             }
             success
         }));
     }
 
-    // Spawn scanner threads - scan the "safe_*" range that has pre-populated data
+    // Spawn scanner tasks - scan the "safe_*" range that has pre-populated data
     for _ in 0..num_scanners {
         let txn_service = Arc::clone(&txn_service);
-        handles.push(thread::spawn(move || {
+        handles.push(tokio::spawn(async move {
             let mut total_entries = 0u64;
             for _ in 0..scans_per_thread {
                 // Start a read-only transaction
@@ -1111,7 +1127,7 @@ async fn test_concurrent_scan_while_writers_run() {
                 let range = b"safe_00".to_vec()..b"safe_99".to_vec();
                 match txn_service.scan_iter(&ctx, range) {
                     Ok(mut iter) => {
-                        tisql::io::block_on_sync(iter.advance()).unwrap();
+                        iter.advance().await.unwrap();
                         let mut count = 0;
                         let mut prev_key: Option<Vec<u8>> = None;
                         while iter.valid() {
@@ -1127,7 +1143,7 @@ async fn test_concurrent_scan_while_writers_run() {
                             }
                             prev_key = Some(key);
                             count += 1;
-                            tisql::io::block_on_sync(iter.advance()).unwrap();
+                            iter.advance().await.unwrap();
                         }
                         total_entries += count;
                     }
@@ -1136,24 +1152,24 @@ async fn test_concurrent_scan_while_writers_run() {
                     }
                     Err(e) => panic!("Unexpected scan error: {e:?}"),
                 }
-                thread::yield_now();
+                tokio::task::yield_now().await;
             }
             total_entries
         }));
     }
 
-    // Wait for all threads
-    stop_flag.store(true, Ordering::Relaxed);
+    // Wait for all tasks to complete their fixed iterations, then signal stop
     let mut writer_successes = 0u64;
     let mut scanner_entries = 0u64;
     for (i, handle) in handles.into_iter().enumerate() {
-        let count = handle.join().unwrap();
+        let count = handle.await.unwrap();
         if i < num_writers {
             writer_successes += count;
         } else {
             scanner_entries += count;
         }
     }
+    stop_flag.store(true, Ordering::Relaxed);
 
     // Verify some work was done
     assert!(writer_successes > 0, "At least some writes should succeed");
@@ -1187,30 +1203,36 @@ async fn test_mvcc_iterator_ordering_invariant() {
     // Write first versions
     let ts_a1 = txn_service
         .autocommit_put(b"key_a", b"a_v1")
+        .await
         .unwrap()
         .commit_ts;
     let ts_b1 = txn_service
         .autocommit_put(b"key_b", b"b_v1")
+        .await
         .unwrap()
         .commit_ts;
     let ts_c1 = txn_service
         .autocommit_put(b"key_c", b"c_v1")
+        .await
         .unwrap()
         .commit_ts;
 
     // Write second versions
     let ts_a2 = txn_service
         .autocommit_put(b"key_a", b"a_v2")
+        .await
         .unwrap()
         .commit_ts;
     let ts_b2 = txn_service
         .autocommit_put(b"key_b", b"b_v2")
+        .await
         .unwrap()
         .commit_ts;
 
     // Write third version for key_a only
     let ts_a3 = txn_service
         .autocommit_put(b"key_a", b"a_v3")
+        .await
         .unwrap()
         .commit_ts;
 
@@ -1227,12 +1249,12 @@ async fn test_mvcc_iterator_ordering_invariant() {
 
     let storage = txn_service.storage();
     let mut iter = storage.scan_iter(start..end, 0).unwrap();
-    tisql::io::block_on_sync(iter.advance()).unwrap();
+    iter.advance().await.unwrap();
 
     let mut entries: Vec<(Vec<u8>, Timestamp)> = Vec::new();
     while iter.valid() {
         entries.push((iter.user_key().to_vec(), iter.timestamp()));
-        tisql::io::block_on_sync(iter.advance()).unwrap();
+        iter.advance().await.unwrap();
     }
 
     // Verify we got all 6 entries
@@ -1286,18 +1308,18 @@ async fn test_mvcc_scan_iterator_returns_latest_visible_only() {
     let (_storage, txn_service, _tso, _cm, _dir) = create_test_service();
 
     // Write multiple versions
-    txn_service.autocommit_put(b"key_a", b"a_v1").unwrap();
-    txn_service.autocommit_put(b"key_b", b"b_v1").unwrap();
-    txn_service.autocommit_put(b"key_a", b"a_v2").unwrap();
-    txn_service.autocommit_put(b"key_c", b"c_v1").unwrap();
-    txn_service.autocommit_put(b"key_b", b"b_v2").unwrap();
-    txn_service.autocommit_put(b"key_a", b"a_v3").unwrap();
+    txn_service.autocommit_put(b"key_a", b"a_v1").await.unwrap();
+    txn_service.autocommit_put(b"key_b", b"b_v1").await.unwrap();
+    txn_service.autocommit_put(b"key_a", b"a_v2").await.unwrap();
+    txn_service.autocommit_put(b"key_c", b"c_v1").await.unwrap();
+    txn_service.autocommit_put(b"key_b", b"b_v2").await.unwrap();
+    txn_service.autocommit_put(b"key_a", b"a_v3").await.unwrap();
 
     // Start a transaction that sees all latest versions
     let ctx = txn_service.begin(true).unwrap();
     let range = b"key_a".to_vec()..b"key_d".to_vec();
     let mut iter = txn_service.scan_iter(&ctx, range).unwrap();
-    tisql::io::block_on_sync(iter.advance()).unwrap();
+    iter.advance().await.unwrap();
 
     let mut results: Vec<(Vec<u8>, Vec<u8>)> = Vec::new();
     let mut prev_key: Option<Vec<u8>> = None;
@@ -1317,7 +1339,7 @@ async fn test_mvcc_scan_iterator_returns_latest_visible_only() {
         }
         prev_key = Some(key.clone());
         results.push((key, value));
-        tisql::io::block_on_sync(iter.advance()).unwrap();
+        iter.advance().await.unwrap();
     }
 
     // Should see exactly 3 keys with their latest values
@@ -1345,13 +1367,12 @@ async fn test_e2e_key_is_locked_concurrent_inserts() {
     let db = Arc::new(Database::open(config).unwrap());
 
     // Create table with primary key
-    tisql::io::block_on_sync(
-        db.handle_mp_query("CREATE TABLE lock_test (id INT PRIMARY KEY, value VARCHAR(100))"),
-    )
-    .unwrap();
+    db.handle_mp_query("CREATE TABLE lock_test (id INT PRIMARY KEY, value VARCHAR(100))")
+        .await
+        .unwrap();
 
     let num_threads = 10;
-    let barrier = Arc::new(std::sync::Barrier::new(num_threads));
+    let barrier = Arc::new(tokio::sync::Barrier::new(num_threads));
     let success_count = Arc::new(AtomicU64::new(0));
     let lock_error_count = Arc::new(AtomicU64::new(0));
     let duplicate_error_count = Arc::new(AtomicU64::new(0));
@@ -1364,13 +1385,13 @@ async fn test_e2e_key_is_locked_concurrent_inserts() {
         let lock_error_count = Arc::clone(&lock_error_count);
         let duplicate_error_count = Arc::clone(&duplicate_error_count);
 
-        handles.push(thread::spawn(move || {
-            // Synchronize all threads to maximize contention
-            barrier.wait();
+        handles.push(tokio::spawn(async move {
+            // Synchronize all tasks to maximize contention
+            barrier.wait().await;
 
-            // All threads try to insert with the same primary key
+            // All tasks try to insert with the same primary key
             let sql = format!("INSERT INTO lock_test (id, value) VALUES (1, 'thread_{i}')");
-            match tisql::io::block_on_sync(db.handle_mp_query(&sql)) {
+            match db.handle_mp_query(&sql).await {
                 Ok(QueryResult::Affected(_)) => {
                     success_count.fetch_add(1, Ordering::Relaxed);
                 }
@@ -1392,7 +1413,7 @@ async fn test_e2e_key_is_locked_concurrent_inserts() {
     }
 
     for handle in handles {
-        handle.join().unwrap();
+        handle.await.unwrap();
     }
 
     let successes = success_count.load(Ordering::Relaxed);
@@ -1415,7 +1436,11 @@ async fn test_e2e_key_is_locked_concurrent_inserts() {
     );
 
     // Verify the data is consistent - exactly one row should exist
-    match tisql::io::block_on_sync(db.handle_mp_query("SELECT COUNT(*) FROM lock_test")).unwrap() {
+    match db
+        .handle_mp_query("SELECT COUNT(*) FROM lock_test")
+        .await
+        .unwrap()
+    {
         QueryResult::Rows { data, .. } => {
             assert_eq!(data.len(), 1);
             assert_eq!(data[0][0], "1", "Exactly one row should exist");
@@ -1423,7 +1448,7 @@ async fn test_e2e_key_is_locked_concurrent_inserts() {
         other => panic!("Expected rows, got: {other:?}"),
     }
 
-    db.close().unwrap();
+    db.close().await.unwrap();
 }
 
 /// E2E test for concurrent SQL UPDATEs to the same key triggering KeyIsLocked error.
@@ -1439,16 +1464,16 @@ async fn test_e2e_key_is_locked_concurrent_updates() {
     let db = Arc::new(Database::open(config).unwrap());
 
     // Create table and insert initial row
-    tisql::io::block_on_sync(
-        db.handle_mp_query("CREATE TABLE update_lock_test (id INT PRIMARY KEY, counter INT)"),
-    )
-    .unwrap();
-    tisql::io::block_on_sync(db.handle_mp_query("INSERT INTO update_lock_test VALUES (1, 0)"))
+    db.handle_mp_query("CREATE TABLE update_lock_test (id INT PRIMARY KEY, counter INT)")
+        .await
+        .unwrap();
+    db.handle_mp_query("INSERT INTO update_lock_test VALUES (1, 0)")
+        .await
         .unwrap();
 
     let num_threads = 10;
     let updates_per_thread = 5;
-    let barrier = Arc::new(std::sync::Barrier::new(num_threads));
+    let barrier = Arc::new(tokio::sync::Barrier::new(num_threads));
     let success_count = Arc::new(AtomicU64::new(0));
     let lock_error_count = Arc::new(AtomicU64::new(0));
 
@@ -1459,14 +1484,17 @@ async fn test_e2e_key_is_locked_concurrent_updates() {
         let success_count = Arc::clone(&success_count);
         let lock_error_count = Arc::clone(&lock_error_count);
 
-        handles.push(thread::spawn(move || {
-            // Synchronize all threads
-            barrier.wait();
+        handles.push(tokio::spawn(async move {
+            // Synchronize all tasks
+            barrier.wait().await;
 
             for _ in 0..updates_per_thread {
-                match tisql::io::block_on_sync(db.handle_mp_query(
-                    "UPDATE update_lock_test SET counter = counter + 1 WHERE id = 1",
-                )) {
+                match db
+                    .handle_mp_query(
+                        "UPDATE update_lock_test SET counter = counter + 1 WHERE id = 1",
+                    )
+                    .await
+                {
                     Ok(QueryResult::Affected(_)) => {
                         success_count.fetch_add(1, Ordering::Relaxed);
                     }
@@ -1488,14 +1516,14 @@ async fn test_e2e_key_is_locked_concurrent_updates() {
                         panic!("Got unexpected result: {other:?}");
                     }
                 }
-                // Small delay to allow other threads to compete
-                thread::yield_now();
+                // Small delay to allow other tasks to compete
+                tokio::task::yield_now().await;
             }
         }));
     }
 
     for handle in handles {
-        handle.join().unwrap();
+        handle.await.unwrap();
     }
 
     let successes = success_count.load(Ordering::Relaxed);
@@ -1516,10 +1544,10 @@ async fn test_e2e_key_is_locked_concurrent_updates() {
     // possible when multiple transactions read before any write. The counter will be
     // at least 1 (at least one update succeeded) and at most successes (all updates
     // incremented unique values).
-    match tisql::io::block_on_sync(
-        db.handle_mp_query("SELECT counter FROM update_lock_test WHERE id = 1"),
-    )
-    .unwrap()
+    match db
+        .handle_mp_query("SELECT counter FROM update_lock_test WHERE id = 1")
+        .await
+        .unwrap()
     {
         QueryResult::Rows { data, .. } => {
             let counter: i64 = data[0][0].parse().unwrap();
@@ -1532,7 +1560,7 @@ async fn test_e2e_key_is_locked_concurrent_updates() {
         other => panic!("Expected rows, got: {other:?}"),
     }
 
-    db.close().unwrap();
+    db.close().await.unwrap();
 }
 
 // ============================================================================
@@ -1552,10 +1580,9 @@ mod explicit_transaction_tests {
         let mut session = Session::new();
 
         // Create table
-        tisql::io::block_on_sync(
-            db.handle_mp_query("CREATE TABLE txn_test (id INT PRIMARY KEY, val VARCHAR(100))"),
-        )
-        .unwrap();
+        db.handle_mp_query("CREATE TABLE txn_test (id INT PRIMARY KEY, val VARCHAR(100))")
+            .await
+            .unwrap();
 
         // Session should not have active transaction initially
         assert!(
@@ -1564,8 +1591,9 @@ mod explicit_transaction_tests {
         );
 
         // BEGIN should start a transaction
-        let result =
-            tisql::io::block_on_sync(db.handle_mp_query_with_session_mut("BEGIN", &mut session));
+        let result = db
+            .handle_mp_query_with_session_mut("BEGIN", &mut session)
+            .await;
         assert!(result.is_ok(), "BEGIN should succeed");
 
         // Session should now have active transaction
@@ -1574,7 +1602,7 @@ mod explicit_transaction_tests {
             "Session should have active txn after BEGIN"
         );
 
-        db.close().unwrap();
+        db.close().await.unwrap();
     }
 
     /// Test that START TRANSACTION works like BEGIN.
@@ -1586,13 +1614,14 @@ mod explicit_transaction_tests {
         let mut session = Session::new();
 
         // Create table
-        tisql::io::block_on_sync(db.handle_mp_query("CREATE TABLE txn_test2 (id INT PRIMARY KEY)"))
+        db.handle_mp_query("CREATE TABLE txn_test2 (id INT PRIMARY KEY)")
+            .await
             .unwrap();
 
         // START TRANSACTION should start a transaction
-        let result = tisql::io::block_on_sync(
-            db.handle_mp_query_with_session_mut("START TRANSACTION", &mut session),
-        );
+        let result = db
+            .handle_mp_query_with_session_mut("START TRANSACTION", &mut session)
+            .await;
         assert!(result.is_ok(), "START TRANSACTION should succeed");
 
         assert!(
@@ -1600,7 +1629,7 @@ mod explicit_transaction_tests {
             "Session should have active txn after START TRANSACTION"
         );
 
-        db.close().unwrap();
+        db.close().await.unwrap();
     }
 
     /// Test that COMMIT commits changes.
@@ -1612,24 +1641,26 @@ mod explicit_transaction_tests {
         let mut session = Session::new();
 
         // Create table
-        tisql::io::block_on_sync(
-            db.handle_mp_query("CREATE TABLE commit_test (id INT PRIMARY KEY, val VARCHAR(100))"),
-        )
-        .unwrap();
+        db.handle_mp_query("CREATE TABLE commit_test (id INT PRIMARY KEY, val VARCHAR(100))")
+            .await
+            .unwrap();
 
         // Begin transaction
-        tisql::io::block_on_sync(db.handle_mp_query_with_session_mut("BEGIN", &mut session))
+        db.handle_mp_query_with_session_mut("BEGIN", &mut session)
+            .await
             .unwrap();
 
         // Insert within transaction
-        tisql::io::block_on_sync(db.handle_mp_query_with_session_mut(
+        db.handle_mp_query_with_session_mut(
             "INSERT INTO commit_test VALUES (1, 'committed')",
             &mut session,
-        ))
+        )
+        .await
         .unwrap();
 
         // Commit
-        tisql::io::block_on_sync(db.handle_mp_query_with_session_mut("COMMIT", &mut session))
+        db.handle_mp_query_with_session_mut("COMMIT", &mut session)
+            .await
             .unwrap();
 
         // Session should no longer have active transaction
@@ -1639,10 +1670,10 @@ mod explicit_transaction_tests {
         );
 
         // Data should be visible
-        match tisql::io::block_on_sync(
-            db.handle_mp_query("SELECT val FROM commit_test WHERE id = 1"),
-        )
-        .unwrap()
+        match db
+            .handle_mp_query("SELECT val FROM commit_test WHERE id = 1")
+            .await
+            .unwrap()
         {
             QueryResult::Rows { data, .. } => {
                 assert_eq!(data.len(), 1);
@@ -1651,7 +1682,7 @@ mod explicit_transaction_tests {
             other => panic!("Expected rows, got: {other:?}"),
         }
 
-        db.close().unwrap();
+        db.close().await.unwrap();
     }
 
     /// Test that ROLLBACK discards changes.
@@ -1663,28 +1694,29 @@ mod explicit_transaction_tests {
         let mut session = Session::new();
 
         // Create table and insert initial data
-        tisql::io::block_on_sync(
-            db.handle_mp_query("CREATE TABLE rollback_test (id INT PRIMARY KEY, val VARCHAR(100))"),
-        )
-        .unwrap();
-        tisql::io::block_on_sync(
-            db.handle_mp_query("INSERT INTO rollback_test VALUES (1, 'original')"),
-        )
-        .unwrap();
+        db.handle_mp_query("CREATE TABLE rollback_test (id INT PRIMARY KEY, val VARCHAR(100))")
+            .await
+            .unwrap();
+        db.handle_mp_query("INSERT INTO rollback_test VALUES (1, 'original')")
+            .await
+            .unwrap();
 
         // Begin transaction
-        tisql::io::block_on_sync(db.handle_mp_query_with_session_mut("BEGIN", &mut session))
+        db.handle_mp_query_with_session_mut("BEGIN", &mut session)
+            .await
             .unwrap();
 
         // Update within transaction
-        tisql::io::block_on_sync(db.handle_mp_query_with_session_mut(
+        db.handle_mp_query_with_session_mut(
             "UPDATE rollback_test SET val = 'modified' WHERE id = 1",
             &mut session,
-        ))
+        )
+        .await
         .unwrap();
 
         // Rollback
-        tisql::io::block_on_sync(db.handle_mp_query_with_session_mut("ROLLBACK", &mut session))
+        db.handle_mp_query_with_session_mut("ROLLBACK", &mut session)
+            .await
             .unwrap();
 
         // Session should no longer have active transaction
@@ -1694,10 +1726,10 @@ mod explicit_transaction_tests {
         );
 
         // Data should be unchanged
-        match tisql::io::block_on_sync(
-            db.handle_mp_query("SELECT val FROM rollback_test WHERE id = 1"),
-        )
-        .unwrap()
+        match db
+            .handle_mp_query("SELECT val FROM rollback_test WHERE id = 1")
+            .await
+            .unwrap()
         {
             QueryResult::Rows { data, .. } => {
                 assert_eq!(data.len(), 1);
@@ -1706,7 +1738,7 @@ mod explicit_transaction_tests {
             other => panic!("Expected rows, got: {other:?}"),
         }
 
-        db.close().unwrap();
+        db.close().await.unwrap();
     }
 
     /// Test multiple INSERT statements within a transaction.
@@ -1722,34 +1754,38 @@ mod explicit_transaction_tests {
         let mut session = Session::new();
 
         // Create table
-        tisql::io::block_on_sync(
-            db.handle_mp_query("CREATE TABLE multi_insert_test (id INT PRIMARY KEY, val INT)"),
-        )
-        .unwrap();
+        db.handle_mp_query("CREATE TABLE multi_insert_test (id INT PRIMARY KEY, val INT)")
+            .await
+            .unwrap();
 
         // Begin transaction
-        tisql::io::block_on_sync(db.handle_mp_query_with_session_mut("BEGIN", &mut session))
+        db.handle_mp_query_with_session_mut("BEGIN", &mut session)
+            .await
             .unwrap();
 
         // Multiple inserts within the transaction
-        tisql::io::block_on_sync(db.handle_mp_query_with_session_mut(
+        db.handle_mp_query_with_session_mut(
             "INSERT INTO multi_insert_test VALUES (1, 10)",
             &mut session,
-        ))
+        )
+        .await
         .unwrap();
-        tisql::io::block_on_sync(db.handle_mp_query_with_session_mut(
+        db.handle_mp_query_with_session_mut(
             "INSERT INTO multi_insert_test VALUES (2, 20)",
             &mut session,
-        ))
+        )
+        .await
         .unwrap();
-        tisql::io::block_on_sync(db.handle_mp_query_with_session_mut(
+        db.handle_mp_query_with_session_mut(
             "INSERT INTO multi_insert_test VALUES (3, 30)",
             &mut session,
-        ))
+        )
+        .await
         .unwrap();
 
         // Commit
-        tisql::io::block_on_sync(db.handle_mp_query_with_session_mut("COMMIT", &mut session))
+        db.handle_mp_query_with_session_mut("COMMIT", &mut session)
+            .await
             .unwrap();
 
         // Session should no longer have active transaction
@@ -1759,10 +1795,10 @@ mod explicit_transaction_tests {
         );
 
         // All inserts should be visible after commit
-        match tisql::io::block_on_sync(
-            db.handle_mp_query("SELECT id, val FROM multi_insert_test ORDER BY id"),
-        )
-        .unwrap()
+        match db
+            .handle_mp_query("SELECT id, val FROM multi_insert_test ORDER BY id")
+            .await
+            .unwrap()
         {
             QueryResult::Rows { data, .. } => {
                 assert_eq!(data.len(), 3);
@@ -1776,7 +1812,7 @@ mod explicit_transaction_tests {
             other => panic!("Expected rows, got: {other:?}"),
         }
 
-        db.close().unwrap();
+        db.close().await.unwrap();
     }
 
     /// Test read-your-writes within a transaction.
@@ -1791,28 +1827,28 @@ mod explicit_transaction_tests {
         let mut session = Session::new();
 
         // Create table
-        tisql::io::block_on_sync(
-            db.handle_mp_query("CREATE TABLE ryw_test (id INT PRIMARY KEY, val VARCHAR(100))"),
-        )
-        .unwrap();
+        db.handle_mp_query("CREATE TABLE ryw_test (id INT PRIMARY KEY, val VARCHAR(100))")
+            .await
+            .unwrap();
 
         // Begin transaction
-        tisql::io::block_on_sync(db.handle_mp_query_with_session_mut("BEGIN", &mut session))
+        db.handle_mp_query_with_session_mut("BEGIN", &mut session)
+            .await
             .unwrap();
 
         // Insert within transaction
-        tisql::io::block_on_sync(db.handle_mp_query_with_session_mut(
+        db.handle_mp_query_with_session_mut(
             "INSERT INTO ryw_test VALUES (1, 'first')",
             &mut session,
-        ))
+        )
+        .await
         .unwrap();
 
         // Read should see the uncommitted insert (read-your-writes)
-        match tisql::io::block_on_sync(db.handle_mp_query_with_session_mut(
-            "SELECT val FROM ryw_test WHERE id = 1",
-            &mut session,
-        ))
-        .unwrap()
+        match db
+            .handle_mp_query_with_session_mut("SELECT val FROM ryw_test WHERE id = 1", &mut session)
+            .await
+            .unwrap()
         {
             QueryResult::Rows { data, .. } => {
                 assert_eq!(data.len(), 1, "Should see own uncommitted write");
@@ -1822,18 +1858,18 @@ mod explicit_transaction_tests {
         }
 
         // Update within transaction
-        tisql::io::block_on_sync(db.handle_mp_query_with_session_mut(
+        db.handle_mp_query_with_session_mut(
             "UPDATE ryw_test SET val = 'updated' WHERE id = 1",
             &mut session,
-        ))
+        )
+        .await
         .unwrap();
 
         // Read should see the updated value
-        match tisql::io::block_on_sync(db.handle_mp_query_with_session_mut(
-            "SELECT val FROM ryw_test WHERE id = 1",
-            &mut session,
-        ))
-        .unwrap()
+        match db
+            .handle_mp_query_with_session_mut("SELECT val FROM ryw_test WHERE id = 1", &mut session)
+            .await
+            .unwrap()
         {
             QueryResult::Rows { data, .. } => {
                 assert_eq!(data[0][0], "updated");
@@ -1842,10 +1878,11 @@ mod explicit_transaction_tests {
         }
 
         // Commit
-        tisql::io::block_on_sync(db.handle_mp_query_with_session_mut("COMMIT", &mut session))
+        db.handle_mp_query_with_session_mut("COMMIT", &mut session)
+            .await
             .unwrap();
 
-        db.close().unwrap();
+        db.close().await.unwrap();
     }
 
     /// Test that COMMIT without active transaction is a no-op (MySQL behavior).
@@ -1857,15 +1894,17 @@ mod explicit_transaction_tests {
         let mut session = Session::new();
 
         // Create table
-        tisql::io::block_on_sync(db.handle_mp_query("CREATE TABLE noop_test (id INT PRIMARY KEY)"))
+        db.handle_mp_query("CREATE TABLE noop_test (id INT PRIMARY KEY)")
+            .await
             .unwrap();
 
         // COMMIT without BEGIN should succeed (MySQL behavior)
-        let result =
-            tisql::io::block_on_sync(db.handle_mp_query_with_session_mut("COMMIT", &mut session));
+        let result = db
+            .handle_mp_query_with_session_mut("COMMIT", &mut session)
+            .await;
         assert!(result.is_ok(), "COMMIT without txn should be no-op");
 
-        db.close().unwrap();
+        db.close().await.unwrap();
     }
 
     /// Test that ROLLBACK without active transaction is a no-op (MySQL behavior).
@@ -1877,17 +1916,17 @@ mod explicit_transaction_tests {
         let mut session = Session::new();
 
         // Create table
-        tisql::io::block_on_sync(
-            db.handle_mp_query("CREATE TABLE noop_rb_test (id INT PRIMARY KEY)"),
-        )
-        .unwrap();
+        db.handle_mp_query("CREATE TABLE noop_rb_test (id INT PRIMARY KEY)")
+            .await
+            .unwrap();
 
         // ROLLBACK without BEGIN should succeed (MySQL behavior)
-        let result =
-            tisql::io::block_on_sync(db.handle_mp_query_with_session_mut("ROLLBACK", &mut session));
+        let result = db
+            .handle_mp_query_with_session_mut("ROLLBACK", &mut session)
+            .await;
         assert!(result.is_ok(), "ROLLBACK without txn should be no-op");
 
-        db.close().unwrap();
+        db.close().await.unwrap();
     }
 
     /// Test nested BEGIN errors (current behavior).
@@ -1902,25 +1941,27 @@ mod explicit_transaction_tests {
         let mut session = Session::new();
 
         // Create table
-        tisql::io::block_on_sync(
-            db.handle_mp_query("CREATE TABLE nested_test (id INT PRIMARY KEY, val INT)"),
-        )
-        .unwrap();
+        db.handle_mp_query("CREATE TABLE nested_test (id INT PRIMARY KEY, val INT)")
+            .await
+            .unwrap();
 
         // Begin first transaction
-        tisql::io::block_on_sync(db.handle_mp_query_with_session_mut("BEGIN", &mut session))
+        db.handle_mp_query_with_session_mut("BEGIN", &mut session)
+            .await
             .unwrap();
 
         // Insert data
-        tisql::io::block_on_sync(db.handle_mp_query_with_session_mut(
+        db.handle_mp_query_with_session_mut(
             "INSERT INTO nested_test VALUES (1, 100)",
             &mut session,
-        ))
+        )
+        .await
         .unwrap();
 
         // Nested BEGIN should return an error (not supported yet)
-        let result =
-            tisql::io::block_on_sync(db.handle_mp_query_with_session_mut("BEGIN", &mut session));
+        let result = db
+            .handle_mp_query_with_session_mut("BEGIN", &mut session)
+            .await;
         assert!(result.is_err(), "Nested BEGIN should return error");
         assert!(
             result
@@ -1938,14 +1979,15 @@ mod explicit_transaction_tests {
         );
 
         // Commit the original transaction
-        tisql::io::block_on_sync(db.handle_mp_query_with_session_mut("COMMIT", &mut session))
+        db.handle_mp_query_with_session_mut("COMMIT", &mut session)
+            .await
             .unwrap();
 
         // Data should be visible after commit
-        match tisql::io::block_on_sync(
-            db.handle_mp_query("SELECT val FROM nested_test WHERE id = 1"),
-        )
-        .unwrap()
+        match db
+            .handle_mp_query("SELECT val FROM nested_test WHERE id = 1")
+            .await
+            .unwrap()
         {
             QueryResult::Rows { data, .. } => {
                 assert_eq!(data.len(), 1);
@@ -1954,6 +1996,6 @@ mod explicit_transaction_tests {
             other => panic!("Expected rows, got: {other:?}"),
         }
 
-        db.close().unwrap();
+        db.close().await.unwrap();
     }
 }

@@ -112,13 +112,15 @@ pub mod testkit {
     use crate::transaction::{CommitInfo, TxnService};
     use crate::tso::TsoService;
 
+    use std::future::Future;
+
     /// Extension trait for TransactionService with test-only autocommit helpers.
     pub trait TxnServiceTestExt {
         /// Execute a single put with autocommit (test helper).
-        fn autocommit_put(&self, key: &[u8], value: &[u8]) -> Result<CommitInfo>;
+        fn autocommit_put<'a>(&'a self, key: &'a [u8], value: &'a [u8]) -> impl Future<Output = Result<CommitInfo>> + Send + 'a;
 
         /// Execute a single delete with autocommit (test helper).
-        fn autocommit_delete(&self, key: &[u8]) -> Result<CommitInfo>;
+        fn autocommit_delete<'a>(&'a self, key: &'a [u8]) -> impl Future<Output = Result<CommitInfo>> + Send + 'a;
     }
 
     impl<S, C, T> TxnServiceTestExt for TransactionService<S, C, T>
@@ -127,10 +129,10 @@ pub mod testkit {
         C: ClogService + 'static,
         T: TsoService,
     {
-        fn autocommit_put(&self, key: &[u8], value: &[u8]) -> Result<CommitInfo> {
+        async fn autocommit_put(&self, key: &[u8], value: &[u8]) -> Result<CommitInfo> {
             let mut ctx = self.begin(false)?;
-            match self.put(&mut ctx, key.to_vec(), value.to_vec()) {
-                Ok(()) => crate::io::block_on_sync(self.commit(ctx)),
+            match self.put(&mut ctx, key.to_vec(), value.to_vec()).await {
+                Ok(()) => self.commit(ctx).await,
                 Err(e) => {
                     let _ = self.rollback(ctx);
                     Err(e)
@@ -138,10 +140,10 @@ pub mod testkit {
             }
         }
 
-        fn autocommit_delete(&self, key: &[u8]) -> Result<CommitInfo> {
+        async fn autocommit_delete(&self, key: &[u8]) -> Result<CommitInfo> {
             let mut ctx = self.begin(false)?;
-            match self.delete(&mut ctx, key.to_vec()) {
-                Ok(()) => crate::io::block_on_sync(self.commit(ctx)),
+            match self.delete(&mut ctx, key.to_vec()).await {
+                Ok(()) => self.commit(ctx).await,
                 Err(e) => {
                     let _ = self.rollback(ctx);
                     Err(e)
@@ -411,9 +413,9 @@ impl Database {
         let catalog = MvccCatalog::new(Arc::clone(&txn_service));
 
         // Bootstrap if fresh database (no default schema exists)
-        if !catalog.is_bootstrapped()? {
+        if !crate::io::block_on_sync(catalog.is_bootstrapped())? {
             log_info!("Fresh database - bootstrapping catalog");
-            catalog.bootstrap()?;
+            crate::io::block_on_sync(catalog.bootstrap())?;
         } else {
             // Load schema version from storage for existing database
             catalog.load_schema_version()?;
@@ -786,14 +788,14 @@ impl Database {
     }
 
     /// Close the database (flush memtables and sync logs).
-    pub fn close(&self) -> Result<()> {
+    pub async fn close(&self) -> Result<()> {
         // Flush any pending memtable data to SSTs
         if let Err(e) = self.storage.flush_all_with_active() {
             log_warn!("Error flushing memtables on close: {}", e);
         }
 
         // Close commit log
-        self.txn_service.clog_service().close()?;
+        self.txn_service.clog_service().close().await?;
 
         // Close ilog
         self.ilog.close()?;
@@ -814,7 +816,7 @@ impl Drop for Database {
         let _ = self.storage.flush_all_with_active();
 
         // 3. Close clog + ilog (sync pending writes)
-        let _ = self.txn_service.clog_service().close();
+        let _ = crate::io::block_on_sync(self.txn_service.clog_service().close());
         let _ = self.ilog.close();
 
         // 4. Shutdown all spawn_blocking task channels BEFORE dropping io_runtime.
@@ -1040,7 +1042,7 @@ mod tests {
             db.handle_mp_query("INSERT INTO t VALUES (2, 'world')")
                 .await
                 .unwrap();
-            db.close().unwrap();
+            db.close().await.unwrap();
         }
 
         // Reopen - data should be in storage but catalog needs recovery

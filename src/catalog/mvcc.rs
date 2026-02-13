@@ -19,7 +19,8 @@
 //! write rows to inner tables and update the cache atomically.
 
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::RwLock;
+
+use parking_lot::RwLock;
 
 use crate::codec::key::{encode_record_key_with_handle, gen_table_record_prefix};
 use crate::codec::row::encode_row;
@@ -30,7 +31,7 @@ use crate::inner_table::bootstrap::{
 };
 use crate::inner_table::catalog_loader::{self, CatalogCache};
 use crate::inner_table::core_tables::*;
-use crate::transaction::{CommitInfo, TxnCtx, TxnService};
+use crate::transaction::{TxnCtx, TxnService};
 use crate::types::{IndexId, TableId, Timestamp, Value};
 
 use super::{Catalog, IndexDef, TableDef};
@@ -59,9 +60,11 @@ struct SchemaState {
 ///
 /// ## DDL/DML Concurrency Control
 ///
-/// Uses RwLock to ensure atomicity between DDL commit and cache update:
-/// - DDL holds write lock during: inner table writes → commit → cache update
-/// - DML holds read lock briefly to check version at commit time
+/// DDL serialization uses `tokio::sync::Mutex` (Send-safe across await points).
+/// Cache reads use `parking_lot::RwLock` (fast, no async overhead for DML reads).
+///
+/// DDL pattern: acquire ddl_mutex → validate under read lock → async txn work
+/// (no parking_lot lock held) → update cache under write lock.
 ///
 /// ## ID Generation
 ///
@@ -69,8 +72,11 @@ struct SchemaState {
 /// conflicts during concurrent DDL operations. IDs are persisted to `__all_meta`.
 pub struct MvccCatalog<T: TxnService> {
     txn_service: std::sync::Arc<T>,
-    /// Schema state + cache protected by RwLock for DDL/DML concurrency.
+    /// Schema state + cache protected by RwLock for fast DML reads.
     schema_state: RwLock<SchemaState>,
+    /// Serializes DDL operations. tokio::sync::Mutex is Send-safe across await points,
+    /// unlike parking_lot::RwLockWriteGuard.
+    ddl_mutex: tokio::sync::Mutex<()>,
     /// Atomic counter for table IDs.
     next_table_id: AtomicU64,
     /// Atomic counter for index IDs.
@@ -98,6 +104,7 @@ impl<T: TxnService> MvccCatalog<T> {
                     table_id_map: Default::default(),
                 },
             }),
+            ddl_mutex: tokio::sync::Mutex::new(()),
             next_table_id: AtomicU64::new(USER_TABLE_ID_START),
             next_index_id: AtomicU64::new(1),
             next_schema_id: AtomicU64::new(USER_SCHEMA_ID_START),
@@ -108,14 +115,14 @@ impl<T: TxnService> MvccCatalog<T> {
     /// Bootstrap the catalog by writing core system tables to storage.
     ///
     /// Call this only for fresh databases where no metadata exists.
-    pub fn bootstrap(&self) -> Result<()> {
-        bootstrap::bootstrap_core_tables(self.txn_service.as_ref())?;
+    pub async fn bootstrap(&self) -> Result<()> {
+        bootstrap::bootstrap_core_tables(self.txn_service.as_ref()).await?;
         self.load_schema_version()
     }
 
     /// Check if the catalog has been bootstrapped.
-    pub fn is_bootstrapped(&self) -> Result<bool> {
-        bootstrap::is_bootstrapped(self.txn_service.as_ref())
+    pub async fn is_bootstrapped(&self) -> Result<bool> {
+        bootstrap::is_bootstrapped(self.txn_service.as_ref()).await
     }
 
     /// Load schema version, counters, and cache from inner tables.
@@ -124,7 +131,7 @@ impl<T: TxnService> MvccCatalog<T> {
     pub fn load_schema_version(&self) -> Result<()> {
         let (cache, counters) = catalog_loader::load_catalog(self.txn_service.as_ref())?;
 
-        let mut state = self.schema_state.write().unwrap();
+        let mut state = self.schema_state.write();
         state.version = counters.schema_version;
         state.cache = cache;
 
@@ -140,44 +147,45 @@ impl<T: TxnService> MvccCatalog<T> {
         Ok(())
     }
 
-    /// Increment schema version in `__all_meta` and memory.
-    /// Must be called while holding write lock on schema_state.
-    fn increment_schema_version(&self, ctx: &mut TxnCtx, state: &mut SchemaState) -> Result<()> {
-        state.version += 1;
+    /// Write schema version to `__all_meta` inner table.
+    /// Called during DDL txn work (no cache lock held).
+    async fn write_schema_version_to_meta(&self, ctx: &mut TxnCtx, new_version: u64) -> Result<()> {
         update_meta_row(
             ctx,
             self.txn_service.as_ref(),
             META_SCHEMA_VERSION,
-            state.version,
-        )
+            new_version,
+        ).await
     }
 
     fn begin_internal(&self) -> Result<TxnCtx> {
         self.txn_service.begin(false)
     }
 
-    fn commit_internal(&self, ctx: TxnCtx) -> Result<CommitInfo> {
-        crate::io::block_on_sync(self.txn_service.commit(ctx))
+    async fn commit_internal(&self, ctx: TxnCtx) -> Result<crate::transaction::CommitInfo> {
+        self.txn_service.commit(ctx).await
     }
 }
 
 impl<T: TxnService> Catalog for MvccCatalog<T> {
-    fn create_schema(&self, name: &str) -> Result<()> {
-        let mut state = self.schema_state.write().unwrap();
+    async fn create_schema(&self, name: &str) -> Result<()> {
+        let _ddl = self.ddl_mutex.lock().await;
 
-        // Check if schema already exists
-        if state.cache.schemas.contains_key(name) {
-            return Err(TiSqlError::Catalog(format!(
-                "Schema '{name}' already exists"
-            )));
-        }
+        // Phase 1: Validate + extract data (brief read lock)
+        let (schema_id, new_version) = {
+            let state = self.schema_state.read();
+            if state.cache.schemas.contains_key(name) {
+                return Err(TiSqlError::Catalog(format!(
+                    "Schema '{name}' already exists"
+                )));
+            }
+            let schema_id = self.next_schema_id.fetch_add(1, Ordering::SeqCst);
+            (schema_id, state.version + 1)
+        };
 
-        // Allocate schema_id
-        let schema_id = self.next_schema_id.fetch_add(1, Ordering::SeqCst);
-
+        // Phase 2: Async txn work (no parking_lot lock held)
         let mut ctx = self.begin_internal()?;
 
-        // INSERT into __all_schema
         let key = encode_record_key_with_handle(ALL_SCHEMA_TABLE_ID, schema_id as i64);
         let col_ids = &[0, 1];
         let values = &[
@@ -185,63 +193,65 @@ impl<T: TxnService> Catalog for MvccCatalog<T> {
             Value::String(name.to_string()),
         ];
         let row_data = encode_row(col_ids, values);
-        self.txn_service.put(&mut ctx, key, row_data)?;
+        self.txn_service.put(&mut ctx, key, row_data).await?;
 
-        // Persist next_schema_id counter
         let current_next = self.next_schema_id.load(Ordering::SeqCst);
         update_meta_row(
             &mut ctx,
             self.txn_service.as_ref(),
             META_NEXT_SCHEMA_ID,
             current_next,
-        )?;
+        ).await?;
 
-        // Increment schema version
-        self.increment_schema_version(&mut ctx, &mut state)?;
+        self.write_schema_version_to_meta(&mut ctx, new_version).await?;
+        self.commit_internal(ctx).await?;
 
-        self.commit_internal(ctx)?;
-
-        // Update cache
+        // Phase 3: Update cache (brief write lock)
+        let mut state = self.schema_state.write();
+        state.version = new_version;
         state.cache.schemas.insert(name.to_string(), schema_id);
         state.cache.schema_names.insert(schema_id, name.to_string());
 
         Ok(())
     }
 
-    fn drop_schema(&self, name: &str) -> Result<()> {
+    async fn drop_schema(&self, name: &str) -> Result<()> {
         if name == "default" {
             return Err(TiSqlError::Catalog(
                 "Cannot drop default schema".to_string(),
             ));
         }
 
-        let mut state = self.schema_state.write().unwrap();
+        let _ddl = self.ddl_mutex.lock().await;
 
-        let schema_id = match state.cache.schemas.get(name) {
-            Some(&id) => id,
-            None => return Err(TiSqlError::Catalog(format!("Schema '{name}' not found"))),
+        // Phase 1: Validate (brief read lock)
+        let (schema_id, new_version) = {
+            let state = self.schema_state.read();
+            let schema_id = match state.cache.schemas.get(name) {
+                Some(&id) => id,
+                None => return Err(TiSqlError::Catalog(format!("Schema '{name}' not found"))),
+            };
+            let has_tables = state.cache.tables.keys().any(|(s, _)| s == name);
+            if has_tables {
+                return Err(TiSqlError::Catalog(format!(
+                    "Schema '{name}' is not empty, drop tables first"
+                )));
+            }
+            (schema_id, state.version + 1)
         };
 
-        // Check if schema has tables
-        let has_tables = state.cache.tables.keys().any(|(s, _)| s == name);
-        if has_tables {
-            return Err(TiSqlError::Catalog(format!(
-                "Schema '{name}' is not empty, drop tables first"
-            )));
-        }
-
+        // Phase 2: Async txn work
         let mut ctx = self.begin_internal()?;
 
-        // DELETE from __all_schema
         let key = encode_record_key_with_handle(ALL_SCHEMA_TABLE_ID, schema_id as i64);
-        self.txn_service.delete(&mut ctx, key)?;
+        self.txn_service.delete(&mut ctx, key).await?;
 
-        // Increment schema version
-        self.increment_schema_version(&mut ctx, &mut state)?;
+        self.write_schema_version_to_meta(&mut ctx, new_version).await?;
+        self.commit_internal(ctx).await?;
 
-        self.commit_internal(ctx)?;
-
-        // Update cache
+        // Phase 3: Update cache
+        let mut state = self.schema_state.write();
+        state.version = new_version;
         state.cache.schemas.remove(name);
         state.cache.schema_names.remove(&schema_id);
 
@@ -249,7 +259,7 @@ impl<T: TxnService> Catalog for MvccCatalog<T> {
     }
 
     fn list_schemas(&self) -> Result<Vec<String>> {
-        let state = self.schema_state.read().unwrap();
+        let state = self.schema_state.read();
         Ok(state
             .cache
             .schemas
@@ -260,124 +270,125 @@ impl<T: TxnService> Catalog for MvccCatalog<T> {
     }
 
     fn schema_exists(&self, name: &str) -> Result<bool> {
-        let state = self.schema_state.read().unwrap();
+        let state = self.schema_state.read();
         Ok(state.cache.schemas.contains_key(name))
     }
 
-    fn create_table(&self, table: TableDef) -> Result<TableId> {
-        let mut state = self.schema_state.write().unwrap();
+    async fn create_table(&self, table: TableDef) -> Result<TableId> {
+        let _ddl = self.ddl_mutex.lock().await;
 
-        // Check if table already exists
-        let key = (table.schema().to_string(), table.name().to_string());
-        if state.cache.tables.contains_key(&key) {
-            return Err(TiSqlError::Catalog(format!(
-                "Table '{}' already exists in schema '{}'",
-                table.name(),
-                table.schema()
-            )));
-        }
-
-        // Resolve schema_id
-        let schema_id = match state.cache.schemas.get(table.schema()) {
-            Some(&id) => id,
-            None => {
+        // Phase 1: Validate (brief read lock)
+        let (schema_id, new_version) = {
+            let state = self.schema_state.read();
+            let key = (table.schema().to_string(), table.name().to_string());
+            if state.cache.tables.contains_key(&key) {
                 return Err(TiSqlError::Catalog(format!(
-                    "Schema '{}' not found",
+                    "Table '{}' already exists in schema '{}'",
+                    table.name(),
                     table.schema()
                 )));
             }
+            let schema_id = match state.cache.schemas.get(table.schema()) {
+                Some(&id) => id,
+                None => {
+                    return Err(TiSqlError::Catalog(format!(
+                        "Schema '{}' not found",
+                        table.schema()
+                    )));
+                }
+            };
+            (schema_id, state.version + 1)
         };
 
         let table_id = table.id();
 
+        // Phase 2: Async txn work
         let mut ctx = self.begin_internal()?;
 
-        // INSERT into __all_table
-        write_user_table_row(&mut ctx, self.txn_service.as_ref(), &table, schema_id)?;
-
-        // INSERT into __all_column for each column
+        write_user_table_row(&mut ctx, self.txn_service.as_ref(), &table, schema_id).await?;
         write_user_column_rows(
             &mut ctx,
             self.txn_service.as_ref(),
             table_id,
             table.columns(),
-        )?;
+        ).await?;
 
-        // Persist next_table_id counter
         let current_next = self.next_table_id.load(Ordering::SeqCst);
         update_meta_row(
             &mut ctx,
             self.txn_service.as_ref(),
             META_NEXT_TABLE_ID,
             current_next,
-        )?;
+        ).await?;
 
-        // Increment schema version
-        self.increment_schema_version(&mut ctx, &mut state)?;
+        self.write_schema_version_to_meta(&mut ctx, new_version).await?;
+        self.commit_internal(ctx).await?;
 
-        self.commit_internal(ctx)?;
-
-        // Update cache
+        // Phase 3: Update cache
+        let mut state = self.schema_state.write();
+        state.version = new_version;
+        let key = (table.schema().to_string(), table.name().to_string());
         state.cache.table_id_map.insert(table_id, key.clone());
         state.cache.tables.insert(key, table);
 
         Ok(table_id)
     }
 
-    fn drop_table(&self, schema: &str, table: &str) -> Result<super::DropTableInfo> {
-        let mut state = self.schema_state.write().unwrap();
+    async fn drop_table(&self, schema: &str, table: &str) -> Result<super::DropTableInfo> {
+        let _ddl = self.ddl_mutex.lock().await;
 
-        let key = (schema.to_string(), table.to_string());
-        let table_def = match state.cache.tables.get(&key) {
-            Some(t) => t.clone(),
-            None => {
-                return Err(TiSqlError::TableNotFound(format!("{schema}.{table}")));
+        // Phase 1: Validate + extract data (brief read lock)
+        let (table_def, new_version, start_key_hex, end_key_hex, gc_task_id) = {
+            let state = self.schema_state.read();
+            let key = (schema.to_string(), table.to_string());
+            let table_def = match state.cache.tables.get(&key) {
+                Some(t) => t.clone(),
+                None => {
+                    return Err(TiSqlError::TableNotFound(format!("{schema}.{table}")));
+                }
+            };
+
+            let table_id = table_def.id();
+            let start_key = gen_table_record_prefix(table_id);
+            let mut end_key = start_key.clone();
+            if let Some(last) = end_key.last_mut() {
+                *last = last.saturating_add(1);
             }
+            let start_key_hex = start_key
+                .iter()
+                .map(|b| format!("{b:02x}"))
+                .collect::<String>();
+            let end_key_hex = end_key
+                .iter()
+                .map(|b| format!("{b:02x}"))
+                .collect::<String>();
+
+            let gc_task_id = self.next_gc_task_id.fetch_add(1, Ordering::SeqCst) as i64;
+            (table_def, state.version + 1, start_key_hex, end_key_hex, gc_task_id)
         };
 
         let table_id = table_def.id();
 
-        // Compute key range for GC delete-range task
-        let start_key = gen_table_record_prefix(table_id);
-        let mut end_key = start_key.clone();
-        if let Some(last) = end_key.last_mut() {
-            *last = last.saturating_add(1);
-        }
-        let start_key_hex = start_key
-            .iter()
-            .map(|b| format!("{b:02x}"))
-            .collect::<String>();
-        let end_key_hex = end_key
-            .iter()
-            .map(|b| format!("{b:02x}"))
-            .collect::<String>();
-
-        // Allocate GC task ID
-        let gc_task_id = self.next_gc_task_id.fetch_add(1, Ordering::SeqCst) as i64;
-
+        // Phase 2: Async txn work
         let mut ctx = self.begin_internal()?;
 
-        // DELETE from __all_table
         let table_key = encode_record_key_with_handle(ALL_TABLE_TABLE_ID, table_id as i64);
-        self.txn_service.delete(&mut ctx, table_key)?;
+        self.txn_service.delete(&mut ctx, table_key).await?;
 
-        // DELETE from __all_column
         delete_column_rows(
             &mut ctx,
             self.txn_service.as_ref(),
             table_id,
             table_def.columns(),
-        )?;
+        ).await?;
 
-        // DELETE from __all_index
         delete_index_rows(
             &mut ctx,
             self.txn_service.as_ref(),
             table_id,
             table_def.indexes(),
-        )?;
+        ).await?;
 
-        // Write GC task row (drop_commit_ts=0, will be updated after commit)
         write_gc_task_row(
             &mut ctx,
             self.txn_service.as_ref(),
@@ -387,21 +398,19 @@ impl<T: TxnService> Catalog for MvccCatalog<T> {
             &end_key_hex,
             0,
             "pending",
-        )?;
+        ).await?;
 
-        // Persist next_gc_task_id counter
         let current_next = self.next_gc_task_id.load(Ordering::SeqCst);
         update_meta_row(
             &mut ctx,
             self.txn_service.as_ref(),
             META_NEXT_GC_TASK_ID,
             current_next,
-        )?;
+        ).await?;
 
-        // Increment schema version
-        self.increment_schema_version(&mut ctx, &mut state)?;
+        self.write_schema_version_to_meta(&mut ctx, new_version).await?;
 
-        let commit_info = self.commit_internal(ctx)?;
+        let commit_info = self.commit_internal(ctx).await?;
         let commit_ts = commit_info.commit_ts;
 
         // Update GC task with the real drop_commit_ts in a new auto-commit txn
@@ -416,11 +425,14 @@ impl<T: TxnService> Catalog for MvccCatalog<T> {
                 &end_key_hex,
                 commit_ts,
                 "pending",
-            )?;
-            self.commit_internal(ctx2)?;
+            ).await?;
+            self.commit_internal(ctx2).await?;
         }
 
-        // Update cache
+        // Phase 3: Update cache
+        let mut state = self.schema_state.write();
+        state.version = new_version;
+        let key = (schema.to_string(), table.to_string());
         state.cache.tables.remove(&key);
         state.cache.table_id_map.remove(&table_id);
 
@@ -431,13 +443,13 @@ impl<T: TxnService> Catalog for MvccCatalog<T> {
     }
 
     fn get_table(&self, schema: &str, table: &str) -> Result<Option<TableDef>> {
-        let state = self.schema_state.read().unwrap();
+        let state = self.schema_state.read();
         let key = (schema.to_string(), table.to_string());
         Ok(state.cache.tables.get(&key).cloned())
     }
 
     fn get_table_by_id(&self, id: TableId) -> Result<Option<TableDef>> {
-        let state = self.schema_state.read().unwrap();
+        let state = self.schema_state.read();
         match state.cache.table_id_map.get(&id) {
             Some(key) => Ok(state.cache.tables.get(key).cloned()),
             None => Ok(None),
@@ -445,7 +457,7 @@ impl<T: TxnService> Catalog for MvccCatalog<T> {
     }
 
     fn list_tables(&self, schema: &str) -> Result<Vec<TableDef>> {
-        let state = self.schema_state.read().unwrap();
+        let state = self.schema_state.read();
         Ok(state
             .cache
             .tables
@@ -455,54 +467,54 @@ impl<T: TxnService> Catalog for MvccCatalog<T> {
             .collect())
     }
 
-    fn create_index(&self, table_id: TableId, index: IndexDef) -> Result<IndexId> {
-        let mut state = self.schema_state.write().unwrap();
+    async fn create_index(&self, table_id: TableId, index: IndexDef) -> Result<IndexId> {
+        let _ddl = self.ddl_mutex.lock().await;
 
-        // Find table in cache
-        let table_key = match state.cache.table_id_map.get(&table_id) {
-            Some(k) => k.clone(),
-            None => {
+        // Phase 1: Validate (brief read lock)
+        let (table_key, new_version) = {
+            let state = self.schema_state.read();
+            let table_key = match state.cache.table_id_map.get(&table_id) {
+                Some(k) => k.clone(),
+                None => {
+                    return Err(TiSqlError::Catalog(format!(
+                        "Table with ID {table_id} not found"
+                    )));
+                }
+            };
+            let table_def =
+                state.cache.tables.get(&table_key).ok_or_else(|| {
+                    TiSqlError::Catalog(format!("Table with ID {table_id} not found"))
+                })?;
+            if table_def.indexes().iter().any(|i| i.name() == index.name()) {
                 return Err(TiSqlError::Catalog(format!(
-                    "Table with ID {table_id} not found"
+                    "Index '{}' already exists",
+                    index.name()
                 )));
             }
+            (table_key, state.version + 1)
         };
-
-        let table_def =
-            state.cache.tables.get(&table_key).cloned().ok_or_else(|| {
-                TiSqlError::Catalog(format!("Table with ID {table_id} not found"))
-            })?;
-
-        // Check for duplicate index name
-        if table_def.indexes().iter().any(|i| i.name() == index.name()) {
-            return Err(TiSqlError::Catalog(format!(
-                "Index '{}' already exists",
-                index.name()
-            )));
-        }
 
         let index_id = index.id();
 
+        // Phase 2: Async txn work
         let mut ctx = self.begin_internal()?;
 
-        // INSERT into __all_index
-        write_index_row(&mut ctx, self.txn_service.as_ref(), table_id, &index)?;
+        write_index_row(&mut ctx, self.txn_service.as_ref(), table_id, &index).await?;
 
-        // Persist next_index_id counter
         let current_next = self.next_index_id.load(Ordering::SeqCst);
         update_meta_row(
             &mut ctx,
             self.txn_service.as_ref(),
             META_NEXT_INDEX_ID,
             current_next,
-        )?;
+        ).await?;
 
-        // Increment schema version
-        self.increment_schema_version(&mut ctx, &mut state)?;
+        self.write_schema_version_to_meta(&mut ctx, new_version).await?;
+        self.commit_internal(ctx).await?;
 
-        self.commit_internal(ctx)?;
-
-        // Update cache
+        // Phase 3: Update cache
+        let mut state = self.schema_state.write();
+        state.version = new_version;
         if let Some(cached_table) = state.cache.tables.get_mut(&table_key) {
             cached_table.add_index(index);
         }
@@ -510,45 +522,45 @@ impl<T: TxnService> Catalog for MvccCatalog<T> {
         Ok(index_id)
     }
 
-    fn drop_index(&self, table_id: TableId, index_name: &str) -> Result<()> {
-        let mut state = self.schema_state.write().unwrap();
+    async fn drop_index(&self, table_id: TableId, index_name: &str) -> Result<()> {
+        let _ddl = self.ddl_mutex.lock().await;
 
-        // Find table in cache
-        let table_key = match state.cache.table_id_map.get(&table_id) {
-            Some(k) => k.clone(),
-            None => {
-                return Err(TiSqlError::Catalog(format!(
-                    "Table with ID {table_id} not found"
-                )));
-            }
+        // Phase 1: Validate (brief read lock)
+        let (table_key, index_key, new_version) = {
+            let state = self.schema_state.read();
+            let table_key = match state.cache.table_id_map.get(&table_id) {
+                Some(k) => k.clone(),
+                None => {
+                    return Err(TiSqlError::Catalog(format!(
+                        "Table with ID {table_id} not found"
+                    )));
+                }
+            };
+            let table_def =
+                state.cache.tables.get(&table_key).ok_or_else(|| {
+                    TiSqlError::Catalog(format!("Table with ID {table_id} not found"))
+                })?;
+            let index = table_def
+                .indexes()
+                .iter()
+                .find(|i| i.name() == index_name)
+                .ok_or_else(|| TiSqlError::Catalog(format!("Index '{index_name}' not found")))?;
+            let index_key = table_id * 10000 + index.id();
+            (table_key, index_key, state.version + 1)
         };
 
-        let table_def =
-            state.cache.tables.get(&table_key).cloned().ok_or_else(|| {
-                TiSqlError::Catalog(format!("Table with ID {table_id} not found"))
-            })?;
-
-        // Find the index to get its ID
-        let index = table_def
-            .indexes()
-            .iter()
-            .find(|i| i.name() == index_name)
-            .ok_or_else(|| TiSqlError::Catalog(format!("Index '{index_name}' not found")))?;
-
-        let index_key = table_id * 10000 + index.id();
-
+        // Phase 2: Async txn work
         let mut ctx = self.begin_internal()?;
 
-        // DELETE from __all_index
         let key = encode_record_key_with_handle(ALL_INDEX_TABLE_ID, index_key as i64);
-        self.txn_service.delete(&mut ctx, key)?;
+        self.txn_service.delete(&mut ctx, key).await?;
 
-        // Increment schema version
-        self.increment_schema_version(&mut ctx, &mut state)?;
+        self.write_schema_version_to_meta(&mut ctx, new_version).await?;
+        self.commit_internal(ctx).await?;
 
-        self.commit_internal(ctx)?;
-
-        // Update cache
+        // Phase 3: Update cache
+        let mut state = self.schema_state.write();
+        state.version = new_version;
         if let Some(cached_table) = state.cache.tables.get_mut(&table_key) {
             cached_table.remove_index(index_name);
         }
@@ -557,7 +569,7 @@ impl<T: TxnService> Catalog for MvccCatalog<T> {
     }
 
     fn next_auto_increment(&self, table_id: TableId) -> Result<u64> {
-        let mut state = self.schema_state.write().unwrap();
+        let mut state = self.schema_state.write();
 
         let table_key = match state.cache.table_id_map.get(&table_id) {
             Some(k) => k.clone(),
@@ -568,7 +580,6 @@ impl<T: TxnService> Catalog for MvccCatalog<T> {
             }
         };
 
-        // Look up schema_id first (before mutable borrow of tables)
         let schema_name = table_key.0.clone();
         let schema_id = match state.cache.schemas.get(&schema_name) {
             Some(&id) => id,
@@ -584,13 +595,12 @@ impl<T: TxnService> Catalog for MvccCatalog<T> {
                 TiSqlError::Catalog(format!("Table with ID {table_id} not found"))
             })?;
 
-        // Increment auto_increment_id
         let new_id = table_def.increment_auto_id();
 
-        // Update __all_table row with new auto_increment_id
+        // Persist: use block_on_sync since this is a sync method
         let mut ctx = self.begin_internal()?;
-        write_user_table_row(&mut ctx, self.txn_service.as_ref(), table_def, schema_id)?;
-        self.commit_internal(ctx)?;
+        crate::io::block_on_sync(write_user_table_row(&mut ctx, self.txn_service.as_ref(), table_def, schema_id))?;
+        crate::io::block_on_sync(self.commit_internal(ctx))?;
 
         Ok(new_id)
     }
@@ -614,7 +624,7 @@ impl<T: TxnService> Catalog for MvccCatalog<T> {
     }
 
     fn list_tables_at(&self, schema: &str, ts: Timestamp) -> Result<Vec<TableDef>> {
-        let state = self.schema_state.read().unwrap();
+        let state = self.schema_state.read();
         let schema_id = match state.cache.schemas.get(schema) {
             Some(&id) => id,
             None => return Ok(Vec::new()),
@@ -628,7 +638,7 @@ impl<T: TxnService> Catalog for MvccCatalog<T> {
     }
 
     fn current_schema_version(&self) -> u64 {
-        let state = self.schema_state.read().unwrap();
+        let state = self.schema_state.read();
         state.version
     }
 }
@@ -666,8 +676,12 @@ mod tests {
         ));
 
         let catalog = MvccCatalog::new(txn_service);
-        catalog.bootstrap().unwrap();
+        (catalog, dir)
+    }
 
+    async fn create_test_catalog_bootstrapped() -> (MvccCatalog<TestTxnService>, tempfile::TempDir) {
+        let (catalog, dir) = create_test_catalog();
+        catalog.bootstrap().await.unwrap();
         (catalog, dir)
     }
 
@@ -694,11 +708,11 @@ mod tests {
 
     #[tokio::test]
     async fn test_create_get_table() {
-        let (catalog, _dir) = create_test_catalog();
+        let (catalog, _dir) = create_test_catalog_bootstrapped().await;
         let table = make_test_table(&catalog, "users");
         let table_id = table.id();
 
-        catalog.create_table(table).unwrap();
+        catalog.create_table(table).await.unwrap();
 
         let retrieved = catalog.get_table("default", "users").unwrap().unwrap();
         assert_eq!(retrieved.id(), table_id);
@@ -710,25 +724,25 @@ mod tests {
 
     #[tokio::test]
     async fn test_drop_table() {
-        let (catalog, _dir) = create_test_catalog();
+        let (catalog, _dir) = create_test_catalog_bootstrapped().await;
         let table = make_test_table(&catalog, "users");
 
-        catalog.create_table(table).unwrap();
+        catalog.create_table(table).await.unwrap();
         assert!(catalog.get_table("default", "users").unwrap().is_some());
 
-        catalog.drop_table("default", "users").unwrap();
+        catalog.drop_table("default", "users").await.unwrap();
         assert!(catalog.get_table("default", "users").unwrap().is_none());
     }
 
     #[tokio::test]
     async fn test_list_tables() {
-        let (catalog, _dir) = create_test_catalog();
+        let (catalog, _dir) = create_test_catalog_bootstrapped().await;
 
         let t1 = make_test_table(&catalog, "users");
         let t2 = make_test_table(&catalog, "orders");
 
-        catalog.create_table(t1).unwrap();
-        catalog.create_table(t2).unwrap();
+        catalog.create_table(t1).await.unwrap();
+        catalog.create_table(t2).await.unwrap();
 
         let tables = catalog.list_tables("default").unwrap();
         assert_eq!(tables.len(), 2);
@@ -740,14 +754,14 @@ mod tests {
 
     #[tokio::test]
     async fn test_schema_operations() {
-        let (catalog, _dir) = create_test_catalog();
+        let (catalog, _dir) = create_test_catalog_bootstrapped().await;
 
         // Default and test schemas should exist after bootstrap
         assert!(catalog.schema_exists("default").unwrap());
         assert!(catalog.schema_exists("test").unwrap());
 
         // Create new schema
-        catalog.create_schema("myschema").unwrap();
+        catalog.create_schema("myschema").await.unwrap();
         assert!(catalog.schema_exists("myschema").unwrap());
 
         // List schemas (should not include __tisql_inner)
@@ -758,17 +772,17 @@ mod tests {
         assert!(!schemas.contains(&INNER_SCHEMA.to_string()));
 
         // Drop schema
-        catalog.drop_schema("myschema").unwrap();
+        catalog.drop_schema("myschema").await.unwrap();
         assert!(!catalog.schema_exists("myschema").unwrap());
     }
 
     #[tokio::test]
     async fn test_auto_increment() {
-        let (catalog, _dir) = create_test_catalog();
+        let (catalog, _dir) = create_test_catalog_bootstrapped().await;
         let table = make_test_table(&catalog, "users");
         let table_id = table.id();
 
-        catalog.create_table(table).unwrap();
+        catalog.create_table(table).await.unwrap();
 
         assert_eq!(catalog.next_auto_increment(table_id).unwrap(), 1);
         assert_eq!(catalog.next_auto_increment(table_id).unwrap(), 2);
@@ -777,7 +791,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_table_id_generation() {
-        let (catalog, _dir) = create_test_catalog();
+        let (catalog, _dir) = create_test_catalog_bootstrapped().await;
 
         let id1 = catalog.next_table_id().unwrap();
         let id2 = catalog.next_table_id().unwrap();
@@ -791,19 +805,19 @@ mod tests {
 
     #[tokio::test]
     async fn test_duplicate_table_error() {
-        let (catalog, _dir) = create_test_catalog();
+        let (catalog, _dir) = create_test_catalog_bootstrapped().await;
         let table = make_test_table(&catalog, "users");
 
-        catalog.create_table(table).unwrap();
+        catalog.create_table(table).await.unwrap();
 
         let table2 = make_test_table(&catalog, "users");
-        let result = catalog.create_table(table2);
+        let result = catalog.create_table(table2).await;
         assert!(result.is_err());
     }
 
     #[tokio::test]
     async fn test_schema_version_increments_on_ddl() {
-        let (catalog, _dir) = create_test_catalog();
+        let (catalog, _dir) = create_test_catalog_bootstrapped().await;
 
         // After bootstrap, version should be > 0
         let initial_version = catalog.current_schema_version();
@@ -814,7 +828,7 @@ mod tests {
 
         // Create a table - version should increment
         let table = make_test_table(&catalog, "users");
-        catalog.create_table(table).unwrap();
+        catalog.create_table(table).await.unwrap();
         let after_create = catalog.current_schema_version();
         assert_eq!(
             after_create,
@@ -823,7 +837,7 @@ mod tests {
         );
 
         // Drop a table - version should increment again
-        catalog.drop_table("default", "users").unwrap();
+        catalog.drop_table("default", "users").await.unwrap();
         let after_drop = catalog.current_schema_version();
         assert_eq!(
             after_drop,
@@ -832,7 +846,7 @@ mod tests {
         );
 
         // Create schema - version should increment
-        catalog.create_schema("test_schema").unwrap();
+        catalog.create_schema("test_schema").await.unwrap();
         let after_schema = catalog.current_schema_version();
         assert_eq!(
             after_schema,
@@ -865,13 +879,13 @@ mod tests {
             ));
 
             let catalog = MvccCatalog::new(txn_service);
-            catalog.bootstrap().unwrap();
+            catalog.bootstrap().await.unwrap();
 
             // Create some tables to increment version
             let table = make_test_table(&catalog, "t1");
-            catalog.create_table(table).unwrap();
+            catalog.create_table(table).await.unwrap();
             let table = make_test_table(&catalog, "t2");
-            catalog.create_table(table).unwrap();
+            catalog.create_table(table).await.unwrap();
 
             initial_version = catalog.current_schema_version();
             assert!(
@@ -912,7 +926,7 @@ mod tests {
 
             // Creating another table should continue from the recovered version
             let table = make_test_table(&catalog, "t3");
-            catalog.create_table(table).unwrap();
+            catalog.create_table(table).await.unwrap();
             assert_eq!(
                 catalog.current_schema_version(),
                 initial_version + 1,
@@ -923,7 +937,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_bootstrap_creates_inner_tables_in_cache() {
-        let (catalog, _dir) = create_test_catalog();
+        let (catalog, _dir) = create_test_catalog_bootstrapped().await;
 
         // Inner tables should be in cache but hidden from list_schemas
         let schemas = catalog.list_schemas().unwrap();

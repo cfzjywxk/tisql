@@ -48,7 +48,7 @@ fn put_at(engine: &VersionedMemTableEngine, key: &[u8], value: &[u8], ts: Timest
 }
 
 /// Get the latest version of a key visible at the given timestamp.
-fn get_at(engine: &VersionedMemTableEngine, key: &[u8], ts: Timestamp) -> Option<RawValue> {
+async fn get_at(engine: &VersionedMemTableEngine, key: &[u8], ts: Timestamp) -> Option<RawValue> {
     let start = MvccKey::encode(key, ts);
     let end = MvccKey::encode(key, 0)
         .next_key()
@@ -57,7 +57,7 @@ fn get_at(engine: &VersionedMemTableEngine, key: &[u8], ts: Timestamp) -> Option
 
     let inner = engine.inner_arc();
     let mut iter = ArcVersionedMemTableIterator::new(inner, range, 0);
-    tisql::io::block_on_sync(iter.advance()).unwrap();
+    iter.advance().await.unwrap();
 
     while iter.valid() {
         if iter.user_key() == key && iter.timestamp() <= ts {
@@ -67,14 +67,14 @@ fn get_at(engine: &VersionedMemTableEngine, key: &[u8], ts: Timestamp) -> Option
             }
             return Some(value);
         }
-        tisql::io::block_on_sync(iter.advance()).unwrap();
+        iter.advance().await.unwrap();
     }
     None
 }
 
 /// Get the latest version of a key.
-fn get(engine: &VersionedMemTableEngine, key: &[u8]) -> Option<RawValue> {
-    get_at(engine, key, Timestamp::MAX)
+async fn get(engine: &VersionedMemTableEngine, key: &[u8]) -> Option<RawValue> {
+    get_at(engine, key, Timestamp::MAX).await
 }
 
 // ============================================================================
@@ -87,8 +87,8 @@ fn get(engine: &VersionedMemTableEngine, key: &[u8]) -> Option<RawValue> {
 /// - Memory doesn't grow excessively
 /// - Point lookups remain fast even with deep version chains
 /// - Scanning works correctly
-#[test]
-fn test_single_key_many_versions() {
+#[tokio::test]
+async fn test_single_key_many_versions() {
     let engine = VersionedMemTableEngine::new();
     let num_versions = 10_000;
 
@@ -110,7 +110,7 @@ fn test_single_key_many_versions() {
     // Verify point reads at various timestamps are fast
     let start = Instant::now();
     for ts in [1, 100, 1000, 5000, 10000] {
-        let value = get_at(&engine, b"hot_key", ts);
+        let value = get_at(&engine, b"hot_key", ts).await;
         let expected = format!("version_{ts:06}");
         assert_eq!(value, Some(expected.into_bytes()));
     }
@@ -121,7 +121,7 @@ fn test_single_key_many_versions() {
     );
 
     // Verify latest read
-    let latest = get(&engine, b"hot_key");
+    let latest = get(&engine, b"hot_key").await;
     assert_eq!(
         latest,
         Some(format!("version_{num_versions:06}").into_bytes())
@@ -134,8 +134,8 @@ fn test_single_key_many_versions() {
 /// - Memory scales linearly with key count
 /// - Iteration order is maintained
 /// - Random access remains O(log n)
-#[test]
-fn test_many_unique_keys() {
+#[tokio::test]
+async fn test_many_unique_keys() {
     let engine = VersionedMemTableEngine::new();
     let num_keys = 100_000;
 
@@ -154,7 +154,7 @@ fn test_many_unique_keys() {
     let test_indices = [0, 1000, 10_000, 50_000, 99_999];
     for &i in &test_indices {
         let key = format!("key_{i:08}");
-        let value = get(&engine, key.as_bytes());
+        let value = get(&engine, key.as_bytes()).await;
         let expected = format!("value_{i}");
         assert_eq!(value, Some(expected.into_bytes()));
     }
@@ -168,13 +168,13 @@ fn test_many_unique_keys() {
     let range = Arc::new(MvccKey::unbounded()..MvccKey::unbounded());
     let inner = engine.inner_arc();
     let mut iter = ArcVersionedMemTableIterator::new(inner, range, 0);
-    tisql::io::block_on_sync(iter.advance()).unwrap();
+    iter.advance().await.unwrap();
 
     let mut count = 0;
     while iter.valid() && count < 100 {
         let expected_key = format!("key_{count:08}");
         assert_eq!(iter.user_key(), expected_key.as_bytes());
-        tisql::io::block_on_sync(iter.advance()).unwrap();
+        iter.advance().await.unwrap();
         count += 1;
     }
     assert_eq!(count, 100);
@@ -184,8 +184,8 @@ fn test_many_unique_keys() {
 ///
 /// Verifies that large values don't cause issues with memory management
 /// or value retrieval.
-#[test]
-fn test_large_values() {
+#[tokio::test]
+async fn test_large_values() {
     let engine = VersionedMemTableEngine::new();
     let num_entries = 10;
     let value_size = 1024 * 1024; // 1MB
@@ -201,7 +201,7 @@ fn test_large_values() {
     // Verify each value
     for i in 0..num_entries {
         let key = format!("large_key_{i}");
-        let value = get(&engine, key.as_bytes());
+        let value = get(&engine, key.as_bytes()).await;
         assert!(value.is_some());
         let v = value.unwrap();
         assert_eq!(v.len(), value_size);
@@ -210,8 +210,8 @@ fn test_large_values() {
 }
 
 /// Test mixed key sizes and value sizes.
-#[test]
-fn test_mixed_sizes() {
+#[tokio::test]
+async fn test_mixed_sizes() {
     let engine = VersionedMemTableEngine::new();
 
     // Empty key and value
@@ -233,10 +233,10 @@ fn test_mixed_sizes() {
     assert_eq!(engine.len(), 4);
 
     // Verify all entries
-    assert_eq!(get(&engine, b""), Some(vec![]));
-    assert_eq!(get(&engine, b"s"), Some(large_value));
-    assert_eq!(get(&engine, &large_key), Some(b"v".to_vec()));
-    assert_eq!(get(&engine, &large_key2), Some(large_value2));
+    assert_eq!(get(&engine, b"").await, Some(vec![]));
+    assert_eq!(get(&engine, b"s").await, Some(large_value));
+    assert_eq!(get(&engine, &large_key).await, Some(b"v".to_vec()));
+    assert_eq!(get(&engine, &large_key2).await, Some(large_value2));
 }
 
 // ============================================================================
@@ -249,8 +249,8 @@ fn test_mixed_sizes() {
 /// - No data loss under heavy concurrent writes
 /// - No panics or deadlocks
 /// - All written data is readable
-#[test]
-fn test_sustained_concurrent_writes() {
+#[tokio::test]
+async fn test_sustained_concurrent_writes() {
     let engine = Arc::new(VersionedMemTableEngine::new());
     let num_threads = 8;
     let writes_per_thread = 10_000;
@@ -287,7 +287,7 @@ fn test_sustained_concurrent_writes() {
     for thread_id in 0..num_threads {
         for i in [0, writes_per_thread / 2, writes_per_thread - 1] {
             let key = format!("t{thread_id}_k{i:06}");
-            let value = get(&engine, key.as_bytes());
+            let value = get(&engine, key.as_bytes()).await;
             assert!(value.is_some(), "Key {key} should exist");
         }
     }
@@ -299,8 +299,8 @@ fn test_sustained_concurrent_writes() {
 /// Note: The memtable requires versions to be inserted in ascending timestamp order.
 /// To test concurrent CAS operations correctly, we use a mutex to ensure atomic
 /// get-timestamp-and-write operations, simulating proper transaction ordering.
-#[test]
-fn test_concurrent_writes_same_key() {
+#[tokio::test]
+async fn test_concurrent_writes_same_key() {
     use std::sync::Mutex;
 
     let engine = Arc::new(VersionedMemTableEngine::new());
@@ -348,7 +348,7 @@ fn test_concurrent_writes_same_key() {
 
     // Latest value should be the highest timestamp
     let latest_ts = *ts_and_write_lock.lock().unwrap() - 1;
-    let value = get(&engine, b"contended_key");
+    let value = get(&engine, b"contended_key").await;
     let expected = format!("v{latest_ts}");
     assert_eq!(value, Some(expected.into_bytes()));
 }
@@ -358,8 +358,8 @@ fn test_concurrent_writes_same_key() {
 /// Verifies MVCC correctness under concurrent access.
 /// Each writer writes to a disjoint set of unique keys (never updating existing keys)
 /// to avoid MVCC ordering violations.
-#[test]
-fn test_concurrent_reads_and_writes() {
+#[tokio::test]
+async fn test_concurrent_reads_and_writes() {
     let engine = Arc::new(VersionedMemTableEngine::new());
     let num_writers = 4;
     let num_readers = 8;
@@ -422,7 +422,7 @@ fn test_concurrent_reads_and_writes() {
                 for offset in 0..10 {
                     let key_idx = (reader_id * 100 + offset) % 1000;
                     let key = format!("read_key_{key_idx:04}");
-                    match get(&engine, key.as_bytes()) {
+                    match tisql::io::block_on_sync(get(&engine, key.as_bytes())) {
                         Some(_) => local_reads += 1,
                         None => local_errors += 1, // Should never happen
                     }
@@ -452,8 +452,8 @@ fn test_concurrent_reads_and_writes() {
 }
 
 /// Stress test with very high thread count.
-#[test]
-fn test_high_thread_count() {
+#[tokio::test]
+async fn test_high_thread_count() {
     let engine = Arc::new(VersionedMemTableEngine::new());
     let num_threads = 64;
     let writes_per_thread = 100;
@@ -492,9 +492,9 @@ fn test_high_thread_count() {
 /// Extended stress test running for 30 seconds.
 ///
 /// Run with: cargo test --test memtable_stress_test -- --ignored test_extended_stress
-#[test]
+#[tokio::test]
 #[ignore]
-fn test_extended_stress() {
+async fn test_extended_stress() {
     let engine = Arc::new(VersionedMemTableEngine::new());
     let num_writers = 8;
     let num_readers = 16;
@@ -566,7 +566,7 @@ fn test_extended_stress() {
                     _ => format!("nonexistent_{}", rng_state % 1000),
                 };
 
-                let _ = get(&engine, key.as_bytes());
+                let _ = tokio::runtime::Handle::current().block_on(get(&engine, key.as_bytes()));
                 local_reads += 1;
 
                 if local_reads % 1000 == 0 {
@@ -603,9 +603,9 @@ fn test_extended_stress() {
 /// Memory pressure test with continuous allocation.
 ///
 /// Run with: cargo test --test memtable_stress_test -- --ignored test_memory_pressure
-#[test]
+#[tokio::test]
 #[ignore]
-fn test_memory_pressure() {
+async fn test_memory_pressure() {
     let engine = Arc::new(VersionedMemTableEngine::new());
     let num_threads: usize = 4;
     let target_entries: usize = 1_000_000;
@@ -672,7 +672,7 @@ fn test_memory_pressure() {
         let thread_id = sample / entries_per_thread;
         let local_idx = sample % entries_per_thread;
         let key = format!("mem_t{thread_id}_k{local_idx:08}");
-        let result = get(&engine, key.as_bytes());
+        let result = get(&engine, key.as_bytes()).await;
         assert!(result.is_some(), "Key {key} should exist");
     }
 }

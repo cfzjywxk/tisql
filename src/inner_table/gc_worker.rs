@@ -105,7 +105,7 @@ impl<T: TxnService + 'static> GcWorkerInner<T> {
         tracing::info!("GC worker started (async)");
 
         while !self.shutdown.load(Ordering::Relaxed) {
-            self.process_gc_tasks();
+            self.process_gc_tasks().await;
 
             tokio::select! {
                 _ = self.notify.notified() => {}
@@ -117,7 +117,7 @@ impl<T: TxnService + 'static> GcWorkerInner<T> {
     }
 
     /// Process all pending GC tasks.
-    fn process_gc_tasks(&self) {
+    async fn process_gc_tasks(&self) {
         // Proactive step 1: Remove obsolete SSTs (direct deletion, no compaction I/O)
         match self.engine.remove_obsolete_dropped_table_ssts() {
             Ok(count) if count > 0 => {
@@ -166,7 +166,7 @@ impl<T: TxnService + 'static> GcWorkerInner<T> {
             }
 
             // No overlap — mark task done
-            if let Err(e) = self.mark_task_done(&task) {
+            if let Err(e) = self.mark_task_done(&task).await {
                 tracing::warn!("GC worker: failed to mark task {} done: {e}", task.task_id);
                 continue;
             }
@@ -209,7 +209,7 @@ impl<T: TxnService + 'static> GcWorkerInner<T> {
     }
 
     /// Mark a GC task as 'done' in the inner table.
-    fn mark_task_done(&self, task: &GcTask) -> crate::error::Result<()> {
+    async fn mark_task_done(&self, task: &GcTask) -> crate::error::Result<()> {
         let mut ctx = self.txn_service.begin(false)?;
         update_gc_task_status(
             &mut ctx,
@@ -220,8 +220,8 @@ impl<T: TxnService + 'static> GcWorkerInner<T> {
             &task.end_key_hex,
             task.drop_commit_ts,
             "done",
-        )?;
-        crate::io::block_on_sync(self.txn_service.commit(ctx))?;
+        ).await?;
+        self.txn_service.commit(ctx).await?;
         Ok(())
     }
 }
