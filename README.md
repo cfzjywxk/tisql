@@ -8,13 +8,14 @@ A minimal SQL database in Rust with MySQL protocol support, designed for learnin
 ## Features
 
 - **MySQL Protocol**: Connect using any MySQL client
-- **SQL Support**: CREATE, INSERT, SELECT, UPDATE, DELETE with explicit transactions (BEGIN/COMMIT/ROLLBACK)
-- **MVCC**: Snapshot isolation with TiDB-compatible key encoding
+- **SQL Support**: CREATE, DROP, INSERT, SELECT, UPDATE, DELETE with explicit transactions (BEGIN/COMMIT/ROLLBACK)
+- **MVCC**: Snapshot isolation with TiDB-compatible key encoding, GC during compaction
 - **Streaming Execution**: Volcano-style operator tree with end-to-end row streaming (zero materialization)
 - **Async I/O**: io_uring for SST reads (O_DIRECT, positional reads), async iterator pipeline
 - **Durability**: LSM-tree storage with WAL (commit log), group commit for batched fsync
 - **Concurrency**: OceanBase-style pessimistic locking with pending version nodes
 - **Recovery**: Crash-safe with coordinated clog/ilog recovery
+- **Drop Table GC**: Background worker with SST-level optimizations (read-path skip, proactive SST deletion, compaction priority boost)
 
 ## Quick Start
 
@@ -104,9 +105,10 @@ cargo test --test concurrency_test --features failpoints
 ```
 src/
 ├── lib.rs           # Public API: Database, traits
-├── catalog/         # Table metadata (MVCC-based)
+├── catalog/         # Table metadata (MVCC-based, inner-table-backed)
 ├── codec/           # TiDB-compatible key encoding
 ├── clog/            # Commit log (WAL) with group commit
+├── inner_table/     # System tables, bootstrap, catalog cache, GC worker
 ├── executor/        # Volcano-style operator tree (streaming)
 ├── io/              # io_uring async I/O (O_DIRECT, AlignedBuf, DmaFile)
 ├── protocol/        # MySQL wire protocol (thin I/O shell)
