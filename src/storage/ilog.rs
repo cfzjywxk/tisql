@@ -56,7 +56,7 @@ use serde::{Deserialize, Serialize};
 use crate::error::{Result, TiSqlError};
 use crate::lsn::SharedLsnProvider;
 use crate::types::Lsn;
-use crate::util::fs::{create_dir_durable, sync_dir};
+use crate::util::fs::{create_dir_durable, rename_durable, sync_dir};
 use crate::{log_info, log_trace, log_warn};
 
 use super::sstable::SstMeta;
@@ -234,6 +234,12 @@ struct PendingOps {
     compact_intents: Vec<Vec<u64>>,
 }
 
+/// Group writer runtime mode for recreating writer after ilog rewrite.
+enum GroupWriterMode {
+    Tokio(tokio::runtime::Handle),
+    Thread,
+}
+
 /// Index log service for SST metadata persistence.
 pub struct IlogService {
     config: IlogConfig,
@@ -244,10 +250,25 @@ pub struct IlogService {
     /// Wrapped in Mutex so the writer can be replaced if needed.
     /// The mutex is only held briefly to call `submit()` (channel send).
     group_writer: Mutex<crate::clog::GroupCommitWriter>,
+    /// Group writer runtime mode (tokio handle or std::thread fallback).
+    writer_mode: GroupWriterMode,
     /// Number of records since last checkpoint
     records_since_checkpoint: AtomicU64,
     /// Last checkpoint sequence
     last_checkpoint_seq: AtomicU64,
+}
+
+/// Statistics returned from ilog truncation.
+#[derive(Debug, Default)]
+pub struct IlogTruncateStats {
+    /// Number of records removed
+    pub records_removed: usize,
+    /// Number of records kept
+    pub records_kept: usize,
+    /// Bytes freed
+    pub bytes_freed: u64,
+    /// New file size
+    pub new_file_size: u64,
 }
 
 impl IlogService {
@@ -323,6 +344,7 @@ impl IlogService {
             config,
             lsn_provider,
             group_writer: Mutex::new(group_writer),
+            writer_mode: GroupWriterMode::Tokio(io_handle.clone()),
             records_since_checkpoint: AtomicU64::new(0),
             last_checkpoint_seq: AtomicU64::new(0),
         })
@@ -491,6 +513,84 @@ impl IlogService {
         self.wait_for_reply(rx)
     }
 
+    /// Truncate ilog records with lsn < min_keep_lsn.
+    ///
+    /// Keeps only records at or after `min_keep_lsn` by rewriting the ilog
+    /// file and durably replacing the old file.
+    pub fn truncate_before(&self, min_keep_lsn: Lsn) -> Result<IlogTruncateStats> {
+        // Serialize with append path and drain already-submitted writes.
+        let mut group_writer = self.group_writer.lock();
+        let barrier_rx = group_writer
+            .submit(Vec::new(), true)
+            .map_err(|e| TiSqlError::Internal(format!("Ilog group commit sync failed: {e}")))?;
+        self.wait_for_reply(barrier_rx)?;
+
+        let ilog_path = self.config.ilog_path();
+        let old_size = std::fs::metadata(&ilog_path).map(|m| m.len()).unwrap_or(0);
+
+        // Safe to read now: no concurrent appends and prior appends are durable.
+        let records = self.read_all_records()?;
+        let (to_keep, to_remove): (Vec<_>, Vec<_>) = records
+            .into_iter()
+            .partition(|record| record.lsn() >= min_keep_lsn);
+
+        if to_remove.is_empty() {
+            return Ok(IlogTruncateStats {
+                records_removed: 0,
+                records_kept: to_keep.len(),
+                bytes_freed: 0,
+                new_file_size: old_size,
+            });
+        }
+
+        // Rewrite kept records into a temp file.
+        let temp_path = ilog_path.with_extension("ilog.tmp");
+        {
+            let temp_file = OpenOptions::new()
+                .write(true)
+                .create(true)
+                .truncate(true)
+                .open(&temp_path)?;
+            let mut temp_writer = BufWriter::new(temp_file);
+            Self::write_header(&mut temp_writer)?;
+            for record in &to_keep {
+                let framed = Self::encode_record(record)?;
+                temp_writer.write_all(&framed)?;
+            }
+            temp_writer.flush()?;
+            temp_writer.get_ref().sync_data()?;
+        }
+
+        rename_durable(&temp_path, &ilog_path)?;
+
+        // Reopen append writer and swap group writer.
+        let mut file_for_write = OpenOptions::new().read(true).write(true).open(&ilog_path)?;
+        file_for_write.seek(SeekFrom::End(0))?;
+        *group_writer = self.create_group_writer(BufWriter::new(file_for_write));
+
+        let new_size = std::fs::metadata(&ilog_path).map(|m| m.len()).unwrap_or(0);
+        log_info!(
+            "Truncated ilog before min_keep_lsn={}: removed {} records, kept {}",
+            min_keep_lsn,
+            to_remove.len(),
+            to_keep.len()
+        );
+
+        Ok(IlogTruncateStats {
+            records_removed: to_remove.len(),
+            records_kept: to_keep.len(),
+            bytes_freed: old_size.saturating_sub(new_size),
+            new_file_size: new_size,
+        })
+    }
+
+    /// Get the ilog file size in bytes.
+    pub fn file_size(&self) -> Result<u64> {
+        let ilog_path = self.config.ilog_path();
+        let metadata = std::fs::metadata(&ilog_path)?;
+        Ok(metadata.len())
+    }
+
     /// Clean up orphan SST files.
     ///
     /// Removes SST files that are not in the Version and were from incomplete operations.
@@ -611,6 +711,7 @@ impl IlogService {
             config,
             lsn_provider,
             group_writer: Mutex::new(group_writer),
+            writer_mode: GroupWriterMode::Thread,
             records_since_checkpoint: AtomicU64::new(0),
             last_checkpoint_seq: AtomicU64::new(0),
         })
@@ -659,28 +760,23 @@ impl IlogService {
 
     // ========== Private methods ==========
 
-    fn write_record(&self, record: &IlogRecord) -> Result<()> {
-        let data = bincode::serialize(record)
-            .map_err(|e| TiSqlError::Internal(format!("Failed to serialize ilog record: {e}")))?;
-
-        // Validate record size to prevent writing records that can't be read back
-        if data.len() > MAX_RECORD_SIZE {
-            return Err(TiSqlError::Internal(format!(
-                "Record size {} exceeds maximum allowed size {}",
-                data.len(),
-                MAX_RECORD_SIZE
-            )));
+    fn create_group_writer(&self, writer: BufWriter<File>) -> crate::clog::GroupCommitWriter {
+        match &self.writer_mode {
+            GroupWriterMode::Tokio(handle) => crate::clog::GroupCommitWriter::new(writer, handle),
+            GroupWriterMode::Thread => crate::clog::GroupCommitWriter::new_with_thread(writer),
         }
+    }
 
-        let checksum = crc32(&data);
+    fn read_all_records(&self) -> Result<Vec<IlogRecord>> {
+        let ilog_path = self.config.ilog_path();
+        let file = File::open(&ilog_path)?;
+        let mut reader = BufReader::new(file);
+        Self::validate_header(&mut reader)?;
+        Self::read_records(&mut reader)
+    }
 
-        // Build framed record: header (type + length + checksum) + data
-        let record_type: u32 = 1; // Entry record
-        let mut buf = Vec::with_capacity(RECORD_HEADER_SIZE + data.len());
-        buf.extend_from_slice(&record_type.to_le_bytes());
-        buf.extend_from_slice(&(data.len() as u32).to_le_bytes());
-        buf.extend_from_slice(&checksum.to_le_bytes());
-        buf.extend_from_slice(&data);
+    fn write_record(&self, record: &IlogRecord) -> Result<()> {
+        let buf = Self::encode_record(record)?;
 
         // Submit to group commit writer (batches fsync with concurrent writers)
         let rx = self
@@ -697,6 +793,28 @@ impl IlogService {
         self.records_since_checkpoint.fetch_add(1, Ordering::SeqCst);
 
         Ok(())
+    }
+
+    fn encode_record(record: &IlogRecord) -> Result<Vec<u8>> {
+        let data = bincode::serialize(record)
+            .map_err(|e| TiSqlError::Internal(format!("Failed to serialize ilog record: {e}")))?;
+
+        if data.len() > MAX_RECORD_SIZE {
+            return Err(TiSqlError::Internal(format!(
+                "Record size {} exceeds maximum allowed size {}",
+                data.len(),
+                MAX_RECORD_SIZE
+            )));
+        }
+
+        let checksum = crc32(&data);
+        let record_type: u32 = 1;
+        let mut buf = Vec::with_capacity(RECORD_HEADER_SIZE + data.len());
+        buf.extend_from_slice(&record_type.to_le_bytes());
+        buf.extend_from_slice(&(data.len() as u32).to_le_bytes());
+        buf.extend_from_slice(&checksum.to_le_bytes());
+        buf.extend_from_slice(&data);
+        Ok(buf)
     }
 
     /// Wait for group commit reply. Uses `.await` in async context,
@@ -1226,6 +1344,103 @@ mod tests {
         }
 
         assert!(service.needs_checkpoint());
+    }
+
+    #[tokio::test]
+    async fn test_ilog_truncate_before_none() {
+        let tmp = TempDir::new().unwrap();
+        let config = test_config(tmp.path());
+        let lsn_provider = new_lsn_provider();
+        let io_handle = tokio::runtime::Handle::current();
+
+        let service =
+            IlogService::open(config.clone(), Arc::clone(&lsn_provider), &io_handle).unwrap();
+        service.write_flush_intent(1, 100, 50).unwrap();
+        service.write_flush_commit(test_sst_meta(1, 0), 50).unwrap();
+        service.sync().unwrap();
+
+        let old_size = service.file_size().unwrap();
+        let stats = service.truncate_before(1).unwrap();
+        assert_eq!(stats.records_removed, 0);
+        assert_eq!(stats.records_kept, 2);
+        assert_eq!(stats.bytes_freed, 0);
+        assert_eq!(stats.new_file_size, old_size);
+
+        let lsn_provider2 = new_lsn_provider();
+        let (_, version, orphans) =
+            IlogService::recover(config, lsn_provider2, &io_handle).unwrap();
+        assert!(orphans.is_empty());
+        assert_eq!(version.level_size(0), 1);
+    }
+
+    #[tokio::test]
+    async fn test_ilog_truncate_before_all_older() {
+        let tmp = TempDir::new().unwrap();
+        let config = test_config(tmp.path());
+        let lsn_provider = new_lsn_provider();
+        let io_handle = tokio::runtime::Handle::current();
+
+        let service =
+            IlogService::open(config.clone(), Arc::clone(&lsn_provider), &io_handle).unwrap();
+        service.write_flush_intent(1, 100, 50).unwrap();
+        service.write_flush_commit(test_sst_meta(1, 0), 50).unwrap();
+        service.write_flush_intent(2, 101, 100).unwrap();
+        service
+            .write_flush_commit(test_sst_meta(2, 0), 100)
+            .unwrap();
+        service.sync().unwrap();
+
+        let stats = service.truncate_before(10).unwrap();
+        assert_eq!(stats.records_removed, 4);
+        assert_eq!(stats.records_kept, 0);
+        assert_eq!(stats.new_file_size, FILE_HEADER_SIZE as u64);
+
+        let lsn_provider2 = new_lsn_provider();
+        let (_, version, orphans) =
+            IlogService::recover(config, lsn_provider2, &io_handle).unwrap();
+        assert!(orphans.is_empty());
+        assert_eq!(version.level_size(0), 0);
+    }
+
+    #[tokio::test]
+    async fn test_ilog_truncate_before_then_append_continuity() {
+        let tmp = TempDir::new().unwrap();
+        let config = test_config(tmp.path());
+        let lsn_provider = new_lsn_provider();
+        let io_handle = tokio::runtime::Handle::current();
+
+        let service =
+            IlogService::open(config.clone(), Arc::clone(&lsn_provider), &io_handle).unwrap();
+
+        service.write_flush_intent(1, 100, 50).unwrap();
+        service.write_flush_commit(test_sst_meta(1, 0), 50).unwrap();
+        let keep_from_lsn = service.write_flush_intent(2, 101, 100).unwrap();
+        service
+            .write_flush_commit(test_sst_meta(2, 0), 100)
+            .unwrap();
+        service.sync().unwrap();
+
+        let stats = service.truncate_before(keep_from_lsn).unwrap();
+        assert_eq!(stats.records_removed, 2);
+        assert_eq!(stats.records_kept, 2);
+
+        let new_lsn = service.write_flush_intent(3, 102, 150).unwrap();
+        service
+            .write_flush_commit(test_sst_meta(3, 0), 150)
+            .unwrap();
+        service.sync().unwrap();
+        assert!(
+            new_lsn > 4,
+            "new writes should continue with higher lsn after truncation"
+        );
+
+        let lsn_provider2 = new_lsn_provider();
+        let (_, version, orphans) =
+            IlogService::recover(config, lsn_provider2, &io_handle).unwrap();
+        assert!(orphans.is_empty());
+        assert!(!version.has_sst(1));
+        assert!(version.has_sst(2));
+        assert!(version.has_sst(3));
     }
 
     #[test]

@@ -106,7 +106,7 @@ pub use compaction_scheduler::CompactionScheduler;
 pub use compaction::{CompactionExecutor, CompactionPicker, CompactionTask, MergeIterator};
 
 // Re-export ilog types
-pub use ilog::{IlogConfig, IlogRecord, IlogService, VersionSnapshot};
+pub use ilog::{IlogConfig, IlogRecord, IlogService, IlogTruncateStats, VersionSnapshot};
 
 // Re-export recovery types
 pub use recovery::{LsmRecovery, RecoveryResult, RecoveryStats};

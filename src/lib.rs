@@ -85,9 +85,9 @@ pub mod testkit {
     // LSM storage engine for testing
     pub use crate::storage::{
         CompactionExecutor, CompactionPicker, CompactionScheduler, CompactionTask, IlogConfig,
-        IlogService, LsmConfig, LsmConfigBuilder, LsmEngine, LsmRecovery, LsmStats, ManifestDelta,
-        MemTable, RecoveryResult, SstBuilder, SstBuilderOptions, SstIterator, SstMeta, SstReader,
-        SstReaderRef, Version,
+        IlogService, IlogTruncateStats, LsmConfig, LsmConfigBuilder, LsmEngine, LsmRecovery,
+        LsmStats, ManifestDelta, MemTable, RecoveryResult, SstBuilder, SstBuilderOptions,
+        SstIterator, SstMeta, SstReader, SstReaderRef, Version,
     };
 
     // Re-export FlushScheduler for testing
@@ -162,14 +162,16 @@ pub mod testkit {
 
 // Internal imports (not re-exported)
 use catalog::MvccCatalog;
-use clog::FileClogService;
+use clog::{FileClogService, TruncateStats};
 use error::Result;
 use executor::{ExecutionOutput, ExecutionResult, Executor, SimpleExecutor};
 use sql::{Binder, Parser};
-use storage::{CompactionScheduler, FlushScheduler, IlogService, LsmEngine, LsmRecovery};
+use storage::{
+    CompactionScheduler, FlushScheduler, IlogService, IlogTruncateStats, LsmEngine, LsmRecovery,
+};
 use transaction::{ConcurrencyManager, TransactionService};
 use tso::LocalTso;
-use types::Value;
+use types::{Lsn, Value};
 use util::Timer;
 
 use std::path::PathBuf;
@@ -339,6 +341,19 @@ pub struct Database {
     io_runtime: Option<tokio::runtime::Runtime>,
     /// Registry of active explicit transactions for GC safe point computation.
     session_registry: Arc<session::SessionRegistry>,
+}
+
+/// One-shot log GC statistics.
+#[derive(Debug, Default)]
+pub struct LogGcStats {
+    /// `Version.flushed_lsn` snapshot used as clog reclaim boundary.
+    pub flushed_lsn: Lsn,
+    /// Checkpoint LSN written in this GC cycle.
+    pub checkpoint_lsn: Lsn,
+    /// Clog truncation result.
+    pub clog: TruncateStats,
+    /// Ilog truncation result.
+    pub ilog: IlogTruncateStats,
 }
 
 impl Database {
@@ -739,6 +754,25 @@ impl Database {
         self.txn_service.rollback(ctx)
     }
 
+    /// Run one log GC cycle:
+    /// 1) checkpoint ilog
+    /// 2) truncate clog up to flushed_lsn
+    /// 3) truncate ilog before checkpoint_lsn
+    pub fn run_log_gc_once(&self) -> Result<LogGcStats> {
+        let version = self.storage.current_version();
+        let flushed_lsn = version.flushed_lsn();
+        let checkpoint_lsn = self.ilog.write_checkpoint(version.as_ref())?;
+        let clog = self.txn_service.clog_service().truncate_to(flushed_lsn)?;
+        let ilog = self.ilog.truncate_before(checkpoint_lsn)?;
+
+        Ok(LogGcStats {
+            flushed_lsn,
+            checkpoint_lsn,
+            clog,
+            ilog,
+        })
+    }
+
     // ========================================================================
     // Unified Query Execution (for Worker Pool)
     // ========================================================================
@@ -1101,6 +1135,76 @@ mod tests {
             status, "pending",
             "GC task should stay pending while dropped-table keys are still in memtables"
         );
+    }
+
+    #[tokio::test]
+    async fn test_run_log_gc_once_reclaims_logs_and_recovers() {
+        use crate::clog::{ClogBatch, ClogEntry, ClogOp, ClogService};
+        use crate::storage::WriteBatch;
+
+        let dir = tempdir().unwrap();
+        let config = DatabaseConfig::with_data_dir(dir.path());
+
+        let db = Database::open(config.clone()).unwrap();
+
+        // Write one durable clog entry and apply it to storage with the same LSN
+        // so flushed_lsn can advance past this boundary.
+        let key = b"log_gc_key".to_vec();
+        let value = b"log_gc_value".to_vec();
+        let mut clog_batch = ClogBatch::new();
+        clog_batch.add(ClogEntry {
+            lsn: 0,
+            txn_id: 42,
+            op: ClogOp::Put {
+                key: key.clone(),
+                value: value.clone(),
+            },
+        });
+        let lsn = db
+            .txn_service
+            .clog_service()
+            .write(&mut clog_batch, true)
+            .unwrap()
+            .await
+            .unwrap();
+
+        let mut write_batch = WriteBatch::new();
+        write_batch.put(key.clone(), value.clone());
+        write_batch.set_commit_ts(100);
+        write_batch.set_clog_lsn(lsn);
+        db.storage.write_batch(write_batch).unwrap();
+
+        // Ensure Version.flushed_lsn advances so clog truncation can reclaim records.
+        db.storage.flush_all_with_active().unwrap();
+        let flushed_lsn = db.storage.current_version().flushed_lsn();
+
+        let clog_size_before = db.txn_service.clog_service().file_size().unwrap();
+        let stats = db.run_log_gc_once().unwrap();
+
+        assert!(
+            stats.flushed_lsn >= lsn,
+            "log GC should use flushed_lsn that includes flushed clog entries"
+        );
+        assert_eq!(stats.flushed_lsn, flushed_lsn);
+        assert!(
+            stats.checkpoint_lsn >= stats.flushed_lsn,
+            "checkpoint lsn should not be older than flushed_lsn snapshot"
+        );
+        assert!(
+            stats.clog.entries_removed > 0,
+            "clog should reclaim entries after flush boundary advances"
+        );
+        assert_eq!(db.ilog.file_size().unwrap(), stats.ilog.new_file_size);
+        assert!(
+            db.txn_service.clog_service().file_size().unwrap() <= clog_size_before,
+            "clog file size should not grow after truncation"
+        );
+
+        db.close().await.unwrap();
+        drop(db);
+
+        let db2 = Database::open(config).unwrap();
+        assert_eq!(db2.storage.get(&key).await.unwrap(), Some(value));
     }
 
     #[tokio::test]
