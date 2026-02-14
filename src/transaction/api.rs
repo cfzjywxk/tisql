@@ -138,6 +138,11 @@ pub struct TxnCtx {
     /// Registration happens on first write (put/delete) for implicit txns,
     /// or at begin_explicit() for explicit txns.
     pub(crate) registered: bool,
+    /// Schema version captured when an explicit transaction starts.
+    ///
+    /// Used by the SQL layer to detect DDL changes before COMMIT.
+    /// `None` means schema checking is not enabled for this context.
+    pub(crate) schema_version: Option<u64>,
 }
 
 impl TxnCtx {
@@ -151,6 +156,7 @@ impl TxnCtx {
             explicit: false,
             mutations: BTreeMap::new(),
             registered: false,
+            schema_version: None,
         }
     }
 
@@ -167,6 +173,7 @@ impl TxnCtx {
             explicit: true,
             mutations: BTreeMap::new(),
             registered: false,
+            schema_version: None,
         }
     }
 
@@ -189,6 +196,7 @@ impl TxnCtx {
             explicit,
             mutations: BTreeMap::new(),
             registered: false,
+            schema_version: None,
         }
     }
 
@@ -229,6 +237,18 @@ impl TxnCtx {
     #[inline]
     pub fn state(&self) -> TxnState {
         self.state
+    }
+
+    /// Get schema version captured for this transaction, if any.
+    #[inline]
+    pub fn schema_version(&self) -> Option<u64> {
+        self.schema_version
+    }
+
+    /// Capture schema version for DDL/DML concurrency check at COMMIT.
+    #[inline]
+    pub(crate) fn set_schema_version(&mut self, version: u64) {
+        self.schema_version = Some(version);
     }
 }
 

@@ -2027,4 +2027,62 @@ mod explicit_transaction_tests {
 
         db.close().await.unwrap();
     }
+
+    /// Test explicit transaction commit fails if concurrent DDL changed schema.
+    #[tokio::test]
+    async fn test_explicit_commit_fails_on_schema_change() {
+        let dir = tempdir().unwrap();
+        let config = DatabaseConfig::with_data_dir(dir.path());
+        let db = Database::open(config).unwrap();
+        let mut s1 = Session::new();
+        let mut s2 = Session::new();
+
+        db.handle_mp_query("CREATE TABLE schema_guard_t (id INT PRIMARY KEY, v INT)")
+            .await
+            .unwrap();
+
+        db.handle_mp_query_with_session_mut("BEGIN", &mut s1)
+            .await
+            .unwrap();
+        db.handle_mp_query_with_session_mut("INSERT INTO schema_guard_t VALUES (1, 10)", &mut s1)
+            .await
+            .unwrap();
+
+        // Concurrent DDL from another session bumps schema version.
+        db.handle_mp_query_with_session_mut(
+            "CREATE TABLE schema_guard_other (id INT PRIMARY KEY)",
+            &mut s2,
+        )
+        .await
+        .unwrap();
+
+        let err = db
+            .handle_mp_query_with_session_mut("COMMIT", &mut s1)
+            .await
+            .unwrap_err();
+        assert!(
+            err.to_string().to_lowercase().contains("schema changed"),
+            "Expected SchemaChanged error, got: {err}"
+        );
+
+        // COMMIT failure should clear explicit transaction state.
+        assert!(
+            !s1.has_active_txn(),
+            "Session should not keep txn after schema-change commit failure"
+        );
+
+        // Write should have been rolled back.
+        match db
+            .handle_mp_query("SELECT id FROM schema_guard_t ORDER BY id")
+            .await
+            .unwrap()
+        {
+            QueryResult::Rows { data, .. } => {
+                assert!(data.is_empty(), "Write should be rolled back");
+            }
+            other => panic!("Expected rows, got: {other:?}"),
+        }
+
+        db.close().await.unwrap();
+    }
 }

@@ -851,7 +851,7 @@ impl Executor for SimpleExecutor {
         // Handle transaction control statements
         if plan.is_transaction_control() {
             return self
-                .execute_transaction_control(plan, txn_service, session)
+                .execute_transaction_control(plan, txn_service, catalog, session)
                 .await;
         }
 
@@ -903,12 +903,14 @@ impl Executor for SimpleExecutor {
                                 .into(),
                         ));
                     }
-                    let ctx = txn_service.begin_explicit(read_only)?;
+                    let mut ctx = txn_service.begin_explicit(read_only)?;
+                    ctx.set_schema_version(catalog.current_schema_version());
                     Ok((ExecutionOutput::Ok, Some(ctx)))
                 }
                 LogicalPlan::Commit => {
                     if let Some(ctx) = txn_ctx {
-                        txn_service.commit(ctx).await?;
+                        self.commit_with_schema_check(ctx, txn_service, catalog)
+                            .await?;
                     }
                     Ok((ExecutionOutput::Ok, None))
                 }
@@ -967,10 +969,11 @@ impl SimpleExecutor {
     // ========================================================================
 
     /// Execute transaction control statements (BEGIN, COMMIT, ROLLBACK).
-    async fn execute_transaction_control<T: TxnService>(
+    async fn execute_transaction_control<T: TxnService, C: Catalog>(
         &self,
         plan: LogicalPlan,
         txn_service: &T,
+        catalog: &C,
         session: &mut Session,
     ) -> Result<ExecutionResult> {
         match plan {
@@ -986,7 +989,8 @@ impl SimpleExecutor {
                 }
 
                 // Start an explicit transaction
-                let ctx = txn_service.begin_explicit(read_only)?;
+                let mut ctx = txn_service.begin_explicit(read_only)?;
+                ctx.set_schema_version(catalog.current_schema_version());
                 session.set_current_txn(ctx);
                 Ok(ExecutionResult::Ok)
             }
@@ -995,7 +999,8 @@ impl SimpleExecutor {
                 // Take the transaction from the session
                 if let Some(ctx) = session.take_current_txn() {
                     // Commit the transaction
-                    txn_service.commit(ctx).await?;
+                    self.commit_with_schema_check(ctx, txn_service, catalog)
+                        .await?;
                 }
                 // If no active transaction, COMMIT is a no-op (MySQL behavior)
                 Ok(ExecutionResult::Ok)
@@ -1015,6 +1020,30 @@ impl SimpleExecutor {
                 "Not a transaction control statement".into(),
             )),
         }
+    }
+
+    /// Commit explicit transaction with schema-version validation.
+    ///
+    /// Mirrors auto-commit write behavior: if schema changed after transaction
+    /// start and this transaction has pending writes, abort with SchemaChanged.
+    async fn commit_with_schema_check<T: TxnService, C: Catalog>(
+        &self,
+        ctx: TxnCtx,
+        txn_service: &T,
+        catalog: &C,
+    ) -> Result<()> {
+        if !ctx.mutations.is_empty() {
+            if let Some(schema_version_at_start) = ctx.schema_version() {
+                let schema_version_now = catalog.current_schema_version();
+                if schema_version_now != schema_version_at_start {
+                    txn_service.rollback(ctx)?;
+                    return Err(TiSqlError::SchemaChanged);
+                }
+            }
+        }
+
+        txn_service.commit(ctx).await?;
+        Ok(())
     }
 
     /// Execute a write operation within an existing explicit transaction.

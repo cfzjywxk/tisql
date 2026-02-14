@@ -207,6 +207,50 @@ async fn test_commit_persists_changes() {
     assert_eq!(rows[2], vec!["3", "300"]);
 }
 
+/// Test that COMMIT fails if concurrent DDL changed schema.
+#[tokio::test]
+async fn test_commit_fails_on_concurrent_ddl_schema_change() {
+    let ctx = TestContext::new().await;
+    let mut conn1 = ctx.conn().await;
+    let mut conn2 = ctx.conn().await;
+
+    exec(
+        &mut conn1,
+        "CREATE TABLE ddl_guard (id INT PRIMARY KEY, val INT)",
+    )
+    .await;
+
+    // Connection 1: explicit transaction with pending write
+    exec(&mut conn1, "BEGIN").await;
+    exec(&mut conn1, "INSERT INTO ddl_guard VALUES (1, 100)").await;
+
+    // Connection 2: concurrent DDL bumps schema version
+    exec(
+        &mut conn2,
+        "CREATE TABLE ddl_guard_other (id INT PRIMARY KEY)",
+    )
+    .await;
+
+    // COMMIT should fail with schema changed
+    let result = conn1.query_drop("COMMIT").await;
+    assert!(result.is_err(), "COMMIT should fail after concurrent DDL");
+    let err_msg = format!("{:?}", result.unwrap_err()).to_lowercase();
+    assert!(
+        err_msg.contains("schema changed") || err_msg.contains("please retry"),
+        "Error should indicate schema change, got: {err_msg}"
+    );
+
+    // Pending write should be rolled back.
+    let rows = query_all(&mut conn1, "SELECT id FROM ddl_guard ORDER BY id").await;
+    assert_eq!(rows.len(), 0, "Write should be rolled back");
+
+    // Session should be usable after failed COMMIT (txn cleared).
+    exec(&mut conn1, "INSERT INTO ddl_guard VALUES (2, 200)").await;
+    let rows = query_all(&mut conn1, "SELECT id FROM ddl_guard ORDER BY id").await;
+    assert_eq!(rows.len(), 1);
+    assert_eq!(rows[0][0], "2");
+}
+
 /// Test that ROLLBACK discards changes.
 #[tokio::test]
 async fn test_rollback_discards_changes() {
