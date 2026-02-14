@@ -28,6 +28,7 @@
 //! | block_size | 4 KB | Target data block size |
 //! | l0_compaction_trigger | 4 | L0 file count to trigger compaction |
 //! | level_size_multiplier | 10 | Size ratio between adjacent levels |
+//! | max_levels | 2 | Number of levels (L0 + L1 by default) |
 //!
 //! ## Example
 //!
@@ -63,6 +64,9 @@ pub const DEFAULT_L1_MAX_SIZE: usize = 256 * 1024 * 1024;
 
 /// Default target file size (64 MB).
 pub const DEFAULT_TARGET_FILE_SIZE: usize = 64 * 1024 * 1024;
+
+/// Default number of LSM levels (L0 + L1).
+pub const DEFAULT_MAX_LEVELS: usize = 2;
 
 /// LSM storage engine configuration.
 #[derive(Debug, Clone)]
@@ -174,7 +178,7 @@ impl LsmConfig {
             l0_stop_trigger: DEFAULT_L0_COMPACTION_TRIGGER * 3,
             level_size_multiplier: DEFAULT_LEVEL_SIZE_MULTIPLIER,
             l1_max_size: DEFAULT_L1_MAX_SIZE,
-            max_levels: 7,
+            max_levels: DEFAULT_MAX_LEVELS,
             compaction_threads: 2,
             flush_threads: 1,
             verify_checksums: true,
@@ -242,6 +246,9 @@ impl LsmConfig {
         }
         if self.level_size_multiplier < 2 {
             return Err("level_size_multiplier must be >= 2".to_string());
+        }
+        if self.max_levels < 2 {
+            return Err("max_levels must be >= 2 (L0 + L1)".to_string());
         }
         Ok(())
     }
@@ -387,6 +394,7 @@ mod tests {
         assert_eq!(config.max_frozen_memtables, DEFAULT_MAX_FROZEN_MEMTABLES);
         assert_eq!(config.block_size, DEFAULT_BLOCK_SIZE);
         assert_eq!(config.l0_compaction_trigger, DEFAULT_L0_COMPACTION_TRIGGER);
+        assert_eq!(config.max_levels, DEFAULT_MAX_LEVELS);
         assert!(config.validate().is_ok());
     }
 

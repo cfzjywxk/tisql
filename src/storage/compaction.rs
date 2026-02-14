@@ -799,6 +799,7 @@ mod tests {
             LsmConfig::builder(tmp.path())
                 .l0_compaction_trigger(4)
                 .l1_max_size(1000) // Very small to trigger compaction
+                .max_levels(3) // Enable L1 -> L2 compaction in this test
                 .build()
                 .unwrap(),
         );
@@ -821,6 +822,7 @@ mod tests {
             LsmConfig::builder(tmp.path())
                 .l0_compaction_trigger(4)
                 .l1_max_size(500) // Very small
+                .max_levels(3) // Enable L1 -> L2 compaction in this test
                 .build()
                 .unwrap(),
         );
@@ -1397,6 +1399,7 @@ mod tests {
                 .l0_slowdown_trigger(12) // Must be >= l0_compaction_trigger
                 .l0_stop_trigger(14) // Must be >= l0_slowdown_trigger
                 .l1_max_size(100) // Very small L1 to trigger compaction
+                .max_levels(3) // Enable L1 -> L2 compaction in this test
                 .build()
                 .unwrap(),
         );
@@ -1521,6 +1524,7 @@ mod tests {
                 .l0_slowdown_trigger(12)
                 .l0_stop_trigger(14)
                 .l1_max_size(2000) // L1 max = 2000 bytes
+                .max_levels(3) // Ensure L1 score is computed
                 .build()
                 .unwrap(),
         );
@@ -1550,6 +1554,7 @@ mod tests {
                 .l0_slowdown_trigger(12)
                 .l0_stop_trigger(14)
                 .l1_max_size(5000) // L1 max = 5000
+                .max_levels(4) // Ensure both L1 and L2 scores are computed
                 .build()
                 .unwrap(),
         );
