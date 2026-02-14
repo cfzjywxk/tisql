@@ -7,127 +7,157 @@ A minimal SQL database in Rust with MySQL protocol support, designed for learnin
 
 ## Features
 
-- **MySQL Protocol**: Connect using any MySQL client
-- **SQL Support**: CREATE, DROP, INSERT, SELECT, UPDATE, DELETE with explicit transactions (BEGIN/COMMIT/ROLLBACK)
-- **MVCC**: Snapshot isolation with TiDB-compatible key encoding, GC during compaction
-- **Streaming Execution**: Volcano-style operator tree with end-to-end row streaming (zero materialization)
-- **Async I/O**: io_uring for SST reads (O_DIRECT, positional reads), async iterator pipeline
-- **Durability**: LSM-tree storage with WAL (commit log), group commit for batched fsync
-- **Concurrency**: OceanBase-style pessimistic locking with pending version nodes
-- **Recovery**: Crash-safe with coordinated clog/ilog recovery
-- **Drop Table GC**: Background worker with SST-level optimizations (read-path skip, proactive SST deletion, compaction priority boost)
+- **MySQL protocol server** (`opensrv-mysql`), connect with standard MySQL clients
+- **SQL support**: `CREATE TABLE`, `DROP TABLE`, `INSERT`, `SELECT`, `UPDATE`, `DELETE`, `USE`, `SHOW`, `BEGIN/COMMIT/ROLLBACK`
+- **Explicit transactions** with snapshot reads, read-your-writes, and pessimistic lock conflict detection
+- **Streaming execution**: volcano-style operator tree, worker-to-protocol batched row streaming
+- **Storage engine**: LSM tree (`VersionedMemTableEngine` + SSTables) with background flush and compaction
+- **Durability & recovery**: commit log (WAL) + ilog with group commit and unified LSN ordering
+- **Async SST I/O**: `io_uring`-backed reads (`O_DIRECT`, positional read)
+- **Persistent catalog**: MVCC inner-table metadata with bootstrap and schema-version checks
+- **Drop-table GC**: background worker with read-path SST skip and proactive dropped-SST cleanup
+- **Runtime separation**: protocol/runtime work split across dedicated worker, background, and I/O runtimes
 
 ## Quick Start
 
 ```bash
-# Start the server
+# Start server
 cargo run
 
-# Connect using mysql client (in another terminal)
+# Connect from another terminal
 mysql -h127.0.0.1 -P4000 -uroot test
-
-# Example SQL
-CREATE TABLE users (id INT, name VARCHAR(100));
-INSERT INTO users VALUES (1, 'Alice'), (2, 'Bob');
-SELECT * FROM users;
-UPDATE users SET name = 'Charlie' WHERE id = 1;
-DELETE FROM users WHERE id = 2;
 ```
+
+```sql
+-- Built-in schemas: default, test
+SHOW DATABASES;
+
+CREATE TABLE users (
+  id INT PRIMARY KEY,
+  name VARCHAR(100),
+  age INT
+);
+
+INSERT INTO users VALUES (1, 'Alice', 25), (2, 'Bob', 30);
+
+BEGIN;
+UPDATE users SET age = age + 1 WHERE id = 1;
+COMMIT;
+
+SELECT id, name, age FROM users ORDER BY id;
+DROP TABLE users;
+```
+
+## SQL Coverage (Current)
+
+- **DDL**: `CREATE TABLE [IF NOT EXISTS]`, `DROP TABLE [IF EXISTS]`
+- **DML**: `INSERT`, `UPDATE`, `DELETE`
+- **Query**: `SELECT` with expressions, `WHERE`, `ORDER BY`, `LIMIT/OFFSET`, aggregate functions (`COUNT/SUM/AVG/MIN/MAX`)
+- **Session/Txn**: `USE`, `BEGIN`, `START TRANSACTION`, `COMMIT`, `ROLLBACK`
+- **SHOW commands**: `SHOW DATABASES`, `SHOW TABLES`, `SHOW WARNINGS`, `SHOW STATUS`
+
+Notes:
+- Tables currently require a `PRIMARY KEY`.
+- `JOIN` and `GROUP BY` execution are not implemented yet.
+- Prepared statement protocol hooks exist, but execution is currently a stub.
 
 ## Server Options
 
 ```bash
 cargo run -- --help
 
-# Common options:
-#   -H, --host <HOST>       Host to bind (default: 127.0.0.1)
-#   -P, --port <PORT>       Port to listen (default: 4000)
-#   -D, --data-dir <DIR>    Data directory (default: data)
-#   -L, --log-level <LEVEL> Log level: trace/debug/info/warn/error (default: info)
+# -H, --host <HOST>            Host address to bind to (default: 127.0.0.1)
+# -P, --port <PORT>            Port to listen on (default: 4000)
+# -D, --data-dir <DATA_DIR>    Data directory for persistence (default: data)
+# -L, --log-level <LOG_LEVEL>  Log level: trace/debug/info/warn/error (default: info)
 ```
 
-## Building
+## Build & Test
 
 ```bash
-# Debug build
+# Build
 cargo build
-
-# Release build
 cargo build --release
 
-# Format and lint
-cargo fmt && cargo clippy
-```
+# Format + lint
+cargo fmt
+cargo clippy --all-targets -- -D warnings
 
-## Testing
+# Core tests
+cargo test --lib
+cargo test --test store_test
+cargo test --test mysql_protocol_test
 
-```bash
-# Run all tests
-cargo test --lib                    # Unit tests
-cargo test --test store_test        # Integration tests
-cargo test --test testkit           # Test utilities
-
-# Run E2E tests (MySQL-test style)
+# E2E (mysql-test style)
 cargo run --bin mysqltest-runner -- --all
 
-# Run with failpoints (for concurrency testing)
+# Failpoint tests
 cargo test --test concurrency_test --features failpoints
+
+# Full local CI gate
+make ci
 ```
 
 ## Architecture
 
-```
-                         MySQL Client
-                              |
-                    +---------+---------+
-                    |  Protocol Layer   |  opensrv-mysql (thin I/O shell)
-                    +---------+---------+
-                              |  mpsc batched row streaming
-                    +---------+---------+
-                    |  Worker Runtime   |  Dedicated tokio runtime
-                    +---------+---------+
-                              |
-                    +---------+---------+
-                    |    SQL Layer      |  Parser -> Binder -> Executor
-                    +---------+---------+
-                              |
-                    +---------+---------+
-                    | Transaction Layer |  TxnService + ConcurrencyManager
-                    +---------+---------+
-                              |
-                    +---------+---------+
-                    |   Storage Layer   |  LSM Engine + Clog + Ilog
-                    +-------------------+
+```text
+MySQL Client
+    |
+    v
+Protocol Layer (main tokio runtime)
+  - MySQL wire I/O
+  - session fast path (SET / USE / @@vars)
+    |
+    | mpsc row batches (1024 rows, cap=4)
+    v
+Worker Runtime (tisql-worker)
+  - parse + bind + execute + txn control + SHOW
+    |
+    v
+SQL Layer (Parser -> Binder -> Executor)
+    |
+    v
+Transaction Layer (TxnService + ConcurrencyManager + TSO)
+    |
+    v
+Storage Layer (LsmEngine + Clog + Ilog + LsnProvider)
+
+Side runtimes/services:
+- Background runtime (tisql-bg): flush scheduler, compaction scheduler, drop-table GC worker
+- I/O runtime (tisql-io): group-commit blocking tasks used by clog/ilog
+- io_uring service thread: SST read/write operations
 ```
 
 ## Project Structure
 
-```
+```text
 src/
-├── lib.rs           # Public API: Database, traits
-├── catalog/         # Table metadata (MVCC-based, inner-table-backed)
-├── codec/           # TiDB-compatible key encoding
-├── clog/            # Commit log (WAL) with group commit
-├── inner_table/     # System tables, bootstrap, catalog cache, GC worker
-├── executor/        # Volcano-style operator tree (streaming)
-├── io/              # io_uring async I/O (O_DIRECT, AlignedBuf, DmaFile)
-├── protocol/        # MySQL wire protocol (thin I/O shell)
-├── session/         # Per-connection state
-├── sql/             # Parser, Binder
-├── storage/         # LSM engine, memtables, SSTables
-├── transaction/     # TxnService, ConcurrencyManager
-├── tso/             # Timestamp oracle
-└── worker/          # Dedicated worker runtime dispatch
+├── lib.rs           # Database entry point and wiring
+├── main.rs          # CLI server binary
+├── lsn.rs           # Shared LSN allocator for clog/ilog
+├── catalog/         # MVCC catalog (inner-table-backed)
+├── inner_table/     # Bootstrap, core system tables, GC worker
+├── sql/             # Parser, binder, logical plan
+├── executor/        # Volcano-style executor
+├── transaction/     # TxnService, concurrency manager, txn state
+├── storage/         # LSM engine, memtable, SST, recovery
+├── clog/            # WAL with group commit
+├── io/              # io_uring I/O service and DMA buffers
+├── protocol/        # MySQL wire protocol handler
+├── worker/          # Worker dispatch + row batch streaming
+├── session/         # Per-connection session state
+├── codec/           # TiDB-compatible key/row codec
+├── tso/             # Local timestamp oracle
+├── util/            # Logging, fs utils, timing, arena
+└── types.rs         # Core value/key/timestamp types
 ```
 
-## Design Highlights
+## Extra Tools
 
-- **Physical thread separation**: Protocol I/O on main runtime, all DB work on dedicated worker runtime (OceanBase-inspired)
-- **Trait-based layering**: Each layer depends on traits, not implementations
-- **TiDB/TiKV patterns**: MVCC key encoding, ConcurrencyManager, TSO
-- **OceanBase patterns**: Unified TxnService with TxnCtx, pessimistic locking
-- **Batched row streaming**: Worker pulls rows from operator tree, sends batches (1024) via bounded mpsc(4) to protocol
-- **Async iterators**: All iterator seek/advance are async fn (native AFIT), yielding during SST I/O
+```bash
+# Sysbench-like memtable benchmark
+cargo run --release --bin sysbench-sim -- --threads 8 --time 60
+```
 
 ## License
 
