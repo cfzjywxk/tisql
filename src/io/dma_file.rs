@@ -18,6 +18,8 @@
 //! bypassing the kernel page cache. If the filesystem doesn't support
 //! O_DIRECT (e.g. tmpfs), it falls back to standard I/O. io_uring works
 //! fine without O_DIRECT — alignment is unnecessary but harmless.
+//! On non-Linux unix targets (for example macOS), `O_DIRECT` may be unavailable;
+//! in that case this module opens files without direct I/O.
 
 use std::io;
 use std::os::unix::io::{AsRawFd, FromRawFd, OwnedFd, RawFd};
@@ -36,6 +38,11 @@ pub struct DmaFile {
     file_size: u64,
 }
 
+#[cfg(any(target_os = "linux", target_os = "android"))]
+const O_DIRECT_FLAG: libc::c_int = libc::O_DIRECT;
+#[cfg(not(any(target_os = "linux", target_os = "android")))]
+const O_DIRECT_FLAG: libc::c_int = 0;
+
 impl DmaFile {
     /// Open an existing file for reading with O_DIRECT (fallback to standard I/O).
     pub fn open_read(path: impl AsRef<Path>) -> io::Result<Self> {
@@ -43,11 +50,11 @@ impl DmaFile {
         let c_path = path_to_cstring(path)?;
 
         // Try O_DIRECT first
-        let flags = libc::O_RDONLY | libc::O_DIRECT;
+        let flags = libc::O_RDONLY | O_DIRECT_FLAG;
         let fd = unsafe { libc::open(c_path.as_ptr(), flags) };
         let fd = if fd < 0 {
             let err = io::Error::last_os_error();
-            if err.raw_os_error() == Some(libc::EINVAL) {
+            if O_DIRECT_FLAG != 0 && err.raw_os_error() == Some(libc::EINVAL) {
                 // O_DIRECT not supported — retry without it
                 let fd = unsafe { libc::open(c_path.as_ptr(), libc::O_RDONLY) };
                 if fd < 0 {
@@ -78,11 +85,11 @@ impl DmaFile {
         let mode = 0o644;
 
         // Try O_DIRECT first
-        let flags = libc::O_WRONLY | libc::O_CREAT | libc::O_TRUNC | libc::O_DIRECT;
+        let flags = libc::O_WRONLY | libc::O_CREAT | libc::O_TRUNC | O_DIRECT_FLAG;
         let fd = unsafe { libc::open(c_path.as_ptr(), flags, mode) };
         let fd = if fd < 0 {
             let err = io::Error::last_os_error();
-            if err.raw_os_error() == Some(libc::EINVAL) {
+            if O_DIRECT_FLAG != 0 && err.raw_os_error() == Some(libc::EINVAL) {
                 // O_DIRECT not supported — retry without it
                 let flags = libc::O_WRONLY | libc::O_CREAT | libc::O_TRUNC;
                 let fd = unsafe { libc::open(c_path.as_ptr(), flags, mode) };
@@ -134,11 +141,11 @@ impl DmaFile {
         let mode = 0o644;
 
         // Try O_DIRECT first
-        let flags = libc::O_RDWR | libc::O_CREAT | libc::O_DIRECT;
+        let flags = libc::O_RDWR | libc::O_CREAT | O_DIRECT_FLAG;
         let fd = unsafe { libc::open(c_path.as_ptr(), flags, mode) };
         let fd = if fd < 0 {
             let err = io::Error::last_os_error();
-            if err.raw_os_error() == Some(libc::EINVAL) {
+            if O_DIRECT_FLAG != 0 && err.raw_os_error() == Some(libc::EINVAL) {
                 // O_DIRECT not supported — retry without it
                 let flags = libc::O_RDWR | libc::O_CREAT;
                 let fd = unsafe { libc::open(c_path.as_ptr(), flags, mode) };

@@ -369,8 +369,7 @@ async fn test_large_explicit_txn_10k_keys_crash_recovery() {
             assert_eq!(
                 get_value(&engine, format!("bulk_key_{i:05}").as_bytes(), max_ts + 100).await,
                 Some(format!("bulk_val_{i:05}").into_bytes()),
-                "bulk key {} should survive recovery",
-                i
+                "bulk key {i} should survive recovery"
             );
         }
     }

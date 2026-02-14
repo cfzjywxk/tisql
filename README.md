@@ -13,7 +13,7 @@ A minimal SQL database in Rust with MySQL protocol support, designed for learnin
 - **Streaming execution**: volcano-style operator tree, worker-to-protocol batched row streaming
 - **Storage engine**: LSM tree (`VersionedMemTableEngine` + SSTables) with background flush and compaction
 - **Durability & recovery**: commit log (WAL) + ilog with group commit and unified LSN ordering
-- **Async SST I/O**: `io_uring`-backed reads (`O_DIRECT`, positional read)
+- **Async SST I/O**: Linux uses `io_uring` (`O_DIRECT`, positional I/O); non-Linux dev builds use a sync fallback backend
 - **Persistent catalog**: MVCC inner-table metadata with bootstrap and schema-version checks
 - **Drop-table GC**: background worker with read-path SST skip and proactive dropped-SST cleanup
 - **Runtime separation**: protocol/runtime work split across dedicated worker, background, and I/O runtimes
@@ -125,7 +125,7 @@ Storage Layer (LsmEngine + Clog + Ilog + LsnProvider)
 Side runtimes/services:
 - Background runtime (tisql-bg): flush scheduler, compaction scheduler, drop-table GC worker
 - I/O runtime (tisql-io): group-commit blocking tasks used by clog/ilog
-- io_uring service thread: SST read/write operations
+- SST I/O service thread: Linux `io_uring`; non-Linux sync fallback (dev only)
 ```
 
 ## Project Structure
@@ -142,7 +142,7 @@ src/
 ├── transaction/     # TxnService, concurrency manager, txn state
 ├── storage/         # LSM engine, memtable, SST, recovery
 ├── clog/            # WAL with group commit
-├── io/              # io_uring I/O service and DMA buffers
+├── io/              # SST I/O service (Linux io_uring + non-Linux fallback) and DMA buffers
 ├── protocol/        # MySQL wire protocol handler
 ├── worker/          # Worker dispatch + row batch streaming
 ├── session/         # Per-connection session state

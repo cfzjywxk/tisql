@@ -51,10 +51,10 @@ parking_lot = "0.12"
 # io_uring for async I/O (Linux only)
 [target.'cfg(target_os = "linux")'.dependencies]
 io-uring = "0.7"
-libc = "0.2"
 
 # Memory allocator (jemalloc for production, like TiKV)
 [target.'cfg(unix)'.dependencies]
+libc = "0.2"
 tikv-jemallocator = { version = "0.5", optional = true }
 
 # Fail injection testing

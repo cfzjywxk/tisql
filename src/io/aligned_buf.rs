@@ -176,6 +176,7 @@ impl std::fmt::Debug for AlignedBuf {
 ///
 /// `alignment` must be a power of two.
 #[inline]
+#[cfg_attr(not(target_os = "linux"), allow(dead_code))]
 pub fn align_up(value: u64, alignment: u64) -> u64 {
     (value + alignment - 1) & !(alignment - 1)
 }
@@ -184,6 +185,7 @@ pub fn align_up(value: u64, alignment: u64) -> u64 {
 ///
 /// `alignment` must be a power of two.
 #[inline]
+#[cfg_attr(not(target_os = "linux"), allow(dead_code))]
 pub fn align_down(value: u64, alignment: u64) -> u64 {
     value & !(alignment - 1)
 }

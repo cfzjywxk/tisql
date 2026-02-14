@@ -1433,13 +1433,11 @@ mod tests {
                     let suffix = format!("{:04}", entry.txn_id);
                     assert!(
                         key.ends_with(suffix.as_bytes()),
-                        "Put key should include txn suffix {suffix}: {:?}",
-                        key
+                        "Put key should include txn suffix {suffix}: {key:?}"
                     );
                     assert!(
                         value.ends_with(suffix.as_bytes()),
-                        "Put value should include txn suffix {suffix}: {:?}",
-                        value
+                        "Put value should include txn suffix {suffix}: {value:?}"
                     );
                     put_txn_ids.insert(entry.txn_id);
                 }

@@ -12,11 +12,11 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-//! io_uring-based I/O service running on a dedicated tokio runtime.
+//! Async I/O service running on a dedicated thread.
 //!
 //! ## Design
 //!
-//! A `spawn_blocking` task on the I/O runtime owns the io_uring ring.
+//! A dedicated thread owns the I/O backend.
 //! Callers submit requests via a crossbeam channel and receive results
 //! through `IoFuture<T>`:
 //!
@@ -24,18 +24,24 @@
 //! - **Sync callers**: `.wait()` using `blocking_recv()` (for iterators,
 //!   flush/compaction on spawn_blocking threads)
 //!
+//! Backend selection:
+//! - Linux: io_uring backend
+//! - Non-Linux unix (macOS dev): synchronous `pread`/`pwrite`/`fsync` fallback
+//!
 //! ## O_DIRECT Alignment
 //!
-//! All reads/writes are internally aligned to `DMA_ALIGNMENT` (4096 bytes).
-//! For reads, the caller gets back an `AlignedBuf` containing the exact bytes
-//! requested (the service reads a larger aligned range and slices the result).
+//! Linux io_uring reads/writes are internally aligned to `DMA_ALIGNMENT` (4096 bytes).
+//! The non-Linux fallback uses buffered positional I/O and does not require alignment.
 
 use std::os::unix::io::RawFd;
 use std::pin::Pin;
 use std::sync::Arc;
 use std::task::{Context, Poll};
 
+#[cfg(target_os = "linux")]
 use super::aligned_buf::{align_down, align_up, AlignedBuf, DMA_ALIGNMENT};
+#[cfg(not(target_os = "linux"))]
+use super::aligned_buf::{AlignedBuf, DMA_ALIGNMENT};
 use super::dma_file::DmaFile;
 
 /// Result type for IO operations — contains either data or an error message.
@@ -104,10 +110,10 @@ enum IoOp {
     },
 }
 
-/// io_uring-backed I/O service.
+/// Backend-abstracted SST I/O service.
 ///
-/// Spawns a dedicated thread with an io_uring event loop.
-/// All SST file I/O (reads, writes, fsyncs) goes through this service.
+/// Spawns a dedicated thread running either the Linux io_uring backend
+/// or the non-Linux synchronous fallback backend.
 pub struct IoService {
     /// Sender for the hot path — lock-free, used by read_at/write_at/fsync.
     tx: crossbeam_channel::Sender<IoOp>,
@@ -126,23 +132,35 @@ impl std::fmt::Debug for IoService {
 }
 
 impl IoService {
-    /// Create a new IoService with the given io_uring ring size.
+    /// Create a new IoService with the given ring size hint.
     ///
-    /// `ring_size` determines the io_uring submission queue depth (e.g., 256).
-    /// Spawns a dedicated OS thread for the io_uring event loop. The thread
+    /// On Linux, `ring_size` determines the io_uring submission queue depth.
+    /// On non-Linux targets, it is ignored by the synchronous fallback backend.
+    ///
+    /// Spawns a dedicated OS thread for the I/O event loop. The thread
     /// exits when the channel is closed (all senders dropped via Drop or `shutdown()`).
     pub fn new(ring_size: u32) -> Result<Arc<Self>, String> {
         let (tx, rx) = crossbeam_channel::unbounded::<IoOp>();
         let shutdown_tx = tx.clone();
 
+        #[cfg(not(target_os = "linux"))]
+        tracing::warn!(
+            "IoService is using sync pread/pwrite fallback backend (non-Linux build, dev-only)"
+        );
+
+        #[cfg(target_os = "linux")]
+        let thread_name = "tisql-io-uring";
+        #[cfg(not(target_os = "linux"))]
+        let thread_name = "tisql-io-sync-fallback";
+
         std::thread::Builder::new()
-            .name("tisql-io-uring".into())
+            .name(thread_name.into())
             .spawn(move || {
                 if let Err(e) = io_thread_main(rx, ring_size) {
-                    tracing::error!("io_uring thread failed: {e}");
+                    tracing::error!("IoService thread failed: {e}");
                 }
             })
-            .map_err(|e| format!("Failed to spawn io_uring thread: {e}"))?;
+            .map_err(|e| format!("Failed to spawn IoService thread: {e}"))?;
 
         Ok(Arc::new(Self {
             tx,
@@ -156,10 +174,10 @@ impl IoService {
         Self::new(ring_size)
     }
 
-    /// Shutdown the io_uring thread by closing the channel early.
+    /// Shutdown the I/O thread by closing the channel early.
     ///
     /// Drops the extra sender clone. Combined with `LsmEngine::drop()` which
-    /// drops the main `tx`, this closes the channel and the io_uring thread exits.
+    /// drops the main `tx`, this closes the channel and the I/O thread exits.
     /// Safe to call multiple times — subsequent calls are no-ops.
     pub fn shutdown(&self) {
         self.shutdown_tx.lock().take();
@@ -231,16 +249,14 @@ impl IoService {
 }
 
 // Drop: Both `tx` and `shutdown_tx` are dropped, closing the channel.
-// The io_uring thread's rx.recv() returns Err, exiting the loop.
+// The I/O thread's rx.recv() returns Err, exiting the loop.
 
 // ============================================================================
 // IO Thread Main Loop
 // ============================================================================
 
-/// Main loop for the dedicated io_uring thread.
-///
-/// Receives IoOp requests from the channel, submits them to io_uring,
-/// reaps completions, and notifies callers via oneshot reply channels.
+/// Main loop for the Linux io_uring backend.
+#[cfg(target_os = "linux")]
 fn io_thread_main(rx: crossbeam_channel::Receiver<IoOp>, ring_size: u32) -> Result<(), String> {
     let mut ring = io_uring::IoUring::new(ring_size)
         .map_err(|e| format!("io_uring::IoUring::new failed: {e}"))?;
@@ -435,6 +451,7 @@ fn io_thread_main(rx: crossbeam_channel::Receiver<IoOp>, ring_size: u32) -> Resu
 }
 
 /// A pending IO operation awaiting completion from io_uring.
+#[cfg(target_os = "linux")]
 enum PendingOp {
     Read {
         buf: AlignedBuf,
@@ -450,6 +467,130 @@ enum PendingOp {
     Fsync {
         reply: tokio::sync::oneshot::Sender<IoResult<()>>,
     },
+}
+
+/// Main loop for the non-Linux fallback backend.
+///
+/// This uses blocking `pread`/`pwrite`/`fsync` on a dedicated thread to keep
+/// the public async/sync IoService API unchanged for macOS development.
+#[cfg(not(target_os = "linux"))]
+fn io_thread_main(rx: crossbeam_channel::Receiver<IoOp>, _ring_size: u32) -> Result<(), String> {
+    while let Ok(op) = rx.recv() {
+        match op {
+            IoOp::ReadAt {
+                fd,
+                offset,
+                len,
+                reply,
+            } => {
+                let _ = reply.send(read_at_sync(fd, offset, len));
+            }
+            IoOp::WriteAt {
+                fd,
+                offset,
+                buf,
+                reply,
+            } => {
+                let _ = reply.send(write_at_sync(fd, offset, &buf));
+            }
+            IoOp::Fsync { fd, reply } => {
+                let _ = reply.send(fsync_sync(fd));
+            }
+        }
+    }
+    Ok(())
+}
+
+#[cfg(not(target_os = "linux"))]
+fn read_at_sync(fd: RawFd, offset: u64, len: usize) -> IoResult<AlignedBuf> {
+    if len == 0 {
+        return Ok(AlignedBuf::zeroed(0, DMA_ALIGNMENT));
+    }
+
+    let mut buf = AlignedBuf::zeroed(len, DMA_ALIGNMENT);
+    let mut total_read = 0usize;
+
+    while total_read < len {
+        let current_offset = offset
+            .checked_add(total_read as u64)
+            .ok_or_else(|| "read offset overflow".to_string())?;
+        let off = offset_to_off_t(current_offset)?;
+
+        // SAFETY: `buf[total_read..]` is a valid writable slice and `fd` belongs
+        // to an open file descriptor owned by DmaFile for the lifetime of this call.
+        let n = unsafe {
+            libc::pread(
+                fd,
+                buf[total_read..].as_mut_ptr() as *mut libc::c_void,
+                len - total_read,
+                off,
+            )
+        };
+        if n < 0 {
+            return Err(format!("pread failed: {}", std::io::Error::last_os_error()));
+        }
+        if n == 0 {
+            break; // EOF
+        }
+        total_read += n as usize;
+    }
+
+    if total_read == len {
+        Ok(buf)
+    } else {
+        Ok(AlignedBuf::from_slice(&buf[..total_read], DMA_ALIGNMENT))
+    }
+}
+
+#[cfg(not(target_os = "linux"))]
+fn write_at_sync(fd: RawFd, offset: u64, buf: &AlignedBuf) -> IoResult<usize> {
+    let mut total_written = 0usize;
+    while total_written < buf.len() {
+        let current_offset = offset
+            .checked_add(total_written as u64)
+            .ok_or_else(|| "write offset overflow".to_string())?;
+        let off = offset_to_off_t(current_offset)?;
+
+        // SAFETY: `buf[total_written..]` is a valid readable slice and `fd` belongs
+        // to an open file descriptor owned by DmaFile for the lifetime of this call.
+        let n = unsafe {
+            libc::pwrite(
+                fd,
+                buf[total_written..].as_ptr() as *const libc::c_void,
+                buf.len() - total_written,
+                off,
+            )
+        };
+        if n < 0 {
+            return Err(format!(
+                "pwrite failed: {}",
+                std::io::Error::last_os_error()
+            ));
+        }
+        if n == 0 {
+            return Err("pwrite returned 0 bytes".to_string());
+        }
+        total_written += n as usize;
+    }
+    Ok(total_written)
+}
+
+#[cfg(not(target_os = "linux"))]
+fn fsync_sync(fd: RawFd) -> IoResult<()> {
+    // SAFETY: `fd` belongs to an open file descriptor owned by DmaFile.
+    let rc = unsafe { libc::fsync(fd) };
+    if rc < 0 {
+        return Err(format!("fsync failed: {}", std::io::Error::last_os_error()));
+    }
+    Ok(())
+}
+
+#[cfg(not(target_os = "linux"))]
+fn offset_to_off_t(offset: u64) -> IoResult<libc::off_t> {
+    if offset > libc::off_t::MAX as u64 {
+        return Err(format!("offset {offset} exceeds off_t::MAX"));
+    }
+    Ok(offset as libc::off_t)
 }
 
 #[cfg(test)]
