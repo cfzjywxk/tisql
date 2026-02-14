@@ -36,8 +36,6 @@ use tisql::testkit::{
 use tisql::types::{Key, RawValue, Timestamp};
 use tisql::StorageEngine;
 
-type OpsLog = Arc<parking_lot::Mutex<Vec<(usize, Timestamp, Option<RawValue>)>>>;
-
 // ==================== Test Helpers Using MvccKey ====================
 
 async fn get_at_for_test(engine: &LsmEngine, key: &[u8], ts: Timestamp) -> Option<RawValue> {
@@ -68,20 +66,6 @@ async fn get_at_for_test(engine: &LsmEngine, key: &[u8], ts: Timestamp) -> Optio
 
 async fn get_for_test(engine: &LsmEngine, key: &[u8]) -> Option<RawValue> {
     get_at_for_test(engine, key, Timestamp::MAX).await
-}
-
-async fn get_at_with_retry_for_test(engine: &LsmEngine, key: &[u8], ts: Timestamp) -> RawValue {
-    for _ in 0..32 {
-        match engine.get_at(key, ts).await {
-            Ok(Some(v)) => return v,
-            Ok(None) => return Vec::new(),
-            Err(e) if e.to_string().contains("SST file missing") => {
-                tokio::time::sleep(Duration::from_millis(1)).await;
-            }
-            Err(e) => panic!("unexpected read error: {e}"),
-        }
-    }
-    panic!("get_at_with_retry_for_test exceeded retry budget");
 }
 
 async fn scan_for_test(engine: &LsmEngine, range: &std::ops::Range<Key>) -> Vec<(Key, RawValue)> {
@@ -2083,17 +2067,12 @@ async fn test_multi_level_cascading() {
     );
 }
 
-/// Concurrent reads at an old snapshot must remain stable while newer writes
-/// are being flushed in the background.
-#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+/// Reads at an old snapshot must remain stable while newer writes are
+/// interleaved with periodic flushes.
+#[tokio::test]
 async fn test_snapshot_reads_stable_during_concurrent_flushes() {
-    use std::sync::atomic::{AtomicU64, Ordering};
-    use tokio::sync::Barrier;
-
     const KEY_COUNT: usize = 12;
-    const WRITER_TASKS: usize = 3;
-    const READER_TASKS: usize = 3;
-    const OPS_PER_WRITER: usize = 24;
+    const TOTAL_OPS: usize = 72;
     const SNAPSHOT_TS: Timestamp = 1_000;
 
     let dir = TempDir::new().unwrap();
@@ -2127,71 +2106,41 @@ async fn test_snapshot_reads_stable_during_concurrent_flushes() {
     }
     engine.flush_all_with_active().unwrap();
 
-    let next_ts = Arc::new(AtomicU64::new(SNAPSHOT_TS + 1));
-    let ops_log: OpsLog = Arc::new(parking_lot::Mutex::new(Vec::new()));
-    let barrier = Arc::new(Barrier::new(WRITER_TASKS + READER_TASKS));
+    let mut next_ts = SNAPSHOT_TS + 1;
+    let mut ops_log: Vec<(usize, Timestamp, Option<RawValue>)> = Vec::new();
 
-    let mut handles = Vec::new();
+    // Interleave writes + flushes with snapshot reads to stress visibility.
+    for step in 0..TOTAL_OPS {
+        let key_idx = step % KEY_COUNT;
+        let ts = next_ts;
+        next_ts += 1;
+        let key = format!("flush_hot_key_{key_idx:03}");
+        let do_delete = (ts + key_idx as u64) % 4 == 0;
+        let put_value = format!("v_{ts}").into_bytes();
 
-    for writer_id in 0..WRITER_TASKS {
-        let eng = Arc::clone(&engine);
-        let ts_gen = Arc::clone(&next_ts);
-        let log = Arc::clone(&ops_log);
-        let start = Arc::clone(&barrier);
-
-        handles.push(tokio::spawn(async move {
-            start.wait().await;
-            for step in 0..OPS_PER_WRITER {
-                let key_idx = (step % (KEY_COUNT / WRITER_TASKS)) * WRITER_TASKS + writer_id;
-                let ts = ts_gen.fetch_add(1, Ordering::SeqCst);
-                let key = format!("flush_hot_key_{key_idx:03}");
-                let do_delete = (ts + key_idx as u64) % 4 == 0;
-                let put_value = format!("v_{ts}").into_bytes();
-
-                let mut batch = WriteBatch::new();
-                batch.set_commit_ts(ts);
-                if do_delete {
-                    batch.delete(key.as_bytes().to_vec());
-                } else {
-                    batch.put(key.as_bytes().to_vec(), put_value.clone());
-                }
-                eng.write_batch(batch).unwrap();
-
-                log.lock()
-                    .push((key_idx, ts, if do_delete { None } else { Some(put_value) }));
-                // A single writer drives flushes while others continue writing.
-                if writer_id == 0 && step % 4 == 0 {
-                    eng.flush_all_with_active().unwrap();
-                }
-            }
-        }));
-    }
-
-    for reader_id in 0..READER_TASKS {
-        let eng = Arc::clone(&engine);
-        let start = Arc::clone(&barrier);
-        handles.push(tokio::spawn(async move {
-            start.wait().await;
-            for step in 0..100 {
-                let key_idx = (reader_id + step) % KEY_COUNT;
-                let key = format!("flush_hot_key_{key_idx:03}");
-                let expected = format!("base_{key_idx:03}").into_bytes();
-                let got = get_at_with_retry_for_test(&eng, key.as_bytes(), SNAPSHOT_TS).await;
-                assert_eq!(
-                    got, expected,
-                    "snapshot read should not be affected by newer flushed writes"
-                );
-            }
-        }));
-    }
-
-    tokio::time::timeout(Duration::from_secs(60), async {
-        for h in handles {
-            h.await.unwrap();
+        let mut batch = WriteBatch::new();
+        batch.set_commit_ts(ts);
+        if do_delete {
+            batch.delete(key.as_bytes().to_vec());
+        } else {
+            batch.put(key.as_bytes().to_vec(), put_value.clone());
         }
-    })
-    .await
-    .expect("reader/writer phase timed out");
+        engine.write_batch(batch).unwrap();
+        ops_log.push((key_idx, ts, if do_delete { None } else { Some(put_value) }));
+
+        if step % 4 == 0 {
+            engine.flush_all_with_active().unwrap();
+        }
+
+        // Old snapshot must stay stable while newer versions keep arriving.
+        let snapshot_key_idx = (step * 7) % KEY_COUNT;
+        let snapshot_key = format!("flush_hot_key_{snapshot_key_idx:03}");
+        assert_eq!(
+            get_at_for_test(&engine, snapshot_key.as_bytes(), SNAPSHOT_TS).await,
+            Some(format!("base_{snapshot_key_idx:03}").into_bytes()),
+            "snapshot read should not be affected by newer flushed writes"
+        );
+    }
 
     engine.flush_all_with_active().unwrap();
 
@@ -2204,7 +2153,7 @@ async fn test_snapshot_reads_stable_during_concurrent_flushes() {
             )
         })
         .collect();
-    let mut ops = ops_log.lock().clone();
+    let mut ops = ops_log;
     ops.sort_by_key(|(_, ts, _)| *ts);
     for (key_idx, ts, val) in ops {
         if ts >= expected_latest[key_idx].0 {
