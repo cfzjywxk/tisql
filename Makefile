@@ -7,6 +7,14 @@ STORE_TEST_TIMEOUT_SECS ?= 1200
 E2E_TEST_TIMEOUT_SECS ?= 900
 E2E_STMT_TIMEOUT_SECS ?= 15
 
+UNAME_S := $(shell uname -s)
+
+# macOS has a lower default file descriptor limit; running store_test in
+# parallel can exhaust descriptors because each test creates multiple runtimes.
+ifeq ($(UNAME_S),Darwin)
+STORE_TEST_THREAD_ARGS := -- --test-threads=1
+endif
+
 # Default target
 all: build
 
@@ -27,7 +35,7 @@ unit-test:
 
 # Run store tests (internal integration tests)
 store-test:
-	./scripts/run_with_timeout.sh $(STORE_TEST_TIMEOUT_SECS) cargo test --test store_test
+	./scripts/run_with_timeout.sh $(STORE_TEST_TIMEOUT_SECS) cargo test --test store_test $(STORE_TEST_THREAD_ARGS)
 
 # Run storage regression tests (ported RocksDB-style suites)
 storage-test:
