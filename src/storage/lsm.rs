@@ -44,7 +44,7 @@
 
 use std::collections::{HashMap, VecDeque};
 use std::ops::Range;
-use std::sync::atomic::{AtomicU64, Ordering as AtomicOrdering};
+use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering as AtomicOrdering};
 use std::sync::Arc;
 
 use parking_lot::{RwLock, RwLockWriteGuard};
@@ -67,6 +67,123 @@ use super::sstable::{
 };
 use super::version::{ManifestDelta, Version, MAX_LEVELS};
 use super::version_set::{SuperVersion, VersionSet};
+
+// ---------------------------------------------------------------------------
+// In-flight LSN tracker (OceanBase-inspired per-thread tracking)
+// ---------------------------------------------------------------------------
+
+/// Sentinel value meaning "no in-flight write on this slot".
+const NO_IN_FLIGHT: u64 = u64::MAX;
+
+/// Default number of tracker slots. Should be >= max worker thread count.
+/// Extra slots are cheap (64 bytes each); a few wasted slots are fine.
+const DEFAULT_TRACKER_SLOTS: usize = 128;
+
+/// Global counter for assigning sequential slot indices to threads.
+static TRACKER_SLOT_COUNTER: AtomicUsize = AtomicUsize::new(0);
+
+thread_local! {
+    /// Each thread gets a unique slot index on first access.
+    static TRACKER_SLOT_INDEX: usize = TRACKER_SLOT_COUNTER.fetch_add(1, AtomicOrdering::Relaxed);
+}
+
+/// Cache-line-aligned atomic u64 to prevent false sharing between threads.
+#[repr(align(64))]
+struct PaddedAtomicU64(AtomicU64);
+
+impl PaddedAtomicU64 {
+    fn new(val: u64) -> Self {
+        Self(AtomicU64::new(val))
+    }
+}
+
+/// Tracks in-flight LSNs across worker threads to prevent `safe_flushed_lsn`
+/// from advancing past a write that has allocated an LSN but not yet completed
+/// its memtable write.
+///
+/// # Design (OceanBase-style per-thread tracking)
+///
+/// Each thread gets a dedicated slot (cache-line padded). Before a memtable
+/// write, the thread stores its LSN in its slot. After the write completes,
+/// it clears the slot back to `NO_IN_FLIGHT`.
+///
+/// The flush thread queries `min_in_flight()` which scans all slots. If any
+/// slot contains a value < u64::MAX, it means that thread has an in-flight
+/// write at that LSN. The safe boundary must not advance past it.
+///
+/// # Why this is correct
+///
+/// `write_batch_inner()` is synchronous (no `.await` points), so each OS
+/// thread can have at most one in-flight LSN at a time. This means:
+/// - No CAS loop needed (unlike OceanBase's `dec_update`)
+/// - Register = simple store, deregister = simple store
+/// - Each slot has exactly one owner thread
+pub struct InFlightLsnTracker {
+    slots: Box<[PaddedAtomicU64]>,
+}
+
+impl InFlightLsnTracker {
+    /// Create a new tracker with the given number of slots.
+    pub fn new(num_slots: usize) -> Self {
+        let slots: Vec<PaddedAtomicU64> = (0..num_slots)
+            .map(|_| PaddedAtomicU64::new(NO_IN_FLIGHT))
+            .collect();
+        Self {
+            slots: slots.into_boxed_slice(),
+        }
+    }
+
+    /// Register an in-flight LSN for the current thread.
+    ///
+    /// Returns a guard that deregisters on drop (RAII).
+    /// Must be called before the memtable write, after the LSN is known.
+    pub fn register(&self, lsn: u64) -> InFlightGuard<'_> {
+        let slot_idx = self.slot_index();
+        self.slots[slot_idx]
+            .0
+            .store(lsn, AtomicOrdering::Release);
+        InFlightGuard {
+            tracker: self,
+            slot_idx,
+        }
+    }
+
+    /// Return the minimum in-flight LSN across all threads,
+    /// or `None` if no thread has an in-flight write.
+    pub fn min_in_flight(&self) -> Option<u64> {
+        let mut min = NO_IN_FLIGHT;
+        for slot in self.slots.iter() {
+            let val = slot.0.load(AtomicOrdering::Acquire);
+            min = min.min(val);
+        }
+        if min == NO_IN_FLIGHT {
+            None
+        } else {
+            Some(min)
+        }
+    }
+
+    /// Get the slot index for the current thread (assigned on first call).
+    fn slot_index(&self) -> usize {
+        TRACKER_SLOT_INDEX.with(|idx| *idx % self.slots.len())
+    }
+}
+
+/// RAII guard that clears the in-flight LSN slot when dropped.
+pub struct InFlightGuard<'a> {
+    tracker: &'a InFlightLsnTracker,
+    slot_idx: usize,
+}
+
+impl<'a> Drop for InFlightGuard<'a> {
+    fn drop(&mut self) {
+        self.tracker.slots[self.slot_idx]
+            .0
+            .store(NO_IN_FLIGHT, AtomicOrdering::Release);
+    }
+}
+
+// ---------------------------------------------------------------------------
 
 /// Inner state of the LSM engine, protected by RwLock for atomic updates.
 ///
@@ -178,6 +295,13 @@ pub struct LsmEngine {
     /// Maps table_id → drop_commit_ts. During compaction, all keys belonging
     /// to a dropped table with drop_ts <= gc_safe_point are filtered out.
     dropped_table_ids: RwLock<HashMap<u64, Timestamp>>,
+
+    /// Per-thread tracker for in-flight LSNs (OceanBase-style).
+    ///
+    /// Prevents `safe_flushed_lsn` from advancing past an LSN that has been
+    /// allocated (via clog) but whose memtable write has not yet completed.
+    /// See `InFlightLsnTracker` for details.
+    in_flight_tracker: InFlightLsnTracker,
 }
 
 impl LsmEngine {
@@ -233,6 +357,7 @@ impl LsmEngine {
             gc_safe_point: AtomicU64::new(0),
             gc_safe_point_updater: RwLock::new(None),
             dropped_table_ids: RwLock::new(HashMap::new()),
+            in_flight_tracker: InFlightLsnTracker::new(DEFAULT_TRACKER_SLOTS),
         })
     }
 
@@ -340,18 +465,23 @@ impl LsmEngine {
     /// Compute the safe clog truncation LSN for log GC.
     ///
     /// Returns the maximum LSN up to which clog entries can be safely deleted.
-    /// This is `min(flushed_lsn, min_unflushed_lsn - 1)` — ensuring we never
-    /// truncate a clog entry that is still only in a volatile memtable.
+    /// Three constraints:
+    /// 1. `flushed_lsn` — can't truncate beyond what's durably in SSTs
+    /// 2. `min_unflushed_lsn - 1` — protects memtable data not yet flushed
+    /// 3. `min_in_flight - 1` — protects writes with allocated LSN but
+    ///    incomplete memtable write (TOCTOU race window)
     ///
     /// Returns 0 if there are unflushed memtable entries with the minimum
     /// possible LSN (1), meaning no truncation is safe.
     pub fn safe_log_gc_lsn(&self) -> u64 {
-        let flushed_lsn = self.version_set.current().flushed_lsn();
-        match self.min_unflushed_lsn() {
-            Some(min_mem_lsn) => flushed_lsn.min(min_mem_lsn.saturating_sub(1)),
-            // No in-memory data — flushed_lsn is the safe boundary.
-            None => flushed_lsn,
+        let mut safe = self.version_set.current().flushed_lsn();
+        if let Some(min_mem_lsn) = self.min_unflushed_lsn() {
+            safe = safe.min(min_mem_lsn.saturating_sub(1));
         }
+        if let Some(min_inf) = self.in_flight_tracker.min_in_flight() {
+            safe = safe.min(min_inf.saturating_sub(1));
+        }
+        safe
     }
 
     /// Get a SuperVersion snapshot for reading.
@@ -527,20 +657,25 @@ impl LsmEngine {
         fail_point!("lsm_flush_after_sst_write");
 
         // Compute safe flushed_lsn: the maximum LSN up to which ALL data is
-        // durably in SSTs. Due to the race window in write_batch_inner() between
-        // LSN allocation and memtable write, a lower-LSN entry can land in a
-        // *different* memtable than the one being flushed. We must not advance
-        // flushed_lsn past such a straggler's LSN.
+        // durably in SSTs. Three constraints prevent advancing too far:
         //
-        // safe_flushed_lsn = min(memtable.max_lsn, min_remaining_lsn - 1)
-        // where min_remaining_lsn is the min LSN across active + other frozen.
+        // 1. memtable.max_lsn — can't claim we flushed beyond what's in this SST
+        // 2. min_remaining_lsn - 1 — protects stragglers in other memtables
+        // 3. min_in_flight - 1 — protects writes that allocated an LSN (via clog)
+        //    but haven't completed their memtable write yet (TOCTOU race in
+        //    write_batch_inner between LSN resolution and memtable insertion)
+        //
+        // safe_flushed_lsn = min(memtable.max_lsn, min_remaining - 1, min_in_flight - 1)
         let max_memtable_lsn = memtable.max_lsn().unwrap_or(0);
         let safe_flushed_lsn = {
-            let min_remaining = self.min_lsn_excluding(memtable.id());
-            match min_remaining {
-                Some(min_rem) => max_memtable_lsn.min(min_rem.saturating_sub(1)),
-                None => max_memtable_lsn,
+            let mut safe = max_memtable_lsn;
+            if let Some(min_rem) = self.min_lsn_excluding(memtable.id()) {
+                safe = safe.min(min_rem.saturating_sub(1));
             }
+            if let Some(min_inf) = self.in_flight_tracker.min_in_flight() {
+                safe = safe.min(min_inf.saturating_sub(1));
+            }
+            safe
         };
 
         // Phase 3: Write flush commit (if durable)
@@ -982,11 +1117,18 @@ impl LsmEngine {
         // have been persisted to storage.
         let lsn = batch.clog_lsn().unwrap_or_else(|| self.alloc_lsn());
 
+        // Register this LSN as in-flight BEFORE the memtable write.
+        // This prevents safe_flushed_lsn from advancing past our LSN
+        // if a concurrent flush runs between LSN allocation and memtable
+        // write completion. The guard clears the slot on drop (RAII).
+        let _guard = self.in_flight_tracker.register(lsn);
+
         // Write to active memtable
         {
             let state = self.state.read();
             state.active.write_batch_with_lsn(batch, lsn)?;
         }
+        // _guard drops here, clearing the in-flight slot.
 
         // Check if rotation is needed (non-blocking check)
         // Actual rotation happens asynchronously or on next write
@@ -2703,6 +2845,7 @@ mod tests {
                 gc_safe_point: AtomicU64::new(0),
                 gc_safe_point_updater: RwLock::new(None),
                 dropped_table_ids: RwLock::new(HashMap::new()),
+                in_flight_tracker: InFlightLsnTracker::new(DEFAULT_TRACKER_SLOTS),
             })
         }
     }
@@ -8054,5 +8197,260 @@ mod tests {
             5,
             "flushed_lsn advances after straggler flushed"
         );
+    }
+
+    // ==================== InFlightLsnTracker Tests ====================
+
+    #[test]
+    fn test_in_flight_tracker_empty() {
+        let tracker = InFlightLsnTracker::new(16);
+        assert_eq!(tracker.min_in_flight(), None);
+    }
+
+    #[test]
+    fn test_in_flight_tracker_register_deregister() {
+        let tracker = InFlightLsnTracker::new(16);
+
+        // Register an in-flight LSN.
+        {
+            let _guard = tracker.register(42);
+            assert_eq!(tracker.min_in_flight(), Some(42));
+        }
+        // Guard dropped — slot cleared.
+        assert_eq!(tracker.min_in_flight(), None);
+    }
+
+    #[test]
+    fn test_in_flight_tracker_concurrent_threads() {
+        use std::sync::Barrier;
+
+        let tracker = Arc::new(InFlightLsnTracker::new(128));
+        // 4 worker threads + 1 main thread = 5 participants
+        let barrier_registered = Arc::new(Barrier::new(5));
+        let barrier_checked = Arc::new(Barrier::new(5));
+        let mut handles = Vec::new();
+
+        // Spawn 4 threads, each registering a different LSN.
+        for i in 0..4u64 {
+            let tracker = Arc::clone(&tracker);
+            let b1 = Arc::clone(&barrier_registered);
+            let b2 = Arc::clone(&barrier_checked);
+            handles.push(std::thread::spawn(move || {
+                let _guard = tracker.register(100 + i);
+                b1.wait(); // Signal: all registered
+                b2.wait(); // Wait: main has checked
+                // _guard drops here
+            }));
+        }
+
+        // Wait for all 4 threads to register their LSNs.
+        barrier_registered.wait();
+
+        let min = tracker.min_in_flight();
+        assert!(min.is_some(), "should see in-flight LSNs");
+        assert_eq!(min.unwrap(), 100, "min should be the lowest registered LSN");
+
+        // Release threads so they can deregister.
+        barrier_checked.wait();
+
+        for h in handles {
+            h.join().unwrap();
+        }
+
+        // All deregistered.
+        assert_eq!(tracker.min_in_flight(), None);
+    }
+
+    #[test]
+    fn test_in_flight_tracker_min_across_slots() {
+        let tracker = InFlightLsnTracker::new(16);
+
+        // Manually register on different slots to test min calculation.
+        tracker.slots[0].0.store(500, AtomicOrdering::Release);
+        tracker.slots[3].0.store(200, AtomicOrdering::Release);
+        tracker.slots[7].0.store(800, AtomicOrdering::Release);
+
+        assert_eq!(tracker.min_in_flight(), Some(200));
+
+        // Clear slot 3 — min should move to 500.
+        tracker.slots[3].0.store(NO_IN_FLIGHT, AtomicOrdering::Release);
+        assert_eq!(tracker.min_in_flight(), Some(500));
+
+        // Clear all.
+        tracker.slots[0].0.store(NO_IN_FLIGHT, AtomicOrdering::Release);
+        tracker.slots[7].0.store(NO_IN_FLIGHT, AtomicOrdering::Release);
+        assert_eq!(tracker.min_in_flight(), None);
+    }
+
+    #[test]
+    fn test_in_flight_tracker_guard_on_panic() {
+        // Verify the guard clears the slot even if the closure panics.
+        let tracker = InFlightLsnTracker::new(16);
+
+        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let _guard = tracker.register(999);
+            assert_eq!(tracker.min_in_flight(), Some(999));
+            panic!("intentional");
+        }));
+
+        assert!(result.is_err());
+        // Guard should have been dropped by unwinding.
+        assert_eq!(tracker.min_in_flight(), None);
+    }
+
+    #[tokio::test]
+    async fn test_safe_flushed_lsn_accounts_for_in_flight() {
+        // Simulates the TOCTOU race: an in-flight LSN should hold back
+        // safe_flushed_lsn even when no memtable contains that LSN yet.
+        let dir = TempDir::new().unwrap();
+        let config = LsmConfig::builder(dir.path())
+            .memtable_size(4096)
+            .build()
+            .unwrap();
+        let engine = LsmEngine::open(config).unwrap();
+
+        // Write LSN 1..5 to the engine.
+        for i in 1..=5u64 {
+            let mut wb = WriteBatch::new();
+            wb.put(format!("key{i}").into_bytes(), b"val".to_vec());
+            wb.set_commit_ts(i);
+            wb.set_clog_lsn(i);
+            engine.write_batch(wb).unwrap();
+        }
+
+        // Freeze and flush — should set flushed_lsn=5 normally.
+        engine.freeze_active();
+        let frozen = {
+            let state = engine.state.read();
+            state.frozen.front().cloned().unwrap()
+        };
+
+        // Simulate an in-flight write at LSN=3 by manually registering
+        // (as if a concurrent thread allocated LSN=3 but hasn't written yet).
+        let _inflight_guard = engine.in_flight_tracker.register(3);
+
+        engine.flush_memtable_async(&frozen).await.unwrap();
+
+        // safe_flushed_lsn should be capped at min(5, 3-1) = 2.
+        assert_eq!(
+            engine.current_version().flushed_lsn(),
+            2,
+            "flushed_lsn must be held back by in-flight LSN"
+        );
+
+        // Drop the guard — simulates the memtable write completing.
+        drop(_inflight_guard);
+
+        // safe_log_gc_lsn should also reflect the cleared in-flight.
+        // No more in-flight, no memtable data → safe = flushed_lsn = 2.
+        assert_eq!(engine.safe_log_gc_lsn(), 2);
+    }
+
+    #[tokio::test]
+    async fn test_safe_log_gc_lsn_accounts_for_in_flight() {
+        let dir = TempDir::new().unwrap();
+        let config = LsmConfig::builder(dir.path())
+            .memtable_size(4096)
+            .build()
+            .unwrap();
+        let engine = LsmEngine::open(config).unwrap();
+
+        // Write LSN 1..3 and flush.
+        for i in 1..=3u64 {
+            let mut wb = WriteBatch::new();
+            wb.put(format!("key{i}").into_bytes(), b"val".to_vec());
+            wb.set_commit_ts(i);
+            wb.set_clog_lsn(i);
+            engine.write_batch(wb).unwrap();
+        }
+        engine.freeze_active();
+        let frozen = {
+            let state = engine.state.read();
+            state.frozen.front().cloned().unwrap()
+        };
+        engine.flush_memtable_async(&frozen).await.unwrap();
+        // flushed_lsn = 3, no memtable data.
+        assert_eq!(engine.safe_log_gc_lsn(), 3);
+
+        // Now simulate an in-flight at LSN=2 (e.g., a late-arriving write).
+        let _guard = engine.in_flight_tracker.register(2);
+        // safe_log_gc_lsn must be capped at min(3, 2-1) = 1.
+        assert_eq!(
+            engine.safe_log_gc_lsn(),
+            1,
+            "safe_log_gc_lsn held back by in-flight"
+        );
+
+        drop(_guard);
+        assert_eq!(engine.safe_log_gc_lsn(), 3, "restored after in-flight clears");
+    }
+
+    #[tokio::test]
+    async fn test_in_flight_with_multiple_flushes() {
+        // Verify that in-flight tracking works correctly across multiple
+        // flush cycles — the tracker doesn't accumulate stale entries.
+        let dir = TempDir::new().unwrap();
+        let config = LsmConfig::builder(dir.path())
+            .memtable_size(4096) // Large enough to hold all keys per cycle
+            .max_frozen_memtables(4)
+            .build()
+            .unwrap();
+        let engine = LsmEngine::open(config).unwrap();
+
+        // Cycle 1: write LSN 1..3, flush without in-flight.
+        for i in 1..=3u64 {
+            let mut wb = WriteBatch::new();
+            wb.put(format!("a{i}").into_bytes(), b"v".to_vec());
+            wb.set_commit_ts(i);
+            wb.set_clog_lsn(i);
+            engine.write_batch(wb).unwrap();
+        }
+        engine.freeze_active();
+        let f1 = {
+            let state = engine.state.read();
+            state.frozen.front().cloned().unwrap()
+        };
+        engine.flush_memtable_async(&f1).await.unwrap();
+        assert_eq!(engine.current_version().flushed_lsn(), 3);
+
+        // Cycle 2: write LSN 4..6, hold in-flight at LSN=5 during flush.
+        for i in 4..=6u64 {
+            let mut wb = WriteBatch::new();
+            wb.put(format!("b{i}").into_bytes(), b"v".to_vec());
+            wb.set_commit_ts(i);
+            wb.set_clog_lsn(i);
+            engine.write_batch(wb).unwrap();
+        }
+        engine.freeze_active();
+        let f2 = {
+            let state = engine.state.read();
+            state.frozen.front().cloned().unwrap()
+        };
+
+        // Hold in-flight at LSN=5 during second flush.
+        let _guard = engine.in_flight_tracker.register(5);
+        engine.flush_memtable_async(&f2).await.unwrap();
+        // safe = min(max_lsn=6, in_flight=5-1=4) = 4
+        // flushed_lsn = max(prev=3, safe=4) = 4
+        assert_eq!(engine.current_version().flushed_lsn(), 4);
+
+        drop(_guard);
+
+        // Cycle 3: write LSN 7..9, flush without in-flight → should advance.
+        for i in 7..=9u64 {
+            let mut wb = WriteBatch::new();
+            wb.put(format!("c{i}").into_bytes(), b"v".to_vec());
+            wb.set_commit_ts(i);
+            wb.set_clog_lsn(i);
+            engine.write_batch(wb).unwrap();
+        }
+        engine.freeze_active();
+        let f3 = {
+            let state = engine.state.read();
+            state.frozen.front().cloned().unwrap()
+        };
+        engine.flush_memtable_async(&f3).await.unwrap();
+        // No in-flight, no remaining memtables → flushed_lsn = 9.
+        assert_eq!(engine.current_version().flushed_lsn(), 9);
     }
 }
