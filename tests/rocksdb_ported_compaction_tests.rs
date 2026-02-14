@@ -1490,7 +1490,7 @@ async fn test_write_stall_e2e() {
                     let mut batch = WriteBatch::new();
                     batch.set_commit_ts(ts);
                     batch.put(key.clone().into_bytes(), value.clone());
-                    match eng.write_batch(batch) {
+                    match eng.write_batch_async(batch).await {
                         Ok(()) => break,
                         Err(e) if e.to_string().contains("frozen memtables") => {
                             tokio::time::sleep(Duration::from_millis(1)).await;

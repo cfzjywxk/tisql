@@ -816,21 +816,24 @@ impl LsmEngine {
         }
     }
 
-    /// Check write backpressure conditions and return error or sleep briefly.
+    /// Check write backpressure conditions. Returns the L0 slowdown delay (if any)
+    /// or an error for frozen memtable stall.
     ///
     /// Two tiers:
     /// 1. **L0 slowdown**: If L0 file count is in `[slowdown_trigger, stop_trigger)`,
-    ///    sleep with a linearly increasing delay (1ms → 100ms).
+    ///    returns `Ok(Some(delay))` with a linearly increasing delay (1ms → 100ms).
     /// 2. **Frozen memtable stall**: If the active memtable is full AND frozen list
     ///    is at capacity, return error immediately (caller should retry after flush).
-    fn check_write_stall(&self) -> Result<()> {
-        // L0 slowdown: sleep proportionally
+    fn check_write_stall(&self) -> Result<Option<Duration>> {
+        // L0 slowdown: compute delay
         let l0_count = self.current_version().level_size(0);
-        if self.config.should_slowdown_writes(l0_count) && !self.config.should_stop_writes(l0_count)
+        let delay = if self.config.should_slowdown_writes(l0_count)
+            && !self.config.should_stop_writes(l0_count)
         {
-            let delay = self.compute_write_delay(l0_count);
-            std::thread::sleep(delay);
-        }
+            Some(self.compute_write_delay(l0_count))
+        } else {
+            None
+        };
 
         // Frozen memtable stall: reject immediately
         let state = self.state.read();
@@ -842,7 +845,7 @@ impl LsmEngine {
             ));
         }
 
-        Ok(())
+        Ok(delay)
     }
 
     /// Compute write delay for L0 slowdown. Linearly interpolates from 1ms to 100ms
@@ -857,6 +860,49 @@ impl LsmEngine {
         let excess = (l0_count.saturating_sub(slowdown).min(stop - slowdown)) as u64;
         let delay_ms = 1 + 99 * excess / range;
         Duration::from_millis(delay_ms)
+    }
+
+    /// Shared write logic: allocate LSN, write to memtable, maybe rotate.
+    fn write_batch_inner(&self, batch: WriteBatch) -> Result<()> {
+        // Use CLOG LSN if provided, otherwise allocate locally.
+        // Using the CLOG LSN ensures proper recovery ordering: when we flush
+        // the memtable to SST, the flushed_lsn in SST metadata matches the
+        // clog LSN, allowing recovery to correctly identify which clog entries
+        // have been persisted to storage.
+        let lsn = batch.clog_lsn().unwrap_or_else(|| self.alloc_lsn());
+
+        // Write to active memtable
+        {
+            let state = self.state.read();
+            state.active.write_batch_with_lsn(batch, lsn)?;
+        }
+
+        // Check if rotation is needed (non-blocking check)
+        // Actual rotation happens asynchronously or on next write
+        let _ = self.maybe_rotate();
+
+        Ok(())
+    }
+
+    /// Async version of `write_batch` — uses `tokio::time::sleep` for L0 slowdown
+    /// instead of blocking the thread. Prefer this over the sync trait method
+    /// when calling from an async context.
+    pub async fn write_batch_async(&self, batch: WriteBatch) -> Result<()> {
+        // L0 write backpressure: reject writes when too many L0 files accumulate
+        let l0_count = self.current_version().level_size(0);
+        if self.config.should_stop_writes(l0_count) {
+            return Err(TiSqlError::Storage(
+                "Too many L0 files, writes temporarily stopped for compaction".into(),
+            ));
+        }
+
+        // Slow down or reject if L0 files are accumulating or frozen memtables at capacity.
+        // Yields the async task instead of blocking the thread.
+        if let Some(delay) = self.check_write_stall()? {
+            tokio::time::sleep(delay).await;
+        }
+
+        self.write_batch_inner(batch)
     }
 
     /// Perform one round of compaction.
@@ -2324,27 +2370,14 @@ impl StorageEngine for LsmEngine {
             ));
         }
 
-        // Slow down or reject if L0 files are accumulating or frozen memtables at capacity
-        self.check_write_stall()?;
-
-        // Use CLOG LSN if provided, otherwise allocate locally.
-        // Using the CLOG LSN ensures proper recovery ordering: when we flush
-        // the memtable to SST, the flushed_lsn in SST metadata matches the
-        // clog LSN, allowing recovery to correctly identify which clog entries
-        // have been persisted to storage.
-        let lsn = batch.clog_lsn().unwrap_or_else(|| self.alloc_lsn());
-
-        // Write to active memtable
-        {
-            let state = self.state.read();
-            state.active.write_batch_with_lsn(batch, lsn)?;
+        // Slow down or reject if L0 files are accumulating or frozen memtables at capacity.
+        // Uses blocking sleep — only safe during recovery (startup, no tokio runtime).
+        // For async callers, use `write_batch_async()` instead.
+        if let Some(delay) = self.check_write_stall()? {
+            std::thread::sleep(delay);
         }
 
-        // Check if rotation is needed (non-blocking check)
-        // Actual rotation happens asynchronously or on next write
-        let _ = self.maybe_rotate();
-
-        Ok(())
+        self.write_batch_inner(batch)
     }
 }
 
@@ -2463,10 +2496,7 @@ impl PessimisticStorage for LsmEngine {
         }
 
         // Check SST files via async point lookup
-        self.get_from_sst(key, read_ts)
-            .await
-            .ok()
-            .flatten()
+        self.get_from_sst(key, read_ts).await.ok().flatten()
     }
 }
 
@@ -3440,12 +3470,9 @@ mod tests {
         assert!(!ssts.is_empty(), "Should have at least one SST");
 
         let sst_path = config.sst_dir().join(format!("{:08}.sst", ssts[0].id));
-        let reader = SstReaderRef::open(
-            &sst_path,
-            crate::io::IoService::new_for_test(32).unwrap(),
-        )
-        .await
-        .unwrap();
+        let reader = SstReaderRef::open(&sst_path, crate::io::IoService::new_for_test(32).unwrap())
+            .await
+            .unwrap();
         let mut iter = SstIterator::new(reader).unwrap();
         iter.seek_to_first().await.unwrap(); // Position the iterator
 
@@ -6965,7 +6992,10 @@ mod tests {
         engine
             .put_pending(b"key1", LOCK.to_vec(), owner_ts)
             .unwrap();
-        assert!(engine.get_with_owner(b"key1", owner_ts, owner_ts).await.is_none());
+        assert!(engine
+            .get_with_owner(b"key1", owner_ts, owner_ts)
+            .await
+            .is_none());
 
         // After finalize, LOCK is aborted → key doesn't exist
         engine.finalize_pending(&[b"key1".to_vec()], owner_ts, 200);
