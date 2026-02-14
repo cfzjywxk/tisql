@@ -87,7 +87,7 @@ help:
 	@echo "Targets:"
 	@echo "  build        Build the project (debug)"
 	@echo "  release      Build the project (release)"
-	@echo "  test         Run all tests (unit + store + e2e)"
+	@echo "  test         Run all tests (unit + store + storage + e2e)"
 	@echo "  unit-test    Run unit tests only"
 	@echo "  store-test   Run store tests only"
 	@echo "  storage-test Run storage regression tests"

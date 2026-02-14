@@ -20,7 +20,7 @@ make test
 
 ## Test Categories
 
-TiSQL has three categories of tests:
+TiSQL has four categories of tests:
 
 | Category | Location | Description |
 |----------|----------|-------------|
