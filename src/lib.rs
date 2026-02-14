@@ -73,7 +73,7 @@ pub mod testkit {
     //! This module exposes internal implementation details for integration tests.
     //! These are NOT part of the public API and may change without notice.
     pub use crate::clog::{
-        ClogBatch, ClogEntry, ClogOp, FileClogConfig, FileClogService, TruncateStats,
+        ClogBatch, ClogEntry, ClogOp, ClogOpRef, FileClogConfig, FileClogService, TruncateStats,
     };
 
     // Arena (from util - it's a general-purpose allocator)

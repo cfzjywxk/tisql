@@ -2120,3 +2120,335 @@ async fn test_log_gc_repeated_cycles_never_over_truncate() {
 
     scenario.teardown();
 }
+
+// ============================================================================
+// Multi-Entry Transaction + Log GC Tests
+//
+// These tests verify that clog truncation respects transaction boundaries:
+// when write_ops() creates Put(lsn=N), Put(lsn=N+1), Commit(lsn=N+2),
+// truncate_to() must keep or remove the entire group atomically.
+// ============================================================================
+
+/// Write a multi-key transaction using write_ops (separate LSN per entry).
+///
+/// This mirrors the production path: `TxnService::commit()` calls `clog.write_ops()`
+/// which allocates Put(lsn=N), Put(lsn=N+1), ..., Commit(lsn=N+K).
+/// Returns the commit_lsn (highest LSN, i.e. the Commit entry's LSN).
+async fn write_durable_multi_put(
+    engine: &LsmEngine,
+    clog: &FileClogService,
+    txn_id: u64,
+    keys_values: &[(&[u8], &[u8])],
+    commit_ts: u64,
+) -> u64 {
+    use tisql::testkit::ClogOpRef;
+
+    let ops: Vec<ClogOpRef<'_>> = keys_values
+        .iter()
+        .map(|(k, v)| ClogOpRef::Put { key: k, value: v })
+        .collect();
+
+    let commit_lsn = clog
+        .write_ops(txn_id, &ops, commit_ts, true)
+        .unwrap()
+        .await
+        .unwrap();
+
+    // Apply to memtable with commit_lsn (same as production path).
+    let mut wb = WriteBatch::new();
+    for (k, v) in keys_values {
+        wb.put(k.to_vec(), v.to_vec());
+    }
+    wb.set_commit_ts(commit_ts);
+    wb.set_clog_lsn(commit_lsn);
+    engine.write_batch(wb).unwrap();
+
+    commit_lsn
+}
+
+/// Test that GC + truncation preserves multi-entry transaction integrity.
+///
+/// Scenario:
+/// 1. Write T1 (single Put+Commit) and flush → fully in SST
+/// 2. Write T2 (3 Puts + Commit) → in active memtable
+/// 3. Run GC → T1 should be removed, T2 must be kept intact
+/// 4. Crash + recover → T2 must be fully recoverable
+#[tokio::test]
+async fn test_gc_preserves_multi_entry_txn_on_recovery() {
+    let scenario = fail::FailScenario::setup();
+    let dir = tempfile::tempdir().unwrap();
+
+    let (engine, ilog, clog) = create_test_lsm_engine_with_unified_logs(&dir).await;
+
+    // T1: single-key autocommit, flush to SST
+    let t1_lsn = write_durable_put(&engine, &clog, 1, b"t1_key", b"t1_value", 100).await;
+    engine.flush_all_with_active().unwrap();
+    ilog.sync().unwrap();
+
+    let flushed_after_t1 = engine.current_version().flushed_lsn();
+    assert!(flushed_after_t1 >= t1_lsn);
+
+    // T2: multi-key transaction (3 Puts + Commit → 4 clog entries with sequential LSNs)
+    let t2_keys: Vec<(&[u8], &[u8])> = vec![
+        (b"t2_key_a", b"t2_val_a"),
+        (b"t2_key_b", b"t2_val_b"),
+        (b"t2_key_c", b"t2_val_c"),
+    ];
+    let t2_commit_lsn = write_durable_multi_put(&engine, &clog, 2, &t2_keys, 200).await;
+
+    // Verify T2 data is readable from memtable
+    for (k, v) in &t2_keys {
+        let got = engine.get(k).await.unwrap();
+        assert_eq!(got.as_deref(), Some(*v));
+    }
+
+    // Run GC cycle
+    let stats = run_log_gc_cycle(&engine, &ilog, &clog).unwrap();
+
+    // Verify: T2 must be atomic in clog (all 4 entries or 0)
+    let remaining = clog.read_all().unwrap();
+    let t2_entries: Vec<_> = remaining.iter().filter(|e| e.txn_id == 2).collect();
+    assert!(
+        t2_entries.len() == 4 || t2_entries.is_empty(),
+        "T2 must be atomic in clog: found {} entries (expected 4 or 0). safe_lsn={}, commit_lsn={}",
+        t2_entries.len(),
+        stats.safe_lsn,
+        t2_commit_lsn,
+    );
+
+    // Crash + recover
+    drop(engine);
+    drop(ilog);
+    drop(clog);
+
+    let recovered = recover_engine(&dir).await;
+
+    // T1 must survive (in SST)
+    let got_t1 = recovered.engine.get(b"t1_key").await.unwrap();
+    assert_eq!(got_t1, Some(b"t1_value".to_vec()));
+
+    // T2 must survive (replayed from clog)
+    for (k, v) in &t2_keys {
+        let got = recovered.engine.get(k).await.unwrap();
+        assert_eq!(
+            got.as_deref(),
+            Some(*v),
+            "T2 key {:?} must survive GC + crash recovery",
+            String::from_utf8_lossy(k)
+        );
+    }
+
+    scenario.teardown();
+}
+
+/// Test multiple GC cycles interleaved with multi-entry writes and flushes.
+#[tokio::test]
+async fn test_gc_multi_entry_repeated_cycles() {
+    let scenario = fail::FailScenario::setup();
+    let dir = tempfile::tempdir().unwrap();
+
+    let (engine, ilog, clog) = create_test_lsm_engine_with_unified_logs(&dir).await;
+
+    let mut all_keys = Vec::new();
+
+    for cycle in 0..4u64 {
+        let keys: Vec<(Vec<u8>, Vec<u8>)> = (0..3)
+            .map(|i| {
+                (
+                    format!("cycle{cycle}_key{i}").into_bytes(),
+                    format!("cycle{cycle}_val{i}").into_bytes(),
+                )
+            })
+            .collect();
+        let refs: Vec<(&[u8], &[u8])> = keys
+            .iter()
+            .map(|(k, v)| (k.as_slice(), v.as_slice()))
+            .collect();
+
+        write_durable_multi_put(&engine, &clog, cycle * 10 + 1, &refs, 100 + cycle).await;
+
+        for (k, v) in &keys {
+            all_keys.push((k.clone(), v.clone()));
+        }
+
+        // Flush everything
+        engine.flush_all_with_active().unwrap();
+        ilog.sync().unwrap();
+
+        // Run GC
+        let stats = run_log_gc_cycle(&engine, &ilog, &clog).unwrap();
+
+        // After flush + GC, no orphaned commits should remain
+        let remaining = clog.read_all().unwrap();
+        let mut txn_has_writes: std::collections::HashMap<u64, bool> =
+            std::collections::HashMap::new();
+        for entry in &remaining {
+            match &entry.op {
+                tisql::testkit::ClogOp::Put { .. } => {
+                    txn_has_writes.insert(entry.txn_id, true);
+                }
+                tisql::testkit::ClogOp::Commit { .. } => {
+                    assert!(
+                        txn_has_writes.get(&entry.txn_id).copied().unwrap_or(false),
+                        "Orphaned Commit at cycle {cycle}: txn={}, lsn={}, safe_lsn={}",
+                        entry.txn_id,
+                        entry.lsn,
+                        stats.safe_lsn,
+                    );
+                }
+                _ => {}
+            }
+        }
+    }
+
+    // Crash + recover — all data must survive
+    drop(engine);
+    drop(ilog);
+    drop(clog);
+
+    let recovered = recover_engine(&dir).await;
+    for (k, v) in &all_keys {
+        let got = recovered.engine.get(k).await.unwrap();
+        assert_eq!(
+            got.as_deref(),
+            Some(v.as_slice()),
+            "key {:?} must survive repeated multi-entry GC cycles + crash",
+            String::from_utf8_lossy(k)
+        );
+    }
+
+    scenario.teardown();
+}
+
+/// Test GC with interleaved flushed and unflushed multi-entry transactions.
+#[tokio::test]
+async fn test_gc_interleaved_flushed_unflushed_multi_entry() {
+    let scenario = fail::FailScenario::setup();
+    let dir = tempfile::tempdir().unwrap();
+
+    let (engine, ilog, clog) = create_test_lsm_engine_with_unified_logs(&dir).await;
+
+    // T1: 3 Puts → frozen → flushed
+    let t1_kv: Vec<(&[u8], &[u8])> = vec![(b"t1_a", b"v1a"), (b"t1_b", b"v1b"), (b"t1_c", b"v1c")];
+    write_durable_multi_put(&engine, &clog, 1, &t1_kv, 100).await;
+    engine.freeze_active();
+
+    // T2: 2 Puts → in active memtable (NOT flushed)
+    let t2_kv: Vec<(&[u8], &[u8])> = vec![(b"t2_x", b"v2x"), (b"t2_y", b"v2y")];
+    let t2_commit_lsn = write_durable_multi_put(&engine, &clog, 2, &t2_kv, 200).await;
+
+    // Flush only the frozen memtable (T1)
+    let frozen_list: Vec<_> = {
+        let sv = engine.get_super_version();
+        sv.frozen.iter().cloned().collect()
+    };
+    assert!(!frozen_list.is_empty());
+    engine.flush_memtable_async(&frozen_list[0]).await.unwrap();
+    ilog.sync().unwrap();
+
+    // T2 is still in active memtable
+    let min_mem = engine.min_unflushed_lsn().unwrap();
+    assert!(min_mem <= t2_commit_lsn);
+
+    // GC cycle 1: T1 should be removable, T2 must be protected
+    let stats1 = run_log_gc_cycle(&engine, &ilog, &clog).unwrap();
+
+    // Verify T2 is intact in clog (2 Puts + Commit = 3 entries)
+    let remaining = clog.read_all().unwrap();
+    let t2_entries: Vec<_> = remaining.iter().filter(|e| e.txn_id == 2).collect();
+    assert_eq!(
+        t2_entries.len(),
+        3,
+        "T2 (2 Puts + Commit = 3 entries) must be intact after GC. safe_lsn={}",
+        stats1.safe_lsn,
+    );
+
+    // T3: 4 Puts (also unflushed)
+    let t3_kv: Vec<(&[u8], &[u8])> =
+        vec![(b"t3_p", b"v3p"), (b"t3_q", b"v3q"), (b"t3_r", b"v3r"), (b"t3_s", b"v3s")];
+    write_durable_multi_put(&engine, &clog, 3, &t3_kv, 300).await;
+
+    // GC cycle 2: both T2 and T3 must survive
+    let _stats2 = run_log_gc_cycle(&engine, &ilog, &clog).unwrap();
+
+    // Crash + recover
+    drop(engine);
+    drop(ilog);
+    drop(clog);
+
+    let recovered = recover_engine(&dir).await;
+
+    for (k, v) in &t1_kv {
+        let got = recovered.engine.get(k).await.unwrap();
+        assert_eq!(got.as_deref(), Some(*v), "T1 key {:?} must survive", k);
+    }
+    for (k, v) in &t2_kv {
+        let got = recovered.engine.get(k).await.unwrap();
+        assert_eq!(got.as_deref(), Some(*v), "T2 key {:?} must survive", k);
+    }
+    for (k, v) in &t3_kv {
+        let got = recovered.engine.get(k).await.unwrap();
+        assert_eq!(got.as_deref(), Some(*v), "T3 key {:?} must survive", k);
+    }
+
+    scenario.teardown();
+}
+
+/// Edge case: verify no orphaned Commit entries after GC with multi-entry txns.
+#[tokio::test]
+async fn test_gc_safe_lsn_splits_multi_entry_txn_boundary() {
+    let scenario = fail::FailScenario::setup();
+    let dir = tempfile::tempdir().unwrap();
+
+    let (engine, ilog, clog) = create_test_lsm_engine_with_unified_logs(&dir).await;
+
+    // Write T1 (single entry) and flush to set a known flushed_lsn
+    write_durable_put(&engine, &clog, 1, b"anchor", b"val", 50).await;
+    engine.flush_all_with_active().unwrap();
+    ilog.sync().unwrap();
+
+    // Write T2 with multiple Puts.
+    let t2_kv: Vec<(&[u8], &[u8])> = vec![(b"split_a", b"sa"), (b"split_b", b"sb"), (b"split_c", b"sc")];
+    let t2_commit_lsn = write_durable_multi_put(&engine, &clog, 2, &t2_kv, 200).await;
+
+    // Verify T2's entries have sequential LSNs
+    let all_entries = clog.read_all().unwrap();
+    let t2_entries: Vec<_> = all_entries.iter().filter(|e| e.txn_id == 2).collect();
+    assert_eq!(t2_entries.len(), 4); // 3 Puts + 1 Commit
+    let t2_min_lsn = t2_entries.iter().map(|e| e.lsn).min().unwrap();
+    let t2_max_lsn = t2_entries.iter().map(|e| e.lsn).max().unwrap();
+    assert_eq!(t2_max_lsn, t2_commit_lsn);
+
+    // Run GC
+    let stats = run_log_gc_cycle(&engine, &ilog, &clog).unwrap();
+
+    // The critical check: T2 must be fully intact or fully removed
+    let after_gc = clog.read_all().unwrap();
+    let t2_after: Vec<_> = after_gc.iter().filter(|e| e.txn_id == 2).collect();
+    assert!(
+        t2_after.len() == 4 || t2_after.is_empty(),
+        "T2 must be atomic: got {} entries (expected 4 or 0). safe_lsn={}, t2_range=[{},{}]",
+        t2_after.len(),
+        stats.safe_lsn,
+        t2_min_lsn,
+        t2_max_lsn,
+    );
+
+    // Crash + recover
+    drop(engine);
+    drop(ilog);
+    drop(clog);
+
+    let recovered = recover_engine(&dir).await;
+    for (k, v) in &t2_kv {
+        let got = recovered.engine.get(k).await.unwrap();
+        assert_eq!(
+            got.as_deref(),
+            Some(*v),
+            "T2 key {:?} must survive GC + crash when safe_lsn could split entries",
+            String::from_utf8_lossy(k),
+        );
+    }
+
+    scenario.teardown();
+}
