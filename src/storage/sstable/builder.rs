@@ -48,12 +48,14 @@
 use std::fs::File;
 use std::io::{BufWriter, Write};
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 
 use serde::{Deserialize, Serialize};
 
 use std::collections::HashMap;
 
 use crate::error::{Result, TiSqlError};
+use crate::io::{AlignedBuf, DmaFile, IoService, DMA_ALIGNMENT};
 use crate::storage::mvcc::extract_key;
 use crate::types::Timestamp;
 use crate::util::fs::sync_dir;
@@ -635,6 +637,257 @@ impl SstBuilder {
 }
 
 impl Drop for SstBuilder {
+    fn drop(&mut self) {
+        // If not finished, try to clean up the partial file
+        if !self.finished && self.path.exists() {
+            let _ = std::fs::remove_file(&self.path);
+        }
+    }
+}
+
+/// Async builder for creating SST files via io_uring-backed writes.
+///
+/// This mirrors `SstBuilder` semantics but executes writes/fsync through
+/// `IoService` so flush/compaction paths can stay async end-to-end.
+pub struct AsyncSstBuilder {
+    /// Output file path
+    path: PathBuf,
+    /// File descriptor for io_uring writes (opened without O_DIRECT for unaligned appends)
+    file: DmaFile,
+    /// Shared io_uring service
+    io: Arc<IoService>,
+    /// Builder options
+    options: SstBuilderOptions,
+    /// Current data block builder
+    data_block: DataBlockBuilder,
+    /// Index block builder
+    index_block: IndexBlockBuilder,
+    /// Current write offset in file
+    current_offset: u64,
+    /// Number of entries written
+    entry_count: u64,
+    /// Number of data blocks written
+    block_count: u32,
+    /// First key in the entire SST
+    first_key: Option<Vec<u8>>,
+    /// Last key in the entire SST
+    last_key: Option<Vec<u8>>,
+    /// Minimum timestamp seen
+    min_ts: Timestamp,
+    /// Maximum timestamp seen
+    max_ts: Timestamp,
+    /// Whether the builder has been finished
+    finished: bool,
+}
+
+impl AsyncSstBuilder {
+    /// Create a new async SST builder.
+    pub fn new<P: AsRef<Path>>(
+        path: P,
+        options: SstBuilderOptions,
+        io: Arc<IoService>,
+    ) -> Result<Self> {
+        let path = path.as_ref().to_path_buf();
+        let file = DmaFile::open_write_buffered(&path).map_err(|e| {
+            TiSqlError::Storage(format!(
+                "Failed to open SST file for async write {}: {e}",
+                path.display()
+            ))
+        })?;
+
+        Ok(Self {
+            path,
+            file,
+            io,
+            data_block: DataBlockBuilder::with_block_size(options.block_size),
+            index_block: IndexBlockBuilder::new(),
+            options,
+            current_offset: 0,
+            entry_count: 0,
+            block_count: 0,
+            first_key: None,
+            last_key: None,
+            min_ts: Timestamp::MAX,
+            max_ts: 0,
+            finished: false,
+        })
+    }
+
+    /// Add a key-value entry.
+    ///
+    /// Keys must be added in sorted order. The key should include the MVCC
+    /// timestamp suffix (key || !commit_ts).
+    pub async fn add(&mut self, key: &[u8], value: &[u8]) -> Result<()> {
+        if self.finished {
+            return Err(TiSqlError::Storage("Builder already finished".into()));
+        }
+
+        // Track first/last key
+        if self.first_key.is_none() {
+            self.first_key = Some(key.to_vec());
+        }
+        self.last_key = Some(key.to_vec());
+
+        // Extract timestamp from MVCC key for min/max tracking
+        if key.len() >= 8 {
+            let ts_bytes: [u8; 8] = key[key.len() - 8..].try_into().unwrap();
+            // Key format: key || !commit_ts, so we need to invert
+            let ts = !u64::from_be_bytes(ts_bytes);
+            self.min_ts = self.min_ts.min(ts);
+            self.max_ts = self.max_ts.max(ts);
+        }
+
+        self.entry_count += 1;
+
+        // Try to add to current block
+        if !self.data_block.add(key, value) {
+            // Block is full, flush it and start a new one
+            self.flush_data_block().await?;
+
+            // Add to new block (should always succeed for first entry)
+            if !self.data_block.add(key, value) {
+                return Err(TiSqlError::Storage("Entry too large for block".into()));
+            }
+        }
+
+        Ok(())
+    }
+
+    /// Flush the current data block to disk via io_uring.
+    async fn flush_data_block(&mut self) -> Result<()> {
+        if self.data_block.is_empty() {
+            return Ok(());
+        }
+
+        let first_key = self.data_block.first_key().cloned().unwrap_or_default();
+        let block_data = std::mem::replace(
+            &mut self.data_block,
+            DataBlockBuilder::with_block_size(self.options.block_size),
+        )
+        .finish();
+
+        let block_offset = self.current_offset;
+        let block_size = block_data.len() as u32;
+        self.write_all(&block_data).await?;
+
+        // Add index entry
+        self.index_block
+            .add_entry(&first_key, block_offset, block_size);
+        self.block_count += 1;
+
+        Ok(())
+    }
+
+    /// Write a byte slice at the current append offset.
+    async fn write_all(&mut self, data: &[u8]) -> Result<()> {
+        if data.is_empty() {
+            return Ok(());
+        }
+
+        let buf = AlignedBuf::from_slice(data, DMA_ALIGNMENT);
+        let written = self
+            .io
+            .write_at(&self.file, self.current_offset, buf)
+            .await
+            .map_err(|e| {
+                TiSqlError::Storage(format!(
+                    "io_uring write failed for {}: {e}",
+                    self.path.display()
+                ))
+            })?;
+
+        if written != data.len() {
+            return Err(TiSqlError::Storage(format!(
+                "Short io_uring write for {}: wrote {written} of {} bytes",
+                self.path.display(),
+                data.len()
+            )));
+        }
+
+        self.current_offset += written as u64;
+        Ok(())
+    }
+
+    /// Finish building the SST and return metadata.
+    pub async fn finish(mut self, sst_id: u64, level: u32) -> Result<SstMeta> {
+        if self.finished {
+            return Err(TiSqlError::Storage("Builder already finished".into()));
+        }
+        self.finished = true;
+
+        // Flush remaining data block
+        self.flush_data_block().await?;
+
+        // Write index block
+        let index_offset = self.current_offset;
+        let index_data = std::mem::take(&mut self.index_block).finish();
+        let index_size = index_data.len() as u32;
+        self.write_all(&index_data).await?;
+
+        // Build and write footer
+        let footer = Footer {
+            index_offset,
+            index_size,
+            num_blocks: self.block_count,
+            num_entries: self.entry_count,
+            min_ts: if self.min_ts == Timestamp::MAX {
+                0
+            } else {
+                self.min_ts
+            },
+            max_ts: self.max_ts,
+            compression: self.options.compression,
+        };
+
+        self.write_all(&footer.encode()).await?;
+
+        // Fsync data via io_uring
+        self.io.fsync(&self.file).await.map_err(|e| {
+            TiSqlError::Storage(format!(
+                "io_uring fsync failed for {}: {e}",
+                self.path.display()
+            ))
+        })?;
+
+        // Sync parent directory to make the file's existence durable
+        if let Some(parent) = self.path.parent() {
+            sync_dir(parent)?;
+        }
+
+        let file_size = self.current_offset;
+
+        Ok(SstMeta {
+            id: sst_id,
+            level,
+            smallest_key: self.first_key.take().unwrap_or_default(),
+            largest_key: self.last_key.take().unwrap_or_default(),
+            file_size,
+            entry_count: self.entry_count,
+            block_count: self.block_count,
+            min_ts: if self.min_ts == Timestamp::MAX {
+                0
+            } else {
+                self.min_ts
+            },
+            max_ts: self.max_ts,
+            created_at: std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_secs())
+                .unwrap_or(0),
+        })
+    }
+
+    /// Abort building and delete the partial file.
+    pub fn abort(mut self) -> Result<()> {
+        self.finished = true;
+        if self.path.exists() {
+            std::fs::remove_file(&self.path)?;
+        }
+        Ok(())
+    }
+}
+
+impl Drop for AsyncSstBuilder {
     fn drop(&mut self) {
         // If not finished, try to clean up the partial file
         if !self.finished && self.path.exists() {

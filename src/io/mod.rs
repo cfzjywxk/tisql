@@ -36,7 +36,7 @@ mod aligned_buf;
 mod dma_file;
 mod service;
 
-pub use aligned_buf::AlignedBuf;
+pub use aligned_buf::{AlignedBuf, DMA_ALIGNMENT};
 pub use dma_file::DmaFile;
 pub use service::{IoFuture, IoService};
 

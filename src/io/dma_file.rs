@@ -105,6 +105,28 @@ impl DmaFile {
         })
     }
 
+    /// Open or create a file for writing without O_DIRECT.
+    ///
+    /// This is useful for workloads that need unaligned writes while still using
+    /// io_uring for async submission/completion.
+    pub fn open_write_buffered(path: impl AsRef<Path>) -> io::Result<Self> {
+        let path = path.as_ref();
+        let c_path = path_to_cstring(path)?;
+        let mode = 0o644;
+        let flags = libc::O_WRONLY | libc::O_CREAT | libc::O_TRUNC;
+        let fd = unsafe { libc::open(c_path.as_ptr(), flags, mode) };
+        if fd < 0 {
+            return Err(io::Error::last_os_error());
+        }
+
+        let owned_fd = unsafe { OwnedFd::from_raw_fd(fd) };
+        Ok(Self {
+            fd: owned_fd,
+            path: path.to_path_buf(),
+            file_size: 0,
+        })
+    }
+
     /// Open or create a file for reading and writing with O_DIRECT (fallback to standard I/O).
     pub fn open_read_write(path: impl AsRef<Path>) -> io::Result<Self> {
         let path = path.as_ref();

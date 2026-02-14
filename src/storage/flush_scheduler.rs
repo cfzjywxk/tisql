@@ -168,7 +168,7 @@ impl FlushSchedulerInner {
             let frozen_count = self.engine.frozen_count();
 
             if frozen_count > 0 {
-                match self.engine.flush_all() {
+                match self.engine.flush_all_async().await {
                     Ok(metas) => {
                         if !metas.is_empty() {
                             self.flush_count
@@ -193,16 +193,16 @@ impl FlushSchedulerInner {
             }
         }
 
-        self.final_flush();
+        self.final_flush().await;
         tracing::info!("Flush worker stopped");
     }
 
     /// Final flush on shutdown — drain any remaining frozen memtables.
-    fn final_flush(&self) {
+    async fn final_flush(&self) {
         let frozen_count = self.engine.frozen_count();
         if frozen_count > 0 {
             tracing::info!("Final flush of {frozen_count} frozen memtables on shutdown");
-            if let Err(e) = self.engine.flush_all() {
+            if let Err(e) = self.engine.flush_all_async().await {
                 tracing::error!("Final flush failed: {e}");
             }
         }

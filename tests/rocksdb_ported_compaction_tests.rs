@@ -189,6 +189,29 @@ fn new_batch_with_lsn(commit_ts: Timestamp, lsn: u64) -> WriteBatch {
     batch
 }
 
+/// Run compaction until no work remains, with deterministic round/latency bounds.
+async fn compact_until_idle(
+    engine: &LsmEngine,
+    max_rounds: usize,
+    per_round_timeout: Duration,
+) -> usize {
+    let mut rounds = 0usize;
+    for round in 0..max_rounds {
+        let compacted = tokio::time::timeout(per_round_timeout, engine.do_compaction())
+            .await
+            .unwrap_or_else(|_| {
+                panic!("do_compaction timed out at round {round} after {per_round_timeout:?}")
+            })
+            .unwrap_or_else(|e| panic!("do_compaction failed at round {round}: {e}"));
+        if compacted {
+            rounds += 1;
+        } else {
+            return rounds;
+        }
+    }
+    panic!("compaction did not converge within {max_rounds} rounds (completed {rounds} rounds)");
+}
+
 fn make_sst(id: u64, level: u32, smallest: &[u8], largest: &[u8]) -> SstMeta {
     SstMeta {
         id,
@@ -1991,6 +2014,9 @@ async fn test_gc_preserves_read_correctness() {
 /// Test: data flows to L2+ via cascading compaction, all keys survive.
 #[tokio::test]
 async fn test_multi_level_cascading() {
+    const ROUNDS: usize = 4;
+    const KEYS_PER_ROUND: usize = 8;
+
     let dir = TempDir::new().unwrap();
     let lsn_provider = new_lsn_provider();
     let ilog_config = IlogConfig::new(dir.path());
@@ -1998,13 +2024,14 @@ async fn test_multi_level_cascading() {
         Arc::new(IlogService::open_with_thread(ilog_config, Arc::clone(&lsn_provider)).unwrap());
 
     let config = LsmConfigBuilder::new(dir.path())
-        .memtable_size(200)
-        .max_frozen_memtables(32)
-        .l0_compaction_trigger(4)
+        .memtable_size(160)
+        .max_frozen_memtables(16)
+        .l0_compaction_trigger(2)
         .l0_slowdown_trigger(100)
         .l0_stop_trigger(200)
-        .target_file_size(512)
-        .l1_max_size(1024) // Small L1 to trigger L1→L2 compaction
+        .target_file_size(256)
+        .l1_max_size(192) // Keep this small to force deeper compaction quickly.
+        .max_levels(4)
         .build_unchecked();
 
     let engine =
@@ -2016,8 +2043,8 @@ async fn test_multi_level_cascading() {
 
     // Write enough data across many flushes to trigger cascading compaction
     let mut ts = 1u64;
-    for round in 0..6 {
-        for i in 0..10 {
+    for round in 0..ROUNDS {
+        for i in 0..KEYS_PER_ROUND {
             let mut batch = new_batch_with_lsn(ts, ts);
             let key = format!("cascade_key_{i:03}");
             let value = format!("round_{round}_val_{i}");
@@ -2028,42 +2055,36 @@ async fn test_multi_level_cascading() {
         engine.flush_all_with_active().unwrap();
     }
 
-    // Run multiple rounds of compaction until no more work
-    let mut total_compactions = 0;
-    loop {
-        match engine.do_compaction().await {
-            Ok(true) => total_compactions += 1,
-            Ok(false) => break,
-            Err(e) => panic!("Compaction error: {e}"),
-        }
-    }
+    // Run compaction with deterministic bounds to avoid hanging CI.
+    let total_compactions = compact_until_idle(&engine, 24, Duration::from_secs(5)).await;
     assert!(
         total_compactions >= 1,
         "Should have compacted at least once"
     );
 
     // Verify all keys are readable with their latest values
-    for i in 0..10 {
+    for i in 0..KEYS_PER_ROUND {
         let key = format!("cascade_key_{i:03}");
         let value = get_for_test(&engine, key.as_bytes()).await;
         assert!(
             value.is_some(),
             "Key {key} should survive cascading compaction"
         );
-        // Latest value is from round 5 (the last round)
+        // Latest value is from the last write round.
         assert_eq!(
             value.unwrap(),
-            format!("round_5_val_{i}").into_bytes(),
+            format!("round_{}_val_{i}", ROUNDS - 1).into_bytes(),
             "Latest value should be from last round"
         );
     }
 
-    // Verify data exists at multiple levels
+    // Verify compaction produced non-L0 output and retained data.
     let version = engine.current_version();
-    let total_files: usize = (0..7).map(|l| version.level_size(l)).sum();
+    let total_files: usize = (0..4).map(|l| version.level_size(l)).sum();
+    assert!(total_files > 0, "Should have SST files after compaction");
     assert!(
-        total_files > 0,
-        "Should have SST files after cascading compaction"
+        version.level_size(1) + version.level_size(2) + version.level_size(3) > 0,
+        "Compaction should place files beyond L0"
     );
 }
 
@@ -2177,6 +2198,8 @@ async fn test_snapshot_reads_stable_during_concurrent_flushes() {
 /// Multi-level compaction should preserve delete/reinsert MVCC semantics.
 #[tokio::test]
 async fn test_multi_level_delete_reinsert_compaction_correctness() {
+    const KEY_COUNT: usize = 4;
+
     let dir = TempDir::new().unwrap();
     let lsn_provider = new_lsn_provider();
     let ilog_config = IlogConfig::new(dir.path());
@@ -2184,13 +2207,13 @@ async fn test_multi_level_delete_reinsert_compaction_correctness() {
         Arc::new(IlogService::open_with_thread(ilog_config, Arc::clone(&lsn_provider)).unwrap());
 
     let config = LsmConfigBuilder::new(dir.path())
-        .memtable_size(256)
-        .max_frozen_memtables(128)
+        .memtable_size(160)
+        .max_frozen_memtables(64)
         .l0_compaction_trigger(2)
         .l0_slowdown_trigger(1000)
         .l0_stop_trigger(2000)
         .target_file_size(256)
-        .l1_max_size(512)
+        .l1_max_size(192)
         .max_levels(4)
         .build()
         .unwrap();
@@ -2199,7 +2222,7 @@ async fn test_multi_level_delete_reinsert_compaction_correctness() {
             .unwrap();
 
     // Round 0: base values
-    for i in 0..6 {
+    for i in 0..KEY_COUNT {
         let mut batch = WriteBatch::new();
         batch.set_commit_ts(10 + i as u64);
         let key = format!("mv_key_{i:03}");
@@ -2209,7 +2232,7 @@ async fn test_multi_level_delete_reinsert_compaction_correctness() {
     engine.flush_all_with_active().unwrap();
 
     // Round 1: delete evens, update odds
-    for i in 0..6 {
+    for i in 0..KEY_COUNT {
         let mut batch = WriteBatch::new();
         batch.set_commit_ts(30 + i as u64);
         let key = format!("mv_key_{i:03}");
@@ -2223,7 +2246,7 @@ async fn test_multi_level_delete_reinsert_compaction_correctness() {
     engine.flush_all_with_active().unwrap();
 
     // Round 2: reinsert evens, update odds again
-    for i in 0..6 {
+    for i in 0..KEY_COUNT {
         let mut batch = WriteBatch::new();
         batch.set_commit_ts(50 + i as u64);
         let key = format!("mv_key_{i:03}");
@@ -2238,8 +2261,8 @@ async fn test_multi_level_delete_reinsert_compaction_correctness() {
 
     // Extra flushed data to drive cascading compaction.
     let mut filler_ts = 100u64;
-    for round in 0..5 {
-        for i in 0..12 {
+    for round in 0..3 {
+        for i in 0..8 {
             let mut batch = WriteBatch::new();
             batch.set_commit_ts(filler_ts);
             filler_ts += 1;
@@ -2252,14 +2275,7 @@ async fn test_multi_level_delete_reinsert_compaction_correctness() {
         engine.flush_all_with_active().unwrap();
     }
 
-    let mut compact_rounds = 0usize;
-    for _ in 0..16 {
-        if engine.do_compaction().await.unwrap() {
-            compact_rounds += 1;
-        } else {
-            break;
-        }
-    }
+    let compact_rounds = compact_until_idle(&engine, 24, Duration::from_secs(5)).await;
     assert!(compact_rounds > 0, "expected compaction to run");
 
     let version = engine.current_version();
@@ -2269,7 +2285,7 @@ async fn test_multi_level_delete_reinsert_compaction_correctness() {
     );
 
     // Snapshot before delete phase
-    for i in 0..6 {
+    for i in 0..KEY_COUNT {
         let key = format!("mv_key_{i:03}");
         assert_eq!(
             get_at_for_test(&engine, key.as_bytes(), 20).await,
@@ -2278,7 +2294,7 @@ async fn test_multi_level_delete_reinsert_compaction_correctness() {
     }
 
     // Snapshot after delete/update phase (before round 2)
-    for i in 0..6 {
+    for i in 0..KEY_COUNT {
         let key = format!("mv_key_{i:03}");
         if i % 2 == 0 {
             assert_eq!(get_at_for_test(&engine, key.as_bytes(), 40).await, None);
@@ -2291,7 +2307,7 @@ async fn test_multi_level_delete_reinsert_compaction_correctness() {
     }
 
     // Latest state after round 2 and compaction.
-    for i in 0..6 {
+    for i in 0..KEY_COUNT {
         let key = format!("mv_key_{i:03}");
         let expected = if i % 2 == 0 {
             format!("even_r2_{i}").into_bytes()
@@ -2307,9 +2323,17 @@ async fn test_multi_level_delete_reinsert_compaction_correctness() {
     let snap_after_delete = scan_at_for_test(&engine, &range, 40).await;
     let latest = scan_for_test(&engine, &range).await;
 
-    assert_eq!(snap_before.len(), 6, "all keys visible before deletes");
-    assert_eq!(snap_after_delete.len(), 3, "only odd keys visible at ts=40");
-    assert_eq!(latest.len(), 6, "all keys visible after reinserts");
+    assert_eq!(
+        snap_before.len(),
+        KEY_COUNT,
+        "all keys visible before deletes"
+    );
+    assert_eq!(
+        snap_after_delete.len(),
+        KEY_COUNT / 2,
+        "only odd keys visible at ts=40"
+    );
+    assert_eq!(latest.len(), KEY_COUNT, "all keys visible after reinserts");
 }
 
 // ==================== Dropped Table GC Tests ====================

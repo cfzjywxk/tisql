@@ -52,8 +52,8 @@ pub use block::{
 };
 
 pub use builder::{
-    CompressionType, Footer, SstBuilder, SstBuilderOptions, SstMeta, FOOTER_SIZE, SST_MAGIC,
-    SST_VERSION,
+    AsyncSstBuilder, CompressionType, Footer, SstBuilder, SstBuilderOptions, SstMeta, FOOTER_SIZE,
+    SST_MAGIC, SST_VERSION,
 };
 
 pub use reader::{SstReader, SstReaderRef};

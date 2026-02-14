@@ -52,7 +52,7 @@ use crate::types::{RawValue, Timestamp};
 
 use super::config::LsmConfig;
 use super::mvcc::{decode_mvcc_key, is_tombstone};
-use super::sstable::{SstBuilder, SstBuilderOptions, SstIterator, SstMeta, SstReaderRef};
+use super::sstable::{AsyncSstBuilder, SstBuilderOptions, SstIterator, SstMeta, SstReaderRef};
 use super::version::{ManifestDelta, Version};
 
 /// A compaction task describing which files to compact.
@@ -552,7 +552,7 @@ impl CompactionExecutor {
             block_size: self.config.block_size,
             compression: self.config.compression,
         };
-        let mut builder = SstBuilder::new(&output_path, options.clone())?;
+        let mut builder = AsyncSstBuilder::new(&output_path, options.clone(), Arc::clone(&io))?;
 
         // Merge and write output with optional GC filtering
         let mut output_ssts = Vec::new();
@@ -618,13 +618,13 @@ impl CompactionExecutor {
                 };
 
                 if should_emit {
-                    builder.add(&key, &value)?;
+                    builder.add(&key, &value).await?;
                     current_size += key.len() + value.len();
 
                     // Check if we should split to a new SST
                     if current_size >= self.config.target_file_size {
                         let sst_id = pre_allocated_ids[id_idx];
-                        let meta = builder.finish(sst_id, task.output_level)?;
+                        let meta = builder.finish(sst_id, task.output_level).await?;
                         output_ssts.push(meta);
                         id_idx += 1;
 
@@ -636,7 +636,8 @@ impl CompactionExecutor {
                         }
                         let new_id = pre_allocated_ids[id_idx];
                         let new_path = sst_dir.join(format!("{new_id:08}.sst"));
-                        builder = SstBuilder::new(&new_path, options.clone())?;
+                        builder =
+                            AsyncSstBuilder::new(&new_path, options.clone(), Arc::clone(&io))?;
                         current_size = 0;
                     }
                 }
@@ -647,7 +648,7 @@ impl CompactionExecutor {
         // Finish last output file (or handle empty output from GC)
         if current_size > 0 {
             let sst_id = pre_allocated_ids[id_idx];
-            let meta = builder.finish(sst_id, task.output_level)?;
+            let meta = builder.finish(sst_id, task.output_level).await?;
             output_ssts.push(meta);
         } else if output_ssts.is_empty() {
             // GC dropped all entries — abort builder, return empty delta

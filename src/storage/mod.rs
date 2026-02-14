@@ -120,6 +120,7 @@ pub use mvcc::{
 // Re-export SST types for persistent storage
 pub use sstable::{
     // Builder types
+    AsyncSstBuilder,
     CompressionType,
     // Iterator types
     ConcatIterator,

@@ -63,7 +63,7 @@ use super::config::LsmConfig;
 use super::ilog::IlogService;
 use super::memtable::MemTable;
 use super::sstable::{
-    SstBuilder, SstBuilderOptions, SstIterator, SstMeta, SstMvccIterator, SstReaderRef,
+    AsyncSstBuilder, SstBuilderOptions, SstIterator, SstMeta, SstMvccIterator, SstReaderRef,
 };
 use super::version::{ManifestDelta, Version, MAX_LEVELS};
 use super::version_set::{SuperVersion, VersionSet};
@@ -410,7 +410,7 @@ impl LsmEngine {
     ///
     /// This creates a new L0 SST and updates the version.
     /// If ilog is configured, uses intent/commit protocol for crash safety.
-    pub fn flush_memtable(&self, memtable: &MemTable) -> Result<SstMeta> {
+    pub async fn flush_memtable_async(&self, memtable: &MemTable) -> Result<SstMeta> {
         if !memtable.is_frozen() {
             return Err(TiSqlError::Storage(
                 "Cannot flush non-frozen memtable".to_string(),
@@ -436,8 +436,7 @@ impl LsmEngine {
             block_size: self.config.block_size,
             compression: self.config.compression,
         };
-
-        let mut builder = SstBuilder::new(&sst_path, options)?;
+        let mut builder = AsyncSstBuilder::new(&sst_path, options, Arc::clone(&self.io))?;
 
         // Iterate memtable using streaming iterator and add all entries INCLUDING tombstones
         // as raw MVCC keys. SSTs MUST store MVCC keys (key || !commit_ts) to preserve version
@@ -448,17 +447,17 @@ impl LsmEngine {
         let range = Arc::new(MvccKey::unbounded()..MvccKey::unbounded());
         // Flush only committed data (owner_ts = 0 means no pending nodes visible)
         let mut iter = memtable.inner().create_streaming_iter(range, 0);
-        crate::io::block_on_sync(iter.advance())?; // Initialize iterator to first entry
+        iter.advance().await?; // Initialize iterator to first entry
 
         while iter.valid() {
             // Reconstruct MVCC key from user_key + timestamp
             let mvcc_key = MvccKey::encode(iter.user_key(), iter.timestamp());
-            builder.add(mvcc_key.as_bytes(), iter.value())?;
-            crate::io::block_on_sync(iter.advance())?;
+            builder.add(mvcc_key.as_bytes(), iter.value()).await?;
+            iter.advance().await?;
         }
 
         // Finish building (writes to disk with fsync)
-        let meta = builder.finish(sst_id, 0)?; // Level 0
+        let meta = builder.finish(sst_id, 0).await?; // Level 0
 
         // Failpoint: crash after SST write, before ilog commit
         #[cfg(feature = "failpoints")]
@@ -514,6 +513,11 @@ impl LsmEngine {
         }
 
         Ok(meta)
+    }
+
+    /// Sync wrapper for callers that cannot use async yet.
+    pub fn flush_memtable(&self, memtable: &MemTable) -> Result<SstMeta> {
+        crate::io::block_on_sync(self.flush_memtable_async(memtable))
     }
 
     /// Read a key from SST files with MVCC timestamp filtering.
@@ -635,7 +639,7 @@ impl LsmEngine {
     /// Force flush all frozen memtables.
     ///
     /// Used for shutdown and testing.
-    pub fn flush_all(&self) -> Result<Vec<SstMeta>> {
+    pub async fn flush_all_async(&self) -> Result<Vec<SstMeta>> {
         let mut results = Vec::new();
 
         loop {
@@ -647,7 +651,7 @@ impl LsmEngine {
 
             match frozen {
                 Some(memtable) => {
-                    let meta = self.flush_memtable(&memtable)?;
+                    let meta = self.flush_memtable_async(&memtable).await?;
                     results.push(meta);
                 }
                 None => break,
@@ -657,15 +661,25 @@ impl LsmEngine {
         Ok(results)
     }
 
+    /// Sync wrapper for callers that cannot use async yet.
+    pub fn flush_all(&self) -> Result<Vec<SstMeta>> {
+        crate::io::block_on_sync(self.flush_all_async())
+    }
+
     /// Freeze active memtable and flush all.
     ///
     /// Used for clean shutdown to ensure all data is persisted.
-    pub fn flush_all_with_active(&self) -> Result<Vec<SstMeta>> {
+    pub async fn flush_all_with_active_async(&self) -> Result<Vec<SstMeta>> {
         // First freeze the active memtable
         self.freeze_active();
 
         // Then flush all frozen
-        self.flush_all()
+        self.flush_all_async().await
+    }
+
+    /// Sync wrapper for callers that cannot use async yet.
+    pub fn flush_all_with_active(&self) -> Result<Vec<SstMeta>> {
+        crate::io::block_on_sync(self.flush_all_with_active_async())
     }
 
     /// Set a callback to be invoked after flush completes.
