@@ -177,6 +177,9 @@ use util::Timer;
 use std::path::PathBuf;
 use std::sync::Arc;
 
+#[cfg(feature = "failpoints")]
+use fail::fail_point;
+
 // ============================================================================
 // Database Configuration
 // ============================================================================
@@ -761,9 +764,24 @@ impl Database {
     pub fn run_log_gc_once(&self) -> Result<LogGcStats> {
         let version = self.storage.current_version();
         let flushed_lsn = version.flushed_lsn();
+
+        #[cfg(feature = "failpoints")]
+        fail_point!("log_gc_before_checkpoint");
+
         let checkpoint_lsn = self.ilog.write_checkpoint(version.as_ref())?;
+
+        #[cfg(feature = "failpoints")]
+        fail_point!("log_gc_after_checkpoint_before_clog_truncate");
+
         let clog = self.txn_service.clog_service().truncate_to(flushed_lsn)?;
+
+        #[cfg(feature = "failpoints")]
+        fail_point!("log_gc_after_clog_truncate_before_ilog_truncate");
+
         let ilog = self.ilog.truncate_before(checkpoint_lsn)?;
+
+        #[cfg(feature = "failpoints")]
+        fail_point!("log_gc_after_ilog_truncate");
 
         Ok(LogGcStats {
             flushed_lsn,

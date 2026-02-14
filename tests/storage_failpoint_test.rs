@@ -27,11 +27,12 @@ use std::sync::Arc;
 
 use tempfile::TempDir;
 
+use fail::fail_point;
 use tisql::new_lsn_provider;
 use tisql::storage::WriteBatch;
 use tisql::testkit::{
-    FileClogConfig, FileClogService, IlogConfig, IlogService, LsmConfigBuilder, LsmEngine,
-    LsmRecovery, RecoveryResult, Version,
+    ClogBatch, FileClogConfig, FileClogService, IlogConfig, IlogService, IlogTruncateStats,
+    LsmConfigBuilder, LsmEngine, LsmRecovery, RecoveryResult, TruncateStats, Version,
 };
 use tisql::StorageEngine;
 
@@ -68,6 +69,113 @@ async fn create_test_lsm_engine(
     .unwrap();
 
     (Arc::new(engine), ilog, clog)
+}
+
+/// Helper to create a test LSM engine where clog + ilog share one LSN space.
+async fn create_test_lsm_engine_with_unified_logs(
+    dir: &TempDir,
+) -> (Arc<LsmEngine>, Arc<IlogService>, Arc<FileClogService>) {
+    let lsn_provider = new_lsn_provider();
+
+    let ilog_config = IlogConfig::new(dir.path());
+    let ilog = Arc::new(
+        IlogService::open(
+            ilog_config,
+            Arc::clone(&lsn_provider),
+            &tokio::runtime::Handle::current(),
+        )
+        .unwrap(),
+    );
+
+    let clog_config = FileClogConfig::with_dir(dir.path());
+    let clog = Arc::new(
+        FileClogService::open_with_lsn_provider(
+            clog_config,
+            Arc::clone(&lsn_provider),
+            &tokio::runtime::Handle::current(),
+        )
+        .unwrap(),
+    );
+
+    let config = LsmConfigBuilder::new(dir.path())
+        .memtable_size(256)
+        .max_frozen_memtables(16)
+        .build_unchecked();
+    let engine = LsmEngine::open_with_recovery(
+        config,
+        Arc::clone(&lsn_provider),
+        Arc::clone(&ilog),
+        Version::new(),
+    )
+    .unwrap();
+
+    (Arc::new(engine), ilog, clog)
+}
+
+#[derive(Debug)]
+struct LogGcCycleStats {
+    flushed_lsn: u64,
+    checkpoint_lsn: u64,
+    clog: TruncateStats,
+    ilog: IlogTruncateStats,
+}
+
+/// Run one flushed-lsn-driven log GC cycle on standalone LSM components.
+fn run_log_gc_cycle(
+    engine: &LsmEngine,
+    ilog: &IlogService,
+    clog: &FileClogService,
+) -> Result<LogGcCycleStats, tisql::error::TiSqlError> {
+    let version = engine.current_version();
+    let flushed_lsn = version.flushed_lsn();
+
+    fail_point!("log_gc_before_checkpoint");
+
+    let checkpoint_lsn = ilog.write_checkpoint(version.as_ref())?;
+
+    fail_point!("log_gc_after_checkpoint_before_clog_truncate");
+
+    let clog_stats = clog.truncate_to(flushed_lsn)?;
+
+    fail_point!("log_gc_after_clog_truncate_before_ilog_truncate");
+
+    let ilog_stats = ilog.truncate_before(checkpoint_lsn)?;
+
+    fail_point!("log_gc_after_ilog_truncate");
+
+    Ok(LogGcCycleStats {
+        flushed_lsn,
+        checkpoint_lsn,
+        clog: clog_stats,
+        ilog: ilog_stats,
+    })
+}
+
+/// Write one durable PUT transaction:
+/// 1) append to clog and fsync
+/// 2) apply to LSM with the same clog LSN
+async fn write_durable_put(
+    engine: &LsmEngine,
+    clog: &FileClogService,
+    txn_id: u64,
+    key: &[u8],
+    value: &[u8],
+    commit_ts: u64,
+) -> u64 {
+    use tisql::ClogService;
+
+    let mut clog_batch = ClogBatch::new();
+    clog_batch.add_put(txn_id, key.to_vec(), value.to_vec());
+    clog_batch.add_commit(txn_id, commit_ts);
+    let lsn = clog.write(&mut clog_batch, true).unwrap().await.unwrap();
+
+    let mut wb = WriteBatch::new();
+    wb.put(key.to_vec(), value.to_vec());
+    wb.set_commit_ts(commit_ts);
+    wb.set_clog_lsn(lsn);
+    engine.write_batch(wb).unwrap();
+
+    lsn
 }
 
 /// Helper to write test data to the engine.
@@ -949,6 +1057,199 @@ async fn test_multiple_consecutive_flushes() {
     assert!(sst_count >= 1, "Should have SST files");
 
     scenario.teardown();
+}
+
+// ============================================================================
+// Unified Log GC Tests
+// ============================================================================
+
+/// One-shot log GC should reclaim flushed clog entries and preserve recovery.
+#[tokio::test]
+async fn test_log_gc_once_reclaims_and_recovers() {
+    let scenario = fail::FailScenario::setup();
+    let dir = tempfile::tempdir().unwrap();
+
+    let (engine, ilog, clog) = create_test_lsm_engine_with_unified_logs(&dir).await;
+    let mut expected = Vec::new();
+
+    // Flushed keys (eligible for clog truncate after flush).
+    for i in 0..8 {
+        let key = format!("log_gc_flush_key_{i:04}").into_bytes();
+        let value = format!("log_gc_flush_value_{i:04}").into_bytes();
+        write_durable_put(&engine, &clog, i as u64 + 1, &key, &value, 100 + i as u64).await;
+        expected.push((key, value));
+    }
+
+    engine.flush_all_with_active().unwrap();
+    ilog.sync().unwrap();
+
+    // Unflushed keys must stay in clog after truncate_to(flushed_lsn).
+    for i in 0..4 {
+        let key = format!("log_gc_unflushed_key_{i:04}").into_bytes();
+        let value = format!("log_gc_unflushed_value_{i:04}").into_bytes();
+        write_durable_put(&engine, &clog, 100 + i as u64, &key, &value, 300 + i as u64).await;
+        expected.push((key, value));
+    }
+
+    let clog_size_before = clog.file_size().unwrap();
+    let ilog_size_before = ilog.file_size().unwrap();
+
+    let stats = run_log_gc_cycle(&engine, &ilog, &clog).unwrap();
+    assert!(stats.flushed_lsn > 0);
+    assert!(stats.checkpoint_lsn >= stats.flushed_lsn);
+    assert!(stats.clog.entries_removed > 0);
+    assert!(stats.clog.bytes_freed > 0);
+    assert!(stats.ilog.new_file_size <= ilog_size_before);
+    assert!(clog.file_size().unwrap() <= clog_size_before);
+
+    drop(engine);
+    drop(ilog);
+    drop(clog);
+
+    let recovered = recover_engine(&dir).await;
+    for (key, value) in expected {
+        let got = recovered.engine.get(&key).await.unwrap();
+        assert_eq!(got, Some(value), "key {:?} should survive log GC", key);
+    }
+
+    scenario.teardown();
+}
+
+/// Running GC again without new flush should be conservative and recovery-safe.
+#[tokio::test]
+async fn test_log_gc_once_without_new_flush_recovery_safe() {
+    let scenario = fail::FailScenario::setup();
+    let dir = tempfile::tempdir().unwrap();
+
+    let (engine, ilog, clog) = create_test_lsm_engine_with_unified_logs(&dir).await;
+    let mut expected = Vec::new();
+
+    for i in 0..6 {
+        let key = format!("log_gc_repeat_key_{i:04}").into_bytes();
+        let value = format!("log_gc_repeat_value_{i:04}").into_bytes();
+        write_durable_put(&engine, &clog, i as u64 + 1, &key, &value, 50 + i as u64).await;
+        expected.push((key, value));
+    }
+
+    engine.flush_all_with_active().unwrap();
+    ilog.sync().unwrap();
+
+    let first = run_log_gc_cycle(&engine, &ilog, &clog).unwrap();
+    let second = run_log_gc_cycle(&engine, &ilog, &clog).unwrap();
+
+    assert_eq!(second.flushed_lsn, first.flushed_lsn);
+    assert_eq!(second.clog.entries_removed, 0);
+    assert!(
+        second.checkpoint_lsn >= first.checkpoint_lsn,
+        "checkpoint should move forward on repeated cycles"
+    );
+
+    drop(engine);
+    drop(ilog);
+    drop(clog);
+
+    let recovered = recover_engine(&dir).await;
+    for (key, value) in expected {
+        let got = recovered.engine.get(&key).await.unwrap();
+        assert_eq!(got, Some(value), "key {:?} should survive repeated GC", key);
+    }
+
+    scenario.teardown();
+}
+
+async fn prepare_log_gc_cutpoint_case(
+    dir: &TempDir,
+) -> (
+    Arc<LsmEngine>,
+    Arc<IlogService>,
+    Arc<FileClogService>,
+    Vec<(Vec<u8>, Vec<u8>)>,
+) {
+    let (engine, ilog, clog) = create_test_lsm_engine_with_unified_logs(dir).await;
+    let mut expected = Vec::new();
+
+    // Flushed group
+    for i in 0..6 {
+        let key = format!("cutpoint_flushed_key_{i:04}").into_bytes();
+        let value = format!("cutpoint_flushed_value_{i:04}").into_bytes();
+        write_durable_put(&engine, &clog, i as u64 + 1, &key, &value, 1000 + i as u64).await;
+        expected.push((key, value));
+    }
+    engine.flush_all_with_active().unwrap();
+    ilog.sync().unwrap();
+
+    // Unflushed group
+    for i in 0..3 {
+        let key = format!("cutpoint_unflushed_key_{i:04}").into_bytes();
+        let value = format!("cutpoint_unflushed_value_{i:04}").into_bytes();
+        write_durable_put(
+            &engine,
+            &clog,
+            100 + i as u64,
+            &key,
+            &value,
+            2000 + i as u64,
+        )
+        .await;
+        expected.push((key, value));
+    }
+
+    (engine, ilog, clog, expected)
+}
+
+async fn run_log_gc_cutpoint_crash_test(failpoint_name: &str) {
+    use std::panic;
+
+    let scenario = fail::FailScenario::setup();
+    let dir = tempfile::tempdir().unwrap();
+
+    let (engine, ilog, clog, expected) = prepare_log_gc_cutpoint_case(&dir).await;
+
+    fail::cfg(failpoint_name, "panic").unwrap();
+
+    let result = panic::catch_unwind(panic::AssertUnwindSafe(|| {
+        let _ = run_log_gc_cycle(&engine, &ilog, &clog);
+    }));
+    assert!(result.is_err(), "failpoint {failpoint_name} should panic");
+
+    fail::cfg(failpoint_name, "off").unwrap();
+
+    drop(engine);
+    drop(ilog);
+    drop(clog);
+
+    let recovered = recover_engine(&dir).await;
+    for (key, value) in expected {
+        let got = recovered.engine.get(&key).await.unwrap();
+        assert_eq!(
+            got,
+            Some(value),
+            "key {:?} should survive log GC crash cutpoint {failpoint_name}",
+            key
+        );
+    }
+
+    scenario.teardown();
+}
+
+#[tokio::test]
+async fn test_log_gc_crash_before_checkpoint() {
+    run_log_gc_cutpoint_crash_test("log_gc_before_checkpoint").await;
+}
+
+#[tokio::test]
+async fn test_log_gc_crash_after_checkpoint_before_clog_truncate() {
+    run_log_gc_cutpoint_crash_test("log_gc_after_checkpoint_before_clog_truncate").await;
+}
+
+#[tokio::test]
+async fn test_log_gc_crash_after_clog_truncate_before_ilog_truncate() {
+    run_log_gc_cutpoint_crash_test("log_gc_after_clog_truncate_before_ilog_truncate").await;
+}
+
+#[tokio::test]
+async fn test_log_gc_crash_after_ilog_truncate() {
+    run_log_gc_cutpoint_crash_test("log_gc_after_ilog_truncate").await;
 }
 
 // ============================================================================
