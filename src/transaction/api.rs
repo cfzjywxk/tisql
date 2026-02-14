@@ -40,12 +40,26 @@
 //! let info = txn_service.commit(ctx)?;
 //! ```
 
+use std::collections::BTreeMap;
 use std::future::Future;
 use std::ops::Range;
 
 use crate::error::Result;
 use crate::storage::MvccIterator;
 use crate::types::{Key, Lsn, RawValue, Timestamp, TxnId};
+
+/// Mutation type for keys tracked in a transaction.
+///
+/// Each key in the transaction's mutations map is either a Write (real data change)
+/// or a Lock (pessimistic lock on a non-existent key, skipped during clog persist).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum MutationType {
+    /// Key has a real data change (put or delete with tombstone).
+    Write,
+    /// Key has only a pessimistic lock (delete on non-existent key).
+    /// Not persisted to clog.
+    Lock,
+}
 
 /// Transaction state machine for OceanBase-style pessimistic locking.
 ///
@@ -115,12 +129,11 @@ pub struct TxnCtx {
     /// Whether this is an explicit transaction (started with BEGIN).
     /// Explicit transactions use pessimistic locking.
     pub(crate) explicit: bool,
-    /// Keys that have been locked by this transaction.
-    /// Used for commit (finalize) and rollback (abort) operations.
-    pub(crate) locked_keys: Vec<Key>,
-    /// Keys holding LOCK-type nodes (pessimistic locks without data change).
-    /// These are skipped during clog write at commit time.
-    pub(crate) lock_keys: Vec<Key>,
+    /// Keys mutated by this transaction, mapped to their mutation type.
+    /// Write keys have real data changes; Lock keys are pessimistic locks
+    /// on non-existent keys (skipped during clog persist).
+    /// BTreeMap ensures O(log n) insert/lookup and deterministic iteration order.
+    pub(crate) mutations: BTreeMap<Key, MutationType>,
     /// Whether this transaction has been registered in the state cache.
     /// Registration happens on first write (put/delete) for implicit txns,
     /// or at begin_explicit() for explicit txns.
@@ -136,8 +149,7 @@ impl TxnCtx {
             state: TxnState::Running,
             read_only,
             explicit: false,
-            locked_keys: Vec::new(),
-            lock_keys: Vec::new(),
+            mutations: BTreeMap::new(),
             registered: false,
         }
     }
@@ -153,8 +165,7 @@ impl TxnCtx {
             state: TxnState::Running,
             read_only,
             explicit: true,
-            locked_keys: Vec::new(),
-            lock_keys: Vec::new(),
+            mutations: BTreeMap::new(),
             registered: false,
         }
     }
@@ -176,8 +187,7 @@ impl TxnCtx {
             state: TxnState::Running,
             read_only,
             explicit,
-            locked_keys: Vec::new(),
-            lock_keys: Vec::new(),
+            mutations: BTreeMap::new(),
             registered: false,
         }
     }
@@ -186,13 +196,6 @@ impl TxnCtx {
     #[inline]
     pub fn is_explicit(&self) -> bool {
         self.explicit
-    }
-
-    /// Add a key to the list of locked keys (for pessimistic transactions).
-    pub(crate) fn add_locked_key(&mut self, key: Key) {
-        if !self.locked_keys.contains(&key) {
-            self.locked_keys.push(key);
-        }
     }
 
     /// Get the transaction ID.

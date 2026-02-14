@@ -23,12 +23,12 @@ use std::sync::Arc;
 #[cfg(feature = "failpoints")]
 use fail::fail_point;
 
-use crate::clog::{ClogEntry, ClogOp, ClogService};
+use crate::clog::{ClogEntry, ClogOp, ClogOpRef, ClogService};
 use crate::error::{Result, TiSqlError};
 use crate::log_warn;
 use crate::tso::TsoService;
 
-use super::api::{CommitInfo, TxnCtx, TxnService, TxnState};
+use super::api::{CommitInfo, MutationType, TxnCtx, TxnService, TxnState};
 use super::concurrency::ConcurrencyManager;
 use crate::storage::mvcc::{is_tombstone, MvccIterator, MvccKey, LOCK, TOMBSTONE};
 use crate::storage::{PessimisticStorage, StorageEngine, WriteBatch};
@@ -218,47 +218,6 @@ impl<S: StorageEngine, L: ClogService, T: TsoService> TransactionService<S, L, T
     }
 }
 
-// Private helpers for the commit protocol.
-//
-// These require PessimisticStorage since they interact with pending nodes.
-impl<S: PessimisticStorage + 'static, L: ClogService + 'static, T: TsoService>
-    TransactionService<S, L, T>
-{
-    /// Build locked_keys and WriteBatch for commit.
-    ///
-    /// Pending writes are already in storage. This reads them back to
-    /// build the clog WriteBatch.
-    async fn prepare_explicit_batch(&self, ctx: &mut TxnCtx) -> Result<(Vec<Key>, WriteBatch)> {
-        let locked_keys = std::mem::take(&mut ctx.locked_keys);
-        if locked_keys.is_empty() {
-            return Ok((vec![], WriteBatch::new()));
-        }
-
-        let lock_keys = std::mem::take(&mut ctx.lock_keys);
-        let mut batch = WriteBatch::new();
-        for key in &locked_keys {
-            if lock_keys.contains(key) {
-                continue; // LOCK key — nothing to persist in clog
-            }
-            match self
-                .storage
-                .get_with_owner(key, ctx.start_ts, ctx.start_ts)
-                .await
-            {
-                Some(value) if !is_tombstone(&value) => {
-                    batch.put(key.clone(), value);
-                }
-                _ => {
-                    // TOMBSTONE: MemTableEngine returns Some(TOMBSTONE),
-                    // LsmEngine returns None. Both handled here as Delete.
-                    batch.delete(key.clone());
-                }
-            }
-        }
-        Ok((locked_keys, batch))
-    }
-}
-
 /// Implement TxnService trait for TransactionService
 ///
 /// Note: `S: PessimisticStorage` is required because both implicit and explicit
@@ -341,9 +300,9 @@ impl<S: PessimisticStorage + 'static, L: ClogService + 'static, T: TsoService> T
         // Write pending node directly to storage.
         match self.storage.put_pending(&key, value, ctx.start_ts) {
             Ok(()) => {
-                // If this key was a LOCK (from prior delete), it's now a real value.
-                ctx.lock_keys.retain(|k| k != &key);
-                ctx.add_locked_key(key);
+                // Single insert handles both: adding a new Write entry AND
+                // upgrading Lock→Write (overwrite) if key had a prior LOCK.
+                ctx.mutations.insert(key, MutationType::Write);
                 Ok(())
             }
             Err(lock_owner) => Err(TiSqlError::KeyIsLocked {
@@ -383,8 +342,7 @@ impl<S: PessimisticStorage + 'static, L: ClogService + 'static, T: TsoService> T
                 .put_pending(&key, TOMBSTONE.to_vec(), ctx.start_ts)
             {
                 Ok(()) => {
-                    ctx.lock_keys.retain(|k| k != &key);
-                    ctx.add_locked_key(key);
+                    ctx.mutations.insert(key, MutationType::Write);
                     Ok(())
                 }
                 Err(lock_owner) => Err(TiSqlError::KeyIsLocked {
@@ -397,10 +355,9 @@ impl<S: PessimisticStorage + 'static, L: ClogService + 'static, T: TsoService> T
             // No value exists → LOCK (pessimistic lock only, not persisted to clog)
             match self.storage.put_pending(&key, LOCK.to_vec(), ctx.start_ts) {
                 Ok(()) => {
-                    if !ctx.lock_keys.contains(&key) {
-                        ctx.lock_keys.push(key.clone());
-                    }
-                    ctx.add_locked_key(key);
+                    // or_insert preserves existing Write if key was previously put
+                    // (won't downgrade Write→Lock).
+                    ctx.mutations.entry(key).or_insert(MutationType::Lock);
                     Ok(())
                 }
                 Err(lock_owner) => Err(TiSqlError::KeyIsLocked {
@@ -418,11 +375,10 @@ impl<S: PessimisticStorage + 'static, L: ClogService + 'static, T: TsoService> T
         let txn_id = ctx.txn_id;
         let start_ts = ctx.start_ts;
 
-        // Build locked_keys and storage_batch from pending nodes in storage.
-        let (locked_keys, storage_batch) = self.prepare_explicit_batch(&mut ctx).await?;
+        let mutations = std::mem::take(&mut ctx.mutations);
 
         // No-write transaction: clean up and return
-        if locked_keys.is_empty() {
+        if mutations.is_empty() {
             if ctx.registered {
                 self.concurrency_manager.remove_txn(start_ts);
             }
@@ -434,6 +390,26 @@ impl<S: PessimisticStorage + 'static, L: ClogService + 'static, T: TsoService> T
                 commit_ts: start_ts,
                 lsn: 0,
             });
+        }
+
+        // Read values for Write keys from storage. Keys are borrowed from
+        // the mutations BTreeMap; values are owned (read from storage).
+        // Lock keys are skipped — they have no data to persist.
+        let mut read_values: Vec<(&[u8], Option<RawValue>)> = Vec::new();
+        for (key, mt) in &mutations {
+            if *mt == MutationType::Lock {
+                continue;
+            }
+            // TOMBSTONE: MemTableEngine returns Some(TOMBSTONE),
+            // LsmEngine returns None. Both handled as Delete in clog.
+            match self.storage.get_with_owner(key, start_ts, start_ts).await {
+                Some(value) if !is_tombstone(&value) => {
+                    read_values.push((key.as_slice(), Some(value)));
+                }
+                _ => {
+                    read_values.push((key.as_slice(), None));
+                }
+            }
         }
 
         // FAILPOINT: After locks acquired (pending nodes written), before commit_ts computation
@@ -452,19 +428,37 @@ impl<S: PessimisticStorage + 'static, L: ClogService + 'static, T: TsoService> T
         // Step 3: Set prepared_ts for readers to check visibility
         self.concurrency_manager.prepare_txn(start_ts, commit_ts)?;
 
-        // Step 4: Write to clog for durability — await fsync (yields worker thread)
-        match self
-            .clog_service
-            .write_batch(txn_id, &storage_batch, commit_ts, true)
-        {
+        // Step 4: Build ClogOpRef entries from read values (zero key clone —
+        // keys borrow from mutations BTreeMap, values borrow from read_values).
+        let ops: Vec<ClogOpRef<'_>> = read_values
+            .iter()
+            .map(|(key, val)| match val {
+                Some(v) => ClogOpRef::Put {
+                    key,
+                    value: v.as_slice(),
+                },
+                None => ClogOpRef::Delete { key },
+            })
+            .collect();
+
+        // Step 5: Write to clog for durability (serializes synchronously, returns
+        // future for fsync). After this call, ops/read_values are no longer needed.
+        let clog_result = self.clog_service.write_ops(txn_id, &ops, commit_ts, true);
+
+        // Release borrows on mutations (ops → read_values → mutations).
+        drop(ops);
+        drop(read_values);
+
+        match clog_result {
             Ok(fsync_future) => {
                 let lsn = fsync_future.await?; // YIELD HERE
 
-                // Step 5: Finalize all pending nodes by setting their commit_ts.
-                self.storage
-                    .finalize_pending(&locked_keys, start_ts, commit_ts);
+                // Step 6: Finalize all pending nodes by setting their commit_ts.
+                // Keys moved from BTreeMap into Vec (zero data clone).
+                let keys: Vec<Key> = mutations.into_keys().collect();
+                self.storage.finalize_pending(&keys, start_ts, commit_ts);
 
-                // Step 6: Transition to Committed in state cache
+                // Step 7: Transition to Committed in state cache
                 self.concurrency_manager.commit_txn(start_ts, commit_ts)?;
                 self.concurrency_manager.remove_txn(start_ts);
                 ctx.state = TxnState::Committed { commit_ts };
@@ -475,7 +469,8 @@ impl<S: PessimisticStorage + 'static, L: ClogService + 'static, T: TsoService> T
                 })
             }
             Err(e) => {
-                self.storage.abort_pending(&locked_keys, start_ts);
+                let keys: Vec<Key> = mutations.into_keys().collect();
+                self.storage.abort_pending(&keys, start_ts);
                 self.concurrency_manager.abort_txn(start_ts).ok();
                 self.concurrency_manager.remove_txn(start_ts);
                 Err(e)
@@ -486,11 +481,12 @@ impl<S: PessimisticStorage + 'static, L: ClogService + 'static, T: TsoService> T
     fn rollback(&self, mut ctx: TxnCtx) -> Result<()> {
         Self::check_active(&ctx)?;
 
-        let locked_keys = std::mem::take(&mut ctx.locked_keys);
+        let mutations = std::mem::take(&mut ctx.mutations);
 
         // Abort all pending nodes in storage
-        if !locked_keys.is_empty() {
-            self.storage.abort_pending(&locked_keys, ctx.start_ts);
+        if !mutations.is_empty() {
+            let keys: Vec<Key> = mutations.into_keys().collect();
+            self.storage.abort_pending(&keys, ctx.start_ts);
         }
 
         // Update state cache
@@ -1504,9 +1500,9 @@ mod tests {
             .await
             .unwrap();
 
-        // Key should be tracked
-        assert_eq!(ctx.locked_keys.len(), 1);
-        assert_eq!(ctx.locked_keys[0], b"key1".to_vec());
+        // Key should be tracked as Write mutation
+        assert_eq!(ctx.mutations.len(), 1);
+        assert!(ctx.mutations.contains_key(b"key1".as_slice()));
 
         // Commit
         let info = txn_service.commit(ctx).await.unwrap();
@@ -1591,7 +1587,7 @@ mod tests {
             .unwrap();
 
         // All keys should be tracked
-        assert_eq!(ctx.locked_keys.len(), 3);
+        assert_eq!(ctx.mutations.len(), 3);
 
         // Commit
         txn_service.commit(ctx).await.unwrap();
@@ -1629,7 +1625,7 @@ mod tests {
             .unwrap();
 
         // Key should only be tracked once
-        assert_eq!(ctx.locked_keys.len(), 1);
+        assert_eq!(ctx.mutations.len(), 1);
 
         // Commit
         txn_service.commit(ctx).await.unwrap();
@@ -1656,7 +1652,7 @@ mod tests {
         ));
 
         // No keys should be locked
-        assert!(ctx.locked_keys.is_empty());
+        assert!(ctx.mutations.is_empty());
 
         // Commit should succeed (no-op for read-only)
         let info = txn_service.commit(ctx).await.unwrap();
@@ -1669,7 +1665,7 @@ mod tests {
 
         // Start explicit transaction but don't write anything
         let ctx = txn_service.begin_explicit(false).unwrap();
-        assert!(ctx.locked_keys.is_empty());
+        assert!(ctx.mutations.is_empty());
 
         // Commit should succeed (no-op)
         let info = txn_service.commit(ctx).await.unwrap();

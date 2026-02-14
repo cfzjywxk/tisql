@@ -584,6 +584,49 @@ impl FileClogService {
             entry_count,
         })
     }
+
+    /// Prepare pre-built ClogOpRef entries for clog writing: allocate LSNs, add commit
+    /// record, serialize. No I/O is performed here.
+    ///
+    /// This is the zero-copy variant — keys and values are borrowed from the caller's
+    /// mutations BTreeMap and storage reads. No cloning occurs.
+    fn prepare_ops(
+        &self,
+        txn_id: TxnId,
+        ops: &[super::ClogOpRef<'_>],
+        commit_ts: Timestamp,
+    ) -> Result<PreparedWriteBatch> {
+        let start_lsn = self.lsn_provider.alloc_lsn();
+        let mut current_lsn = start_lsn;
+
+        let entry_count = ops.len() + 1; // +1 for commit record
+        let mut entries: Vec<super::ClogEntryRef<'_>> = Vec::with_capacity(entry_count);
+
+        for op in ops {
+            entries.push(super::ClogEntryRef {
+                lsn: current_lsn,
+                txn_id,
+                op: *op,
+            });
+            current_lsn = self.lsn_provider.alloc_lsn();
+        }
+
+        // Add commit record
+        let end_lsn = current_lsn;
+        entries.push(super::ClogEntryRef {
+            lsn: end_lsn,
+            txn_id,
+            op: super::ClogOpRef::Commit { commit_ts },
+        });
+
+        let record_bytes = Self::serialize_record_refs(&entries)?;
+
+        Ok(PreparedWriteBatch {
+            record_bytes,
+            end_lsn,
+            entry_count,
+        })
+    }
 }
 
 impl ClogService for FileClogService {
@@ -664,6 +707,43 @@ impl ClogService for FileClogService {
 
         log_trace!(
             "Wrote {} entries to commit log (zero-copy), lsn=...-{}",
+            prepared.entry_count,
+            prepared.end_lsn
+        );
+
+        Ok(ClogFsyncFuture::new(end_lsn, rx))
+    }
+
+    fn write_ops(
+        &self,
+        txn_id: TxnId,
+        ops: &[super::ClogOpRef<'_>],
+        commit_ts: Timestamp,
+        sync: bool,
+    ) -> Result<ClogFsyncFuture> {
+        if ops.is_empty() {
+            let (tx, rx) = tokio::sync::oneshot::channel();
+            let _ = tx.send(Ok(()));
+            return Ok(ClogFsyncFuture::new(self.lsn_provider.current_lsn(), rx));
+        }
+
+        let prepared = self.prepare_ops(txn_id, ops, commit_ts)?;
+        let end_lsn = prepared.end_lsn;
+
+        #[cfg(feature = "failpoints")]
+        fail_point!("clog_before_sync");
+
+        let rx = self
+            .group_writer
+            .lock()
+            .submit(prepared.record_bytes, sync)
+            .map_err(|e| TiSqlError::Internal(format!("Clog group commit failed: {e}")))?;
+
+        #[cfg(feature = "failpoints")]
+        fail_point!("clog_after_sync");
+
+        log_trace!(
+            "Wrote {} entries to commit log (zero-copy ops), lsn=...-{}",
             prepared.entry_count,
             prepared.end_lsn
         );

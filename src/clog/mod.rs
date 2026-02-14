@@ -78,8 +78,8 @@ pub(crate) struct ClogEntryRef<'a> {
 }
 
 /// Reference-based clog operation for zero-copy serialization.
-#[derive(Serialize)]
-pub(crate) enum ClogOpRef<'a> {
+#[derive(Clone, Copy, Serialize)]
+pub enum ClogOpRef<'a> {
     Put { key: &'a [u8], value: &'a [u8] },
     Delete { key: &'a [u8] },
     Commit { commit_ts: Timestamp },
@@ -167,6 +167,20 @@ pub trait ClogService: Send + Sync {
         &self,
         txn_id: TxnId,
         batch: &WriteBatch,
+        commit_ts: Timestamp,
+        sync: bool,
+    ) -> Result<ClogFsyncFuture>;
+
+    /// Write pre-built clog ops directly, bypassing WriteBatch entirely.
+    ///
+    /// This is the zero-copy commit path: the caller builds `ClogOpRef` entries
+    /// that borrow keys from the transaction's mutations BTreeMap and values from
+    /// storage reads. The clog allocates LSNs, appends a Commit record, serializes,
+    /// and submits to group commit. No key or value cloning occurs.
+    fn write_ops(
+        &self,
+        txn_id: TxnId,
+        ops: &[ClogOpRef<'_>],
         commit_ts: Timestamp,
         sync: bool,
     ) -> Result<ClogFsyncFuture>;
