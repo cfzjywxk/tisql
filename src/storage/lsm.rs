@@ -756,6 +756,23 @@ impl LsmEngine {
         self.dropped_table_ids.read().clone()
     }
 
+    /// Check whether active/frozen memtables contain any user key in [start, end).
+    pub fn has_memtable_overlap(&self, start: &[u8], end: &[u8]) -> bool {
+        if start >= end {
+            return false;
+        }
+
+        let state = self.state.read();
+        if state.active.has_user_key_in_range(start, end) {
+            return true;
+        }
+
+        state
+            .frozen
+            .iter()
+            .any(|memtable| memtable.has_user_key_in_range(start, end))
+    }
+
     /// Remove SST files that belong entirely to dropped tables past GC safe point.
     ///
     /// This is a deletion-only version update — no compaction I/O needed.

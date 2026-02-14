@@ -875,6 +875,18 @@ impl VersionedMemTableEngine {
         self.inner.index.len()
     }
 
+    /// Check whether any user key exists in the range [start, end).
+    pub fn has_user_key_in_range(&self, start: &[u8], end: &[u8]) -> bool {
+        if start >= end {
+            return false;
+        }
+        self.inner
+            .index
+            .range::<[u8], _>((Bound::Included(start), Bound::Excluded(end)))
+            .next()
+            .is_some()
+    }
+
     /// Get memory usage statistics.
     pub fn memory_stats(&self) -> VersionedMemoryStats {
         VersionedMemoryStats {

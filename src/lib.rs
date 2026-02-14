@@ -978,7 +978,9 @@ fn value_to_string(val: &Value) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::inner_table::catalog_loader::load_gc_tasks;
     use tempfile::tempdir;
+    use tokio::time::{sleep, Duration};
 
     fn create_test_db() -> (Database, tempfile::TempDir) {
         let dir = tempdir().unwrap();
@@ -1059,6 +1061,46 @@ mod tests {
             // Note: Catalog is not persisted yet, so CREATE TABLE won't survive
             // But commit log entries are persisted
         }
+    }
+
+    #[tokio::test]
+    async fn test_drop_table_gc_not_done_while_data_still_in_memtable() {
+        let (db, _dir) = create_test_db();
+
+        db.handle_mp_query("CREATE TABLE gc_pending (id INT PRIMARY KEY, val INT)")
+            .await
+            .unwrap();
+        db.handle_mp_query("INSERT INTO gc_pending VALUES (1, 10), (2, 20), (3, 30)")
+            .await
+            .unwrap();
+
+        // Make the task immediately eligible. The regression is about overlap checks,
+        // not safe-point timing.
+        db.storage.set_gc_safe_point(u64::MAX);
+
+        db.handle_mp_query("DROP TABLE gc_pending").await.unwrap();
+
+        // Keep waking the worker; status should remain pending until memtable data
+        // is flushed/compacted away.
+        let mut latest_status: Option<String> = None;
+        for _ in 0..30 {
+            db.gc_worker.notify();
+            sleep(Duration::from_millis(30)).await;
+
+            let tasks = load_gc_tasks(db.txn_service.as_ref()).unwrap();
+            if let Some(task) = tasks.first() {
+                latest_status = Some(task.status.clone());
+                if task.status == "done" {
+                    break;
+                }
+            }
+        }
+
+        let status = latest_status.expect("expected at least one gc task row");
+        assert_eq!(
+            status, "pending",
+            "GC task should stay pending while dropped-table keys are still in memtables"
+        );
     }
 
     #[tokio::test]

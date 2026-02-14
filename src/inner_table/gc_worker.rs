@@ -159,6 +159,12 @@ impl<T: TxnService + 'static> GcWorkerInner<T> {
             self.engine
                 .add_dropped_table(task.table_id, task.drop_commit_ts);
 
+            // Memtables still contain dropped-table keys. Do not mark done yet,
+            // otherwise those keys may flush later without table-drop filtering.
+            if self.check_memtable_overlap(&task) {
+                continue;
+            }
+
             // Check if all SSTs overlapping the key range have been compacted
             if self.check_sst_overlap(&task) {
                 // Still overlapping — compaction will filter on next round
@@ -180,6 +186,20 @@ impl<T: TxnService + 'static> GcWorkerInner<T> {
         }
     }
 
+    /// Check if active/frozen memtables overlap the task's key range.
+    fn check_memtable_overlap(&self, task: &GcTask) -> bool {
+        let start_key = match hex_decode(&task.start_key_hex) {
+            Some(k) => k,
+            None => return true, // Can't decode — assume overlap
+        };
+        let end_key = match hex_decode(&task.end_key_hex) {
+            Some(k) => k,
+            None => return true,
+        };
+
+        self.engine.has_memtable_overlap(&start_key, &end_key)
+    }
+
     /// Check if any SST file overlaps the task's key range.
     fn check_sst_overlap(&self, task: &GcTask) -> bool {
         let start_key = match hex_decode(&task.start_key_hex) {
@@ -192,15 +212,10 @@ impl<T: TxnService + 'static> GcWorkerInner<T> {
         };
 
         let version = self.engine.current_version();
-        for level_idx in 0..7 {
+        for level_idx in 0..self.engine.config().max_levels {
             let level_files = version.level(level_idx);
             for sst in level_files {
-                // Check if SST key range overlaps [start_key, end_key)
-                // SST range: [smallest_key, largest_key]
-                // Overlap: sst.smallest_key < end_key && sst.largest_key >= start_key
-                if sst.smallest_key.as_slice() < end_key.as_slice()
-                    && sst.largest_key.as_slice() >= start_key.as_slice()
-                {
+                if sst.overlaps(&start_key, &end_key) {
                     return true;
                 }
             }

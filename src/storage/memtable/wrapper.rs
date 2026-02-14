@@ -162,6 +162,12 @@ impl MemTable {
         self.inner.len()
     }
 
+    /// Check whether any user key exists in the range [start, end).
+    #[inline]
+    pub fn has_user_key_in_range(&self, start: &[u8], end: &[u8]) -> bool {
+        self.inner.has_user_key_in_range(start, end)
+    }
+
     /// Check if the memtable is empty.
     #[inline]
     pub fn is_empty(&self) -> bool {
