@@ -91,8 +91,6 @@ pub enum IlogRecord {
         sst_id: u64,
         /// Memtable ID being flushed
         memtable_id: u64,
-        /// Max LSN in the memtable
-        max_memtable_lsn: Lsn,
     },
 
     /// Commit of a successful flush.
@@ -228,7 +226,7 @@ impl IlogConfig {
 /// Pending operation tracker for intent/commit matching.
 #[derive(Default)]
 struct PendingOps {
-    /// Pending flush intents: sst_id -> (memtable_id, max_memtable_lsn)
+    /// Pending flush intents: sst_id
     flush_intents: HashSet<u64>,
     /// Pending compact intents: output_sst_ids
     compact_intents: Vec<Vec<u64>>,
@@ -401,18 +399,12 @@ impl IlogService {
     }
 
     /// Write a flush intent record.
-    pub fn write_flush_intent(
-        &self,
-        sst_id: u64,
-        memtable_id: u64,
-        max_memtable_lsn: Lsn,
-    ) -> Result<Lsn> {
+    pub fn write_flush_intent(&self, sst_id: u64, memtable_id: u64) -> Result<Lsn> {
         let lsn = self.lsn_provider.alloc_lsn();
         let record = IlogRecord::FlushIntent {
             lsn,
             sst_id,
             memtable_id,
-            max_memtable_lsn,
         };
         self.write_record(&record)?;
 
@@ -1107,7 +1099,7 @@ mod tests {
             IlogService::open(config.clone(), Arc::clone(&lsn_provider), &io_handle).unwrap();
 
         // Write flush intent
-        let intent_lsn = service.write_flush_intent(1, 100, 50).unwrap();
+        let intent_lsn = service.write_flush_intent(1, 100).unwrap();
         assert_eq!(intent_lsn, 1);
 
         // Write flush commit
@@ -1138,7 +1130,7 @@ mod tests {
             IlogService::open(config.clone(), Arc::clone(&lsn_provider), &io_handle).unwrap();
 
         // Write flush intent but no commit (simulating crash)
-        service.write_flush_intent(1, 100, 50).unwrap();
+        service.write_flush_intent(1, 100).unwrap();
         service.sync().unwrap();
 
         // Recover
@@ -1163,9 +1155,9 @@ mod tests {
         // First add some SSTs via flush
         let meta1 = test_sst_meta(1, 0);
         let meta2 = test_sst_meta(2, 0);
-        service.write_flush_intent(1, 100, 50).unwrap();
+        service.write_flush_intent(1, 100).unwrap();
         service.write_flush_commit(meta1.clone(), 50).unwrap();
-        service.write_flush_intent(2, 101, 100).unwrap();
+        service.write_flush_intent(2, 101).unwrap();
         service.write_flush_commit(meta2.clone(), 100).unwrap();
 
         // Now compact
@@ -1205,7 +1197,7 @@ mod tests {
 
         // Add SSTs
         let meta1 = test_sst_meta(1, 0);
-        service.write_flush_intent(1, 100, 50).unwrap();
+        service.write_flush_intent(1, 100).unwrap();
         service.write_flush_commit(meta1, 50).unwrap();
 
         // Start compact but don't commit
@@ -1234,7 +1226,7 @@ mod tests {
         // Add many flushes
         for i in 1..=10 {
             let meta = test_sst_meta(i, 0);
-            service.write_flush_intent(i, 100 + i, i * 10).unwrap();
+            service.write_flush_intent(i, 100 + i).unwrap();
             service.write_flush_commit(meta, i * 10).unwrap();
         }
 
@@ -1269,7 +1261,7 @@ mod tests {
             IlogService::open(config.clone(), Arc::clone(&lsn_provider), &io_handle).unwrap();
 
         // Write some records
-        service.write_flush_intent(1, 100, 50).unwrap();
+        service.write_flush_intent(1, 100).unwrap();
         let meta = test_sst_meta(1, 0);
         service.write_flush_commit(meta, 50).unwrap();
         service.sync().unwrap();
@@ -1283,7 +1275,7 @@ mod tests {
         assert!(lsn_provider2.current_lsn() >= 3);
 
         // New writes should have higher LSNs
-        let new_lsn = service2.write_flush_intent(2, 101, 100).unwrap();
+        let new_lsn = service2.write_flush_intent(2, 101).unwrap();
         assert!(new_lsn >= 3);
     }
 
@@ -1305,7 +1297,7 @@ mod tests {
 
         // Add a valid SST
         let meta = test_sst_meta(1, 0);
-        service.write_flush_intent(1, 100, 50).unwrap();
+        service.write_flush_intent(1, 100).unwrap();
         service.write_flush_commit(meta, 50).unwrap();
         service.sync().unwrap();
 
@@ -1340,7 +1332,7 @@ mod tests {
 
         // Write 5 records
         for i in 1..=5 {
-            service.write_flush_intent(i, 100 + i, i * 10).unwrap();
+            service.write_flush_intent(i, 100 + i).unwrap();
         }
 
         assert!(service.needs_checkpoint());
@@ -1355,7 +1347,7 @@ mod tests {
 
         let service =
             IlogService::open(config.clone(), Arc::clone(&lsn_provider), &io_handle).unwrap();
-        service.write_flush_intent(1, 100, 50).unwrap();
+        service.write_flush_intent(1, 100).unwrap();
         service.write_flush_commit(test_sst_meta(1, 0), 50).unwrap();
         service.sync().unwrap();
 
@@ -1382,9 +1374,9 @@ mod tests {
 
         let service =
             IlogService::open(config.clone(), Arc::clone(&lsn_provider), &io_handle).unwrap();
-        service.write_flush_intent(1, 100, 50).unwrap();
+        service.write_flush_intent(1, 100).unwrap();
         service.write_flush_commit(test_sst_meta(1, 0), 50).unwrap();
-        service.write_flush_intent(2, 101, 100).unwrap();
+        service.write_flush_intent(2, 101).unwrap();
         service
             .write_flush_commit(test_sst_meta(2, 0), 100)
             .unwrap();
@@ -1412,9 +1404,9 @@ mod tests {
         let service =
             IlogService::open(config.clone(), Arc::clone(&lsn_provider), &io_handle).unwrap();
 
-        service.write_flush_intent(1, 100, 50).unwrap();
+        service.write_flush_intent(1, 100).unwrap();
         service.write_flush_commit(test_sst_meta(1, 0), 50).unwrap();
-        let keep_from_lsn = service.write_flush_intent(2, 101, 100).unwrap();
+        let keep_from_lsn = service.write_flush_intent(2, 101).unwrap();
         service
             .write_flush_commit(test_sst_meta(2, 0), 100)
             .unwrap();
@@ -1424,7 +1416,7 @@ mod tests {
         assert_eq!(stats.records_removed, 2);
         assert_eq!(stats.records_kept, 2);
 
-        let new_lsn = service.write_flush_intent(3, 102, 150).unwrap();
+        let new_lsn = service.write_flush_intent(3, 102).unwrap();
         service
             .write_flush_commit(test_sst_meta(3, 0), 150)
             .unwrap();
@@ -1450,7 +1442,6 @@ mod tests {
             lsn: 100,
             sst_id: 1,
             memtable_id: 1,
-            max_memtable_lsn: 50,
         };
         assert_eq!(flush_intent.lsn(), 100);
 
@@ -1578,7 +1569,7 @@ mod tests {
         // First write a valid record
         let service =
             IlogService::open(config.clone(), Arc::clone(&lsn_provider), &io_handle).unwrap();
-        service.write_flush_intent(1, 100, 50).unwrap();
+        service.write_flush_intent(1, 100).unwrap();
         service.sync().unwrap();
         drop(service);
 
@@ -1610,7 +1601,7 @@ mod tests {
         // Write a valid record
         let service =
             IlogService::open(config.clone(), Arc::clone(&lsn_provider), &io_handle).unwrap();
-        service.write_flush_intent(1, 100, 50).unwrap();
+        service.write_flush_intent(1, 100).unwrap();
         let meta = test_sst_meta(1, 0);
         service.write_flush_commit(meta, 50).unwrap();
         service.sync().unwrap();
@@ -1649,7 +1640,7 @@ mod tests {
         // First batch of flushes
         for i in 1..=3 {
             let meta = test_sst_meta(i, 0);
-            service.write_flush_intent(i, 100 + i, i * 10).unwrap();
+            service.write_flush_intent(i, 100 + i).unwrap();
             service.write_flush_commit(meta, i * 10).unwrap();
         }
 
@@ -1667,7 +1658,7 @@ mod tests {
         let service3 = IlogService::open(config.clone(), lsn_provider4, &io_handle).unwrap();
         for i in 4..=6 {
             let meta = test_sst_meta(i, 0);
-            service3.write_flush_intent(i, 100 + i, i * 10).unwrap();
+            service3.write_flush_intent(i, 100 + i).unwrap();
             service3.write_flush_commit(meta, i * 10).unwrap();
         }
 
@@ -1727,7 +1718,7 @@ mod tests {
 
         let service =
             IlogService::open(config.clone(), Arc::clone(&lsn_provider), &io_handle).unwrap();
-        service.write_flush_intent(1, 100, 50).unwrap();
+        service.write_flush_intent(1, 100).unwrap();
 
         // Close should succeed
         service.close().unwrap();
@@ -1775,7 +1766,7 @@ mod tests {
         {
             let service =
                 IlogService::open(config.clone(), Arc::clone(&lsn_provider), &io_handle).unwrap();
-            service.write_flush_intent(1, 100, 50).unwrap();
+            service.write_flush_intent(1, 100).unwrap();
             let meta = test_sst_meta(1, 0);
             service.write_flush_commit(meta, 50).unwrap();
             service.sync().unwrap();
@@ -1786,7 +1777,7 @@ mod tests {
             let lsn_provider2 = new_lsn_provider();
             let (service, _, _) =
                 IlogService::recover(config.clone(), lsn_provider2, &io_handle).unwrap();
-            service.write_flush_intent(2, 101, 100).unwrap();
+            service.write_flush_intent(2, 101).unwrap();
             let meta = test_sst_meta(2, 0);
             service.write_flush_commit(meta, 100).unwrap();
             service.sync().unwrap();

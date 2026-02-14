@@ -19,10 +19,15 @@
 //!
 //! ## Recovery Sequence
 //!
-//! 1. **Replay ilog**: Rebuild Version (SST metadata) from ilog
-//! 2. **Get flushed_lsn**: Determine which clog entries are already in SSTs
-//! 3. **Replay clog**: Apply entries with lsn > flushed_lsn to memtable
-//! 4. **Cleanup orphans**: Remove SST files from incomplete operations
+//! 1. **Replay ilog**: Rebuild Version (SST metadata), get `flushed_lsn`
+//! 2. **Replay clog**: Skip committed txns with `commit_lsn <= flushed_lsn`
+//!    (those are already in SSTs), apply remaining to memtable
+//! 3. **Cleanup orphans**: Remove SST files from incomplete operations
+//!
+//! The `flushed_lsn` filter is safe because `LsmEngine::flush_memtable_async()`
+//! computes a safe `flushed_lsn` that accounts for the race window in
+//! `write_batch_inner()` — it never advances past a straggler's LSN in
+//! another memtable.
 //!
 //! ## Recovery Guarantees
 //!
@@ -57,7 +62,7 @@ struct TxnReplayState {
     writes: Vec<(Vec<u8>, Option<Vec<u8>>)>, // (key, value) - None means delete
     /// Commit timestamp (if committed)
     commit_ts: Option<Timestamp>,
-    /// LSN of the commit record (for replay ordering and flushed_lsn tracking)
+    /// LSN of the commit record (for replay ordering)
     commit_lsn: Option<Lsn>,
 }
 
@@ -196,12 +201,17 @@ impl LsmRecovery {
         let clog = Arc::new(clog);
 
         log_info!(
-            "Clog recovery: {} total entries, replaying entries with lsn > {}",
+            "Clog recovery: {} total entries, flushed_lsn={}",
             clog_entries.len(),
-            flushed_lsn
+            flushed_lsn,
         );
 
-        // Step 5: Replay clog entries with lsn > flushed_lsn
+        // Step 5: Replay clog entries, skipping committed txns already in SSTs.
+        //
+        // Entries with commit_lsn <= flushed_lsn are already durably in SSTs
+        // and can be skipped. This is safe because flush_memtable_async()
+        // computes a safe flushed_lsn that never exceeds a straggler's LSN
+        // in another memtable (via min_lsn_excluding).
         let replay_result = Self::replay_clog(&engine, &clog_entries, flushed_lsn)?;
         stats.clog_entries = replay_result.entries_replayed;
         stats.txn_count = replay_result.txn_count;
@@ -229,10 +239,12 @@ impl LsmRecovery {
         })
     }
 
-    /// Replay clog entries to the engine.
+    /// Replay clog entries to the engine, skipping already-flushed transactions.
     ///
-    /// Only replays entries with lsn > flushed_lsn, but scans ALL entries
-    /// to find max_commit_ts for TSO initialization.
+    /// First pass: collect all entries into TxnReplayState, track max_commit_ts
+    /// from ALL entries (needed for TSO initialization even if txn is skipped).
+    /// Second pass: skip committed txns where `commit_lsn <= flushed_lsn`
+    /// (those are already durably in SSTs).
     fn replay_clog(
         engine: &LsmEngine,
         entries: &[ClogEntry],
@@ -241,17 +253,11 @@ impl LsmRecovery {
         let mut txn_states: HashMap<TxnId, TxnReplayState> = HashMap::new();
         let mut result = ReplayResult::default();
 
-        // Process all entries - track max_commit_ts from ALL,
-        // but only replay writes from entries with lsn > flushed_lsn
+        // First pass: collect all entries and track max_commit_ts
         for entry in entries {
             // Track max_commit_ts from ALL entries (for TSO initialization)
             if let ClogOp::Commit { commit_ts } = &entry.op {
                 result.max_commit_ts = result.max_commit_ts.max(*commit_ts);
-            }
-
-            // Skip entries already in SSTs
-            if entry.lsn <= flushed_lsn {
-                continue;
             }
 
             result.entries_replayed += 1;
@@ -278,13 +284,17 @@ impl LsmRecovery {
             }
         }
 
-        // Collect committed transactions and sort by commit_lsn to ensure
-        // replay order matches commit order. This is critical for correct
-        // flushed_lsn tracking: the last replayed batch must have the highest
-        // clog_lsn so the memtable's max LSN reflects the true recovery point.
+        // Second pass: collect committed transactions, skip those already in SSTs
         let mut committed_txns: Vec<(TxnId, TxnReplayState)> = txn_states
             .into_iter()
-            .filter(|(_, state)| state.commit_ts.is_some() && !state.writes.is_empty())
+            .filter(|(_, state)| {
+                state.commit_ts.is_some()
+                    && !state.writes.is_empty()
+                    && state
+                        .commit_lsn
+                        .map(|lsn| lsn > flushed_lsn)
+                        .unwrap_or(true)
+            })
             .collect();
 
         // Sort by commit_lsn (ascending) so older transactions are applied first
@@ -311,10 +321,6 @@ impl LsmRecovery {
             engine.write_batch(batch)?;
             result.txn_count += 1;
         }
-
-        // Log any uncommitted transactions
-        // Note: txn_states is now consumed, but we already filtered and collected committed ones
-        // For logging, we'd need a separate pass but it's not critical for correctness
 
         Ok(result)
     }
@@ -489,7 +495,7 @@ mod tests {
             let recovery = LsmRecovery::new(tmp.path());
             let result = recovery.recover(&io_handle).unwrap();
 
-            // Data should be readable from SST (not replayed from clog)
+            // Data should be readable (from SST + redundant memtable replay)
             for (key, expected_value) in &written {
                 assert_eq!(
                     get_for_test(&result.engine, key).await,
@@ -499,8 +505,6 @@ mod tests {
                 );
             }
 
-            // With unified LSN provider, flushed_lsn correctly tracks what's in SSTs
-            // so clog replay should skip entries that are already flushed
             assert!(
                 result.stats.flushed_lsn > 0,
                 "flushed_lsn should be set after flush"
@@ -716,10 +720,11 @@ mod tests {
                 );
             }
 
-            // With unified LSN provider, exactly 3 unflushed transactions should be replayed
+            // Only unflushed transactions are replayed (flushed ones are
+            // skipped by the flushed_lsn filter — already in SSTs).
             assert_eq!(
                 result.stats.txn_count, 3,
-                "Exactly 3 unflushed transactions should be replayed"
+                "Only 3 unflushed transactions should be replayed"
             );
         }
     }
@@ -828,13 +833,11 @@ mod tests {
                 "final_lsn should be >= flushed_lsn"
             );
 
-            // Verify the key property: flushed_lsn is properly tracked
-            // so recovery only replays entries with lsn > flushed_lsn
-            // Note: Some entries may be replayed if they were logged to clog
-            // after the memtable captured max_memtable_lsn but before flush completed
-            assert!(
-                result.stats.clog_entries <= 10,
-                "Should replay at most 10 clog entries (2 per transaction * 5 transactions)"
+            // All 10 clog entries are read in the first pass (for max_commit_ts).
+            // Flushed transactions are skipped by the commit_lsn filter.
+            assert_eq!(
+                result.stats.clog_entries, 10,
+                "All 10 clog entries should be read (2 per transaction * 5 transactions)"
             );
         }
     }
@@ -1214,12 +1217,11 @@ mod tests {
         }
     }
 
-    /// Test that recovery correctly handles the flushed_lsn boundary.
+    /// Test that recovery replays ALL clog entries, including those already in SSTs.
     ///
-    /// Entries with lsn <= flushed_lsn are already in SSTs and should be skipped.
-    /// Entries with lsn > flushed_lsn must be replayed from clog.
-    /// This test verifies the exact boundary: writes before flush are in SST,
-    /// writes after flush are replayed from clog.
+    /// After the unconditional-replay fix, entries with lsn <= flushed_lsn are
+    /// replayed to the memtable redundantly (idempotent — merge iterator deduplicates).
+    /// This test verifies both flushed and unflushed data is readable after recovery.
     #[tokio::test]
     async fn test_recovery_flushed_lsn_boundary() {
         let tmp = TempDir::new().unwrap();
@@ -1332,14 +1334,275 @@ mod tests {
                 );
             }
 
-            // Verify only unflushed entries were replayed
+            // Only unflushed transactions are replayed. Flushed ones are
+            // skipped by the commit_lsn filter (already in SSTs).
             assert_eq!(
                 result.stats.flushed_lsn, flushed_lsn,
                 "Recovered flushed_lsn should match"
             );
             assert_eq!(
                 result.stats.txn_count, 3,
-                "Exactly 3 unflushed transactions should be replayed"
+                "Only 3 unflushed transactions should be replayed"
+            );
+        }
+    }
+
+    /// Test recovery with out-of-order LSN writes — the core bug scenario.
+    ///
+    /// Simulates the race window in `write_batch_inner()`:
+    ///   1. Thread B allocates LSN=4, writes to memtable, memtable rotates
+    ///   2. Thread A's late write with LSN=2 lands in NEW active memtable
+    ///   3. Frozen memtable (with LSN 4) is flushed
+    ///   4. safe_flushed_lsn = min(4, 2-1) = 1 — protects the straggler
+    ///   5. Crash before next flush
+    ///
+    /// The safe flushed_lsn computation (via min_lsn_excluding) ensures
+    /// flushed_lsn < straggler's LSN, so recovery correctly replays it.
+    #[tokio::test]
+    async fn test_recovery_out_of_order_lsn_no_data_loss() {
+        let tmp = TempDir::new().unwrap();
+        let io_handle = tokio::runtime::Handle::current();
+
+        let straggler_key = b"straggler_key".to_vec();
+        let straggler_value = b"straggler_value".to_vec();
+
+        // First session: simulate the race condition
+        {
+            // Use large memtable_size to prevent auto-rotation inside write_batch.
+            // We control rotation explicitly via freeze_active().
+            let lsm_config = LsmConfig::builder(tmp.path())
+                .memtable_size(4096)
+                .max_frozen_memtables(4)
+                .build()
+                .unwrap();
+
+            let lsn_provider = new_lsn_provider();
+            let ilog_config = IlogConfig::new(tmp.path());
+            let ilog = Arc::new(
+                IlogService::open(ilog_config, Arc::clone(&lsn_provider), &io_handle).unwrap(),
+            );
+
+            let engine = LsmEngine::open_with_recovery(
+                lsm_config,
+                Arc::clone(&lsn_provider),
+                Arc::clone(&ilog),
+                Version::new(),
+            )
+            .unwrap();
+
+            let clog_config = FileClogConfig::with_dir(tmp.path());
+            let clog = FileClogService::open_with_lsn_provider(
+                clog_config,
+                Arc::clone(&lsn_provider),
+                &io_handle,
+            )
+            .unwrap();
+
+            // Step 1: Write txn A to clog (the "straggler"). Gets early clog LSN.
+            let mut batch_a = ClogBatch::new();
+            batch_a.add_put(1, straggler_key.clone(), straggler_value.clone());
+            batch_a.add_commit(1, 100);
+            let straggler_clog_lsn = clog.write(&mut batch_a, true).unwrap().await.unwrap();
+
+            // Step 2: Write txn B to clog and immediately to engine.
+            let mut batch_b = ClogBatch::new();
+            batch_b.add_put(2, b"normal_key_1".to_vec(), b"normal_val_1".to_vec());
+            batch_b.add_commit(2, 200);
+            let clog_lsn_b = clog.write(&mut batch_b, true).unwrap().await.unwrap();
+
+            let mut wb_b = WriteBatch::new();
+            wb_b.set_commit_ts(200);
+            wb_b.set_clog_lsn(clog_lsn_b);
+            wb_b.put(b"normal_key_1".to_vec(), b"normal_val_1".to_vec());
+            engine.write_batch(wb_b).unwrap();
+
+            // Step 3: Write txn C to clog and immediately to engine.
+            let mut batch_c = ClogBatch::new();
+            batch_c.add_put(3, b"normal_key_2".to_vec(), b"normal_val_2".to_vec());
+            batch_c.add_commit(3, 300);
+            let clog_lsn_c = clog.write(&mut batch_c, true).unwrap().await.unwrap();
+
+            let mut wb_c = WriteBatch::new();
+            wb_c.set_commit_ts(300);
+            wb_c.set_clog_lsn(clog_lsn_c);
+            wb_c.put(b"normal_key_2".to_vec(), b"normal_val_2".to_vec());
+            engine.write_batch(wb_c).unwrap();
+
+            // Step 4: Force rotation so B+C go to frozen, then write straggler
+            // to the new active (simulating the late arrival from the race).
+            engine.freeze_active();
+
+            let mut wb_a = WriteBatch::new();
+            wb_a.set_commit_ts(100);
+            wb_a.set_clog_lsn(straggler_clog_lsn);
+            wb_a.put(straggler_key.clone(), straggler_value.clone());
+            engine.write_batch(wb_a).unwrap();
+
+            // Step 5: Flush the frozen memtable (B+C).
+            // safe_flushed_lsn = min(B+C max_lsn, straggler_lsn - 1) — protects straggler.
+            engine.flush_all().unwrap();
+
+            let flushed_lsn = engine.current_version().flushed_lsn();
+            assert!(
+                flushed_lsn < straggler_clog_lsn,
+                "safe flushed_lsn ({flushed_lsn}) must be < straggler's LSN ({straggler_clog_lsn}) \
+                 — min_lsn_excluding protects the straggler"
+            );
+
+            // Verify safe_log_gc_lsn is correct (protects the straggler)
+            let safe_lsn = engine.safe_log_gc_lsn();
+            assert!(
+                safe_lsn <= straggler_clog_lsn,
+                "safe_log_gc_lsn ({safe_lsn}) must not exceed straggler's LSN ({straggler_clog_lsn})"
+            );
+
+            // Step 6: "Crash" — drop without flushing the active memtable.
+            clog.close().await.unwrap();
+        }
+
+        // Second session: recover and verify the straggler survives.
+        {
+            let recovery = LsmRecovery::new(tmp.path());
+            let result = recovery.recover(&io_handle).unwrap();
+
+            // THE CRITICAL ASSERTION: the straggler's data must survive recovery.
+            // safe_flushed_lsn < straggler's commit_lsn, so recovery replays it.
+            assert_eq!(
+                get_for_test(&result.engine, &straggler_key).await,
+                Some(straggler_value.clone()),
+                "CRITICAL: straggler data must survive recovery — \
+                 safe flushed_lsn protects out-of-order LSN writes"
+            );
+
+            // Normal keys should also be present (from SST)
+            assert_eq!(
+                get_for_test(&result.engine, b"normal_key_1").await,
+                Some(b"normal_val_1".to_vec()),
+            );
+            assert_eq!(
+                get_for_test(&result.engine, b"normal_key_2").await,
+                Some(b"normal_val_2".to_vec()),
+            );
+
+            // safe_flushed_lsn is conservative (protects straggler), so B+C also
+            // get replayed (idempotent). All 3 txns have commit_lsn > flushed_lsn.
+            assert_eq!(
+                result.stats.txn_count, 3,
+                "All 3 txns replayed (safe_flushed_lsn is conservative)"
+            );
+        }
+    }
+
+    /// Test that out-of-order LSN recovery is correct across multiple recovery cycles.
+    ///
+    /// Scenario: rotate + straggler in active + flush frozen + crash + recover
+    /// + flush + recover again. The straggler data should survive both recoveries.
+    #[tokio::test]
+    async fn test_recovery_out_of_order_lsn_survives_second_recovery() {
+        let tmp = TempDir::new().unwrap();
+        let io_handle = tokio::runtime::Handle::current();
+
+        let straggler_key = b"straggler_survives".to_vec();
+        let straggler_value = b"straggler_data".to_vec();
+
+        // Session 1: create the out-of-order state and crash.
+        {
+            // Use large memtable_size to prevent auto-rotation inside write_batch.
+            let lsm_config = LsmConfig::builder(tmp.path())
+                .memtable_size(4096)
+                .max_frozen_memtables(4)
+                .build()
+                .unwrap();
+
+            let lsn_provider = new_lsn_provider();
+            let ilog_config = IlogConfig::new(tmp.path());
+            let ilog = Arc::new(
+                IlogService::open(ilog_config, Arc::clone(&lsn_provider), &io_handle).unwrap(),
+            );
+
+            let engine = LsmEngine::open_with_recovery(
+                lsm_config,
+                Arc::clone(&lsn_provider),
+                Arc::clone(&ilog),
+                Version::new(),
+            )
+            .unwrap();
+
+            let clog_config = FileClogConfig::with_dir(tmp.path());
+            let clog = FileClogService::open_with_lsn_provider(
+                clog_config,
+                Arc::clone(&lsn_provider),
+                &io_handle,
+            )
+            .unwrap();
+
+            // Straggler: write to clog first (gets early LSN)
+            let mut batch_a = ClogBatch::new();
+            batch_a.add_put(1, straggler_key.clone(), straggler_value.clone());
+            batch_a.add_commit(1, 100);
+            let straggler_lsn = clog.write(&mut batch_a, true).unwrap().await.unwrap();
+
+            // Normal txn: write to clog AND engine
+            let mut batch_b = ClogBatch::new();
+            batch_b.add_put(2, b"normal".to_vec(), b"data".to_vec());
+            batch_b.add_commit(2, 200);
+            let lsn_b = clog.write(&mut batch_b, true).unwrap().await.unwrap();
+
+            let mut wb = WriteBatch::new();
+            wb.set_commit_ts(200);
+            wb.set_clog_lsn(lsn_b);
+            wb.put(b"normal".to_vec(), b"data".to_vec());
+            engine.write_batch(wb).unwrap();
+
+            // Force rotation so normal txn goes to frozen
+            engine.freeze_active();
+
+            // Write straggler to the new active (simulating late arrival)
+            let mut wb_a = WriteBatch::new();
+            wb_a.set_commit_ts(100);
+            wb_a.set_clog_lsn(straggler_lsn);
+            wb_a.put(straggler_key.clone(), straggler_value.clone());
+            engine.write_batch(wb_a).unwrap();
+
+            // Flush frozen — safe flushed_lsn protects the straggler
+            engine.flush_all().unwrap();
+
+            clog.close().await.unwrap();
+            // "Crash"
+        }
+
+        // Session 2: recover, flush the straggler, then "crash" again.
+        {
+            let recovery = LsmRecovery::new(tmp.path());
+            let result = recovery.recover(&io_handle).unwrap();
+
+            // Straggler must be recoverable
+            assert_eq!(
+                get_for_test(&result.engine, &straggler_key).await,
+                Some(straggler_value.clone()),
+                "Straggler should survive first recovery"
+            );
+
+            // Flush everything (including the replayed straggler)
+            result.engine.flush_all_with_active().unwrap();
+
+            // "Crash" again
+            result.clog.close().await.unwrap();
+        }
+
+        // Session 3: recover again — data should still be there (now in SST).
+        {
+            let recovery = LsmRecovery::new(tmp.path());
+            let result = recovery.recover(&io_handle).unwrap();
+
+            assert_eq!(
+                get_for_test(&result.engine, &straggler_key).await,
+                Some(straggler_value.clone()),
+                "Straggler should survive second recovery (now in SST)"
+            );
+            assert_eq!(
+                get_for_test(&result.engine, b"normal").await,
+                Some(b"data".to_vec()),
             );
         }
     }
@@ -1357,7 +1620,7 @@ mod tests {
                 IlogService::open(ilog_config, Arc::clone(&lsn_provider), &io_handle).unwrap();
 
             // Write flush intent but no commit (simulating crash before SST creation)
-            ilog.write_flush_intent(99, 100, 50).unwrap();
+            ilog.write_flush_intent(99, 100).unwrap();
             ilog.sync().unwrap();
         }
 

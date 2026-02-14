@@ -290,6 +290,70 @@ impl LsmEngine {
         self.version_set.current()
     }
 
+    /// Compute the minimum LSN across all in-memory memtables (active + frozen).
+    ///
+    /// Returns `None` if all memtables are empty (no writes in memory).
+    ///
+    /// This is critical for log GC safety: we must never truncate clog entries
+    /// at or above this LSN, because those entries may not yet be flushed to SST.
+    ///
+    /// # Why this exists
+    ///
+    /// Due to a race window in `write_batch_inner()` between LSN allocation and
+    /// memtable write, a lower-LSN write can land in a *newer* memtable than a
+    /// higher-LSN write. This means `flushed_lsn` (from a flushed frozen
+    /// memtable's `max_lsn`) could exceed the `min_lsn` of a still-in-memory
+    /// memtable. Using `flushed_lsn` alone for clog truncation would lose those
+    /// lower-LSN entries on crash.
+    pub fn min_unflushed_lsn(&self) -> Option<u64> {
+        let state = self.state.read();
+        let mut min_lsn = state.active.min_lsn();
+        for frozen in &state.frozen {
+            match (min_lsn, frozen.min_lsn()) {
+                (Some(cur), Some(f)) => min_lsn = Some(cur.min(f)),
+                (None, some) => min_lsn = some,
+                _ => {}
+            }
+        }
+        min_lsn
+    }
+
+    /// Compute the minimum LSN across active + frozen memtables, excluding
+    /// the memtable with the given ID. Used at flush time to determine the
+    /// safe `flushed_lsn` that protects stragglers in other memtables.
+    fn min_lsn_excluding(&self, exclude_id: u64) -> Option<u64> {
+        let state = self.state.read();
+        let mut min_lsn = state.active.min_lsn();
+        for frozen in &state.frozen {
+            if frozen.id() == exclude_id {
+                continue;
+            }
+            match (min_lsn, frozen.min_lsn()) {
+                (Some(cur), Some(f)) => min_lsn = Some(cur.min(f)),
+                (None, some) => min_lsn = some,
+                _ => {}
+            }
+        }
+        min_lsn
+    }
+
+    /// Compute the safe clog truncation LSN for log GC.
+    ///
+    /// Returns the maximum LSN up to which clog entries can be safely deleted.
+    /// This is `min(flushed_lsn, min_unflushed_lsn - 1)` — ensuring we never
+    /// truncate a clog entry that is still only in a volatile memtable.
+    ///
+    /// Returns 0 if there are unflushed memtable entries with the minimum
+    /// possible LSN (1), meaning no truncation is safe.
+    pub fn safe_log_gc_lsn(&self) -> u64 {
+        let flushed_lsn = self.version_set.current().flushed_lsn();
+        match self.min_unflushed_lsn() {
+            Some(min_mem_lsn) => flushed_lsn.min(min_mem_lsn.saturating_sub(1)),
+            // No in-memory data — flushed_lsn is the safe boundary.
+            None => flushed_lsn,
+        }
+    }
+
     /// Get a SuperVersion snapshot for reading.
     ///
     /// Returns a consistent snapshot of:
@@ -419,11 +483,10 @@ impl LsmEngine {
 
         // Allocate SST ID atomically to prevent races during concurrent flushes
         let sst_id = self.alloc_sst_id();
-        let max_memtable_lsn = memtable.max_lsn().unwrap_or(0);
 
         // Phase 1: Write flush intent (if durable)
         if let Some(ref ilog) = self.ilog {
-            ilog.write_flush_intent(sst_id, memtable.id(), max_memtable_lsn)?;
+            ilog.write_flush_intent(sst_id, memtable.id())?;
         }
 
         // Phase 2: Build SST file
@@ -463,9 +526,26 @@ impl LsmEngine {
         #[cfg(feature = "failpoints")]
         fail_point!("lsm_flush_after_sst_write");
 
+        // Compute safe flushed_lsn: the maximum LSN up to which ALL data is
+        // durably in SSTs. Due to the race window in write_batch_inner() between
+        // LSN allocation and memtable write, a lower-LSN entry can land in a
+        // *different* memtable than the one being flushed. We must not advance
+        // flushed_lsn past such a straggler's LSN.
+        //
+        // safe_flushed_lsn = min(memtable.max_lsn, min_remaining_lsn - 1)
+        // where min_remaining_lsn is the min LSN across active + other frozen.
+        let max_memtable_lsn = memtable.max_lsn().unwrap_or(0);
+        let safe_flushed_lsn = {
+            let min_remaining = self.min_lsn_excluding(memtable.id());
+            match min_remaining {
+                Some(min_rem) => max_memtable_lsn.min(min_rem.saturating_sub(1)),
+                None => max_memtable_lsn,
+            }
+        };
+
         // Phase 3: Write flush commit (if durable)
         if let Some(ref ilog) = self.ilog {
-            ilog.write_flush_commit(meta.clone(), max_memtable_lsn)?;
+            ilog.write_flush_commit(meta.clone(), safe_flushed_lsn)?;
         }
 
         // Failpoint: crash after ilog commit, before version update
@@ -483,7 +563,7 @@ impl LsmEngine {
         //
         // install_super_version reads version_set.current() inside the state lock,
         // so SV readers always get a consistent (frozen, version) pair.
-        let delta = ManifestDelta::flush(meta.clone(), max_memtable_lsn);
+        let delta = ManifestDelta::flush(meta.clone(), safe_flushed_lsn);
         let new_version = self.version_set.apply_delta(&delta);
 
         {
@@ -7565,6 +7645,414 @@ mod tests {
         assert!(
             engine.write_batch(batch).is_ok(),
             "Should succeed after flush"
+        );
+    }
+
+    // ==================== min_unflushed_lsn / safe_log_gc_lsn Tests ====================
+
+    #[test]
+    fn test_min_unflushed_lsn_empty_engine() {
+        let dir = TempDir::new().unwrap();
+        let config = test_config(dir.path());
+        let engine = LsmEngine::open(config).unwrap();
+
+        // No writes at all — min_unflushed_lsn should be None.
+        assert_eq!(engine.min_unflushed_lsn(), None);
+    }
+
+    #[test]
+    fn test_min_unflushed_lsn_active_only() {
+        let dir = TempDir::new().unwrap();
+        let config = test_config(dir.path());
+        let engine = LsmEngine::open(config).unwrap();
+
+        let mut batch = new_batch(1);
+        batch.put(b"k1".to_vec(), b"v1".to_vec());
+        batch.set_clog_lsn(10);
+        engine.write_batch(batch).unwrap();
+
+        assert_eq!(engine.min_unflushed_lsn(), Some(10));
+
+        let mut batch = new_batch(2);
+        batch.put(b"k2".to_vec(), b"v2".to_vec());
+        batch.set_clog_lsn(15);
+        engine.write_batch(batch).unwrap();
+
+        // min stays at 10 even after a second, higher LSN write.
+        assert_eq!(engine.min_unflushed_lsn(), Some(10));
+    }
+
+    #[test]
+    fn test_min_unflushed_lsn_across_frozen_and_active() {
+        let dir = TempDir::new().unwrap();
+        // Small memtable to trigger rotation easily.
+        let config = LsmConfig::builder(dir.path())
+            .memtable_size(100)
+            .max_frozen_memtables(4)
+            .build()
+            .unwrap();
+        let engine = LsmEngine::open(config).unwrap();
+
+        // Fill and rotate: this creates a frozen memtable with LSN=5.
+        let mut batch = new_batch(1);
+        batch.put(b"k1".to_vec(), vec![b'x'; 80]);
+        batch.set_clog_lsn(5);
+        engine.write_batch(batch).unwrap();
+        engine.maybe_rotate();
+
+        assert!(engine.frozen_count() >= 1);
+
+        // Write to new active with a higher LSN.
+        let mut batch = new_batch(2);
+        batch.put(b"k2".to_vec(), b"v2".to_vec());
+        batch.set_clog_lsn(20);
+        engine.write_batch(batch).unwrap();
+
+        // min_unflushed_lsn should be 5 (from frozen), not 20 (from active).
+        assert_eq!(engine.min_unflushed_lsn(), Some(5));
+    }
+
+    /// Simulates the race condition where a lower LSN lands in a newer memtable.
+    ///
+    /// This directly reproduces the bug scenario:
+    /// - Frozen memtable has max_lsn=20 (from a "later" write that landed first)
+    /// - Active memtable has min_lsn=10 (from an "earlier" write that landed second)
+    /// - safe_flushed_lsn = min(20, 10-1) = 9 — protects the straggler
+    /// - safe_log_gc_lsn = min(9, 10-1) = 9
+    #[tokio::test]
+    async fn test_safe_log_gc_lsn_with_out_of_order_lsn() {
+        let dir = TempDir::new().unwrap();
+        let config = LsmConfig::builder(dir.path())
+            .memtable_size(100)
+            .max_frozen_memtables(4)
+            .build()
+            .unwrap();
+        let engine = LsmEngine::open(config).unwrap();
+
+        // Step 1: Write LSN=20 to active, then rotate.
+        let mut batch = new_batch(1);
+        batch.put(b"k_high".to_vec(), vec![b'x'; 80]);
+        batch.set_clog_lsn(20);
+        engine.write_batch(batch).unwrap();
+        engine.maybe_rotate();
+        assert!(engine.frozen_count() >= 1);
+
+        // Step 2: Simulate a "late" write with a lower LSN landing in the new active.
+        // This is the exact scenario from the race window.
+        let mut batch = new_batch(2);
+        batch.put(b"k_low".to_vec(), b"v_low".to_vec());
+        batch.set_clog_lsn(10);
+        engine.write_batch(batch).unwrap();
+
+        // Before flush: min_unflushed_lsn = 10 (from active), flushed_lsn = 0.
+        assert_eq!(engine.min_unflushed_lsn(), Some(10));
+        assert_eq!(engine.safe_log_gc_lsn(), 0); // flushed_lsn is still 0
+
+        // Step 3: Flush the frozen memtable (max_lsn=20).
+        let frozen = {
+            let state = engine.state.read();
+            state.frozen.front().cloned().unwrap()
+        };
+        engine.flush_memtable_async(&frozen).await.unwrap();
+
+        // After flush: safe_flushed_lsn = min(20, 10-1) = 9.
+        // Active still has LSN=10.
+        let flushed_lsn = engine.current_version().flushed_lsn();
+        assert_eq!(
+            flushed_lsn, 9,
+            "safe flushed_lsn should be min(20, 10-1) = 9"
+        );
+        assert_eq!(engine.min_unflushed_lsn(), Some(10));
+
+        // safe_log_gc_lsn = min(flushed_lsn=9, min_unflushed_lsn-1=9) = 9
+        let safe = engine.safe_log_gc_lsn();
+        assert_eq!(safe, 9, "safe_log_gc_lsn must be 9");
+    }
+
+    #[tokio::test]
+    async fn test_safe_log_gc_lsn_equals_flushed_when_all_flushed() {
+        let dir = TempDir::new().unwrap();
+        let config = LsmConfig::builder(dir.path())
+            .memtable_size(100)
+            .max_frozen_memtables(4)
+            .build()
+            .unwrap();
+        let engine = LsmEngine::open(config).unwrap();
+
+        let mut batch = new_batch(1);
+        batch.put(b"k1".to_vec(), vec![b'x'; 80]);
+        batch.set_clog_lsn(10);
+        engine.write_batch(batch).unwrap();
+
+        // Flush everything (freeze active + flush all frozen).
+        engine.flush_all_with_active().unwrap();
+
+        let flushed_lsn = engine.current_version().flushed_lsn();
+        assert!(flushed_lsn >= 10);
+
+        // No in-memory data left — safe_lsn == flushed_lsn.
+        assert_eq!(engine.min_unflushed_lsn(), None);
+        assert_eq!(engine.safe_log_gc_lsn(), flushed_lsn);
+    }
+
+    #[tokio::test]
+    async fn test_safe_log_gc_lsn_with_multiple_frozen() {
+        let dir = TempDir::new().unwrap();
+        let config = LsmConfig::builder(dir.path())
+            .memtable_size(100)
+            .max_frozen_memtables(4)
+            .build()
+            .unwrap();
+        let engine = LsmEngine::open(config).unwrap();
+
+        // Create frozen[0] with LSN=5.
+        let mut batch = new_batch(1);
+        batch.put(b"k1".to_vec(), vec![b'x'; 80]);
+        batch.set_clog_lsn(5);
+        engine.write_batch(batch).unwrap();
+        engine.maybe_rotate();
+
+        // Create frozen[1] with LSN=15.
+        let mut batch = new_batch(2);
+        batch.put(b"k2".to_vec(), vec![b'y'; 80]);
+        batch.set_clog_lsn(15);
+        engine.write_batch(batch).unwrap();
+        engine.maybe_rotate();
+
+        // Write LSN=3 to active (simulating late arrival from race window).
+        let mut batch = new_batch(3);
+        batch.put(b"k3".to_vec(), b"v3".to_vec());
+        batch.set_clog_lsn(3);
+        engine.write_batch(batch).unwrap();
+
+        // min across all: active(3), frozen[0](5), frozen[1](15) → 3.
+        assert_eq!(engine.min_unflushed_lsn(), Some(3));
+
+        // Flush frozen[0] (LSN=5) — FIFO order.
+        let frozen0 = {
+            let state = engine.state.read();
+            state.frozen.front().cloned().unwrap()
+        };
+        engine.flush_memtable_async(&frozen0).await.unwrap();
+
+        // safe_flushed_lsn = min(5, min_remaining-1) = min(5, min(3,15)-1) = min(5, 2) = 2.
+        assert_eq!(engine.current_version().flushed_lsn(), 2);
+        assert_eq!(engine.min_unflushed_lsn(), Some(3));
+        assert_eq!(engine.safe_log_gc_lsn(), 2); // min(2, 3-1) = 2
+
+        // Flush frozen[1] (LSN=15).
+        let frozen1 = {
+            let state = engine.state.read();
+            state.frozen.front().cloned().unwrap()
+        };
+        engine.flush_memtable_async(&frozen1).await.unwrap();
+
+        // safe_flushed_lsn = min(15, active(3)-1) = 2. flushed_lsn = max(2, 2) = 2.
+        assert_eq!(engine.current_version().flushed_lsn(), 2);
+        assert_eq!(engine.min_unflushed_lsn(), Some(3));
+        assert_eq!(engine.safe_log_gc_lsn(), 2); // min(2, 3-1) = 2
+    }
+
+    #[test]
+    fn test_safe_log_gc_lsn_with_lsn_1() {
+        let dir = TempDir::new().unwrap();
+        let config = test_config(dir.path());
+        let engine = LsmEngine::open(config).unwrap();
+
+        // Write with LSN=1 — the minimum possible clog LSN.
+        let mut batch = new_batch(1);
+        batch.put(b"k".to_vec(), b"v".to_vec());
+        batch.set_clog_lsn(1);
+        engine.write_batch(batch).unwrap();
+
+        // min_unflushed = 1, safe_lsn = min(0, 1-1) = 0.
+        // No truncation is safe.
+        assert_eq!(engine.min_unflushed_lsn(), Some(1));
+        assert_eq!(engine.safe_log_gc_lsn(), 0);
+    }
+
+    /// Verify flushed_lsn advances correctly through a multi-step flush sequence.
+    ///
+    /// Scenario:
+    ///   1. Flush with no straggler → flushed_lsn = max_memtable_lsn (unclamped)
+    ///   2. Straggler arrives → next flush clamps flushed_lsn
+    ///   3. Straggler is flushed → flushed_lsn advances past the clamp
+    #[tokio::test]
+    async fn test_flushed_lsn_forwarded_correctly_across_flushes() {
+        let dir = TempDir::new().unwrap();
+        let config = LsmConfig::builder(dir.path())
+            .memtable_size(4096)
+            .max_frozen_memtables(4)
+            .build()
+            .unwrap();
+        let engine = LsmEngine::open(config).unwrap();
+
+        assert_eq!(engine.current_version().flushed_lsn(), 0);
+
+        // --- Phase 1: No straggler. flushed_lsn advances to max_memtable_lsn. ---
+
+        // Write LSN=10 to active, rotate to frozen.
+        let mut batch = new_batch(1);
+        batch.put(b"k1".to_vec(), b"v1".to_vec());
+        batch.set_clog_lsn(10);
+        engine.write_batch(batch).unwrap();
+        engine.freeze_active();
+
+        // Flush frozen (max_lsn=10). No remaining memtables have data, so
+        // min_lsn_excluding = None → safe_flushed_lsn = 10 (unclamped).
+        let frozen = {
+            let state = engine.state.read();
+            state.frozen.front().cloned().unwrap()
+        };
+        engine.flush_memtable_async(&frozen).await.unwrap();
+
+        assert_eq!(engine.current_version().flushed_lsn(), 10);
+        assert_eq!(engine.min_unflushed_lsn(), None);
+        assert_eq!(engine.safe_log_gc_lsn(), 10);
+
+        // --- Phase 2: Straggler clamps flushed_lsn. ---
+
+        // Write LSN=30 to active, rotate.
+        let mut batch = new_batch(2);
+        batch.put(b"k2".to_vec(), b"v2".to_vec());
+        batch.set_clog_lsn(30);
+        engine.write_batch(batch).unwrap();
+        engine.freeze_active();
+
+        // Simulate late-arriving straggler with LSN=15 in the new active.
+        let mut batch = new_batch(3);
+        batch.put(b"k_straggler".to_vec(), b"v_straggler".to_vec());
+        batch.set_clog_lsn(15);
+        engine.write_batch(batch).unwrap();
+
+        // Flush frozen (max_lsn=30). min_lsn_excluding = active(15) → 15.
+        // safe_flushed_lsn = min(30, 15-1) = 14.
+        // flushed_lsn = max(10, 14) = 14.
+        let frozen = {
+            let state = engine.state.read();
+            state.frozen.front().cloned().unwrap()
+        };
+        engine.flush_memtable_async(&frozen).await.unwrap();
+
+        assert_eq!(
+            engine.current_version().flushed_lsn(),
+            14,
+            "flushed_lsn clamped to straggler_lsn - 1"
+        );
+        assert_eq!(engine.min_unflushed_lsn(), Some(15));
+        assert_eq!(engine.safe_log_gc_lsn(), 14);
+
+        // --- Phase 3: Flush the straggler. flushed_lsn advances. ---
+
+        // Write LSN=50 to active (new data arriving after the straggler).
+        let mut batch = new_batch(4);
+        batch.put(b"k3".to_vec(), b"v3".to_vec());
+        batch.set_clog_lsn(50);
+        engine.write_batch(batch).unwrap();
+
+        // Freeze the active (straggler=15, k3=50 are in the same memtable).
+        engine.freeze_active();
+
+        // Flush frozen (max_lsn=50). No remaining data (empty active), so
+        // min_lsn_excluding = None → safe_flushed_lsn = 50 (unclamped).
+        // flushed_lsn = max(14, 50) = 50.
+        let frozen = {
+            let state = engine.state.read();
+            state.frozen.front().cloned().unwrap()
+        };
+        engine.flush_memtable_async(&frozen).await.unwrap();
+
+        assert_eq!(
+            engine.current_version().flushed_lsn(),
+            50,
+            "flushed_lsn advances after straggler is flushed"
+        );
+        assert_eq!(engine.min_unflushed_lsn(), None);
+        assert_eq!(engine.safe_log_gc_lsn(), 50);
+
+        // Verify data integrity: all keys readable from SSTs.
+        assert_eq!(engine.get(b"k1").await.unwrap(), Some(b"v1".to_vec()));
+        assert_eq!(engine.get(b"k2").await.unwrap(), Some(b"v2".to_vec()));
+        assert_eq!(
+            engine.get(b"k_straggler").await.unwrap(),
+            Some(b"v_straggler".to_vec())
+        );
+        assert_eq!(engine.get(b"k3").await.unwrap(), Some(b"v3".to_vec()));
+    }
+
+    /// Verify flushed_lsn never regresses (monotonicity) even when later flushes
+    /// compute a smaller safe_flushed_lsn than previously recorded.
+    #[tokio::test]
+    async fn test_flushed_lsn_monotonicity() {
+        let dir = TempDir::new().unwrap();
+        let config = LsmConfig::builder(dir.path())
+            .memtable_size(4096)
+            .max_frozen_memtables(4)
+            .build()
+            .unwrap();
+        let engine = LsmEngine::open(config).unwrap();
+
+        // Write LSN=100 to frozen[0].
+        let mut batch = new_batch(1);
+        batch.put(b"a".to_vec(), b"v".to_vec());
+        batch.set_clog_lsn(100);
+        engine.write_batch(batch).unwrap();
+        engine.freeze_active();
+
+        // Write LSN=200 to frozen[1].
+        let mut batch = new_batch(2);
+        batch.put(b"b".to_vec(), b"v".to_vec());
+        batch.set_clog_lsn(200);
+        engine.write_batch(batch).unwrap();
+        engine.freeze_active();
+
+        // Write a straggler with LSN=5 to active.
+        let mut batch = new_batch(3);
+        batch.put(b"c".to_vec(), b"v".to_vec());
+        batch.set_clog_lsn(5);
+        engine.write_batch(batch).unwrap();
+
+        // State: frozen=[100, 200], active=5.
+
+        // Flush frozen[0] (max_lsn=100).
+        // min_lsn_excluding = min(active=5, frozen[1]=200) = 5.
+        // safe_flushed_lsn = min(100, 4) = 4.
+        let frozen0 = {
+            let state = engine.state.read();
+            state.frozen.front().cloned().unwrap()
+        };
+        engine.flush_memtable_async(&frozen0).await.unwrap();
+        assert_eq!(engine.current_version().flushed_lsn(), 4);
+
+        // Flush frozen[1] (max_lsn=200).
+        // min_lsn_excluding = active=5.
+        // safe_flushed_lsn = min(200, 4) = 4.
+        // flushed_lsn = max(4, 4) = 4 — no regression.
+        let frozen1 = {
+            let state = engine.state.read();
+            state.frozen.front().cloned().unwrap()
+        };
+        engine.flush_memtable_async(&frozen1).await.unwrap();
+        assert_eq!(
+            engine.current_version().flushed_lsn(),
+            4,
+            "flushed_lsn must not regress"
+        );
+
+        // Now flush the straggler too.
+        engine.freeze_active();
+        let frozen2 = {
+            let state = engine.state.read();
+            state.frozen.front().cloned().unwrap()
+        };
+        engine.flush_memtable_async(&frozen2).await.unwrap();
+
+        // min_lsn_excluding = None (empty active).
+        // safe_flushed_lsn = 5. flushed_lsn = max(4, 5) = 5.
+        assert_eq!(
+            engine.current_version().flushed_lsn(),
+            5,
+            "flushed_lsn advances after straggler flushed"
         );
     }
 }

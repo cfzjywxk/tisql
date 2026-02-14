@@ -349,8 +349,14 @@ pub struct Database {
 /// One-shot log GC statistics.
 #[derive(Debug, Default)]
 pub struct LogGcStats {
-    /// `Version.flushed_lsn` snapshot used as clog reclaim boundary.
+    /// `Version.flushed_lsn` — the max LSN persisted to SST files.
     pub flushed_lsn: Lsn,
+    /// Safe clog truncation boundary: `min(flushed_lsn, min_unflushed_lsn - 1)`.
+    ///
+    /// This accounts for the race window in `write_batch_inner()` where a
+    /// lower-LSN write can land in a newer memtable than a higher-LSN write.
+    /// Without this, clog truncation could delete entries still only in memory.
+    pub safe_lsn: Lsn,
     /// Checkpoint LSN written in this GC cycle.
     pub checkpoint_lsn: Lsn,
     /// Clog truncation result.
@@ -759,11 +765,17 @@ impl Database {
 
     /// Run one log GC cycle:
     /// 1) checkpoint ilog
-    /// 2) truncate clog up to flushed_lsn
+    /// 2) truncate clog up to safe_lsn
     /// 3) truncate ilog before checkpoint_lsn
+    ///
+    /// The safe truncation boundary is `min(flushed_lsn, min_unflushed_lsn - 1)`,
+    /// which accounts for the race window where a lower-LSN write can land in a
+    /// newer (unflushed) memtable. Using `flushed_lsn` alone would risk deleting
+    /// clog entries that are still only in volatile memory.
     pub fn run_log_gc_once(&self) -> Result<LogGcStats> {
         let version = self.storage.current_version();
         let flushed_lsn = version.flushed_lsn();
+        let safe_lsn = self.storage.safe_log_gc_lsn();
 
         #[cfg(feature = "failpoints")]
         fail_point!("log_gc_before_checkpoint");
@@ -773,7 +785,7 @@ impl Database {
         #[cfg(feature = "failpoints")]
         fail_point!("log_gc_after_checkpoint_before_clog_truncate");
 
-        let clog = self.txn_service.clog_service().truncate_to(flushed_lsn)?;
+        let clog = self.txn_service.clog_service().truncate_to(safe_lsn)?;
 
         #[cfg(feature = "failpoints")]
         fail_point!("log_gc_after_clog_truncate_before_ilog_truncate");
@@ -785,6 +797,7 @@ impl Database {
 
         Ok(LogGcStats {
             flushed_lsn,
+            safe_lsn,
             checkpoint_lsn,
             clog,
             ilog,
@@ -1193,6 +1206,8 @@ mod tests {
         db.storage.write_batch(write_batch).unwrap();
 
         // Ensure Version.flushed_lsn advances so clog truncation can reclaim records.
+        // After flush_all_with_active, no in-memory data remains, so
+        // safe_lsn == flushed_lsn.
         db.storage.flush_all_with_active().unwrap();
         let flushed_lsn = db.storage.current_version().flushed_lsn();
 
@@ -1204,6 +1219,8 @@ mod tests {
             "log GC should use flushed_lsn that includes flushed clog entries"
         );
         assert_eq!(stats.flushed_lsn, flushed_lsn);
+        // When all memtables are flushed, safe_lsn == flushed_lsn.
+        assert_eq!(stats.safe_lsn, flushed_lsn);
         assert!(
             stats.checkpoint_lsn >= stats.flushed_lsn,
             "checkpoint lsn should not be older than flushed_lsn snapshot"
