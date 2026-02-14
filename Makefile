@@ -2,6 +2,11 @@
 
 .PHONY: all build test unit-test store-test e2e-test fmt clippy clean run help prepare
 
+UNIT_TEST_TIMEOUT_SECS ?= 1200
+STORE_TEST_TIMEOUT_SECS ?= 1200
+E2E_TEST_TIMEOUT_SECS ?= 900
+E2E_STMT_TIMEOUT_SECS ?= 15
+
 # Default target
 all: build
 
@@ -18,19 +23,21 @@ test: unit-test store-test e2e-test
 
 # Run unit tests only
 unit-test:
-	cargo test --lib
+	./scripts/run_with_timeout.sh $(UNIT_TEST_TIMEOUT_SECS) cargo test --lib
 
 # Run store tests (internal integration tests)
 store-test:
-	cargo test --test store_test
+	./scripts/run_with_timeout.sh $(STORE_TEST_TIMEOUT_SECS) cargo test --test store_test
 
 # Run E2E tests (MySQL-test format)
 e2e-test:
-	cargo run --bin mysqltest-runner -- --all
+	./scripts/run_with_timeout.sh $(E2E_TEST_TIMEOUT_SECS) \
+		cargo run --bin mysqltest-runner -- --all --statement-timeout-secs $(E2E_STMT_TIMEOUT_SECS)
 
 # Record E2E test results (use when adding new tests)
 e2e-record:
-	cargo run --bin mysqltest-runner -- --all --record
+	./scripts/run_with_timeout.sh $(E2E_TEST_TIMEOUT_SECS) \
+		cargo run --bin mysqltest-runner -- --all --record --statement-timeout-secs $(E2E_STMT_TIMEOUT_SECS)
 
 # Format code
 fmt:

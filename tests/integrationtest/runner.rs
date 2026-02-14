@@ -26,6 +26,7 @@ use std::fs;
 use std::io::{BufRead, BufReader};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
+use std::time::Duration;
 
 use tisql::error::TiSqlError;
 use tisql::{Database, DatabaseConfig, QueryResult};
@@ -35,7 +36,11 @@ struct Config {
     test_dir: PathBuf,
     result_dir: PathBuf,
     record_mode: bool,
+    statement_timeout: Duration,
 }
+
+const DEFAULT_STATEMENT_TIMEOUT_SECS: u64 = 15;
+const STATEMENT_TIMEOUT_ENV: &str = "TISQL_E2E_STMT_TIMEOUT_SECS";
 
 /// Test case
 struct TestCase {
@@ -70,6 +75,7 @@ async fn main() {
         test_dir: base_dir.join("t"),
         result_dir: base_dir.join("r"),
         record_mode: args.iter().any(|a| a == "--record" || a == "-r"),
+        statement_timeout: parse_statement_timeout(&args),
     };
 
     let specific_test = args
@@ -90,6 +96,9 @@ async fn main() {
         eprintln!("  --test, -t  <name>  Run specific test (e.g., crud/basic)");
         eprintln!("  --all               Run all tests");
         eprintln!("  --record, -r        Record results instead of comparing");
+        eprintln!(
+            "  --statement-timeout-secs <n>  Per-statement timeout in seconds (default: {DEFAULT_STATEMENT_TIMEOUT_SECS}, env: {STATEMENT_TIMEOUT_ENV})",
+        );
         std::process::exit(1);
     };
 
@@ -124,6 +133,25 @@ async fn main() {
     if failed > 0 {
         std::process::exit(1);
     }
+}
+
+fn parse_statement_timeout(args: &[String]) -> Duration {
+    let from_cli = args
+        .iter()
+        .position(|a| a == "--statement-timeout-secs")
+        .and_then(|idx| args.get(idx + 1))
+        .and_then(|value| value.parse::<u64>().ok());
+
+    let from_env = std::env::var(STATEMENT_TIMEOUT_ENV)
+        .ok()
+        .and_then(|value| value.parse::<u64>().ok());
+
+    let secs = from_cli
+        .or(from_env)
+        .filter(|v| *v > 0)
+        .unwrap_or(DEFAULT_STATEMENT_TIMEOUT_SECS);
+
+    Duration::from_secs(secs)
 }
 
 /// Expected behavior for a statement.
@@ -244,9 +272,22 @@ async fn run_test(config: &Config, test_case: &TestCase) -> TestResult {
         output.push_str(&stmt.sql);
         output.push('\n');
 
+        let statement_result =
+            tokio::time::timeout(config.statement_timeout, db.handle_mp_query(&stmt.sql)).await;
+
         // Execute
-        match db.handle_mp_query(&stmt.sql).await {
-            Ok(result) => {
+        match statement_result {
+            Err(_) => {
+                return TestResult {
+                    name: test_case.name.clone(),
+                    passed: false,
+                    message: format!(
+                        "Line {}: Statement timed out after {:?} for: {}",
+                        stmt.line_number, config.statement_timeout, stmt.sql
+                    ),
+                };
+            }
+            Ok(Ok(result)) => {
                 if stmt.expectations.expected_error.is_some() {
                     return TestResult {
                         name: test_case.name.clone(),
@@ -309,7 +350,7 @@ async fn run_test(config: &Config, test_case: &TestCase) -> TestResult {
                     }
                 }
             }
-            Err(e) => {
+            Ok(Err(e)) => {
                 if let Some(expected) = &stmt.expectations.expected_error {
                     // Error was expected; validate it and record a stable representation.
                     let actual_code = mysql_error_code(&e);

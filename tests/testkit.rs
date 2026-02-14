@@ -23,12 +23,17 @@
 //! ```
 
 use std::sync::Arc;
+use std::time::Duration;
 use tempfile::TempDir;
 use tisql::{Database, DatabaseConfig, QueryResult};
+
+const DEFAULT_QUERY_TIMEOUT_SECS: u64 = 15;
+const QUERY_TIMEOUT_ENV: &str = "TISQL_TESTKIT_QUERY_TIMEOUT_SECS";
 
 /// TestKit provides a convenient API for testing SQL execution
 pub struct TestKit {
     db: Arc<Database>,
+    query_timeout: Duration,
     // Keep temp dir alive - dropping it deletes the directory
     _temp_dir: TempDir,
 }
@@ -42,13 +47,22 @@ impl TestKit {
 
         Self {
             db: Arc::new(db),
+            query_timeout: testkit_query_timeout(),
             _temp_dir: temp_dir,
+        }
+    }
+
+    async fn execute_with_timeout(&self, sql: &str) -> Result<QueryResult, QueryExecutionError> {
+        match tokio::time::timeout(self.query_timeout, self.db.handle_mp_query(sql)).await {
+            Ok(Ok(result)) => Ok(result),
+            Ok(Err(e)) => Err(QueryExecutionError::Sql(e.to_string())),
+            Err(_) => Err(QueryExecutionError::Timeout(self.query_timeout)),
         }
     }
 
     /// Execute SQL and panic on error
     pub async fn must_exec(&self, sql: &str) -> ExecResult {
-        match self.db.handle_mp_query(sql).await {
+        match self.execute_with_timeout(sql).await {
             Ok(result) => ExecResult { result },
             Err(e) => panic!("SQL execution failed: {e}\nSQL: {sql}"),
         }
@@ -56,15 +70,18 @@ impl TestKit {
 
     /// Execute SQL and expect an error
     pub async fn must_exec_err(&self, sql: &str) -> String {
-        match self.db.handle_mp_query(sql).await {
+        match self.execute_with_timeout(sql).await {
             Ok(_) => panic!("Expected error but got success\nSQL: {sql}"),
-            Err(e) => e.to_string(),
+            Err(QueryExecutionError::Sql(e)) => e,
+            Err(QueryExecutionError::Timeout(timeout)) => {
+                panic!("Expected SQL error, but execution timed out after {timeout:?}\nSQL: {sql}",)
+            }
         }
     }
 
     /// Execute SQL that should return rows
     pub async fn must_query(&self, sql: &str) -> QueryChecker {
-        match self.db.handle_mp_query(sql).await {
+        match self.execute_with_timeout(sql).await {
             Ok(QueryResult::Rows { columns, data }) => QueryChecker { columns, data },
             Ok(other) => panic!("Expected rows but got: {other:?}\nSQL: {sql}"),
             Err(e) => panic!("Query failed: {e}\nSQL: {sql}"),
@@ -74,8 +91,7 @@ impl TestKit {
     /// Execute SQL without checking result
     #[allow(dead_code)]
     pub async fn exec(&self, sql: &str) -> Result<QueryResult, String> {
-        self.db
-            .handle_mp_query(sql)
+        self.execute_with_timeout(sql)
             .await
             .map_err(|e| e.to_string())
     }
@@ -91,6 +107,32 @@ impl Default for TestKit {
     fn default() -> Self {
         Self::new()
     }
+}
+
+#[derive(Debug)]
+enum QueryExecutionError {
+    Sql(String),
+    Timeout(Duration),
+}
+
+impl std::fmt::Display for QueryExecutionError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            QueryExecutionError::Sql(err) => write!(f, "{err}"),
+            QueryExecutionError::Timeout(timeout) => {
+                write!(f, "timed out after {timeout:?} waiting for query execution")
+            }
+        }
+    }
+}
+
+fn testkit_query_timeout() -> Duration {
+    let parsed = std::env::var(QUERY_TIMEOUT_ENV)
+        .ok()
+        .and_then(|value| value.parse::<u64>().ok())
+        .filter(|secs| *secs > 0);
+
+    Duration::from_secs(parsed.unwrap_or(DEFAULT_QUERY_TIMEOUT_SECS))
 }
 
 /// Result of an execution
