@@ -98,6 +98,15 @@ cargo test --test concurrency_test --features failpoints
 make ci
 ```
 
+macOS dev note:
+- TiSQL supports macOS for development (with a non-Linux sync I/O fallback), but production target is Linux.
+- `make store-test` and `make prepare` automatically run store tests single-threaded on macOS to avoid file-descriptor/runtime churn issues.
+- If you run store tests directly on macOS, prefer:
+
+```bash
+cargo test --test store_test -- --test-threads=1
+```
+
 ## Architecture
 
 ```text

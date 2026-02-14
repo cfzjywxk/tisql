@@ -59,6 +59,16 @@ cargo test --test store_test select
 cargo test --test store_test filter
 ```
 
+macOS note:
+- `make store-test` automatically uses single-thread execution on macOS.
+- For manual runs on macOS, use:
+
+```bash
+cargo test --test store_test -- --test-threads=1
+```
+
+This avoids intermittent runtime-drop and file-descriptor exhaustion issues caused by high parallelism in store tests.
+
 ### Storage Regression Tests
 
 These suites focus on LSM flush/compaction/read-path correctness.
