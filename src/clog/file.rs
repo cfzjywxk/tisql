@@ -30,7 +30,6 @@ use fail::fail_point;
 
 use crate::error::{Result, TiSqlError};
 use crate::lsn::{AtomicLsnProvider, LsnProvider, SharedLsnProvider};
-use crate::storage::{WriteBatch, WriteOp};
 use crate::types::{Lsn, Timestamp, TxnId};
 use crate::util::fs::{rename_durable, sync_dir};
 use crate::{log_info, log_trace, log_warn};
@@ -525,66 +524,14 @@ impl FileClogService {
     }
 }
 
-/// Result of preparing a write batch for clog: serialized bytes + end LSN.
-struct PreparedWriteBatch {
+/// Result of preparing clog ops for writing: serialized bytes + end LSN.
+struct PreparedBatch {
     record_bytes: Vec<u8>,
     end_lsn: Lsn,
     entry_count: usize,
 }
 
 impl FileClogService {
-    /// Prepare a WriteBatch for clog writing: allocate LSNs, build entries, serialize.
-    ///
-    /// Shared serialization logic for `write_batch()`. No I/O is performed here.
-    fn prepare_write_batch(
-        &self,
-        txn_id: TxnId,
-        batch: &WriteBatch,
-        commit_ts: Timestamp,
-    ) -> Result<PreparedWriteBatch> {
-        // Allocate LSNs atomically
-        let start_lsn = self.lsn_provider.alloc_lsn();
-        let mut current_lsn = start_lsn;
-
-        // Build reference-based entries directly from WriteBatch
-        let entry_count = batch.len() + 1;
-        let mut entries: Vec<super::ClogEntryRef<'_>> = Vec::with_capacity(entry_count);
-
-        for (key, op) in batch.iter() {
-            let entry = match op {
-                WriteOp::Put { value } => super::ClogEntryRef {
-                    lsn: current_lsn,
-                    txn_id,
-                    op: super::ClogOpRef::Put { key, value },
-                },
-                WriteOp::Delete => super::ClogEntryRef {
-                    lsn: current_lsn,
-                    txn_id,
-                    op: super::ClogOpRef::Delete { key },
-                },
-            };
-            entries.push(entry);
-            current_lsn = self.lsn_provider.alloc_lsn();
-        }
-
-        // Add commit record
-        let end_lsn = current_lsn;
-        entries.push(super::ClogEntryRef {
-            lsn: end_lsn,
-            txn_id,
-            op: super::ClogOpRef::Commit { commit_ts },
-        });
-
-        // Serialize to bytes (zero-copy from borrowed data)
-        let record_bytes = Self::serialize_record_refs(&entries)?;
-
-        Ok(PreparedWriteBatch {
-            record_bytes,
-            end_lsn,
-            entry_count,
-        })
-    }
-
     /// Prepare pre-built ClogOpRef entries for clog writing: allocate LSNs, add commit
     /// record, serialize. No I/O is performed here.
     ///
@@ -595,7 +542,7 @@ impl FileClogService {
         txn_id: TxnId,
         ops: &[super::ClogOpRef<'_>],
         commit_ts: Timestamp,
-    ) -> Result<PreparedWriteBatch> {
+    ) -> Result<PreparedBatch> {
         let start_lsn = self.lsn_provider.alloc_lsn();
         let mut current_lsn = start_lsn;
 
@@ -621,7 +568,7 @@ impl FileClogService {
 
         let record_bytes = Self::serialize_record_refs(&entries)?;
 
-        Ok(PreparedWriteBatch {
+        Ok(PreparedBatch {
             record_bytes,
             end_lsn,
             entry_count,
@@ -671,44 +618,6 @@ impl ClogService for FileClogService {
             batch.len(),
             start_lsn,
             end_lsn
-        );
-
-        Ok(ClogFsyncFuture::new(end_lsn, rx))
-    }
-
-    fn write_batch(
-        &self,
-        txn_id: TxnId,
-        batch: &WriteBatch,
-        commit_ts: Timestamp,
-        sync: bool,
-    ) -> Result<ClogFsyncFuture> {
-        if batch.is_empty() {
-            let (tx, rx) = tokio::sync::oneshot::channel();
-            let _ = tx.send(Ok(()));
-            return Ok(ClogFsyncFuture::new(self.lsn_provider.current_lsn(), rx));
-        }
-
-        let prepared = self.prepare_write_batch(txn_id, batch, commit_ts)?;
-        let end_lsn = prepared.end_lsn;
-
-        #[cfg(feature = "failpoints")]
-        fail_point!("clog_before_sync");
-
-        // Submit to group commit writer (batches fsync with concurrent writers)
-        let rx = self
-            .group_writer
-            .lock()
-            .submit(prepared.record_bytes, sync)
-            .map_err(|e| TiSqlError::Internal(format!("Clog group commit failed: {e}")))?;
-
-        #[cfg(feature = "failpoints")]
-        fail_point!("clog_after_sync");
-
-        log_trace!(
-            "Wrote {} entries to commit log (zero-copy), lsn=...-{}",
-            prepared.entry_count,
-            prepared.end_lsn
         );
 
         Ok(ClogFsyncFuture::new(end_lsn, rx))
@@ -1620,175 +1529,6 @@ mod tests {
     }
 
     // ========================================================================
-    // write_batch() Zero-Copy Path Tests
-    // ========================================================================
-
-    /// Test write_batch() zero-copy serialization path.
-    /// This is the preferred method for transaction commits.
-    #[tokio::test]
-    async fn test_write_batch_zero_copy() {
-        use crate::storage::WriteBatch;
-
-        let dir = tempdir().unwrap();
-        let config = FileClogConfig::with_dir(dir.path());
-        let service =
-            FileClogService::open(config.clone(), &tokio::runtime::Handle::current()).unwrap();
-
-        // Create a WriteBatch with various operations
-        let mut batch = WriteBatch::new();
-        batch.put(b"key1".to_vec(), b"value1".to_vec());
-        batch.put(b"key2".to_vec(), b"value2".to_vec());
-        batch.delete(b"key3".to_vec());
-
-        let txn_id = 42;
-        let commit_ts = 100;
-
-        // Write using zero-copy path
-        let lsn = service
-            .write_batch(txn_id, &batch, commit_ts, true)
-            .unwrap()
-            .await
-            .unwrap();
-        // 3 ops + 1 commit = 4 entries, so last LSN is 4
-        assert_eq!(lsn, 4);
-
-        service.close().await.unwrap();
-
-        // Recover and verify
-        let (_, entries) =
-            FileClogService::recover(config, &tokio::runtime::Handle::current()).unwrap();
-        assert_eq!(entries.len(), 4);
-
-        // Verify Put 1
-        assert_eq!(entries[0].txn_id, txn_id);
-        assert_eq!(entries[0].lsn, 1);
-        match &entries[0].op {
-            ClogOp::Put { key, value } => {
-                assert_eq!(key, b"key1");
-                assert_eq!(value, b"value1");
-            }
-            _ => panic!("Expected Put"),
-        }
-
-        // Verify Put 2
-        assert_eq!(entries[1].lsn, 2);
-        match &entries[1].op {
-            ClogOp::Put { key, value } => {
-                assert_eq!(key, b"key2");
-                assert_eq!(value, b"value2");
-            }
-            _ => panic!("Expected Put"),
-        }
-
-        // Verify Delete
-        assert_eq!(entries[2].lsn, 3);
-        match &entries[2].op {
-            ClogOp::Delete { key } => {
-                assert_eq!(key, b"key3");
-            }
-            _ => panic!("Expected Delete"),
-        }
-
-        // Verify Commit
-        assert_eq!(entries[3].lsn, 4);
-        match &entries[3].op {
-            ClogOp::Commit { commit_ts: ts } => {
-                assert_eq!(*ts, commit_ts);
-            }
-            _ => panic!("Expected Commit"),
-        }
-    }
-
-    /// Test that write_batch() and write() produce compatible on-disk formats.
-    /// Both should be readable after recovery.
-    #[tokio::test]
-    async fn test_write_batch_and_write_interleaved() {
-        use crate::storage::WriteBatch;
-
-        let dir = tempdir().unwrap();
-        let config = FileClogConfig::with_dir(dir.path());
-        let service =
-            FileClogService::open(config.clone(), &tokio::runtime::Handle::current()).unwrap();
-
-        // Write using ClogBatch (owned path)
-        let mut clog_batch = ClogBatch::new();
-        clog_batch.add_put(1, b"owned_key".to_vec(), b"owned_value".to_vec());
-        clog_batch.add_commit(1, 100);
-        let lsn1 = service.write(&mut clog_batch, true).unwrap().await.unwrap();
-        assert_eq!(lsn1, 2);
-
-        // Write using WriteBatch (zero-copy path)
-        let mut write_batch = WriteBatch::new();
-        write_batch.put(b"zerocopy_key".to_vec(), b"zerocopy_value".to_vec());
-        let lsn2 = service
-            .write_batch(2, &write_batch, 200, true)
-            .unwrap()
-            .await
-            .unwrap();
-        assert_eq!(lsn2, 4); // 1 put + 1 commit = 2 more entries
-
-        service.close().await.unwrap();
-
-        // Recover and verify all entries
-        let (_, entries) =
-            FileClogService::recover(config, &tokio::runtime::Handle::current()).unwrap();
-        assert_eq!(entries.len(), 4);
-
-        // Verify first batch (owned)
-        match &entries[0].op {
-            ClogOp::Put { key, .. } => assert_eq!(key, b"owned_key"),
-            _ => panic!("Expected Put"),
-        }
-        match &entries[1].op {
-            ClogOp::Commit { commit_ts } => assert_eq!(*commit_ts, 100),
-            _ => panic!("Expected Commit"),
-        }
-
-        // Verify second batch (zero-copy)
-        match &entries[2].op {
-            ClogOp::Put { key, .. } => assert_eq!(key, b"zerocopy_key"),
-            _ => panic!("Expected Put"),
-        }
-        match &entries[3].op {
-            ClogOp::Commit { commit_ts } => assert_eq!(*commit_ts, 200),
-            _ => panic!("Expected Commit"),
-        }
-    }
-
-    /// Test write_batch() with empty WriteBatch returns current LSN.
-    #[tokio::test]
-    async fn test_write_batch_empty() {
-        use crate::storage::WriteBatch;
-
-        let dir = tempdir().unwrap();
-        let config = FileClogConfig::with_dir(dir.path());
-        let service =
-            FileClogService::open(config.clone(), &tokio::runtime::Handle::current()).unwrap();
-
-        // Write some entries first
-        let mut batch = ClogBatch::new();
-        batch.add_put(1, b"k".to_vec(), b"v".to_vec());
-        service.write(&mut batch, true).unwrap().await.unwrap();
-
-        // Now try write_batch with empty batch
-        let empty_batch = WriteBatch::new();
-        let lsn = service
-            .write_batch(2, &empty_batch, 100, true)
-            .unwrap()
-            .await
-            .unwrap();
-
-        // Should return current LSN (2, since we wrote 1 entry)
-        assert_eq!(lsn, 2);
-
-        // Verify no extra entries were written
-        let entries = service.read_all().unwrap();
-        assert_eq!(entries.len(), 1);
-
-        service.close().await.unwrap();
-    }
-
-    // ========================================================================
     // Empty Batch Tests
     // ========================================================================
 
@@ -2398,75 +2138,6 @@ mod tests {
             ClogOp::Rollback => {}
             _ => panic!("Expected Rollback"),
         }
-    }
-
-    // ========================================================================
-    // Concurrent write_batch Tests
-    // ========================================================================
-
-    /// Test concurrent writes using write_batch() (zero-copy path).
-    #[tokio::test]
-    async fn test_concurrent_write_batch() {
-        use crate::storage::WriteBatch;
-        use std::sync::{Arc, Barrier};
-        use std::thread;
-
-        let dir = tempdir().unwrap();
-        let config = FileClogConfig::with_dir(dir.path());
-        let service = Arc::new(
-            FileClogService::open(config.clone(), &tokio::runtime::Handle::current()).unwrap(),
-        );
-
-        let num_threads = 4;
-        let writes_per_thread = 50;
-        let barrier = Arc::new(Barrier::new(num_threads));
-
-        let mut handles = Vec::new();
-        for tid in 0..num_threads {
-            let service = Arc::clone(&service);
-            let barrier = Arc::clone(&barrier);
-
-            handles.push(thread::spawn(move || {
-                barrier.wait();
-
-                for i in 0..writes_per_thread {
-                    let mut batch = WriteBatch::new();
-                    batch.put(
-                        format!("key_{tid}_{i}").into_bytes(),
-                        format!("value_{tid}_{i}").into_bytes(),
-                    );
-                    crate::io::block_on_sync(
-                        service
-                            .write_batch(tid as u64, &batch, (tid * 1000 + i) as u64, false)
-                            .unwrap(),
-                    )
-                    .unwrap();
-                }
-            }));
-        }
-
-        for h in handles {
-            h.join().unwrap();
-        }
-
-        service.close().await.unwrap();
-
-        // Recover and verify
-        let (_, entries) =
-            FileClogService::recover(config, &tokio::runtime::Handle::current()).unwrap();
-
-        // Each thread writes: 1 put + 1 commit = 2 entries per iteration
-        let expected_count = num_threads * writes_per_thread * 2;
-        assert_eq!(entries.len(), expected_count);
-
-        // With group commit, file order may differ from LSN allocation order.
-        // Verify all LSNs are unique and contiguous.
-        let mut lsns: Vec<u64> = entries.iter().map(|e| e.lsn).collect();
-        lsns.sort();
-        lsns.dedup();
-        assert_eq!(lsns.len(), expected_count, "All LSNs should be unique");
-        assert_eq!(lsns[0], 1);
-        assert_eq!(*lsns.last().unwrap(), expected_count as u64);
     }
 
     // ========================================================================

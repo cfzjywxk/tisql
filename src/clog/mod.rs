@@ -38,7 +38,6 @@ use std::pin::Pin;
 use std::task::{Context, Poll};
 
 use crate::error::{Result, TiSqlError};
-use crate::storage::WriteBatch;
 use crate::types::{Key, Lsn, RawValue, Timestamp, TxnId};
 use serde::{Deserialize, Serialize};
 
@@ -159,19 +158,7 @@ pub trait ClogService: Send + Sync {
     /// Append batch atomically, returns future that yields the last LSN.
     fn write(&self, batch: &mut ClogBatch, sync: bool) -> Result<ClogFsyncFuture>;
 
-    /// Write a transaction's WriteBatch directly to clog without cloning.
-    ///
-    /// This is the preferred method for the commit path - it serializes directly
-    /// from the WriteBatch's references, avoiding unnecessary allocations.
-    fn write_batch(
-        &self,
-        txn_id: TxnId,
-        batch: &WriteBatch,
-        commit_ts: Timestamp,
-        sync: bool,
-    ) -> Result<ClogFsyncFuture>;
-
-    /// Write pre-built clog ops directly, bypassing WriteBatch entirely.
+    /// Write pre-built clog ops directly.
     ///
     /// This is the zero-copy commit path: the caller builds `ClogOpRef` entries
     /// that borrow keys from the transaction's mutations BTreeMap and values from
