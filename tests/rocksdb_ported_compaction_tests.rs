@@ -36,6 +36,8 @@ use tisql::testkit::{
 use tisql::types::{Key, RawValue, Timestamp};
 use tisql::StorageEngine;
 
+type OpsLog = Arc<parking_lot::Mutex<Vec<(usize, Timestamp, Option<RawValue>)>>>;
+
 // ==================== Test Helpers Using MvccKey ====================
 
 async fn get_at_for_test(engine: &LsmEngine, key: &[u8], ts: Timestamp) -> Option<RawValue> {
@@ -68,6 +70,20 @@ async fn get_for_test(engine: &LsmEngine, key: &[u8]) -> Option<RawValue> {
     get_at_for_test(engine, key, Timestamp::MAX).await
 }
 
+async fn get_at_with_retry_for_test(engine: &LsmEngine, key: &[u8], ts: Timestamp) -> RawValue {
+    for _ in 0..32 {
+        match engine.get_at(key, ts).await {
+            Ok(Some(v)) => return v,
+            Ok(None) => return Vec::new(),
+            Err(e) if e.to_string().contains("SST file missing") => {
+                tokio::time::sleep(Duration::from_millis(1)).await;
+            }
+            Err(e) => panic!("unexpected read error: {e}"),
+        }
+    }
+    panic!("get_at_with_retry_for_test exceeded retry budget");
+}
+
 async fn scan_for_test(engine: &LsmEngine, range: &std::ops::Range<Key>) -> Vec<(Key, RawValue)> {
     let start = MvccKey::encode(&range.start, Timestamp::MAX);
     let end = MvccKey::encode(&range.end, 0);
@@ -88,6 +104,47 @@ async fn scan_for_test(engine: &LsmEngine, range: &std::ops::Range<Key>) -> Vec<
         iter.advance().await.unwrap();
 
         if decoded_key < range.start || decoded_key >= range.end {
+            continue;
+        }
+        if seen_keys.contains(&decoded_key) {
+            continue;
+        }
+        seen_keys.insert(decoded_key.clone());
+        if !is_tombstone(&value) {
+            output.push((decoded_key, value));
+        }
+    }
+
+    output.sort_by(|a, b| a.0.cmp(&b.0));
+    output
+}
+
+async fn scan_at_for_test(
+    engine: &LsmEngine,
+    range: &std::ops::Range<Key>,
+    ts: Timestamp,
+) -> Vec<(Key, RawValue)> {
+    let start = MvccKey::encode(&range.start, ts);
+    let end = MvccKey::encode(&range.end, 0);
+    let mvcc_range = start..end;
+
+    let mut iter = engine.scan_iter(mvcc_range, 0).unwrap();
+    iter.advance().await.unwrap();
+
+    let mut seen_keys: std::collections::HashSet<Key> = std::collections::HashSet::new();
+    let mut output = Vec::new();
+
+    while iter.valid() {
+        let decoded_key = iter.user_key().to_vec();
+        let entry_ts = iter.timestamp();
+        let value = iter.value().to_vec();
+
+        iter.advance().await.unwrap();
+
+        if decoded_key < range.start || decoded_key >= range.end {
+            continue;
+        }
+        if entry_ts > ts {
             continue;
         }
         if seen_keys.contains(&decoded_key) {
@@ -2024,6 +2081,286 @@ async fn test_multi_level_cascading() {
         total_files > 0,
         "Should have SST files after cascading compaction"
     );
+}
+
+/// Concurrent reads at an old snapshot must remain stable while newer writes
+/// are being flushed in the background.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn test_snapshot_reads_stable_during_concurrent_flushes() {
+    use std::sync::atomic::{AtomicU64, Ordering};
+    use tokio::sync::Barrier;
+
+    const KEY_COUNT: usize = 12;
+    const WRITER_TASKS: usize = 3;
+    const READER_TASKS: usize = 3;
+    const OPS_PER_WRITER: usize = 24;
+    const SNAPSHOT_TS: Timestamp = 1_000;
+
+    let dir = TempDir::new().unwrap();
+    let lsn_provider = new_lsn_provider();
+    let ilog_config = IlogConfig::new(dir.path());
+    let ilog =
+        Arc::new(IlogService::open_with_thread(ilog_config, Arc::clone(&lsn_provider)).unwrap());
+
+    let config = LsmConfigBuilder::new(dir.path())
+        .memtable_size(256)
+        .max_frozen_memtables(256)
+        .l0_compaction_trigger(1000) // Disable compaction in this test
+        .l0_slowdown_trigger(2000)
+        .l0_stop_trigger(3000)
+        .max_levels(4)
+        .build()
+        .unwrap();
+    let engine = Arc::new(
+        LsmEngine::open_with_recovery(config, lsn_provider, Arc::clone(&ilog), Version::new())
+            .unwrap(),
+    );
+
+    // Baseline at ts <= snapshot
+    let base_ts_start = SNAPSHOT_TS - KEY_COUNT as u64;
+    for i in 0..KEY_COUNT {
+        let mut batch = WriteBatch::new();
+        batch.set_commit_ts(base_ts_start + i as u64 + 1);
+        let key = format!("flush_hot_key_{i:03}");
+        batch.put(key.into_bytes(), format!("base_{i:03}").into_bytes());
+        engine.write_batch(batch).unwrap();
+    }
+    engine.flush_all_with_active().unwrap();
+
+    let next_ts = Arc::new(AtomicU64::new(SNAPSHOT_TS + 1));
+    let ops_log: OpsLog = Arc::new(parking_lot::Mutex::new(Vec::new()));
+    let barrier = Arc::new(Barrier::new(WRITER_TASKS + READER_TASKS));
+
+    let mut handles = Vec::new();
+
+    for writer_id in 0..WRITER_TASKS {
+        let eng = Arc::clone(&engine);
+        let ts_gen = Arc::clone(&next_ts);
+        let log = Arc::clone(&ops_log);
+        let start = Arc::clone(&barrier);
+
+        handles.push(tokio::spawn(async move {
+            start.wait().await;
+            for step in 0..OPS_PER_WRITER {
+                let key_idx = (step % (KEY_COUNT / WRITER_TASKS)) * WRITER_TASKS + writer_id;
+                let ts = ts_gen.fetch_add(1, Ordering::SeqCst);
+                let key = format!("flush_hot_key_{key_idx:03}");
+                let do_delete = (ts + key_idx as u64) % 4 == 0;
+                let put_value = format!("v_{ts}").into_bytes();
+
+                let mut batch = WriteBatch::new();
+                batch.set_commit_ts(ts);
+                if do_delete {
+                    batch.delete(key.as_bytes().to_vec());
+                } else {
+                    batch.put(key.as_bytes().to_vec(), put_value.clone());
+                }
+                eng.write_batch(batch).unwrap();
+
+                log.lock()
+                    .push((key_idx, ts, if do_delete { None } else { Some(put_value) }));
+                // A single writer drives flushes while others continue writing.
+                if writer_id == 0 && step % 4 == 0 {
+                    eng.flush_all_with_active().unwrap();
+                }
+            }
+        }));
+    }
+
+    for reader_id in 0..READER_TASKS {
+        let eng = Arc::clone(&engine);
+        let start = Arc::clone(&barrier);
+        handles.push(tokio::spawn(async move {
+            start.wait().await;
+            for step in 0..100 {
+                let key_idx = (reader_id + step) % KEY_COUNT;
+                let key = format!("flush_hot_key_{key_idx:03}");
+                let expected = format!("base_{key_idx:03}").into_bytes();
+                let got = get_at_with_retry_for_test(&eng, key.as_bytes(), SNAPSHOT_TS).await;
+                assert_eq!(
+                    got, expected,
+                    "snapshot read should not be affected by newer flushed writes"
+                );
+            }
+        }));
+    }
+
+    tokio::time::timeout(Duration::from_secs(60), async {
+        for h in handles {
+            h.await.unwrap();
+        }
+    })
+    .await
+    .expect("reader/writer phase timed out");
+
+    engine.flush_all_with_active().unwrap();
+
+    // Validate latest values after concurrent phase.
+    let mut expected_latest: Vec<(Timestamp, Option<RawValue>)> = (0..KEY_COUNT)
+        .map(|i| {
+            (
+                base_ts_start + i as u64 + 1,
+                Some(format!("base_{i:03}").into_bytes()),
+            )
+        })
+        .collect();
+    let mut ops = ops_log.lock().clone();
+    ops.sort_by_key(|(_, ts, _)| *ts);
+    for (key_idx, ts, val) in ops {
+        if ts >= expected_latest[key_idx].0 {
+            expected_latest[key_idx] = (ts, val);
+        }
+    }
+
+    for (i, (_ts, latest_expected)) in expected_latest.iter().enumerate() {
+        let key = format!("flush_hot_key_{i:03}");
+        assert_eq!(
+            get_at_for_test(&engine, key.as_bytes(), SNAPSHOT_TS).await,
+            Some(format!("base_{i:03}").into_bytes())
+        );
+        assert_eq!(
+            get_for_test(&engine, key.as_bytes()).await,
+            latest_expected.clone()
+        );
+    }
+}
+
+/// Multi-level compaction should preserve delete/reinsert MVCC semantics.
+#[tokio::test]
+async fn test_multi_level_delete_reinsert_compaction_correctness() {
+    let dir = TempDir::new().unwrap();
+    let lsn_provider = new_lsn_provider();
+    let ilog_config = IlogConfig::new(dir.path());
+    let ilog =
+        Arc::new(IlogService::open_with_thread(ilog_config, Arc::clone(&lsn_provider)).unwrap());
+
+    let config = LsmConfigBuilder::new(dir.path())
+        .memtable_size(256)
+        .max_frozen_memtables(128)
+        .l0_compaction_trigger(2)
+        .l0_slowdown_trigger(1000)
+        .l0_stop_trigger(2000)
+        .target_file_size(256)
+        .l1_max_size(512)
+        .max_levels(4)
+        .build()
+        .unwrap();
+    let engine =
+        LsmEngine::open_with_recovery(config, lsn_provider, Arc::clone(&ilog), Version::new())
+            .unwrap();
+
+    // Round 0: base values
+    for i in 0..6 {
+        let mut batch = WriteBatch::new();
+        batch.set_commit_ts(10 + i as u64);
+        let key = format!("mv_key_{i:03}");
+        batch.put(key.into_bytes(), format!("base_{i}").into_bytes());
+        engine.write_batch(batch).unwrap();
+    }
+    engine.flush_all_with_active().unwrap();
+
+    // Round 1: delete evens, update odds
+    for i in 0..6 {
+        let mut batch = WriteBatch::new();
+        batch.set_commit_ts(30 + i as u64);
+        let key = format!("mv_key_{i:03}");
+        if i % 2 == 0 {
+            batch.delete(key.into_bytes());
+        } else {
+            batch.put(key.into_bytes(), format!("odd_r1_{i}").into_bytes());
+        }
+        engine.write_batch(batch).unwrap();
+    }
+    engine.flush_all_with_active().unwrap();
+
+    // Round 2: reinsert evens, update odds again
+    for i in 0..6 {
+        let mut batch = WriteBatch::new();
+        batch.set_commit_ts(50 + i as u64);
+        let key = format!("mv_key_{i:03}");
+        if i % 2 == 0 {
+            batch.put(key.into_bytes(), format!("even_r2_{i}").into_bytes());
+        } else {
+            batch.put(key.into_bytes(), format!("odd_r2_{i}").into_bytes());
+        }
+        engine.write_batch(batch).unwrap();
+    }
+    engine.flush_all_with_active().unwrap();
+
+    // Extra flushed data to drive cascading compaction.
+    let mut filler_ts = 100u64;
+    for round in 0..5 {
+        for i in 0..12 {
+            let mut batch = WriteBatch::new();
+            batch.set_commit_ts(filler_ts);
+            filler_ts += 1;
+            batch.put(
+                format!("mv_filler_{round:02}_{i:03}").into_bytes(),
+                vec![b'x'; 64],
+            );
+            engine.write_batch(batch).unwrap();
+        }
+        engine.flush_all_with_active().unwrap();
+    }
+
+    let mut compact_rounds = 0usize;
+    for _ in 0..16 {
+        if engine.do_compaction().await.unwrap() {
+            compact_rounds += 1;
+        } else {
+            break;
+        }
+    }
+    assert!(compact_rounds > 0, "expected compaction to run");
+
+    let version = engine.current_version();
+    assert!(
+        version.level_size(2) + version.level_size(3) > 0,
+        "expected data in deeper levels after cascading compaction"
+    );
+
+    // Snapshot before delete phase
+    for i in 0..6 {
+        let key = format!("mv_key_{i:03}");
+        assert_eq!(
+            get_at_for_test(&engine, key.as_bytes(), 20).await,
+            Some(format!("base_{i}").into_bytes())
+        );
+    }
+
+    // Snapshot after delete/update phase (before round 2)
+    for i in 0..6 {
+        let key = format!("mv_key_{i:03}");
+        if i % 2 == 0 {
+            assert_eq!(get_at_for_test(&engine, key.as_bytes(), 40).await, None);
+        } else {
+            assert_eq!(
+                get_at_for_test(&engine, key.as_bytes(), 40).await,
+                Some(format!("odd_r1_{i}").into_bytes())
+            );
+        }
+    }
+
+    // Latest state after round 2 and compaction.
+    for i in 0..6 {
+        let key = format!("mv_key_{i:03}");
+        let expected = if i % 2 == 0 {
+            format!("even_r2_{i}").into_bytes()
+        } else {
+            format!("odd_r2_{i}").into_bytes()
+        };
+        assert_eq!(get_for_test(&engine, key.as_bytes()).await, Some(expected));
+    }
+
+    // Scan-level checks for snapshot and latest.
+    let range = b"mv_key_000".to_vec()..b"mv_key_999".to_vec();
+    let snap_before = scan_at_for_test(&engine, &range, 20).await;
+    let snap_after_delete = scan_at_for_test(&engine, &range, 40).await;
+    let latest = scan_for_test(&engine, &range).await;
+
+    assert_eq!(snap_before.len(), 6, "all keys visible before deletes");
+    assert_eq!(snap_after_delete.len(), 3, "only odd keys visible at ts=40");
+    assert_eq!(latest.len(), 6, "all keys visible after reinserts");
 }
 
 // ==================== Dropped Table GC Tests ====================
