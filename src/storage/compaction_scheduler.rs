@@ -324,4 +324,72 @@ mod tests {
 
         scheduler.stop();
     }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn test_compaction_scheduler_polling_updates_gc_and_filters_old_versions() {
+        let tmp = TempDir::new().unwrap();
+        let config = LsmConfig::builder(tmp.path())
+            .memtable_size(120)
+            .max_frozen_memtables(16)
+            .l0_compaction_trigger(3)
+            .l0_slowdown_trigger(100)
+            .l0_stop_trigger(200)
+            .target_file_size(256)
+            .l1_max_size(4096)
+            .build()
+            .unwrap();
+        let engine = Arc::new(LsmEngine::open(config).unwrap());
+
+        // Scheduler should advance this safe point before compaction.
+        engine.set_gc_safe_point_updater(Arc::new(|| 25));
+
+        let scheduler = CompactionScheduler::new(Arc::clone(&engine));
+        scheduler.start(&tokio::runtime::Handle::current());
+
+        // Build three versions for the same key in separate L0 files.
+        for (ts, value) in [(10u64, b"v10"), (20u64, b"v20"), (30u64, b"v30")] {
+            let mut batch = WriteBatch::new();
+            batch.set_commit_ts(ts);
+            batch.put(b"gc_key".to_vec(), value.to_vec());
+            engine.write_batch(batch).unwrap();
+            engine.flush_all_with_active().unwrap();
+        }
+
+        // Add extra files so L0 compaction score definitely crosses threshold.
+        for i in 0..3u64 {
+            let mut batch = WriteBatch::new();
+            batch.set_commit_ts(100 + i);
+            batch.put(format!("filler_{i:03}").into_bytes(), vec![b'f'; 32]);
+            engine.write_batch(batch).unwrap();
+            engine.flush_all_with_active().unwrap();
+        }
+
+        // No explicit notify(): scheduler should compact via polling.
+        tokio::time::timeout(Duration::from_secs(15), async {
+            loop {
+                if scheduler.compaction_count() >= 1 {
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(50)).await;
+            }
+        })
+        .await
+        .expect("compaction scheduler did not compact via polling");
+
+        assert_eq!(
+            engine.gc_safe_point(),
+            25,
+            "GC safe point should be advanced by updater callback"
+        );
+
+        // gc_safe_point=25 keeps barrier ts=20 and drops ts=10 at bottommost level.
+        assert_eq!(engine.get_at(b"gc_key", 15).await.unwrap(), None);
+        assert_eq!(
+            engine.get_at(b"gc_key", 20).await.unwrap(),
+            Some(b"v20".to_vec())
+        );
+        assert_eq!(engine.get(b"gc_key").await.unwrap(), Some(b"v30".to_vec()));
+
+        scheduler.stop();
+    }
 }

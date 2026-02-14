@@ -326,6 +326,138 @@ mod tests {
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn test_flush_scheduler_progress_without_explicit_notify() {
+        let tmp = TempDir::new().unwrap();
+        let config = LsmConfig::builder(tmp.path())
+            .memtable_size(120) // Small to trigger frequent rotations
+            .max_frozen_memtables(1) // Tight pressure so auto-flush progress is required
+            .l0_compaction_trigger(100) // Keep write backpressure from L0 out of this test
+            .l0_slowdown_trigger(200)
+            .l0_stop_trigger(300)
+            .build()
+            .unwrap();
+        let engine = Arc::new(LsmEngine::open(config).unwrap());
+
+        let scheduler = FlushScheduler::new(Arc::clone(&engine));
+        scheduler.start(&tokio::runtime::Handle::current());
+
+        // Write without calling scheduler.notify(); worker should make progress via polling.
+        for i in 0..40u64 {
+            let key = format!("auto_flush_key_{i:04}");
+            let value = vec![b'v'; 80];
+            let deadline = std::time::Instant::now() + Duration::from_secs(3);
+
+            loop {
+                let mut batch = WriteBatch::new();
+                batch.set_commit_ts(i + 1);
+                batch.put(key.clone().into_bytes(), value.clone());
+
+                match engine.write_batch(batch) {
+                    Ok(()) => break,
+                    Err(e) if e.to_string().contains("frozen memtables") => {
+                        assert!(
+                            std::time::Instant::now() < deadline,
+                            "write stalled too long without auto flush progress"
+                        );
+                        tokio::time::sleep(Duration::from_millis(5)).await;
+                    }
+                    Err(e) => panic!("Unexpected write error: {e}"),
+                }
+            }
+        }
+
+        tokio::time::timeout(Duration::from_secs(10), async {
+            loop {
+                if scheduler.flush_count() >= 1 {
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(20)).await;
+            }
+        })
+        .await
+        .expect("background flush did not trigger without explicit notify");
+
+        // Spot-check readability.
+        for i in [0usize, 17, 39] {
+            let key = format!("auto_flush_key_{i:04}");
+            let result = engine.get(key.as_bytes()).await.unwrap();
+            assert!(result.is_some(), "Key {key} should exist");
+        }
+
+        scheduler.stop();
+    }
+
+    #[cfg(unix)]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn test_flush_scheduler_recovers_after_permission_denied() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let tmp = TempDir::new().unwrap();
+        let config = LsmConfig::builder(tmp.path())
+            .memtable_size(120)
+            .max_frozen_memtables(8)
+            .l0_compaction_trigger(100)
+            .l0_slowdown_trigger(200)
+            .l0_stop_trigger(300)
+            .build()
+            .unwrap();
+        let engine = Arc::new(LsmEngine::open(config).unwrap());
+
+        let scheduler = FlushScheduler::new(Arc::clone(&engine));
+        scheduler.start(&tokio::runtime::Handle::current());
+
+        let sst_dir = tmp.path().join("sst");
+        let original_mode = std::fs::metadata(&sst_dir).unwrap().permissions().mode();
+        let mut readonly = std::fs::metadata(&sst_dir).unwrap().permissions();
+        readonly.set_mode(0o555); // no write bit for owner/group/others
+        std::fs::set_permissions(&sst_dir, readonly).unwrap();
+
+        // Produce at least one frozen memtable while flush cannot create SST files.
+        let mut ts = 1u64;
+        tokio::time::timeout(Duration::from_secs(3), async {
+            while engine.frozen_count() == 0 {
+                let mut batch = WriteBatch::new();
+                batch.set_commit_ts(ts);
+                batch.put(format!("perm_key_{ts:04}").into_bytes(), vec![b'x'; 80]);
+                engine.write_batch(batch).unwrap();
+                ts += 1;
+            }
+        })
+        .await
+        .expect("failed to create frozen memtable under read-only SST directory");
+
+        tokio::time::sleep(Duration::from_millis(400)).await;
+        let flushes_while_readonly = scheduler.flush_count();
+        let frozen_while_readonly = engine.frozen_count();
+
+        let mut restored = std::fs::metadata(&sst_dir).unwrap().permissions();
+        restored.set_mode(original_mode);
+        std::fs::set_permissions(&sst_dir, restored).unwrap();
+
+        assert_eq!(
+            flushes_while_readonly, 0,
+            "flush should fail while SST directory is read-only"
+        );
+        assert!(
+            frozen_while_readonly > 0,
+            "frozen memtables should remain queued when flush fails"
+        );
+
+        tokio::time::timeout(Duration::from_secs(10), async {
+            loop {
+                if scheduler.flush_count() >= 1 && engine.frozen_count() == 0 {
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(20)).await;
+            }
+        })
+        .await
+        .expect("flush scheduler did not recover after permissions were restored");
+
+        scheduler.stop();
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn test_flush_scheduler_drop_stops_worker() {
         let tmp = TempDir::new().unwrap();
         let config = test_config(tmp.path());
