@@ -1,6 +1,6 @@
 # TiSQL Makefile
 
-.PHONY: all build test unit-test store-test e2e-test fmt clippy clean run help prepare
+.PHONY: all build test unit-test store-test storage-test failpoint-test e2e-test fmt clippy clean run help prepare
 
 UNIT_TEST_TIMEOUT_SECS ?= 1200
 STORE_TEST_TIMEOUT_SECS ?= 1200
@@ -19,7 +19,7 @@ release:
 	cargo build --release
 
 # Run all tests
-test: unit-test store-test e2e-test
+test: unit-test store-test storage-test e2e-test
 
 # Run unit tests only
 unit-test:
@@ -28,6 +28,15 @@ unit-test:
 # Run store tests (internal integration tests)
 store-test:
 	./scripts/run_with_timeout.sh $(STORE_TEST_TIMEOUT_SECS) cargo test --test store_test
+
+# Run storage regression tests (ported RocksDB-style suites)
+storage-test:
+	./scripts/run_with_timeout.sh $(STORE_TEST_TIMEOUT_SECS) cargo test --test rocksdb_ported_tests
+	./scripts/run_with_timeout.sh $(STORE_TEST_TIMEOUT_SECS) cargo test --test rocksdb_ported_compaction_tests
+
+# Run failpoint crash-recovery tests (opt-in; requires feature flag)
+failpoint-test:
+	./scripts/run_with_timeout.sh $(UNIT_TEST_TIMEOUT_SECS) cargo test --test storage_failpoint_test --features failpoints
 
 # Run E2E tests (MySQL-test format)
 e2e-test:
@@ -81,6 +90,8 @@ help:
 	@echo "  test         Run all tests (unit + store + e2e)"
 	@echo "  unit-test    Run unit tests only"
 	@echo "  store-test   Run store tests only"
+	@echo "  storage-test Run storage regression tests"
+	@echo "  failpoint-test Run failpoint crash-recovery tests"
 	@echo "  e2e-test     Run E2E tests only"
 	@echo "  e2e-record   Record E2E test results"
 	@echo "  fmt          Format code"

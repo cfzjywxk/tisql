@@ -11,6 +11,9 @@ cargo test
 # Run E2E integration tests
 cargo run --bin mysqltest-runner -- --all
 
+# Run storage regression suites (ported RocksDB-style tests)
+make storage-test
+
 # Run all tests including E2E
 make test
 ```
@@ -23,6 +26,7 @@ TiSQL has three categories of tests:
 |----------|----------|-------------|
 | Unit Tests | `src/**/*.rs` | Module-level tests using `#[cfg(test)]` |
 | Store Tests | `tests/store_test.rs` | Integration tests using TestKit API |
+| Storage Regression Tests | `tests/rocksdb_ported*.rs` | Flush/compaction/read-path regression suites |
 | E2E Tests | `tests/integrationtest/` | MySQL-test style end-to-end tests |
 
 ## Running Tests
@@ -53,6 +57,22 @@ cargo test --test store_test
 cargo test --test store_test crud
 cargo test --test store_test select
 cargo test --test store_test filter
+```
+
+### Storage Regression Tests
+
+These suites focus on LSM flush/compaction/read-path correctness.
+
+```bash
+# Run all storage regression tests
+make storage-test
+
+# Or run suites directly
+cargo test --test rocksdb_ported_tests
+cargo test --test rocksdb_ported_compaction_tests
+
+# Run failpoint crash-recovery tests (feature-gated)
+make failpoint-test
 ```
 
 ### E2E Tests (MySQL-test Format)

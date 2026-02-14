@@ -244,6 +244,7 @@ async fn test_picker_level_picks_oldest() {
         LsmConfigBuilder::new(dir.path())
             .l0_compaction_trigger(10) // High threshold to skip L0
             .l1_max_size(100) // Very small to trigger L1 compaction
+            .max_levels(3) // Enable L1 -> L2 compaction for this test
             .build_unchecked(),
     );
     let picker = CompactionPicker::new(config);
@@ -276,6 +277,7 @@ async fn test_picker_trivial_move_no_overlap() {
         LsmConfigBuilder::new(dir.path())
             .l0_compaction_trigger(10)
             .l1_max_size(100)
+            .max_levels(3) // Enable L1 -> L2 compaction for this test
             .build_unchecked(),
     );
     let picker = CompactionPicker::new(config);
@@ -1223,7 +1225,7 @@ async fn test_l0_write_backpressure() {
 // ============================================================================
 
 /// Test that CompactionScheduler automatically compacts after enough L0 files.
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn test_compaction_scheduler_automatic() {
     let dir = TempDir::new().unwrap();
     let lsn_provider = new_lsn_provider();
