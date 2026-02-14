@@ -335,3 +335,43 @@ async fn test_explicit_txn_rollback_not_recovered() {
         );
     }
 }
+
+#[tokio::test]
+async fn test_large_explicit_txn_10k_keys_crash_recovery() {
+    let dir = tempdir().unwrap();
+    let max_ts;
+
+    // Phase 1: Commit a large explicit transaction (10k keys), then crash.
+    {
+        let (_engine, txn_service, clog) = create_txn_env(dir.path());
+        let mut ctx = txn_service.begin_explicit(false).unwrap();
+
+        for i in 0..10_000u32 {
+            txn_service
+                .put(
+                    &mut ctx,
+                    format!("bulk_key_{i:05}").into_bytes(),
+                    format!("bulk_val_{i:05}").into_bytes(),
+                )
+                .await
+                .unwrap();
+        }
+
+        let info = txn_service.commit(ctx).await.unwrap();
+        max_ts = info.commit_ts;
+        clog.sync().unwrap().await.unwrap();
+    }
+
+    // Phase 2: Recover and spot-check representative keys.
+    {
+        let (engine, _txn_service) = recover_txn_env(dir.path());
+        for i in [0u32, 1, 17, 777, 4_321, 9_999] {
+            assert_eq!(
+                get_value(&engine, format!("bulk_key_{i:05}").as_bytes(), max_ts + 100).await,
+                Some(format!("bulk_val_{i:05}").into_bytes()),
+                "bulk key {} should survive recovery",
+                i
+            );
+        }
+    }
+}

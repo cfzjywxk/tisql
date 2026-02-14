@@ -1370,6 +1370,244 @@ mod tests {
         );
     }
 
+    /// Stress test group commit with many concurrent transactions.
+    ///
+    /// Each transaction writes (Put + Commit) with sync=true. We verify all
+    /// transactions are durably recovered with exactly one commit record each.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn test_group_commit_concurrent_transactions() {
+        use std::collections::HashSet;
+        use std::sync::Arc;
+
+        let dir = tempdir().unwrap();
+        let config = FileClogConfig::with_dir(dir.path());
+        let service = Arc::new(
+            FileClogService::open(config.clone(), &tokio::runtime::Handle::current()).unwrap(),
+        );
+
+        let txn_count = 64u64;
+        let mut handles = Vec::with_capacity(txn_count as usize);
+
+        for txn_id in 1..=txn_count {
+            let service = Arc::clone(&service);
+            handles.push(tokio::spawn(async move {
+                let mut batch = ClogBatch::new();
+                batch.add_put(
+                    txn_id,
+                    format!("tx_key_{txn_id:04}").into_bytes(),
+                    format!("tx_val_{txn_id:04}").into_bytes(),
+                );
+                batch.add_commit(txn_id, 10_000 + txn_id);
+                service.write(&mut batch, true).unwrap().await.unwrap()
+            }));
+        }
+
+        let mut end_lsns = Vec::with_capacity(txn_count as usize);
+        for handle in handles {
+            end_lsns.push(handle.await.unwrap());
+        }
+        end_lsns.sort_unstable();
+        end_lsns.dedup();
+        assert_eq!(
+            end_lsns.len(),
+            txn_count as usize,
+            "Each transaction should have a unique end_lsn"
+        );
+
+        service.close().await.unwrap();
+
+        let (_, entries) =
+            FileClogService::recover(config, &tokio::runtime::Handle::current()).unwrap();
+        assert_eq!(
+            entries.len(),
+            (txn_count * 2) as usize,
+            "Each transaction should produce Put + Commit"
+        );
+
+        let mut put_txn_ids = HashSet::new();
+        let mut commit_txn_ids = HashSet::new();
+
+        for entry in &entries {
+            match &entry.op {
+                ClogOp::Put { key, value } => {
+                    let suffix = format!("{:04}", entry.txn_id);
+                    assert!(
+                        key.ends_with(suffix.as_bytes()),
+                        "Put key should include txn suffix {suffix}: {:?}",
+                        key
+                    );
+                    assert!(
+                        value.ends_with(suffix.as_bytes()),
+                        "Put value should include txn suffix {suffix}: {:?}",
+                        value
+                    );
+                    put_txn_ids.insert(entry.txn_id);
+                }
+                ClogOp::Commit { commit_ts } => {
+                    assert_eq!(
+                        *commit_ts,
+                        10_000 + entry.txn_id,
+                        "Commit ts should match transaction-specific value"
+                    );
+                    commit_txn_ids.insert(entry.txn_id);
+                }
+                ClogOp::Delete { .. } | ClogOp::Rollback => {
+                    panic!(
+                        "Unexpected op in concurrent transaction test: {:?}",
+                        entry.op
+                    )
+                }
+            }
+        }
+
+        assert_eq!(
+            put_txn_ids.len(),
+            txn_count as usize,
+            "Each transaction should have exactly one Put"
+        );
+        assert_eq!(
+            commit_txn_ids.len(),
+            txn_count as usize,
+            "Each transaction should have exactly one Commit"
+        );
+    }
+
+    /// Corruption in the middle of the log should truncate everything after the
+    /// last valid prefix (including records that were valid before truncation).
+    #[tokio::test]
+    async fn test_recover_corrupted_middle_record_truncates_tail() {
+        let dir = tempdir().unwrap();
+        let config = FileClogConfig::with_dir(dir.path());
+        let clog_path = config.clog_path();
+
+        // Write 3 valid records.
+        {
+            let service =
+                FileClogService::open(config.clone(), &tokio::runtime::Handle::current()).unwrap();
+            for i in 1..=3u64 {
+                let mut batch = ClogBatch::new();
+                batch.add_put(
+                    i,
+                    format!("k{i}").into_bytes(),
+                    format!("v{i}").into_bytes(),
+                );
+                service.write(&mut batch, true).unwrap().await.unwrap();
+            }
+            service.close().await.unwrap();
+        }
+
+        let file_size_before = std::fs::metadata(&clog_path).unwrap().len();
+
+        // Corrupt checksum of the second record header.
+        {
+            let mut file = OpenOptions::new()
+                .read(true)
+                .write(true)
+                .open(&clog_path)
+                .unwrap();
+
+            file.seek(SeekFrom::Start(FILE_HEADER_SIZE as u64)).unwrap();
+            let mut first_header = [0u8; RECORD_HEADER_SIZE];
+            file.read_exact(&mut first_header).unwrap();
+            let first_len = u32::from_le_bytes(first_header[4..8].try_into().unwrap()) as u64;
+
+            let second_record_start =
+                FILE_HEADER_SIZE as u64 + RECORD_HEADER_SIZE as u64 + first_len;
+            file.seek(SeekFrom::Start(second_record_start + 8)).unwrap();
+            file.write_all(&0xFFFF_FFFFu32.to_le_bytes()).unwrap();
+            file.sync_all().unwrap();
+        }
+
+        // Recovery should keep only first record and truncate the rest.
+        let (service, entries) =
+            FileClogService::recover(config.clone(), &tokio::runtime::Handle::current()).unwrap();
+        assert_eq!(entries.len(), 1, "Only first valid record should survive");
+        assert_eq!(entries[0].lsn, 1);
+
+        let file_size_after_recover = std::fs::metadata(&clog_path).unwrap().len();
+        assert!(
+            file_size_after_recover < file_size_before,
+            "File should be truncated after recovery of corrupted middle record"
+        );
+
+        // New writes should append from the valid prefix only.
+        let mut batch = ClogBatch::new();
+        batch.add_put(9, b"post_recover".to_vec(), b"ok".to_vec());
+        let lsn = service.write(&mut batch, true).unwrap().await.unwrap();
+        assert_eq!(
+            lsn, 2,
+            "LSN should continue from the first surviving record"
+        );
+        service.close().await.unwrap();
+
+        let (_, recovered) =
+            FileClogService::recover(config, &tokio::runtime::Handle::current()).unwrap();
+        assert_eq!(
+            recovered.len(),
+            2,
+            "Recovered log should contain first original record + post-recovery record"
+        );
+        assert_eq!(recovered[0].lsn, 1);
+        assert_eq!(recovered[1].lsn, 2);
+    }
+
+    /// Replaying recovery multiple times should be idempotent.
+    ///
+    /// Running recover() repeatedly must not duplicate entries, and new writes
+    /// after recovery should append once.
+    #[tokio::test]
+    async fn test_recover_idempotent_replay() {
+        let dir = tempdir().unwrap();
+        let config = FileClogConfig::with_dir(dir.path());
+
+        {
+            let service =
+                FileClogService::open(config.clone(), &tokio::runtime::Handle::current()).unwrap();
+            for i in 1..=3u64 {
+                let mut batch = ClogBatch::new();
+                batch.add_put(
+                    i,
+                    format!("k{i}").into_bytes(),
+                    format!("v{i}").into_bytes(),
+                );
+                batch.add_commit(i, 100 + i);
+                service.write(&mut batch, true).unwrap().await.unwrap();
+            }
+            service.close().await.unwrap();
+        }
+
+        let (service1, entries1) =
+            FileClogService::recover(config.clone(), &tokio::runtime::Handle::current()).unwrap();
+        let sig1 = bincode::serialize(&entries1).unwrap();
+        service1.close().await.unwrap();
+
+        let (service2, entries2) =
+            FileClogService::recover(config.clone(), &tokio::runtime::Handle::current()).unwrap();
+        let sig2 = bincode::serialize(&entries2).unwrap();
+        assert_eq!(
+            sig1, sig2,
+            "Repeated recover() should return identical entry stream"
+        );
+
+        let mut batch = ClogBatch::new();
+        batch.add_put(99, b"k99".to_vec(), b"v99".to_vec());
+        service2.write(&mut batch, true).unwrap().await.unwrap();
+        service2.close().await.unwrap();
+
+        let (_, entries3) =
+            FileClogService::recover(config, &tokio::runtime::Handle::current()).unwrap();
+        assert_eq!(
+            entries3.len(),
+            entries2.len() + 1,
+            "Post-recovery write should append exactly one new entry"
+        );
+        assert_eq!(
+            bincode::serialize(&entries3[..entries2.len()]).unwrap(),
+            sig2,
+            "Prefix should remain unchanged after idempotent recover + append"
+        );
+    }
+
     // ========================================================================
     // Shared LSN Provider Tests
     // ========================================================================

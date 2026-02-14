@@ -1914,6 +1914,117 @@ mod explicit_transaction_tests {
         db.close().await.unwrap();
     }
 
+    /// Test snapshot isolation across multiple statements in one explicit transaction.
+    ///
+    /// Session s1 keeps a stable snapshot across repeated reads, even after s2 commits
+    /// new writes in between. s1 should still see its own writes (read-your-writes).
+    #[tokio::test]
+    async fn test_multi_statement_snapshot_isolation() {
+        let dir = tempdir().unwrap();
+        let config = DatabaseConfig::with_data_dir(dir.path());
+        let db = Database::open(config).unwrap();
+        let mut s1 = Session::new();
+        let mut s2 = Session::new();
+
+        db.handle_mp_query("CREATE TABLE ms_iso_t (id INT PRIMARY KEY, v INT)")
+            .await
+            .unwrap();
+        db.handle_mp_query("INSERT INTO ms_iso_t VALUES (1, 10)")
+            .await
+            .unwrap();
+
+        // s1 starts explicit transaction and reads initial snapshot.
+        db.handle_mp_query_with_session_mut("BEGIN", &mut s1)
+            .await
+            .unwrap();
+        match db
+            .handle_mp_query_with_session_mut("SELECT v FROM ms_iso_t WHERE id = 1", &mut s1)
+            .await
+            .unwrap()
+        {
+            QueryResult::Rows { data, .. } => {
+                assert_eq!(data.len(), 1);
+                assert_eq!(data[0][0], "10");
+            }
+            other => panic!("Expected rows, got: {other:?}"),
+        }
+
+        // Concurrent commits from s2 after s1 snapshot is established.
+        db.handle_mp_query_with_session_mut("UPDATE ms_iso_t SET v = 20 WHERE id = 1", &mut s2)
+            .await
+            .unwrap();
+        db.handle_mp_query_with_session_mut("INSERT INTO ms_iso_t VALUES (2, 200)", &mut s2)
+            .await
+            .unwrap();
+
+        // s1 should still read old snapshot values, not s2's newly committed ones.
+        match db
+            .handle_mp_query_with_session_mut("SELECT v FROM ms_iso_t WHERE id = 1", &mut s1)
+            .await
+            .unwrap()
+        {
+            QueryResult::Rows { data, .. } => {
+                assert_eq!(data.len(), 1);
+                assert_eq!(
+                    data[0][0], "10",
+                    "s1 should keep snapshot value despite s2 update"
+                );
+            }
+            other => panic!("Expected rows, got: {other:?}"),
+        }
+        match db
+            .handle_mp_query_with_session_mut("SELECT COUNT(*) FROM ms_iso_t", &mut s1)
+            .await
+            .unwrap()
+        {
+            QueryResult::Rows { data, .. } => {
+                assert_eq!(data.len(), 1);
+                assert_eq!(
+                    data[0][0], "1",
+                    "s1 should not see phantom row inserted by s2 in same txn"
+                );
+            }
+            other => panic!("Expected rows, got: {other:?}"),
+        }
+
+        // s1 should still see its own writes.
+        db.handle_mp_query_with_session_mut("INSERT INTO ms_iso_t VALUES (3, 300)", &mut s1)
+            .await
+            .unwrap();
+        match db
+            .handle_mp_query_with_session_mut("SELECT v FROM ms_iso_t WHERE id = 3", &mut s1)
+            .await
+            .unwrap()
+        {
+            QueryResult::Rows { data, .. } => {
+                assert_eq!(data.len(), 1);
+                assert_eq!(data[0][0], "300");
+            }
+            other => panic!("Expected rows, got: {other:?}"),
+        }
+
+        db.handle_mp_query_with_session_mut("COMMIT", &mut s1)
+            .await
+            .unwrap();
+
+        // After commit, latest view should include both s2 and s1 committed writes.
+        match db
+            .handle_mp_query("SELECT id, v FROM ms_iso_t ORDER BY id")
+            .await
+            .unwrap()
+        {
+            QueryResult::Rows { data, .. } => {
+                assert_eq!(data.len(), 3);
+                assert_eq!(data[0], vec!["1".to_string(), "20".to_string()]);
+                assert_eq!(data[1], vec!["2".to_string(), "200".to_string()]);
+                assert_eq!(data[2], vec!["3".to_string(), "300".to_string()]);
+            }
+            other => panic!("Expected rows, got: {other:?}"),
+        }
+
+        db.close().await.unwrap();
+    }
+
     /// Test that COMMIT without active transaction is a no-op (MySQL behavior).
     #[tokio::test]
     async fn test_commit_without_transaction_is_noop() {
