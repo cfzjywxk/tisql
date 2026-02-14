@@ -33,10 +33,10 @@ mod mvcc;
 pub(crate) use memory::MemoryCatalog;
 pub(crate) use mvcc::MvccCatalog;
 
-use serde::{Deserialize, Serialize};
-use std::future::Future;
 use crate::error::Result;
 use crate::types::{ColumnId, DataType, IndexId, TableId, Timestamp};
+use serde::{Deserialize, Serialize};
+use std::future::Future;
 
 // ============================================================================
 // Column Definition
@@ -331,7 +331,11 @@ pub trait Catalog: Send + Sync {
     ///
     /// Returns `DropTableInfo` with the table ID and commit timestamp,
     /// enabling GC infrastructure to physically clean up data keys.
-    fn drop_table<'a>(&'a self, schema: &'a str, table: &'a str) -> impl Future<Output = Result<DropTableInfo>> + Send + 'a;
+    fn drop_table<'a>(
+        &'a self,
+        schema: &'a str,
+        table: &'a str,
+    ) -> impl Future<Output = Result<DropTableInfo>> + Send + 'a;
 
     /// Get a table by name.
     fn get_table(&self, schema: &str, table: &str) -> Result<Option<TableDef>>;
@@ -345,10 +349,18 @@ pub trait Catalog: Send + Sync {
     // Index operations
 
     /// Create an index on a table.
-    fn create_index(&self, table_id: TableId, index: IndexDef) -> impl Future<Output = Result<IndexId>> + Send + '_;
+    fn create_index(
+        &self,
+        table_id: TableId,
+        index: IndexDef,
+    ) -> impl Future<Output = Result<IndexId>> + Send + '_;
 
     /// Drop an index.
-    fn drop_index<'a>(&'a self, table_id: TableId, index_name: &'a str) -> impl Future<Output = Result<()>> + Send + 'a;
+    fn drop_index<'a>(
+        &'a self,
+        table_id: TableId,
+        index_name: &'a str,
+    ) -> impl Future<Output = Result<()>> + Send + 'a;
 
     // Auto-increment support
 

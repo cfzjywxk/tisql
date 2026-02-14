@@ -67,14 +67,16 @@ pub async fn bootstrap_core_tables<T: TxnService>(txn: &T) -> Result<()> {
         META_BOOTSTRAP_VERSION,
         "bootstrap_version",
         "1",
-    ).await?;
+    )
+    .await?;
     write_meta_row(
         &mut ctx,
         txn,
         META_NEXT_TABLE_ID,
         "next_table_id",
         &USER_TABLE_ID_START.to_string(),
-    ).await?;
+    )
+    .await?;
     write_meta_row(&mut ctx, txn, META_NEXT_INDEX_ID, "next_index_id", "1").await?;
     write_meta_row(&mut ctx, txn, META_SCHEMA_VERSION, "schema_version", "1").await?;
     write_meta_row(
@@ -83,7 +85,8 @@ pub async fn bootstrap_core_tables<T: TxnService>(txn: &T) -> Result<()> {
         META_NEXT_SCHEMA_ID,
         "next_schema_id",
         &USER_SCHEMA_ID_START.to_string(),
-    ).await?;
+    )
+    .await?;
     write_meta_row(&mut ctx, txn, META_NEXT_GC_TASK_ID, "next_gc_task_id", "1").await?;
 
     txn.commit(ctx).await?;
@@ -337,7 +340,8 @@ pub(crate) async fn update_gc_task_status<T: TxnService>(
         end_key_hex,
         drop_commit_ts,
         status,
-    ).await
+    )
+    .await
 }
 
 /// Update a meta row in `__all_meta` (overwrite existing row).

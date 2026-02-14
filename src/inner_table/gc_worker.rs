@@ -220,7 +220,8 @@ impl<T: TxnService + 'static> GcWorkerInner<T> {
             &task.end_key_hex,
             task.drop_commit_ts,
             "done",
-        ).await?;
+        )
+        .await?;
         self.txn_service.commit(ctx).await?;
         Ok(())
     }

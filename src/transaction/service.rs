@@ -240,7 +240,11 @@ impl<S: PessimisticStorage + 'static, L: ClogService + 'static, T: TsoService>
             if lock_keys.contains(key) {
                 continue; // LOCK key — nothing to persist in clog
             }
-            match self.storage.get_with_owner(key, ctx.start_ts, ctx.start_ts).await {
+            match self
+                .storage
+                .get_with_owner(key, ctx.start_ts, ctx.start_ts)
+                .await
+            {
                 Some(value) if !is_tombstone(&value) => {
                     batch.put(key.clone(), value);
                 }
@@ -284,7 +288,10 @@ impl<S: PessimisticStorage + 'static, L: ClogService + 'static, T: TsoService> T
     async fn get(&self, ctx: &TxnCtx, key: &[u8]) -> Result<Option<RawValue>> {
         // Use get_with_owner with owner_ts=start_ts for read-your-writes.
         // This sees own pending writes and committed data at start_ts.
-        let value = self.storage.get_with_owner(key, ctx.start_ts, ctx.start_ts).await;
+        let value = self
+            .storage
+            .get_with_owner(key, ctx.start_ts, ctx.start_ts)
+            .await;
         Ok(value.filter(|v| !is_tombstone(v)))
     }
 
@@ -871,12 +878,18 @@ mod tests {
         let (storage, txn_service, _dir) = create_test_service();
 
         // Execute writes using proper transaction flow
-        let info = txn_service.autocommit_put(b"key1", b"value1").await.unwrap();
+        let info = txn_service
+            .autocommit_put(b"key1", b"value1")
+            .await
+            .unwrap();
         assert!(info.txn_id > 0);
         assert!(info.commit_ts > 0);
         assert!(info.lsn > 0);
 
-        txn_service.autocommit_put(b"key2", b"value2").await.unwrap();
+        txn_service
+            .autocommit_put(b"key2", b"value2")
+            .await
+            .unwrap();
 
         // Verify storage
         let v1 = get_for_test(&*storage, b"key1").await;
@@ -1008,7 +1021,10 @@ mod tests {
         let (storage, txn_service, _dir) = create_test_service();
 
         // First commit a value
-        txn_service.autocommit_put(b"key1", b"value1").await.unwrap();
+        txn_service
+            .autocommit_put(b"key1", b"value1")
+            .await
+            .unwrap();
         assert_eq!(
             get_for_test(&*storage, b"key1").await,
             Some(b"value1".to_vec())
@@ -1016,7 +1032,10 @@ mod tests {
 
         // Delete via transaction
         let mut ctx = txn_service.begin(false).unwrap();
-        txn_service.delete(&mut ctx, b"key1".to_vec()).await.unwrap();
+        txn_service
+            .delete(&mut ctx, b"key1".to_vec())
+            .await
+            .unwrap();
         txn_service.commit(ctx).await.unwrap();
 
         // Should be deleted in storage
@@ -1075,7 +1094,9 @@ mod tests {
         let mut ctx = txn_service.begin(true).unwrap();
 
         // Put should error for read-only transaction
-        let result = txn_service.put(&mut ctx, b"key1".to_vec(), b"value1".to_vec()).await;
+        let result = txn_service
+            .put(&mut ctx, b"key1".to_vec(), b"value1".to_vec())
+            .await;
         assert!(result.is_err());
         assert!(matches!(
             result.unwrap_err(),
@@ -1522,7 +1543,10 @@ mod tests {
         let (storage, txn_service, _dir) = create_test_service();
 
         // First commit a value (via implicit txn)
-        txn_service.autocommit_put(b"key1", b"value1").await.unwrap();
+        txn_service
+            .autocommit_put(b"key1", b"value1")
+            .await
+            .unwrap();
         assert_eq!(
             get_for_test(&*storage, b"key1").await,
             Some(b"value1".to_vec())
@@ -1532,7 +1556,10 @@ mod tests {
         let mut ctx = txn_service.begin_explicit(false).unwrap();
 
         // Delete via explicit transaction
-        txn_service.delete(&mut ctx, b"key1".to_vec()).await.unwrap();
+        txn_service
+            .delete(&mut ctx, b"key1".to_vec())
+            .await
+            .unwrap();
 
         // Commit
         txn_service.commit(ctx).await.unwrap();
@@ -1619,7 +1646,9 @@ mod tests {
         let mut ctx = txn_service.begin_explicit(true).unwrap();
 
         // Put should error for read-only explicit transaction
-        let result = txn_service.put(&mut ctx, b"key1".to_vec(), b"value1".to_vec()).await;
+        let result = txn_service
+            .put(&mut ctx, b"key1".to_vec(), b"value1".to_vec())
+            .await;
         assert!(result.is_err());
         assert!(matches!(
             result.unwrap_err(),
@@ -1724,7 +1753,10 @@ mod tests {
         let mut ctx = txn_service.begin_explicit(false).unwrap();
 
         // Delete the key
-        txn_service.delete(&mut ctx, b"key1".to_vec()).await.unwrap();
+        txn_service
+            .delete(&mut ctx, b"key1".to_vec())
+            .await
+            .unwrap();
 
         // Read should return None (deleted)
         let value = txn_service.get(&ctx, b"key1").await.unwrap();
@@ -1849,7 +1881,10 @@ mod tests {
         let mut ctx = txn_service.begin_explicit(false).unwrap();
 
         // Delete
-        txn_service.delete(&mut ctx, b"key1".to_vec()).await.unwrap();
+        txn_service
+            .delete(&mut ctx, b"key1".to_vec())
+            .await
+            .unwrap();
 
         // Should see None
         let value = txn_service.get(&ctx, b"key1").await.unwrap();
@@ -1920,7 +1955,9 @@ mod tests {
         };
 
         // Try to put on committed transaction - should fail
-        let result = txn_service.put(&mut committed_ctx, b"key2".to_vec(), b"value2".to_vec()).await;
+        let result = txn_service
+            .put(&mut committed_ctx, b"key2".to_vec(), b"value2".to_vec())
+            .await;
         assert!(result.is_err());
         assert!(matches!(
             result.unwrap_err(),
@@ -1943,7 +1980,9 @@ mod tests {
         };
 
         // Try to delete on committed transaction - should fail
-        let result = txn_service.delete(&mut committed_ctx, b"key1".to_vec()).await;
+        let result = txn_service
+            .delete(&mut committed_ctx, b"key1".to_vec())
+            .await;
         assert!(result.is_err());
         assert!(matches!(
             result.unwrap_err(),
@@ -1960,7 +1999,9 @@ mod tests {
         aborted_ctx.state = TxnState::Aborted;
 
         // Try to put on aborted transaction - should fail
-        let result = txn_service.put(&mut aborted_ctx, b"key1".to_vec(), b"value1".to_vec()).await;
+        let result = txn_service
+            .put(&mut aborted_ctx, b"key1".to_vec(), b"value1".to_vec())
+            .await;
         assert!(result.is_err());
         assert!(matches!(
             result.unwrap_err(),
@@ -2093,9 +2134,18 @@ mod tests {
         let (_storage, txn_service, _dir) = create_test_service();
 
         // Write some data
-        txn_service.autocommit_put(b"key1", b"value1").await.unwrap();
-        txn_service.autocommit_put(b"key2", b"value2").await.unwrap();
-        txn_service.autocommit_put(b"key3", b"value3").await.unwrap();
+        txn_service
+            .autocommit_put(b"key1", b"value1")
+            .await
+            .unwrap();
+        txn_service
+            .autocommit_put(b"key2", b"value2")
+            .await
+            .unwrap();
+        txn_service
+            .autocommit_put(b"key3", b"value3")
+            .await
+            .unwrap();
 
         let ctx = txn_service.begin(true).unwrap();
 
@@ -2173,7 +2223,9 @@ mod tests {
 
         // Transaction 2: Try to write same key - should fail
         let mut ctx2 = txn_service.begin_explicit(false).unwrap();
-        let result = txn_service.put(&mut ctx2, b"conflict_key".to_vec(), b"value2".to_vec()).await;
+        let result = txn_service
+            .put(&mut ctx2, b"conflict_key".to_vec(), b"value2".to_vec())
+            .await;
 
         assert!(result.is_err());
         match result.unwrap_err() {
@@ -2194,7 +2246,10 @@ mod tests {
         let (_storage, txn_service, _dir) = create_test_service();
 
         // Commit initial value
-        txn_service.autocommit_put(b"delete_key", b"value").await.unwrap();
+        txn_service
+            .autocommit_put(b"delete_key", b"value")
+            .await
+            .unwrap();
 
         // Transaction 1: Lock key with delete
         let mut ctx1 = txn_service.begin_explicit(false).unwrap();
@@ -2235,7 +2290,10 @@ mod tests {
             let txn_service = TransactionService::new(storage, clog_service.clone(), tso, cm);
 
             // Put then delete
-            txn_service.autocommit_put(b"del_key", b"value").await.unwrap();
+            txn_service
+                .autocommit_put(b"del_key", b"value")
+                .await
+                .unwrap();
             txn_service.autocommit_delete(b"del_key").await.unwrap();
 
             clog_service.close().await.unwrap();
@@ -2330,7 +2388,10 @@ mod tests {
     async fn test_implicit_txn_commit_writes_clog() {
         let (_storage, txn_service, _dir) = create_test_service();
 
-        let info = txn_service.autocommit_put(b"key1", b"value1").await.unwrap();
+        let info = txn_service
+            .autocommit_put(b"key1", b"value1")
+            .await
+            .unwrap();
         assert!(info.lsn > 0, "implicit txn should produce non-zero LSN");
 
         // Verify clog contains Put + Commit entries
@@ -2379,12 +2440,18 @@ mod tests {
         let (_storage, txn_service, _dir) = create_test_service();
 
         // First, commit a value via autocommit
-        txn_service.autocommit_put(b"key1", b"value1").await.unwrap();
+        txn_service
+            .autocommit_put(b"key1", b"value1")
+            .await
+            .unwrap();
 
         // Now delete it via explicit transaction
         let mut ctx = txn_service.begin_explicit(false).unwrap();
         let txn_id = ctx.txn_id();
-        txn_service.delete(&mut ctx, b"key1".to_vec()).await.unwrap();
+        txn_service
+            .delete(&mut ctx, b"key1".to_vec())
+            .await
+            .unwrap();
         let info = txn_service.commit(ctx).await.unwrap();
         assert!(info.lsn > 0);
 
@@ -2465,7 +2532,10 @@ mod tests {
             .put(&mut ctx, b"key1".to_vec(), b"value1".to_vec())
             .await
             .unwrap();
-        txn_service.delete(&mut ctx, b"key1".to_vec()).await.unwrap();
+        txn_service
+            .delete(&mut ctx, b"key1".to_vec())
+            .await
+            .unwrap();
         txn_service.commit(ctx).await.unwrap();
 
         // TOMBSTONE → Delete entry in clog
@@ -2494,7 +2564,10 @@ mod tests {
             .put(&mut ctx, b"key1".to_vec(), b"v1".to_vec())
             .await
             .unwrap();
-        txn_service.delete(&mut ctx, b"key1".to_vec()).await.unwrap();
+        txn_service
+            .delete(&mut ctx, b"key1".to_vec())
+            .await
+            .unwrap();
         txn_service
             .put(&mut ctx, b"key1".to_vec(), b"v2".to_vec())
             .await

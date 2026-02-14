@@ -117,10 +117,17 @@ pub mod testkit {
     /// Extension trait for TransactionService with test-only autocommit helpers.
     pub trait TxnServiceTestExt {
         /// Execute a single put with autocommit (test helper).
-        fn autocommit_put<'a>(&'a self, key: &'a [u8], value: &'a [u8]) -> impl Future<Output = Result<CommitInfo>> + Send + 'a;
+        fn autocommit_put<'a>(
+            &'a self,
+            key: &'a [u8],
+            value: &'a [u8],
+        ) -> impl Future<Output = Result<CommitInfo>> + Send + 'a;
 
         /// Execute a single delete with autocommit (test helper).
-        fn autocommit_delete<'a>(&'a self, key: &'a [u8]) -> impl Future<Output = Result<CommitInfo>> + Send + 'a;
+        fn autocommit_delete<'a>(
+            &'a self,
+            key: &'a [u8],
+        ) -> impl Future<Output = Result<CommitInfo>> + Send + 'a;
     }
 
     impl<S, C, T> TxnServiceTestExt for TransactionService<S, C, T>

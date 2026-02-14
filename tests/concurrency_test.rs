@@ -319,13 +319,25 @@ async fn test_mvcc_read_at_timestamp() {
     let key = b"version_key";
 
     // Write version 1
-    let ts1 = txn_service.autocommit_put(key, b"v1").await.unwrap().commit_ts;
+    let ts1 = txn_service
+        .autocommit_put(key, b"v1")
+        .await
+        .unwrap()
+        .commit_ts;
 
     // Write version 2
-    let ts2 = txn_service.autocommit_put(key, b"v2").await.unwrap().commit_ts;
+    let ts2 = txn_service
+        .autocommit_put(key, b"v2")
+        .await
+        .unwrap()
+        .commit_ts;
 
     // Write version 3
-    let ts3 = txn_service.autocommit_put(key, b"v3").await.unwrap().commit_ts;
+    let ts3 = txn_service
+        .autocommit_put(key, b"v3")
+        .await
+        .unwrap()
+        .commit_ts;
 
     assert!(ts1 < ts2);
     assert!(ts2 < ts3);
@@ -358,7 +370,10 @@ async fn test_concurrent_readers_no_interference() {
     let key = b"shared_read_key";
 
     // Write initial value
-    txn_service.autocommit_put(key, b"initial_value").await.unwrap();
+    txn_service
+        .autocommit_put(key, b"initial_value")
+        .await
+        .unwrap();
 
     let num_readers = 10;
     let reads_per_thread = 100;
@@ -400,7 +415,11 @@ async fn test_concurrent_read_after_delete() {
     let key = b"delete_key";
 
     // Write initial value
-    let ts1 = txn_service.autocommit_put(key, b"value").await.unwrap().commit_ts;
+    let ts1 = txn_service
+        .autocommit_put(key, b"value")
+        .await
+        .unwrap()
+        .commit_ts;
 
     // Verify value exists
     assert!(get_for_test(&storage, key).await.is_some());
@@ -670,7 +689,10 @@ mod failpoint_tests {
             // This will pause right after acquiring locks but BEFORE setting commit_ts
             // At the failpoint, locks are held but commit_ts = max(max_ts+1, tso_ts)
             // hasn't been computed yet
-            txn_service_clone.autocommit_put(key, b"value").await.unwrap()
+            txn_service_clone
+                .autocommit_put(key, b"value")
+                .await
+                .unwrap()
         });
 
         // Give writer time to reach failpoint (pending locks acquired)
@@ -741,8 +763,12 @@ mod failpoint_tests {
         fail::cfg("txn_after_lock_before_commit_ts", "pause").unwrap();
 
         let txn_service_clone = Arc::clone(&txn_service);
-        let writer =
-            tokio::spawn(async move { txn_service_clone.autocommit_put(key, b"value").await.unwrap() });
+        let writer = tokio::spawn(async move {
+            txn_service_clone
+                .autocommit_put(key, b"value")
+                .await
+                .unwrap()
+        });
 
         tokio::time::sleep(Duration::from_millis(50)).await;
 
@@ -1103,7 +1129,10 @@ async fn test_concurrent_scan_while_writers_run() {
                 // Write to a different key range to reduce lock conflicts with scanners
                 let key = format!("write_{:02}_{:02}", w, i % 10);
                 let value = format!("writer_{w}_iter_{i}");
-                match txn_service.autocommit_put(key.as_bytes(), value.as_bytes()).await {
+                match txn_service
+                    .autocommit_put(key.as_bytes(), value.as_bytes())
+                    .await
+                {
                     Ok(_) => success += 1,
                     Err(TiSqlError::KeyIsLocked { .. }) => {} // Expected under contention
                     Err(e) => panic!("Unexpected error: {e:?}"),

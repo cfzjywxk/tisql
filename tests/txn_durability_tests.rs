@@ -209,10 +209,16 @@ async fn test_explicit_txn_delete_crash_recovery() {
     {
         let (_engine, txn_service, clog) = create_txn_env(dir.path());
 
-        txn_service.autocommit_put(b"key1", b"value1").await.unwrap();
+        txn_service
+            .autocommit_put(b"key1", b"value1")
+            .await
+            .unwrap();
 
         let mut ctx = txn_service.begin_explicit(false).unwrap();
-        txn_service.delete(&mut ctx, b"key1".to_vec()).await.unwrap();
+        txn_service
+            .delete(&mut ctx, b"key1".to_vec())
+            .await
+            .unwrap();
         let info = txn_service.commit(ctx).await.unwrap();
         max_ts = info.commit_ts;
 
@@ -249,7 +255,10 @@ async fn test_mixed_implicit_explicit_crash_recovery() {
             .put(&mut ctx, b"key2".to_vec(), b"v2".to_vec())
             .await
             .unwrap();
-        txn_service.delete(&mut ctx, b"key1".to_vec()).await.unwrap();
+        txn_service
+            .delete(&mut ctx, b"key1".to_vec())
+            .await
+            .unwrap();
         txn_service.commit(ctx).await.unwrap();
 
         // Implicit put key3

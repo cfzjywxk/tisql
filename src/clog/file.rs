@@ -1726,7 +1726,11 @@ mod tests {
         // Write empty batch
         let mut empty_batch = ClogBatch::new();
         assert!(empty_batch.is_empty());
-        let lsn = service.write(&mut empty_batch, true).unwrap().await.unwrap();
+        let lsn = service
+            .write(&mut empty_batch, true)
+            .unwrap()
+            .await
+            .unwrap();
 
         // Should return current LSN without incrementing
         assert_eq!(lsn, 1);

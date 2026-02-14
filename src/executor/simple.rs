@@ -1124,7 +1124,11 @@ impl SimpleExecutor {
     }
 
     /// Execute DDL operations (no transaction needed).
-    async fn execute_ddl<C: Catalog>(&self, plan: LogicalPlan, catalog: &C) -> Result<ExecutionResult> {
+    async fn execute_ddl<C: Catalog>(
+        &self,
+        plan: LogicalPlan,
+        catalog: &C,
+    ) -> Result<ExecutionResult> {
         match plan {
             LogicalPlan::CreateTable {
                 table,

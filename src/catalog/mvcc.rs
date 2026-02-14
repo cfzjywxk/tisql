@@ -155,7 +155,8 @@ impl<T: TxnService> MvccCatalog<T> {
             self.txn_service.as_ref(),
             META_SCHEMA_VERSION,
             new_version,
-        ).await
+        )
+        .await
     }
 
     fn begin_internal(&self) -> Result<TxnCtx> {
@@ -201,9 +202,11 @@ impl<T: TxnService> Catalog for MvccCatalog<T> {
             self.txn_service.as_ref(),
             META_NEXT_SCHEMA_ID,
             current_next,
-        ).await?;
+        )
+        .await?;
 
-        self.write_schema_version_to_meta(&mut ctx, new_version).await?;
+        self.write_schema_version_to_meta(&mut ctx, new_version)
+            .await?;
         self.commit_internal(ctx).await?;
 
         // Phase 3: Update cache (brief write lock)
@@ -246,7 +249,8 @@ impl<T: TxnService> Catalog for MvccCatalog<T> {
         let key = encode_record_key_with_handle(ALL_SCHEMA_TABLE_ID, schema_id as i64);
         self.txn_service.delete(&mut ctx, key).await?;
 
-        self.write_schema_version_to_meta(&mut ctx, new_version).await?;
+        self.write_schema_version_to_meta(&mut ctx, new_version)
+            .await?;
         self.commit_internal(ctx).await?;
 
         // Phase 3: Update cache
@@ -311,7 +315,8 @@ impl<T: TxnService> Catalog for MvccCatalog<T> {
             self.txn_service.as_ref(),
             table_id,
             table.columns(),
-        ).await?;
+        )
+        .await?;
 
         let current_next = self.next_table_id.load(Ordering::SeqCst);
         update_meta_row(
@@ -319,9 +324,11 @@ impl<T: TxnService> Catalog for MvccCatalog<T> {
             self.txn_service.as_ref(),
             META_NEXT_TABLE_ID,
             current_next,
-        ).await?;
+        )
+        .await?;
 
-        self.write_schema_version_to_meta(&mut ctx, new_version).await?;
+        self.write_schema_version_to_meta(&mut ctx, new_version)
+            .await?;
         self.commit_internal(ctx).await?;
 
         // Phase 3: Update cache
@@ -364,7 +371,13 @@ impl<T: TxnService> Catalog for MvccCatalog<T> {
                 .collect::<String>();
 
             let gc_task_id = self.next_gc_task_id.fetch_add(1, Ordering::SeqCst) as i64;
-            (table_def, state.version + 1, start_key_hex, end_key_hex, gc_task_id)
+            (
+                table_def,
+                state.version + 1,
+                start_key_hex,
+                end_key_hex,
+                gc_task_id,
+            )
         };
 
         let table_id = table_def.id();
@@ -380,14 +393,16 @@ impl<T: TxnService> Catalog for MvccCatalog<T> {
             self.txn_service.as_ref(),
             table_id,
             table_def.columns(),
-        ).await?;
+        )
+        .await?;
 
         delete_index_rows(
             &mut ctx,
             self.txn_service.as_ref(),
             table_id,
             table_def.indexes(),
-        ).await?;
+        )
+        .await?;
 
         write_gc_task_row(
             &mut ctx,
@@ -398,7 +413,8 @@ impl<T: TxnService> Catalog for MvccCatalog<T> {
             &end_key_hex,
             0,
             "pending",
-        ).await?;
+        )
+        .await?;
 
         let current_next = self.next_gc_task_id.load(Ordering::SeqCst);
         update_meta_row(
@@ -406,9 +422,11 @@ impl<T: TxnService> Catalog for MvccCatalog<T> {
             self.txn_service.as_ref(),
             META_NEXT_GC_TASK_ID,
             current_next,
-        ).await?;
+        )
+        .await?;
 
-        self.write_schema_version_to_meta(&mut ctx, new_version).await?;
+        self.write_schema_version_to_meta(&mut ctx, new_version)
+            .await?;
 
         let commit_info = self.commit_internal(ctx).await?;
         let commit_ts = commit_info.commit_ts;
@@ -425,7 +443,8 @@ impl<T: TxnService> Catalog for MvccCatalog<T> {
                 &end_key_hex,
                 commit_ts,
                 "pending",
-            ).await?;
+            )
+            .await?;
             self.commit_internal(ctx2).await?;
         }
 
@@ -481,10 +500,9 @@ impl<T: TxnService> Catalog for MvccCatalog<T> {
                     )));
                 }
             };
-            let table_def =
-                state.cache.tables.get(&table_key).ok_or_else(|| {
-                    TiSqlError::Catalog(format!("Table with ID {table_id} not found"))
-                })?;
+            let table_def = state.cache.tables.get(&table_key).ok_or_else(|| {
+                TiSqlError::Catalog(format!("Table with ID {table_id} not found"))
+            })?;
             if table_def.indexes().iter().any(|i| i.name() == index.name()) {
                 return Err(TiSqlError::Catalog(format!(
                     "Index '{}' already exists",
@@ -507,9 +525,11 @@ impl<T: TxnService> Catalog for MvccCatalog<T> {
             self.txn_service.as_ref(),
             META_NEXT_INDEX_ID,
             current_next,
-        ).await?;
+        )
+        .await?;
 
-        self.write_schema_version_to_meta(&mut ctx, new_version).await?;
+        self.write_schema_version_to_meta(&mut ctx, new_version)
+            .await?;
         self.commit_internal(ctx).await?;
 
         // Phase 3: Update cache
@@ -536,10 +556,9 @@ impl<T: TxnService> Catalog for MvccCatalog<T> {
                     )));
                 }
             };
-            let table_def =
-                state.cache.tables.get(&table_key).ok_or_else(|| {
-                    TiSqlError::Catalog(format!("Table with ID {table_id} not found"))
-                })?;
+            let table_def = state.cache.tables.get(&table_key).ok_or_else(|| {
+                TiSqlError::Catalog(format!("Table with ID {table_id} not found"))
+            })?;
             let index = table_def
                 .indexes()
                 .iter()
@@ -555,7 +574,8 @@ impl<T: TxnService> Catalog for MvccCatalog<T> {
         let key = encode_record_key_with_handle(ALL_INDEX_TABLE_ID, index_key as i64);
         self.txn_service.delete(&mut ctx, key).await?;
 
-        self.write_schema_version_to_meta(&mut ctx, new_version).await?;
+        self.write_schema_version_to_meta(&mut ctx, new_version)
+            .await?;
         self.commit_internal(ctx).await?;
 
         // Phase 3: Update cache
@@ -599,7 +619,12 @@ impl<T: TxnService> Catalog for MvccCatalog<T> {
 
         // Persist: use block_on_sync since this is a sync method
         let mut ctx = self.begin_internal()?;
-        crate::io::block_on_sync(write_user_table_row(&mut ctx, self.txn_service.as_ref(), table_def, schema_id))?;
+        crate::io::block_on_sync(write_user_table_row(
+            &mut ctx,
+            self.txn_service.as_ref(),
+            table_def,
+            schema_id,
+        ))?;
         crate::io::block_on_sync(self.commit_internal(ctx))?;
 
         Ok(new_id)
@@ -679,7 +704,8 @@ mod tests {
         (catalog, dir)
     }
 
-    async fn create_test_catalog_bootstrapped() -> (MvccCatalog<TestTxnService>, tempfile::TempDir) {
+    async fn create_test_catalog_bootstrapped() -> (MvccCatalog<TestTxnService>, tempfile::TempDir)
+    {
         let (catalog, dir) = create_test_catalog();
         catalog.bootstrap().await.unwrap();
         (catalog, dir)

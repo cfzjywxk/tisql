@@ -979,7 +979,9 @@ mod tests {
     #[tokio::test]
     async fn test_load_catalog_after_bootstrap() {
         let (txn, _dir) = create_test_txn();
-        bootstrap::bootstrap_core_tables(txn.as_ref()).await.unwrap();
+        bootstrap::bootstrap_core_tables(txn.as_ref())
+            .await
+            .unwrap();
 
         let (cache, counters) = load_catalog(txn.as_ref()).unwrap();
 
@@ -1010,7 +1012,9 @@ mod tests {
     #[tokio::test]
     async fn test_load_catalog_core_table_columns() {
         let (txn, _dir) = create_test_txn();
-        bootstrap::bootstrap_core_tables(txn.as_ref()).await.unwrap();
+        bootstrap::bootstrap_core_tables(txn.as_ref())
+            .await
+            .unwrap();
 
         let (cache, _) = load_catalog(txn.as_ref()).unwrap();
 
@@ -1035,7 +1039,9 @@ mod tests {
     #[tokio::test]
     async fn test_load_catalog_table_id_map() {
         let (txn, _dir) = create_test_txn();
-        bootstrap::bootstrap_core_tables(txn.as_ref()).await.unwrap();
+        bootstrap::bootstrap_core_tables(txn.as_ref())
+            .await
+            .unwrap();
 
         let (cache, _) = load_catalog(txn.as_ref()).unwrap();
 
