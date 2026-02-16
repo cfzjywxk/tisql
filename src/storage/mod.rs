@@ -471,6 +471,19 @@ pub trait PessimisticStorage: StorageEngine {
     /// Only affects nodes where `owner_start_ts` matches.
     fn finalize_pending(&self, keys: &[Key], owner_start_ts: Timestamp, commit_ts: Timestamp);
 
+    /// Finalize all pending writes and, when applicable, track the corresponding clog LSN.
+    ///
+    /// Engines without LSN-aware pending tracking may use the default implementation.
+    fn finalize_pending_with_lsn(
+        &self,
+        keys: &[Key],
+        owner_start_ts: Timestamp,
+        commit_ts: Timestamp,
+        _clog_lsn: u64,
+    ) {
+        self.finalize_pending(keys, owner_start_ts, commit_ts);
+    }
+
     /// Abort all pending writes for a transaction.
     ///
     /// Called during rollback. Marks pending nodes as aborted so readers skip them.

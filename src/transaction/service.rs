@@ -25,7 +25,6 @@ use fail::fail_point;
 
 use crate::clog::{ClogEntry, ClogOp, ClogOpRef, ClogService};
 use crate::error::{Result, TiSqlError};
-use crate::log_warn;
 use crate::tso::TsoService;
 
 use super::api::{CommitInfo, MutationType, TxnCtx, TxnService, TxnState};
@@ -53,6 +52,8 @@ pub struct TransactionService<S: StorageEngine, L: ClogService, T: TsoService> {
     tso: Arc<T>,
     /// ConcurrencyManager for lock table and max_ts tracking
     concurrency_manager: Arc<ConcurrencyManager>,
+    /// Optional commit/flush coordination fence (LSM flush gate).
+    commit_fence: Option<Arc<tokio::sync::RwLock<()>>>,
 }
 
 impl<S: StorageEngine, L: ClogService, T: TsoService> TransactionService<S, L, T> {
@@ -63,11 +64,22 @@ impl<S: StorageEngine, L: ClogService, T: TsoService> TransactionService<S, L, T
         tso: Arc<T>,
         concurrency_manager: Arc<ConcurrencyManager>,
     ) -> Self {
+        Self::new_with_commit_fence(storage, clog_service, tso, concurrency_manager, None)
+    }
+
+    pub fn new_with_commit_fence(
+        storage: Arc<S>,
+        clog_service: Arc<L>,
+        tso: Arc<T>,
+        concurrency_manager: Arc<ConcurrencyManager>,
+        commit_fence: Option<Arc<tokio::sync::RwLock<()>>>,
+    ) -> Self {
         Self {
             storage,
             clog_service,
             tso,
             concurrency_manager,
+            commit_fence,
         }
     }
 
@@ -107,22 +119,14 @@ impl<S: StorageEngine, L: ClogService, T: TsoService> TransactionService<S, L, T
         let mut max_ts: Timestamp = 0;
 
         // First pass: identify committed transactions, find max commit_ts,
-        // and build txn metadata (commit_ts, commit LSN, and max LSN per txn)
+        // and build txn metadata (commit_ts + commit LSN per txn).
         let mut committed_txns = std::collections::HashSet::new();
         let mut txn_commit_ts: std::collections::HashMap<TxnId, Timestamp> =
             std::collections::HashMap::new();
         let mut txn_commit_lsn: std::collections::HashMap<TxnId, u64> =
             std::collections::HashMap::new();
-        let mut txn_max_lsn: std::collections::HashMap<TxnId, u64> =
-            std::collections::HashMap::new();
 
         for entry in entries {
-            // Track max LSN per transaction for recovery ordering
-            txn_max_lsn
-                .entry(entry.txn_id)
-                .and_modify(|lsn| *lsn = (*lsn).max(entry.lsn))
-                .or_insert(entry.lsn);
-
             if let ClogOp::Commit { commit_ts } = entry.op {
                 committed_txns.insert(entry.txn_id);
                 txn_commit_ts.insert(entry.txn_id, commit_ts);
@@ -132,8 +136,7 @@ impl<S: StorageEngine, L: ClogService, T: TsoService> TransactionService<S, L, T
             }
         }
 
-        // Second pass: apply committed operations with their commit_ts and LSN
-        // Also validate per-txn shape: ops should appear before their Commit record
+        // Second pass: apply committed operations with their commit_ts and LSN.
         for entry in entries {
             if !committed_txns.contains(&entry.txn_id) {
                 stats.rolled_back_entries += 1;
@@ -141,21 +144,8 @@ impl<S: StorageEngine, L: ClogService, T: TsoService> TransactionService<S, L, T
             }
 
             let commit_ts = *txn_commit_ts.get(&entry.txn_id).unwrap_or(&max_ts);
-            // Use the max LSN of the transaction (the commit record's LSN) for proper ordering
-            let lsn = *txn_max_lsn.get(&entry.txn_id).unwrap_or(&entry.lsn);
-
-            // Validate per-txn shape: non-commit ops should have LSN < commit LSN
-            // This detects potential log corruption where ops appear after commit
-            if let Some(&commit_lsn) = txn_commit_lsn.get(&entry.txn_id) {
-                if !matches!(entry.op, ClogOp::Commit { .. }) && entry.lsn > commit_lsn {
-                    log_warn!(
-                        "Recovery: txn {} has op at LSN {} after commit at LSN {} (possible corruption)",
-                        entry.txn_id, entry.lsn, commit_lsn
-                    );
-                    stats.post_commit_ops += 1;
-                    // Still apply the op to preserve all data, but flag it
-                }
-            }
+            // V2.5 per-txn LSN: all txn entries share the commit record's LSN.
+            let lsn = *txn_commit_lsn.get(&entry.txn_id).unwrap_or(&entry.lsn);
 
             match &entry.op {
                 ClogOp::Put { key, value } => {
@@ -441,6 +431,15 @@ impl<S: PessimisticStorage + 'static, L: ClogService + 'static, T: TsoService> T
             })
             .collect();
 
+        // Hold commit fence (if configured) across clog write + finalize/abort.
+        // This prevents flush/GC from computing boundaries while this txn is
+        // durable in clog but not yet reflected in memtable LSN tracking.
+        let _commit_fence = if let Some(fence) = &self.commit_fence {
+            Some(fence.read().await)
+        } else {
+            None
+        };
+
         // Step 5: Write to clog for durability (serializes synchronously, returns
         // future for fsync). After this call, ops/read_values are no longer needed.
         let clog_result = self.clog_service.write_ops(txn_id, &ops, commit_ts, true);
@@ -450,24 +449,32 @@ impl<S: PessimisticStorage + 'static, L: ClogService + 'static, T: TsoService> T
         drop(read_values);
 
         match clog_result {
-            Ok(fsync_future) => {
-                let lsn = fsync_future.await?; // YIELD HERE
+            Ok(fsync_future) => match fsync_future.await {
+                Ok(lsn) => {
+                    // Step 6: Finalize all pending nodes by setting commit_ts and
+                    // tracking the clog LSN on touched memtables.
+                    let keys: Vec<Key> = mutations.into_keys().collect();
+                    self.storage
+                        .finalize_pending_with_lsn(&keys, start_ts, commit_ts, lsn);
 
-                // Step 6: Finalize all pending nodes by setting their commit_ts.
-                // Keys moved from BTreeMap into Vec (zero data clone).
-                let keys: Vec<Key> = mutations.into_keys().collect();
-                self.storage.finalize_pending(&keys, start_ts, commit_ts);
-
-                // Step 7: Transition to Committed in state cache
-                self.concurrency_manager.commit_txn(start_ts, commit_ts)?;
-                self.concurrency_manager.remove_txn(start_ts);
-                ctx.state = TxnState::Committed { commit_ts };
-                Ok(CommitInfo {
-                    txn_id,
-                    commit_ts,
-                    lsn,
-                })
-            }
+                    // Step 7: Transition to Committed in state cache
+                    self.concurrency_manager.commit_txn(start_ts, commit_ts)?;
+                    self.concurrency_manager.remove_txn(start_ts);
+                    ctx.state = TxnState::Committed { commit_ts };
+                    Ok(CommitInfo {
+                        txn_id,
+                        commit_ts,
+                        lsn,
+                    })
+                }
+                Err(e) => {
+                    let keys: Vec<Key> = mutations.into_keys().collect();
+                    self.storage.abort_pending(&keys, start_ts);
+                    self.concurrency_manager.abort_txn(start_ts).ok();
+                    self.concurrency_manager.remove_txn(start_ts);
+                    Err(e)
+                }
+            },
             Err(e) => {
                 let keys: Vec<Key> = mutations.into_keys().collect();
                 self.storage.abort_pending(&keys, start_ts);
@@ -482,6 +489,13 @@ impl<S: PessimisticStorage + 'static, L: ClogService + 'static, T: TsoService> T
         Self::check_active(&ctx)?;
 
         let mutations = std::mem::take(&mut ctx.mutations);
+
+        // Keep rollback/abort aligned with commit fence semantics:
+        // flush/GC boundary computations wait for pending resolution updates.
+        let _rollback_fence = self
+            .commit_fence
+            .as_ref()
+            .map(|fence| crate::io::block_on_sync(fence.read()));
 
         // Abort all pending nodes in storage
         if !mutations.is_empty() {
@@ -792,7 +806,8 @@ pub struct RecoveryStats {
     pub applied_deletes: u64,
     /// Number of entries from uncommitted transactions (rolled back)
     pub rolled_back_entries: u64,
-    /// Number of ops that appeared after their txn's Commit record (possible corruption)
+    /// Reserved for future recovery-shape validation diagnostics.
+    /// Under per-transaction LSN, this is currently expected to stay 0.
     pub post_commit_ops: u64,
 }
 

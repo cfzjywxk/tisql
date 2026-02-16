@@ -49,6 +49,7 @@ use std::sync::Arc;
 
 use parking_lot::{RwLock, RwLockWriteGuard};
 use std::time::Duration;
+use tokio::sync::RwLock as AsyncRwLock;
 
 #[cfg(feature = "failpoints")]
 use fail::fail_point;
@@ -61,7 +62,7 @@ use crate::types::{Key, RawValue, Timestamp};
 
 use super::config::LsmConfig;
 use super::ilog::IlogService;
-use super::memtable::MemTable;
+use super::memtable::{FlushState, MemTable};
 use super::sstable::{
     AsyncSstBuilder, SstBuilderOptions, SstIterator, SstMeta, SstMvccIterator, SstReaderRef,
 };
@@ -93,9 +94,11 @@ impl PaddedAtomicU64 {
     }
 }
 
-/// Tracks in-flight LSNs across worker threads to prevent `safe_flushed_lsn`
-/// from advancing past a write that has allocated an LSN but not yet completed
-/// its memtable write.
+/// Tracks in-flight LSNs across worker threads.
+///
+/// Note: V2.5 safety boundaries rely on `flush_gate` + memtable state/LSN,
+/// not `min_in_flight()`. This tracker is retained as test instrumentation
+/// and for failpoint scenarios that explicitly exercise the TOCTOU window.
 ///
 /// # Design (OceanBase-style per-thread tracking)
 ///
@@ -307,11 +310,7 @@ pub struct LsmEngine {
     /// to a dropped table with drop_ts <= gc_safe_point are filtered out.
     dropped_table_ids: RwLock<HashMap<u64, Timestamp>>,
 
-    /// Per-thread tracker for in-flight LSNs (OceanBase-style).
-    ///
-    /// Prevents `safe_flushed_lsn` from advancing past an LSN that has been
-    /// allocated (via clog) but whose memtable write has not yet completed.
-    /// See `InFlightLsnTracker` for details.
+    /// Per-thread tracker for in-flight LSNs (test/failpoint instrumentation).
     in_flight_tracker: InFlightLsnTracker,
 
     /// Serializes all ilog mutations with version updates.
@@ -324,6 +323,9 @@ pub struct LsmEngine {
     /// - A background checkpoint could use a stale version — recovery's rposition
     ///   skips CompactCommit records that precede it in the file.
     manifest_lock: parking_lot::Mutex<()>,
+
+    /// Commit/flush coordination gate for correctness-critical boundaries.
+    flush_gate: Arc<AsyncRwLock<()>>,
 }
 
 impl LsmEngine {
@@ -381,7 +383,13 @@ impl LsmEngine {
             dropped_table_ids: RwLock::new(HashMap::new()),
             in_flight_tracker: InFlightLsnTracker::new_auto(),
             manifest_lock: parking_lot::Mutex::new(()),
+            flush_gate: Arc::new(AsyncRwLock::new(())),
         })
+    }
+
+    /// Shared flush gate used by commit and flush/GC paths.
+    pub fn flush_gate(&self) -> Arc<AsyncRwLock<()>> {
+        Arc::clone(&self.flush_gate)
     }
 
     /// Get the current configuration.
@@ -433,6 +441,35 @@ impl LsmEngine {
         state.active.approximate_size()
     }
 
+    fn next_flushable_frozen(&self) -> Option<Arc<MemTable>> {
+        let state = self.state.read();
+        state
+            .frozen
+            .iter()
+            .find(|m| {
+                matches!(
+                    m.flush_state(),
+                    FlushState::NeedsFlush | FlushState::FlushedDirty
+                )
+            })
+            .cloned()
+    }
+
+    fn cleanup_flushed_clean_frozen_locked(
+        &self,
+        state: &mut RwLockWriteGuard<'_, LsmState>,
+    ) -> bool {
+        let before = state.frozen.len();
+        state
+            .frozen
+            .retain(|m| !(m.flush_state() == FlushState::FlushedClean && m.pending_count() == 0));
+        state.frozen.len() != before
+    }
+
+    fn rollback_flushing_state(memtable: &MemTable) {
+        let _ = memtable.compare_exchange_flush_state(FlushState::Flushing, FlushState::NeedsFlush);
+    }
+
     /// Get the current version.
     pub fn current_version(&self) -> Arc<Version> {
         self.version_set.current()
@@ -458,14 +495,17 @@ impl LsmEngine {
     ///
     /// Due to a race window in `write_batch_inner()` between LSN allocation and
     /// memtable write, a lower-LSN write can land in a *newer* memtable than a
-    /// higher-LSN write. This means `flushed_lsn` (from a flushed frozen
-    /// memtable's `max_lsn`) could exceed the `min_lsn` of a still-in-memory
-    /// memtable. Using `flushed_lsn` alone for clog truncation would lose those
+    /// higher-LSN write. This means a flushed boundary computed from only the
+    /// flushed memtable can exceed the `min_lsn` of a still-in-memory memtable.
+    /// Using `flushed_lsn` alone for clog truncation would lose those
     /// lower-LSN entries on crash.
     pub fn min_unflushed_lsn(&self) -> Option<u64> {
         let state = self.state.read();
         let mut min_lsn = state.active.min_lsn();
         for frozen in &state.frozen {
+            if !frozen.has_unflushed_committed_data() {
+                continue;
+            }
             match (min_lsn, frozen.min_lsn()) {
                 (Some(cur), Some(f)) => min_lsn = Some(cur.min(f)),
                 (None, some) => min_lsn = some,
@@ -485,6 +525,9 @@ impl LsmEngine {
             if frozen.id() == exclude_id {
                 continue;
             }
+            if !frozen.has_unflushed_committed_data() {
+                continue;
+            }
             match (min_lsn, frozen.min_lsn()) {
                 (Some(cur), Some(f)) => min_lsn = Some(cur.min(f)),
                 (None, some) => min_lsn = some,
@@ -497,11 +540,9 @@ impl LsmEngine {
     /// Compute the safe clog truncation LSN for log GC.
     ///
     /// Returns the maximum LSN up to which clog entries can be safely deleted.
-    /// Three constraints:
+    /// Two constraints:
     /// 1. `flushed_lsn` — can't truncate beyond what's durably in SSTs
     /// 2. `min_unflushed_lsn - 1` — protects memtable data not yet flushed
-    /// 3. `min_in_flight - 1` — protects writes with allocated LSN but
-    ///    incomplete memtable write (TOCTOU race window)
     ///
     /// Returns 0 if there are unflushed memtable entries with the minimum
     /// possible LSN (1), meaning no truncation is safe.
@@ -509,9 +550,6 @@ impl LsmEngine {
         let mut safe = self.version_set.current().flushed_lsn();
         if let Some(min_mem_lsn) = self.min_unflushed_lsn() {
             safe = safe.min(min_mem_lsn.saturating_sub(1));
-        }
-        if let Some(min_inf) = self.in_flight_tracker.min_in_flight() {
-            safe = safe.min(min_inf.saturating_sub(1));
         }
         safe
     }
@@ -524,9 +562,6 @@ impl LsmEngine {
         let mut safe = flushed_lsn;
         if let Some(min_mem_lsn) = self.min_unflushed_lsn() {
             safe = safe.min(min_mem_lsn.saturating_sub(1));
-        }
-        if let Some(min_inf) = self.in_flight_tracker.min_in_flight() {
-            safe = safe.min(min_inf.saturating_sub(1));
         }
         safe
     }
@@ -658,12 +693,37 @@ impl LsmEngine {
             ));
         }
 
+        // Step 1: mark memtable as flushing under commit/flush gate.
+        {
+            let _gate = self.flush_gate.write().await;
+            match memtable.flush_state() {
+                FlushState::NeedsFlush | FlushState::FlushedDirty => {
+                    memtable.set_flush_state(FlushState::Flushing);
+                }
+                FlushState::Flushing => {
+                    return Err(TiSqlError::Storage(format!(
+                        "Memtable {} is already flushing",
+                        memtable.id()
+                    )));
+                }
+                FlushState::FlushedClean => {
+                    return Err(TiSqlError::Storage(format!(
+                        "Memtable {} is already flushed clean",
+                        memtable.id()
+                    )));
+                }
+            }
+        }
+
         // Allocate SST ID atomically to prevent races during concurrent flushes
         let sst_id = self.alloc_sst_id();
 
         // Phase 1: Write flush intent (if durable)
         if let Some(ref ilog) = self.ilog {
-            ilog.write_flush_intent(sst_id, memtable.id())?;
+            if let Err(e) = ilog.write_flush_intent(sst_id, memtable.id()) {
+                Self::rollback_flushing_state(memtable);
+                return Err(e);
+            }
         }
 
         // Phase 2: Build SST file
@@ -697,83 +757,70 @@ impl LsmEngine {
         }
 
         // Finish building (writes to disk with fsync)
-        let meta = builder.finish(sst_id, 0).await?; // Level 0
+        let meta = match builder.finish(sst_id, 0).await {
+            Ok(meta) => meta,
+            Err(e) => {
+                Self::rollback_flushing_state(memtable);
+                return Err(e);
+            }
+        }; // Level 0
 
         // Failpoint: crash after SST write, before ilog commit
         #[cfg(feature = "failpoints")]
         fail_point!("lsm_flush_after_sst_write");
 
-        // Compute safe flushed_lsn: the maximum LSN up to which ALL data is
-        // durably in SSTs. Three constraints prevent advancing too far:
-        //
-        // 1. memtable.max_lsn — can't claim we flushed beyond what's in this SST
-        // 2. min_remaining_lsn - 1 — protects stragglers in other memtables
-        // 3. min_in_flight - 1 — protects writes that allocated an LSN (via clog)
-        //    but haven't completed their memtable write yet (TOCTOU race in
-        //    write_batch_inner between LSN resolution and memtable insertion)
-        //
-        // safe_flushed_lsn = min(memtable.max_lsn, min_remaining - 1, min_in_flight - 1)
-        let max_memtable_lsn = memtable.max_lsn().unwrap_or(0);
-        let safe_flushed_lsn = {
-            let mut safe = max_memtable_lsn;
-            if let Some(min_rem) = self.min_lsn_excluding(memtable.id()) {
-                safe = safe.min(min_rem.saturating_sub(1));
-            }
-            if let Some(min_inf) = self.in_flight_tracker.min_in_flight() {
-                safe = safe.min(min_inf.saturating_sub(1));
-            }
-            safe
-        };
-
-        // Phase 3 + 4: Atomically write ilog commit, update version, and
-        // optionally write checkpoint — all under manifest_lock.
-        //
-        // The manifest_lock serializes (ilog commit + apply_delta + checkpoint)
-        // with concurrent compaction and log GC. This prevents:
-        // - Bug 2: GC capturing a stale version while our commit record exists
-        // - Bug 3: A concurrent compaction interleaving between our apply_delta
-        //   and our checkpoint, making the checkpoint stale for rposition recovery
+        // Phase 3 + 4: under flush gate, compute conservative flushed boundary
+        // and commit manifest mutation atomically.
         {
-            let _manifest = self.manifest_lock.lock();
+            let _gate = self.flush_gate.write().await;
+            let safe_flushed_lsn = self
+                .min_lsn_excluding(memtable.id())
+                .map(|m| m.saturating_sub(1))
+                .unwrap_or_else(|| self.version_set.current().flushed_lsn());
 
-            if let Some(ref ilog) = self.ilog {
-                ilog.write_flush_commit(meta.clone(), safe_flushed_lsn)?;
-            }
+            let commit_result: Result<()> = {
+                let _manifest = self.manifest_lock.lock();
 
-            // Failpoint: crash after ilog commit, before version update
-            #[cfg(feature = "failpoints")]
-            fail_point!("lsm_flush_after_ilog_commit");
-
-            let delta = ManifestDelta::flush(meta.clone(), safe_flushed_lsn);
-            self.version_set.apply_delta(&delta);
-
-            if let Some(ref ilog) = self.ilog {
-                if ilog.needs_checkpoint() {
-                    ilog.write_checkpoint(self.version_set.current().as_ref())?;
+                if let Some(ref ilog) = self.ilog {
+                    ilog.write_flush_commit(meta.clone(), safe_flushed_lsn)?;
                 }
+
+                // Failpoint: crash after ilog commit, before version update
+                #[cfg(feature = "failpoints")]
+                fail_point!("lsm_flush_after_ilog_commit");
+
+                let delta = ManifestDelta::flush(meta.clone(), safe_flushed_lsn);
+                self.version_set.apply_delta(&delta);
+
+                if let Some(ref ilog) = self.ilog {
+                    if ilog.needs_checkpoint() {
+                        ilog.write_checkpoint(self.version_set.current().as_ref())?;
+                    }
+                }
+                Ok(())
+            };
+
+            if let Err(e) = commit_result {
+                let _ = memtable
+                    .compare_exchange_flush_state(FlushState::Flushing, FlushState::NeedsFlush);
+                return Err(e);
             }
-        }
 
-        // Phase 5: Remove from frozen + install SV (separate state lock, after
-        // manifest_lock is released — no lock ordering issue).
-        //
-        // apply_delta is done before frozen removal. This is safe because readers
-        // may momentarily see the flushed memtable AND the new SST (redundant but
-        // correct — get_at short-circuits on memtable hit, merge iterator deduplicates).
-        // The dangerous direction (data in neither) cannot happen since version is
-        // updated before the memtable is removed from frozen.
-        //
-        // install_super_version reads version_set.current() inside the state lock,
-        // so SV readers always get a consistent (frozen, version) pair.
-        {
+            if memtable.pending_count() == 0 {
+                if memtable
+                    .compare_exchange_flush_state(FlushState::Flushing, FlushState::FlushedClean)
+                    .is_err()
+                {
+                    memtable.set_flush_state(FlushState::FlushedDirty);
+                }
+            } else {
+                memtable.set_flush_state(FlushState::FlushedDirty);
+            }
+
             let mut state = self.state.write();
-
-            // Remove flushed memtable from frozen list
-            state.frozen.retain(|m| m.id() != memtable.id());
-
-            // Install new SuperVersion while still holding lock
+            let _removed = self.cleanup_flushed_clean_frozen_locked(&mut state);
             self.install_super_version(&state);
-        };
+        }
 
         // Failpoint: crash after version update
         #[cfg(feature = "failpoints")]
@@ -915,11 +962,18 @@ impl LsmEngine {
         let mut results = Vec::new();
 
         loop {
-            // Get next frozen memtable to flush
-            let frozen = {
-                let state = self.state.read();
-                state.frozen.front().cloned() // Oldest first
-            };
+            // Opportunistically drop flushed+clean memtables that no longer
+            // need to be retained for pending tracking.
+            {
+                let mut state = self.state.write();
+                let removed = self.cleanup_flushed_clean_frozen_locked(&mut state);
+                if removed {
+                    self.install_super_version(&state);
+                }
+            }
+
+            // Get next frozen memtable that is eligible for flush/reflush.
+            let frozen = self.next_flushable_frozen();
 
             match frozen {
                 Some(memtable) => {
@@ -2736,14 +2790,47 @@ impl PessimisticStorage for LsmEngine {
     }
 
     fn finalize_pending(&self, keys: &[Key], owner_start_ts: Timestamp, commit_ts: Timestamp) {
-        // Finalize in active memtable
+        self.finalize_pending_with_lsn(keys, owner_start_ts, commit_ts, 0);
+    }
+
+    fn finalize_pending_with_lsn(
+        &self,
+        keys: &[Key],
+        owner_start_ts: Timestamp,
+        commit_ts: Timestamp,
+        clog_lsn: u64,
+    ) {
         let state = self.state.read();
-        state
+
+        let active_stats = state
             .active
             .finalize_pending(keys, owner_start_ts, commit_ts);
-        // Also finalize in frozen memtables in case writes happened before rotation
+        if active_stats.committed > 0 {
+            if clog_lsn > 0 {
+                state.active.track_lsn(clog_lsn);
+            }
+            if matches!(
+                state.active.flush_state(),
+                FlushState::Flushing | FlushState::FlushedClean
+            ) {
+                state.active.set_flush_state(FlushState::FlushedDirty);
+            }
+        }
+
+        // Also finalize in frozen memtables in case writes happened before rotation.
         for frozen in &state.frozen {
-            frozen.finalize_pending(keys, owner_start_ts, commit_ts);
+            let stats = frozen.finalize_pending(keys, owner_start_ts, commit_ts);
+            if stats.committed > 0 {
+                if clog_lsn > 0 {
+                    frozen.track_lsn(clog_lsn);
+                }
+                if matches!(
+                    frozen.flush_state(),
+                    FlushState::Flushing | FlushState::FlushedClean
+                ) {
+                    frozen.set_flush_state(FlushState::FlushedDirty);
+                }
+            }
         }
     }
 
@@ -2921,6 +3008,7 @@ mod tests {
                 dropped_table_ids: RwLock::new(HashMap::new()),
                 in_flight_tracker: InFlightLsnTracker::new_auto(),
                 manifest_lock: parking_lot::Mutex::new(()),
+                flush_gate: Arc::new(AsyncRwLock::new(())),
             })
         }
     }
@@ -3649,7 +3737,7 @@ mod tests {
         // Check that the memtable has the correct LSN
         let state = engine.state.read();
         assert_eq!(
-            state.active.max_lsn(),
+            state.active.min_lsn(),
             Some(42),
             "Memtable should have CLOG LSN"
         );
@@ -3705,7 +3793,7 @@ mod tests {
 
     #[test]
     fn test_clog_lsn_preserved_through_flush() {
-        // Critical: Verify that flushed_lsn matches CLOG LSN for correct recovery
+        // Critical: verify conservative flush boundary never advances unsafely.
         let tmp = TempDir::new().unwrap();
         let config = LsmConfig::builder(tmp.path())
             .memtable_size(100)
@@ -3738,18 +3826,19 @@ mod tests {
         // Verify memtable has the CLOG LSN
         {
             let state = engine.state.read();
-            assert_eq!(state.active.max_lsn(), Some(clog_lsn));
+            assert_eq!(state.active.min_lsn(), Some(clog_lsn));
         }
 
         // Flush to SST
         engine.flush_all_with_active().unwrap();
 
-        // Verify version.flushed_lsn matches the CLOG LSN
+        // Conservative fallback keeps flushed_lsn unchanged when this is the
+        // only memtable with committed data.
         let version = engine.current_version();
         assert_eq!(
             version.flushed_lsn(),
-            clog_lsn,
-            "flushed_lsn should match CLOG LSN for correct recovery"
+            0,
+            "single-memtable flush keeps flushed_lsn conservative"
         );
     }
 
@@ -8006,7 +8095,7 @@ mod tests {
         engine.flush_all_with_active().unwrap();
 
         let flushed_lsn = engine.current_version().flushed_lsn();
-        assert!(flushed_lsn >= 10);
+        assert_eq!(flushed_lsn, 0);
 
         // No in-memory data left — safe_lsn == flushed_lsn.
         assert_eq!(engine.min_unflushed_lsn(), None);
@@ -8089,12 +8178,13 @@ mod tests {
         assert_eq!(engine.safe_log_gc_lsn(), 0);
     }
 
-    /// Verify flushed_lsn advances correctly through a multi-step flush sequence.
+    /// Verify flushed_lsn stays conservative when `min_lsn_excluding` is absent
+    /// and still honors straggler clamps.
     ///
     /// Scenario:
-    ///   1. Flush with no straggler → flushed_lsn = max_memtable_lsn (unclamped)
+    ///   1. Flush with no straggler → conservative fallback (no advance)
     ///   2. Straggler arrives → next flush clamps flushed_lsn
-    ///   3. Straggler is flushed → flushed_lsn advances past the clamp
+    ///   3. Straggler is flushed with no remaining memtable bound → stays conservative
     #[tokio::test]
     async fn test_flushed_lsn_forwarded_correctly_across_flushes() {
         let dir = TempDir::new().unwrap();
@@ -8107,7 +8197,7 @@ mod tests {
 
         assert_eq!(engine.current_version().flushed_lsn(), 0);
 
-        // --- Phase 1: No straggler. flushed_lsn advances to max_memtable_lsn. ---
+        // --- Phase 1: No straggler. conservative fallback keeps flushed_lsn unchanged. ---
 
         // Write LSN=10 to active, rotate to frozen.
         let mut batch = new_batch(1);
@@ -8116,17 +8206,17 @@ mod tests {
         engine.write_batch(batch).unwrap();
         engine.freeze_active();
 
-        // Flush frozen (max_lsn=10). No remaining memtables have data, so
-        // min_lsn_excluding = None → safe_flushed_lsn = 10 (unclamped).
+        // Flush frozen. No remaining memtables have data, so
+        // min_lsn_excluding = None → conservative fallback keeps flushed_lsn=0.
         let frozen = {
             let state = engine.state.read();
             state.frozen.front().cloned().unwrap()
         };
         engine.flush_memtable_async(&frozen).await.unwrap();
 
-        assert_eq!(engine.current_version().flushed_lsn(), 10);
+        assert_eq!(engine.current_version().flushed_lsn(), 0);
         assert_eq!(engine.min_unflushed_lsn(), None);
-        assert_eq!(engine.safe_log_gc_lsn(), 10);
+        assert_eq!(engine.safe_log_gc_lsn(), 0);
 
         // --- Phase 2: Straggler clamps flushed_lsn. ---
 
@@ -8143,9 +8233,8 @@ mod tests {
         batch.set_clog_lsn(15);
         engine.write_batch(batch).unwrap();
 
-        // Flush frozen (max_lsn=30). min_lsn_excluding = active(15) → 15.
-        // safe_flushed_lsn = min(30, 15-1) = 14.
-        // flushed_lsn = max(10, 14) = 14.
+        // Flush frozen. min_lsn_excluding = active(15) → 15.
+        // safe_flushed_lsn = 14.
         let frozen = {
             let state = engine.state.read();
             state.frozen.front().cloned().unwrap()
@@ -8171,9 +8260,8 @@ mod tests {
         // Freeze the active (straggler=15, k3=50 are in the same memtable).
         engine.freeze_active();
 
-        // Flush frozen (max_lsn=50). No remaining data (empty active), so
-        // min_lsn_excluding = None → safe_flushed_lsn = 50 (unclamped).
-        // flushed_lsn = max(14, 50) = 50.
+        // Flush frozen. No remaining data (empty active), so
+        // min_lsn_excluding = None → conservative fallback keeps flushed_lsn=14.
         let frozen = {
             let state = engine.state.read();
             state.frozen.front().cloned().unwrap()
@@ -8182,11 +8270,11 @@ mod tests {
 
         assert_eq!(
             engine.current_version().flushed_lsn(),
-            50,
-            "flushed_lsn advances after straggler is flushed"
+            14,
+            "without a remaining-bound, flushed_lsn stays conservative"
         );
         assert_eq!(engine.min_unflushed_lsn(), None);
-        assert_eq!(engine.safe_log_gc_lsn(), 50);
+        assert_eq!(engine.safe_log_gc_lsn(), 14);
 
         // Verify data integrity: all keys readable from SSTs.
         assert_eq!(engine.get(b"k1").await.unwrap(), Some(b"v1".to_vec()));
@@ -8265,12 +8353,12 @@ mod tests {
         };
         engine.flush_memtable_async(&frozen2).await.unwrap();
 
-        // min_lsn_excluding = None (empty active).
-        // safe_flushed_lsn = 5. flushed_lsn = max(4, 5) = 5.
+        // min_lsn_excluding = None (empty active), so conservative fallback
+        // keeps the prior flushed_lsn.
         assert_eq!(
             engine.current_version().flushed_lsn(),
-            5,
-            "flushed_lsn advances after straggler flushed"
+            4,
+            "flushed_lsn remains conservative when no remaining bound exists"
         );
     }
 
@@ -8436,7 +8524,10 @@ mod tests {
         // Verify new_auto creates a tracker with a reasonable slot count.
         let tracker = InFlightLsnTracker::new_auto();
         let slot_count = tracker.slots.len();
-        assert!(slot_count >= 128, "should be at least 128, got {slot_count}");
+        assert!(
+            slot_count >= 128,
+            "should be at least 128, got {slot_count}"
+        );
         assert!(
             slot_count.is_power_of_two(),
             "should be power of two, got {slot_count}"
@@ -8446,8 +8537,8 @@ mod tests {
 
     #[tokio::test]
     async fn test_safe_flushed_lsn_accounts_for_in_flight() {
-        // Simulates the TOCTOU race: an in-flight LSN should hold back
-        // safe_flushed_lsn even when no memtable contains that LSN yet.
+        // In V2.5, safe boundaries are derived from flush_gate coordination and
+        // memtable bounds, not from in-flight tracker slots.
         let dir = TempDir::new().unwrap();
         let config = LsmConfig::builder(dir.path())
             .memtable_size(4096)
@@ -8464,32 +8555,25 @@ mod tests {
             engine.write_batch(wb).unwrap();
         }
 
-        // Freeze and flush — should set flushed_lsn=5 normally.
+        // Freeze and flush.
         engine.freeze_active();
         let frozen = {
             let state = engine.state.read();
             state.frozen.front().cloned().unwrap()
         };
 
-        // Simulate an in-flight write at LSN=3 by manually registering
-        // (as if a concurrent thread allocated LSN=3 but hasn't written yet).
+        // Simulate an in-flight write marker; flush boundary should be unchanged.
         let _inflight_guard = engine.in_flight_tracker.register(3);
 
         engine.flush_memtable_async(&frozen).await.unwrap();
 
-        // safe_flushed_lsn should be capped at min(5, 3-1) = 2.
-        assert_eq!(
-            engine.current_version().flushed_lsn(),
-            2,
-            "flushed_lsn must be held back by in-flight LSN"
-        );
+        assert_eq!(engine.current_version().flushed_lsn(), 0);
 
         // Drop the guard — simulates the memtable write completing.
         drop(_inflight_guard);
 
-        // safe_log_gc_lsn should also reflect the cleared in-flight.
-        // No more in-flight, no memtable data → safe = flushed_lsn = 2.
-        assert_eq!(engine.safe_log_gc_lsn(), 2);
+        // No more in-flight, no memtable data -> safe == flushed_lsn.
+        assert_eq!(engine.safe_log_gc_lsn(), 0);
     }
 
     #[tokio::test]
@@ -8515,30 +8599,20 @@ mod tests {
             state.frozen.front().cloned().unwrap()
         };
         engine.flush_memtable_async(&frozen).await.unwrap();
-        // flushed_lsn = 3, no memtable data.
-        assert_eq!(engine.safe_log_gc_lsn(), 3);
+        // Conservative fallback keeps flushed_lsn at 0 in this setup.
+        assert_eq!(engine.safe_log_gc_lsn(), 0);
 
-        // Now simulate an in-flight at LSN=2 (e.g., a late-arriving write).
+        // Simulate an in-flight slot; safe_lsn remains unchanged.
         let _guard = engine.in_flight_tracker.register(2);
-        // safe_log_gc_lsn must be capped at min(3, 2-1) = 1.
-        assert_eq!(
-            engine.safe_log_gc_lsn(),
-            1,
-            "safe_log_gc_lsn held back by in-flight"
-        );
+        assert_eq!(engine.safe_log_gc_lsn(), 0);
 
         drop(_guard);
-        assert_eq!(
-            engine.safe_log_gc_lsn(),
-            3,
-            "restored after in-flight clears"
-        );
+        assert_eq!(engine.safe_log_gc_lsn(), 0);
     }
 
     #[tokio::test]
     async fn test_in_flight_with_multiple_flushes() {
-        // Verify that in-flight tracking works correctly across multiple
-        // flush cycles — the tracker doesn't accumulate stale entries.
+        // Verify conservative flushed_lsn behavior across multiple flush cycles.
         let dir = TempDir::new().unwrap();
         let config = LsmConfig::builder(dir.path())
             .memtable_size(4096) // Large enough to hold all keys per cycle
@@ -8561,7 +8635,7 @@ mod tests {
             state.frozen.front().cloned().unwrap()
         };
         engine.flush_memtable_async(&f1).await.unwrap();
-        assert_eq!(engine.current_version().flushed_lsn(), 3);
+        assert_eq!(engine.current_version().flushed_lsn(), 0);
 
         // Cycle 2: write LSN 4..6, hold in-flight at LSN=5 during flush.
         for i in 4..=6u64 {
@@ -8580,9 +8654,7 @@ mod tests {
         // Hold in-flight at LSN=5 during second flush.
         let _guard = engine.in_flight_tracker.register(5);
         engine.flush_memtable_async(&f2).await.unwrap();
-        // safe = min(max_lsn=6, in_flight=5-1=4) = 4
-        // flushed_lsn = max(prev=3, safe=4) = 4
-        assert_eq!(engine.current_version().flushed_lsn(), 4);
+        assert_eq!(engine.current_version().flushed_lsn(), 0);
 
         drop(_guard);
 
@@ -8600,8 +8672,7 @@ mod tests {
             state.frozen.front().cloned().unwrap()
         };
         engine.flush_memtable_async(&f3).await.unwrap();
-        // No in-flight, no remaining memtables → flushed_lsn = 9.
-        assert_eq!(engine.current_version().flushed_lsn(), 9);
+        assert_eq!(engine.current_version().flushed_lsn(), 0);
     }
 
     /// Failpoint test: verify safe_flushed_lsn accounts for in-flight LSNs

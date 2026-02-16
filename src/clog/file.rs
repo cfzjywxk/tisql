@@ -543,23 +543,21 @@ impl FileClogService {
         ops: &[ClogOpRef<'_>],
         commit_ts: Timestamp,
     ) -> Result<PreparedBatch> {
-        let start_lsn = self.lsn_provider.alloc_lsn();
-        let mut current_lsn = start_lsn;
+        let txn_lsn = self.lsn_provider.alloc_lsn();
 
         let entry_count = ops.len() + 1; // +1 for commit record
         let mut entries: Vec<super::ClogEntryRef<'_>> = Vec::with_capacity(entry_count);
 
         for op in ops {
             entries.push(super::ClogEntryRef {
-                lsn: current_lsn,
+                lsn: txn_lsn,
                 txn_id,
                 op: *op,
             });
-            current_lsn = self.lsn_provider.alloc_lsn();
         }
 
         // Add commit record
-        let end_lsn = current_lsn;
+        let end_lsn = txn_lsn;
         entries.push(super::ClogEntryRef {
             lsn: end_lsn,
             txn_id,
@@ -584,16 +582,21 @@ impl ClogService for FileClogService {
             return Ok(ClogFsyncFuture::new(self.lsn_provider.current_lsn(), rx));
         }
 
-        // Assign LSNs atomically (LsnProvider is atomic, no lock needed for ordering)
-        let mut start_lsn = 0;
-        for (i, entry) in batch.entries.iter_mut().enumerate() {
-            let lsn = self.lsn_provider.alloc_lsn();
-            if i == 0 {
-                start_lsn = lsn;
-            }
-            entry.lsn = lsn;
+        // V2.5 contract: write(ClogBatch) is single-transaction only.
+        // Mixed-txn batches are rejected to keep per-txn LSN semantics strict.
+        let first_txn = batch.entries[0].txn_id;
+        if batch.entries.iter().any(|entry| entry.txn_id != first_txn) {
+            return Err(TiSqlError::Internal(
+                "ClogBatch::write requires a single txn_id; split mixed batches by transaction"
+                    .to_string(),
+            ));
         }
-        let end_lsn = batch.entries.last().unwrap().lsn;
+
+        // Per-transaction LSN assignment: all entries in this batch share one LSN.
+        let txn_lsn = self.lsn_provider.alloc_lsn();
+        for entry in &mut batch.entries {
+            entry.lsn = txn_lsn;
+        }
 
         // Serialize to bytes
         let record_bytes = Self::serialize_record(batch.entries())?;
@@ -616,11 +619,11 @@ impl ClogService for FileClogService {
         log_trace!(
             "Wrote {} entries to commit log, lsn={}-{}",
             batch.len(),
-            start_lsn,
-            end_lsn
+            txn_lsn,
+            txn_lsn
         );
 
-        Ok(ClogFsyncFuture::new(end_lsn, rx))
+        Ok(ClogFsyncFuture::new(txn_lsn, rx))
     }
 
     fn write_ops(
@@ -894,18 +897,18 @@ mod tests {
         batch.add_put(1, b"key2".to_vec(), b"value2".to_vec());
 
         let lsn = service.write(&mut batch, true).unwrap().await.unwrap();
-        assert_eq!(lsn, 2);
+        assert_eq!(lsn, 1);
 
         service.close().await.unwrap();
 
         // Reopen and verify
         let service2 = FileClogService::open(config, &tokio::runtime::Handle::current()).unwrap();
-        assert_eq!(service2.current_lsn(), 3);
+        assert_eq!(service2.current_lsn(), 2);
 
         let entries = service2.read_all().unwrap();
         assert_eq!(entries.len(), 2);
         assert_eq!(entries[0].lsn, 1);
-        assert_eq!(entries[1].lsn, 2);
+        assert_eq!(entries[1].lsn, 1);
     }
 
     #[tokio::test]
@@ -952,7 +955,7 @@ mod tests {
             _ => panic!("Expected Commit"),
         }
 
-        assert_eq!(service.current_lsn(), 4);
+        assert_eq!(service.current_lsn(), 2);
     }
 
     #[test]
@@ -1006,7 +1009,7 @@ mod tests {
         );
         assert_eq!(
             service.current_lsn(),
-            3,
+            2,
             "LSN should continue from valid entries"
         );
     }
@@ -1050,7 +1053,7 @@ mod tests {
             FileClogService::recover(config, &tokio::runtime::Handle::current()).unwrap();
 
         assert_eq!(entries.len(), 2, "Should recover entries before truncation");
-        assert_eq!(service.current_lsn(), 3);
+        assert_eq!(service.current_lsn(), 2);
     }
 
     /// Test recovery with corrupted checksum.
@@ -1119,7 +1122,7 @@ mod tests {
 
         // Should only recover the first batch (2 entries)
         assert_eq!(entries.len(), 2, "Should stop at corrupted record");
-        assert_eq!(service.current_lsn(), 3);
+        assert_eq!(service.current_lsn(), 2);
 
         // Verify we got the first batch
         match &entries[0].op {
@@ -1169,7 +1172,7 @@ mod tests {
             FileClogService::recover(config, &tokio::runtime::Handle::current()).unwrap();
 
         assert_eq!(entries.len(), 10, "Should recover all valid entries");
-        assert_eq!(service.current_lsn(), 11);
+        assert_eq!(service.current_lsn(), 6);
 
         // Verify all 5 puts are there
         let puts: Vec<_> = entries
@@ -1723,7 +1726,7 @@ mod tests {
             batch.add_put(1, b"k2".to_vec(), b"v2".to_vec());
             batch.add_put(1, b"k3".to_vec(), b"v3".to_vec());
             service.write(&mut batch, true).unwrap().await.unwrap();
-            // LSNs 1, 2, 3 are used
+            // All entries share txn LSN=1.
             service.close().await.unwrap();
         }
 
@@ -1731,7 +1734,7 @@ mod tests {
         let provider = new_lsn_provider();
         assert_eq!(provider.current_lsn(), 1);
 
-        // Recover with shared provider - it should be updated to 4
+        // Recover with shared provider - it should be updated to 2.
         let (recovered, entries) = FileClogService::recover_with_lsn_provider(
             config,
             provider.clone(),
@@ -1739,8 +1742,8 @@ mod tests {
         )
         .unwrap();
         assert_eq!(entries.len(), 3);
-        assert_eq!(provider.current_lsn(), 4); // max(3) + 1
-        assert_eq!(recovered.current_lsn(), 4);
+        assert_eq!(provider.current_lsn(), 2);
+        assert_eq!(recovered.current_lsn(), 2);
     }
 
     /// Test read_from_lsn for partial replay during recovery.
@@ -1799,7 +1802,7 @@ mod tests {
         batch.add_put(1, b"k2".to_vec(), b"v2".to_vec());
         service.write(&mut batch, true).unwrap().await.unwrap();
 
-        assert_eq!(service.max_lsn().unwrap(), 2);
+        assert_eq!(service.max_lsn().unwrap(), 1);
 
         service.close().await.unwrap();
     }
@@ -1836,6 +1839,28 @@ mod tests {
         let entries = service.read_all().unwrap();
         assert!(entries.is_empty());
 
+        service.close().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn test_write_rejects_mixed_txn_batch() {
+        let dir = tempdir().unwrap();
+        let config = FileClogConfig::with_dir(dir.path());
+        let service =
+            FileClogService::open(config.clone(), &tokio::runtime::Handle::current()).unwrap();
+
+        let mut batch = ClogBatch::new();
+        batch.add_put(1, b"k1".to_vec(), b"v1".to_vec());
+        batch.add_put(2, b"k2".to_vec(), b"v2".to_vec());
+
+        let err = match service.write(&mut batch, true) {
+            Ok(_) => panic!("mixed-txn ClogBatch should be rejected"),
+            Err(e) => e.to_string(),
+        };
+        assert!(err.contains("single txn_id"));
+
+        // Verify that no entries were written.
+        assert!(service.read_all().unwrap().is_empty());
         service.close().await.unwrap();
     }
 
@@ -2052,13 +2077,17 @@ mod tests {
         let service =
             FileClogService::open(config.clone(), &tokio::runtime::Handle::current()).unwrap();
 
-        // Write entries with LSN 1-3, each in a different transaction so
-        // per-transaction truncation can remove them individually.
-        let mut batch = ClogBatch::new();
-        batch.add_put(1, b"k1".to_vec(), b"v1".to_vec());
-        batch.add_put(2, b"k2".to_vec(), b"v2".to_vec());
-        batch.add_put(3, b"k3".to_vec(), b"v3".to_vec());
-        service.write(&mut batch, true).unwrap().await.unwrap();
+        // Write entries as separate transactions (mixed txn_id in one batch is
+        // rejected by write()).
+        for (txn_id, key, value) in [
+            (1, b"k1".as_slice(), b"v1".as_slice()),
+            (2, b"k2".as_slice(), b"v2".as_slice()),
+            (3, b"k3".as_slice(), b"v3".as_slice()),
+        ] {
+            let mut batch = ClogBatch::new();
+            batch.add_put(txn_id, key.to_vec(), value.to_vec());
+            service.write(&mut batch, true).unwrap().await.unwrap();
+        }
 
         // Truncate LSN 1-2 — txn 1 (max_lsn=1) and txn 2 (max_lsn=2) removed,
         // txn 3 (max_lsn=3 > 2) kept.
@@ -2084,8 +2113,7 @@ mod tests {
     // ========================================================================
 
     /// Verify truncate_to respects transaction boundaries: when safe_lsn falls
-    /// between a transaction's Put LSNs and its Commit LSN, the entire transaction
-    /// is kept (not split). This prevents orphaned Commit records on recovery.
+    /// below a transaction LSN, the entire transaction is kept (not split).
     #[tokio::test]
     async fn test_truncate_preserves_transaction_atomicity() {
         let dir = tempdir().unwrap();
@@ -2093,8 +2121,7 @@ mod tests {
         let service =
             FileClogService::open(config.clone(), &tokio::runtime::Handle::current()).unwrap();
 
-        // Write a multi-entry transaction: Put(lsn=1), Put(lsn=2), Commit(lsn=3)
-        // using write_ops which allocates individual LSNs per entry.
+        // Write a multi-entry transaction: all entries share one txn LSN.
         let ops = [
             ClogOpRef::Put {
                 key: b"k1",
@@ -2110,20 +2137,18 @@ mod tests {
             .unwrap()
             .await
             .unwrap();
-        assert_eq!(commit_lsn, 3); // Put(1), Put(2), Commit(3)
+        assert_eq!(commit_lsn, 1);
 
         // Verify 3 entries written
         let entries = service.read_all().unwrap();
         assert_eq!(entries.len(), 3);
-        assert_eq!(entries[0].lsn, 1); // Put k1
-        assert_eq!(entries[1].lsn, 2); // Put k2
-        assert_eq!(entries[2].lsn, 3); // Commit
+        assert_eq!(entries[0].lsn, 1);
+        assert_eq!(entries[1].lsn, 1);
+        assert_eq!(entries[2].lsn, 1);
 
-        // Truncate with safe_lsn=2: falls between Put LSNs and Commit LSN.
-        // The old per-entry partition would remove Put(1) and Put(2), keeping
-        // only Commit(3) — an orphaned commit that causes data loss on recovery.
-        // The fix keeps the entire transaction.
-        let stats = service.truncate_to(2).unwrap();
+        // Truncate with safe_lsn=0: transaction is above boundary, so it must
+        // be kept atomically.
+        let stats = service.truncate_to(0).unwrap();
         assert_eq!(stats.entries_removed, 0, "entire txn should be kept");
         assert_eq!(stats.entries_kept, 3);
 
@@ -2131,7 +2156,7 @@ mod tests {
         let remaining = service.read_all().unwrap();
         assert_eq!(remaining.len(), 3);
         assert_eq!(remaining[0].lsn, 1);
-        assert_eq!(remaining[2].lsn, 3);
+        assert_eq!(remaining[2].lsn, 1);
 
         service.close().await.unwrap();
     }
@@ -2145,7 +2170,7 @@ mod tests {
         let service =
             FileClogService::open(config.clone(), &tokio::runtime::Handle::current()).unwrap();
 
-        // Transaction 1: Put(lsn=1), Commit(lsn=2) — fully below safe_lsn=5
+        // Transaction 1: Put + Commit at lsn=1.
         let ops1 = [ClogOpRef::Put {
             key: b"k1",
             value: b"v1",
@@ -2156,8 +2181,7 @@ mod tests {
             .await
             .unwrap();
 
-        // Transaction 2: Put(lsn=3), Put(lsn=4), Put(lsn=5), Commit(lsn=6)
-        // Commit LSN (6) > safe_lsn (5), but Put LSNs (3,4,5) straddle boundary.
+        // Transaction 2: all entries at lsn=2.
         let ops2 = [
             ClogOpRef::Put {
                 key: b"k2",
@@ -2177,21 +2201,21 @@ mod tests {
             .unwrap()
             .await
             .unwrap();
-        assert_eq!(commit_lsn, 6);
+        assert_eq!(commit_lsn, 2);
 
-        // Truncate at safe_lsn=5: T1 (max_lsn=2 <= 5) removed, T2 (max_lsn=6 > 5) kept
-        let stats = service.truncate_to(5).unwrap();
+        // Truncate at safe_lsn=1: T1 removed, T2 kept.
+        let stats = service.truncate_to(1).unwrap();
         assert_eq!(stats.entries_removed, 2); // T1's Put + Commit
         assert_eq!(stats.entries_kept, 4); // T2's 3 Puts + Commit
 
         // Verify T2 is intact (all 4 entries)
         let remaining = service.read_all().unwrap();
         assert_eq!(remaining.len(), 4);
-        assert_eq!(remaining[0].lsn, 3); // T2 Put k2
-        assert_eq!(remaining[1].lsn, 4); // T2 Put k3
-        assert_eq!(remaining[2].lsn, 5); // T2 Put k4
-        assert_eq!(remaining[3].lsn, 6); // T2 Commit
-                                         // All entries belong to txn 2
+        assert_eq!(remaining[0].lsn, 2);
+        assert_eq!(remaining[1].lsn, 2);
+        assert_eq!(remaining[2].lsn, 2);
+        assert_eq!(remaining[3].lsn, 2);
+        // All entries belong to txn 2
         assert!(remaining.iter().all(|e| e.txn_id == 2));
 
         service.close().await.unwrap();
@@ -2205,7 +2229,7 @@ mod tests {
         let service =
             FileClogService::open(config.clone(), &tokio::runtime::Handle::current()).unwrap();
 
-        // Transaction: Put(lsn=1), Put(lsn=2), Commit(lsn=3)
+        // Transaction: all entries share one LSN.
         let ops = [
             ClogOpRef::Put {
                 key: b"k1",
@@ -2222,8 +2246,8 @@ mod tests {
             .await
             .unwrap();
 
-        // Truncate at safe_lsn=3 (equals Commit LSN) → entire txn removed
-        let stats = service.truncate_to(3).unwrap();
+        // Truncate at safe_lsn=1 (equals txn LSN) → entire txn removed.
+        let stats = service.truncate_to(1).unwrap();
         assert_eq!(stats.entries_removed, 3);
         assert_eq!(stats.entries_kept, 0);
         assert!(service.read_all().unwrap().is_empty());
@@ -2239,8 +2263,8 @@ mod tests {
         let service =
             FileClogService::open(config.clone(), &tokio::runtime::Handle::current()).unwrap();
 
-        // Write 10 transactions, each with 2 Puts + 1 Commit (3 entries each)
-        // LSN ranges: T1=[1,3], T2=[4,6], ..., T10=[28,30]
+        // Write 10 transactions, each with 2 Puts + 1 Commit (3 entries each).
+        // Per-txn LSNs are T1=1, T2=2, ..., T10=10.
         for txn_id in 1..=10u64 {
             let ops = [
                 ClogOpRef::Put {
@@ -2262,9 +2286,8 @@ mod tests {
         // Verify 30 entries total
         assert_eq!(service.read_all().unwrap().len(), 30);
 
-        // Truncate at safe_lsn=14: T1[1-3], T2[4-6], T3[7-9], T4[10-12] fully below.
-        // T5[13-15]: max_lsn=15 > 14, so T5 is KEPT (even though Put lsn=13,14 <= 14).
-        let stats = service.truncate_to(14).unwrap();
+        // Truncate at safe_lsn=4: T1..T4 removed, T5..T10 kept.
+        let stats = service.truncate_to(4).unwrap();
         assert_eq!(stats.entries_removed, 12); // T1-T4 (4 txns × 3 entries)
         assert_eq!(stats.entries_kept, 18); // T5-T10 (6 txns × 3 entries)
 
@@ -2693,7 +2716,7 @@ mod tests {
         batch.add_commit(1, 1000);
 
         let lsn = service.write(&mut batch, true).unwrap().await.unwrap();
-        assert_eq!(lsn, 5);
+        assert_eq!(lsn, 1);
 
         service.close().await.unwrap();
 
@@ -2949,11 +2972,11 @@ mod tests {
         let (service2, entries) =
             FileClogService::recover(config.clone(), &tokio::runtime::Handle::current()).unwrap();
         assert_eq!(entries.len(), 40); // 20 puts + 20 commits
-        assert_eq!(service2.current_lsn(), 41);
+        assert_eq!(service2.current_lsn(), 21);
 
         // Verify first and last entries
         assert_eq!(entries[0].lsn, 1);
-        assert_eq!(entries[39].lsn, 40);
+        assert_eq!(entries[39].lsn, 20);
     }
 
     // ========================================================================

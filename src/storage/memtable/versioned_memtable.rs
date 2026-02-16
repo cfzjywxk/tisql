@@ -194,6 +194,38 @@ struct MvccRow {
     version_count: AtomicU32,
 }
 
+/// Result of resolving pending nodes for one transaction.
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+pub struct PendingResolveStats {
+    /// Number of pending nodes resolved (committed or aborted).
+    pub resolved: usize,
+    /// Number of pending nodes converted to committed versions.
+    pub committed: usize,
+}
+
+/// Outcome of deleting under pessimistic locking.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DeletePendingOutcome {
+    /// No new pending node was created (key absent or already deleted).
+    Noop,
+    /// Existing pending node (owned by same txn) was updated in-place.
+    ExistingPendingUpdated,
+    /// A new pending TOMBSTONE node was created.
+    PendingCreated,
+}
+
+impl DeletePendingOutcome {
+    #[inline]
+    pub fn performed(self) -> bool {
+        !matches!(self, DeletePendingOutcome::Noop)
+    }
+
+    #[inline]
+    pub fn pending_created(self) -> bool {
+        matches!(self, DeletePendingOutcome::PendingCreated)
+    }
+}
+
 impl MvccRow {
     /// Create a new empty row (no versions).
     ///
@@ -490,13 +522,16 @@ impl MvccRow {
     /// - `Ok(true)` if delete was performed (LOCK or TOMBSTONE written)
     /// - `Ok(false)` if key doesn't exist or already deleted
     /// - `Err(lock_owner)` if key is locked by another transaction
-    fn delete_pending(&self, owner_start_ts: Timestamp) -> std::result::Result<bool, Timestamp> {
+    fn delete_pending(
+        &self,
+        owner_start_ts: Timestamp,
+    ) -> std::result::Result<DeletePendingOutcome, Timestamp> {
         loop {
             let current_head = self.head.load(Ordering::Acquire);
 
             if current_head.is_null() {
                 // Key doesn't exist at all - do nothing
-                return Ok(false);
+                return Ok(DeletePendingOutcome::Noop);
             }
 
             let head_node = unsafe { &*current_head };
@@ -515,7 +550,7 @@ impl MvccRow {
 
                 if current.is_null() {
                     // All nodes aborted - treat as empty
-                    return Ok(false);
+                    return Ok(DeletePendingOutcome::Noop);
                 }
 
                 let actual_node = unsafe { &*current };
@@ -539,7 +574,7 @@ impl MvccRow {
                     ) {
                         Ok(_) => {
                             self.version_count.fetch_add(1, Ordering::Relaxed);
-                            return Ok(true);
+                            return Ok(DeletePendingOutcome::PendingCreated);
                         }
                         Err(_) => {
                             let _ = unsafe { Box::from_raw(new_ptr) };
@@ -547,7 +582,7 @@ impl MvccRow {
                         }
                     }
                 }
-                return Ok(false); // Already deleted
+                return Ok(DeletePendingOutcome::Noop); // Already deleted
             }
 
             let node_owner = head_node.get_owner();
@@ -561,7 +596,7 @@ impl MvccRow {
                 unsafe {
                     std::ptr::swap(value_ptr, &mut lock_value);
                 }
-                return Ok(true);
+                return Ok(DeletePendingOutcome::ExistingPendingUpdated);
             }
 
             if node_owner > 0 {
@@ -584,7 +619,7 @@ impl MvccRow {
                 ) {
                     Ok(_) => {
                         self.version_count.fetch_add(1, Ordering::Relaxed);
-                        return Ok(true);
+                        return Ok(DeletePendingOutcome::PendingCreated);
                     }
                     Err(_) => {
                         let _ = unsafe { Box::from_raw(new_ptr) };
@@ -594,7 +629,7 @@ impl MvccRow {
             }
 
             // Key already deleted (committed tombstone) - do nothing
-            return Ok(false);
+            return Ok(DeletePendingOutcome::Noop);
         }
     }
 
@@ -604,8 +639,13 @@ impl MvccRow {
     /// For LOCK nodes: Marks as aborted (not persisted - pessimistic lock served its purpose).
     ///
     /// Called during transaction commit.
-    fn finalize_pending(&self, owner_start_ts: Timestamp, commit_ts: Timestamp) {
+    fn finalize_pending(
+        &self,
+        owner_start_ts: Timestamp,
+        commit_ts: Timestamp,
+    ) -> PendingResolveStats {
         let mut current = self.head.load(Ordering::Acquire);
+        let mut stats = PendingResolveStats::default();
 
         while !current.is_null() {
             let node = unsafe { &*current };
@@ -615,32 +655,41 @@ impl MvccRow {
                     // LOCK served its purpose (conflict detection via pessimistic lock)
                     // Don't persist - mark as aborted so readers skip it
                     node.mark_aborted();
+                    stats.resolved += 1;
                 } else {
                     // Value or TOMBSTONE - finalize normally
                     node.finalize(commit_ts);
+                    stats.resolved += 1;
+                    stats.committed += 1;
                 }
             }
 
             current = node.next;
         }
+
+        stats
     }
 
     /// Mark all pending nodes owned by the given transaction as aborted.
     ///
     /// Aborted nodes are skipped by readers and not written to SST during flush.
     /// Called during transaction rollback.
-    fn abort_pending(&self, owner_start_ts: Timestamp) {
+    fn abort_pending(&self, owner_start_ts: Timestamp) -> usize {
         let mut current = self.head.load(Ordering::Acquire);
+        let mut resolved = 0;
 
         while !current.is_null() {
             let node = unsafe { &*current };
 
-            if node.get_owner() == owner_start_ts {
+            if node.get_owner() == owner_start_ts && !node.is_aborted() {
                 node.mark_aborted();
+                resolved += 1;
             }
 
             current = node.next;
         }
+
+        resolved
     }
 }
 
@@ -745,12 +794,12 @@ impl VersionedMemTableEngine {
     /// - `Err(lock_owner)` if the key is already locked by another transaction
     ///
     /// If the key is already locked by the same transaction, the value is updated in place.
-    pub fn put_pending(
+    pub fn put_pending_counted(
         &self,
         key: &[u8],
         value: RawValue,
         owner_start_ts: Timestamp,
-    ) -> std::result::Result<(), Timestamp> {
+    ) -> std::result::Result<bool, Timestamp> {
         let entry = self
             .inner
             .index
@@ -761,10 +810,21 @@ impl VersionedMemTableEngine {
                 if new_node_created {
                     self.inner.entry_count.fetch_add(1, Ordering::Relaxed);
                 }
-                Ok(())
+                Ok(new_node_created)
             }
             Err(lock_owner) => Err(lock_owner),
         }
+    }
+
+    /// Write pending value and ignore whether a new pending node was created.
+    pub fn put_pending(
+        &self,
+        key: &[u8],
+        value: RawValue,
+        owner_start_ts: Timestamp,
+    ) -> std::result::Result<(), Timestamp> {
+        self.put_pending_counted(key, value, owner_start_ts)
+            .map(|_| ())
     }
 
     /// Check if a key is locked by a pending write.
@@ -782,23 +842,42 @@ impl VersionedMemTableEngine {
     /// Finalize all pending writes for a transaction by setting commit_ts.
     ///
     /// Called during transaction commit. Converts pending nodes to committed nodes.
-    pub fn finalize_pending(&self, keys: &[Key], owner_start_ts: Timestamp, commit_ts: Timestamp) {
+    pub fn finalize_pending_counted(
+        &self,
+        keys: &[Key],
+        owner_start_ts: Timestamp,
+        commit_ts: Timestamp,
+    ) -> PendingResolveStats {
+        let mut total = PendingResolveStats::default();
         for key in keys {
             if let Some(entry) = self.inner.index.get(key) {
-                entry.value().finalize_pending(owner_start_ts, commit_ts);
+                let stats = entry.value().finalize_pending(owner_start_ts, commit_ts);
+                total.resolved += stats.resolved;
+                total.committed += stats.committed;
             }
         }
+        total
+    }
+
+    pub fn finalize_pending(&self, keys: &[Key], owner_start_ts: Timestamp, commit_ts: Timestamp) {
+        let _ = self.finalize_pending_counted(keys, owner_start_ts, commit_ts);
     }
 
     /// Mark all pending writes for a transaction as aborted.
     ///
     /// Called during transaction rollback. Aborted nodes are skipped by readers.
-    pub fn abort_pending(&self, keys: &[Key], owner_start_ts: Timestamp) {
+    pub fn abort_pending_counted(&self, keys: &[Key], owner_start_ts: Timestamp) -> usize {
+        let mut resolved = 0;
         for key in keys {
             if let Some(entry) = self.inner.index.get(key) {
-                entry.value().abort_pending(owner_start_ts);
+                resolved += entry.value().abort_pending(owner_start_ts);
             }
         }
+        resolved
+    }
+
+    pub fn abort_pending(&self, keys: &[Key], owner_start_ts: Timestamp) {
+        let _ = self.abort_pending_counted(keys, owner_start_ts);
     }
 
     /// Delete a key with pessimistic locking.
@@ -813,29 +892,38 @@ impl VersionedMemTableEngine {
     /// - `Ok(true)` if delete was performed
     /// - `Ok(false)` if key doesn't exist or already deleted
     /// - `Err(lock_owner)` if key is locked by another transaction
+    pub fn delete_pending_with_outcome(
+        &self,
+        key: &[u8],
+        owner_start_ts: Timestamp,
+    ) -> std::result::Result<DeletePendingOutcome, Timestamp> {
+        // If key doesn't exist, do nothing
+        let entry = match self.inner.index.get(key) {
+            Some(e) => e,
+            None => return Ok(DeletePendingOutcome::Noop),
+        };
+
+        match entry.value().delete_pending(owner_start_ts) {
+            Ok(DeletePendingOutcome::PendingCreated) => {
+                // A TOMBSTONE node was added (delete on committed)
+                self.inner.entry_count.fetch_add(1, Ordering::Relaxed);
+                Ok(DeletePendingOutcome::PendingCreated)
+            }
+            Ok(DeletePendingOutcome::ExistingPendingUpdated) => {
+                Ok(DeletePendingOutcome::ExistingPendingUpdated)
+            }
+            Ok(DeletePendingOutcome::Noop) => Ok(DeletePendingOutcome::Noop),
+            Err(lock_owner) => Err(lock_owner),
+        }
+    }
+
     pub fn delete_pending(
         &self,
         key: &[u8],
         owner_start_ts: Timestamp,
     ) -> std::result::Result<bool, Timestamp> {
-        // If key doesn't exist, do nothing
-        let entry = match self.inner.index.get(key) {
-            Some(e) => e,
-            None => return Ok(false),
-        };
-
-        match entry.value().delete_pending(owner_start_ts) {
-            Ok(true) => {
-                // A TOMBSTONE node was added (delete on committed)
-                // or LOCK was set (delete on our pending)
-                // Note: entry_count not incremented here because:
-                // - LOCK update is in-place
-                // - TOMBSTONE add is counted when we check if entry existed
-                Ok(true)
-            }
-            Ok(false) => Ok(false),
-            Err(lock_owner) => Err(lock_owner),
-        }
+        self.delete_pending_with_outcome(key, owner_start_ts)
+            .map(DeletePendingOutcome::performed)
     }
 
     /// Get a value with read-your-writes support.
@@ -3076,7 +3164,7 @@ mod tests {
 
         // Txn 100 deletes their pending write (converts to LOCK)
         let result = row.delete_pending(100);
-        assert_eq!(result, Ok(true));
+        assert_eq!(result, Ok(DeletePendingOutcome::ExistingPendingUpdated));
 
         // Owner should now see LOCK, skip to previous (none) -> None
         let value = row.get_at_with_owner(100, 100);
@@ -3095,7 +3183,7 @@ mod tests {
 
         // Txn 100 deletes (converts to LOCK)
         let result = row.delete_pending(100);
-        assert_eq!(result, Ok(true));
+        assert_eq!(result, Ok(DeletePendingOutcome::ExistingPendingUpdated));
 
         // Owner sees LOCK, skips to base
         let value = row.get_at_with_owner(100, 100);
@@ -3111,7 +3199,7 @@ mod tests {
 
         // Txn 100 deletes committed value (writes pending TOMBSTONE)
         let result = row.delete_pending(100);
-        assert_eq!(result, Ok(true));
+        assert_eq!(result, Ok(DeletePendingOutcome::PendingCreated));
 
         // Owner sees their pending TOMBSTONE
         let value = row.get_at_with_owner(100, 100);
@@ -3140,7 +3228,7 @@ mod tests {
 
         // Delete on non-existent key - should do nothing
         let result = row.delete_pending(100);
-        assert_eq!(result, Ok(false));
+        assert_eq!(result, Ok(DeletePendingOutcome::Noop));
     }
 
     #[tokio::test]
@@ -3152,7 +3240,7 @@ mod tests {
 
         // Delete on already deleted - should do nothing
         let result = row.delete_pending(100);
-        assert_eq!(result, Ok(false));
+        assert_eq!(result, Ok(DeletePendingOutcome::Noop));
     }
 
     #[tokio::test]
@@ -3185,7 +3273,7 @@ mod tests {
 
         // Txn 200 deletes - should write TOMBSTONE (committed value exists)
         let result = row.delete_pending(200);
-        assert_eq!(result, Ok(true));
+        assert_eq!(result, Ok(DeletePendingOutcome::PendingCreated));
 
         // Txn 200 sees their TOMBSTONE
         let value = row.get_at_with_owner(200, 200);

@@ -32,13 +32,36 @@
 //! it is frozen and a new active memtable is created. Frozen memtables are
 //! flushed to SST files asynchronously.
 
-use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicU8, AtomicUsize, Ordering};
 use std::time::Instant;
 
 use crate::error::Result;
 use crate::storage::WriteBatch;
 
+use super::versioned_memtable::PendingResolveStats;
 use super::VersionedMemTableEngine;
+
+/// Flush lifecycle state of a frozen memtable.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum FlushState {
+    NeedsFlush = 0,
+    Flushing = 1,
+    FlushedDirty = 2,
+    FlushedClean = 3,
+}
+
+impl FlushState {
+    #[inline]
+    fn from_u8(v: u8) -> Self {
+        match v {
+            0 => FlushState::NeedsFlush,
+            1 => FlushState::Flushing,
+            2 => FlushState::FlushedDirty,
+            3 => FlushState::FlushedClean,
+            _ => panic!("invalid FlushState value: {v}"),
+        }
+    }
+}
 
 /// MemTable wrapper with LSM metadata.
 ///
@@ -47,7 +70,7 @@ use super::VersionedMemTableEngine;
 ///
 /// - `id`: Unique identifier for ordering memtables
 /// - `approximate_size`: Estimated memory usage for flush decisions
-/// - `min_lsn`/`max_lsn`: LSN range for recovery
+/// - `min_lsn`: minimum LSN seen in this memtable
 /// - `created_at`: Creation time for age-based policies
 pub struct MemTable {
     /// Unique memtable ID (monotonically increasing)
@@ -68,11 +91,6 @@ pub struct MemTable {
     /// which WAL entries have been persisted.
     min_lsn: AtomicU64,
 
-    /// Maximum LSN in this memtable.
-    ///
-    /// Updated on each write. Used for recovery ordering.
-    max_lsn: AtomicU64,
-
     /// Whether this memtable is frozen (read-only).
     ///
     /// Once frozen, no more writes are accepted.
@@ -80,9 +98,31 @@ pub struct MemTable {
 
     /// Creation time for age-based policies.
     created_at: Instant,
+
+    /// Count of unresolved pending nodes owned by in-flight transactions.
+    pending_count: AtomicUsize,
+
+    /// Flush lifecycle state for correctness-critical retention.
+    flush_state: AtomicU8,
 }
 
 impl MemTable {
+    #[inline]
+    fn is_legal_transition(from: FlushState, to: FlushState) -> bool {
+        if from == to {
+            return true;
+        }
+        matches!(
+            (from, to),
+            (FlushState::NeedsFlush, FlushState::Flushing)
+                | (FlushState::Flushing, FlushState::FlushedClean)
+                | (FlushState::Flushing, FlushState::FlushedDirty)
+                | (FlushState::Flushing, FlushState::NeedsFlush)
+                | (FlushState::FlushedClean, FlushState::FlushedDirty)
+                | (FlushState::FlushedDirty, FlushState::Flushing)
+        )
+    }
+
     /// Create a new active memtable with the given ID.
     ///
     /// The memtable starts empty and accepts writes until frozen.
@@ -92,9 +132,10 @@ impl MemTable {
             inner: VersionedMemTableEngine::new(),
             approximate_size: AtomicUsize::new(0),
             min_lsn: AtomicU64::new(u64::MAX),
-            max_lsn: AtomicU64::new(0),
             frozen: AtomicBool::new(false),
             created_at: Instant::now(),
+            pending_count: AtomicUsize::new(0),
+            flush_state: AtomicU8::new(FlushState::NeedsFlush as u8),
         }
     }
 
@@ -120,16 +161,6 @@ impl MemTable {
         }
     }
 
-    /// Get the maximum LSN, or None if no writes have been made.
-    pub fn max_lsn(&self) -> Option<u64> {
-        let lsn = self.max_lsn.load(Ordering::Acquire);
-        if lsn == 0 && self.min_lsn.load(Ordering::Acquire) == u64::MAX {
-            None
-        } else {
-            Some(lsn)
-        }
-    }
-
     /// Check if this memtable is frozen (read-only).
     #[inline]
     pub fn is_frozen(&self) -> bool {
@@ -142,6 +173,72 @@ impl MemTable {
     /// can still be read from until it is flushed to SST.
     pub fn freeze(&self) {
         self.frozen.store(true, Ordering::Release);
+    }
+
+    /// Get current pending node count.
+    #[inline]
+    pub fn pending_count(&self) -> usize {
+        self.pending_count.load(Ordering::Acquire)
+    }
+
+    /// Get current flush lifecycle state.
+    #[inline]
+    pub fn flush_state(&self) -> FlushState {
+        FlushState::from_u8(self.flush_state.load(Ordering::Acquire))
+    }
+
+    /// Set flush lifecycle state directly.
+    pub fn set_flush_state(&self, state: FlushState) {
+        let mut current_raw = self.flush_state.load(Ordering::Acquire);
+        loop {
+            let current = FlushState::from_u8(current_raw);
+            assert!(
+                Self::is_legal_transition(current, state),
+                "illegal FlushState transition on memtable {}: {:?} -> {:?}",
+                self.id,
+                current,
+                state
+            );
+            match self.flush_state.compare_exchange_weak(
+                current_raw,
+                state as u8,
+                Ordering::AcqRel,
+                Ordering::Acquire,
+            ) {
+                Ok(_) => return,
+                Err(actual) => current_raw = actual,
+            }
+        }
+    }
+
+    /// Compare and swap flush state.
+    pub fn compare_exchange_flush_state(
+        &self,
+        current: FlushState,
+        new: FlushState,
+    ) -> std::result::Result<FlushState, FlushState> {
+        assert!(
+            Self::is_legal_transition(current, new),
+            "illegal FlushState CAS transition on memtable {}: {:?} -> {:?}",
+            self.id,
+            current,
+            new
+        );
+        self.flush_state
+            .compare_exchange(
+                current as u8,
+                new as u8,
+                Ordering::AcqRel,
+                Ordering::Acquire,
+            )
+            .map(FlushState::from_u8)
+            .map_err(FlushState::from_u8)
+    }
+
+    /// Whether this memtable can contain committed data that is not yet durably flushed.
+    #[inline]
+    pub fn has_unflushed_committed_data(&self) -> bool {
+        !matches!(self.flush_state(), FlushState::FlushedClean)
     }
 
     /// Get the creation time.
@@ -194,8 +291,13 @@ impl MemTable {
         self.approximate_size
             .fetch_add(size_delta, Ordering::Relaxed);
 
-        // Update LSN range atomically
-        // For min_lsn, we want the smallest value seen
+        self.track_lsn(lsn);
+
+        Ok(())
+    }
+
+    /// Track an LSN in this memtable (minimum seen value).
+    pub fn track_lsn(&self, lsn: u64) {
         let mut current = self.min_lsn.load(Ordering::Relaxed);
         while lsn < current {
             match self.min_lsn.compare_exchange_weak(
@@ -208,22 +310,6 @@ impl MemTable {
                 Err(c) => current = c,
             }
         }
-
-        // For max_lsn, we want the largest value seen
-        let mut current = self.max_lsn.load(Ordering::Relaxed);
-        while lsn > current {
-            match self.max_lsn.compare_exchange_weak(
-                current,
-                lsn,
-                Ordering::Release,
-                Ordering::Relaxed,
-            ) {
-                Ok(_) => break,
-                Err(c) => current = c,
-            }
-        }
-
-        Ok(())
     }
 
     /// Get the underlying engine reference for iteration.
@@ -251,7 +337,24 @@ impl MemTable {
             // Return a sentinel value to indicate this - the caller should handle this case
             return Err(0);
         }
-        self.inner.put_pending(key, value, owner_start_ts)
+        let created = self.inner.put_pending_counted(key, value, owner_start_ts)?;
+        if created {
+            self.pending_count.fetch_add(1, Ordering::AcqRel);
+        }
+        Ok(())
+    }
+
+    fn dec_pending_count(&self, resolved: usize) {
+        if resolved == 0 {
+            return;
+        }
+        let prev = self.pending_count.fetch_sub(resolved, Ordering::AcqRel);
+        if prev < resolved {
+            panic!(
+                "pending_count underflow on memtable {}: prev={}, resolved={}",
+                self.id, prev, resolved
+            );
+        }
     }
 
     /// Check if a key is locked by a pending write.
@@ -265,8 +368,12 @@ impl MemTable {
         keys: &[crate::types::Key],
         owner_start_ts: crate::types::Timestamp,
         commit_ts: crate::types::Timestamp,
-    ) {
-        self.inner.finalize_pending(keys, owner_start_ts, commit_ts)
+    ) -> PendingResolveStats {
+        let stats = self
+            .inner
+            .finalize_pending_counted(keys, owner_start_ts, commit_ts);
+        self.dec_pending_count(stats.resolved);
+        stats
     }
 
     /// Abort all pending writes for a transaction.
@@ -274,8 +381,10 @@ impl MemTable {
         &self,
         keys: &[crate::types::Key],
         owner_start_ts: crate::types::Timestamp,
-    ) {
-        self.inner.abort_pending(keys, owner_start_ts)
+    ) -> usize {
+        let resolved = self.inner.abort_pending_counted(keys, owner_start_ts);
+        self.dec_pending_count(resolved);
+        resolved
     }
 
     /// Delete a key with pessimistic locking.
@@ -291,7 +400,13 @@ impl MemTable {
             // Frozen memtables cannot accept new writes
             return Err(0);
         }
-        self.inner.delete_pending(key, owner_start_ts)
+        let outcome = self
+            .inner
+            .delete_pending_with_outcome(key, owner_start_ts)?;
+        if outcome.pending_created() {
+            self.pending_count.fetch_add(1, Ordering::AcqRel);
+        }
+        Ok(outcome.performed())
     }
 
     /// Get a value with read-your-writes support.
@@ -420,9 +535,27 @@ mod tests {
         assert_eq!(mt.id(), 1);
         assert_eq!(mt.approximate_size(), 0);
         assert_eq!(mt.min_lsn(), None);
-        assert_eq!(mt.max_lsn(), None);
         assert!(!mt.is_frozen());
         assert!(mt.is_empty());
+    }
+
+    #[test]
+    fn test_flush_state_illegal_transition_panics() {
+        let mt = MemTable::new(1);
+        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            mt.set_flush_state(FlushState::FlushedDirty);
+        }));
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_flush_state_invalid_atomic_value_panics() {
+        let mt = MemTable::new(1);
+        mt.flush_state.store(9, Ordering::Release);
+        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let _ = mt.flush_state();
+        }));
+        assert!(result.is_err());
     }
 
     #[tokio::test]
@@ -451,7 +584,6 @@ mod tests {
         mt.write_batch_with_lsn(batch, 5).unwrap();
 
         assert_eq!(mt.min_lsn(), Some(5));
-        assert_eq!(mt.max_lsn(), Some(5));
 
         // Second write at LSN 10
         let mut batch = new_batch(101);
@@ -459,7 +591,6 @@ mod tests {
         mt.write_batch_with_lsn(batch, 10).unwrap();
 
         assert_eq!(mt.min_lsn(), Some(5));
-        assert_eq!(mt.max_lsn(), Some(10));
 
         // Third write at LSN 3 (out of order)
         let mut batch = new_batch(102);
@@ -467,7 +598,6 @@ mod tests {
         mt.write_batch_with_lsn(batch, 3).unwrap();
 
         assert_eq!(mt.min_lsn(), Some(3));
-        assert_eq!(mt.max_lsn(), Some(10));
     }
 
     #[tokio::test]
@@ -701,7 +831,7 @@ mod tests {
                         batch.set_commit_ts(ts);
                         batch.put(format!("k_{tid}_{i}").as_bytes().to_vec(), b"v".to_vec());
 
-                        // Use varying LSNs to test min/max tracking
+                        // Use varying LSNs to test minimum tracking
                         let lsn = ((tid * writes_per_thread + i) * 2 + 1) as u64;
                         mt.write_batch_with_lsn(batch, lsn).unwrap();
                     }
@@ -715,8 +845,6 @@ mod tests {
 
         // Verify LSN tracking
         let min = mt.min_lsn().unwrap();
-        let max = mt.max_lsn().unwrap();
-        assert!(min <= max);
         // Min should be 1 (first thread, first write: 0 * 2 + 1 = 1)
         assert_eq!(min, 1);
     }

@@ -36,7 +36,7 @@ pub use versioned_memtable::VersionedMemoryStats;
 pub use versioned_memtable::VersionedMemoryStats as MemoryStats;
 
 // LSM MemTable wrapper with metadata
-pub use wrapper::MemTable;
+pub use wrapper::{FlushState, MemTable};
 
 // ============================================================================
 // Common Types

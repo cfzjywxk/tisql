@@ -1334,15 +1334,15 @@ mod tests {
                 );
             }
 
-            // Only unflushed transactions are replayed. Flushed ones are
-            // skipped by the commit_lsn filter (already in SSTs).
+            // Conservative flushed_lsn may replay one boundary transaction even
+            // if its data is already in SSTs.
             assert_eq!(
                 result.stats.flushed_lsn, flushed_lsn,
                 "Recovered flushed_lsn should match"
             );
             assert_eq!(
-                result.stats.txn_count, 3,
-                "Only 3 unflushed transactions should be replayed"
+                result.stats.txn_count, 4,
+                "Conservative boundary replays extra txn but must preserve all data"
             );
         }
     }

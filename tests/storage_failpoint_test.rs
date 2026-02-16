@@ -125,7 +125,7 @@ struct LogGcCycleStats {
 ///
 /// Mirrors the production `Database::run_log_gc_once()` flow:
 /// 1. Hold manifest_lock during version capture + checkpoint write
-/// 2. Use `safe_log_gc_lsn_with()` pinned to checkpointed flushed_lsn
+/// 2. Compute safe_lsn under flush_gate.write() pinned to checkpointed flushed_lsn
 fn run_log_gc_cycle(
     engine: &LsmEngine,
     ilog: &IlogService,
@@ -144,7 +144,13 @@ fn run_log_gc_cycle(
     };
 
     let flushed_lsn = version.flushed_lsn();
-    let safe_lsn = engine.safe_log_gc_lsn_with(flushed_lsn);
+    let safe_lsn = {
+        let fence = engine.flush_gate();
+        let gate = tisql::io::block_on_sync(fence.write());
+        let safe = engine.safe_log_gc_lsn_with(flushed_lsn);
+        drop(gate);
+        safe
+    };
 
     fail_point!("log_gc_after_checkpoint_before_clog_truncate");
 
@@ -2132,16 +2138,15 @@ async fn test_log_gc_repeated_cycles_never_over_truncate() {
 // ============================================================================
 // Multi-Entry Transaction + Log GC Tests
 //
-// These tests verify that clog truncation respects transaction boundaries:
-// when write_ops() creates Put(lsn=N), Put(lsn=N+1), Commit(lsn=N+2),
-// truncate_to() must keep or remove the entire group atomically.
+// These tests verify that clog truncation respects transaction boundaries
+// with per-transaction LSN semantics.
 // ============================================================================
 
-/// Write a multi-key transaction using write_ops (separate LSN per entry).
+/// Write a multi-key transaction using write_ops (single LSN per transaction).
 ///
 /// This mirrors the production path: `TxnService::commit()` calls `clog.write_ops()`
-/// which allocates Put(lsn=N), Put(lsn=N+1), ..., Commit(lsn=N+K).
-/// Returns the commit_lsn (highest LSN, i.e. the Commit entry's LSN).
+/// which allocates one LSN for all entries in the transaction.
+/// Returns that transaction LSN.
 async fn write_durable_multi_put(
     engine: &LsmEngine,
     clog: &FileClogService,
@@ -2189,14 +2194,14 @@ async fn test_gc_preserves_multi_entry_txn_on_recovery() {
     let (engine, ilog, clog) = create_test_lsm_engine_with_unified_logs(&dir).await;
 
     // T1: single-key autocommit, flush to SST
-    let t1_lsn = write_durable_put(&engine, &clog, 1, b"t1_key", b"t1_value", 100).await;
+    let _t1_lsn = write_durable_put(&engine, &clog, 1, b"t1_key", b"t1_value", 100).await;
     engine.flush_all_with_active().unwrap();
     ilog.sync().unwrap();
 
     let flushed_after_t1 = engine.current_version().flushed_lsn();
-    assert!(flushed_after_t1 >= t1_lsn);
+    assert_eq!(flushed_after_t1, 0);
 
-    // T2: multi-key transaction (3 Puts + Commit → 4 clog entries with sequential LSNs)
+    // T2: multi-key transaction (3 Puts + Commit => 4 clog entries with one txn LSN).
     let t2_keys: Vec<(&[u8], &[u8])> = vec![
         (b"t2_key_a", b"t2_val_a"),
         (b"t2_key_b", b"t2_val_b"),
@@ -2361,7 +2366,7 @@ async fn test_gc_interleaved_flushed_unflushed_multi_entry() {
     // GC cycle 1: T1 should be removable, T2 must be protected
     let stats1 = run_log_gc_cycle(&engine, &ilog, &clog).unwrap();
 
-    // Verify T2 is intact in clog (2 Puts + Commit = 3 entries)
+    // Verify T2 is intact in clog (2 Puts + Commit = 3 entries).
     let remaining = clog.read_all().unwrap();
     let t2_entries: Vec<_> = remaining.iter().filter(|e| e.txn_id == 2).collect();
     assert_eq!(
@@ -2427,7 +2432,7 @@ async fn test_gc_safe_lsn_splits_multi_entry_txn_boundary() {
     ];
     let t2_commit_lsn = write_durable_multi_put(&engine, &clog, 2, &t2_kv, 200).await;
 
-    // Verify T2's entries have sequential LSNs
+    // Verify T2's entries are grouped by a single transaction LSN.
     let all_entries = clog.read_all().unwrap();
     let t2_entries: Vec<_> = all_entries.iter().filter(|e| e.txn_id == 2).collect();
     assert_eq!(t2_entries.len(), 4); // 3 Puts + 1 Commit
@@ -2438,7 +2443,7 @@ async fn test_gc_safe_lsn_splits_multi_entry_txn_boundary() {
     // Run GC
     let stats = run_log_gc_cycle(&engine, &ilog, &clog).unwrap();
 
-    // The critical check: T2 must be fully intact or fully removed
+    // The critical check: T2 must be fully intact or fully removed.
     let after_gc = clog.read_all().unwrap();
     let t2_after: Vec<_> = after_gc.iter().filter(|e| e.txn_id == 2).collect();
     assert!(
@@ -2461,7 +2466,7 @@ async fn test_gc_safe_lsn_splits_multi_entry_txn_boundary() {
         assert_eq!(
             got.as_deref(),
             Some(*v),
-            "T2 key {:?} must survive GC + crash when safe_lsn could split entries",
+            "T2 key {:?} must survive GC + crash with txn-atomic truncation",
             String::from_utf8_lossy(k),
         );
     }

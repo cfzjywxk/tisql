@@ -433,11 +433,12 @@ impl Database {
             Arc::new(ConcurrencyManager::new(recovery_result.stats.max_commit_ts));
 
         // Create transaction service with recovered components
-        let txn_service = Arc::new(TransactionService::new(
+        let txn_service = Arc::new(TransactionService::new_with_commit_fence(
             Arc::clone(&storage),
             recovery_result.clog,
             Arc::clone(&tso),
             Arc::clone(&concurrency_manager),
+            Some(storage.flush_gate()),
         ));
 
         // Create MVCC catalog using same txn_service
@@ -791,10 +792,16 @@ impl Database {
         // manifest_lock released — flush/compaction can proceed
 
         // Compute clog truncation boundary from the SAME version that was
-        // checkpointed. min_unflushed_lsn and min_in_flight are independent
-        // of the version and provide additional safety.
+        // checkpointed. min_unflushed_lsn is independent of the version and
+        // provides additional safety.
         let flushed_lsn = version.flushed_lsn();
-        let safe_lsn = self.storage.safe_log_gc_lsn_with(flushed_lsn);
+        let safe_lsn = {
+            let fence = self.storage.flush_gate();
+            let gate = crate::io::block_on_sync(fence.write());
+            let safe = self.storage.safe_log_gc_lsn_with(flushed_lsn);
+            drop(gate);
+            safe
+        };
 
         #[cfg(feature = "failpoints")]
         fail_point!("log_gc_after_checkpoint_before_clog_truncate");
