@@ -75,10 +75,6 @@ use super::version_set::{SuperVersion, VersionSet};
 /// Sentinel value meaning "no in-flight write on this slot".
 const NO_IN_FLIGHT: u64 = u64::MAX;
 
-/// Default number of tracker slots. Should be >= max worker thread count.
-/// Extra slots are cheap (64 bytes each); a few wasted slots are fine.
-const DEFAULT_TRACKER_SLOTS: usize = 128;
-
 /// Global counter for assigning sequential slot indices to threads.
 static TRACKER_SLOT_COUNTER: AtomicUsize = AtomicUsize::new(0);
 
@@ -133,13 +129,30 @@ impl InFlightLsnTracker {
         }
     }
 
+    /// Create a tracker sized for the current machine.
+    ///
+    /// Uses at least 128 slots, rounded up to the next power of two
+    /// for efficient modulo (compiler optimizes `% power_of_two` to bitwise AND).
+    pub fn new_auto() -> Self {
+        let cpus = std::thread::available_parallelism()
+            .map(|n| n.get())
+            .unwrap_or(128);
+        // 2x headroom for blocking pool threads, test threads, etc.
+        let slots = (cpus * 2).next_power_of_two().max(128);
+        Self::new(slots)
+    }
+
     /// Register an in-flight LSN for the current thread.
     ///
     /// Returns a guard that deregisters on drop (RAII).
     /// Must be called before the memtable write, after the LSN is known.
     pub fn register(&self, lsn: u64) -> InFlightGuard<'_> {
         let slot_idx = self.slot_index();
-        self.slots[slot_idx].0.store(lsn, AtomicOrdering::Release);
+        let prev = self.slots[slot_idx].0.swap(lsn, AtomicOrdering::AcqRel);
+        debug_assert_eq!(
+            prev, NO_IN_FLIGHT,
+            "InFlightLsnTracker slot {slot_idx} aliased: prev={prev}, new={lsn}"
+        );
         InFlightGuard {
             tracker: self,
             slot_idx,
@@ -366,7 +379,7 @@ impl LsmEngine {
             gc_safe_point: AtomicU64::new(0),
             gc_safe_point_updater: RwLock::new(None),
             dropped_table_ids: RwLock::new(HashMap::new()),
-            in_flight_tracker: InFlightLsnTracker::new(DEFAULT_TRACKER_SLOTS),
+            in_flight_tracker: InFlightLsnTracker::new_auto(),
             manifest_lock: parking_lot::Mutex::new(()),
         })
     }
@@ -1168,6 +1181,12 @@ impl LsmEngine {
         // if a concurrent flush runs between LSN allocation and memtable
         // write completion. The guard clears the slot on drop (RAII).
         let _guard = self.in_flight_tracker.register(lsn);
+
+        // Failpoint: pause after in-flight registration, before memtable write.
+        // This simulates the TOCTOU window where an LSN is allocated and registered
+        // but the memtable write has not yet completed.
+        #[cfg(feature = "failpoints")]
+        fail_point!("write_batch_after_inflight_register");
 
         // Write to active memtable
         {
@@ -2900,7 +2919,7 @@ mod tests {
                 gc_safe_point: AtomicU64::new(0),
                 gc_safe_point_updater: RwLock::new(None),
                 dropped_table_ids: RwLock::new(HashMap::new()),
-                in_flight_tracker: InFlightLsnTracker::new(DEFAULT_TRACKER_SLOTS),
+                in_flight_tracker: InFlightLsnTracker::new_auto(),
                 manifest_lock: parking_lot::Mutex::new(()),
             })
         }
@@ -8360,6 +8379,71 @@ mod tests {
         assert_eq!(tracker.min_in_flight(), None);
     }
 
+    #[test]
+    fn test_in_flight_tracker_aliasing_with_small_slot_count() {
+        // Simulate aliasing by manually writing to slots that map to the same
+        // index under modulo. This tests min_in_flight correctness when
+        // overwrites occur (the scenario the dynamic sizing fix prevents).
+        let tracker = InFlightLsnTracker::new(4);
+
+        // Simulate two "threads" sharing slot 0: one writes LSN=100, then
+        // the other overwrites with LSN=50 (the aliasing corruption).
+        tracker.slots[0].0.store(100, AtomicOrdering::Release);
+        assert_eq!(tracker.min_in_flight(), Some(100));
+
+        // Aliasing: second writer overwrites slot 0 with lower LSN.
+        tracker.slots[0].0.store(50, AtomicOrdering::Release);
+        assert_eq!(tracker.min_in_flight(), Some(50));
+
+        // First writer's guard drops — clears the slot, hiding the second
+        // writer's in-flight LSN. This is the data-loss scenario.
+        tracker.slots[0]
+            .0
+            .store(NO_IN_FLIGHT, AtomicOrdering::Release);
+        assert_eq!(
+            tracker.min_in_flight(),
+            None,
+            "aliasing causes the in-flight LSN to become invisible"
+        );
+    }
+
+    #[test]
+    fn test_in_flight_tracker_debug_assert_detects_aliasing() {
+        // Verify that the debug_assert in register() fires when a thread
+        // calls register() while its slot is already occupied.
+        // This tests the actual register() code path, not a reimplementation.
+        let tracker = InFlightLsnTracker::new(16);
+
+        // First register — occupies this thread's slot.
+        let _guard1 = tracker.register(100);
+        assert_eq!(tracker.min_in_flight(), Some(100));
+
+        // Second register from same thread — same slot is already occupied.
+        // In debug builds, register()'s debug_assert should fire.
+        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let _guard2 = tracker.register(200);
+        }));
+
+        if cfg!(debug_assertions) {
+            assert!(result.is_err(), "debug_assert should panic on aliasing");
+        } else {
+            assert!(result.is_ok(), "release mode should not panic");
+        }
+    }
+
+    #[test]
+    fn test_in_flight_tracker_new_auto() {
+        // Verify new_auto creates a tracker with a reasonable slot count.
+        let tracker = InFlightLsnTracker::new_auto();
+        let slot_count = tracker.slots.len();
+        assert!(slot_count >= 128, "should be at least 128, got {slot_count}");
+        assert!(
+            slot_count.is_power_of_two(),
+            "should be power of two, got {slot_count}"
+        );
+        assert_eq!(tracker.min_in_flight(), None);
+    }
+
     #[tokio::test]
     async fn test_safe_flushed_lsn_accounts_for_in_flight() {
         // Simulates the TOCTOU race: an in-flight LSN should hold back
@@ -8518,5 +8602,94 @@ mod tests {
         engine.flush_memtable_async(&f3).await.unwrap();
         // No in-flight, no remaining memtables → flushed_lsn = 9.
         assert_eq!(engine.current_version().flushed_lsn(), 9);
+    }
+
+    /// Failpoint test: verify safe_flushed_lsn accounts for in-flight LSNs
+    /// when a concurrent write is paused between LSN allocation and memtable
+    /// write completion (the TOCTOU window).
+    ///
+    /// Sequence:
+    /// 1. Write data with LSNs 1..5, freeze memtable
+    /// 2. Pause a concurrent writer after in-flight registration (failpoint)
+    /// 3. Flush the frozen memtable — safe_flushed_lsn must be capped
+    /// 4. Unpause writer, verify flushed_lsn didn't advance past in-flight
+    #[cfg(feature = "failpoints")]
+    #[tokio::test]
+    async fn test_flush_boundary_with_inflight_failpoint() {
+        use std::sync::Barrier;
+
+        let scenario = fail::FailScenario::setup();
+        let dir = TempDir::new().unwrap();
+        let config = LsmConfig::builder(dir.path())
+            .memtable_size(4096)
+            .build()
+            .unwrap();
+        let engine = Arc::new(LsmEngine::open(config).unwrap());
+
+        // Step 1: Write LSN 1..5 to the engine and freeze.
+        for i in 1..=5u64 {
+            let mut wb = WriteBatch::new();
+            wb.put(format!("key{i}").into_bytes(), b"val".to_vec());
+            wb.set_commit_ts(i);
+            wb.set_clog_lsn(i);
+            engine.write_batch(wb).unwrap();
+        }
+        engine.freeze_active();
+
+        let frozen = {
+            let state = engine.state.read();
+            state.frozen.front().cloned().unwrap()
+        };
+
+        // Step 2: Set failpoint to pause write_batch_inner after in-flight
+        // registration but before memtable write. This simulates the TOCTOU
+        // window where an LSN is allocated but not yet written to memtable.
+        fail::cfg("write_batch_after_inflight_register", "pause").unwrap();
+
+        // Spawn a writer thread that will pause with in-flight LSN=3
+        // registered. Use a barrier to confirm it started.
+        let barrier = Arc::new(Barrier::new(2));
+        let engine_clone = Arc::clone(&engine);
+        let barrier_clone = Arc::clone(&barrier);
+        let writer_handle = std::thread::spawn(move || {
+            barrier_clone.wait(); // Signal that we're about to write
+            let mut wb = WriteBatch::new();
+            wb.put(b"inflight_key".to_vec(), b"val".to_vec());
+            wb.set_commit_ts(3);
+            wb.set_clog_lsn(3);
+            // This will pause at the failpoint after register(3)
+            engine_clone.write_batch(wb).unwrap();
+        });
+
+        // Wait for writer thread to start
+        barrier.wait();
+        // Poll until the writer's in-flight LSN is visible in the tracker.
+        // This is deterministic: register() stores before the failpoint pauses,
+        // so min_in_flight() will return Some(3) once the writer is paused.
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        while engine.in_flight_tracker.min_in_flight() != Some(3) {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "writer thread did not register in-flight LSN within 5s"
+            );
+            std::thread::sleep(std::time::Duration::from_millis(1));
+        }
+
+        // Step 3: Flush frozen memtable. safe_flushed_lsn should be capped
+        // by the in-flight LSN=3 → safe = min(5, 3-1) = 2.
+        engine.flush_memtable_async(&frozen).await.unwrap();
+
+        let flushed_lsn = engine.current_version().flushed_lsn();
+        assert!(
+            flushed_lsn <= 2,
+            "flushed_lsn should be capped by in-flight LSN=3: \
+             expected <= 2, got {flushed_lsn}"
+        );
+
+        // Step 4: Unpause writer and let it complete.
+        fail::cfg("write_batch_after_inflight_register", "off").unwrap();
+        writer_handle.join().unwrap();
+
+        scenario.teardown();
     }
 }
