@@ -139,9 +139,7 @@ impl InFlightLsnTracker {
     /// Must be called before the memtable write, after the LSN is known.
     pub fn register(&self, lsn: u64) -> InFlightGuard<'_> {
         let slot_idx = self.slot_index();
-        self.slots[slot_idx]
-            .0
-            .store(lsn, AtomicOrdering::Release);
+        self.slots[slot_idx].0.store(lsn, AtomicOrdering::Release);
         InFlightGuard {
             tracker: self,
             slot_idx,
@@ -8239,7 +8237,7 @@ mod tests {
                 let _guard = tracker.register(100 + i);
                 b1.wait(); // Signal: all registered
                 b2.wait(); // Wait: main has checked
-                // _guard drops here
+                           // _guard drops here
             }));
         }
 
@@ -8273,12 +8271,18 @@ mod tests {
         assert_eq!(tracker.min_in_flight(), Some(200));
 
         // Clear slot 3 — min should move to 500.
-        tracker.slots[3].0.store(NO_IN_FLIGHT, AtomicOrdering::Release);
+        tracker.slots[3]
+            .0
+            .store(NO_IN_FLIGHT, AtomicOrdering::Release);
         assert_eq!(tracker.min_in_flight(), Some(500));
 
         // Clear all.
-        tracker.slots[0].0.store(NO_IN_FLIGHT, AtomicOrdering::Release);
-        tracker.slots[7].0.store(NO_IN_FLIGHT, AtomicOrdering::Release);
+        tracker.slots[0]
+            .0
+            .store(NO_IN_FLIGHT, AtomicOrdering::Release);
+        tracker.slots[7]
+            .0
+            .store(NO_IN_FLIGHT, AtomicOrdering::Release);
         assert_eq!(tracker.min_in_flight(), None);
     }
 
@@ -8382,7 +8386,11 @@ mod tests {
         );
 
         drop(_guard);
-        assert_eq!(engine.safe_log_gc_lsn(), 3, "restored after in-flight clears");
+        assert_eq!(
+            engine.safe_log_gc_lsn(),
+            3,
+            "restored after in-flight clears"
+        );
     }
 
     #[tokio::test]

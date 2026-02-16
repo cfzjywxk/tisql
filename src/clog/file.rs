@@ -713,6 +713,20 @@ pub struct TruncateStats {
 }
 
 impl FileClogService {
+    /// Block the current thread waiting for a group commit reply.
+    ///
+    /// Uses `block_on_sync` (thread-parking executor) instead of
+    /// `blocking_recv()` — safe inside or outside a tokio runtime.
+    /// `blocking_recv()` panics when called from an async context
+    /// (e.g. `#[tokio::test]` or background runtime tasks).
+    fn wait_for_reply(
+        rx: tokio::sync::oneshot::Receiver<std::result::Result<(), String>>,
+    ) -> Result<()> {
+        crate::io::block_on_sync(rx)
+            .map_err(|_| TiSqlError::Internal("Clog group commit reply dropped".into()))?
+            .map_err(|e| TiSqlError::Internal(format!("Clog group commit failed: {e}")))
+    }
+
     /// Truncate clog entries with lsn <= safe_lsn.
     ///
     /// This rewrites the clog file keeping only entries with lsn > safe_lsn.
@@ -733,6 +747,16 @@ impl FileClogService {
         // Acquire group_writer lock to prevent concurrent writes during truncation.
         let mut group_writer = self.group_writer.lock();
 
+        // Drain already-submitted group commit requests before reading the file.
+        //
+        // Without this barrier, writes enqueued before we acquired the lock
+        // could be processed by the old writer loop AFTER we replace the file,
+        // writing to the unlinked old inode — silently losing acknowledged data.
+        let barrier_rx = group_writer
+            .submit(Vec::new(), true)
+            .map_err(|e| TiSqlError::Internal(format!("Clog group commit drain failed: {e}")))?;
+        Self::wait_for_reply(barrier_rx)?;
+
         let clog_path = self.config.clog_path();
         let old_size = std::fs::metadata(&clog_path).map(|m| m.len()).unwrap_or(0);
 
@@ -742,8 +766,7 @@ impl FileClogService {
         // Compute the max LSN per transaction. A transaction's entries must be
         // kept or removed as a unit: individual per-entry LSN partitioning would
         // split Put(lsn=N) / Commit(lsn=N+K) when safe_lsn falls between them.
-        let mut txn_max_lsn: std::collections::HashMap<u64, Lsn> =
-            std::collections::HashMap::new();
+        let mut txn_max_lsn: std::collections::HashMap<u64, Lsn> = std::collections::HashMap::new();
         for entry in &entries {
             let max = txn_max_lsn.entry(entry.txn_id).or_insert(0);
             *max = (*max).max(entry.lsn);
@@ -2168,7 +2191,7 @@ mod tests {
         assert_eq!(remaining[1].lsn, 4); // T2 Put k3
         assert_eq!(remaining[2].lsn, 5); // T2 Put k4
         assert_eq!(remaining[3].lsn, 6); // T2 Commit
-        // All entries belong to txn 2
+                                         // All entries belong to txn 2
         assert!(remaining.iter().all(|e| e.txn_id == 2));
 
         service.close().await.unwrap();
@@ -2265,6 +2288,47 @@ mod tests {
                 _ => {}
             }
         }
+
+        service.close().await.unwrap();
+    }
+
+    // ========================================================================
+    // truncate_to() Drain Safety Tests
+    // ========================================================================
+
+    /// Test that truncate_to() drains pending group commit writes before
+    /// reading the file. Without the drain barrier, writes enqueued to the
+    /// crossbeam channel but not yet processed by the writer loop could be
+    /// lost when the file is rewritten.
+    #[tokio::test]
+    async fn test_truncate_to_drains_pending_writes() {
+        let dir = tempdir().unwrap();
+        let config = FileClogConfig::with_dir(dir.path());
+        let service =
+            FileClogService::open(config.clone(), &tokio::runtime::Handle::current()).unwrap();
+
+        // Submit 10 writes without waiting for replies. Some may still be
+        // in the crossbeam channel when truncate_to runs.
+        for i in 1..=10u64 {
+            let mut batch = ClogBatch::new();
+            batch.add_put(
+                i,
+                format!("key{i}").into_bytes(),
+                format!("val{i}").into_bytes(),
+            );
+            let _future = service.write(&mut batch, true).unwrap();
+            // Deliberately NOT awaiting _future
+        }
+
+        // Truncate immediately (keep all — safe_lsn=0)
+        let stats = service.truncate_to(0).unwrap();
+
+        // All 10 writes must survive: the drain barrier ensures pending
+        // writes are flushed to disk before read_all().
+        let entries = service.read_all().unwrap();
+        assert_eq!(entries.len(), 10);
+        assert_eq!(stats.entries_kept, 10);
+        assert_eq!(stats.entries_removed, 0);
 
         service.close().await.unwrap();
     }

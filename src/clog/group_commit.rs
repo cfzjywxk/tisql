@@ -146,6 +146,9 @@ impl GroupCommitWriter {
                 batch.push(req);
             }
 
+            #[cfg(feature = "failpoints")]
+            fail::fail_point!("clog_writer_loop_pause");
+
             // Write the batch
             let write_error = Self::write_batch(&mut writer, &batch);
 

@@ -2364,8 +2364,12 @@ async fn test_gc_interleaved_flushed_unflushed_multi_entry() {
     );
 
     // T3: 4 Puts (also unflushed)
-    let t3_kv: Vec<(&[u8], &[u8])> =
-        vec![(b"t3_p", b"v3p"), (b"t3_q", b"v3q"), (b"t3_r", b"v3r"), (b"t3_s", b"v3s")];
+    let t3_kv: Vec<(&[u8], &[u8])> = vec![
+        (b"t3_p", b"v3p"),
+        (b"t3_q", b"v3q"),
+        (b"t3_r", b"v3r"),
+        (b"t3_s", b"v3s"),
+    ];
     write_durable_multi_put(&engine, &clog, 3, &t3_kv, 300).await;
 
     // GC cycle 2: both T2 and T3 must survive
@@ -2408,7 +2412,11 @@ async fn test_gc_safe_lsn_splits_multi_entry_txn_boundary() {
     ilog.sync().unwrap();
 
     // Write T2 with multiple Puts.
-    let t2_kv: Vec<(&[u8], &[u8])> = vec![(b"split_a", b"sa"), (b"split_b", b"sb"), (b"split_c", b"sc")];
+    let t2_kv: Vec<(&[u8], &[u8])> = vec![
+        (b"split_a", b"sa"),
+        (b"split_b", b"sb"),
+        (b"split_c", b"sc"),
+    ];
     let t2_commit_lsn = write_durable_multi_put(&engine, &clog, 2, &t2_kv, 200).await;
 
     // Verify T2's entries have sequential LSNs
@@ -2449,6 +2457,81 @@ async fn test_gc_safe_lsn_splits_multi_entry_txn_boundary() {
             String::from_utf8_lossy(k),
         );
     }
+
+    scenario.teardown();
+}
+
+// ============================================================================
+// Clog Truncate Drain Failpoint Tests
+// ============================================================================
+
+/// Test that truncate_to() drains pending group commit writes before
+/// rewriting the file, using a failpoint to freeze the writer loop.
+///
+/// Without the drain barrier, writes enqueued to the crossbeam channel
+/// but not yet processed by the writer loop would be lost when the file
+/// is rewritten (they'd be written to the old, unlinked inode).
+///
+/// Test structure:
+/// 1. Write one entry and wait (writer loop iteration 1 completes)
+/// 2. Pause the writer loop via failpoint
+/// 3. Submit another write (sits in channel, unprocessed)
+/// 4. Spawn truncate_to on background thread (blocks on drain barrier)
+/// 5. Unpause writer loop from main thread
+/// 6. Verify both entries survive
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn test_clog_truncate_drains_pending_under_failpoint() {
+    use tisql::ClogService;
+
+    let scenario = fail::FailScenario::setup();
+    let dir = tempfile::tempdir().unwrap();
+
+    let clog_config = FileClogConfig::with_dir(dir.path());
+    let service =
+        Arc::new(FileClogService::open(clog_config, &tokio::runtime::Handle::current()).unwrap());
+
+    // Write one entry and wait for it (establishes baseline; writer loop
+    // completes iteration 1 and returns to recv()).
+    let mut batch1 = ClogBatch::new();
+    batch1.add_put(1, b"key1".to_vec(), b"val1".to_vec());
+    service.write(&mut batch1, true).unwrap().await.unwrap();
+
+    // Pause the writer loop. After recv() picks up the next request and
+    // drains try_recv(), the failpoint fires before write_batch().
+    fail::cfg("clog_writer_loop_pause", "pause").unwrap();
+
+    // Submit a second write — it enters the channel. The writer loop
+    // receives it via recv(), then hits the pause failpoint. Entry 2
+    // is in the loop's local batch but NOT written to disk.
+    let mut batch2 = ClogBatch::new();
+    batch2.add_put(2, b"key2".to_vec(), b"val2".to_vec());
+    let _future2 = service.write(&mut batch2, false).unwrap();
+
+    // Spawn truncate_to on a background OS thread. It will:
+    //   acquire group_writer lock → submit barrier → block_on_sync(barrier_rx)
+    // Since the writer loop is paused, the barrier can't complete,
+    // so truncate_to is guaranteed to be blocked when we unpause.
+    let svc = Arc::clone(&service);
+    let handle = std::thread::spawn(move || svc.truncate_to(0).unwrap());
+
+    // Coordination delay: let truncate_to reach its barrier wait.
+    // Its pre-block path is just lock acquire + channel send (~microseconds).
+    // The "pause" failpoint guarantees the writer loop stays frozen
+    // regardless of how long we wait.
+    std::thread::sleep(std::time::Duration::from_millis(50));
+
+    // Unpause. Writer loop processes: entry2 (pending) → barrier.
+    // truncate_to unblocks, reads file (entry2 now on disk), rewrites
+    // file preserving both entries.
+    fail::cfg("clog_writer_loop_pause", "off").unwrap();
+
+    let stats = handle.join().unwrap();
+
+    // Both entries must survive the truncation.
+    let entries = service.read_all().unwrap();
+    assert_eq!(entries.len(), 2, "drain must preserve pending writes");
+    assert_eq!(stats.entries_kept, 2);
+    assert_eq!(stats.entries_removed, 0);
 
     scenario.teardown();
 }
