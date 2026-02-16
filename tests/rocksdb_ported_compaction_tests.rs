@@ -687,7 +687,7 @@ async fn test_interleaved_writes_flushes() {
     }
 
     // Final flush
-    engine.flush_all_with_active().unwrap();
+    engine.flush_all_with_active_async().await.unwrap();
 
     // Verify all keys exist with latest values
     for round in 0..10 {
@@ -1326,7 +1326,7 @@ async fn test_compaction_scheduler_automatic() {
     }
 
     // Flush all to create L0 files
-    engine.flush_all_with_active().unwrap();
+    engine.flush_all_with_active_async().await.unwrap();
 
     // Notify compaction scheduler
     scheduler.notify();
@@ -2052,7 +2052,7 @@ async fn test_multi_level_cascading() {
             engine.write_batch(batch).unwrap();
             ts += 1;
         }
-        engine.flush_all_with_active().unwrap();
+        engine.flush_all_with_active_async().await.unwrap();
     }
 
     // Run compaction with deterministic bounds to avoid hanging CI.
@@ -2229,7 +2229,7 @@ async fn test_multi_level_delete_reinsert_compaction_correctness() {
         batch.put(key.into_bytes(), format!("base_{i}").into_bytes());
         engine.write_batch(batch).unwrap();
     }
-    engine.flush_all_with_active().unwrap();
+    engine.flush_all_with_active_async().await.unwrap();
 
     // Round 1: delete evens, update odds
     for i in 0..KEY_COUNT {
@@ -2243,7 +2243,7 @@ async fn test_multi_level_delete_reinsert_compaction_correctness() {
         }
         engine.write_batch(batch).unwrap();
     }
-    engine.flush_all_with_active().unwrap();
+    engine.flush_all_with_active_async().await.unwrap();
 
     // Round 2: reinsert evens, update odds again
     for i in 0..KEY_COUNT {
@@ -2257,7 +2257,7 @@ async fn test_multi_level_delete_reinsert_compaction_correctness() {
         }
         engine.write_batch(batch).unwrap();
     }
-    engine.flush_all_with_active().unwrap();
+    engine.flush_all_with_active_async().await.unwrap();
 
     // Extra flushed data to drive cascading compaction.
     let mut filler_ts = 100u64;
@@ -2272,7 +2272,7 @@ async fn test_multi_level_delete_reinsert_compaction_correctness() {
             );
             engine.write_batch(batch).unwrap();
         }
-        engine.flush_all_with_active().unwrap();
+        engine.flush_all_with_active_async().await.unwrap();
     }
 
     let compact_rounds = compact_until_idle(&engine, 24, Duration::from_secs(5)).await;

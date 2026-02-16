@@ -4,6 +4,9 @@
 
 UNIT_TEST_TIMEOUT_SECS ?= 1200
 STORE_TEST_TIMEOUT_SECS ?= 1200
+STORAGE_TEST_TIMEOUT_SECS ?= 1200
+COMPACTION_BATCH_TIMEOUT_SECS ?= 300
+COMPACTION_CASE_TIMEOUT_SECS ?= 240
 E2E_TEST_TIMEOUT_SECS ?= 900
 E2E_STMT_TIMEOUT_SECS ?= 15
 
@@ -39,8 +42,18 @@ store-test:
 
 # Run storage regression tests (ported RocksDB-style suites)
 storage-test:
-	./scripts/run_with_timeout.sh $(STORE_TEST_TIMEOUT_SECS) cargo test --test rocksdb_ported_tests
-	./scripts/run_with_timeout.sh $(STORE_TEST_TIMEOUT_SECS) cargo test --test rocksdb_ported_compaction_tests
+	./scripts/run_with_timeout.sh $(STORAGE_TEST_TIMEOUT_SECS) cargo test --test rocksdb_ported_tests
+	./scripts/run_with_timeout.sh $(COMPACTION_BATCH_TIMEOUT_SECS) \
+		cargo test --test rocksdb_ported_compaction_tests -- --test-threads=1 \
+		--skip test_compaction_scheduler_automatic \
+		--skip test_multi_level_cascading \
+		--skip test_multi_level_delete_reinsert_compaction_correctness
+	./scripts/run_with_timeout.sh $(COMPACTION_CASE_TIMEOUT_SECS) \
+		cargo test --test rocksdb_ported_compaction_tests test_compaction_scheduler_automatic -- --test-threads=1
+	./scripts/run_with_timeout.sh $(COMPACTION_CASE_TIMEOUT_SECS) \
+		cargo test --test rocksdb_ported_compaction_tests test_multi_level_cascading -- --test-threads=1
+	./scripts/run_with_timeout.sh $(COMPACTION_CASE_TIMEOUT_SECS) \
+		cargo test --test rocksdb_ported_compaction_tests test_multi_level_delete_reinsert_compaction_correctness -- --test-threads=1
 
 # Run failpoint crash-recovery tests (opt-in; requires feature flag)
 failpoint-test:

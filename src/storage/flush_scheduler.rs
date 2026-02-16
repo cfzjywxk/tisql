@@ -178,6 +178,11 @@ impl FlushSchedulerInner {
                                 metas.len(),
                                 self.flush_count.load(Ordering::Relaxed)
                             );
+                        } else {
+                            // Defensive backoff: if frozen_count > 0 but no memtable was
+                            // flushable in this pass (e.g. transient state mismatch), avoid
+                            // a tight loop that can starve runtime workers.
+                            tokio::time::sleep(Duration::from_millis(10)).await;
                         }
                     }
                     Err(e) => {
@@ -412,19 +417,21 @@ mod tests {
         readonly.set_mode(0o555); // no write bit for owner/group/others
         std::fs::set_permissions(&sst_dir, readonly).unwrap();
 
-        // Produce at least one frozen memtable while flush cannot create SST files.
-        let mut ts = 1u64;
-        tokio::time::timeout(Duration::from_secs(3), async {
-            while engine.frozen_count() == 0 {
-                let mut batch = WriteBatch::new();
-                batch.set_commit_ts(ts);
-                batch.put(format!("perm_key_{ts:04}").into_bytes(), vec![b'x'; 80]);
-                engine.write_batch(batch).unwrap();
-                ts += 1;
-            }
-        })
-        .await
-        .expect("failed to create frozen memtable under read-only SST directory");
+        // Deterministically create one frozen memtable while flush cannot create SST files.
+        // Avoid a busy write loop here: if the permission check is ineffective on some
+        // environments, the scheduler could flush quickly and keep frozen_count at 0 forever.
+        let mut batch = WriteBatch::new();
+        batch.set_commit_ts(1);
+        batch.put(b"perm_key_0001".to_vec(), vec![b'x'; 80]);
+        engine.write_batch(batch).unwrap();
+        if engine.frozen_count() == 0 {
+            assert!(
+                engine.freeze_active().is_some(),
+                "failed to create a frozen memtable under read-only SST directory"
+            );
+        }
+        assert!(engine.frozen_count() > 0);
+        scheduler.notify();
 
         tokio::time::sleep(Duration::from_millis(400)).await;
         let flushes_while_readonly = scheduler.flush_count();

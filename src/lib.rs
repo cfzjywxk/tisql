@@ -1204,36 +1204,64 @@ mod tests {
 
         let db = Database::open(config.clone()).unwrap();
 
-        // Write one durable clog entry and apply it to storage with the same LSN
-        // so flushed_lsn can advance past this boundary.
-        let key = b"log_gc_key".to_vec();
-        let value = b"log_gc_value".to_vec();
-        let mut clog_batch = ClogBatch::new();
-        clog_batch.add(ClogEntry {
+        // Txn 1: write durable clog + memtable entry.
+        let key1 = b"log_gc_key1".to_vec();
+        let value1 = b"log_gc_value1".to_vec();
+        let mut clog_batch1 = ClogBatch::new();
+        clog_batch1.add(ClogEntry {
             lsn: 0,
             txn_id: 42,
             op: ClogOp::Put {
-                key: key.clone(),
-                value: value.clone(),
+                key: key1.clone(),
+                value: value1.clone(),
             },
         });
-        let lsn = db
+        let lsn1 = db
             .txn_service
             .clog_service()
-            .write(&mut clog_batch, true)
+            .write(&mut clog_batch1, true)
             .unwrap()
             .await
             .unwrap();
 
-        let mut write_batch = WriteBatch::new();
-        write_batch.put(key.clone(), value.clone());
-        write_batch.set_commit_ts(100);
-        write_batch.set_clog_lsn(lsn);
-        db.storage.write_batch(write_batch).unwrap();
+        let mut write_batch1 = WriteBatch::new();
+        write_batch1.put(key1.clone(), value1.clone());
+        write_batch1.set_commit_ts(100);
+        write_batch1.set_clog_lsn(lsn1);
+        db.storage.write_batch(write_batch1).unwrap();
 
-        // Ensure Version.flushed_lsn advances so clog truncation can reclaim records.
-        // After flush_all_with_active, no in-memory data remains, so
-        // safe_lsn == flushed_lsn.
+        // Force key1 into a frozen memtable so the next flush has a remaining
+        // in-memory bound from key2 (below), allowing flushed_lsn to advance.
+        db.storage.freeze_active();
+
+        // Txn 2: stays in active during first flush to provide min_lsn bound.
+        let key2 = b"log_gc_key2".to_vec();
+        let value2 = b"log_gc_value2".to_vec();
+        let mut clog_batch2 = ClogBatch::new();
+        clog_batch2.add(ClogEntry {
+            lsn: 0,
+            txn_id: 43,
+            op: ClogOp::Put {
+                key: key2.clone(),
+                value: value2.clone(),
+            },
+        });
+        let lsn2 = db
+            .txn_service
+            .clog_service()
+            .write(&mut clog_batch2, true)
+            .unwrap()
+            .await
+            .unwrap();
+
+        let mut write_batch2 = WriteBatch::new();
+        write_batch2.put(key2.clone(), value2.clone());
+        write_batch2.set_commit_ts(101);
+        write_batch2.set_clog_lsn(lsn2);
+        db.storage.write_batch(write_batch2).unwrap();
+
+        // Flush all memtables; with two memtables this should advance boundary
+        // enough to reclaim at least txn1's clog entry.
         db.storage.flush_all_with_active().unwrap();
         let flushed_lsn = db.storage.current_version().flushed_lsn();
 
@@ -1241,7 +1269,7 @@ mod tests {
         let stats = db.run_log_gc_once().unwrap();
 
         assert!(
-            stats.flushed_lsn >= lsn,
+            stats.flushed_lsn >= lsn1,
             "log GC should use flushed_lsn that includes flushed clog entries"
         );
         assert_eq!(stats.flushed_lsn, flushed_lsn);
@@ -1265,7 +1293,8 @@ mod tests {
         drop(db);
 
         let db2 = Database::open(config).unwrap();
-        assert_eq!(db2.storage.get(&key).await.unwrap(), Some(value));
+        assert_eq!(db2.storage.get(&key1).await.unwrap(), Some(value1));
+        assert_eq!(db2.storage.get(&key2).await.unwrap(), Some(value2));
     }
 
     #[tokio::test]

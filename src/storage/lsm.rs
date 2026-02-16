@@ -392,6 +392,15 @@ impl LsmEngine {
         Arc::clone(&self.flush_gate)
     }
 
+    async fn acquire_flush_gate_write(&self) -> tokio::sync::RwLockWriteGuard<'_, ()> {
+        loop {
+            if let Ok(guard) = self.flush_gate.try_write() {
+                return guard;
+            }
+            tokio::task::yield_now().await;
+        }
+    }
+
     /// Get the current configuration.
     pub fn config(&self) -> &LsmConfig {
         &self.config
@@ -695,7 +704,7 @@ impl LsmEngine {
 
         // Step 1: mark memtable as flushing under commit/flush gate.
         {
-            let _gate = self.flush_gate.write().await;
+            let _gate = self.acquire_flush_gate_write().await;
             match memtable.flush_state() {
                 FlushState::NeedsFlush | FlushState::FlushedDirty => {
                     memtable.set_flush_state(FlushState::Flushing);
@@ -736,28 +745,33 @@ impl LsmEngine {
             block_size: self.config.block_size,
             compression: self.config.compression,
         };
-        let mut builder = AsyncSstBuilder::new(&sst_path, options, Arc::clone(&self.io))?;
+        let build_result: Result<SstMeta> = async {
+            let mut builder = AsyncSstBuilder::new(&sst_path, options, Arc::clone(&self.io))?;
 
-        // Iterate memtable using streaming iterator and add all entries INCLUDING tombstones
-        // as raw MVCC keys. SSTs MUST store MVCC keys (key || !commit_ts) to preserve version
-        // information for correct MVCC semantics during reads.
-        //
-        // Use truly unbounded range - MvccKey::unbounded() creates empty placeholder
-        // that signals "scan all entries" to the memtable.
-        let range = Arc::new(MvccKey::unbounded()..MvccKey::unbounded());
-        // Flush only committed data (owner_ts = 0 means no pending nodes visible)
-        let mut iter = memtable.inner().create_streaming_iter(range, 0);
-        iter.advance().await?; // Initialize iterator to first entry
+            // Iterate memtable using streaming iterator and add all entries INCLUDING tombstones
+            // as raw MVCC keys. SSTs MUST store MVCC keys (key || !commit_ts) to preserve version
+            // information for correct MVCC semantics during reads.
+            //
+            // Use truly unbounded range - MvccKey::unbounded() creates empty placeholder
+            // that signals "scan all entries" to the memtable.
+            let range = Arc::new(MvccKey::unbounded()..MvccKey::unbounded());
+            // Flush only committed data (owner_ts = 0 means no pending nodes visible)
+            let mut iter = memtable.inner().create_streaming_iter(range, 0);
+            iter.advance().await?; // Initialize iterator to first entry
 
-        while iter.valid() {
-            // Reconstruct MVCC key from user_key + timestamp
-            let mvcc_key = MvccKey::encode(iter.user_key(), iter.timestamp());
-            builder.add(mvcc_key.as_bytes(), iter.value()).await?;
-            iter.advance().await?;
+            while iter.valid() {
+                // Reconstruct MVCC key from user_key + timestamp
+                let mvcc_key = MvccKey::encode(iter.user_key(), iter.timestamp());
+                builder.add(mvcc_key.as_bytes(), iter.value()).await?;
+                iter.advance().await?;
+            }
+
+            // Finish building (writes to disk with fsync)
+            builder.finish(sst_id, 0).await
         }
+        .await;
 
-        // Finish building (writes to disk with fsync)
-        let meta = match builder.finish(sst_id, 0).await {
+        let meta = match build_result {
             Ok(meta) => meta,
             Err(e) => {
                 Self::rollback_flushing_state(memtable);
@@ -772,7 +786,7 @@ impl LsmEngine {
         // Phase 3 + 4: under flush gate, compute conservative flushed boundary
         // and commit manifest mutation atomically.
         {
-            let _gate = self.flush_gate.write().await;
+            let _gate = self.acquire_flush_gate_write().await;
             let safe_flushed_lsn = self
                 .min_lsn_excluding(memtable.id())
                 .map(|m| m.saturating_sub(1))
