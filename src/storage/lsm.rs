@@ -300,6 +300,17 @@ pub struct LsmEngine {
     /// allocated (via clog) but whose memtable write has not yet completed.
     /// See `InFlightLsnTracker` for details.
     in_flight_tracker: InFlightLsnTracker,
+
+    /// Serializes all ilog mutations with version updates.
+    ///
+    /// Ensures that every checkpoint reflects the latest version, and that
+    /// ilog commit + apply_delta are atomic with respect to concurrent
+    /// checkpoint writes. Without this:
+    /// - A concurrent compaction could write a CompactCommit (LSN < checkpoint_lsn)
+    ///   not yet applied to the checkpointed version — GC truncation removes it.
+    /// - A background checkpoint could use a stale version — recovery's rposition
+    ///   skips CompactCommit records that precede it in the file.
+    manifest_lock: parking_lot::Mutex<()>,
 }
 
 impl LsmEngine {
@@ -356,6 +367,7 @@ impl LsmEngine {
             gc_safe_point_updater: RwLock::new(None),
             dropped_table_ids: RwLock::new(HashMap::new()),
             in_flight_tracker: InFlightLsnTracker::new(DEFAULT_TRACKER_SLOTS),
+            manifest_lock: parking_lot::Mutex::new(()),
         })
     }
 
@@ -411,6 +423,15 @@ impl LsmEngine {
     /// Get the current version.
     pub fn current_version(&self) -> Arc<Version> {
         self.version_set.current()
+    }
+
+    /// Acquire the manifest lock.
+    ///
+    /// Must be held during log GC's version capture + checkpoint write.
+    /// Also held internally during flush/compaction commit + apply_delta +
+    /// background checkpoint writes.
+    pub fn manifest_guard(&self) -> parking_lot::MutexGuard<'_, ()> {
+        self.manifest_lock.lock()
     }
 
     /// Compute the minimum LSN across all in-memory memtables (active + frozen).
@@ -473,6 +494,21 @@ impl LsmEngine {
     /// possible LSN (1), meaning no truncation is safe.
     pub fn safe_log_gc_lsn(&self) -> u64 {
         let mut safe = self.version_set.current().flushed_lsn();
+        if let Some(min_mem_lsn) = self.min_unflushed_lsn() {
+            safe = safe.min(min_mem_lsn.saturating_sub(1));
+        }
+        if let Some(min_inf) = self.in_flight_tracker.min_in_flight() {
+            safe = safe.min(min_inf.saturating_sub(1));
+        }
+        safe
+    }
+
+    /// Compute safe clog truncation LSN, bounded by the given flushed_lsn.
+    ///
+    /// Used by log GC to make the clog boundary explicit — `flushed_lsn` comes
+    /// from the checkpointed version, not from a potentially newer version.
+    pub fn safe_log_gc_lsn_with(&self, flushed_lsn: u64) -> u64 {
+        let mut safe = flushed_lsn;
         if let Some(min_mem_lsn) = self.min_unflushed_lsn() {
             safe = safe.min(min_mem_lsn.saturating_sub(1));
         }
@@ -676,19 +712,39 @@ impl LsmEngine {
             safe
         };
 
-        // Phase 3: Write flush commit (if durable)
-        if let Some(ref ilog) = self.ilog {
-            ilog.write_flush_commit(meta.clone(), safe_flushed_lsn)?;
+        // Phase 3 + 4: Atomically write ilog commit, update version, and
+        // optionally write checkpoint — all under manifest_lock.
+        //
+        // The manifest_lock serializes (ilog commit + apply_delta + checkpoint)
+        // with concurrent compaction and log GC. This prevents:
+        // - Bug 2: GC capturing a stale version while our commit record exists
+        // - Bug 3: A concurrent compaction interleaving between our apply_delta
+        //   and our checkpoint, making the checkpoint stale for rposition recovery
+        {
+            let _manifest = self.manifest_lock.lock();
+
+            if let Some(ref ilog) = self.ilog {
+                ilog.write_flush_commit(meta.clone(), safe_flushed_lsn)?;
+            }
+
+            // Failpoint: crash after ilog commit, before version update
+            #[cfg(feature = "failpoints")]
+            fail_point!("lsm_flush_after_ilog_commit");
+
+            let delta = ManifestDelta::flush(meta.clone(), safe_flushed_lsn);
+            self.version_set.apply_delta(&delta);
+
+            if let Some(ref ilog) = self.ilog {
+                if ilog.needs_checkpoint() {
+                    ilog.write_checkpoint(self.version_set.current().as_ref())?;
+                }
+            }
         }
 
-        // Failpoint: crash after ilog commit, before version update
-        #[cfg(feature = "failpoints")]
-        fail_point!("lsm_flush_after_ilog_commit");
-
-        // Phase 4: Update version, then atomically update frozen + SuperVersion.
+        // Phase 5: Remove from frozen + install SV (separate state lock, after
+        // manifest_lock is released — no lock ordering issue).
         //
-        // apply_delta is done outside the state write lock to reduce contention.
-        // This is safe because readers that snapshot state and version separately
+        // apply_delta is done before frozen removal. This is safe because readers
         // may momentarily see the flushed memtable AND the new SST (redundant but
         // correct — get_at short-circuits on memtable hit, merge iterator deduplicates).
         // The dangerous direction (data in neither) cannot happen since version is
@@ -696,9 +752,6 @@ impl LsmEngine {
         //
         // install_super_version reads version_set.current() inside the state lock,
         // so SV readers always get a consistent (frozen, version) pair.
-        let delta = ManifestDelta::flush(meta.clone(), safe_flushed_lsn);
-        let new_version = self.version_set.apply_delta(&delta);
-
         {
             let mut state = self.state.write();
 
@@ -712,13 +765,6 @@ impl LsmEngine {
         // Failpoint: crash after version update
         #[cfg(feature = "failpoints")]
         fail_point!("lsm_flush_after_version_update");
-
-        // Check if checkpoint needed
-        if let Some(ref ilog) = self.ilog {
-            if ilog.needs_checkpoint() {
-                ilog.write_checkpoint(&new_version)?;
-            }
-        }
 
         // Notify compaction scheduler that new L0 SSTs are available
         if let Some(ref notify) = *self.compaction_notify.read() {
@@ -1025,15 +1071,24 @@ impl LsmEngine {
             delta.delete_sst(*level, *sst_id);
         }
 
-        // Write CompactCommit to ilog (if durable) — CompactCommit supports empty new_ssts
-        if let Some(ref ilog) = self.ilog {
-            ilog.write_compact_commit(obsolete_ssts, vec![])?;
+        // Atomically write CompactCommit + apply_delta + checkpoint under manifest_lock.
+        {
+            let _manifest = self.manifest_lock.lock();
+
+            if let Some(ref ilog) = self.ilog {
+                ilog.write_compact_commit(obsolete_ssts, vec![])?;
+            }
+
+            self.version_set.apply_delta(&delta);
+
+            if let Some(ref ilog) = self.ilog {
+                if ilog.needs_checkpoint() {
+                    ilog.write_checkpoint(self.version_set.current().as_ref())?;
+                }
+            }
         }
 
-        // Apply delta to VersionSet
-        let new_version = self.version_set.apply_delta(&delta);
-
-        // Install new SuperVersion
+        // Install new SuperVersion (after manifest_lock released)
         {
             #[allow(clippy::readonly_write_lock)]
             let state = self.state.write();
@@ -1042,13 +1097,6 @@ impl LsmEngine {
 
         // Delete physical SST files
         self.delete_obsolete_ssts(&delta)?;
-
-        // Checkpoint if needed
-        if let Some(ref ilog) = self.ilog {
-            if ilog.needs_checkpoint() {
-                ilog.write_checkpoint(&new_version)?;
-            }
-        }
 
         Ok(count)
     }
@@ -1205,21 +1253,27 @@ impl LsmEngine {
                 )
                 .await?;
 
-            // Apply delta
-            let new_version = self.version_set.apply_delta(&delta);
+            // Apply delta + optional checkpoint under manifest_lock.
+            // Even though trivial moves don't write ilog commit records,
+            // their checkpoint must be serialized with other operations to
+            // prevent Bug 3 (stale checkpoint via rposition).
+            {
+                let _manifest = self.manifest_lock.lock();
 
-            // Install new SuperVersion (write lock required by install_super_version signature)
+                self.version_set.apply_delta(&delta);
+
+                if let Some(ref ilog) = self.ilog {
+                    if ilog.needs_checkpoint() {
+                        ilog.write_checkpoint(self.version_set.current().as_ref())?;
+                    }
+                }
+            }
+
+            // Install new SuperVersion (after manifest_lock released)
             {
                 #[allow(clippy::readonly_write_lock)]
                 let state = self.state.write();
                 self.install_super_version(&state);
-            }
-
-            // Checkpoint if needed
-            if let Some(ref ilog) = self.ilog {
-                if ilog.needs_checkpoint() {
-                    ilog.write_checkpoint(&new_version)?;
-                }
             }
 
             return Ok(true);
@@ -1251,16 +1305,26 @@ impl LsmEngine {
             )
             .await?;
 
-        // Phase 4: Write CompactCommit (if durable)
-        if let Some(ref ilog) = self.ilog {
-            let new_ssts: Vec<SstMeta> = delta.new_ssts.iter().map(|m| (**m).clone()).collect();
-            ilog.write_compact_commit(delta.deleted_ssts.clone(), new_ssts)?;
+        // Phase 4 + 5: Atomically write ilog commit, update version, and
+        // optionally checkpoint — all under manifest_lock.
+        {
+            let _manifest = self.manifest_lock.lock();
+
+            if let Some(ref ilog) = self.ilog {
+                let new_ssts: Vec<SstMeta> = delta.new_ssts.iter().map(|m| (**m).clone()).collect();
+                ilog.write_compact_commit(delta.deleted_ssts.clone(), new_ssts)?;
+            }
+
+            self.version_set.apply_delta(&delta);
+
+            if let Some(ref ilog) = self.ilog {
+                if ilog.needs_checkpoint() {
+                    ilog.write_checkpoint(self.version_set.current().as_ref())?;
+                }
+            }
         }
 
-        // Phase 5: Apply ManifestDelta to VersionSet
-        let new_version = self.version_set.apply_delta(&delta);
-
-        // Phase 6: Install new SuperVersion (write lock required by install_super_version signature)
+        // Phase 6: Install new SuperVersion (after manifest_lock released)
         {
             #[allow(clippy::readonly_write_lock)]
             let state = self.state.write();
@@ -1269,13 +1333,6 @@ impl LsmEngine {
 
         // Phase 7: Delete obsolete SST files
         self.delete_obsolete_ssts(&delta)?;
-
-        // Phase 8: Checkpoint if needed
-        if let Some(ref ilog) = self.ilog {
-            if ilog.needs_checkpoint() {
-                ilog.write_checkpoint(&new_version)?;
-            }
-        }
 
         Ok(true)
     }
@@ -2844,6 +2901,7 @@ mod tests {
                 gc_safe_point_updater: RwLock::new(None),
                 dropped_table_ids: RwLock::new(HashMap::new()),
                 in_flight_tracker: InFlightLsnTracker::new(DEFAULT_TRACKER_SLOTS),
+                manifest_lock: parking_lot::Mutex::new(()),
             })
         }
     }

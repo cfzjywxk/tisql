@@ -123,20 +123,28 @@ struct LogGcCycleStats {
 
 /// Run one safe log GC cycle on standalone LSM components.
 ///
-/// Uses `safe_log_gc_lsn()` instead of raw `flushed_lsn` to avoid truncating
-/// clog entries that are still only in volatile memtables.
+/// Mirrors the production `Database::run_log_gc_once()` flow:
+/// 1. Hold manifest_lock during version capture + checkpoint write
+/// 2. Use `safe_log_gc_lsn_with()` pinned to checkpointed flushed_lsn
 fn run_log_gc_cycle(
     engine: &LsmEngine,
     ilog: &IlogService,
     clog: &FileClogService,
 ) -> Result<LogGcCycleStats, tisql::error::TiSqlError> {
-    let version = engine.current_version();
+    let (version, checkpoint_lsn) = {
+        let _manifest = engine.manifest_guard();
+
+        let version = engine.current_version();
+
+        fail_point!("log_gc_before_checkpoint");
+
+        let checkpoint_lsn = ilog.write_checkpoint(version.as_ref())?;
+
+        (version, checkpoint_lsn)
+    };
+
     let flushed_lsn = version.flushed_lsn();
-    let safe_lsn = engine.safe_log_gc_lsn();
-
-    fail_point!("log_gc_before_checkpoint");
-
-    let checkpoint_lsn = ilog.write_checkpoint(version.as_ref())?;
+    let safe_lsn = engine.safe_log_gc_lsn_with(flushed_lsn);
 
     fail_point!("log_gc_after_checkpoint_before_clog_truncate");
 

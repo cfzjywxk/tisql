@@ -773,14 +773,28 @@ impl Database {
     /// newer (unflushed) memtable. Using `flushed_lsn` alone would risk deleting
     /// clog entries that are still only in volatile memory.
     pub fn run_log_gc_once(&self) -> Result<LogGcStats> {
-        let version = self.storage.current_version();
+        // Hold manifest_lock during version capture + checkpoint write.
+        // This ensures all ilog records with LSN < checkpoint_lsn are
+        // reflected in `version` — safe to truncate.
+        let (version, checkpoint_lsn) = {
+            let _manifest = self.storage.manifest_guard();
+
+            let version = self.storage.current_version();
+
+            #[cfg(feature = "failpoints")]
+            fail_point!("log_gc_before_checkpoint");
+
+            let checkpoint_lsn = self.ilog.write_checkpoint(version.as_ref())?;
+
+            (version, checkpoint_lsn)
+        };
+        // manifest_lock released — flush/compaction can proceed
+
+        // Compute clog truncation boundary from the SAME version that was
+        // checkpointed. min_unflushed_lsn and min_in_flight are independent
+        // of the version and provide additional safety.
         let flushed_lsn = version.flushed_lsn();
-        let safe_lsn = self.storage.safe_log_gc_lsn();
-
-        #[cfg(feature = "failpoints")]
-        fail_point!("log_gc_before_checkpoint");
-
-        let checkpoint_lsn = self.ilog.write_checkpoint(version.as_ref())?;
+        let safe_lsn = self.storage.safe_log_gc_lsn_with(flushed_lsn);
 
         #[cfg(feature = "failpoints")]
         fail_point!("log_gc_after_checkpoint_before_clog_truncate");
@@ -794,6 +808,11 @@ impl Database {
 
         #[cfg(feature = "failpoints")]
         fail_point!("log_gc_after_ilog_truncate");
+
+        debug_assert!(
+            safe_lsn <= flushed_lsn,
+            "safe_lsn ({safe_lsn}) exceeds checkpointed flushed_lsn ({flushed_lsn})"
+        );
 
         Ok(LogGcStats {
             flushed_lsn,
