@@ -148,6 +148,7 @@ pub use sstable::{
 
 use std::collections::BTreeMap;
 use std::ops::Range;
+use std::time::Duration;
 
 use crate::error::Result;
 use crate::types::{Key, RawValue, TableId, Timestamp};
@@ -401,6 +402,18 @@ impl WriteBatch {
 // Pessimistic Storage Trait - For Explicit Transactions
 // ============================================================================
 
+/// Errors returned by pessimistic pending-write operations.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PessimisticWriteError {
+    /// Key is locked by another transaction.
+    LockConflict(Timestamp),
+    /// Write throttled by storage backpressure.
+    ///
+    /// `delay=Some(d)` means caller should sleep/retry after `d`.
+    /// `delay=None` means hard stall/retry later without delay hint.
+    WriteStall { delay: Option<Duration> },
+}
+
 /// Pessimistic storage operations for explicit transactions.
 ///
 /// This trait extends `StorageEngine` with methods for pessimistic locking:
@@ -423,7 +436,12 @@ impl WriteBatch {
 /// let result = storage.put_pending(key, value, txn.start_ts);
 /// match result {
 ///     Ok(()) => { /* lock acquired, value written */ },
-///     Err(lock_owner) => { /* blocked by another transaction */ },
+///     Err(PessimisticWriteError::LockConflict(lock_owner)) => {
+///         /* blocked by another transaction */
+///     }
+///     Err(PessimisticWriteError::WriteStall { delay }) => {
+///         /* apply async sleep/retry policy in caller */
+///     }
 /// }
 ///
 /// // On commit: finalize all pending writes
@@ -444,7 +462,8 @@ pub trait PessimisticStorage: StorageEngine {
     /// # Returns
     ///
     /// * `Ok(())` - Write successful, lock acquired
-    /// * `Err(lock_owner)` - Key is locked by another transaction with start_ts = lock_owner
+    /// * `Err(LockConflict(lock_owner))` - Locked by another transaction
+    /// * `Err(WriteStall { .. })` - Storage backpressure/stall signal
     ///
     /// If the key is already locked by the same transaction (owner_start_ts matches),
     /// the value is updated in place without error.
@@ -453,7 +472,7 @@ pub trait PessimisticStorage: StorageEngine {
         key: &[u8],
         value: RawValue,
         owner_start_ts: Timestamp,
-    ) -> std::result::Result<(), Timestamp>;
+    ) -> std::result::Result<(), PessimisticWriteError>;
 
     /// Check if a key is locked by a pending write.
     ///
@@ -504,12 +523,13 @@ pub trait PessimisticStorage: StorageEngine {
     ///
     /// * `Ok(true)` - Delete was performed (LOCK or TOMBSTONE written)
     /// * `Ok(false)` - Key doesn't exist or already deleted
-    /// * `Err(lock_owner)` - Key is locked by another transaction
+    /// * `Err(LockConflict(lock_owner))` - Key locked by another transaction
+    /// * `Err(WriteStall { .. })` - Storage backpressure/stall signal
     fn delete_pending(
         &self,
         key: &[u8],
         owner_start_ts: Timestamp,
-    ) -> std::result::Result<bool, Timestamp>;
+    ) -> std::result::Result<bool, PessimisticWriteError>;
 
     /// Get a value with read-your-writes support.
     ///

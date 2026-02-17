@@ -67,7 +67,9 @@ use crate::error::{Result, TiSqlError};
 use crate::storage::mvcc::{
     is_lock, is_tombstone, MvccIterator, MvccKey, SharedMvccRange, LOCK, TOMBSTONE,
 };
-use crate::storage::{PessimisticStorage, StorageEngine, WriteBatch, WriteOp};
+use crate::storage::{
+    PessimisticStorage, PessimisticWriteError, StorageEngine, WriteBatch, WriteOp,
+};
 use crate::types::{Key, RawValue, Timestamp};
 
 // ============================================================================
@@ -1051,9 +1053,10 @@ impl PessimisticStorage for VersionedMemTableEngine {
         key: &[u8],
         value: RawValue,
         owner_start_ts: Timestamp,
-    ) -> std::result::Result<(), Timestamp> {
-        // Delegate to the inherent method
+    ) -> std::result::Result<(), PessimisticWriteError> {
+        // Delegate to the inherent method.
         VersionedMemTableEngine::put_pending(self, key, value, owner_start_ts)
+            .map_err(PessimisticWriteError::LockConflict)
     }
 
     fn get_lock_owner(&self, key: &[u8]) -> Option<Timestamp> {
@@ -1075,9 +1078,10 @@ impl PessimisticStorage for VersionedMemTableEngine {
         &self,
         key: &[u8],
         owner_start_ts: Timestamp,
-    ) -> std::result::Result<bool, Timestamp> {
-        // Delegate to the inherent method
+    ) -> std::result::Result<bool, PessimisticWriteError> {
+        // Delegate to the inherent method.
         VersionedMemTableEngine::delete_pending(self, key, owner_start_ts)
+            .map_err(PessimisticWriteError::LockConflict)
     }
 
     async fn get_with_owner(

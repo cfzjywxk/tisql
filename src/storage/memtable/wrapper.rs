@@ -36,10 +36,18 @@ use std::sync::atomic::{AtomicBool, AtomicU64, AtomicU8, AtomicUsize, Ordering};
 use std::time::Instant;
 
 use crate::error::Result;
-use crate::storage::WriteBatch;
+use crate::storage::mvcc::TOMBSTONE;
+use crate::storage::{PessimisticWriteError, WriteBatch};
 
 use super::versioned_memtable::PendingResolveStats;
 use super::VersionedMemTableEngine;
+
+const ENTRY_OVERHEAD: usize = 64;
+
+#[inline]
+fn estimate_entry_size(key_len: usize, value_len: usize) -> usize {
+    key_len + value_len + ENTRY_OVERHEAD
+}
 
 /// Flush lifecycle state of a frozen memtable.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -325,21 +333,29 @@ impl MemTable {
 
     /// Write a pending value for pessimistic transactions.
     ///
-    /// Returns `Ok(())` if write was successful, `Err(lock_owner)` if locked by another txn.
+    /// Returns:
+    /// - `Ok(())` if write was successful
+    /// - `Err(LockConflict(lock_owner))` if locked by another txn
+    /// - `Err(WriteStall { .. })` if this memtable is frozen
     pub fn put_pending(
         &self,
         key: &[u8],
         value: Vec<u8>,
         owner_start_ts: crate::types::Timestamp,
-    ) -> std::result::Result<(), crate::types::Timestamp> {
+    ) -> std::result::Result<(), PessimisticWriteError> {
         if self.is_frozen() {
             // Frozen memtables cannot accept new writes
-            // Return a sentinel value to indicate this - the caller should handle this case
-            return Err(0);
+            return Err(PessimisticWriteError::WriteStall { delay: None });
         }
-        let created = self.inner.put_pending_counted(key, value, owner_start_ts)?;
+        let value_len = value.len();
+        let created = self
+            .inner
+            .put_pending_counted(key, value, owner_start_ts)
+            .map_err(PessimisticWriteError::LockConflict)?;
         if created {
             self.pending_count.fetch_add(1, Ordering::AcqRel);
+            self.approximate_size
+                .fetch_add(estimate_entry_size(key.len(), value_len), Ordering::Relaxed);
         }
         Ok(())
     }
@@ -389,22 +405,30 @@ impl MemTable {
 
     /// Delete a key with pessimistic locking.
     ///
-    /// Returns `Ok(true)` if delete was performed, `Ok(false)` if key doesn't exist,
-    /// `Err(lock_owner)` if key is locked by another transaction.
+    /// Returns:
+    /// - `Ok(true)` if delete was performed
+    /// - `Ok(false)` if key doesn't exist
+    /// - `Err(LockConflict(lock_owner))` if key is locked by another transaction
+    /// - `Err(WriteStall { .. })` if this memtable is frozen
     pub fn delete_pending(
         &self,
         key: &[u8],
         owner_start_ts: crate::types::Timestamp,
-    ) -> std::result::Result<bool, crate::types::Timestamp> {
+    ) -> std::result::Result<bool, PessimisticWriteError> {
         if self.is_frozen() {
             // Frozen memtables cannot accept new writes
-            return Err(0);
+            return Err(PessimisticWriteError::WriteStall { delay: None });
         }
         let outcome = self
             .inner
-            .delete_pending_with_outcome(key, owner_start_ts)?;
+            .delete_pending_with_outcome(key, owner_start_ts)
+            .map_err(PessimisticWriteError::LockConflict)?;
         if outcome.pending_created() {
             self.pending_count.fetch_add(1, Ordering::AcqRel);
+            self.approximate_size.fetch_add(
+                estimate_entry_size(key.len(), TOMBSTONE.len()),
+                Ordering::Relaxed,
+            );
         }
         Ok(outcome.performed())
     }
@@ -426,16 +450,11 @@ impl MemTable {
 ///
 /// This is a rough estimate: key size + value size + overhead per entry.
 fn estimate_batch_size(batch: &WriteBatch) -> usize {
-    // VersionedMemTableEngine has different overhead than crossbeam:
-    // - ~64 bytes for VersionNode (ts, value vec, next pointer)
-    // - Skiplist node overhead shared across versions of same key
-    const ENTRY_OVERHEAD: usize = 64;
-
     batch
         .iter()
         .map(|(key, op)| match op {
-            crate::storage::WriteOp::Put { value } => key.len() + value.len() + ENTRY_OVERHEAD,
-            crate::storage::WriteOp::Delete => key.len() + ENTRY_OVERHEAD,
+            crate::storage::WriteOp::Put { value } => estimate_entry_size(key.len(), value.len()),
+            crate::storage::WriteOp::Delete => estimate_entry_size(key.len(), 0),
         })
         .sum()
 }
@@ -864,6 +883,7 @@ mod tests {
     #[test]
     fn test_memtable_get_lock_owner() {
         let mt = MemTable::new(1);
+        let size_before = mt.approximate_size();
 
         // No lock initially
         assert!(mt.get_lock_owner(b"key").is_none());
@@ -873,6 +893,10 @@ mod tests {
 
         // Now has lock owner
         assert_eq!(mt.get_lock_owner(b"key"), Some(100));
+        assert!(
+            mt.approximate_size() > size_before,
+            "pending write should contribute to approximate_size"
+        );
     }
 
     #[tokio::test]
@@ -919,11 +943,16 @@ mod tests {
         let mut batch = new_batch(100);
         batch.put(b"key".to_vec(), b"value".to_vec());
         mt.write_batch_with_lsn(batch, 1).unwrap();
+        let size_before_delete = mt.approximate_size();
 
         // Delete with pending
         let result = mt.delete_pending(b"key", 200);
         assert!(result.is_ok());
         assert!(result.unwrap()); // true = deleted
+        assert!(
+            mt.approximate_size() > size_before_delete,
+            "pending tombstone should contribute to approximate_size"
+        );
 
         // Finalize the delete
         mt.finalize_pending(&[b"key".to_vec()], 200, 300);
@@ -955,10 +984,12 @@ mod tests {
         let mt = MemTable::new(1);
         mt.freeze();
 
-        // Should return Err(0) for frozen memtable
+        // Should return hard stall for frozen memtable
         let result = mt.put_pending(b"key", b"value".to_vec(), 100);
-        assert!(result.is_err());
-        assert_eq!(result.unwrap_err(), 0);
+        assert_eq!(
+            result,
+            Err(PessimisticWriteError::WriteStall { delay: None })
+        );
     }
 
     #[test]
@@ -966,9 +997,11 @@ mod tests {
         let mt = MemTable::new(1);
         mt.freeze();
 
-        // Should return Err(0) for frozen memtable
+        // Should return hard stall for frozen memtable
         let result = mt.delete_pending(b"key", 100);
-        assert!(result.is_err());
-        assert_eq!(result.unwrap_err(), 0);
+        assert_eq!(
+            result,
+            Err(PessimisticWriteError::WriteStall { delay: None })
+        );
     }
 }

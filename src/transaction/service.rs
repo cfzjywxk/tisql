@@ -30,7 +30,7 @@ use crate::tso::TsoService;
 use super::api::{CommitInfo, MutationType, TxnCtx, TxnService, TxnState};
 use super::concurrency::ConcurrencyManager;
 use crate::storage::mvcc::{is_tombstone, MvccIterator, MvccKey, LOCK, TOMBSTONE};
-use crate::storage::{PessimisticStorage, StorageEngine, WriteBatch};
+use crate::storage::{PessimisticStorage, PessimisticWriteError, StorageEngine, WriteBatch};
 use crate::types::{Key, RawValue, Timestamp, TxnId};
 
 /// Transaction service manages transactions with durability and MVCC.
@@ -106,6 +106,38 @@ impl<S: StorageEngine, L: ClogService, T: TsoService> TransactionService<S, L, T
     /// Used for computing the GC safe point when no explicit transactions are active.
     pub fn last_ts(&self) -> Timestamp {
         self.tso.last_ts()
+    }
+
+    /// Write a pending value and retry when storage requests slowdown delay.
+    ///
+    /// This keeps storage trait methods synchronous while ensuring async callers
+    /// can apply `tokio::time::sleep` for backpressure hints.
+    async fn put_pending_with_retry(
+        &self,
+        key: &[u8],
+        value: RawValue,
+        owner_start_ts: Timestamp,
+    ) -> std::result::Result<(), PessimisticWriteError>
+    where
+        S: PessimisticStorage,
+    {
+        // Keep retries bounded so explicit txn writes fail fast instead of hanging
+        // indefinitely if background compaction cannot clear slowdown pressure.
+        const MAX_SLOWDOWN_RETRIES: usize = 32;
+        let mut retries = 0;
+        loop {
+            match self.storage.put_pending(key, value.clone(), owner_start_ts) {
+                Ok(()) => return Ok(()),
+                Err(PessimisticWriteError::WriteStall { delay: Some(delay) }) => {
+                    if retries >= MAX_SLOWDOWN_RETRIES {
+                        return Err(PessimisticWriteError::WriteStall { delay: None });
+                    }
+                    retries += 1;
+                    tokio::time::sleep(delay).await;
+                }
+                Err(e) => return Err(e),
+            }
+        }
     }
 
     /// Execute a write batch with durability guarantees (for direct/autocommit writes).
@@ -288,18 +320,24 @@ impl<S: PessimisticStorage + 'static, L: ClogService + 'static, T: TsoService> T
         }
 
         // Write pending node directly to storage.
-        match self.storage.put_pending(&key, value, ctx.start_ts) {
+        match self.put_pending_with_retry(&key, value, ctx.start_ts).await {
             Ok(()) => {
                 // Single insert handles both: adding a new Write entry AND
                 // upgrading Lock→Write (overwrite) if key had a prior LOCK.
                 ctx.mutations.insert(key, MutationType::Write);
                 Ok(())
             }
-            Err(lock_owner) => Err(TiSqlError::KeyIsLocked {
+            Err(PessimisticWriteError::LockConflict(lock_owner)) => Err(TiSqlError::KeyIsLocked {
                 key,
                 lock_ts: lock_owner,
                 primary: vec![],
             }),
+            Err(PessimisticWriteError::WriteStall { delay: None }) => Err(TiSqlError::Storage(
+                "Write stalled: storage backpressure, retry later".to_string(),
+            )),
+            Err(PessimisticWriteError::WriteStall { delay: Some(_) }) => {
+                unreachable!("put_pending_with_retry returns only LockConflict or hard WriteStall")
+            }
         }
     }
 
@@ -328,33 +366,52 @@ impl<S: PessimisticStorage + 'static, L: ClogService + 'static, T: TsoService> T
         if value_exists {
             // Value exists (committed or own pending) → TOMBSTONE
             match self
-                .storage
-                .put_pending(&key, TOMBSTONE.to_vec(), ctx.start_ts)
+                .put_pending_with_retry(&key, TOMBSTONE.to_vec(), ctx.start_ts)
+                .await
             {
                 Ok(()) => {
                     ctx.mutations.insert(key, MutationType::Write);
                     Ok(())
                 }
-                Err(lock_owner) => Err(TiSqlError::KeyIsLocked {
-                    key,
-                    lock_ts: lock_owner,
-                    primary: vec![],
-                }),
+                Err(PessimisticWriteError::LockConflict(lock_owner)) => {
+                    Err(TiSqlError::KeyIsLocked {
+                        key,
+                        lock_ts: lock_owner,
+                        primary: vec![],
+                    })
+                }
+                Err(PessimisticWriteError::WriteStall { delay: None }) => Err(TiSqlError::Storage(
+                    "Write stalled: storage backpressure, retry later".into(),
+                )),
+                Err(PessimisticWriteError::WriteStall { delay: Some(_) }) => unreachable!(
+                    "put_pending_with_retry returns only LockConflict or hard WriteStall"
+                ),
             }
         } else {
             // No value exists → LOCK (pessimistic lock only, not persisted to clog)
-            match self.storage.put_pending(&key, LOCK.to_vec(), ctx.start_ts) {
+            match self
+                .put_pending_with_retry(&key, LOCK.to_vec(), ctx.start_ts)
+                .await
+            {
                 Ok(()) => {
                     // or_insert preserves existing Write if key was previously put
                     // (won't downgrade Write→Lock).
                     ctx.mutations.entry(key).or_insert(MutationType::Lock);
                     Ok(())
                 }
-                Err(lock_owner) => Err(TiSqlError::KeyIsLocked {
-                    key,
-                    lock_ts: lock_owner,
-                    primary: vec![],
-                }),
+                Err(PessimisticWriteError::LockConflict(lock_owner)) => {
+                    Err(TiSqlError::KeyIsLocked {
+                        key,
+                        lock_ts: lock_owner,
+                        primary: vec![],
+                    })
+                }
+                Err(PessimisticWriteError::WriteStall { delay: None }) => Err(TiSqlError::Storage(
+                    "Write stalled: storage backpressure, retry later".into(),
+                )),
+                Err(PessimisticWriteError::WriteStall { delay: Some(_) }) => unreachable!(
+                    "put_pending_with_retry returns only LockConflict or hard WriteStall"
+                ),
             }
         }
     }

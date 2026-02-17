@@ -57,7 +57,7 @@ use fail::fail_point;
 use crate::error::{Result, TiSqlError};
 use crate::lsn::SharedLsnProvider;
 use crate::storage::mvcc::{decode_mvcc_key, is_tombstone, MvccIterator, MvccKey, SharedMvccRange};
-use crate::storage::{PessimisticStorage, StorageEngine, WriteBatch};
+use crate::storage::{PessimisticStorage, PessimisticWriteError, StorageEngine, WriteBatch};
 use crate::types::{Key, RawValue, Timestamp};
 
 use super::config::LsmConfig;
@@ -1198,8 +1198,12 @@ impl LsmEngine {
     /// 2. **Frozen memtable stall**: If the active memtable is full AND frozen list
     ///    is at capacity, return error immediately (caller should retry after flush).
     fn check_write_stall(&self) -> Result<Option<Duration>> {
-        // L0 slowdown: compute delay
         let l0_count = self.current_version().level_size(0);
+        self.check_write_stall_with_l0(l0_count)
+    }
+
+    fn check_write_stall_with_l0(&self, l0_count: usize) -> Result<Option<Duration>> {
+        // L0 slowdown: compute delay
         let delay = if self.config.should_slowdown_writes(l0_count)
             && !self.config.should_stop_writes(l0_count)
         {
@@ -1233,6 +1237,22 @@ impl LsmEngine {
         let excess = (l0_count.saturating_sub(slowdown).min(stop - slowdown)) as u64;
         let delay_ms = 1 + 99 * excess / range;
         Duration::from_millis(delay_ms)
+    }
+
+    /// Return pending-write backpressure status without sleeping.
+    ///
+    /// Pending writes are called from async txn code paths; the caller decides
+    /// whether to sleep/retry on `WriteStall { delay: Some(..) }`.
+    fn pending_write_pressure_status(&self) -> std::result::Result<(), PessimisticWriteError> {
+        let l0_count = self.current_version().level_size(0);
+        if self.config.should_stop_writes(l0_count) {
+            return Err(PessimisticWriteError::WriteStall { delay: None });
+        }
+        match self.check_write_stall_with_l0(l0_count) {
+            Ok(Some(delay)) => Err(PessimisticWriteError::WriteStall { delay: Some(delay) }),
+            Ok(None) => Ok(()),
+            Err(_) => Err(PessimisticWriteError::WriteStall { delay: None }),
+        }
     }
 
     /// Shared write logic: allocate LSN, write to memtable, maybe rotate.
@@ -2782,10 +2802,22 @@ impl PessimisticStorage for LsmEngine {
         key: &[u8],
         value: RawValue,
         owner_start_ts: Timestamp,
-    ) -> std::result::Result<(), Timestamp> {
-        // Forward to active memtable
-        let state = self.state.read();
-        state.active.put_pending(key, value, owner_start_ts)
+    ) -> std::result::Result<(), PessimisticWriteError> {
+        self.pending_write_pressure_status()?;
+
+        // Keep the read lock scope minimal and drop it before maybe_rotate().
+        let write_result = {
+            let state = self.state.read();
+            state.active.put_pending(key, value, owner_start_ts)
+        };
+
+        match write_result {
+            Ok(()) => {
+                let _ = self.maybe_rotate();
+                Ok(())
+            }
+            Err(err) => Err(err),
+        }
     }
 
     fn get_lock_owner(&self, key: &[u8]) -> Option<Timestamp> {
@@ -2862,25 +2894,36 @@ impl PessimisticStorage for LsmEngine {
         &self,
         key: &[u8],
         owner_start_ts: Timestamp,
-    ) -> std::result::Result<bool, Timestamp> {
-        // Check for lock conflicts across all memtables first
-        let state = self.state.read();
+    ) -> std::result::Result<bool, PessimisticWriteError> {
+        // TransactionService currently uses explicit put_pending(LOCK/TOMBSTONE)
+        // for delete semantics; keep this method as trait completeness and tests.
+        self.pending_write_pressure_status()?;
 
-        // Check frozen memtables for conflicts (newest to oldest = iterate from back)
-        for frozen in state.frozen.iter().rev() {
-            if let Some(owner) = frozen.get_lock_owner(key) {
-                if owner != owner_start_ts {
-                    return Err(owner);
+        // Check for lock conflicts across all memtables first
+        let delete_result = {
+            let state = self.state.read();
+
+            // Check frozen memtables for conflicts (newest to oldest = iterate from back)
+            for frozen in state.frozen.iter().rev() {
+                if let Some(owner) = frozen.get_lock_owner(key) {
+                    if owner != owner_start_ts {
+                        return Err(PessimisticWriteError::LockConflict(owner));
+                    }
                 }
             }
-        }
 
-        // Forward delete to active memtable
-        // The active memtable will handle:
-        // - Our pending write -> convert to LOCK
-        // - Committed value -> write pending TOMBSTONE
-        // - No value -> return Ok(false)
-        state.active.delete_pending(key, owner_start_ts)
+            // Forward delete to active memtable. The active memtable handles:
+            // - our pending write -> convert to LOCK
+            // - committed value -> write pending TOMBSTONE
+            // - no value -> return Ok(false)
+            state.active.delete_pending(key, owner_start_ts)
+        };
+
+        if delete_result.as_ref().is_ok_and(|performed| *performed) {
+            // Drop state.read() first, then check rotate.
+            let _ = self.maybe_rotate();
+        }
+        delete_result
     }
 
     async fn get_with_owner(
@@ -2970,6 +3013,7 @@ pub struct LsmStats {
 mod tests {
     use super::*;
     use crate::storage::mvcc::{is_tombstone, LOCK, TOMBSTONE};
+    use crate::storage::PessimisticWriteError;
     use std::path::Path;
     use tempfile::TempDir;
 
@@ -7966,6 +8010,76 @@ mod tests {
         assert!(
             engine.write_batch(batch).is_ok(),
             "Should succeed after flush"
+        );
+    }
+
+    #[test]
+    fn test_pending_put_returns_write_stall_when_frozen_memtables_full() {
+        // Pending writes should report a hard stall under frozen-memtable pressure.
+        let tmp = TempDir::new().unwrap();
+        let config = LsmConfig::builder(tmp.path())
+            .memtable_size(100)
+            .max_frozen_memtables(1)
+            .l0_compaction_trigger(100)
+            .l0_slowdown_trigger(200)
+            .l0_stop_trigger(300)
+            .build()
+            .unwrap();
+        let engine = LsmEngine::open(config).unwrap();
+
+        // Fill active and freeze once.
+        let mut batch = WriteBatch::new();
+        batch.set_commit_ts(1);
+        batch.put(b"k1".to_vec(), vec![b'x'; 60]);
+        engine.write_batch(batch).unwrap();
+
+        let mut batch = WriteBatch::new();
+        batch.set_commit_ts(2);
+        batch.put(b"k2".to_vec(), vec![b'x'; 60]);
+        engine.write_batch(batch).unwrap();
+
+        // Fill the new active so both active and frozen are at pressure.
+        let mut batch = WriteBatch::new();
+        batch.set_commit_ts(3);
+        batch.put(b"k3".to_vec(), vec![b'x'; 60]);
+        let _ = engine.write_batch(batch);
+
+        let result = engine.put_pending(b"pending_stalled", b"value".to_vec(), 100);
+        assert_eq!(
+            result,
+            Err(PessimisticWriteError::WriteStall { delay: None })
+        );
+    }
+
+    #[test]
+    fn test_pending_put_lock_conflict_still_reported() {
+        let tmp = TempDir::new().unwrap();
+        let config = test_config(tmp.path());
+        let engine = LsmEngine::open(config).unwrap();
+
+        engine.put_pending(b"key", b"v1".to_vec(), 100).unwrap();
+        let result = engine.put_pending(b"key", b"v2".to_vec(), 200);
+        assert_eq!(result, Err(PessimisticWriteError::LockConflict(100)));
+    }
+
+    #[test]
+    fn test_pending_put_triggers_rotation_after_write() {
+        let tmp = TempDir::new().unwrap();
+        let config = LsmConfig::builder(tmp.path())
+            .memtable_size(64)
+            .max_frozen_memtables(4)
+            .build()
+            .unwrap();
+        let engine = LsmEngine::open(config).unwrap();
+
+        engine
+            .put_pending(b"rot_key", vec![b'x'; 128], 100)
+            .unwrap();
+
+        let state = engine.state.read();
+        assert!(
+            !state.frozen.is_empty(),
+            "pending write should trigger memtable rotation when size threshold is crossed"
         );
     }
 
