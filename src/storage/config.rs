@@ -218,9 +218,8 @@ impl LsmConfig {
             flush_threads: 1,
             verify_checksums: true,
             sync_writes: true,
-            // Phase 3 behavior was shadow-by-default; keep that as initial value
-            // while Phase 4 adds runtime switching.
-            v26_boundary_mode: V26BoundaryMode::Shadow,
+            // Phase 5: reservation/in-flight boundary is authoritative.
+            v26_boundary_mode: V26BoundaryMode::On,
         }
     }
 
@@ -439,7 +438,7 @@ mod tests {
         assert_eq!(config.block_size, DEFAULT_BLOCK_SIZE);
         assert_eq!(config.l0_compaction_trigger, DEFAULT_L0_COMPACTION_TRIGGER);
         assert_eq!(config.max_levels, DEFAULT_MAX_LEVELS);
-        assert_eq!(config.v26_boundary_mode, V26BoundaryMode::Shadow);
+        assert_eq!(config.v26_boundary_mode, V26BoundaryMode::On);
         assert!(config.validate().is_ok());
     }
 

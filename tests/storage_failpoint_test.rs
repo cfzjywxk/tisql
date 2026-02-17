@@ -33,9 +33,9 @@ use tisql::storage::WriteBatch;
 use tisql::testkit::{
     ClogBatch, ConcurrencyManager, FileClogConfig, FileClogService, IlogConfig, IlogService,
     IlogTruncateStats, LocalTso, LsmConfigBuilder, LsmEngine, LsmRecovery, RecoveryResult,
-    TransactionService, TruncateStats, V26BoundaryMode, Version,
+    TransactionService, TruncateStats, Version,
 };
-use tisql::{ClogService, StorageEngine, TxnService};
+use tisql::{ClogService, StorageEngine, TxnService, V26BoundaryMode};
 
 /// Helper to create a test LSM engine with ilog for durability tests.
 async fn create_test_lsm_engine(
@@ -125,12 +125,11 @@ async fn create_test_txn_service_with_unified_logs(
     let (engine, ilog, clog) = create_test_lsm_engine_with_unified_logs(dir).await;
     let tso = Arc::new(LocalTso::new(1));
     let cm = Arc::new(ConcurrencyManager::new(0));
-    let txn_service = Arc::new(TransactionService::new_with_commit_fence(
+    let txn_service = Arc::new(TransactionService::new_strict(
         Arc::clone(&engine),
         Arc::clone(&clog),
         tso,
         cm,
-        Some(engine.flush_gate()),
     ));
     (engine, ilog, clog, txn_service)
 }
@@ -148,10 +147,7 @@ struct LogGcCycleStats {
 ///
 /// Mirrors the production `Database::run_log_gc_once()` flow:
 /// 1. Hold manifest_lock during version capture + checkpoint write
-/// 2. Compute mode-selected boundary:
-///    - off: old-gated only
-///    - shadow: new-live + old-gated, old authoritative
-///    - on: new-live authoritative (fail-safe min with old)
+/// 2. Compute authoritative V2.6 boundary (checkpoint + mem + reservation + in-flight caps)
 fn run_log_gc_cycle(
     engine: &LsmEngine,
     ilog: &IlogService,
@@ -170,50 +166,11 @@ fn run_log_gc_cycle(
     };
 
     let flushed_lsn = version.flushed_lsn();
-    let boundary_mode = engine.get_v26_mode();
     #[cfg(feature = "failpoints")]
     fail_point!("log_gc_after_checkpoint_before_safe_compute_v26");
-    let new_live_boundary = match boundary_mode {
-        V26BoundaryMode::Off => None,
-        V26BoundaryMode::Shadow | V26BoundaryMode::On => {
-            Some(engine.shadow_log_gc_boundary_with_caps(flushed_lsn))
-        }
-    };
-    let old_gated = {
-        let fence = engine.flush_gate();
-        let gate = tisql::io::block_on_sync(fence.write());
-        let safe = engine.safe_log_gc_lsn_with(flushed_lsn);
-        drop(gate);
-        safe
-    };
-    let safe_lsn = match (boundary_mode, new_live_boundary.as_ref()) {
-        (V26BoundaryMode::Off, _) => old_gated,
-        (V26BoundaryMode::Shadow, Some(new_live)) => {
-            debug_assert!(
-                new_live.safe_lsn <= old_gated,
-                "shadow log-gc boundary regression in test helper: new_live={} old_gated={} mem_cap={:?} reservation_cap={:?} inflight_cap={:?}",
-                new_live.safe_lsn,
-                old_gated,
-                new_live.mem_cap,
-                new_live.reservation_cap,
-                new_live.inflight_cap
-            );
-            old_gated
-        }
-        (V26BoundaryMode::On, Some(new_live)) => {
-            debug_assert!(
-                new_live.safe_lsn <= old_gated,
-                "on-mode log-gc boundary regression in test helper: new_live={} old_gated={} mem_cap={:?} reservation_cap={:?} inflight_cap={:?}",
-                new_live.safe_lsn,
-                old_gated,
-                new_live.mem_cap,
-                new_live.reservation_cap,
-                new_live.inflight_cap
-            );
-            new_live.safe_lsn.min(old_gated)
-        }
-        _ => old_gated,
-    };
+    let safe_lsn = engine
+        .shadow_log_gc_boundary_with_caps(flushed_lsn)
+        .safe_lsn;
 
     #[cfg(feature = "failpoints")]
     fail_point!("log_gc_after_safe_compute_before_clog_truncate_v26");
@@ -268,22 +225,13 @@ async fn test_v26_mode_matrix_log_gc_boundary_selection() {
         let dir = tempfile::tempdir().unwrap();
         let (engine, ilog, clog, _reserved_lsn) = prepare_v26_mode_boundary_case(&dir).await;
         engine.set_v26_mode(mode);
-        assert_eq!(engine.get_v26_mode(), mode);
+        assert_eq!(engine.get_v26_mode(), V26BoundaryMode::On);
 
         let flushed = engine.current_version().flushed_lsn();
-        let old_gated = engine.safe_log_gc_lsn_with(flushed);
-        let new_live = engine.shadow_log_gc_boundary_with_caps(flushed).safe_lsn;
-        assert!(
-            new_live <= old_gated,
-            "new boundary must stay <= old boundary in all modes"
-        );
+        let safe_expected = engine.shadow_log_gc_boundary_with_caps(flushed).safe_lsn;
 
         let stats = run_log_gc_cycle(&engine, &ilog, &clog).unwrap();
-        let expected = match mode {
-            V26BoundaryMode::Off | V26BoundaryMode::Shadow => old_gated,
-            V26BoundaryMode::On => new_live.min(old_gated),
-        };
-        assert_eq!(stats.safe_lsn, expected, "mode={mode:?}");
+        assert_eq!(stats.safe_lsn, safe_expected, "mode={mode:?}");
 
         drop(engine);
         drop(ilog);
@@ -300,28 +248,27 @@ async fn test_v26_mode_runtime_switch_off_on_off_log_gc() {
     let (engine, ilog, clog, _reserved_lsn) = prepare_v26_mode_boundary_case(&dir).await;
 
     let flushed = engine.current_version().flushed_lsn();
-    let old_gated = engine.safe_log_gc_lsn_with(flushed);
-    let new_live = engine.shadow_log_gc_boundary_with_caps(flushed).safe_lsn;
-    assert!(
-        new_live < old_gated,
-        "test setup must differentiate on vs off/shadow behavior"
-    );
+    let safe_expected = engine.shadow_log_gc_boundary_with_caps(flushed).safe_lsn;
 
     engine.set_v26_mode(V26BoundaryMode::Off);
+    assert_eq!(engine.get_v26_mode(), V26BoundaryMode::On);
     let off_stats = run_log_gc_cycle(&engine, &ilog, &clog).unwrap();
-    assert_eq!(off_stats.safe_lsn, old_gated);
+    assert_eq!(off_stats.safe_lsn, safe_expected);
 
     engine.set_v26_mode(V26BoundaryMode::On);
+    assert_eq!(engine.get_v26_mode(), V26BoundaryMode::On);
     let on_stats = run_log_gc_cycle(&engine, &ilog, &clog).unwrap();
-    assert_eq!(on_stats.safe_lsn, new_live);
+    assert_eq!(on_stats.safe_lsn, safe_expected);
 
     engine.set_v26_mode(V26BoundaryMode::Off);
+    assert_eq!(engine.get_v26_mode(), V26BoundaryMode::On);
     let off_again_stats = run_log_gc_cycle(&engine, &ilog, &clog).unwrap();
-    assert_eq!(off_again_stats.safe_lsn, old_gated);
+    assert_eq!(off_again_stats.safe_lsn, safe_expected);
 
     engine.set_v26_mode(V26BoundaryMode::Shadow);
+    assert_eq!(engine.get_v26_mode(), V26BoundaryMode::On);
     let shadow_stats = run_log_gc_cycle(&engine, &ilog, &clog).unwrap();
-    assert_eq!(shadow_stats.safe_lsn, old_gated);
+    assert_eq!(shadow_stats.safe_lsn, safe_expected);
 
     scenario.teardown();
 }

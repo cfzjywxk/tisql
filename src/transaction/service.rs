@@ -52,8 +52,10 @@ pub struct TransactionService<S: StorageEngine, L: ClogService, T: TsoService> {
     tso: Arc<T>,
     /// ConcurrencyManager for lock table and max_ts tracking
     concurrency_manager: Arc<ConcurrencyManager>,
-    /// Optional commit/flush coordination fence (LSM flush gate).
-    commit_fence: Option<Arc<tokio::sync::RwLock<()>>>,
+    /// Compatibility switch for legacy commit path that bypasses reservations.
+    ///
+    /// Production must keep this disabled.
+    allow_legacy_write_ops: bool,
 }
 
 /// Ensures commit reservations are released on every exit path.
@@ -95,22 +97,32 @@ impl<S: StorageEngine, L: ClogService, T: TsoService> TransactionService<S, L, T
         tso: Arc<T>,
         concurrency_manager: Arc<ConcurrencyManager>,
     ) -> Self {
-        Self::new_with_commit_fence(storage, clog_service, tso, concurrency_manager, None)
+        Self::new_with_policy(storage, clog_service, tso, concurrency_manager, true)
     }
 
-    pub fn new_with_commit_fence(
+    /// Create a production transaction service that requires reservation path.
+    pub fn new_strict(
         storage: Arc<S>,
         clog_service: Arc<L>,
         tso: Arc<T>,
         concurrency_manager: Arc<ConcurrencyManager>,
-        commit_fence: Option<Arc<tokio::sync::RwLock<()>>>,
+    ) -> Self {
+        Self::new_with_policy(storage, clog_service, tso, concurrency_manager, false)
+    }
+
+    fn new_with_policy(
+        storage: Arc<S>,
+        clog_service: Arc<L>,
+        tso: Arc<T>,
+        concurrency_manager: Arc<ConcurrencyManager>,
+        allow_legacy_write_ops: bool,
     ) -> Self {
         Self {
             storage,
             clog_service,
             tso,
             concurrency_manager,
-            commit_fence,
+            allow_legacy_write_ops,
         }
     }
 
@@ -524,10 +536,6 @@ impl<S: PessimisticStorage + 'static, L: ClogService + 'static, T: TsoService> T
             .collect();
 
         // V2.6: reserve commit LSN ahead of WAL write when storage supports it.
-        // Phase 2 keeps commit_fence authoritative; reservation path runs in parallel.
-        // Ordering note: reservation is installed before commit_fence.read().await.
-        // That's safe while old gated boundaries are authoritative. In Phase 3+,
-        // shadow/live boundary computations explicitly account for this ordering.
         ctx.reserved_lsn = self.storage.alloc_and_reserve_commit_lsn(start_ts);
         let mut reservation_guard = ctx
             .reserved_lsn
@@ -537,15 +545,6 @@ impl<S: PessimisticStorage + 'static, L: ClogService + 'static, T: TsoService> T
         if ctx.reserved_lsn.is_some() {
             fail_point!("txn_after_alloc_and_reserve_before_clog_write_v26");
         }
-
-        // Hold commit fence (if configured) across clog write + finalize/abort.
-        // This prevents flush/GC from computing boundaries while this txn is
-        // durable in clog but not yet reflected in memtable LSN tracking.
-        let _commit_fence = if let Some(fence) = &self.commit_fence {
-            Some(fence.read().await)
-        } else {
-            None
-        };
 
         // Step 5: Write to clog for durability (serializes synchronously, returns
         // future for fsync). After this call, ops/read_values are no longer needed.
@@ -559,7 +558,18 @@ impl<S: PessimisticStorage + 'static, L: ClogService + 'static, T: TsoService> T
             self.clog_service
                 .write_ops_with_lsn(txn_id, &ops, commit_ts, txn_lsn, true)
         } else {
-            self.clog_service.write_ops(txn_id, &ops, commit_ts, true)
+            if self.allow_legacy_write_ops {
+                tracing::warn!(
+                    txn_id,
+                    start_ts,
+                    "using legacy clog write_ops path without reservation; test compatibility mode"
+                );
+                self.clog_service.write_ops(txn_id, &ops, commit_ts, true)
+            } else {
+                Err(TiSqlError::Internal(
+                    "storage does not support commit LSN reservation path".into(),
+                ))
+            }
         };
 
         #[cfg(feature = "failpoints")]
@@ -643,13 +653,6 @@ impl<S: PessimisticStorage + 'static, L: ClogService + 'static, T: TsoService> T
         Self::check_active(&ctx)?;
 
         let mutations = std::mem::take(&mut ctx.mutations);
-
-        // Keep rollback/abort aligned with commit fence semantics:
-        // flush/GC boundary computations wait for pending resolution updates.
-        let _rollback_fence = self
-            .commit_fence
-            .as_ref()
-            .map(|fence| crate::io::block_on_sync(fence.read()));
 
         // Abort all pending nodes in storage
         if !mutations.is_empty() {
@@ -1002,6 +1005,23 @@ mod tests {
         (storage, txn_service, dir)
     }
 
+    fn create_strict_test_service() -> (
+        Arc<TestStorage>,
+        TransactionService<TestStorage, FileClogService, LocalTso>,
+        tempfile::TempDir,
+    ) {
+        let dir = tempdir().unwrap();
+        let config = FileClogConfig::with_dir(dir.path());
+        let io_handle = tokio::runtime::Handle::current();
+        let clog_service = Arc::new(FileClogService::open(config, &io_handle).unwrap());
+        let tso = Arc::new(LocalTso::new(1));
+        let cm = Arc::new(ConcurrencyManager::new(0));
+        let storage = Arc::new(MemTableEngine::new());
+        let txn_service =
+            TransactionService::new_strict(Arc::clone(&storage), clog_service, tso, cm);
+        (storage, txn_service, dir)
+    }
+
     // ========================================================================
     // Test Helpers Using MvccKey
     // ========================================================================
@@ -1065,6 +1085,28 @@ mod tests {
         assert_eq!(v1, Some(b"value1".to_vec()));
         let v2 = get_for_test(&*storage, b"key2").await;
         assert_eq!(v2, Some(b"value2".to_vec()));
+    }
+
+    #[tokio::test]
+    async fn test_strict_mode_rejects_storage_without_reservations() {
+        let (_storage, txn_service, _dir) = create_strict_test_service();
+
+        let mut ctx = txn_service.begin(false).unwrap();
+        txn_service
+            .put(&mut ctx, b"strict_key".to_vec(), b"strict_value".to_vec())
+            .await
+            .unwrap();
+
+        let err = txn_service.commit(ctx).await.unwrap_err();
+        match err {
+            TiSqlError::Internal(msg) => {
+                assert!(
+                    msg.contains("reservation"),
+                    "unexpected strict mode error message: {msg}"
+                );
+            }
+            other => panic!("expected strict mode Internal error, got {other:?}"),
+        }
     }
 
     #[tokio::test]
