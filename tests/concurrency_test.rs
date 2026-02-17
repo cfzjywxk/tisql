@@ -36,6 +36,10 @@ use tisql::testkit::{
 use tisql::types::{RawValue, Timestamp};
 use tisql::StorageEngine;
 
+fn make_test_io() -> Arc<tisql::io::IoService> {
+    tisql::io::IoService::new(32).unwrap()
+}
+
 // ==================== Test Helpers Using MvccKey ====================
 
 async fn get_at_for_test(storage: &MemTableEngine, key: &[u8], ts: Timestamp) -> Option<RawValue> {
@@ -87,7 +91,7 @@ fn create_test_service() -> TestServiceTuple {
     let dir = tempfile::tempdir().unwrap();
     let handle = tokio::runtime::Handle::current();
     let config = FileClogConfig::with_dir(dir.path());
-    let clog_service = Arc::new(FileClogService::open(config, &handle).unwrap());
+    let clog_service = Arc::new(FileClogService::open(config, make_test_io(), &handle).unwrap());
     let tso = Arc::new(LocalTso::new(1));
     let cm = Arc::new(ConcurrencyManager::new(0));
     let storage = Arc::new(MemTableEngine::new());

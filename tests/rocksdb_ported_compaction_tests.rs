@@ -148,6 +148,10 @@ async fn scan_at_for_test(
 // HELPER FUNCTIONS
 // ============================================================================
 
+fn make_test_io() -> std::sync::Arc<tisql::io::IoService> {
+    tisql::io::IoService::new(32).unwrap()
+}
+
 #[allow(dead_code)]
 fn create_engine(dir: &TempDir) -> LsmEngine {
     let lsn_provider = new_lsn_provider();
@@ -159,7 +163,8 @@ fn create_engine(dir: &TempDir) -> LsmEngine {
         .memtable_size(4096)
         .max_frozen_memtables(32)
         .build_unchecked();
-    LsmEngine::open_with_recovery(config, lsn_provider, ilog, Version::new()).unwrap()
+    LsmEngine::open_with_recovery(config, lsn_provider, ilog, Version::new(), make_test_io())
+        .unwrap()
 }
 
 fn create_durable_engine(dir: &TempDir) -> (LsmEngine, Arc<IlogService>) {
@@ -176,9 +181,14 @@ fn create_durable_engine(dir: &TempDir) -> (LsmEngine, Arc<IlogService>) {
         .l0_stop_trigger(200)
         .build_unchecked();
 
-    let engine =
-        LsmEngine::open_with_recovery(config, lsn_provider, Arc::clone(&ilog), Version::new())
-            .unwrap();
+    let engine = LsmEngine::open_with_recovery(
+        config,
+        lsn_provider,
+        Arc::clone(&ilog),
+        Version::new(),
+        make_test_io(),
+    )
+    .unwrap();
     (engine, ilog)
 }
 
@@ -1248,9 +1258,14 @@ async fn test_l0_write_backpressure() {
         .l0_stop_trigger(5) // Stop at 5 L0 files
         .build_unchecked();
 
-    let engine =
-        LsmEngine::open_with_recovery(config, lsn_provider, Arc::clone(&ilog), Version::new())
-            .unwrap();
+    let engine = LsmEngine::open_with_recovery(
+        config,
+        lsn_provider,
+        Arc::clone(&ilog),
+        Version::new(),
+        make_test_io(),
+    )
+    .unwrap();
 
     // Create L0 files by flushing
     let mut write_succeeded = true;
@@ -1308,8 +1323,14 @@ async fn test_compaction_scheduler_automatic() {
         .build_unchecked();
 
     let engine = Arc::new(
-        LsmEngine::open_with_recovery(config, lsn_provider, Arc::clone(&ilog), Version::new())
-            .unwrap(),
+        LsmEngine::open_with_recovery(
+            config,
+            lsn_provider,
+            Arc::clone(&ilog),
+            Version::new(),
+            make_test_io(),
+        )
+        .unwrap(),
     );
 
     let scheduler = CompactionScheduler::new(Arc::clone(&engine));
@@ -1535,7 +1556,8 @@ async fn test_write_stall_e2e() {
         .build()
         .unwrap();
     let engine = Arc::new(
-        LsmEngine::open_with_recovery(config, lsn_provider, ilog, Version::new()).unwrap(),
+        LsmEngine::open_with_recovery(config, lsn_provider, ilog, Version::new(), make_test_io())
+            .unwrap(),
     );
 
     // Start flush scheduler so frozen memtables get drained
@@ -2034,9 +2056,14 @@ async fn test_multi_level_cascading() {
         .max_levels(4)
         .build_unchecked();
 
-    let engine =
-        LsmEngine::open_with_recovery(config, lsn_provider, Arc::clone(&ilog), Version::new())
-            .unwrap();
+    let engine = LsmEngine::open_with_recovery(
+        config,
+        lsn_provider,
+        Arc::clone(&ilog),
+        Version::new(),
+        make_test_io(),
+    )
+    .unwrap();
 
     // Set a GC safe point so GC runs during compaction
     engine.set_gc_safe_point(5);
@@ -2112,8 +2139,14 @@ async fn test_snapshot_reads_stable_during_concurrent_flushes() {
         .build()
         .unwrap();
     let engine = Arc::new(
-        LsmEngine::open_with_recovery(config, lsn_provider, Arc::clone(&ilog), Version::new())
-            .unwrap(),
+        LsmEngine::open_with_recovery(
+            config,
+            lsn_provider,
+            Arc::clone(&ilog),
+            Version::new(),
+            make_test_io(),
+        )
+        .unwrap(),
     );
 
     // Baseline at ts <= snapshot
@@ -2217,9 +2250,14 @@ async fn test_multi_level_delete_reinsert_compaction_correctness() {
         .max_levels(4)
         .build()
         .unwrap();
-    let engine =
-        LsmEngine::open_with_recovery(config, lsn_provider, Arc::clone(&ilog), Version::new())
-            .unwrap();
+    let engine = LsmEngine::open_with_recovery(
+        config,
+        lsn_provider,
+        Arc::clone(&ilog),
+        Version::new(),
+        make_test_io(),
+    )
+    .unwrap();
 
     // Round 0: base values
     for i in 0..KEY_COUNT {

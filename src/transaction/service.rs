@@ -984,6 +984,10 @@ mod tests {
 
     type TestStorage = MemTableEngine;
 
+    fn make_test_io() -> Arc<crate::io::IoService> {
+        crate::io::IoService::new_for_test(32).unwrap()
+    }
+
     fn create_test_service() -> (
         Arc<TestStorage>,
         TransactionService<TestStorage, FileClogService, LocalTso>,
@@ -992,7 +996,8 @@ mod tests {
         let dir = tempdir().unwrap();
         let config = FileClogConfig::with_dir(dir.path());
         let io_handle = tokio::runtime::Handle::current();
-        let clog_service = Arc::new(FileClogService::open(config, &io_handle).unwrap());
+        let clog_service =
+            Arc::new(FileClogService::open(config, make_test_io(), &io_handle).unwrap());
         let tso = Arc::new(LocalTso::new(1));
         let cm = Arc::new(ConcurrencyManager::new(0));
         let storage = Arc::new(MemTableEngine::new());
@@ -1008,7 +1013,8 @@ mod tests {
         let dir = tempdir().unwrap();
         let config = FileClogConfig::with_dir(dir.path());
         let io_handle = tokio::runtime::Handle::current();
-        let clog_service = Arc::new(FileClogService::open(config, &io_handle).unwrap());
+        let clog_service =
+            Arc::new(FileClogService::open(config, make_test_io(), &io_handle).unwrap());
         let tso = Arc::new(LocalTso::new(1));
         let cm = Arc::new(ConcurrencyManager::new(0));
         let storage = Arc::new(MemTableEngine::new());
@@ -1112,7 +1118,9 @@ mod tests {
 
         // Write some data
         {
-            let clog_service = Arc::new(FileClogService::open(config.clone(), &io_handle).unwrap());
+            let clog_service = Arc::new(
+                FileClogService::open(config.clone(), make_test_io(), &io_handle).unwrap(),
+            );
             let tso = Arc::new(LocalTso::new(1));
             let cm = Arc::new(ConcurrencyManager::new(0));
             let storage = Arc::new(MemTableEngine::new());
@@ -1126,7 +1134,8 @@ mod tests {
         }
 
         // Recover
-        let (clog_service, entries) = FileClogService::recover(config, &io_handle).unwrap();
+        let (clog_service, entries) =
+            FileClogService::recover(config, make_test_io(), &io_handle).unwrap();
         let clog_service = Arc::new(clog_service);
         let tso = Arc::new(LocalTso::new(1));
         let cm = Arc::new(ConcurrencyManager::new(0));
@@ -2266,7 +2275,9 @@ mod tests {
         let io_handle = tokio::runtime::Handle::current();
 
         {
-            let clog_service = Arc::new(FileClogService::open(config.clone(), &io_handle).unwrap());
+            let clog_service = Arc::new(
+                FileClogService::open(config.clone(), make_test_io(), &io_handle).unwrap(),
+            );
 
             // Write entries directly to clog without commit record
             // This simulates a crash before commit
@@ -2313,7 +2324,8 @@ mod tests {
         }
 
         // Recover
-        let (clog_service, entries) = FileClogService::recover(config, &io_handle).unwrap();
+        let (clog_service, entries) =
+            FileClogService::recover(config, make_test_io(), &io_handle).unwrap();
         let clog_service = Arc::new(clog_service);
         let tso = Arc::new(LocalTso::new(1));
         let cm = Arc::new(ConcurrencyManager::new(0));
@@ -2489,7 +2501,9 @@ mod tests {
         let io_handle = tokio::runtime::Handle::current();
 
         {
-            let clog_service = Arc::new(FileClogService::open(config.clone(), &io_handle).unwrap());
+            let clog_service = Arc::new(
+                FileClogService::open(config.clone(), make_test_io(), &io_handle).unwrap(),
+            );
             let tso = Arc::new(LocalTso::new(1));
             let cm = Arc::new(ConcurrencyManager::new(0));
             let storage = Arc::new(MemTableEngine::new());
@@ -2506,7 +2520,8 @@ mod tests {
         }
 
         // Recover
-        let (clog_service, entries) = FileClogService::recover(config, &io_handle).unwrap();
+        let (clog_service, entries) =
+            FileClogService::recover(config, make_test_io(), &io_handle).unwrap();
         let clog_service = Arc::new(clog_service);
         let tso = Arc::new(LocalTso::new(1));
         let cm = Arc::new(ConcurrencyManager::new(0));
@@ -2528,7 +2543,8 @@ mod tests {
         let dir = tempdir().unwrap();
         let config = FileClogConfig::with_dir(dir.path());
         let io_handle = tokio::runtime::Handle::current();
-        let clog_service = Arc::new(FileClogService::open(config, &io_handle).unwrap());
+        let clog_service =
+            Arc::new(FileClogService::open(config, make_test_io(), &io_handle).unwrap());
         let tso = Arc::new(LocalTso::new(1));
         let cm = Arc::new(ConcurrencyManager::new(0));
         let storage = Arc::new(MemTableEngine::new());

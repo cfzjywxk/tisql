@@ -246,7 +246,8 @@ impl LsmState {
 /// let lsn_provider = new_lsn_provider();
 /// let ilog = Arc::new(IlogService::open(IlogConfig::new("./data"), lsn_provider.clone())?);
 /// let config = LsmConfig::new("./data");
-/// let engine = LsmEngine::open_with_recovery(config, lsn_provider, ilog, Version::new())?;
+/// let io_service = crate::io::IoService::new_for_test(32).unwrap();
+/// let engine = LsmEngine::open_with_recovery(config, lsn_provider, ilog, Version::new(), io_service)?;
 ///
 /// // Write with timestamp
 /// let mut batch = WriteBatch::new();
@@ -348,6 +349,7 @@ impl LsmEngine {
         lsn_provider: SharedLsnProvider,
         ilog: Arc<IlogService>,
         version: Version,
+        io_service: Arc<crate::io::IoService>,
     ) -> Result<Self> {
         config.validate().map_err(TiSqlError::Storage)?;
         let initial_v26_mode = Self::normalize_v26_mode(config.v26_boundary_mode).as_u8();
@@ -360,10 +362,6 @@ impl LsmEngine {
 
         // Initialize next_sst_id from recovered version's max SST ID + 1
         let recovered_max_sst_id = version.next_sst_id();
-
-        // Create io_uring service for async SST reads
-        let io_service = crate::io::IoService::new(256)
-            .map_err(|e| TiSqlError::Storage(format!("Failed to create IoService: {e}")))?;
 
         // Create initial state and version_set
         let initial_state = LsmState::new(1);
@@ -860,7 +858,7 @@ impl LsmEngine {
 
         // Phase 1: Write flush intent (if durable)
         if let Some(ref ilog) = self.ilog {
-            if let Err(e) = ilog.write_flush_intent(sst_id, memtable.id()) {
+            if let Err(e) = ilog.write_flush_intent_async(sst_id, memtable.id()).await {
                 Self::rollback_flushing_state(memtable);
                 return Err(e);
             }
@@ -1533,7 +1531,12 @@ impl LsmEngine {
         // Phase 2: Write CompactIntent (if durable)
         let input_sst_ids: Vec<u64> = task.inputs.iter().map(|(_, id)| *id).collect();
         if let Some(ref ilog) = self.ilog {
-            ilog.write_compact_intent(input_sst_ids, pre_allocated_ids.clone(), task.output_level)?;
+            ilog.write_compact_intent_async(
+                input_sst_ids,
+                pre_allocated_ids.clone(),
+                task.output_level,
+            )
+            .await?;
         }
 
         // Phase 3: Execute compaction
@@ -3172,6 +3175,10 @@ mod tests {
     use std::path::Path;
     use tempfile::TempDir;
 
+    fn make_test_io() -> Arc<crate::io::IoService> {
+        crate::io::IoService::new_for_test(32).unwrap()
+    }
+
     // ==================== Test-only LsmEngine Methods ====================
 
     impl LsmEngine {
@@ -3805,6 +3812,7 @@ mod tests {
             Arc::clone(&lsn_provider),
             Arc::clone(&ilog),
             Version::new(),
+            make_test_io(),
         )
         .unwrap();
 
@@ -3852,8 +3860,14 @@ mod tests {
                 IlogService::open_with_thread(ilog_config, Arc::clone(&lsn_provider)).unwrap(),
             );
 
-            let engine =
-                LsmEngine::open_with_recovery(config, lsn_provider, ilog, Version::new()).unwrap();
+            let engine = LsmEngine::open_with_recovery(
+                config,
+                lsn_provider,
+                ilog,
+                Version::new(),
+                make_test_io(),
+            )
+            .unwrap();
 
             for i in 0..5 {
                 let mut batch = new_batch(i as Timestamp + 1);
@@ -3885,9 +3899,14 @@ mod tests {
                 .build()
                 .unwrap();
 
-            let engine =
-                LsmEngine::open_with_recovery(config, lsn_provider, Arc::new(ilog), version)
-                    .unwrap();
+            let engine = LsmEngine::open_with_recovery(
+                config,
+                lsn_provider,
+                Arc::new(ilog),
+                version,
+                make_test_io(),
+            )
+            .unwrap();
 
             // Data should be readable from SST
             for i in 0..5 {
@@ -3983,6 +4002,7 @@ mod tests {
             Arc::clone(&lsn_provider),
             Arc::clone(&ilog),
             Version::new(),
+            make_test_io(),
         )
         .unwrap();
 
@@ -4033,6 +4053,7 @@ mod tests {
             Arc::clone(&lsn_provider),
             Arc::clone(&ilog),
             Version::new(),
+            make_test_io(),
         )
         .unwrap();
 
@@ -4152,6 +4173,7 @@ mod tests {
             Arc::clone(&lsn_provider),
             Arc::clone(&ilog),
             Version::new(),
+            make_test_io(),
         )
         .unwrap();
 
@@ -4203,6 +4225,7 @@ mod tests {
             Arc::clone(&lsn_provider),
             Arc::clone(&ilog),
             Version::new(),
+            make_test_io(),
         )
         .unwrap();
 
@@ -4291,6 +4314,7 @@ mod tests {
             Arc::clone(&lsn_provider),
             Arc::clone(&ilog),
             Version::new(),
+            make_test_io(),
         )
         .unwrap();
 
@@ -4354,6 +4378,7 @@ mod tests {
             Arc::clone(&lsn_provider),
             Arc::clone(&ilog),
             Version::new(),
+            make_test_io(),
         )
         .unwrap();
 
@@ -4487,8 +4512,14 @@ mod tests {
                 IlogService::open_with_thread(ilog_config, Arc::clone(&lsn_provider)).unwrap(),
             );
 
-            let engine =
-                LsmEngine::open_with_recovery(config, lsn_provider, ilog, Version::new()).unwrap();
+            let engine = LsmEngine::open_with_recovery(
+                config,
+                lsn_provider,
+                ilog,
+                Version::new(),
+                make_test_io(),
+            )
+            .unwrap();
 
             // Write key@ts=10
             let mut batch1 = WriteBatch::new();
@@ -4521,9 +4552,14 @@ mod tests {
                 .build()
                 .unwrap();
 
-            let engine =
-                LsmEngine::open_with_recovery(config, lsn_provider, Arc::new(ilog), version)
-                    .unwrap();
+            let engine = LsmEngine::open_with_recovery(
+                config,
+                lsn_provider,
+                Arc::new(ilog),
+                version,
+                make_test_io(),
+            )
+            .unwrap();
 
             // MVCC visibility should work from SST
             assert_eq!(
@@ -4572,6 +4608,7 @@ mod tests {
             Arc::clone(&lsn_provider),
             Arc::clone(&ilog),
             Version::new(),
+            make_test_io(),
         )
         .unwrap();
 
@@ -4652,6 +4689,7 @@ mod tests {
             Arc::clone(&lsn_provider),
             Arc::clone(&ilog),
             Version::new(),
+            make_test_io(),
         )
         .unwrap();
 
@@ -4693,7 +4731,7 @@ mod tests {
     /// recover again and verify no missing keys.
     ///
     /// This catches the missing clog_lsn + replay ordering issues.
-    #[tokio::test]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn test_two_crash_recovery() {
         use crate::clog::{ClogBatch, ClogService, FileClogConfig, FileClogService};
 
@@ -4720,6 +4758,7 @@ mod tests {
                 Arc::clone(&lsn_provider),
                 Arc::clone(&ilog),
                 Version::new(),
+                make_test_io(),
             )
             .unwrap();
 
@@ -4728,6 +4767,7 @@ mod tests {
             let clog = FileClogService::open_with_lsn_provider(
                 clog_config,
                 Arc::clone(&lsn_provider),
+                make_test_io(),
                 &handle,
             )
             .unwrap();
@@ -4835,6 +4875,7 @@ mod tests {
             Arc::clone(&lsn_provider),
             Arc::clone(&ilog),
             Version::new(),
+            make_test_io(),
         )
         .unwrap();
 
@@ -8971,18 +9012,19 @@ mod tests {
             state.frozen.front().cloned().unwrap()
         };
 
-        // Simulate an in-flight write marker; flush boundary should be unchanged.
+        // Simulate an in-flight write marker. Flush boundary is capped at
+        // `min_in_flight - 1`, so flushed_lsn can advance only to 2.
         let _inflight_guard = engine.in_flight_tracker.register(3);
 
         engine.flush_memtable_async(&frozen).await.unwrap();
 
-        assert_eq!(engine.current_version().flushed_lsn(), 0);
+        assert_eq!(engine.current_version().flushed_lsn(), 2);
 
         // Drop the guard — simulates the memtable write completing.
         drop(_inflight_guard);
 
         // No more in-flight, no memtable data -> safe == flushed_lsn.
-        assert_eq!(engine.safe_log_gc_lsn(), 0);
+        assert_eq!(engine.safe_log_gc_lsn(), 2);
     }
 
     #[tokio::test]
@@ -9063,7 +9105,7 @@ mod tests {
         // Hold in-flight at LSN=5 during second flush.
         let _guard = engine.in_flight_tracker.register(5);
         engine.flush_memtable_async(&f2).await.unwrap();
-        assert_eq!(engine.current_version().flushed_lsn(), 0);
+        assert_eq!(engine.current_version().flushed_lsn(), 4);
 
         drop(_guard);
 
@@ -9081,7 +9123,7 @@ mod tests {
             state.frozen.front().cloned().unwrap()
         };
         engine.flush_memtable_async(&f3).await.unwrap();
-        assert_eq!(engine.current_version().flushed_lsn(), 0);
+        assert_eq!(engine.current_version().flushed_lsn(), 4);
     }
 
     /// Failpoint test: verify safe_flushed_lsn accounts for in-flight LSNs

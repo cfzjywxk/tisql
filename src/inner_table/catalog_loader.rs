@@ -958,11 +958,16 @@ mod tests {
 
     type TestTxnService = TransactionService<MemTableEngine, FileClogService, LocalTso>;
 
+    fn make_test_io() -> Arc<crate::io::IoService> {
+        crate::io::IoService::new_for_test(32).unwrap()
+    }
+
     fn create_test_txn() -> (Arc<TestTxnService>, tempfile::TempDir) {
         let dir = tempdir().unwrap();
         let clog_config = FileClogConfig::with_dir(dir.path());
         let io_handle = tokio::runtime::Handle::current();
-        let (clog_service, _) = FileClogService::recover(clog_config, &io_handle).unwrap();
+        let (clog_service, _) =
+            FileClogService::recover(clog_config, make_test_io(), &io_handle).unwrap();
         let clog_service = Arc::new(clog_service);
         let tso = Arc::new(LocalTso::new(1));
         let concurrency_manager = Arc::new(ConcurrencyManager::new(0));
@@ -976,7 +981,7 @@ mod tests {
         (txn_service, dir)
     }
 
-    #[tokio::test]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn test_load_catalog_after_bootstrap() {
         let (txn, _dir) = create_test_txn();
         bootstrap::bootstrap_core_tables(txn.as_ref())
@@ -1009,7 +1014,7 @@ mod tests {
             .contains_key(&(INNER_SCHEMA.to_string(), "__all_table".to_string())));
     }
 
-    #[tokio::test]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn test_load_catalog_core_table_columns() {
         let (txn, _dir) = create_test_txn();
         bootstrap::bootstrap_core_tables(txn.as_ref())
@@ -1036,7 +1041,7 @@ mod tests {
         assert_eq!(all_column.columns().len(), 9);
     }
 
-    #[tokio::test]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn test_load_catalog_table_id_map() {
         let (txn, _dir) = create_test_txn();
         bootstrap::bootstrap_core_tables(txn.as_ref())

@@ -118,6 +118,10 @@ async fn scan_at_for_test(
 // HELPER FUNCTIONS
 // ============================================================================
 
+fn make_test_io() -> std::sync::Arc<tisql::io::IoService> {
+    tisql::io::IoService::new(32).unwrap()
+}
+
 fn create_engine(dir: &TempDir) -> LsmEngine {
     let lsn_provider = new_lsn_provider();
     let ilog_config = IlogConfig::new(dir.path());
@@ -128,7 +132,8 @@ fn create_engine(dir: &TempDir) -> LsmEngine {
         .memtable_size(4096)
         .max_frozen_memtables(64)
         .build_unchecked();
-    LsmEngine::open_with_recovery(config, lsn_provider, ilog, Version::new()).unwrap()
+    LsmEngine::open_with_recovery(config, lsn_provider, ilog, Version::new(), make_test_io())
+        .unwrap()
 }
 
 fn create_durable_engine(dir: &TempDir) -> (LsmEngine, Arc<IlogService>) {
@@ -142,9 +147,14 @@ fn create_durable_engine(dir: &TempDir) -> (LsmEngine, Arc<IlogService>) {
         .max_frozen_memtables(32)
         .build_unchecked();
 
-    let engine =
-        LsmEngine::open_with_recovery(config, lsn_provider, Arc::clone(&ilog), Version::new())
-            .unwrap();
+    let engine = LsmEngine::open_with_recovery(
+        config,
+        lsn_provider,
+        Arc::clone(&ilog),
+        Version::new(),
+        make_test_io(),
+    )
+    .unwrap();
     (engine, ilog)
 }
 
@@ -634,7 +644,8 @@ async fn test_flush_while_writing() {
         let ilog = Arc::new(
             IlogService::open_with_thread(ilog_config, Arc::clone(&lsn_provider)).unwrap(),
         );
-        LsmEngine::open_with_recovery(config, lsn_provider, ilog, Version::new()).unwrap()
+        LsmEngine::open_with_recovery(config, lsn_provider, ilog, Version::new(), make_test_io())
+            .unwrap()
     });
 
     let num_writers = 4;
@@ -1057,8 +1068,14 @@ async fn test_recovery_flushed_data() {
             .max_frozen_memtables(16)
             .build_unchecked();
 
-        let engine =
-            LsmEngine::open_with_recovery(config, lsn_provider, Arc::new(ilog), version).unwrap();
+        let engine = LsmEngine::open_with_recovery(
+            config,
+            lsn_provider,
+            Arc::new(ilog),
+            version,
+            make_test_io(),
+        )
+        .unwrap();
 
         let value = get_for_test(&engine, b"recovery_key").await;
         assert_eq!(
@@ -1107,8 +1124,14 @@ async fn test_recovery_multiple_flushes() {
             .max_frozen_memtables(16)
             .build_unchecked();
 
-        let engine =
-            LsmEngine::open_with_recovery(config, lsn_provider, Arc::new(ilog), version).unwrap();
+        let engine = LsmEngine::open_with_recovery(
+            config,
+            lsn_provider,
+            Arc::new(ilog),
+            version,
+            make_test_io(),
+        )
+        .unwrap();
 
         // Latest values should be from round 4
         for i in 0..5 {
@@ -1163,8 +1186,14 @@ async fn test_recovery_mvcc_versions() {
             .max_frozen_memtables(16)
             .build_unchecked();
 
-        let engine =
-            LsmEngine::open_with_recovery(config, lsn_provider, Arc::new(ilog), version).unwrap();
+        let engine = LsmEngine::open_with_recovery(
+            config,
+            lsn_provider,
+            Arc::new(ilog),
+            version,
+            make_test_io(),
+        )
+        .unwrap();
 
         // Verify each version is accessible
         for ts in [10, 20, 30, 40, 50] {

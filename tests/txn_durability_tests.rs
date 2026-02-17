@@ -58,6 +58,10 @@ async fn get_value(engine: &LsmEngine, key: &[u8], read_ts: Timestamp) -> Option
     None
 }
 
+fn make_test_io() -> std::sync::Arc<tisql::io::IoService> {
+    tisql::io::IoService::new(32).unwrap()
+}
+
 /// Create a fresh LsmEngine + TransactionService environment.
 /// Uses `Handle::current()` for the clog GroupCommitWriter (spawn_blocking).
 fn create_txn_env(
@@ -77,13 +81,24 @@ fn create_txn_env(
     let ilog =
         Arc::new(IlogService::open_with_thread(ilog_config, Arc::clone(&lsn_provider)).unwrap());
     let engine = Arc::new(
-        LsmEngine::open_with_recovery(lsm_config, Arc::clone(&lsn_provider), ilog, Version::new())
-            .unwrap(),
+        LsmEngine::open_with_recovery(
+            lsm_config,
+            Arc::clone(&lsn_provider),
+            ilog,
+            Version::new(),
+            make_test_io(),
+        )
+        .unwrap(),
     );
     let clog_config = FileClogConfig::with_dir(dir);
     let clog = Arc::new(
-        FileClogService::open_with_lsn_provider(clog_config, Arc::clone(&lsn_provider), &handle)
-            .unwrap(),
+        FileClogService::open_with_lsn_provider(
+            clog_config,
+            Arc::clone(&lsn_provider),
+            make_test_io(),
+            &handle,
+        )
+        .unwrap(),
     );
     let tso = Arc::new(LocalTso::new(1));
     let cm = Arc::new(ConcurrencyManager::new(0));

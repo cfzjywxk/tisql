@@ -42,12 +42,10 @@
 
 use std::collections::HashSet;
 use std::fs::{self, File, OpenOptions};
-use std::io::{BufReader, BufWriter, Read, Seek, SeekFrom, Write};
+use std::io::{BufReader, BufWriter, Read, Write};
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
-
-use parking_lot::Mutex;
 
 #[cfg(feature = "failpoints")]
 use fail::fail_point;
@@ -232,12 +230,6 @@ struct PendingOps {
     compact_intents: Vec<Vec<u64>>,
 }
 
-/// Group writer runtime mode for recreating writer after ilog rewrite.
-enum GroupWriterMode {
-    Tokio(tokio::runtime::Handle),
-    Thread,
-}
-
 /// Index log service for SST metadata persistence.
 pub struct IlogService {
     config: IlogConfig,
@@ -245,11 +237,14 @@ pub struct IlogService {
     lsn_provider: SharedLsnProvider,
     /// Group commit writer for batched fsync.
     ///
-    /// Wrapped in Mutex so the writer can be replaced if needed.
-    /// The mutex is only held briefly to call `submit()` (channel send).
-    group_writer: Mutex<crate::clog::GroupCommitWriter>,
-    /// Group writer runtime mode (tokio handle or std::thread fallback).
-    writer_mode: GroupWriterMode,
+    /// Concurrency is handled internally by the writer's 3-state machine
+    /// (Active/Draining/Failed with Condvar). No outer Mutex needed.
+    group_writer: crate::clog::GroupCommitWriter,
+    /// IoService for io_uring-backed writes.
+    io_service: Arc<crate::io::IoService>,
+    /// Runtime handle for spawning new GroupCommitWriter tasks (e.g. on ilog rewrite).
+    /// None for test paths that use std::thread.
+    io_handle: Option<tokio::runtime::Handle>,
     /// Number of records since last checkpoint
     records_since_checkpoint: AtomicU64,
     /// Last checkpoint sequence
@@ -274,6 +269,7 @@ impl IlogService {
     pub fn open(
         config: IlogConfig,
         lsn_provider: SharedLsnProvider,
+        io: Arc<crate::io::IoService>,
         io_handle: &tokio::runtime::Handle,
     ) -> Result<Self> {
         // Ensure directory exists with durable creation
@@ -315,7 +311,7 @@ impl IlogService {
         }
 
         // Re-open for appending
-        let mut file_for_write = OpenOptions::new().read(true).write(true).open(&ilog_path)?;
+        let file_for_write = OpenOptions::new().read(true).write(true).open(&ilog_path)?;
 
         // If we detected corruption (file is larger than valid data), truncate it
         if let Some(valid_end) = valid_data_end {
@@ -331,18 +327,22 @@ impl IlogService {
             }
         }
 
-        file_for_write.seek(SeekFrom::End(0))?;
+        // Close the std File, reopen as DmaFile for io_uring-backed writes
+        drop(file_for_write);
+        let dma_file = crate::io::DmaFile::open_append_buffered(&ilog_path)
+            .map_err(|e| TiSqlError::Internal(format!("Failed to open ilog as DmaFile: {e}")))?;
 
         log_info!("Opened ilog file: {:?}", ilog_path);
 
         let group_writer =
-            crate::clog::GroupCommitWriter::new(BufWriter::new(file_for_write), io_handle);
+            crate::clog::GroupCommitWriter::new(dma_file, Arc::clone(&io), io_handle);
 
         Ok(Self {
             config,
             lsn_provider,
-            group_writer: Mutex::new(group_writer),
-            writer_mode: GroupWriterMode::Tokio(io_handle.clone()),
+            group_writer,
+            io_service: io,
+            io_handle: Some(io_handle.clone()),
             records_since_checkpoint: AtomicU64::new(0),
             last_checkpoint_seq: AtomicU64::new(0),
         })
@@ -357,12 +357,13 @@ impl IlogService {
     pub fn recover(
         config: IlogConfig,
         lsn_provider: SharedLsnProvider,
+        io: Arc<crate::io::IoService>,
         io_handle: &tokio::runtime::Handle,
     ) -> Result<(Self, Version, HashSet<u64>)> {
         let ilog_path = config.ilog_path();
 
         if !ilog_path.exists() {
-            let service = Self::open(config, lsn_provider, io_handle)?;
+            let service = Self::open(config, lsn_provider, io, io_handle)?;
             return Ok((service, Version::new(), HashSet::new()));
         }
 
@@ -390,7 +391,7 @@ impl IlogService {
         }
 
         // Open service
-        let service = Self::open(config, Arc::clone(&lsn_provider), io_handle)?;
+        let service = Self::open(config, Arc::clone(&lsn_provider), io, io_handle)?;
         service
             .last_checkpoint_seq
             .store(last_checkpoint_seq, Ordering::SeqCst);
@@ -398,15 +399,15 @@ impl IlogService {
         Ok((service, version, orphan_ssts))
     }
 
-    /// Write a flush intent record.
-    pub fn write_flush_intent(&self, sst_id: u64, memtable_id: u64) -> Result<Lsn> {
+    /// Write a flush intent record asynchronously.
+    pub async fn write_flush_intent_async(&self, sst_id: u64, memtable_id: u64) -> Result<Lsn> {
         let lsn = self.lsn_provider.alloc_lsn();
         let record = IlogRecord::FlushIntent {
             lsn,
             sst_id,
             memtable_id,
         };
-        self.write_record(&record)?;
+        self.write_record_async(&record).await?;
 
         // Failpoint: crash after flush intent write
         #[cfg(feature = "failpoints")]
@@ -416,15 +417,26 @@ impl IlogService {
         Ok(lsn)
     }
 
-    /// Write a flush commit record.
-    pub fn write_flush_commit(&self, sst_meta: SstMeta, flushed_lsn: Lsn) -> Result<Lsn> {
+    /// Write a flush intent record.
+    ///
+    /// Transitional sync wrapper used by existing sync call sites.
+    pub fn write_flush_intent(&self, sst_id: u64, memtable_id: u64) -> Result<Lsn> {
+        crate::io::block_on_sync(self.write_flush_intent_async(sst_id, memtable_id))
+    }
+
+    /// Write a flush commit record asynchronously.
+    pub async fn write_flush_commit_async(
+        &self,
+        sst_meta: SstMeta,
+        flushed_lsn: Lsn,
+    ) -> Result<Lsn> {
         let lsn = self.lsn_provider.alloc_lsn();
         let record = IlogRecord::FlushCommit {
             lsn,
             sst_meta,
             flushed_lsn,
         };
-        self.write_record(&record)?;
+        self.write_record_async(&record).await?;
         log_trace!(
             "Wrote FlushCommit: lsn={}, flushed_lsn={}",
             lsn,
@@ -433,8 +445,15 @@ impl IlogService {
         Ok(lsn)
     }
 
-    /// Write a compact intent record.
-    pub fn write_compact_intent(
+    /// Write a flush commit record.
+    ///
+    /// Transitional sync wrapper used by existing sync call sites.
+    pub fn write_flush_commit(&self, sst_meta: SstMeta, flushed_lsn: Lsn) -> Result<Lsn> {
+        crate::io::block_on_sync(self.write_flush_commit_async(sst_meta, flushed_lsn))
+    }
+
+    /// Write a compact intent record asynchronously.
+    pub async fn write_compact_intent_async(
         &self,
         input_sst_ids: Vec<u64>,
         output_sst_ids: Vec<u64>,
@@ -447,13 +466,29 @@ impl IlogService {
             output_sst_ids,
             target_level,
         };
-        self.write_record(&record)?;
+        self.write_record_async(&record).await?;
         log_trace!("Wrote CompactIntent: lsn={}", lsn);
         Ok(lsn)
     }
 
-    /// Write a compact commit record.
-    pub fn write_compact_commit(
+    /// Write a compact intent record.
+    ///
+    /// Transitional sync wrapper used by existing sync call sites.
+    pub fn write_compact_intent(
+        &self,
+        input_sst_ids: Vec<u64>,
+        output_sst_ids: Vec<u64>,
+        target_level: u32,
+    ) -> Result<Lsn> {
+        crate::io::block_on_sync(self.write_compact_intent_async(
+            input_sst_ids,
+            output_sst_ids,
+            target_level,
+        ))
+    }
+
+    /// Write a compact commit record asynchronously.
+    pub async fn write_compact_commit_async(
         &self,
         deleted_ssts: Vec<(u32, u64)>,
         new_ssts: Vec<SstMeta>,
@@ -464,13 +499,24 @@ impl IlogService {
             deleted_ssts,
             new_ssts,
         };
-        self.write_record(&record)?;
+        self.write_record_async(&record).await?;
         log_trace!("Wrote CompactCommit: lsn={}", lsn);
         Ok(lsn)
     }
 
-    /// Write a checkpoint record.
-    pub fn write_checkpoint(&self, version: &Version) -> Result<Lsn> {
+    /// Write a compact commit record.
+    ///
+    /// Transitional sync wrapper used by existing sync call sites.
+    pub fn write_compact_commit(
+        &self,
+        deleted_ssts: Vec<(u32, u64)>,
+        new_ssts: Vec<SstMeta>,
+    ) -> Result<Lsn> {
+        crate::io::block_on_sync(self.write_compact_commit_async(deleted_ssts, new_ssts))
+    }
+
+    /// Write a checkpoint record asynchronously.
+    pub async fn write_checkpoint_async(&self, version: &Version) -> Result<Lsn> {
         let lsn = self.lsn_provider.alloc_lsn();
         let checkpoint_seq = self.last_checkpoint_seq.fetch_add(1, Ordering::SeqCst) + 1;
         let record = IlogRecord::Checkpoint {
@@ -483,10 +529,17 @@ impl IlogService {
         #[cfg(feature = "failpoints")]
         fail_point!("ilog_checkpoint_mid_write");
 
-        self.write_record(&record)?;
+        self.write_record_async(&record).await?;
         self.records_since_checkpoint.store(0, Ordering::SeqCst);
         log_info!("Wrote Checkpoint: lsn={}, seq={}", lsn, checkpoint_seq);
         Ok(lsn)
+    }
+
+    /// Write a checkpoint record.
+    ///
+    /// Transitional sync wrapper used by existing sync call sites.
+    pub fn write_checkpoint(&self, version: &Version) -> Result<Lsn> {
+        crate::io::block_on_sync(self.write_checkpoint_async(version))
     }
 
     /// Check if a checkpoint is needed based on record count.
@@ -495,38 +548,55 @@ impl IlogService {
             >= self.config.checkpoint_interval
     }
 
-    /// Sync the log to disk.
-    pub fn sync(&self) -> Result<()> {
+    /// Sync the log to disk asynchronously.
+    pub async fn sync_async(&self) -> Result<()> {
         let rx = self
             .group_writer
-            .lock()
             .submit(Vec::new(), true)
             .map_err(|e| TiSqlError::Internal(format!("Ilog group commit sync failed: {e}")))?;
-        self.wait_for_reply(rx)
+        rx.await
+            .map_err(|_| TiSqlError::Internal("Ilog writer dropped".into()))?
+            .map_err(|e| TiSqlError::Internal(format!("Ilog group commit failed: {e}")))?;
+        Ok(())
+    }
+
+    /// Sync the log to disk.
+    ///
+    /// Transitional sync wrapper used by existing sync call sites.
+    pub fn sync(&self) -> Result<()> {
+        crate::io::block_on_sync(self.sync_async())
     }
 
     /// Truncate ilog records with lsn < min_keep_lsn.
     ///
     /// Keeps only records at or after `min_keep_lsn` by rewriting the ilog
     /// file and durably replacing the old file.
-    pub fn truncate_before(&self, min_keep_lsn: Lsn) -> Result<IlogTruncateStats> {
-        // Serialize with append path and drain already-submitted writes.
-        let mut group_writer = self.group_writer.lock();
-        let barrier_rx = group_writer
-            .submit(Vec::new(), true)
-            .map_err(|e| TiSqlError::Internal(format!("Ilog group commit sync failed: {e}")))?;
-        self.wait_for_reply(barrier_rx)?;
+    ///
+    /// Uses async stop-drain-restart: stops the writer, drains in-flight
+    /// requests, rewrites the file via `spawn_blocking`, then restarts
+    /// the writer with the new file.
+    pub async fn truncate_before(&self, min_keep_lsn: Lsn) -> Result<IlogTruncateStats> {
+        // Stop the writer and drain all in-flight requests.
+        self.group_writer
+            .stop_and_drain()
+            .await
+            .map_err(|e| TiSqlError::Internal(format!("Ilog stop_and_drain failed: {e}")))?;
 
         let ilog_path = self.config.ilog_path();
         let old_size = std::fs::metadata(&ilog_path).map(|m| m.len()).unwrap_or(0);
 
-        // Safe to read now: no concurrent appends and prior appends are durable.
+        // Safe to read now: writer is drained.
         let records = self.read_all_records()?;
         let (to_keep, to_remove): (Vec<_>, Vec<_>) = records
             .into_iter()
             .partition(|record| record.lsn() >= min_keep_lsn);
 
         if to_remove.is_empty() {
+            // Nothing to truncate — restart the writer.
+            let file = crate::io::DmaFile::open_append_buffered(&ilog_path)
+                .map_err(|e| TiSqlError::Internal(format!("Failed to reopen ilog: {e}")))?;
+            self.group_writer
+                .restart(file, Arc::clone(&self.io_service), self.io_handle.as_ref());
             return Ok(IlogTruncateStats {
                 records_removed: 0,
                 records_kept: to_keep.len(),
@@ -535,45 +605,66 @@ impl IlogService {
             });
         }
 
-        // Rewrite kept records into a temp file.
-        let temp_path = ilog_path.with_extension("ilog.tmp");
-        {
-            let temp_file = OpenOptions::new()
-                .write(true)
-                .create(true)
-                .truncate(true)
-                .open(&temp_path)?;
-            let mut temp_writer = BufWriter::new(temp_file);
-            Self::write_header(&mut temp_writer)?;
-            for record in &to_keep {
-                let framed = Self::encode_record(record)?;
-                temp_writer.write_all(&framed)?;
+        // Rewrite kept records via spawn_blocking (file I/O).
+        let config_clone = self.config.clone();
+        let rewrite_result = tokio::task::spawn_blocking(move || -> Result<(usize, usize)> {
+            let ilog_path = config_clone.ilog_path();
+            let temp_path = ilog_path.with_extension("ilog.tmp");
+            {
+                let temp_file = OpenOptions::new()
+                    .write(true)
+                    .create(true)
+                    .truncate(true)
+                    .open(&temp_path)?;
+                let mut temp_writer = BufWriter::new(temp_file);
+                Self::write_header(&mut temp_writer)?;
+                for record in &to_keep {
+                    let framed = Self::encode_record(record)?;
+                    temp_writer.write_all(&framed)?;
+                }
+                temp_writer.flush()?;
+                temp_writer.get_ref().sync_data()?;
             }
-            temp_writer.flush()?;
-            temp_writer.get_ref().sync_data()?;
-        }
 
-        rename_durable(&temp_path, &ilog_path)?;
-
-        // Reopen append writer and swap group writer.
-        let mut file_for_write = OpenOptions::new().read(true).write(true).open(&ilog_path)?;
-        file_for_write.seek(SeekFrom::End(0))?;
-        *group_writer = self.create_group_writer(BufWriter::new(file_for_write));
-
-        let new_size = std::fs::metadata(&ilog_path).map(|m| m.len()).unwrap_or(0);
-        log_info!(
-            "Truncated ilog before min_keep_lsn={}: removed {} records, kept {}",
-            min_keep_lsn,
-            to_remove.len(),
-            to_keep.len()
-        );
-
-        Ok(IlogTruncateStats {
-            records_removed: to_remove.len(),
-            records_kept: to_keep.len(),
-            bytes_freed: old_size.saturating_sub(new_size),
-            new_file_size: new_size,
+            rename_durable(&temp_path, &ilog_path)?;
+            Ok((to_remove.len(), to_keep.len()))
         })
+        .await
+        .map_err(|e| TiSqlError::Internal(format!("Ilog rewrite task panicked: {e}")))?;
+
+        match rewrite_result {
+            Ok((removed, kept)) => {
+                let file = crate::io::DmaFile::open_append_buffered(self.config.ilog_path())
+                    .map_err(|e| TiSqlError::Internal(format!("Failed to reopen ilog: {e}")))?;
+                self.group_writer.restart(
+                    file,
+                    Arc::clone(&self.io_service),
+                    self.io_handle.as_ref(),
+                );
+
+                let new_size = std::fs::metadata(self.config.ilog_path())
+                    .map(|m| m.len())
+                    .unwrap_or(0);
+
+                log_info!(
+                    "Truncated ilog before min_keep_lsn={}: removed {} records, kept {}",
+                    min_keep_lsn,
+                    removed,
+                    kept
+                );
+
+                Ok(IlogTruncateStats {
+                    records_removed: removed,
+                    records_kept: kept,
+                    bytes_freed: old_size.saturating_sub(new_size),
+                    new_file_size: new_size,
+                })
+            }
+            Err(e) => {
+                self.group_writer.set_failed(format!("{e}"));
+                Err(e)
+            }
+        }
     }
 
     /// Get the ilog file size in bytes.
@@ -628,9 +719,16 @@ impl IlogService {
         Ok(cleaned)
     }
 
+    /// Close the ilog service asynchronously, flushing any pending writes.
+    pub async fn close_async(&self) -> Result<()> {
+        self.sync_async().await
+    }
+
     /// Close the ilog service, flushing any pending writes.
+    ///
+    /// Transitional sync wrapper used by existing sync call sites.
     pub fn close(&self) -> Result<()> {
-        self.sync()
+        crate::io::block_on_sync(self.close_async())
     }
 
     /// Shutdown the group commit writer channel.
@@ -638,7 +736,7 @@ impl IlogService {
     /// Must be called before the io_runtime is dropped, otherwise the runtime
     /// drop blocks waiting for the writer loop (spawn_blocking task) to exit.
     pub fn shutdown(&self) {
-        self.group_writer.lock().shutdown();
+        self.group_writer.shutdown();
     }
 
     /// Open or create an ilog service using a plain `std::thread` for
@@ -677,7 +775,7 @@ impl IlogService {
             sync_dir(&config.ilog_dir)?;
         }
 
-        let mut file_for_write = OpenOptions::new().read(true).write(true).open(&ilog_path)?;
+        let file_for_write = OpenOptions::new().read(true).write(true).open(&ilog_path)?;
 
         if let Some(valid_end) = valid_data_end {
             let actual_len = file_for_write.metadata()?.len();
@@ -692,18 +790,25 @@ impl IlogService {
             }
         }
 
-        file_for_write.seek(SeekFrom::End(0))?;
+        // Close the std File, reopen as DmaFile for io_uring-backed writes
+        drop(file_for_write);
+        let dma_file = crate::io::DmaFile::open_append_buffered(&ilog_path)
+            .map_err(|e| TiSqlError::Internal(format!("Failed to open ilog as DmaFile: {e}")))?;
 
         log_info!("Opened ilog file: {:?}", ilog_path);
 
+        // Create IoService internally for test/thread paths
+        let io = crate::io::IoService::new(32)
+            .map_err(|e| TiSqlError::Internal(format!("Failed to create IoService: {e}")))?;
         let group_writer =
-            crate::clog::GroupCommitWriter::new_with_thread(BufWriter::new(file_for_write));
+            crate::clog::GroupCommitWriter::new_with_thread(dma_file, Arc::clone(&io));
 
         Ok(Self {
             config,
             lsn_provider,
-            group_writer: Mutex::new(group_writer),
-            writer_mode: GroupWriterMode::Thread,
+            group_writer,
+            io_service: io,
+            io_handle: None,
             records_since_checkpoint: AtomicU64::new(0),
             last_checkpoint_seq: AtomicU64::new(0),
         })
@@ -752,13 +857,6 @@ impl IlogService {
 
     // ========== Private methods ==========
 
-    fn create_group_writer(&self, writer: BufWriter<File>) -> crate::clog::GroupCommitWriter {
-        match &self.writer_mode {
-            GroupWriterMode::Tokio(handle) => crate::clog::GroupCommitWriter::new(writer, handle),
-            GroupWriterMode::Thread => crate::clog::GroupCommitWriter::new_with_thread(writer),
-        }
-    }
-
     fn read_all_records(&self) -> Result<Vec<IlogRecord>> {
         let ilog_path = self.config.ilog_path();
         let file = File::open(&ilog_path)?;
@@ -767,16 +865,17 @@ impl IlogService {
         Self::read_records(&mut reader)
     }
 
-    fn write_record(&self, record: &IlogRecord) -> Result<()> {
+    async fn write_record_async(&self, record: &IlogRecord) -> Result<()> {
         let buf = Self::encode_record(record)?;
 
         // Submit to group commit writer (batches fsync with concurrent writers)
         let rx = self
             .group_writer
-            .lock()
             .submit(buf, true)
             .map_err(|e| TiSqlError::Internal(format!("Ilog group commit failed: {e}")))?;
-        self.wait_for_reply(rx)?;
+        rx.await
+            .map_err(|_| TiSqlError::Internal("Ilog writer dropped".into()))?
+            .map_err(|e| TiSqlError::Internal(format!("Ilog group commit failed: {e}")))?;
 
         // Failpoint: crash after fsync
         #[cfg(feature = "failpoints")]
@@ -807,18 +906,6 @@ impl IlogService {
         buf.extend_from_slice(&checksum.to_le_bytes());
         buf.extend_from_slice(&data);
         Ok(buf)
-    }
-
-    /// Wait for group commit reply. Uses `.await` in async context,
-    /// falls back to `block_on_sync` otherwise.
-    fn wait_for_reply(
-        &self,
-        rx: tokio::sync::oneshot::Receiver<std::result::Result<(), String>>,
-    ) -> Result<()> {
-        crate::io::block_on_sync(rx)
-            .map_err(|_| TiSqlError::Internal("Ilog writer dropped".into()))?
-            .map_err(|e| TiSqlError::Internal(format!("Ilog group commit failed: {e}")))?;
-        Ok(())
     }
 
     fn write_header<W: Write>(writer: &mut W) -> Result<()> {
@@ -1058,6 +1145,10 @@ mod tests {
     use std::path::Path;
     use tempfile::TempDir;
 
+    fn make_test_io() -> Arc<crate::io::IoService> {
+        crate::io::IoService::new_for_test(32).unwrap()
+    }
+
     fn test_config(dir: &Path) -> IlogConfig {
         IlogConfig::new(dir)
     }
@@ -1077,26 +1168,36 @@ mod tests {
         }
     }
 
-    #[tokio::test]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn test_ilog_open() {
         let tmp = TempDir::new().unwrap();
         let config = test_config(tmp.path());
         let lsn_provider = new_lsn_provider();
 
-        let service =
-            IlogService::open(config, lsn_provider, &tokio::runtime::Handle::current()).unwrap();
+        let service = IlogService::open(
+            config,
+            lsn_provider,
+            make_test_io(),
+            &tokio::runtime::Handle::current(),
+        )
+        .unwrap();
         service.sync().unwrap();
     }
 
-    #[tokio::test]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn test_ilog_flush_intent_commit() {
         let tmp = TempDir::new().unwrap();
         let config = test_config(tmp.path());
         let lsn_provider = new_lsn_provider();
         let io_handle = tokio::runtime::Handle::current();
 
-        let service =
-            IlogService::open(config.clone(), Arc::clone(&lsn_provider), &io_handle).unwrap();
+        let service = IlogService::open(
+            config.clone(),
+            Arc::clone(&lsn_provider),
+            make_test_io(),
+            &io_handle,
+        )
+        .unwrap();
 
         // Write flush intent
         let intent_lsn = service.write_flush_intent(1, 100).unwrap();
@@ -1112,22 +1213,27 @@ mod tests {
         // Recover and verify
         let lsn_provider2 = new_lsn_provider();
         let (_, version, orphans) =
-            IlogService::recover(config, lsn_provider2, &io_handle).unwrap();
+            IlogService::recover(config, lsn_provider2, make_test_io(), &io_handle).unwrap();
 
         assert!(orphans.is_empty(), "Should have no orphans");
         assert_eq!(version.level_size(0), 1);
         assert_eq!(version.flushed_lsn(), 50);
     }
 
-    #[tokio::test]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn test_ilog_incomplete_flush() {
         let tmp = TempDir::new().unwrap();
         let config = test_config(tmp.path());
         let lsn_provider = new_lsn_provider();
         let io_handle = tokio::runtime::Handle::current();
 
-        let service =
-            IlogService::open(config.clone(), Arc::clone(&lsn_provider), &io_handle).unwrap();
+        let service = IlogService::open(
+            config.clone(),
+            Arc::clone(&lsn_provider),
+            make_test_io(),
+            &io_handle,
+        )
+        .unwrap();
 
         // Write flush intent but no commit (simulating crash)
         service.write_flush_intent(1, 100).unwrap();
@@ -1136,21 +1242,26 @@ mod tests {
         // Recover
         let lsn_provider2 = new_lsn_provider();
         let (_, version, orphans) =
-            IlogService::recover(config, lsn_provider2, &io_handle).unwrap();
+            IlogService::recover(config, lsn_provider2, make_test_io(), &io_handle).unwrap();
 
         assert!(orphans.contains(&1), "SST 1 should be orphan");
         assert_eq!(version.level_size(0), 0, "No SST should be in version");
     }
 
-    #[tokio::test]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn test_ilog_compact_intent_commit() {
         let tmp = TempDir::new().unwrap();
         let config = test_config(tmp.path());
         let lsn_provider = new_lsn_provider();
         let io_handle = tokio::runtime::Handle::current();
 
-        let service =
-            IlogService::open(config.clone(), Arc::clone(&lsn_provider), &io_handle).unwrap();
+        let service = IlogService::open(
+            config.clone(),
+            Arc::clone(&lsn_provider),
+            make_test_io(),
+            &io_handle,
+        )
+        .unwrap();
 
         // First add some SSTs via flush
         let meta1 = test_sst_meta(1, 0);
@@ -1174,7 +1285,7 @@ mod tests {
         // Recover
         let lsn_provider2 = new_lsn_provider();
         let (_, version, orphans) =
-            IlogService::recover(config, lsn_provider2, &io_handle).unwrap();
+            IlogService::recover(config, lsn_provider2, make_test_io(), &io_handle).unwrap();
 
         assert!(orphans.is_empty());
         assert_eq!(
@@ -1185,15 +1296,20 @@ mod tests {
         assert_eq!(version.level_size(1), 1, "L1 should have 1 SST");
     }
 
-    #[tokio::test]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn test_ilog_incomplete_compact() {
         let tmp = TempDir::new().unwrap();
         let config = test_config(tmp.path());
         let lsn_provider = new_lsn_provider();
         let io_handle = tokio::runtime::Handle::current();
 
-        let service =
-            IlogService::open(config.clone(), Arc::clone(&lsn_provider), &io_handle).unwrap();
+        let service = IlogService::open(
+            config.clone(),
+            Arc::clone(&lsn_provider),
+            make_test_io(),
+            &io_handle,
+        )
+        .unwrap();
 
         // Add SSTs
         let meta1 = test_sst_meta(1, 0);
@@ -1207,21 +1323,26 @@ mod tests {
         // Recover
         let lsn_provider2 = new_lsn_provider();
         let (_, version, orphans) =
-            IlogService::recover(config, lsn_provider2, &io_handle).unwrap();
+            IlogService::recover(config, lsn_provider2, make_test_io(), &io_handle).unwrap();
 
         assert!(orphans.contains(&2), "Output SST 2 should be orphan");
         assert_eq!(version.level_size(0), 1, "Original SST should remain");
     }
 
-    #[tokio::test]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn test_ilog_checkpoint() {
         let tmp = TempDir::new().unwrap();
         let config = test_config(tmp.path());
         let lsn_provider = new_lsn_provider();
         let io_handle = tokio::runtime::Handle::current();
 
-        let service =
-            IlogService::open(config.clone(), Arc::clone(&lsn_provider), &io_handle).unwrap();
+        let service = IlogService::open(
+            config.clone(),
+            Arc::clone(&lsn_provider),
+            make_test_io(),
+            &io_handle,
+        )
+        .unwrap();
 
         // Add many flushes
         for i in 1..=10 {
@@ -1233,32 +1354,39 @@ mod tests {
         // Write checkpoint
         let lsn_provider2 = new_lsn_provider();
         let (_, version, _) =
-            IlogService::recover(config.clone(), lsn_provider2, &io_handle).unwrap();
+            IlogService::recover(config.clone(), lsn_provider2, make_test_io(), &io_handle)
+                .unwrap();
 
         let lsn_provider3 = new_lsn_provider();
-        let service2 = IlogService::open(config.clone(), lsn_provider3, &io_handle).unwrap();
+        let service2 =
+            IlogService::open(config.clone(), lsn_provider3, make_test_io(), &io_handle).unwrap();
         service2.write_checkpoint(&version).unwrap();
         service2.sync().unwrap();
 
         // Recover from checkpoint
         let lsn_provider4 = new_lsn_provider();
         let (_, recovered_version, orphans) =
-            IlogService::recover(config, lsn_provider4, &io_handle).unwrap();
+            IlogService::recover(config, lsn_provider4, make_test_io(), &io_handle).unwrap();
 
         assert!(orphans.is_empty());
         assert_eq!(recovered_version.level_size(0), 10);
         assert_eq!(recovered_version.flushed_lsn(), 100);
     }
 
-    #[tokio::test]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn test_ilog_lsn_continuity() {
         let tmp = TempDir::new().unwrap();
         let config = test_config(tmp.path());
         let lsn_provider = new_lsn_provider();
         let io_handle = tokio::runtime::Handle::current();
 
-        let service =
-            IlogService::open(config.clone(), Arc::clone(&lsn_provider), &io_handle).unwrap();
+        let service = IlogService::open(
+            config.clone(),
+            Arc::clone(&lsn_provider),
+            make_test_io(),
+            &io_handle,
+        )
+        .unwrap();
 
         // Write some records
         service.write_flush_intent(1, 100).unwrap();
@@ -1268,8 +1396,13 @@ mod tests {
 
         // Recover
         let lsn_provider2 = new_lsn_provider();
-        let (service2, _, _) =
-            IlogService::recover(config.clone(), lsn_provider2.clone(), &io_handle).unwrap();
+        let (service2, _, _) = IlogService::recover(
+            config.clone(),
+            lsn_provider2.clone(),
+            make_test_io(),
+            &io_handle,
+        )
+        .unwrap();
 
         // LSN should continue from where we left off
         assert!(lsn_provider2.current_lsn() >= 3);
@@ -1279,7 +1412,7 @@ mod tests {
         assert!(new_lsn >= 3);
     }
 
-    #[tokio::test]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn test_ilog_orphan_cleanup() {
         let tmp = TempDir::new().unwrap();
         let config = test_config(tmp.path());
@@ -1292,8 +1425,13 @@ mod tests {
         fs::write(&orphan_path, b"orphan data").unwrap();
         assert!(orphan_path.exists());
 
-        let service =
-            IlogService::open(config.clone(), Arc::clone(&lsn_provider), &io_handle).unwrap();
+        let service = IlogService::open(
+            config.clone(),
+            Arc::clone(&lsn_provider),
+            make_test_io(),
+            &io_handle,
+        )
+        .unwrap();
 
         // Add a valid SST
         let meta = test_sst_meta(1, 0);
@@ -1304,7 +1442,7 @@ mod tests {
         // Recover and get version
         let lsn_provider2 = new_lsn_provider();
         let (service2, version, _orphans) =
-            IlogService::recover(config, lsn_provider2, &io_handle).unwrap();
+            IlogService::recover(config, lsn_provider2, make_test_io(), &io_handle).unwrap();
 
         // Cleanup should remove orphan file
         let cleaned = service2
@@ -1314,7 +1452,7 @@ mod tests {
         assert!(!orphan_path.exists());
     }
 
-    #[tokio::test]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn test_ilog_needs_checkpoint() {
         let tmp = TempDir::new().unwrap();
         let mut config = test_config(tmp.path());
@@ -1324,6 +1462,7 @@ mod tests {
         let service = IlogService::open(
             config,
             Arc::clone(&lsn_provider),
+            make_test_io(),
             &tokio::runtime::Handle::current(),
         )
         .unwrap();
@@ -1338,21 +1477,26 @@ mod tests {
         assert!(service.needs_checkpoint());
     }
 
-    #[tokio::test]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn test_ilog_truncate_before_none() {
         let tmp = TempDir::new().unwrap();
         let config = test_config(tmp.path());
         let lsn_provider = new_lsn_provider();
         let io_handle = tokio::runtime::Handle::current();
 
-        let service =
-            IlogService::open(config.clone(), Arc::clone(&lsn_provider), &io_handle).unwrap();
+        let service = IlogService::open(
+            config.clone(),
+            Arc::clone(&lsn_provider),
+            make_test_io(),
+            &io_handle,
+        )
+        .unwrap();
         service.write_flush_intent(1, 100).unwrap();
         service.write_flush_commit(test_sst_meta(1, 0), 50).unwrap();
         service.sync().unwrap();
 
         let old_size = service.file_size().unwrap();
-        let stats = service.truncate_before(1).unwrap();
+        let stats = service.truncate_before(1).await.unwrap();
         assert_eq!(stats.records_removed, 0);
         assert_eq!(stats.records_kept, 2);
         assert_eq!(stats.bytes_freed, 0);
@@ -1360,20 +1504,25 @@ mod tests {
 
         let lsn_provider2 = new_lsn_provider();
         let (_, version, orphans) =
-            IlogService::recover(config, lsn_provider2, &io_handle).unwrap();
+            IlogService::recover(config, lsn_provider2, make_test_io(), &io_handle).unwrap();
         assert!(orphans.is_empty());
         assert_eq!(version.level_size(0), 1);
     }
 
-    #[tokio::test]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn test_ilog_truncate_before_all_older() {
         let tmp = TempDir::new().unwrap();
         let config = test_config(tmp.path());
         let lsn_provider = new_lsn_provider();
         let io_handle = tokio::runtime::Handle::current();
 
-        let service =
-            IlogService::open(config.clone(), Arc::clone(&lsn_provider), &io_handle).unwrap();
+        let service = IlogService::open(
+            config.clone(),
+            Arc::clone(&lsn_provider),
+            make_test_io(),
+            &io_handle,
+        )
+        .unwrap();
         service.write_flush_intent(1, 100).unwrap();
         service.write_flush_commit(test_sst_meta(1, 0), 50).unwrap();
         service.write_flush_intent(2, 101).unwrap();
@@ -1382,27 +1531,32 @@ mod tests {
             .unwrap();
         service.sync().unwrap();
 
-        let stats = service.truncate_before(10).unwrap();
+        let stats = service.truncate_before(10).await.unwrap();
         assert_eq!(stats.records_removed, 4);
         assert_eq!(stats.records_kept, 0);
         assert_eq!(stats.new_file_size, FILE_HEADER_SIZE as u64);
 
         let lsn_provider2 = new_lsn_provider();
         let (_, version, orphans) =
-            IlogService::recover(config, lsn_provider2, &io_handle).unwrap();
+            IlogService::recover(config, lsn_provider2, make_test_io(), &io_handle).unwrap();
         assert!(orphans.is_empty());
         assert_eq!(version.level_size(0), 0);
     }
 
-    #[tokio::test]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn test_ilog_truncate_before_then_append_continuity() {
         let tmp = TempDir::new().unwrap();
         let config = test_config(tmp.path());
         let lsn_provider = new_lsn_provider();
         let io_handle = tokio::runtime::Handle::current();
 
-        let service =
-            IlogService::open(config.clone(), Arc::clone(&lsn_provider), &io_handle).unwrap();
+        let service = IlogService::open(
+            config.clone(),
+            Arc::clone(&lsn_provider),
+            make_test_io(),
+            &io_handle,
+        )
+        .unwrap();
 
         service.write_flush_intent(1, 100).unwrap();
         service.write_flush_commit(test_sst_meta(1, 0), 50).unwrap();
@@ -1412,7 +1566,7 @@ mod tests {
             .unwrap();
         service.sync().unwrap();
 
-        let stats = service.truncate_before(keep_from_lsn).unwrap();
+        let stats = service.truncate_before(keep_from_lsn).await.unwrap();
         assert_eq!(stats.records_removed, 2);
         assert_eq!(stats.records_kept, 2);
 
@@ -1428,7 +1582,7 @@ mod tests {
 
         let lsn_provider2 = new_lsn_provider();
         let (_, version, orphans) =
-            IlogService::recover(config, lsn_provider2, &io_handle).unwrap();
+            IlogService::recover(config, lsn_provider2, make_test_io(), &io_handle).unwrap();
         assert!(orphans.is_empty());
         assert!(!version.has_sst(1));
         assert!(version.has_sst(2));
@@ -1507,7 +1661,7 @@ mod tests {
         assert_eq!(snapshot.levels[1].len(), 1);
     }
 
-    #[tokio::test]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn test_ilog_corrupted_header_magic() {
         let tmp = TempDir::new().unwrap();
         let config = test_config(tmp.path());
@@ -1522,7 +1676,12 @@ mod tests {
         .unwrap();
 
         let lsn_provider = new_lsn_provider();
-        let result = IlogService::open(config, lsn_provider, &tokio::runtime::Handle::current());
+        let result = IlogService::open(
+            config,
+            lsn_provider,
+            make_test_io(),
+            &tokio::runtime::Handle::current(),
+        );
 
         match result {
             Ok(_) => panic!("Expected error for invalid magic"),
@@ -1533,7 +1692,7 @@ mod tests {
         }
     }
 
-    #[tokio::test]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn test_ilog_corrupted_header_version() {
         let tmp = TempDir::new().unwrap();
         let config = test_config(tmp.path());
@@ -1548,7 +1707,12 @@ mod tests {
         .unwrap();
 
         let lsn_provider = new_lsn_provider();
-        let result = IlogService::open(config, lsn_provider, &tokio::runtime::Handle::current());
+        let result = IlogService::open(
+            config,
+            lsn_provider,
+            make_test_io(),
+            &tokio::runtime::Handle::current(),
+        );
 
         match result {
             Ok(_) => panic!("Expected error for unsupported version"),
@@ -1559,7 +1723,7 @@ mod tests {
         }
     }
 
-    #[tokio::test]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn test_ilog_checksum_mismatch() {
         let tmp = TempDir::new().unwrap();
         let config = test_config(tmp.path());
@@ -1567,8 +1731,13 @@ mod tests {
         let io_handle = tokio::runtime::Handle::current();
 
         // First write a valid record
-        let service =
-            IlogService::open(config.clone(), Arc::clone(&lsn_provider), &io_handle).unwrap();
+        let service = IlogService::open(
+            config.clone(),
+            Arc::clone(&lsn_provider),
+            make_test_io(),
+            &io_handle,
+        )
+        .unwrap();
         service.write_flush_intent(1, 100).unwrap();
         service.sync().unwrap();
         drop(service);
@@ -1585,13 +1754,14 @@ mod tests {
 
         // Recovery should handle the corrupted record
         let lsn_provider2 = new_lsn_provider();
-        let (_, version, _) = IlogService::recover(config, lsn_provider2, &io_handle).unwrap();
+        let (_, version, _) =
+            IlogService::recover(config, lsn_provider2, make_test_io(), &io_handle).unwrap();
 
         // Version should be empty since the record was corrupted
         assert_eq!(version.level_size(0), 0);
     }
 
-    #[tokio::test]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn test_ilog_truncated_record() {
         let tmp = TempDir::new().unwrap();
         let config = test_config(tmp.path());
@@ -1599,8 +1769,13 @@ mod tests {
         let io_handle = tokio::runtime::Handle::current();
 
         // Write a valid record
-        let service =
-            IlogService::open(config.clone(), Arc::clone(&lsn_provider), &io_handle).unwrap();
+        let service = IlogService::open(
+            config.clone(),
+            Arc::clone(&lsn_provider),
+            make_test_io(),
+            &io_handle,
+        )
+        .unwrap();
         service.write_flush_intent(1, 100).unwrap();
         let meta = test_sst_meta(1, 0);
         service.write_flush_commit(meta, 50).unwrap();
@@ -1616,7 +1791,7 @@ mod tests {
         // Recovery should handle truncation gracefully
         let lsn_provider2 = new_lsn_provider();
         let (_, version, orphans) =
-            IlogService::recover(config, lsn_provider2, &io_handle).unwrap();
+            IlogService::recover(config, lsn_provider2, make_test_io(), &io_handle).unwrap();
 
         // First record (flush intent) might be recovered, second (commit) likely corrupted
         // Either way, should not crash
@@ -1626,7 +1801,7 @@ mod tests {
         );
     }
 
-    #[tokio::test]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn test_ilog_multiple_checkpoints_recovery() {
         let tmp = TempDir::new().unwrap();
         let config = test_config(tmp.path());
@@ -1634,8 +1809,13 @@ mod tests {
         let io_handle = tokio::runtime::Handle::current();
 
         // Write records with multiple checkpoints
-        let service =
-            IlogService::open(config.clone(), Arc::clone(&lsn_provider), &io_handle).unwrap();
+        let service = IlogService::open(
+            config.clone(),
+            Arc::clone(&lsn_provider),
+            make_test_io(),
+            &io_handle,
+        )
+        .unwrap();
 
         // First batch of flushes
         for i in 1..=3 {
@@ -1647,15 +1827,18 @@ mod tests {
         // First checkpoint
         let lsn_provider2 = new_lsn_provider();
         let (_, version1, _) =
-            IlogService::recover(config.clone(), lsn_provider2, &io_handle).unwrap();
+            IlogService::recover(config.clone(), lsn_provider2, make_test_io(), &io_handle)
+                .unwrap();
         let lsn_provider3 = new_lsn_provider();
-        let service2 = IlogService::open(config.clone(), lsn_provider3, &io_handle).unwrap();
+        let service2 =
+            IlogService::open(config.clone(), lsn_provider3, make_test_io(), &io_handle).unwrap();
         service2.write_checkpoint(&version1).unwrap();
         drop(service2);
 
         // Second batch of flushes
         let lsn_provider4 = new_lsn_provider();
-        let service3 = IlogService::open(config.clone(), lsn_provider4, &io_handle).unwrap();
+        let service3 =
+            IlogService::open(config.clone(), lsn_provider4, make_test_io(), &io_handle).unwrap();
         for i in 4..=6 {
             let meta = test_sst_meta(i, 0);
             service3.write_flush_intent(i, 100 + i).unwrap();
@@ -1665,16 +1848,18 @@ mod tests {
         // Second checkpoint
         let lsn_provider5 = new_lsn_provider();
         let (_, version2, _) =
-            IlogService::recover(config.clone(), lsn_provider5, &io_handle).unwrap();
+            IlogService::recover(config.clone(), lsn_provider5, make_test_io(), &io_handle)
+                .unwrap();
         let lsn_provider6 = new_lsn_provider();
-        let service4 = IlogService::open(config.clone(), lsn_provider6, &io_handle).unwrap();
+        let service4 =
+            IlogService::open(config.clone(), lsn_provider6, make_test_io(), &io_handle).unwrap();
         service4.write_checkpoint(&version2).unwrap();
         drop(service4);
 
         // Final recovery should have all 6 SSTs
         let lsn_provider7 = new_lsn_provider();
         let (_, final_version, _) =
-            IlogService::recover(config, lsn_provider7, &io_handle).unwrap();
+            IlogService::recover(config, lsn_provider7, make_test_io(), &io_handle).unwrap();
 
         assert_eq!(
             final_version.level_size(0),
@@ -1709,15 +1894,20 @@ mod tests {
         );
     }
 
-    #[tokio::test]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn test_ilog_close() {
         let tmp = TempDir::new().unwrap();
         let config = test_config(tmp.path());
         let lsn_provider = new_lsn_provider();
         let io_handle = tokio::runtime::Handle::current();
 
-        let service =
-            IlogService::open(config.clone(), Arc::clone(&lsn_provider), &io_handle).unwrap();
+        let service = IlogService::open(
+            config.clone(),
+            Arc::clone(&lsn_provider),
+            make_test_io(),
+            &io_handle,
+        )
+        .unwrap();
         service.write_flush_intent(1, 100).unwrap();
 
         // Close should succeed
@@ -1725,19 +1915,25 @@ mod tests {
 
         // File should still be valid after close
         let lsn_provider2 = new_lsn_provider();
-        let (_, _, orphans) = IlogService::recover(config, lsn_provider2, &io_handle).unwrap();
+        let (_, _, orphans) =
+            IlogService::recover(config, lsn_provider2, make_test_io(), &io_handle).unwrap();
         assert!(orphans.contains(&1)); // Incomplete flush intent
     }
 
-    #[tokio::test]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn test_ilog_multiple_incomplete_compacts() {
         let tmp = TempDir::new().unwrap();
         let config = test_config(tmp.path());
         let lsn_provider = new_lsn_provider();
         let io_handle = tokio::runtime::Handle::current();
 
-        let service =
-            IlogService::open(config.clone(), Arc::clone(&lsn_provider), &io_handle).unwrap();
+        let service = IlogService::open(
+            config.clone(),
+            Arc::clone(&lsn_provider),
+            make_test_io(),
+            &io_handle,
+        )
+        .unwrap();
 
         // Multiple incomplete compact intents
         service.write_compact_intent(vec![1], vec![10], 1).unwrap();
@@ -1747,7 +1943,8 @@ mod tests {
         service.sync().unwrap();
 
         let lsn_provider2 = new_lsn_provider();
-        let (_, _, orphans) = IlogService::recover(config, lsn_provider2, &io_handle).unwrap();
+        let (_, _, orphans) =
+            IlogService::recover(config, lsn_provider2, make_test_io(), &io_handle).unwrap();
 
         // All output SST IDs should be orphans
         assert!(orphans.contains(&10));
@@ -1755,7 +1952,7 @@ mod tests {
         assert!(orphans.contains(&21));
     }
 
-    #[tokio::test]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn test_ilog_reopen_and_append() {
         let tmp = TempDir::new().unwrap();
         let config = test_config(tmp.path());
@@ -1764,8 +1961,13 @@ mod tests {
 
         // First session
         {
-            let service =
-                IlogService::open(config.clone(), Arc::clone(&lsn_provider), &io_handle).unwrap();
+            let service = IlogService::open(
+                config.clone(),
+                Arc::clone(&lsn_provider),
+                make_test_io(),
+                &io_handle,
+            )
+            .unwrap();
             service.write_flush_intent(1, 100).unwrap();
             let meta = test_sst_meta(1, 0);
             service.write_flush_commit(meta, 50).unwrap();
@@ -1776,7 +1978,8 @@ mod tests {
         {
             let lsn_provider2 = new_lsn_provider();
             let (service, _, _) =
-                IlogService::recover(config.clone(), lsn_provider2, &io_handle).unwrap();
+                IlogService::recover(config.clone(), lsn_provider2, make_test_io(), &io_handle)
+                    .unwrap();
             service.write_flush_intent(2, 101).unwrap();
             let meta = test_sst_meta(2, 0);
             service.write_flush_commit(meta, 100).unwrap();
@@ -1785,12 +1988,13 @@ mod tests {
 
         // Verify both records are present
         let lsn_provider3 = new_lsn_provider();
-        let (_, version, _) = IlogService::recover(config, lsn_provider3, &io_handle).unwrap();
+        let (_, version, _) =
+            IlogService::recover(config, lsn_provider3, make_test_io(), &io_handle).unwrap();
 
         assert_eq!(version.level_size(0), 2);
     }
 
-    #[tokio::test]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn test_ilog_empty_file_recovery() {
         let tmp = TempDir::new().unwrap();
         let config = test_config(tmp.path());
@@ -1804,8 +2008,13 @@ mod tests {
         std::fs::write(config.ilog_path(), &header).unwrap();
 
         let lsn_provider = new_lsn_provider();
-        let (_, version, orphans) =
-            IlogService::recover(config, lsn_provider, &tokio::runtime::Handle::current()).unwrap();
+        let (_, version, orphans) = IlogService::recover(
+            config,
+            lsn_provider,
+            make_test_io(),
+            &tokio::runtime::Handle::current(),
+        )
+        .unwrap();
 
         assert!(orphans.is_empty());
         assert_eq!(version.level_size(0), 0);

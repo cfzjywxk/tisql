@@ -146,6 +146,11 @@ impl LsmRecovery {
         // Create shared LSN provider
         let lsn_provider = new_lsn_provider();
 
+        // Create shared IoService for clog/ilog group commit writers
+        let io_service = crate::io::IoService::new(256).map_err(|e| {
+            crate::error::TiSqlError::Storage(format!("Failed to create IoService: {e}"))
+        })?;
+
         // Step 1: Recover ilog to rebuild Version
         log_info!(
             "Starting ilog recovery from {:?}",
@@ -154,6 +159,7 @@ impl LsmRecovery {
         let (ilog, version, orphan_ssts) = IlogService::recover(
             self.ilog_config.clone(),
             Arc::clone(&lsn_provider),
+            Arc::clone(&io_service),
             io_handle,
         )?;
         let ilog = Arc::new(ilog);
@@ -185,6 +191,7 @@ impl LsmRecovery {
             Arc::clone(&lsn_provider),
             Arc::clone(&ilog),
             version,
+            Arc::clone(&io_service),
         )?;
 
         // Step 4: Recover clog with shared LSN provider
@@ -196,6 +203,7 @@ impl LsmRecovery {
         let (clog, clog_entries) = FileClogService::recover_with_lsn_provider(
             self.clog_config,
             Arc::clone(&lsn_provider),
+            Arc::clone(&io_service),
             io_handle,
         )?;
         let clog = Arc::new(clog);
@@ -346,6 +354,10 @@ mod tests {
     use crate::types::RawValue;
     use tempfile::TempDir;
 
+    fn make_test_io() -> Arc<crate::io::IoService> {
+        crate::io::IoService::new_for_test(32).unwrap()
+    }
+
     async fn get_at_for_test(engine: &LsmEngine, key: &[u8], ts: Timestamp) -> Option<RawValue> {
         use crate::storage::StorageEngine;
         let start = MvccKey::encode(key, ts);
@@ -404,7 +416,7 @@ mod tests {
         written
     }
 
-    #[tokio::test]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn test_recovery_empty() {
         let tmp = TempDir::new().unwrap();
         let io_handle = tokio::runtime::Handle::current();
@@ -445,7 +457,7 @@ mod tests {
         );
     }
 
-    #[tokio::test]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn test_recovery_with_flushed_data() {
         let tmp = TempDir::new().unwrap();
         let io_handle = tokio::runtime::Handle::current();
@@ -461,7 +473,13 @@ mod tests {
             let lsn_provider = new_lsn_provider();
             let ilog_config = IlogConfig::new(tmp.path());
             let ilog = Arc::new(
-                IlogService::open(ilog_config, Arc::clone(&lsn_provider), &io_handle).unwrap(),
+                IlogService::open(
+                    ilog_config,
+                    Arc::clone(&lsn_provider),
+                    make_test_io(),
+                    &io_handle,
+                )
+                .unwrap(),
             );
 
             let engine = LsmEngine::open_with_recovery(
@@ -469,6 +487,7 @@ mod tests {
                 Arc::clone(&lsn_provider),
                 Arc::clone(&ilog),
                 Version::new(),
+                make_test_io(),
             )
             .unwrap();
 
@@ -477,6 +496,7 @@ mod tests {
             let clog = FileClogService::open_with_lsn_provider(
                 clog_config,
                 Arc::clone(&lsn_provider),
+                make_test_io(),
                 &io_handle,
             )
             .unwrap();
@@ -512,7 +532,7 @@ mod tests {
         }
     }
 
-    #[tokio::test]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn test_recovery_with_unflushed_data() {
         let tmp = TempDir::new().unwrap();
         let io_handle = tokio::runtime::Handle::current();
@@ -528,7 +548,13 @@ mod tests {
             let lsn_provider = new_lsn_provider();
             let ilog_config = IlogConfig::new(tmp.path());
             let ilog = Arc::new(
-                IlogService::open(ilog_config, Arc::clone(&lsn_provider), &io_handle).unwrap(),
+                IlogService::open(
+                    ilog_config,
+                    Arc::clone(&lsn_provider),
+                    make_test_io(),
+                    &io_handle,
+                )
+                .unwrap(),
             );
 
             let engine = LsmEngine::open_with_recovery(
@@ -536,6 +562,7 @@ mod tests {
                 Arc::clone(&lsn_provider),
                 Arc::clone(&ilog),
                 Version::new(),
+                make_test_io(),
             )
             .unwrap();
 
@@ -544,6 +571,7 @@ mod tests {
             let clog = FileClogService::open_with_lsn_provider(
                 clog_config,
                 Arc::clone(&lsn_provider),
+                make_test_io(),
                 &io_handle,
             )
             .unwrap();
@@ -578,7 +606,7 @@ mod tests {
         }
     }
 
-    #[tokio::test]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn test_recovery_uncommitted_discarded() {
         let tmp = TempDir::new().unwrap();
         let io_handle = tokio::runtime::Handle::current();
@@ -586,7 +614,7 @@ mod tests {
         // First session: write uncommitted data
         {
             let clog_config = FileClogConfig::with_dir(tmp.path());
-            let clog = FileClogService::open(clog_config, &io_handle).unwrap();
+            let clog = FileClogService::open(clog_config, make_test_io(), &io_handle).unwrap();
 
             // Write uncommitted transaction (no Commit record)
             let mut batch = ClogBatch::new();
@@ -629,7 +657,7 @@ mod tests {
         }
     }
 
-    #[tokio::test]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn test_recovery_partial_flush() {
         let tmp = TempDir::new().unwrap();
         let io_handle = tokio::runtime::Handle::current();
@@ -645,7 +673,13 @@ mod tests {
             let lsn_provider = new_lsn_provider();
             let ilog_config = IlogConfig::new(tmp.path());
             let ilog = Arc::new(
-                IlogService::open(ilog_config, Arc::clone(&lsn_provider), &io_handle).unwrap(),
+                IlogService::open(
+                    ilog_config,
+                    Arc::clone(&lsn_provider),
+                    make_test_io(),
+                    &io_handle,
+                )
+                .unwrap(),
             );
 
             let engine = LsmEngine::open_with_recovery(
@@ -653,6 +687,7 @@ mod tests {
                 Arc::clone(&lsn_provider),
                 Arc::clone(&ilog),
                 Version::new(),
+                make_test_io(),
             )
             .unwrap();
 
@@ -661,6 +696,7 @@ mod tests {
             let clog = FileClogService::open_with_lsn_provider(
                 clog_config,
                 Arc::clone(&lsn_provider),
+                make_test_io(),
                 &io_handle,
             )
             .unwrap();
@@ -731,7 +767,7 @@ mod tests {
 
     /// Test that unified LSN provider ensures correct ordering across clog and ilog.
     /// This test specifically verifies that both logs use the same LSN space.
-    #[tokio::test]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn test_unified_lsn_provider() {
         let tmp = TempDir::new().unwrap();
         let io_handle = tokio::runtime::Handle::current();
@@ -743,7 +779,13 @@ mod tests {
             // Open ilog and clog with shared provider
             let ilog_config = IlogConfig::new(tmp.path());
             let ilog = Arc::new(
-                IlogService::open(ilog_config, Arc::clone(&lsn_provider), &io_handle).unwrap(),
+                IlogService::open(
+                    ilog_config,
+                    Arc::clone(&lsn_provider),
+                    make_test_io(),
+                    &io_handle,
+                )
+                .unwrap(),
             );
 
             let lsm_config = LsmConfig::builder(tmp.path())
@@ -757,6 +799,7 @@ mod tests {
                 Arc::clone(&lsn_provider),
                 Arc::clone(&ilog),
                 Version::new(),
+                make_test_io(),
             )
             .unwrap();
 
@@ -764,6 +807,7 @@ mod tests {
             let clog = FileClogService::open_with_lsn_provider(
                 clog_config,
                 Arc::clone(&lsn_provider),
+                make_test_io(),
                 &io_handle,
             )
             .unwrap();
@@ -842,7 +886,7 @@ mod tests {
         }
     }
 
-    #[tokio::test]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn test_recovery_with_custom_configs() {
         // Test LsmRecovery::with_configs() constructor
         let tmp = TempDir::new().unwrap();
@@ -863,7 +907,7 @@ mod tests {
         assert_eq!(result.stats.txn_count, 0);
     }
 
-    #[tokio::test]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn test_recovery_with_delete_operations() {
         let tmp = TempDir::new().unwrap();
         let io_handle = tokio::runtime::Handle::current();
@@ -871,7 +915,7 @@ mod tests {
         // First session: write data and then delete some
         {
             let clog_config = FileClogConfig::with_dir(tmp.path());
-            let clog = FileClogService::open(clog_config, &io_handle).unwrap();
+            let clog = FileClogService::open(clog_config, make_test_io(), &io_handle).unwrap();
 
             // Insert key1
             let mut batch = ClogBatch::new();
@@ -917,7 +961,7 @@ mod tests {
         }
     }
 
-    #[tokio::test]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn test_recovery_with_rollback_operations() {
         let tmp = TempDir::new().unwrap();
         let io_handle = tokio::runtime::Handle::current();
@@ -925,7 +969,7 @@ mod tests {
         // First session: write data and rollback some
         {
             let clog_config = FileClogConfig::with_dir(tmp.path());
-            let clog = FileClogService::open(clog_config, &io_handle).unwrap();
+            let clog = FileClogService::open(clog_config, make_test_io(), &io_handle).unwrap();
 
             // Transaction 1: committed
             let mut batch = ClogBatch::new();
@@ -973,7 +1017,7 @@ mod tests {
         }
     }
 
-    #[tokio::test]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn test_recovery_stats_max_commit_ts() {
         let tmp = TempDir::new().unwrap();
         let io_handle = tokio::runtime::Handle::current();
@@ -981,7 +1025,7 @@ mod tests {
         // First session: write data with various commit timestamps
         {
             let clog_config = FileClogConfig::with_dir(tmp.path());
-            let clog = FileClogService::open(clog_config, &io_handle).unwrap();
+            let clog = FileClogService::open(clog_config, make_test_io(), &io_handle).unwrap();
 
             // Commit at ts=100
             let mut batch = ClogBatch::new();
@@ -1016,7 +1060,7 @@ mod tests {
         }
     }
 
-    #[tokio::test]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn test_recovery_interleaved_transactions() {
         let tmp = TempDir::new().unwrap();
         let io_handle = tokio::runtime::Handle::current();
@@ -1024,7 +1068,7 @@ mod tests {
         // First session: interleaved transaction writes
         {
             let clog_config = FileClogConfig::with_dir(tmp.path());
-            let clog = FileClogService::open(clog_config, &io_handle).unwrap();
+            let clog = FileClogService::open(clog_config, make_test_io(), &io_handle).unwrap();
 
             // Start both transactions
             let mut batch = ClogBatch::new();
@@ -1066,7 +1110,7 @@ mod tests {
         }
     }
 
-    #[tokio::test]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn test_recovery_multi_key_transaction() {
         let tmp = TempDir::new().unwrap();
         let io_handle = tokio::runtime::Handle::current();
@@ -1074,7 +1118,7 @@ mod tests {
         // First session: transaction with multiple keys
         {
             let clog_config = FileClogConfig::with_dir(tmp.path());
-            let clog = FileClogService::open(clog_config, &io_handle).unwrap();
+            let clog = FileClogService::open(clog_config, make_test_io(), &io_handle).unwrap();
 
             // Single transaction writing multiple keys
             let mut batch = ClogBatch::new();
@@ -1109,7 +1153,7 @@ mod tests {
         }
     }
 
-    #[tokio::test]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn test_recovery_max_commit_ts_from_sst() {
         // Test that max_commit_ts is taken from SST metadata when clog is truncated
         let tmp = TempDir::new().unwrap();
@@ -1126,7 +1170,13 @@ mod tests {
             let lsn_provider = new_lsn_provider();
             let ilog_config = IlogConfig::new(tmp.path());
             let ilog = Arc::new(
-                IlogService::open(ilog_config, Arc::clone(&lsn_provider), &io_handle).unwrap(),
+                IlogService::open(
+                    ilog_config,
+                    Arc::clone(&lsn_provider),
+                    make_test_io(),
+                    &io_handle,
+                )
+                .unwrap(),
             );
 
             let engine = LsmEngine::open_with_recovery(
@@ -1134,6 +1184,7 @@ mod tests {
                 Arc::clone(&lsn_provider),
                 Arc::clone(&ilog),
                 Version::new(),
+                make_test_io(),
             )
             .unwrap();
 
@@ -1141,6 +1192,7 @@ mod tests {
             let clog = FileClogService::open_with_lsn_provider(
                 clog_config,
                 Arc::clone(&lsn_provider),
+                make_test_io(),
                 &io_handle,
             )
             .unwrap();
@@ -1180,7 +1232,7 @@ mod tests {
         }
     }
 
-    #[tokio::test]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn test_recovery_empty_transaction() {
         // Transaction with no writes followed by commit should be ignored
         let tmp = TempDir::new().unwrap();
@@ -1188,7 +1240,7 @@ mod tests {
 
         {
             let clog_config = FileClogConfig::with_dir(tmp.path());
-            let clog = FileClogService::open(clog_config, &io_handle).unwrap();
+            let clog = FileClogService::open(clog_config, make_test_io(), &io_handle).unwrap();
 
             // Empty transaction (commit without any puts)
             let mut batch = ClogBatch::new();
@@ -1222,7 +1274,7 @@ mod tests {
     /// After the unconditional-replay fix, entries with lsn <= flushed_lsn are
     /// replayed to the memtable redundantly (idempotent — merge iterator deduplicates).
     /// This test verifies both flushed and unflushed data is readable after recovery.
-    #[tokio::test]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn test_recovery_flushed_lsn_boundary() {
         let tmp = TempDir::new().unwrap();
         let io_handle = tokio::runtime::Handle::current();
@@ -1240,7 +1292,13 @@ mod tests {
             let lsn_provider = new_lsn_provider();
             let ilog_config = IlogConfig::new(tmp.path());
             let ilog = Arc::new(
-                IlogService::open(ilog_config, Arc::clone(&lsn_provider), &io_handle).unwrap(),
+                IlogService::open(
+                    ilog_config,
+                    Arc::clone(&lsn_provider),
+                    make_test_io(),
+                    &io_handle,
+                )
+                .unwrap(),
             );
 
             let engine = LsmEngine::open_with_recovery(
@@ -1248,6 +1306,7 @@ mod tests {
                 Arc::clone(&lsn_provider),
                 Arc::clone(&ilog),
                 Version::new(),
+                make_test_io(),
             )
             .unwrap();
 
@@ -1255,6 +1314,7 @@ mod tests {
             let clog = FileClogService::open_with_lsn_provider(
                 clog_config,
                 Arc::clone(&lsn_provider),
+                make_test_io(),
                 &io_handle,
             )
             .unwrap();
@@ -1358,7 +1418,7 @@ mod tests {
     ///
     /// The safe flushed_lsn computation (via min_lsn_excluding) ensures
     /// flushed_lsn < straggler's LSN, so recovery correctly replays it.
-    #[tokio::test]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn test_recovery_out_of_order_lsn_no_data_loss() {
         let tmp = TempDir::new().unwrap();
         let io_handle = tokio::runtime::Handle::current();
@@ -1379,7 +1439,13 @@ mod tests {
             let lsn_provider = new_lsn_provider();
             let ilog_config = IlogConfig::new(tmp.path());
             let ilog = Arc::new(
-                IlogService::open(ilog_config, Arc::clone(&lsn_provider), &io_handle).unwrap(),
+                IlogService::open(
+                    ilog_config,
+                    Arc::clone(&lsn_provider),
+                    make_test_io(),
+                    &io_handle,
+                )
+                .unwrap(),
             );
 
             let engine = LsmEngine::open_with_recovery(
@@ -1387,6 +1453,7 @@ mod tests {
                 Arc::clone(&lsn_provider),
                 Arc::clone(&ilog),
                 Version::new(),
+                make_test_io(),
             )
             .unwrap();
 
@@ -1394,6 +1461,7 @@ mod tests {
             let clog = FileClogService::open_with_lsn_provider(
                 clog_config,
                 Arc::clone(&lsn_provider),
+                make_test_io(),
                 &io_handle,
             )
             .unwrap();
@@ -1497,7 +1565,7 @@ mod tests {
     ///
     /// Scenario: rotate + straggler in active + flush frozen + crash + recover
     /// + flush + recover again. The straggler data should survive both recoveries.
-    #[tokio::test]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn test_recovery_out_of_order_lsn_survives_second_recovery() {
         let tmp = TempDir::new().unwrap();
         let io_handle = tokio::runtime::Handle::current();
@@ -1517,7 +1585,13 @@ mod tests {
             let lsn_provider = new_lsn_provider();
             let ilog_config = IlogConfig::new(tmp.path());
             let ilog = Arc::new(
-                IlogService::open(ilog_config, Arc::clone(&lsn_provider), &io_handle).unwrap(),
+                IlogService::open(
+                    ilog_config,
+                    Arc::clone(&lsn_provider),
+                    make_test_io(),
+                    &io_handle,
+                )
+                .unwrap(),
             );
 
             let engine = LsmEngine::open_with_recovery(
@@ -1525,6 +1599,7 @@ mod tests {
                 Arc::clone(&lsn_provider),
                 Arc::clone(&ilog),
                 Version::new(),
+                make_test_io(),
             )
             .unwrap();
 
@@ -1532,6 +1607,7 @@ mod tests {
             let clog = FileClogService::open_with_lsn_provider(
                 clog_config,
                 Arc::clone(&lsn_provider),
+                make_test_io(),
                 &io_handle,
             )
             .unwrap();
@@ -1607,7 +1683,7 @@ mod tests {
         }
     }
 
-    #[tokio::test]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn test_recovery_orphan_ssts_cleaned_stat() {
         let tmp = TempDir::new().unwrap();
         let io_handle = tokio::runtime::Handle::current();
@@ -1616,8 +1692,13 @@ mod tests {
         {
             let lsn_provider = new_lsn_provider();
             let ilog_config = IlogConfig::new(tmp.path());
-            let ilog =
-                IlogService::open(ilog_config, Arc::clone(&lsn_provider), &io_handle).unwrap();
+            let ilog = IlogService::open(
+                ilog_config,
+                Arc::clone(&lsn_provider),
+                make_test_io(),
+                &io_handle,
+            )
+            .unwrap();
 
             // Write flush intent but no commit (simulating crash before SST creation)
             ilog.write_flush_intent(99, 100).unwrap();

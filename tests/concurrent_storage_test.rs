@@ -42,6 +42,10 @@ use tisql::testkit::{
 use tisql::types::{RawValue, Timestamp};
 use tisql::StorageEngine;
 
+fn make_test_io() -> std::sync::Arc<tisql::io::IoService> {
+    tisql::io::IoService::new(32).unwrap()
+}
+
 // ==================== Test Helpers Using MvccKey ====================
 
 async fn get_at_for_test(engine: &LsmEngine, key: &[u8], ts: Timestamp) -> Option<RawValue> {
@@ -91,6 +95,7 @@ fn create_test_lsm_engine(dir: &TempDir) -> (Arc<LsmEngine>, Arc<IlogService>) {
         Arc::clone(&lsn_provider),
         Arc::clone(&ilog),
         Version::new(),
+        make_test_io(),
     )
     .unwrap();
 
@@ -1170,6 +1175,7 @@ async fn test_scan_snapshot_isolation_during_rotation() {
             Arc::clone(&lsn_provider),
             Arc::clone(&ilog),
             Version::new(),
+            make_test_io(),
         )
         .unwrap(),
     );
@@ -1350,6 +1356,7 @@ async fn test_stress_rotations_with_concurrent_scans() {
             Arc::clone(&lsn_provider),
             Arc::clone(&ilog),
             Version::new(),
+            make_test_io(),
         )
         .unwrap(),
     );
@@ -1542,6 +1549,7 @@ async fn test_rotation_blocked_at_frozen_limit() {
         Arc::clone(&lsn_provider),
         Arc::clone(&ilog),
         Version::new(),
+        make_test_io(),
     )
     .unwrap();
 
@@ -1625,6 +1633,7 @@ async fn test_flush_unblocks_rotation() {
         Arc::clone(&lsn_provider),
         Arc::clone(&ilog),
         Version::new(),
+        make_test_io(),
     )
     .unwrap();
 
@@ -1705,6 +1714,7 @@ async fn test_concurrent_writes_under_backpressure() {
             Arc::clone(&lsn_provider),
             Arc::clone(&ilog),
             Version::new(),
+            make_test_io(),
         )
         .unwrap(),
     );
@@ -1813,6 +1823,7 @@ async fn test_slow_flush_causes_memtable_growth() {
             Arc::clone(&lsn_provider),
             Arc::clone(&ilog),
             Version::new(),
+            make_test_io(),
         )
         .unwrap(),
     );
@@ -1909,6 +1920,7 @@ async fn test_large_batch_under_frozen_limit() {
         Arc::clone(&lsn_provider),
         Arc::clone(&ilog),
         Version::new(),
+        make_test_io(),
     )
     .unwrap();
 

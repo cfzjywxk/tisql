@@ -367,11 +367,16 @@ mod tests {
 
     type TestTxnService = TransactionService<MemTableEngine, FileClogService, LocalTso>;
 
+    fn make_test_io() -> Arc<crate::io::IoService> {
+        crate::io::IoService::new_for_test(32).unwrap()
+    }
+
     fn create_test_txn() -> (Arc<TestTxnService>, tempfile::TempDir) {
         let dir = tempdir().unwrap();
         let clog_config = FileClogConfig::with_dir(dir.path());
         let io_handle = tokio::runtime::Handle::current();
-        let (clog_service, _) = FileClogService::recover(clog_config, &io_handle).unwrap();
+        let (clog_service, _) =
+            FileClogService::recover(clog_config, make_test_io(), &io_handle).unwrap();
         let clog_service = Arc::new(clog_service);
         let tso = Arc::new(LocalTso::new(1));
         let concurrency_manager = Arc::new(ConcurrencyManager::new(0));
@@ -385,13 +390,13 @@ mod tests {
         (txn_service, dir)
     }
 
-    #[tokio::test]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn test_not_bootstrapped_initially() {
         let (txn, _dir) = create_test_txn();
         assert!(!is_bootstrapped(txn.as_ref()).await.unwrap());
     }
 
-    #[tokio::test]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn test_bootstrap_then_detect() {
         let (txn, _dir) = create_test_txn();
         assert!(!is_bootstrapped(txn.as_ref()).await.unwrap());
@@ -399,7 +404,7 @@ mod tests {
         assert!(is_bootstrapped(txn.as_ref()).await.unwrap());
     }
 
-    #[tokio::test]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn test_bootstrap_idempotent_detection() {
         let (txn, _dir) = create_test_txn();
         bootstrap_core_tables(txn.as_ref()).await.unwrap();
@@ -408,7 +413,7 @@ mod tests {
         assert!(is_bootstrapped(txn.as_ref()).await.unwrap());
     }
 
-    #[tokio::test]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn test_bootstrap_writes_meta_rows() {
         let (txn, _dir) = create_test_txn();
         bootstrap_core_tables(txn.as_ref()).await.unwrap();
@@ -424,7 +429,7 @@ mod tests {
         }
     }
 
-    #[tokio::test]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn test_bootstrap_writes_schema_rows() {
         let (txn, _dir) = create_test_txn();
         bootstrap_core_tables(txn.as_ref()).await.unwrap();
@@ -440,7 +445,7 @@ mod tests {
         }
     }
 
-    #[tokio::test]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn test_bootstrap_writes_table_rows() {
         let (txn, _dir) = create_test_txn();
         bootstrap_core_tables(txn.as_ref()).await.unwrap();

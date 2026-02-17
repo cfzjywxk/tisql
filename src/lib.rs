@@ -624,7 +624,7 @@ impl Database {
     /// which accounts for the race window where a lower-LSN write can land in a
     /// newer (unflushed) memtable. Using `flushed_lsn` alone would risk deleting
     /// clog entries that are still only in volatile memory.
-    pub fn run_log_gc_once(&self) -> Result<LogGcStats> {
+    pub async fn run_log_gc_once(&self) -> Result<LogGcStats> {
         // Hold manifest_lock during version capture + checkpoint write.
         // This ensures all ilog records with LSN < checkpoint_lsn are
         // reflected in `version` — safe to truncate.
@@ -657,12 +657,16 @@ impl Database {
         #[cfg(feature = "failpoints")]
         fail_point!("log_gc_after_checkpoint_before_clog_truncate");
 
-        let clog = self.txn_service.clog_service().truncate_to(safe_lsn)?;
+        let clog = self
+            .txn_service
+            .clog_service()
+            .truncate_to(safe_lsn)
+            .await?;
 
         #[cfg(feature = "failpoints")]
         fail_point!("log_gc_after_clog_truncate_before_ilog_truncate");
 
-        let ilog = self.ilog.truncate_before(checkpoint_lsn)?;
+        let ilog = self.ilog.truncate_before(checkpoint_lsn).await?;
 
         #[cfg(feature = "failpoints")]
         fail_point!("log_gc_after_ilog_truncate");
@@ -1106,7 +1110,7 @@ mod tests {
         let flushed_lsn = db.storage.current_version().flushed_lsn();
 
         let clog_size_before = db.txn_service.clog_service().file_size().unwrap();
-        let stats = db.run_log_gc_once().unwrap();
+        let stats = db.run_log_gc_once().await.unwrap();
 
         assert!(
             stats.flushed_lsn >= lsn1,

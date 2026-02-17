@@ -37,6 +37,10 @@ use tisql::testkit::{
 };
 use tisql::{ClogService, StorageEngine, TxnService, V26BoundaryMode};
 
+fn make_test_io() -> std::sync::Arc<tisql::io::IoService> {
+    tisql::io::IoService::new(32).unwrap()
+}
+
 /// Helper to create a test LSM engine with ilog for durability tests.
 async fn create_test_lsm_engine(
     dir: &TempDir,
@@ -48,14 +52,21 @@ async fn create_test_lsm_engine(
         IlogService::open(
             ilog_config,
             Arc::clone(&lsn_provider),
+            make_test_io(),
             &tokio::runtime::Handle::current(),
         )
         .unwrap(),
     );
 
     let clog_config = FileClogConfig::with_dir(dir.path());
-    let clog =
-        Arc::new(FileClogService::open(clog_config, &tokio::runtime::Handle::current()).unwrap());
+    let clog = Arc::new(
+        FileClogService::open(
+            clog_config,
+            make_test_io(),
+            &tokio::runtime::Handle::current(),
+        )
+        .unwrap(),
+    );
 
     let config = LsmConfigBuilder::new(dir.path())
         .memtable_size(256) // Very small for testing to trigger rotations
@@ -66,6 +77,7 @@ async fn create_test_lsm_engine(
         Arc::clone(&lsn_provider),
         Arc::clone(&ilog),
         Version::new(),
+        make_test_io(),
     )
     .unwrap();
 
@@ -83,6 +95,7 @@ async fn create_test_lsm_engine_with_unified_logs(
         IlogService::open(
             ilog_config,
             Arc::clone(&lsn_provider),
+            make_test_io(),
             &tokio::runtime::Handle::current(),
         )
         .unwrap(),
@@ -93,6 +106,7 @@ async fn create_test_lsm_engine_with_unified_logs(
         FileClogService::open_with_lsn_provider(
             clog_config,
             Arc::clone(&lsn_provider),
+            make_test_io(),
             &tokio::runtime::Handle::current(),
         )
         .unwrap(),
@@ -107,6 +121,7 @@ async fn create_test_lsm_engine_with_unified_logs(
         Arc::clone(&lsn_provider),
         Arc::clone(&ilog),
         Version::new(),
+        make_test_io(),
     )
     .unwrap();
 
@@ -148,7 +163,7 @@ struct LogGcCycleStats {
 /// Mirrors the production `Database::run_log_gc_once()` flow:
 /// 1. Hold manifest_lock during version capture + checkpoint write
 /// 2. Compute authoritative V2.6 boundary (checkpoint + mem + reservation + in-flight caps)
-fn run_log_gc_cycle(
+async fn run_log_gc_cycle(
     engine: &LsmEngine,
     ilog: &IlogService,
     clog: &FileClogService,
@@ -177,11 +192,11 @@ fn run_log_gc_cycle(
 
     fail_point!("log_gc_after_checkpoint_before_clog_truncate");
 
-    let clog_stats = clog.truncate_to(safe_lsn)?;
+    let clog_stats = clog.truncate_to(safe_lsn).await?;
 
     fail_point!("log_gc_after_clog_truncate_before_ilog_truncate");
 
-    let ilog_stats = ilog.truncate_before(checkpoint_lsn)?;
+    let ilog_stats = ilog.truncate_before(checkpoint_lsn).await?;
 
     fail_point!("log_gc_after_ilog_truncate");
 
@@ -213,7 +228,7 @@ async fn prepare_v26_mode_boundary_case(
     (engine, ilog, clog, reserved_lsn)
 }
 
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn test_v26_mode_matrix_log_gc_boundary_selection() {
     let scenario = fail::FailScenario::setup();
 
@@ -230,7 +245,7 @@ async fn test_v26_mode_matrix_log_gc_boundary_selection() {
         let flushed = engine.current_version().flushed_lsn();
         let safe_expected = engine.compute_log_gc_boundary_with_caps(flushed).safe_lsn;
 
-        let stats = run_log_gc_cycle(&engine, &ilog, &clog).unwrap();
+        let stats = run_log_gc_cycle(&engine, &ilog, &clog).await.unwrap();
         assert_eq!(stats.safe_lsn, safe_expected, "mode={mode:?}");
 
         drop(engine);
@@ -241,7 +256,7 @@ async fn test_v26_mode_matrix_log_gc_boundary_selection() {
     scenario.teardown();
 }
 
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn test_v26_mode_runtime_switch_normalizes_to_on() {
     let scenario = fail::FailScenario::setup();
     let dir = tempfile::tempdir().unwrap();
@@ -260,7 +275,7 @@ async fn test_v26_mode_runtime_switch_normalizes_to_on() {
         assert_eq!(engine.get_v26_mode(), V26BoundaryMode::On);
     }
 
-    let stats = run_log_gc_cycle(&engine, &ilog, &clog).unwrap();
+    let stats = run_log_gc_cycle(&engine, &ilog, &clog).await.unwrap();
     assert_eq!(stats.safe_lsn, safe_expected);
 
     scenario.teardown();
@@ -350,32 +365,32 @@ async fn run_v26_commit_cutpoint_panic_test(failpoint_name: &str) {
     scenario.teardown();
 }
 
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn test_v26_commit_cutpoint_c0_after_alloc_before_reserve() {
     run_v26_commit_cutpoint_panic_test("txn_after_lsn_alloc_before_reserve_v26").await;
 }
 
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn test_v26_commit_cutpoint_c1_after_reserve_before_clog() {
     run_v26_commit_cutpoint_panic_test("txn_after_alloc_and_reserve_before_clog_write_v26").await;
 }
 
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn test_v26_commit_cutpoint_c2_after_clog_write_before_fsync_wait() {
     run_v26_commit_cutpoint_panic_test("txn_after_clog_write_before_fsync_wait_v26").await;
 }
 
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn test_v26_commit_cutpoint_c3_after_fsync_before_finalize() {
     run_v26_commit_cutpoint_panic_test("txn_after_clog_fsync_before_finalize_v26").await;
 }
 
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn test_v26_commit_cutpoint_c4_after_finalize_before_release() {
     run_v26_commit_cutpoint_panic_test("txn_after_finalize_before_reservation_release_v26").await;
 }
 
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn test_v26_commit_cutpoint_after_release_before_state_commit() {
     run_v26_commit_cutpoint_panic_test("txn_after_reservation_release_before_state_commit_v26")
         .await;
@@ -386,7 +401,7 @@ async fn test_v26_commit_cutpoint_after_release_before_state_commit() {
 // ============================================================================
 
 /// Test that data in memtable is preserved after crash before freeze.
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn test_crash_before_freeze() {
     let scenario = fail::FailScenario::setup();
     let dir = tempfile::tempdir().unwrap();
@@ -413,7 +428,7 @@ async fn test_crash_before_freeze() {
 /// Verifies the failpoint actually fires during rotation. After the panic,
 /// the RwLock is poisoned (as expected for a real crash), so we just verify
 /// the failpoint was triggered.
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn test_crash_after_freeze_before_insert() {
     use std::panic;
 
@@ -464,7 +479,7 @@ async fn test_crash_after_freeze_before_insert() {
 ///
 /// Uses freeze_active() to guarantee a frozen memtable exists, and "panic"
 /// action to verify the failpoint fires during flush_memtable().
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn test_crash_before_sst_build() {
     use std::panic;
 
@@ -579,12 +594,12 @@ async fn run_flush_crash_after_sst_before_manifest_test(
     scenario.teardown();
 }
 
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn test_crash_after_sst_write_before_ilog() {
     run_flush_crash_after_sst_before_manifest_test("lsm_flush_after_sst_write", None).await;
 }
 
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn test_crash_after_sst_before_boundary_v26() {
     run_flush_crash_after_sst_before_manifest_test(
         "lsm_flush_after_sst_before_boundary_v26",
@@ -593,7 +608,7 @@ async fn test_crash_after_sst_before_boundary_v26() {
     .await;
 }
 
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn test_crash_after_boundary_before_manifest_commit_v26() {
     run_flush_crash_after_sst_before_manifest_test(
         "lsm_flush_after_boundary_before_manifest_commit_v26",
@@ -658,12 +673,12 @@ async fn run_flush_crash_after_manifest_commit_test(
     scenario.teardown();
 }
 
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn test_crash_after_ilog_commit() {
     run_flush_crash_after_manifest_commit_test("lsm_flush_after_ilog_commit", None).await;
 }
 
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn test_crash_after_manifest_commit_before_state_transition_v26() {
     run_flush_crash_after_manifest_commit_test(
         "lsm_flush_after_manifest_commit_before_state_transition_v26",
@@ -673,7 +688,7 @@ async fn test_crash_after_manifest_commit_before_state_transition_v26() {
 }
 
 /// Test crash after version update - everything should be consistent.
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn test_crash_after_version_update() {
     use std::panic;
 
@@ -743,7 +758,7 @@ async fn test_crash_after_version_update() {
 // ============================================================================
 
 /// Test crash after flush intent write - SST should be orphaned.
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn test_crash_after_flush_intent() {
     use std::panic;
 
@@ -757,6 +772,7 @@ async fn test_crash_after_flush_intent() {
         let ilog = IlogService::open(
             ilog_config.clone(),
             Arc::clone(&lsn_provider),
+            make_test_io(),
             &tokio::runtime::Handle::current(),
         )
         .unwrap();
@@ -782,7 +798,7 @@ async fn test_crash_after_flush_intent() {
 }
 
 /// Test crash during checkpoint write.
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn test_crash_during_checkpoint() {
     use std::panic;
 
@@ -796,6 +812,7 @@ async fn test_crash_during_checkpoint() {
         let ilog = IlogService::open(
             ilog_config,
             Arc::clone(&lsn_provider),
+            make_test_io(),
             &tokio::runtime::Handle::current(),
         )
         .unwrap();
@@ -830,7 +847,7 @@ async fn test_crash_during_checkpoint() {
 ///
 /// Creates enough L0 SSTs to trigger compaction, then verifies the failpoint
 /// fires when do_compaction() is called.
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn test_crash_before_merge() {
     let scenario = fail::FailScenario::setup();
     let dir = tempfile::tempdir().unwrap();
@@ -887,7 +904,7 @@ async fn test_crash_before_merge() {
 /// Creates multiple L0 SSTs, triggers compaction, and panics mid-write.
 /// Data remains intact because the original SSTs are not removed until
 /// compaction commits.
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn test_crash_mid_compaction() {
     let scenario = fail::FailScenario::setup();
     let dir = tempfile::tempdir().unwrap();
@@ -945,7 +962,7 @@ async fn test_crash_mid_compaction() {
 ///
 /// All SSTs are written, but the manifest delta is not applied. Original SSTs
 /// remain in the version, so data is still readable.
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn test_crash_after_compaction_finish() {
     let scenario = fail::FailScenario::setup();
     let dir = tempfile::tempdir().unwrap();
@@ -1012,7 +1029,7 @@ async fn test_crash_after_compaction_finish() {
 ///
 /// Writes to clog with sync=true, but the failpoint panics before the fsync.
 /// Data written but not synced may be lost on recovery (depending on OS buffer).
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn test_crash_before_clog_sync() {
     use tisql::ClogService;
 
@@ -1020,7 +1037,12 @@ async fn test_crash_before_clog_sync() {
     let dir = tempfile::tempdir().unwrap();
 
     let clog_config = FileClogConfig::with_dir(dir.path());
-    let clog = FileClogService::open(clog_config, &tokio::runtime::Handle::current()).unwrap();
+    let clog = FileClogService::open(
+        clog_config,
+        make_test_io(),
+        &tokio::runtime::Handle::current(),
+    )
+    .unwrap();
 
     // Configure failpoint to crash before fsync
     fail::cfg("clog_before_sync", "panic").unwrap();
@@ -1050,7 +1072,7 @@ async fn test_crash_before_clog_sync() {
 ///
 /// After fsync completes, the data is durable on disk. A crash after fsync
 /// should not lose the written data.
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn test_crash_after_clog_sync() {
     use tisql::ClogService;
 
@@ -1058,7 +1080,12 @@ async fn test_crash_after_clog_sync() {
     let dir = tempfile::tempdir().unwrap();
 
     let clog_config = FileClogConfig::with_dir(dir.path());
-    let clog = FileClogService::open(clog_config, &tokio::runtime::Handle::current()).unwrap();
+    let clog = FileClogService::open(
+        clog_config,
+        make_test_io(),
+        &tokio::runtime::Handle::current(),
+    )
+    .unwrap();
 
     // First write without failpoint to establish baseline
     let mut batch = tisql::testkit::ClogBatch::new();
@@ -1090,8 +1117,12 @@ async fn test_crash_after_clog_sync() {
     // Drop clog and recover
     drop(clog);
     let clog_config = FileClogConfig::with_dir(dir.path());
-    let (recovered_clog, entries) =
-        FileClogService::recover(clog_config, &tokio::runtime::Handle::current()).unwrap();
+    let (recovered_clog, entries) = FileClogService::recover(
+        clog_config,
+        make_test_io(),
+        &tokio::runtime::Handle::current(),
+    )
+    .unwrap();
 
     // First write should be recoverable (was synced before failpoint was set)
     assert!(
@@ -1110,7 +1141,7 @@ async fn test_crash_after_clog_sync() {
 // ============================================================================
 
 /// Test full recovery cycle after simulated crash.
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn test_recovery_after_clean_shutdown() {
     let scenario = fail::FailScenario::setup();
     let dir = tempfile::tempdir().unwrap();
@@ -1147,7 +1178,7 @@ async fn test_recovery_after_clean_shutdown() {
 }
 
 /// Test recovery with interleaved transactions.
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn test_recovery_interleaved_txns() {
     let scenario = fail::FailScenario::setup();
     let dir = tempfile::tempdir().unwrap();
@@ -1187,7 +1218,7 @@ async fn test_recovery_interleaved_txns() {
 }
 
 /// Test recovery handles tombstones correctly.
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn test_recovery_with_tombstones() {
     let scenario = fail::FailScenario::setup();
     let dir = tempfile::tempdir().unwrap();
@@ -1231,7 +1262,7 @@ async fn test_recovery_with_tombstones() {
 // ============================================================================
 
 /// Test empty memtable flush (should be a no-op or handled gracefully).
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn test_flush_empty_memtable() {
     let scenario = fail::FailScenario::setup();
     let dir = tempfile::tempdir().unwrap();
@@ -1251,7 +1282,7 @@ async fn test_flush_empty_memtable() {
 }
 
 /// Test multiple consecutive flushes.
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn test_multiple_consecutive_flushes() {
     let scenario = fail::FailScenario::setup();
     let dir = tempfile::tempdir().unwrap();
@@ -1295,7 +1326,7 @@ async fn test_multiple_consecutive_flushes() {
 // ============================================================================
 
 /// One-shot log GC should reclaim flushed clog entries and preserve recovery.
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn test_log_gc_once_reclaims_and_recovers() {
     let scenario = fail::FailScenario::setup();
     let dir = tempfile::tempdir().unwrap();
@@ -1325,7 +1356,7 @@ async fn test_log_gc_once_reclaims_and_recovers() {
     let clog_size_before = clog.file_size().unwrap();
     let ilog_size_before = ilog.file_size().unwrap();
 
-    let stats = run_log_gc_cycle(&engine, &ilog, &clog).unwrap();
+    let stats = run_log_gc_cycle(&engine, &ilog, &clog).await.unwrap();
     assert!(stats.flushed_lsn > 0);
     assert!(stats.checkpoint_lsn >= stats.flushed_lsn);
     assert!(stats.clog.entries_removed > 0);
@@ -1347,7 +1378,7 @@ async fn test_log_gc_once_reclaims_and_recovers() {
 }
 
 /// Running GC again without new flush should be conservative and recovery-safe.
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn test_log_gc_once_without_new_flush_recovery_safe() {
     let scenario = fail::FailScenario::setup();
     let dir = tempfile::tempdir().unwrap();
@@ -1365,8 +1396,8 @@ async fn test_log_gc_once_without_new_flush_recovery_safe() {
     engine.flush_all_with_active().unwrap();
     ilog.sync().unwrap();
 
-    let first = run_log_gc_cycle(&engine, &ilog, &clog).unwrap();
-    let second = run_log_gc_cycle(&engine, &ilog, &clog).unwrap();
+    let first = run_log_gc_cycle(&engine, &ilog, &clog).await.unwrap();
+    let second = run_log_gc_cycle(&engine, &ilog, &clog).await.unwrap();
 
     assert_eq!(second.flushed_lsn, first.flushed_lsn);
     assert_eq!(second.clog.entries_removed, 0);
@@ -1429,8 +1460,6 @@ async fn prepare_log_gc_cutpoint_case(
 }
 
 async fn run_log_gc_cutpoint_crash_test(failpoint_name: &str, mode: Option<V26BoundaryMode>) {
-    use std::panic;
-
     let scenario = fail::FailScenario::setup();
     let dir = tempfile::tempdir().unwrap();
 
@@ -1441,9 +1470,13 @@ async fn run_log_gc_cutpoint_crash_test(failpoint_name: &str, mode: Option<V26Bo
 
     fail::cfg(failpoint_name, "panic").unwrap();
 
-    let result = panic::catch_unwind(panic::AssertUnwindSafe(|| {
-        let _ = run_log_gc_cycle(&engine, &ilog, &clog);
-    }));
+    let engine_c = Arc::clone(&engine);
+    let ilog_c = Arc::clone(&ilog);
+    let clog_c = Arc::clone(&clog);
+    let result = tokio::spawn(async move {
+        let _ = run_log_gc_cycle(&engine_c, &ilog_c, &clog_c).await;
+    })
+    .await;
     assert!(result.is_err(), "failpoint {failpoint_name} should panic");
 
     fail::cfg(failpoint_name, "off").unwrap();
@@ -1466,17 +1499,17 @@ async fn run_log_gc_cutpoint_crash_test(failpoint_name: &str, mode: Option<V26Bo
     scenario.teardown();
 }
 
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn test_log_gc_crash_before_checkpoint() {
     run_log_gc_cutpoint_crash_test("log_gc_before_checkpoint", None).await;
 }
 
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn test_log_gc_crash_after_checkpoint_before_clog_truncate() {
     run_log_gc_cutpoint_crash_test("log_gc_after_checkpoint_before_clog_truncate", None).await;
 }
 
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn test_log_gc_crash_after_checkpoint_before_safe_compute_v26() {
     run_log_gc_cutpoint_crash_test(
         "log_gc_after_checkpoint_before_safe_compute_v26",
@@ -1485,7 +1518,7 @@ async fn test_log_gc_crash_after_checkpoint_before_safe_compute_v26() {
     .await;
 }
 
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn test_log_gc_crash_after_safe_compute_before_clog_truncate_v26() {
     run_log_gc_cutpoint_crash_test(
         "log_gc_after_safe_compute_before_clog_truncate_v26",
@@ -1494,12 +1527,12 @@ async fn test_log_gc_crash_after_safe_compute_before_clog_truncate_v26() {
     .await;
 }
 
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn test_log_gc_crash_after_clog_truncate_before_ilog_truncate() {
     run_log_gc_cutpoint_crash_test("log_gc_after_clog_truncate_before_ilog_truncate", None).await;
 }
 
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn test_log_gc_crash_after_ilog_truncate() {
     run_log_gc_cutpoint_crash_test("log_gc_after_ilog_truncate", None).await;
 }
@@ -1509,7 +1542,7 @@ async fn test_log_gc_crash_after_ilog_truncate() {
 // ============================================================================
 
 /// Test truncation at checkpoint boundary - recovery should still work.
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn test_truncate_at_checkpoint_boundary() {
     let scenario = fail::FailScenario::setup();
     let dir = tempfile::tempdir().unwrap();
@@ -1532,10 +1565,15 @@ async fn test_truncate_at_checkpoint_boundary() {
 
     // Create new clog service for truncation
     let clog_config = FileClogConfig::with_dir(dir.path());
-    let clog = FileClogService::open(clog_config, &tokio::runtime::Handle::current()).unwrap();
+    let clog = FileClogService::open(
+        clog_config,
+        make_test_io(),
+        &tokio::runtime::Handle::current(),
+    )
+    .unwrap();
 
     // Truncate to flushed_lsn
-    let _stats = clog.truncate_to(flushed_lsn).unwrap();
+    let _stats = clog.truncate_to(flushed_lsn).await.unwrap();
 
     // Since data is flushed, all clog entries could be removed
     // (entries with lsn <= flushed_lsn are safe to remove)
@@ -1558,7 +1596,7 @@ async fn test_truncate_at_checkpoint_boundary() {
 }
 
 /// Test truncation preserves uncommitted transactions.
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn test_truncate_with_uncommitted_txn() {
     let scenario = fail::FailScenario::setup();
     let dir = tempfile::tempdir().unwrap();
@@ -1579,9 +1617,14 @@ async fn test_truncate_with_uncommitted_txn() {
 
     // Truncate to flushed_lsn - should keep unflushed entries
     let clog_config = FileClogConfig::with_dir(dir.path());
-    let clog = FileClogService::open(clog_config, &tokio::runtime::Handle::current()).unwrap();
+    let clog = FileClogService::open(
+        clog_config,
+        make_test_io(),
+        &tokio::runtime::Handle::current(),
+    )
+    .unwrap();
 
-    let stats = clog.truncate_to(flushed_lsn).unwrap();
+    let stats = clog.truncate_to(flushed_lsn).await.unwrap();
 
     // Entries with lsn > flushed_lsn should be kept
     // (These represent data not yet persisted in SST)
@@ -1592,7 +1635,7 @@ async fn test_truncate_with_uncommitted_txn() {
 }
 
 /// Test concurrent truncate and write doesn't corrupt data.
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn test_concurrent_truncate_and_write() {
     let scenario = fail::FailScenario::setup();
     let dir = tempfile::tempdir().unwrap();
@@ -1621,7 +1664,12 @@ async fn test_concurrent_truncate_and_write() {
 
     // Truncate
     let clog_config = FileClogConfig::with_dir(dir.path());
-    let clog = FileClogService::open(clog_config, &tokio::runtime::Handle::current()).unwrap();
+    let clog = FileClogService::open(
+        clog_config,
+        make_test_io(),
+        &tokio::runtime::Handle::current(),
+    )
+    .unwrap();
     let _ = clog.truncate_to(flushed_lsn);
 
     // Verify data integrity
@@ -1642,7 +1690,7 @@ async fn test_concurrent_truncate_and_write() {
 }
 
 /// Test truncate then crash then recover.
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn test_truncate_then_crash_then_recover() {
     let scenario = fail::FailScenario::setup();
     let dir = tempfile::tempdir().unwrap();
@@ -1663,8 +1711,13 @@ async fn test_truncate_then_crash_then_recover() {
 
         // Truncate
         let clog_config = FileClogConfig::with_dir(dir.path());
-        let clog = FileClogService::open(clog_config, &tokio::runtime::Handle::current()).unwrap();
-        clog.truncate_to(flushed_lsn).unwrap();
+        let clog = FileClogService::open(
+            clog_config,
+            make_test_io(),
+            &tokio::runtime::Handle::current(),
+        )
+        .unwrap();
+        clog.truncate_to(flushed_lsn).await.unwrap();
 
         // "Crash" by dropping without clean shutdown
     }
@@ -1683,7 +1736,7 @@ async fn test_truncate_then_crash_then_recover() {
 }
 
 /// Test flushed_lsn consistency across operations.
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn test_flushed_lsn_consistency() {
     let scenario = fail::FailScenario::setup();
     let dir = tempfile::tempdir().unwrap();
@@ -1738,7 +1791,7 @@ async fn test_flushed_lsn_consistency() {
 }
 
 /// Test clog oldest_lsn and file_size APIs.
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn test_clog_metadata_apis() {
     use tisql::ClogService;
 
@@ -1746,7 +1799,12 @@ async fn test_clog_metadata_apis() {
     let dir = tempfile::tempdir().unwrap();
 
     let clog_config = FileClogConfig::with_dir(dir.path());
-    let clog = FileClogService::open(clog_config, &tokio::runtime::Handle::current()).unwrap();
+    let clog = FileClogService::open(
+        clog_config,
+        make_test_io(),
+        &tokio::runtime::Handle::current(),
+    )
+    .unwrap();
 
     // Check initial state
     let initial_oldest = clog.oldest_lsn().unwrap();
@@ -1791,7 +1849,7 @@ async fn test_clog_metadata_apis() {
 /// Test L0SstIterator open_file failpoint.
 ///
 /// When SST file opening fails, the scan_iter should propagate the error.
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn test_level_iterator_open_file_error() {
     use tisql::storage::mvcc::MvccIterator;
 
@@ -1836,7 +1894,7 @@ async fn test_level_iterator_open_file_error() {
 }
 
 /// Test L0SstIterator seek failpoint.
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn test_level_iterator_seek_error() {
     use tisql::storage::mvcc::MvccIterator;
 
@@ -1880,7 +1938,7 @@ async fn test_level_iterator_seek_error() {
 ///
 /// The TieredMergeIterator stores advance errors in pending_error and returns them
 /// on the next call to advance(). So we need to call advance twice to see the error.
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn test_level_iterator_advance_error() {
     use tisql::storage::mvcc::MvccIterator;
 
@@ -1925,7 +1983,7 @@ async fn test_level_iterator_advance_error() {
 /// Test LsmEngine::get returns data from memtable first.
 ///
 /// This test verifies the point lookup path through memtables.
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn test_get_from_memtable() {
     let scenario = fail::FailScenario::setup();
     let dir = tempfile::tempdir().unwrap();
@@ -1963,7 +2021,7 @@ async fn test_get_from_memtable() {
 }
 
 /// Test that LsmEngine getters work correctly.
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn test_lsm_engine_getters() {
     let scenario = fail::FailScenario::setup();
     let dir = tempfile::tempdir().unwrap();
@@ -2000,7 +2058,7 @@ async fn test_lsm_engine_getters() {
 }
 
 /// Test scan with data in both memtable and SST.
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn test_scan_iter_memtable_and_sst() {
     use tisql::storage::mvcc::MvccIterator;
 
@@ -2060,7 +2118,7 @@ async fn test_scan_iter_memtable_and_sst() {
 /// 3. Flush frozen → flushed_lsn advances past the low-LSN entry
 /// 4. Run log GC → safe_lsn must NOT truncate the low-LSN clog entry
 /// 5. Crash + recover → low-LSN data must survive
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn test_log_gc_safe_truncation_out_of_order_lsn() {
     let scenario = fail::FailScenario::setup();
     let dir = tempfile::tempdir().unwrap();
@@ -2141,7 +2199,7 @@ async fn test_log_gc_safe_truncation_out_of_order_lsn() {
     );
 
     // Step 4: Run log GC — safe_lsn must protect the active memtable's entry.
-    let stats = run_log_gc_cycle(&engine, &ilog, &clog).unwrap();
+    let stats = run_log_gc_cycle(&engine, &ilog, &clog).await.unwrap();
 
     assert!(
         stats.safe_lsn < actual_clog_lsn,
@@ -2179,7 +2237,7 @@ async fn test_log_gc_safe_truncation_out_of_order_lsn() {
 ///
 /// This ensures the safe truncation doesn't over-conservatively prevent
 /// log reclamation when there's nothing in memory to protect.
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn test_log_gc_safe_lsn_equals_flushed_when_all_flushed() {
     let scenario = fail::FailScenario::setup();
     let dir = tempfile::tempdir().unwrap();
@@ -2205,7 +2263,7 @@ async fn test_log_gc_safe_lsn_equals_flushed_when_all_flushed() {
         "safe_lsn should equal flushed_lsn when all data is flushed"
     );
 
-    let stats = run_log_gc_cycle(&engine, &ilog, &clog).unwrap();
+    let stats = run_log_gc_cycle(&engine, &ilog, &clog).await.unwrap();
     assert_eq!(stats.safe_lsn, flushed_lsn);
     assert!(
         stats.clog.entries_removed > 0,
@@ -2232,7 +2290,7 @@ async fn test_log_gc_safe_lsn_equals_flushed_when_all_flushed() {
 ///
 /// Scenario: 3 frozen memtables + 1 active, each with different LSN ranges.
 /// Only the first frozen is flushed. safe_lsn must protect all remaining.
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn test_log_gc_safe_lsn_multiple_frozen_memtables() {
     let scenario = fail::FailScenario::setup();
     let dir = tempfile::tempdir().unwrap();
@@ -2293,7 +2351,7 @@ async fn test_log_gc_safe_lsn_multiple_frozen_memtables() {
     );
 
     // Run GC + crash + recover.
-    let _ = run_log_gc_cycle(&engine, &ilog, &clog).unwrap();
+    let _ = run_log_gc_cycle(&engine, &ilog, &clog).await.unwrap();
 
     drop(engine);
     drop(ilog);
@@ -2314,7 +2372,7 @@ async fn test_log_gc_safe_lsn_multiple_frozen_memtables() {
 }
 
 /// Regression guard: repeated GC cycles should never truncate past safe_lsn.
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn test_log_gc_repeated_cycles_never_over_truncate() {
     let scenario = fail::FailScenario::setup();
     let dir = tempfile::tempdir().unwrap();
@@ -2341,7 +2399,7 @@ async fn test_log_gc_repeated_cycles_never_over_truncate() {
 
     // Run GC multiple times — safe_lsn should protect unflushed entries.
     for cycle in 0..3 {
-        let stats = run_log_gc_cycle(&engine, &ilog, &clog).unwrap();
+        let stats = run_log_gc_cycle(&engine, &ilog, &clog).await.unwrap();
         let min_mem = engine.min_unflushed_lsn().unwrap();
         assert!(
             stats.safe_lsn < min_mem,
@@ -2421,7 +2479,7 @@ async fn write_durable_multi_put(
 /// 2. Write T2 (3 Puts + Commit) → in active memtable
 /// 3. Run GC → T1 should be removed, T2 must be kept intact
 /// 4. Crash + recover → T2 must be fully recoverable
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn test_gc_preserves_multi_entry_txn_on_recovery() {
     let scenario = fail::FailScenario::setup();
     let dir = tempfile::tempdir().unwrap();
@@ -2451,7 +2509,7 @@ async fn test_gc_preserves_multi_entry_txn_on_recovery() {
     }
 
     // Run GC cycle
-    let stats = run_log_gc_cycle(&engine, &ilog, &clog).unwrap();
+    let stats = run_log_gc_cycle(&engine, &ilog, &clog).await.unwrap();
 
     // Verify: T2 must be atomic in clog (all 4 entries or 0)
     let remaining = clog.read_all().unwrap();
@@ -2490,7 +2548,7 @@ async fn test_gc_preserves_multi_entry_txn_on_recovery() {
 }
 
 /// Test multiple GC cycles interleaved with multi-entry writes and flushes.
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn test_gc_multi_entry_repeated_cycles() {
     let scenario = fail::FailScenario::setup();
     let dir = tempfile::tempdir().unwrap();
@@ -2524,7 +2582,7 @@ async fn test_gc_multi_entry_repeated_cycles() {
         ilog.sync().unwrap();
 
         // Run GC
-        let stats = run_log_gc_cycle(&engine, &ilog, &clog).unwrap();
+        let stats = run_log_gc_cycle(&engine, &ilog, &clog).await.unwrap();
 
         // After flush + GC, no orphaned commits should remain
         let remaining = clog.read_all().unwrap();
@@ -2569,7 +2627,7 @@ async fn test_gc_multi_entry_repeated_cycles() {
 }
 
 /// Test GC with interleaved flushed and unflushed multi-entry transactions.
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn test_gc_interleaved_flushed_unflushed_multi_entry() {
     let scenario = fail::FailScenario::setup();
     let dir = tempfile::tempdir().unwrap();
@@ -2599,7 +2657,7 @@ async fn test_gc_interleaved_flushed_unflushed_multi_entry() {
     assert!(min_mem <= t2_commit_lsn);
 
     // GC cycle 1: T1 should be removable, T2 must be protected
-    let stats1 = run_log_gc_cycle(&engine, &ilog, &clog).unwrap();
+    let stats1 = run_log_gc_cycle(&engine, &ilog, &clog).await.unwrap();
 
     // Verify T2 is intact in clog (2 Puts + Commit = 3 entries).
     let remaining = clog.read_all().unwrap();
@@ -2621,7 +2679,7 @@ async fn test_gc_interleaved_flushed_unflushed_multi_entry() {
     write_durable_multi_put(&engine, &clog, 3, &t3_kv, 300).await;
 
     // GC cycle 2: both T2 and T3 must survive
-    let _stats2 = run_log_gc_cycle(&engine, &ilog, &clog).unwrap();
+    let _stats2 = run_log_gc_cycle(&engine, &ilog, &clog).await.unwrap();
 
     // Crash + recover
     drop(engine);
@@ -2647,7 +2705,7 @@ async fn test_gc_interleaved_flushed_unflushed_multi_entry() {
 }
 
 /// Edge case: verify no orphaned Commit entries after GC with multi-entry txns.
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn test_gc_safe_lsn_splits_multi_entry_txn_boundary() {
     let scenario = fail::FailScenario::setup();
     let dir = tempfile::tempdir().unwrap();
@@ -2676,7 +2734,7 @@ async fn test_gc_safe_lsn_splits_multi_entry_txn_boundary() {
     assert_eq!(t2_max_lsn, t2_commit_lsn);
 
     // Run GC
-    let stats = run_log_gc_cycle(&engine, &ilog, &clog).unwrap();
+    let stats = run_log_gc_cycle(&engine, &ilog, &clog).await.unwrap();
 
     // The critical check: T2 must be fully intact or fully removed.
     let after_gc = clog.read_all().unwrap();
@@ -2735,8 +2793,14 @@ async fn test_clog_truncate_drains_pending_under_failpoint() {
     let dir = tempfile::tempdir().unwrap();
 
     let clog_config = FileClogConfig::with_dir(dir.path());
-    let service =
-        Arc::new(FileClogService::open(clog_config, &tokio::runtime::Handle::current()).unwrap());
+    let service = Arc::new(
+        FileClogService::open(
+            clog_config,
+            make_test_io(),
+            &tokio::runtime::Handle::current(),
+        )
+        .unwrap(),
+    );
 
     // Write one entry and wait for it (establishes baseline; writer loop
     // completes iteration 1 and returns to recv()).
@@ -2760,20 +2824,20 @@ async fn test_clog_truncate_drains_pending_under_failpoint() {
     // Since the writer loop is paused, the barrier can't complete,
     // so truncate_to is guaranteed to be blocked when we unpause.
     let svc = Arc::clone(&service);
-    let handle = std::thread::spawn(move || svc.truncate_to(0).unwrap());
+    let handle = tokio::spawn(async move { svc.truncate_to(0).await.unwrap() });
 
     // Coordination delay: let truncate_to reach its barrier wait.
     // Its pre-block path is just lock acquire + channel send (~microseconds).
     // The "pause" failpoint guarantees the writer loop stays frozen
     // regardless of how long we wait.
-    std::thread::sleep(std::time::Duration::from_millis(50));
+    tokio::time::sleep(std::time::Duration::from_millis(50)).await;
 
     // Unpause. Writer loop processes: entry2 (pending) → barrier.
     // truncate_to unblocks, reads file (entry2 now on disk), rewrites
     // file preserving both entries.
     fail::cfg("clog_writer_loop_pause", "off").unwrap();
 
-    let stats = handle.join().unwrap();
+    let stats = handle.await.unwrap();
 
     // Both entries must survive the truncation.
     let entries = service.read_all().unwrap();
