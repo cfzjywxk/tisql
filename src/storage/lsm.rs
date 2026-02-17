@@ -669,9 +669,8 @@ impl LsmEngine {
         }
     }
 
-    /// Compute flush boundary with mem + reservation + in-flight caps.
-    #[doc(hidden)]
-    pub fn shadow_flush_boundary_with_caps(
+    /// Compute authoritative flush boundary from memtable/reservation/in-flight caps.
+    pub fn compute_flush_boundary_with_caps(
         &self,
         exclude_memtable_id: u64,
         base_flushed_lsn: u64,
@@ -683,9 +682,8 @@ impl LsmEngine {
         self.compute_boundary_with_caps(base_flushed_lsn, mem_cap, false)
     }
 
-    /// Compute log-GC boundary with checkpoint + mem + reservation + in-flight caps.
-    #[doc(hidden)]
-    pub fn shadow_log_gc_boundary_with_caps(
+    /// Compute authoritative log-GC boundary with checkpoint/memtable/reservation/in-flight caps.
+    pub fn compute_log_gc_boundary_with_caps(
         &self,
         checkpointed_flushed_lsn: u64,
     ) -> BoundaryComputation {
@@ -705,18 +703,6 @@ impl LsmEngine {
     /// possible LSN (1), meaning no truncation is safe.
     pub fn safe_log_gc_lsn(&self) -> u64 {
         let mut safe = self.version_set.current().flushed_lsn();
-        if let Some(min_mem_lsn) = self.min_unflushed_lsn() {
-            safe = safe.min(min_mem_lsn.saturating_sub(1));
-        }
-        safe
-    }
-
-    /// Compute safe clog truncation LSN, bounded by the given flushed_lsn.
-    ///
-    /// Used by log GC to make the clog boundary explicit — `flushed_lsn` comes
-    /// from the checkpointed version, not from a potentially newer version.
-    pub fn safe_log_gc_lsn_with(&self, flushed_lsn: u64) -> u64 {
-        let mut safe = flushed_lsn;
         if let Some(min_mem_lsn) = self.min_unflushed_lsn() {
             safe = safe.min(min_mem_lsn.saturating_sub(1));
         }
@@ -934,7 +920,7 @@ impl LsmEngine {
         #[cfg(feature = "failpoints")]
         fail_point!("lsm_flush_after_sst_before_boundary_v26");
         let safe_flushed_lsn = self
-            .shadow_flush_boundary_with_caps(memtable.id(), base_flushed_lsn)
+            .compute_flush_boundary_with_caps(memtable.id(), base_flushed_lsn)
             .safe_lsn;
 
         // Commit manifest mutation atomically under manifest lock.
@@ -3458,7 +3444,7 @@ mod tests {
     }
 
     #[test]
-    fn test_shadow_boundary_includes_reservation_and_inflight_caps() {
+    fn test_compute_boundary_includes_reservation_and_inflight_caps() {
         let tmp = TempDir::new().unwrap();
         let config = test_config(tmp.path());
         let engine = LsmEngine::open(config).unwrap();
@@ -3471,7 +3457,7 @@ mod tests {
         let _inflight = engine.in_flight_tracker.register(80);
 
         let boundary =
-            engine.shadow_flush_boundary_with_caps(/*exclude*/ 0, /*base*/ 120);
+            engine.compute_flush_boundary_with_caps(/*exclude*/ 0, /*base*/ 120);
         assert_eq!(boundary.mem_cap, None);
         assert_eq!(boundary.reservation_cap, Some(reserved_lsn - 1));
         assert_eq!(boundary.inflight_cap, Some(79));
@@ -3483,7 +3469,7 @@ mod tests {
             .unwrap_or(120);
         assert!(
             boundary.safe_lsn <= old_gated,
-            "shadow boundary must be <= old gated boundary"
+            "computed boundary must be <= old gated boundary"
         );
     }
 

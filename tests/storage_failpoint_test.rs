@@ -169,7 +169,7 @@ fn run_log_gc_cycle(
     #[cfg(feature = "failpoints")]
     fail_point!("log_gc_after_checkpoint_before_safe_compute_v26");
     let safe_lsn = engine
-        .shadow_log_gc_boundary_with_caps(flushed_lsn)
+        .compute_log_gc_boundary_with_caps(flushed_lsn)
         .safe_lsn;
 
     #[cfg(feature = "failpoints")]
@@ -228,7 +228,7 @@ async fn test_v26_mode_matrix_log_gc_boundary_selection() {
         assert_eq!(engine.get_v26_mode(), V26BoundaryMode::On);
 
         let flushed = engine.current_version().flushed_lsn();
-        let safe_expected = engine.shadow_log_gc_boundary_with_caps(flushed).safe_lsn;
+        let safe_expected = engine.compute_log_gc_boundary_with_caps(flushed).safe_lsn;
 
         let stats = run_log_gc_cycle(&engine, &ilog, &clog).unwrap();
         assert_eq!(stats.safe_lsn, safe_expected, "mode={mode:?}");
@@ -242,33 +242,26 @@ async fn test_v26_mode_matrix_log_gc_boundary_selection() {
 }
 
 #[tokio::test]
-async fn test_v26_mode_runtime_switch_off_on_off_log_gc() {
+async fn test_v26_mode_runtime_switch_normalizes_to_on() {
     let scenario = fail::FailScenario::setup();
     let dir = tempfile::tempdir().unwrap();
     let (engine, ilog, clog, _reserved_lsn) = prepare_v26_mode_boundary_case(&dir).await;
 
     let flushed = engine.current_version().flushed_lsn();
-    let safe_expected = engine.shadow_log_gc_boundary_with_caps(flushed).safe_lsn;
+    let safe_expected = engine.compute_log_gc_boundary_with_caps(flushed).safe_lsn;
 
-    engine.set_v26_mode(V26BoundaryMode::Off);
-    assert_eq!(engine.get_v26_mode(), V26BoundaryMode::On);
-    let off_stats = run_log_gc_cycle(&engine, &ilog, &clog).unwrap();
-    assert_eq!(off_stats.safe_lsn, safe_expected);
+    for requested in [
+        V26BoundaryMode::Off,
+        V26BoundaryMode::On,
+        V26BoundaryMode::Off,
+        V26BoundaryMode::Shadow,
+    ] {
+        engine.set_v26_mode(requested);
+        assert_eq!(engine.get_v26_mode(), V26BoundaryMode::On);
+    }
 
-    engine.set_v26_mode(V26BoundaryMode::On);
-    assert_eq!(engine.get_v26_mode(), V26BoundaryMode::On);
-    let on_stats = run_log_gc_cycle(&engine, &ilog, &clog).unwrap();
-    assert_eq!(on_stats.safe_lsn, safe_expected);
-
-    engine.set_v26_mode(V26BoundaryMode::Off);
-    assert_eq!(engine.get_v26_mode(), V26BoundaryMode::On);
-    let off_again_stats = run_log_gc_cycle(&engine, &ilog, &clog).unwrap();
-    assert_eq!(off_again_stats.safe_lsn, safe_expected);
-
-    engine.set_v26_mode(V26BoundaryMode::Shadow);
-    assert_eq!(engine.get_v26_mode(), V26BoundaryMode::On);
-    let shadow_stats = run_log_gc_cycle(&engine, &ilog, &clog).unwrap();
-    assert_eq!(shadow_stats.safe_lsn, safe_expected);
+    let stats = run_log_gc_cycle(&engine, &ilog, &clog).unwrap();
+    assert_eq!(stats.safe_lsn, safe_expected);
 
     scenario.teardown();
 }

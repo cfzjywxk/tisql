@@ -806,7 +806,7 @@ impl Database {
         fail_point!("log_gc_after_checkpoint_before_safe_compute_v26");
         let safe_lsn = self
             .storage
-            .shadow_log_gc_boundary_with_caps(flushed_lsn)
+            .compute_log_gc_boundary_with_caps(flushed_lsn)
             .safe_lsn;
 
         #[cfg(feature = "failpoints")]
