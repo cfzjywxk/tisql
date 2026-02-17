@@ -69,6 +69,9 @@ pub const DEFAULT_TARGET_FILE_SIZE: usize = 64 * 1024 * 1024;
 pub const DEFAULT_MAX_LEVELS: usize = 2;
 
 /// Rollout mode for V2.6 reservation/in-flight boundaries.
+///
+/// Note: Phase 5 normalizes runtime behavior to `On` inside `LsmEngine`.
+/// `Off`/`Shadow` are retained to preserve rollout/rollback API shape and tests.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[repr(u8)]
 pub enum V26BoundaryMode {

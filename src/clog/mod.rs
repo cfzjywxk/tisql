@@ -164,6 +164,9 @@ pub trait ClogService: Send + Sync {
     /// that borrow keys from the transaction's mutations BTreeMap and values from
     /// storage reads. The clog allocates LSNs, appends a Commit record, serializes,
     /// and submits to group commit. No key or value cloning occurs.
+    ///
+    /// V2.6 production commit paths should prefer `write_ops_with_lsn` via strict
+    /// reservation flow. `write_ops` remains for compatibility/test paths.
     fn write_ops(
         &self,
         txn_id: TxnId,
