@@ -57,7 +57,7 @@ pub use clog::{ClogFsyncFuture, ClogService};
 pub use lsn::{new_lsn_provider, LsnProvider, SharedLsnProvider};
 pub use protocol::{MySqlServer, MYSQL_DEFAULT_PORT};
 pub use session::{ExecutionCtx, Priority, QueryCtx, Session, SessionRegistry, SessionVars};
-pub use storage::{PessimisticStorage, StorageEngine};
+pub use storage::{PessimisticStorage, StorageEngine, V26BoundaryMode};
 pub use transaction::{CommitInfo, TxnCtx, TxnService, TxnState};
 pub use tso::TsoService;
 pub use worker::QueryResponse;
@@ -83,6 +83,7 @@ pub mod testkit {
     pub use crate::storage::{MemTableEngine, MemoryStats, VersionedMemTableEngine};
 
     // LSM storage engine for testing
+    pub use crate::storage::V26BoundaryMode;
     pub use crate::storage::{
         CompactionExecutor, CompactionPicker, CompactionScheduler, CompactionTask, IlogConfig,
         IlogService, IlogTruncateStats, LsmConfig, LsmConfigBuilder, LsmEngine, LsmRecovery,
@@ -725,6 +726,16 @@ impl Database {
         self.catalog.list_schemas()
     }
 
+    /// Get current V2.6 boundary mode (`off|shadow|on`).
+    pub fn v26_boundary_mode(&self) -> V26BoundaryMode {
+        self.storage.get_v26_mode()
+    }
+
+    /// Set V2.6 boundary mode at runtime for immediate rollout/rollback.
+    pub fn set_v26_boundary_mode(&self, mode: V26BoundaryMode) {
+        self.storage.set_v26_mode(mode);
+    }
+
     // ========================================================================
     // Inner Session Factory
     // ========================================================================
@@ -791,17 +802,22 @@ impl Database {
         };
         // manifest_lock released — flush/compaction can proceed
 
-        // Compute clog truncation boundary from the SAME version that was
-        // checkpointed.
+        // Compute clog truncation boundary from the SAME version that was checkpointed.
         //
-        // V2.6 Phase 3 shadow mode:
-        // - `new_live_boundary`: no gate lock, includes mem + reservation + in-flight caps
-        // - `old_gated_boundary`: existing gated path, still authoritative
+        // Mode behavior:
+        // - off: old gated boundary only
+        // - shadow: compute both, old gated authoritative
+        // - on: new boundary authoritative (with fail-safe fallback to old on divergence)
         let flushed_lsn = version.flushed_lsn();
+        let boundary_mode = self.storage.get_v26_mode();
         #[cfg(feature = "failpoints")]
         fail_point!("log_gc_after_checkpoint_before_safe_compute_v26");
-
-        let new_live_boundary = self.storage.shadow_log_gc_boundary_with_caps(flushed_lsn);
+        let new_live_boundary = match boundary_mode {
+            V26BoundaryMode::Off => None,
+            V26BoundaryMode::Shadow | V26BoundaryMode::On => {
+                Some(self.storage.shadow_log_gc_boundary_with_caps(flushed_lsn))
+            }
+        };
 
         let old_gated_boundary = {
             let fence = self.storage.flush_gate();
@@ -810,24 +826,54 @@ impl Database {
             drop(gate);
             safe
         };
-        if new_live_boundary.safe_lsn > old_gated_boundary {
-            tracing::error!(
-                new_live = new_live_boundary.safe_lsn,
-                old_gated = old_gated_boundary,
-                base_cap = new_live_boundary.base_cap,
-                mem_cap = ?new_live_boundary.mem_cap,
-                reservation_cap = ?new_live_boundary.reservation_cap,
-                inflight_cap = ?new_live_boundary.inflight_cap,
-                "v2.6 shadow log-gc boundary is less safe than old gated boundary"
-            );
-            debug_assert!(
-                new_live_boundary.safe_lsn <= old_gated_boundary,
-                "shadow log-gc boundary regression: new_live={} old_gated={}",
-                new_live_boundary.safe_lsn,
+        let safe_lsn = match (boundary_mode, new_live_boundary.as_ref()) {
+            (V26BoundaryMode::Off, _) => old_gated_boundary,
+            (V26BoundaryMode::Shadow, Some(new_live)) => {
+                if new_live.safe_lsn > old_gated_boundary {
+                    tracing::error!(
+                        mode = ?boundary_mode,
+                        new_live = new_live.safe_lsn,
+                        old_gated = old_gated_boundary,
+                        base_cap = new_live.base_cap,
+                        mem_cap = ?new_live.mem_cap,
+                        reservation_cap = ?new_live.reservation_cap,
+                        inflight_cap = ?new_live.inflight_cap,
+                        "v2.6 log-gc boundary is less safe than old gated boundary"
+                    );
+                    debug_assert!(
+                        new_live.safe_lsn <= old_gated_boundary,
+                        "shadow log-gc boundary regression: new_live={} old_gated={}",
+                        new_live.safe_lsn,
+                        old_gated_boundary
+                    );
+                }
                 old_gated_boundary
-            );
-        }
-        let safe_lsn = old_gated_boundary;
+            }
+            (V26BoundaryMode::On, Some(new_live)) => {
+                if new_live.safe_lsn > old_gated_boundary {
+                    tracing::error!(
+                        mode = ?boundary_mode,
+                        new_live = new_live.safe_lsn,
+                        old_gated = old_gated_boundary,
+                        base_cap = new_live.base_cap,
+                        mem_cap = ?new_live.mem_cap,
+                        reservation_cap = ?new_live.reservation_cap,
+                        inflight_cap = ?new_live.inflight_cap,
+                        "v2.6 log-gc boundary divergence in on mode; falling back to old gated boundary"
+                    );
+                    debug_assert!(
+                        new_live.safe_lsn <= old_gated_boundary,
+                        "on-mode log-gc boundary regression: new_live={} old_gated={}",
+                        new_live.safe_lsn,
+                        old_gated_boundary
+                    );
+                    old_gated_boundary
+                } else {
+                    new_live.safe_lsn
+                }
+            }
+            _ => old_gated_boundary,
+        };
 
         #[cfg(feature = "failpoints")]
         fail_point!("log_gc_after_safe_compute_before_clog_truncate_v26");

@@ -33,7 +33,7 @@ use tisql::storage::WriteBatch;
 use tisql::testkit::{
     ClogBatch, ConcurrencyManager, FileClogConfig, FileClogService, IlogConfig, IlogService,
     IlogTruncateStats, LocalTso, LsmConfigBuilder, LsmEngine, LsmRecovery, RecoveryResult,
-    TransactionService, TruncateStats, Version,
+    TransactionService, TruncateStats, V26BoundaryMode, Version,
 };
 use tisql::{ClogService, StorageEngine, TxnService};
 
@@ -148,8 +148,10 @@ struct LogGcCycleStats {
 ///
 /// Mirrors the production `Database::run_log_gc_once()` flow:
 /// 1. Hold manifest_lock during version capture + checkpoint write
-/// 2. Compute new-live boundary without gate (shadow), then old-gated boundary
-///    under flush_gate.write(); persist old-gated safe_lsn
+/// 2. Compute mode-selected boundary:
+///    - off: old-gated only
+///    - shadow: new-live + old-gated, old authoritative
+///    - on: new-live authoritative (fail-safe min with old)
 fn run_log_gc_cycle(
     engine: &LsmEngine,
     ilog: &IlogService,
@@ -168,22 +170,15 @@ fn run_log_gc_cycle(
     };
 
     let flushed_lsn = version.flushed_lsn();
+    let boundary_mode = engine.get_v26_mode();
     #[cfg(feature = "failpoints")]
     fail_point!("log_gc_after_checkpoint_before_safe_compute_v26");
-
-    let mem_cap = engine.min_unflushed_lsn().map(|lsn| lsn.saturating_sub(1));
-    let reservation_cap = engine.min_reserved_lsn().map(|lsn| lsn.saturating_sub(1));
-    let inflight_cap = engine.min_in_flight_lsn().map(|lsn| lsn.saturating_sub(1));
-    let mut new_live = flushed_lsn;
-    if let Some(cap) = mem_cap {
-        new_live = new_live.min(cap);
-    }
-    if let Some(cap) = reservation_cap {
-        new_live = new_live.min(cap);
-    }
-    if let Some(cap) = inflight_cap {
-        new_live = new_live.min(cap);
-    }
+    let new_live_boundary = match boundary_mode {
+        V26BoundaryMode::Off => None,
+        V26BoundaryMode::Shadow | V26BoundaryMode::On => {
+            Some(engine.shadow_log_gc_boundary_with_caps(flushed_lsn))
+        }
+    };
     let old_gated = {
         let fence = engine.flush_gate();
         let gate = tisql::io::block_on_sync(fence.write());
@@ -191,16 +186,34 @@ fn run_log_gc_cycle(
         drop(gate);
         safe
     };
-    debug_assert!(
-        new_live <= old_gated,
-        "shadow log-gc boundary regression in test helper: new_live={} old_gated={} mem_cap={:?} reservation_cap={:?} inflight_cap={:?}",
-        new_live,
-        old_gated,
-        mem_cap,
-        reservation_cap,
-        inflight_cap
-    );
-    let safe_lsn = old_gated;
+    let safe_lsn = match (boundary_mode, new_live_boundary.as_ref()) {
+        (V26BoundaryMode::Off, _) => old_gated,
+        (V26BoundaryMode::Shadow, Some(new_live)) => {
+            debug_assert!(
+                new_live.safe_lsn <= old_gated,
+                "shadow log-gc boundary regression in test helper: new_live={} old_gated={} mem_cap={:?} reservation_cap={:?} inflight_cap={:?}",
+                new_live.safe_lsn,
+                old_gated,
+                new_live.mem_cap,
+                new_live.reservation_cap,
+                new_live.inflight_cap
+            );
+            old_gated
+        }
+        (V26BoundaryMode::On, Some(new_live)) => {
+            debug_assert!(
+                new_live.safe_lsn <= old_gated,
+                "on-mode log-gc boundary regression in test helper: new_live={} old_gated={} mem_cap={:?} reservation_cap={:?} inflight_cap={:?}",
+                new_live.safe_lsn,
+                old_gated,
+                new_live.mem_cap,
+                new_live.reservation_cap,
+                new_live.inflight_cap
+            );
+            new_live.safe_lsn.min(old_gated)
+        }
+        _ => old_gated,
+    };
 
     #[cfg(feature = "failpoints")]
     fail_point!("log_gc_after_safe_compute_before_clog_truncate_v26");
@@ -222,6 +235,95 @@ fn run_log_gc_cycle(
         clog: clog_stats,
         ilog: ilog_stats,
     })
+}
+
+async fn prepare_v26_mode_boundary_case(
+    dir: &TempDir,
+) -> (Arc<LsmEngine>, Arc<IlogService>, Arc<FileClogService>, u64) {
+    let (engine, ilog, clog) = create_test_lsm_engine_with_unified_logs(dir).await;
+
+    // Reserve the very first LSN so reservation cap is strictly below old gated cap.
+    let reserved_lsn = engine.alloc_and_reserve_commit_lsn(9_999);
+    assert!(engine.is_commit_lsn_reserved(9_999, reserved_lsn));
+
+    // Build one frozen + one active memtable so old gated boundary advances > 0.
+    write_durable_put(&engine, &clog, 1, b"mode_key_frozen", b"mode_value", 10).await;
+    engine.freeze_active();
+    write_durable_put(&engine, &clog, 2, b"mode_key_active", b"mode_value", 11).await;
+    engine.flush_all().unwrap();
+    ilog.sync().unwrap();
+
+    (engine, ilog, clog, reserved_lsn)
+}
+
+#[tokio::test]
+async fn test_v26_mode_matrix_log_gc_boundary_selection() {
+    let scenario = fail::FailScenario::setup();
+
+    for mode in [
+        V26BoundaryMode::Off,
+        V26BoundaryMode::Shadow,
+        V26BoundaryMode::On,
+    ] {
+        let dir = tempfile::tempdir().unwrap();
+        let (engine, ilog, clog, _reserved_lsn) = prepare_v26_mode_boundary_case(&dir).await;
+        engine.set_v26_mode(mode);
+        assert_eq!(engine.get_v26_mode(), mode);
+
+        let flushed = engine.current_version().flushed_lsn();
+        let old_gated = engine.safe_log_gc_lsn_with(flushed);
+        let new_live = engine.shadow_log_gc_boundary_with_caps(flushed).safe_lsn;
+        assert!(
+            new_live <= old_gated,
+            "new boundary must stay <= old boundary in all modes"
+        );
+
+        let stats = run_log_gc_cycle(&engine, &ilog, &clog).unwrap();
+        let expected = match mode {
+            V26BoundaryMode::Off | V26BoundaryMode::Shadow => old_gated,
+            V26BoundaryMode::On => new_live.min(old_gated),
+        };
+        assert_eq!(stats.safe_lsn, expected, "mode={mode:?}");
+
+        drop(engine);
+        drop(ilog);
+        drop(clog);
+    }
+
+    scenario.teardown();
+}
+
+#[tokio::test]
+async fn test_v26_mode_runtime_switch_off_on_off_log_gc() {
+    let scenario = fail::FailScenario::setup();
+    let dir = tempfile::tempdir().unwrap();
+    let (engine, ilog, clog, _reserved_lsn) = prepare_v26_mode_boundary_case(&dir).await;
+
+    let flushed = engine.current_version().flushed_lsn();
+    let old_gated = engine.safe_log_gc_lsn_with(flushed);
+    let new_live = engine.shadow_log_gc_boundary_with_caps(flushed).safe_lsn;
+    assert!(
+        new_live < old_gated,
+        "test setup must differentiate on vs off/shadow behavior"
+    );
+
+    engine.set_v26_mode(V26BoundaryMode::Off);
+    let off_stats = run_log_gc_cycle(&engine, &ilog, &clog).unwrap();
+    assert_eq!(off_stats.safe_lsn, old_gated);
+
+    engine.set_v26_mode(V26BoundaryMode::On);
+    let on_stats = run_log_gc_cycle(&engine, &ilog, &clog).unwrap();
+    assert_eq!(on_stats.safe_lsn, new_live);
+
+    engine.set_v26_mode(V26BoundaryMode::Off);
+    let off_again_stats = run_log_gc_cycle(&engine, &ilog, &clog).unwrap();
+    assert_eq!(off_again_stats.safe_lsn, old_gated);
+
+    engine.set_v26_mode(V26BoundaryMode::Shadow);
+    let shadow_stats = run_log_gc_cycle(&engine, &ilog, &clog).unwrap();
+    assert_eq!(shadow_stats.safe_lsn, old_gated);
+
+    scenario.teardown();
 }
 
 /// Write one durable PUT transaction:
@@ -464,13 +566,19 @@ async fn test_crash_before_sst_build() {
 ///
 /// The SST file is written but the ilog commit never happens, creating an orphan.
 /// Recovery should clean up the orphan and data should be recoverable from clog.
-async fn run_flush_crash_after_sst_before_manifest_test(failpoint_name: &str) {
+async fn run_flush_crash_after_sst_before_manifest_test(
+    failpoint_name: &str,
+    mode: Option<V26BoundaryMode>,
+) {
     use std::panic;
 
     let scenario = fail::FailScenario::setup();
     let dir = tempfile::tempdir().unwrap();
 
     let (engine, ilog, clog) = create_test_lsm_engine(&dir).await;
+    if let Some(mode) = mode {
+        engine.set_v26_mode(mode);
+    }
 
     // Write data and record in clog for recovery
     write_test_data(&engine, b"orphan_key", b"orphan_value", 1);
@@ -533,18 +641,23 @@ async fn run_flush_crash_after_sst_before_manifest_test(failpoint_name: &str) {
 
 #[tokio::test]
 async fn test_crash_after_sst_write_before_ilog() {
-    run_flush_crash_after_sst_before_manifest_test("lsm_flush_after_sst_write").await;
+    run_flush_crash_after_sst_before_manifest_test("lsm_flush_after_sst_write", None).await;
 }
 
 #[tokio::test]
 async fn test_crash_after_sst_before_boundary_v26() {
-    run_flush_crash_after_sst_before_manifest_test("lsm_flush_after_sst_before_boundary_v26").await;
+    run_flush_crash_after_sst_before_manifest_test(
+        "lsm_flush_after_sst_before_boundary_v26",
+        Some(V26BoundaryMode::On),
+    )
+    .await;
 }
 
 #[tokio::test]
 async fn test_crash_after_boundary_before_manifest_commit_v26() {
     run_flush_crash_after_sst_before_manifest_test(
         "lsm_flush_after_boundary_before_manifest_commit_v26",
+        Some(V26BoundaryMode::On),
     )
     .await;
 }
@@ -553,7 +666,10 @@ async fn test_crash_after_boundary_before_manifest_commit_v26() {
 ///
 /// The SST is written and ilog is committed, but the version update doesn't happen
 /// because we crash. On recovery, the ilog should rebuild the version correctly.
-async fn run_flush_crash_after_manifest_commit_test(failpoint_name: &str) {
+async fn run_flush_crash_after_manifest_commit_test(
+    failpoint_name: &str,
+    mode: Option<V26BoundaryMode>,
+) {
     use std::panic;
 
     let scenario = fail::FailScenario::setup();
@@ -561,6 +677,9 @@ async fn run_flush_crash_after_manifest_commit_test(failpoint_name: &str) {
 
     {
         let (engine, ilog, _clog) = create_test_lsm_engine(&dir).await;
+        if let Some(mode) = mode {
+            engine.set_v26_mode(mode);
+        }
 
         // Write data
         write_test_data(&engine, b"committed_key", b"committed_value", 1);
@@ -601,13 +720,14 @@ async fn run_flush_crash_after_manifest_commit_test(failpoint_name: &str) {
 
 #[tokio::test]
 async fn test_crash_after_ilog_commit() {
-    run_flush_crash_after_manifest_commit_test("lsm_flush_after_ilog_commit").await;
+    run_flush_crash_after_manifest_commit_test("lsm_flush_after_ilog_commit", None).await;
 }
 
 #[tokio::test]
 async fn test_crash_after_manifest_commit_before_state_transition_v26() {
     run_flush_crash_after_manifest_commit_test(
         "lsm_flush_after_manifest_commit_before_state_transition_v26",
+        Some(V26BoundaryMode::On),
     )
     .await;
 }
@@ -1368,13 +1488,16 @@ async fn prepare_log_gc_cutpoint_case(
     (engine, ilog, clog, expected)
 }
 
-async fn run_log_gc_cutpoint_crash_test(failpoint_name: &str) {
+async fn run_log_gc_cutpoint_crash_test(failpoint_name: &str, mode: Option<V26BoundaryMode>) {
     use std::panic;
 
     let scenario = fail::FailScenario::setup();
     let dir = tempfile::tempdir().unwrap();
 
     let (engine, ilog, clog, expected) = prepare_log_gc_cutpoint_case(&dir).await;
+    if let Some(mode) = mode {
+        engine.set_v26_mode(mode);
+    }
 
     fail::cfg(failpoint_name, "panic").unwrap();
 
@@ -1405,32 +1528,40 @@ async fn run_log_gc_cutpoint_crash_test(failpoint_name: &str) {
 
 #[tokio::test]
 async fn test_log_gc_crash_before_checkpoint() {
-    run_log_gc_cutpoint_crash_test("log_gc_before_checkpoint").await;
+    run_log_gc_cutpoint_crash_test("log_gc_before_checkpoint", None).await;
 }
 
 #[tokio::test]
 async fn test_log_gc_crash_after_checkpoint_before_clog_truncate() {
-    run_log_gc_cutpoint_crash_test("log_gc_after_checkpoint_before_clog_truncate").await;
+    run_log_gc_cutpoint_crash_test("log_gc_after_checkpoint_before_clog_truncate", None).await;
 }
 
 #[tokio::test]
 async fn test_log_gc_crash_after_checkpoint_before_safe_compute_v26() {
-    run_log_gc_cutpoint_crash_test("log_gc_after_checkpoint_before_safe_compute_v26").await;
+    run_log_gc_cutpoint_crash_test(
+        "log_gc_after_checkpoint_before_safe_compute_v26",
+        Some(V26BoundaryMode::On),
+    )
+    .await;
 }
 
 #[tokio::test]
 async fn test_log_gc_crash_after_safe_compute_before_clog_truncate_v26() {
-    run_log_gc_cutpoint_crash_test("log_gc_after_safe_compute_before_clog_truncate_v26").await;
+    run_log_gc_cutpoint_crash_test(
+        "log_gc_after_safe_compute_before_clog_truncate_v26",
+        Some(V26BoundaryMode::On),
+    )
+    .await;
 }
 
 #[tokio::test]
 async fn test_log_gc_crash_after_clog_truncate_before_ilog_truncate() {
-    run_log_gc_cutpoint_crash_test("log_gc_after_clog_truncate_before_ilog_truncate").await;
+    run_log_gc_cutpoint_crash_test("log_gc_after_clog_truncate_before_ilog_truncate", None).await;
 }
 
 #[tokio::test]
 async fn test_log_gc_crash_after_ilog_truncate() {
-    run_log_gc_cutpoint_crash_test("log_gc_after_ilog_truncate").await;
+    run_log_gc_cutpoint_crash_test("log_gc_after_ilog_truncate", None).await;
 }
 
 // ============================================================================

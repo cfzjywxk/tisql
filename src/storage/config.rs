@@ -68,6 +68,35 @@ pub const DEFAULT_TARGET_FILE_SIZE: usize = 64 * 1024 * 1024;
 /// Default number of LSM levels (L0 + L1).
 pub const DEFAULT_MAX_LEVELS: usize = 2;
 
+/// Rollout mode for V2.6 reservation/in-flight boundaries.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[repr(u8)]
+pub enum V26BoundaryMode {
+    /// Keep V2.5 behavior (gated boundary only).
+    Off = 0,
+    /// Compute both paths, old gated path remains authoritative.
+    Shadow = 1,
+    /// Reservation/in-flight caps become authoritative.
+    On = 2,
+}
+
+impl V26BoundaryMode {
+    #[inline]
+    pub const fn as_u8(self) -> u8 {
+        self as u8
+    }
+
+    #[inline]
+    pub const fn from_u8(value: u8) -> Self {
+        match value {
+            0 => Self::Off,
+            1 => Self::Shadow,
+            2 => Self::On,
+            _ => Self::Off,
+        }
+    }
+}
+
 /// LSM storage engine configuration.
 #[derive(Debug, Clone)]
 pub struct LsmConfig {
@@ -160,6 +189,12 @@ pub struct LsmConfig {
     /// If false, we rely on OS buffering which improves throughput
     /// but risks losing recent writes on crash.
     pub sync_writes: bool,
+
+    // ==================== V2.6 Rollout Configuration ====================
+    /// Initial rollout mode for reservation/in-flight boundaries.
+    ///
+    /// Runtime mode may change via `LsmEngine::set_v26_mode()`.
+    pub v26_boundary_mode: V26BoundaryMode,
 }
 
 impl LsmConfig {
@@ -183,6 +218,9 @@ impl LsmConfig {
             flush_threads: 1,
             verify_checksums: true,
             sync_writes: true,
+            // Phase 3 behavior was shadow-by-default; keep that as initial value
+            // while Phase 4 adds runtime switching.
+            v26_boundary_mode: V26BoundaryMode::Shadow,
         }
     }
 
@@ -369,6 +407,12 @@ impl LsmConfigBuilder {
         self
     }
 
+    /// Set initial V2.6 boundary rollout mode.
+    pub fn v26_boundary_mode(mut self, mode: V26BoundaryMode) -> Self {
+        self.config.v26_boundary_mode = mode;
+        self
+    }
+
     /// Build the configuration.
     ///
     /// Returns an error if validation fails.
@@ -395,6 +439,7 @@ mod tests {
         assert_eq!(config.block_size, DEFAULT_BLOCK_SIZE);
         assert_eq!(config.l0_compaction_trigger, DEFAULT_L0_COMPACTION_TRIGGER);
         assert_eq!(config.max_levels, DEFAULT_MAX_LEVELS);
+        assert_eq!(config.v26_boundary_mode, V26BoundaryMode::Shadow);
         assert!(config.validate().is_ok());
     }
 
@@ -406,12 +451,14 @@ mod tests {
             .l0_compaction_trigger(8)
             .l0_slowdown_trigger(16)
             .l0_stop_trigger(24)
+            .v26_boundary_mode(V26BoundaryMode::On)
             .build()
             .unwrap();
 
         assert_eq!(config.memtable_size, 128 * 1024 * 1024);
         assert_eq!(config.max_frozen_memtables, 8);
         assert_eq!(config.l0_compaction_trigger, 8);
+        assert_eq!(config.v26_boundary_mode, V26BoundaryMode::On);
     }
 
     #[test]

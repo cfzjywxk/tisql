@@ -83,7 +83,7 @@ pub use memtable::VersionedMemoryStats;
 pub use memtable::MemTable;
 
 // Re-export LSM configuration
-pub use config::{LsmConfig, LsmConfigBuilder};
+pub use config::{LsmConfig, LsmConfigBuilder, V26BoundaryMode};
 pub use config::{
     DEFAULT_BLOCK_SIZE as LSM_DEFAULT_BLOCK_SIZE, DEFAULT_L0_COMPACTION_TRIGGER,
     DEFAULT_L1_MAX_SIZE, DEFAULT_LEVEL_SIZE_MULTIPLIER, DEFAULT_MAX_FROZEN_MEMTABLES,
