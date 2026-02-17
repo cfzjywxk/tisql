@@ -266,6 +266,10 @@ impl<S: PessimisticStorage + 'static, L: ClogService + 'static, T: TsoService> T
         Ok(ctx)
     }
 
+    fn get_txn_state(&self, start_ts: Timestamp) -> Option<TxnState> {
+        self.concurrency_manager.get_txn_state(start_ts)
+    }
+
     async fn get(&self, ctx: &TxnCtx, key: &[u8]) -> Result<Option<RawValue>> {
         // Use get_with_owner with owner_ts=start_ts for read-your-writes.
         // This sees own pending writes and committed data at start_ts.

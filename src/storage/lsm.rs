@@ -60,6 +60,7 @@ use crate::storage::mvcc::{decode_mvcc_key, is_tombstone, MvccIterator, MvccKey,
 use crate::storage::{PessimisticStorage, PessimisticWriteError, StorageEngine, WriteBatch};
 use crate::types::{Key, RawValue, Timestamp};
 
+use super::commit_reservations::{CommitLsnReservations, CommitReservationStats};
 use super::config::LsmConfig;
 use super::ilog::IlogService;
 use super::memtable::{FlushState, MemTable};
@@ -313,6 +314,9 @@ pub struct LsmEngine {
     /// Per-thread tracker for in-flight LSNs (test/failpoint instrumentation).
     in_flight_tracker: InFlightLsnTracker,
 
+    /// Commit-path LSN reservations (V2.6 phase 1 infrastructure).
+    commit_reservations: CommitLsnReservations,
+
     /// Serializes all ilog mutations with version updates.
     ///
     /// Ensures that every checkpoint reflects the latest version, and that
@@ -382,6 +386,7 @@ impl LsmEngine {
             gc_safe_point_updater: RwLock::new(None),
             dropped_table_ids: RwLock::new(HashMap::new()),
             in_flight_tracker: InFlightLsnTracker::new_auto(),
+            commit_reservations: CommitLsnReservations::new(),
             manifest_lock: parking_lot::Mutex::new(()),
             flush_gate: Arc::new(AsyncRwLock::new(())),
         })
@@ -390,6 +395,62 @@ impl LsmEngine {
     /// Shared flush gate used by commit and flush/GC paths.
     pub fn flush_gate(&self) -> Arc<AsyncRwLock<()>> {
         Arc::clone(&self.flush_gate)
+    }
+
+    /// Allocate and reserve a commit LSN atomically for one transaction.
+    ///
+    /// Reservation identity should use transaction `start_ts` so leak-defense
+    /// sweep can consult `TxnStateCache` directly.
+    pub fn alloc_and_reserve_commit_lsn(&self, txn_start_ts: Timestamp) -> u64 {
+        self.commit_reservations
+            .alloc_and_reserve_with(txn_start_ts, || self.alloc_lsn())
+    }
+
+    /// Release reservation for one committed/aborted transaction.
+    pub fn release_commit_lsn(&self, txn_start_ts: Timestamp) -> Option<u64> {
+        self.commit_reservations.release(txn_start_ts)
+    }
+
+    /// Minimum currently reserved LSN.
+    pub fn min_reserved_lsn(&self) -> Option<u64> {
+        self.commit_reservations.min_reserved_lsn()
+    }
+
+    /// Debug/test helper to verify reservation ownership.
+    pub fn is_commit_lsn_reserved(&self, txn_start_ts: Timestamp, lsn: u64) -> bool {
+        self.commit_reservations.is_reserved(txn_start_ts, lsn)
+    }
+
+    /// Reservation metrics snapshot (phase-1 observability).
+    pub fn commit_reservation_stats(&self) -> CommitReservationStats {
+        self.commit_reservations.stats()
+    }
+
+    /// Sweep stale reservations (defense in depth).
+    ///
+    /// `should_keep(txn_start_ts)` returns true when a transaction is still in a
+    /// commit path state and reservation must be retained.
+    pub fn sweep_stale_commit_reservations<F>(&self, mut should_keep: F) -> usize
+    where
+        F: FnMut(Timestamp) -> bool,
+    {
+        let txn_start_ts_list = self.commit_reservations.reserved_txn_start_ts();
+        let mut released = 0usize;
+        for txn_start_ts in txn_start_ts_list {
+            let is_stale = !should_keep(txn_start_ts);
+            if let Some(lsn) = self
+                .commit_reservations
+                .force_release_if_stale(txn_start_ts, is_stale)
+            {
+                released += 1;
+                tracing::warn!(
+                    txn_start_ts,
+                    lsn,
+                    "forced release of stale commit reservation"
+                );
+            }
+        }
+        released
     }
 
     async fn acquire_flush_gate_write(&self) -> tokio::sync::RwLockWriteGuard<'_, ()> {
@@ -3014,6 +3075,7 @@ mod tests {
     use super::*;
     use crate::storage::mvcc::{is_tombstone, LOCK, TOMBSTONE};
     use crate::storage::PessimisticWriteError;
+    use crate::transaction::TxnState;
     use std::path::Path;
     use tempfile::TempDir;
 
@@ -3065,6 +3127,7 @@ mod tests {
                 gc_safe_point_updater: RwLock::new(None),
                 dropped_table_ids: RwLock::new(HashMap::new()),
                 in_flight_tracker: InFlightLsnTracker::new_auto(),
+                commit_reservations: CommitLsnReservations::new(),
                 manifest_lock: parking_lot::Mutex::new(()),
                 flush_gate: Arc::new(AsyncRwLock::new(())),
             })
@@ -3189,6 +3252,75 @@ mod tests {
         assert_eq!(stats.active_memtable_size, 0);
         assert_eq!(stats.frozen_memtable_count, 0);
         assert_eq!(stats.total_sst_count, 0);
+    }
+
+    #[test]
+    fn test_commit_lsn_reservation_wrappers() {
+        let tmp = TempDir::new().unwrap();
+        let config = test_config(tmp.path());
+        let engine = LsmEngine::open(config).unwrap();
+
+        let l1 = engine.alloc_and_reserve_commit_lsn(1001);
+        let l2 = engine.alloc_and_reserve_commit_lsn(1002);
+        assert_eq!(l1, 1);
+        assert_eq!(l2, 2);
+        assert_eq!(engine.min_reserved_lsn(), Some(1));
+        assert!(engine.is_commit_lsn_reserved(1001, l1));
+
+        assert_eq!(engine.release_commit_lsn(1001), Some(1));
+        assert_eq!(engine.min_reserved_lsn(), Some(2));
+        assert_eq!(engine.release_commit_lsn(1002), Some(2));
+        assert_eq!(engine.min_reserved_lsn(), None);
+    }
+
+    #[test]
+    fn test_sweep_stale_commit_reservations_keeps_active_states() {
+        let tmp = TempDir::new().unwrap();
+        let config = test_config(tmp.path());
+        let engine = LsmEngine::open(config).unwrap();
+
+        let lsn_running = engine.alloc_and_reserve_commit_lsn(10);
+        let lsn_preparing = engine.alloc_and_reserve_commit_lsn(20);
+        let lsn_prepared = engine.alloc_and_reserve_commit_lsn(30);
+        let lsn_committed = engine.alloc_and_reserve_commit_lsn(40);
+        let lsn_missing = engine.alloc_and_reserve_commit_lsn(50);
+        assert_eq!(
+            [
+                lsn_running,
+                lsn_preparing,
+                lsn_prepared,
+                lsn_committed,
+                lsn_missing
+            ],
+            [1, 2, 3, 4, 5]
+        );
+
+        let states = std::collections::HashMap::from([
+            (10_u64, TxnState::Running),
+            (20_u64, TxnState::Preparing),
+            (30_u64, TxnState::Prepared { prepared_ts: 999 }),
+            (40_u64, TxnState::Committed { commit_ts: 1000 }),
+        ]);
+
+        let released = engine.sweep_stale_commit_reservations(|txn_start_ts| {
+            matches!(
+                states.get(&txn_start_ts),
+                Some(TxnState::Running)
+                    | Some(TxnState::Preparing)
+                    | Some(TxnState::Prepared { .. })
+            )
+        });
+        assert_eq!(released, 2, "Committed + missing should be force-released");
+
+        assert!(engine.is_commit_lsn_reserved(10, 1));
+        assert!(engine.is_commit_lsn_reserved(20, 2));
+        assert!(engine.is_commit_lsn_reserved(30, 3));
+        assert!(!engine.is_commit_lsn_reserved(40, 4));
+        assert!(!engine.is_commit_lsn_reserved(50, 5));
+
+        let stats = engine.commit_reservation_stats();
+        assert_eq!(stats.active, 3);
+        assert_eq!(stats.total_forced_released, 2);
     }
 
     #[tokio::test]

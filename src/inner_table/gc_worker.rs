@@ -34,7 +34,7 @@ use tokio::sync::Notify;
 use crate::inner_table::bootstrap::update_gc_task_status;
 use crate::inner_table::catalog_loader::{load_gc_tasks, GcTask};
 use crate::storage::lsm::LsmEngine;
-use crate::transaction::TxnService;
+use crate::transaction::{TxnService, TxnState};
 
 /// Background GC worker that marks completed drop-table tasks as done.
 pub struct GcWorker<T: TxnService + 'static> {
@@ -118,6 +118,20 @@ impl<T: TxnService + 'static> GcWorkerInner<T> {
 
     /// Process all pending GC tasks.
     async fn process_gc_tasks(&self) {
+        // Defense in depth: periodically force-release stale commit reservations.
+        // Keep reservations for active txn states only.
+        let released = self.engine.sweep_stale_commit_reservations(|txn_start_ts| {
+            matches!(
+                self.txn_service.get_txn_state(txn_start_ts),
+                Some(TxnState::Running)
+                    | Some(TxnState::Preparing)
+                    | Some(TxnState::Prepared { .. })
+            )
+        });
+        if released > 0 {
+            tracing::warn!("GC worker: force-released {released} stale commit reservations");
+        }
+
         // Proactive step 1: Remove obsolete SSTs (direct deletion, no compaction I/O)
         match self.engine.remove_obsolete_dropped_table_ssts() {
             Ok(count) if count > 0 => {

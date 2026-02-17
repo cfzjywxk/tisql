@@ -50,6 +50,7 @@
 //! Keys are encoded using TiDB-compatible format via the codec module.
 //! The storage layer is agnostic to key structure - it just stores bytes.
 
+pub mod commit_reservations;
 pub mod compaction;
 pub mod compaction_scheduler;
 pub mod config;
@@ -94,6 +95,9 @@ pub use version::{ManifestDelta, Version, VersionBuilder, MAX_LEVELS};
 pub use version_set::{SuperVersion, VersionSet};
 
 // Re-export LSM engine
+pub use commit_reservations::{
+    CommitLsnReservations, CommitReservation, CommitReservationStats, ReservationGuard,
+};
 pub use lsm::{LevelStats, LsmEngine, LsmStats, TieredMergeIterator};
 
 // Re-export flush scheduler

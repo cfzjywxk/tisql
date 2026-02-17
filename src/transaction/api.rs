@@ -320,6 +320,11 @@ pub trait TxnService: Send + Sync {
     /// marked as explicit. If `read_only` is true, write operations will error.
     fn begin_explicit(&self, read_only: bool) -> Result<TxnCtx>;
 
+    /// Read current transaction state from the shared state cache.
+    ///
+    /// Used by background safety sweeps (for example reservation leak defense).
+    fn get_txn_state(&self, start_ts: Timestamp) -> Option<TxnState>;
+
     // === Data Operations ===
 
     /// Read a key within the transaction.
