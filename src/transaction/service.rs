@@ -525,6 +525,9 @@ impl<S: PessimisticStorage + 'static, L: ClogService + 'static, T: TsoService> T
 
         // V2.6: reserve commit LSN ahead of WAL write when storage supports it.
         // Phase 2 keeps commit_fence authoritative; reservation path runs in parallel.
+        // Ordering note: reservation is installed before commit_fence.read().await.
+        // That's safe while old gated boundaries are authoritative. In Phase 3+,
+        // shadow/live boundary computations explicitly account for this ordering.
         ctx.reserved_lsn = self.storage.alloc_and_reserve_commit_lsn(start_ts);
         let mut reservation_guard = ctx
             .reserved_lsn

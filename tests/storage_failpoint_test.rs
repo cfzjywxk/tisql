@@ -148,7 +148,8 @@ struct LogGcCycleStats {
 ///
 /// Mirrors the production `Database::run_log_gc_once()` flow:
 /// 1. Hold manifest_lock during version capture + checkpoint write
-/// 2. Compute safe_lsn under flush_gate.write() pinned to checkpointed flushed_lsn
+/// 2. Compute new-live boundary without gate (shadow), then old-gated boundary
+///    under flush_gate.write(); persist old-gated safe_lsn
 fn run_log_gc_cycle(
     engine: &LsmEngine,
     ilog: &IlogService,
@@ -167,13 +168,42 @@ fn run_log_gc_cycle(
     };
 
     let flushed_lsn = version.flushed_lsn();
-    let safe_lsn = {
+    #[cfg(feature = "failpoints")]
+    fail_point!("log_gc_after_checkpoint_before_safe_compute_v26");
+
+    let mem_cap = engine.min_unflushed_lsn().map(|lsn| lsn.saturating_sub(1));
+    let reservation_cap = engine.min_reserved_lsn().map(|lsn| lsn.saturating_sub(1));
+    let inflight_cap = engine.min_in_flight_lsn().map(|lsn| lsn.saturating_sub(1));
+    let mut new_live = flushed_lsn;
+    if let Some(cap) = mem_cap {
+        new_live = new_live.min(cap);
+    }
+    if let Some(cap) = reservation_cap {
+        new_live = new_live.min(cap);
+    }
+    if let Some(cap) = inflight_cap {
+        new_live = new_live.min(cap);
+    }
+    let old_gated = {
         let fence = engine.flush_gate();
         let gate = tisql::io::block_on_sync(fence.write());
         let safe = engine.safe_log_gc_lsn_with(flushed_lsn);
         drop(gate);
         safe
     };
+    debug_assert!(
+        new_live <= old_gated,
+        "shadow log-gc boundary regression in test helper: new_live={} old_gated={} mem_cap={:?} reservation_cap={:?} inflight_cap={:?}",
+        new_live,
+        old_gated,
+        mem_cap,
+        reservation_cap,
+        inflight_cap
+    );
+    let safe_lsn = old_gated;
+
+    #[cfg(feature = "failpoints")]
+    fail_point!("log_gc_after_safe_compute_before_clog_truncate_v26");
 
     fail_point!("log_gc_after_checkpoint_before_clog_truncate");
 
@@ -434,8 +464,7 @@ async fn test_crash_before_sst_build() {
 ///
 /// The SST file is written but the ilog commit never happens, creating an orphan.
 /// Recovery should clean up the orphan and data should be recoverable from clog.
-#[tokio::test]
-async fn test_crash_after_sst_write_before_ilog() {
+async fn run_flush_crash_after_sst_before_manifest_test(failpoint_name: &str) {
     use std::panic;
 
     let scenario = fail::FailScenario::setup();
@@ -467,15 +496,15 @@ async fn test_crash_after_sst_write_before_ilog() {
         .map(|entries| entries.filter_map(|e| e.ok()).count())
         .unwrap_or(0);
 
-    // Configure failpoint to crash after SST write but before ilog commit
-    fail::cfg("lsm_flush_after_sst_write", "panic").unwrap();
+    // Configure failpoint to crash after SST build, before manifest commit.
+    fail::cfg(failpoint_name, "panic").unwrap();
 
     // Flush will create SST file, then panic before ilog commit
     let result = panic::catch_unwind(panic::AssertUnwindSafe(|| engine.flush_memtable(&frozen)));
     assert!(result.is_err(), "Failpoint should have triggered a panic");
 
     // Remove failpoint
-    fail::cfg("lsm_flush_after_sst_write", "off").unwrap();
+    fail::cfg(failpoint_name, "off").unwrap();
 
     // Verify an orphan SST was created
     let sst_count_after = std::fs::read_dir(&sst_dir)
@@ -502,12 +531,29 @@ async fn test_crash_after_sst_write_before_ilog() {
     scenario.teardown();
 }
 
+#[tokio::test]
+async fn test_crash_after_sst_write_before_ilog() {
+    run_flush_crash_after_sst_before_manifest_test("lsm_flush_after_sst_write").await;
+}
+
+#[tokio::test]
+async fn test_crash_after_sst_before_boundary_v26() {
+    run_flush_crash_after_sst_before_manifest_test("lsm_flush_after_sst_before_boundary_v26").await;
+}
+
+#[tokio::test]
+async fn test_crash_after_boundary_before_manifest_commit_v26() {
+    run_flush_crash_after_sst_before_manifest_test(
+        "lsm_flush_after_boundary_before_manifest_commit_v26",
+    )
+    .await;
+}
+
 /// Test crash after ilog commit - data should be recoverable from SST on recovery.
 ///
 /// The SST is written and ilog is committed, but the version update doesn't happen
 /// because we crash. On recovery, the ilog should rebuild the version correctly.
-#[tokio::test]
-async fn test_crash_after_ilog_commit() {
+async fn run_flush_crash_after_manifest_commit_test(failpoint_name: &str) {
     use std::panic;
 
     let scenario = fail::FailScenario::setup();
@@ -524,9 +570,8 @@ async fn test_crash_after_ilog_commit() {
             .freeze_active()
             .expect("freeze_active should return frozen memtable");
 
-        // Configure failpoint after ilog commit (SST written + ilog committed, but
-        // version not yet updated in memory)
-        fail::cfg("lsm_flush_after_ilog_commit", "panic").unwrap();
+        // Configure failpoint after manifest/ilog commit.
+        fail::cfg(failpoint_name, "panic").unwrap();
 
         // Flush will write SST, commit to ilog, then panic before version update
         let result =
@@ -534,7 +579,7 @@ async fn test_crash_after_ilog_commit() {
         assert!(result.is_err(), "Failpoint should have triggered a panic");
 
         // Remove failpoint
-        fail::cfg("lsm_flush_after_ilog_commit", "off").unwrap();
+        fail::cfg(failpoint_name, "off").unwrap();
 
         // Simulate crash by dropping without clean shutdown
         ilog.sync().unwrap();
@@ -552,6 +597,19 @@ async fn test_crash_after_ilog_commit() {
     );
 
     scenario.teardown();
+}
+
+#[tokio::test]
+async fn test_crash_after_ilog_commit() {
+    run_flush_crash_after_manifest_commit_test("lsm_flush_after_ilog_commit").await;
+}
+
+#[tokio::test]
+async fn test_crash_after_manifest_commit_before_state_transition_v26() {
+    run_flush_crash_after_manifest_commit_test(
+        "lsm_flush_after_manifest_commit_before_state_transition_v26",
+    )
+    .await;
 }
 
 /// Test crash after version update - everything should be consistent.
@@ -1353,6 +1411,16 @@ async fn test_log_gc_crash_before_checkpoint() {
 #[tokio::test]
 async fn test_log_gc_crash_after_checkpoint_before_clog_truncate() {
     run_log_gc_cutpoint_crash_test("log_gc_after_checkpoint_before_clog_truncate").await;
+}
+
+#[tokio::test]
+async fn test_log_gc_crash_after_checkpoint_before_safe_compute_v26() {
+    run_log_gc_cutpoint_crash_test("log_gc_after_checkpoint_before_safe_compute_v26").await;
+}
+
+#[tokio::test]
+async fn test_log_gc_crash_after_safe_compute_before_clog_truncate_v26() {
+    run_log_gc_cutpoint_crash_test("log_gc_after_safe_compute_before_clog_truncate_v26").await;
 }
 
 #[tokio::test]

@@ -792,16 +792,45 @@ impl Database {
         // manifest_lock released — flush/compaction can proceed
 
         // Compute clog truncation boundary from the SAME version that was
-        // checkpointed. min_unflushed_lsn is independent of the version and
-        // provides additional safety.
+        // checkpointed.
+        //
+        // V2.6 Phase 3 shadow mode:
+        // - `new_live_boundary`: no gate lock, includes mem + reservation + in-flight caps
+        // - `old_gated_boundary`: existing gated path, still authoritative
         let flushed_lsn = version.flushed_lsn();
-        let safe_lsn = {
+        #[cfg(feature = "failpoints")]
+        fail_point!("log_gc_after_checkpoint_before_safe_compute_v26");
+
+        let new_live_boundary = self.storage.shadow_log_gc_boundary_with_caps(flushed_lsn);
+
+        let old_gated_boundary = {
             let fence = self.storage.flush_gate();
             let gate = crate::io::block_on_sync(fence.write());
             let safe = self.storage.safe_log_gc_lsn_with(flushed_lsn);
             drop(gate);
             safe
         };
+        if new_live_boundary.safe_lsn > old_gated_boundary {
+            tracing::error!(
+                new_live = new_live_boundary.safe_lsn,
+                old_gated = old_gated_boundary,
+                base_cap = new_live_boundary.base_cap,
+                mem_cap = ?new_live_boundary.mem_cap,
+                reservation_cap = ?new_live_boundary.reservation_cap,
+                inflight_cap = ?new_live_boundary.inflight_cap,
+                "v2.6 shadow log-gc boundary is less safe than old gated boundary"
+            );
+            debug_assert!(
+                new_live_boundary.safe_lsn <= old_gated_boundary,
+                "shadow log-gc boundary regression: new_live={} old_gated={}",
+                new_live_boundary.safe_lsn,
+                old_gated_boundary
+            );
+        }
+        let safe_lsn = old_gated_boundary;
+
+        #[cfg(feature = "failpoints")]
+        fail_point!("log_gc_after_safe_compute_before_clog_truncate_v26");
 
         #[cfg(feature = "failpoints")]
         fail_point!("log_gc_after_checkpoint_before_clog_truncate");

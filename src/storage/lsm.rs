@@ -97,9 +97,9 @@ impl PaddedAtomicU64 {
 
 /// Tracks in-flight LSNs across worker threads.
 ///
-/// Note: V2.5 safety boundaries rely on `flush_gate` + memtable state/LSN,
-/// not `min_in_flight()`. This tracker is retained as test instrumentation
-/// and for failpoint scenarios that explicitly exercise the TOCTOU window.
+/// Note: V2.5 authoritative safety boundaries rely on `flush_gate` + memtable
+/// state/LSN. V2.6 Phase 3 computes `min_in_flight()` in shadow mode (assert-only)
+/// while keeping the old gated boundary authoritative.
 ///
 /// # Design (OceanBase-style per-thread tracking)
 ///
@@ -199,6 +199,15 @@ impl<'a> Drop for InFlightGuard<'a> {
 }
 
 // ---------------------------------------------------------------------------
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct BoundaryComputation {
+    pub base_cap: u64,
+    pub mem_cap: Option<u64>,
+    pub reservation_cap: Option<u64>,
+    pub inflight_cap: Option<u64>,
+    pub safe_lsn: u64,
+}
 
 /// Inner state of the LSM engine, protected by RwLock for atomic updates.
 ///
@@ -416,6 +425,11 @@ impl LsmEngine {
         self.commit_reservations.min_reserved_lsn()
     }
 
+    /// Minimum in-flight write LSN (write_batch path).
+    pub fn min_in_flight_lsn(&self) -> Option<u64> {
+        self.in_flight_tracker.min_in_flight()
+    }
+
     /// Debug/test helper to verify reservation ownership.
     pub fn is_commit_lsn_reserved(&self, txn_start_ts: Timestamp, lsn: u64) -> bool {
         self.commit_reservations.is_reserved(txn_start_ts, lsn)
@@ -605,6 +619,62 @@ impl LsmEngine {
             }
         }
         min_lsn
+    }
+
+    fn compute_boundary_with_caps(
+        &self,
+        base_cap: u64,
+        mem_cap: Option<u64>,
+    ) -> BoundaryComputation {
+        let reservation_cap = self.min_reserved_lsn().map(|lsn| lsn.saturating_sub(1));
+        let inflight_cap = self
+            .in_flight_tracker
+            .min_in_flight()
+            .map(|lsn| lsn.saturating_sub(1));
+
+        let mut safe_lsn = base_cap;
+        if let Some(cap) = mem_cap {
+            safe_lsn = safe_lsn.min(cap);
+        }
+        if let Some(cap) = reservation_cap {
+            safe_lsn = safe_lsn.min(cap);
+        }
+        if let Some(cap) = inflight_cap {
+            safe_lsn = safe_lsn.min(cap);
+        }
+
+        BoundaryComputation {
+            base_cap,
+            mem_cap,
+            reservation_cap,
+            inflight_cap,
+            safe_lsn,
+        }
+    }
+
+    /// Shadow-only flush boundary (V2.6 Phase 3): include mem + reservation + in-flight caps.
+    ///
+    /// Old gated boundary remains authoritative in this phase.
+    pub(crate) fn shadow_flush_boundary_with_caps(
+        &self,
+        exclude_memtable_id: u64,
+        base_flushed_lsn: u64,
+    ) -> BoundaryComputation {
+        let mem_cap = self
+            .min_lsn_excluding(exclude_memtable_id)
+            .map(|lsn| lsn.saturating_sub(1));
+        self.compute_boundary_with_caps(base_flushed_lsn, mem_cap)
+    }
+
+    /// Shadow-only log-GC boundary (V2.6 Phase 3): include checkpoint + mem + reservation + in-flight caps.
+    ///
+    /// Old gated boundary remains authoritative in this phase.
+    pub(crate) fn shadow_log_gc_boundary_with_caps(
+        &self,
+        checkpointed_flushed_lsn: u64,
+    ) -> BoundaryComputation {
+        let mem_cap = self.min_unflushed_lsn().map(|lsn| lsn.saturating_sub(1));
+        self.compute_boundary_with_caps(checkpointed_flushed_lsn, mem_cap)
     }
 
     /// Compute the safe clog truncation LSN for log GC.
@@ -844,14 +914,47 @@ impl LsmEngine {
         #[cfg(feature = "failpoints")]
         fail_point!("lsm_flush_after_sst_write");
 
-        // Phase 3 + 4: under flush gate, compute conservative flushed boundary
-        // and commit manifest mutation atomically.
+        // Phase 3 (shadow): compute V2.6 boundary live (without gate write lock),
+        // then compare against old gated boundary.
+        #[cfg(feature = "failpoints")]
+        fail_point!("lsm_flush_after_sst_before_boundary_v26");
+        let new_live_boundary = self.shadow_flush_boundary_with_caps(
+            memtable.id(),
+            self.version_set.current().flushed_lsn(),
+        );
+
+        // Phase 3 + 4 (authoritative old path): under flush gate, compute
+        // conservative flushed boundary and commit manifest mutation atomically.
         {
             let _gate = self.acquire_flush_gate_write().await;
-            let safe_flushed_lsn = self
+            let old_gated_boundary = self
                 .min_lsn_excluding(memtable.id())
                 .map(|m| m.saturating_sub(1))
                 .unwrap_or_else(|| self.version_set.current().flushed_lsn());
+
+            if new_live_boundary.safe_lsn > old_gated_boundary {
+                tracing::error!(
+                    memtable_id = memtable.id(),
+                    new_live = new_live_boundary.safe_lsn,
+                    old_gated = old_gated_boundary,
+                    base_cap = new_live_boundary.base_cap,
+                    mem_cap = ?new_live_boundary.mem_cap,
+                    reservation_cap = ?new_live_boundary.reservation_cap,
+                    inflight_cap = ?new_live_boundary.inflight_cap,
+                    "v2.6 shadow flush boundary is less safe than old gated boundary"
+                );
+                debug_assert!(
+                    new_live_boundary.safe_lsn <= old_gated_boundary,
+                    "shadow flush boundary regression: new_live={} old_gated={}",
+                    new_live_boundary.safe_lsn,
+                    old_gated_boundary
+                );
+            }
+
+            let safe_flushed_lsn = old_gated_boundary;
+
+            #[cfg(feature = "failpoints")]
+            fail_point!("lsm_flush_after_boundary_before_manifest_commit_v26");
 
             let commit_result: Result<()> = {
                 let _manifest = self.manifest_lock.lock();
@@ -880,6 +983,9 @@ impl LsmEngine {
                     .compare_exchange_flush_state(FlushState::Flushing, FlushState::NeedsFlush);
                 return Err(e);
             }
+
+            #[cfg(feature = "failpoints")]
+            fail_point!("lsm_flush_after_manifest_commit_before_state_transition_v26");
 
             if memtable.pending_count() == 0 {
                 if memtable
@@ -3336,6 +3442,36 @@ mod tests {
         let stats = engine.commit_reservation_stats();
         assert_eq!(stats.active, 3);
         assert_eq!(stats.total_forced_released, 2);
+    }
+
+    #[test]
+    fn test_shadow_boundary_includes_reservation_and_inflight_caps() {
+        let tmp = TempDir::new().unwrap();
+        let config = test_config(tmp.path());
+        let engine = LsmEngine::open(config).unwrap();
+
+        // Move allocator forward so reservation cap is not trivially zero.
+        for _ in 0..40 {
+            let _ = engine.alloc_lsn();
+        }
+        let reserved_lsn = engine.alloc_and_reserve_commit_lsn(777);
+        let _inflight = engine.in_flight_tracker.register(80);
+
+        let boundary =
+            engine.shadow_flush_boundary_with_caps(/*exclude*/ 0, /*base*/ 120);
+        assert_eq!(boundary.mem_cap, None);
+        assert_eq!(boundary.reservation_cap, Some(reserved_lsn - 1));
+        assert_eq!(boundary.inflight_cap, Some(79));
+        assert_eq!(boundary.safe_lsn, reserved_lsn - 1);
+
+        let old_gated = engine
+            .min_lsn_excluding(0)
+            .map(|lsn| lsn.saturating_sub(1))
+            .unwrap_or(120);
+        assert!(
+            boundary.safe_lsn <= old_gated,
+            "shadow boundary must be <= old gated boundary"
+        );
     }
 
     #[tokio::test]
