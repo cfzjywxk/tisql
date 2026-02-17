@@ -56,6 +56,37 @@ pub struct TransactionService<S: StorageEngine, L: ClogService, T: TsoService> {
     commit_fence: Option<Arc<tokio::sync::RwLock<()>>>,
 }
 
+/// Ensures commit reservations are released on every exit path.
+struct CommitReservationReleaseGuard<'a, S: PessimisticStorage + ?Sized> {
+    storage: &'a S,
+    txn_start_ts: Timestamp,
+    released: bool,
+}
+
+impl<'a, S: PessimisticStorage + ?Sized> CommitReservationReleaseGuard<'a, S> {
+    fn new(storage: &'a S, txn_start_ts: Timestamp) -> Self {
+        Self {
+            storage,
+            txn_start_ts,
+            released: false,
+        }
+    }
+
+    fn release(mut self) -> Option<u64> {
+        let released = self.storage.release_commit_lsn(self.txn_start_ts);
+        self.released = true;
+        released
+    }
+}
+
+impl<S: PessimisticStorage + ?Sized> Drop for CommitReservationReleaseGuard<'_, S> {
+    fn drop(&mut self) {
+        if !self.released {
+            let _ = self.storage.release_commit_lsn(self.txn_start_ts);
+        }
+    }
+}
+
 impl<S: StorageEngine, L: ClogService, T: TsoService> TransactionService<S, L, T> {
     /// Create a new transaction service
     pub fn new(
@@ -492,6 +523,18 @@ impl<S: PessimisticStorage + 'static, L: ClogService + 'static, T: TsoService> T
             })
             .collect();
 
+        // V2.6: reserve commit LSN ahead of WAL write when storage supports it.
+        // Phase 2 keeps commit_fence authoritative; reservation path runs in parallel.
+        ctx.reserved_lsn = self.storage.alloc_and_reserve_commit_lsn(start_ts);
+        let mut reservation_guard = ctx
+            .reserved_lsn
+            .map(|_| CommitReservationReleaseGuard::new(self.storage.as_ref(), start_ts));
+
+        #[cfg(feature = "failpoints")]
+        if ctx.reserved_lsn.is_some() {
+            fail_point!("txn_after_alloc_and_reserve_before_clog_write_v26");
+        }
+
         // Hold commit fence (if configured) across clog write + finalize/abort.
         // This prevents flush/GC from computing boundaries while this txn is
         // durable in clog but not yet reflected in memtable LSN tracking.
@@ -503,7 +546,21 @@ impl<S: PessimisticStorage + 'static, L: ClogService + 'static, T: TsoService> T
 
         // Step 5: Write to clog for durability (serializes synchronously, returns
         // future for fsync). After this call, ops/read_values are no longer needed.
-        let clog_result = self.clog_service.write_ops(txn_id, &ops, commit_ts, true);
+        let clog_result = if let Some(txn_lsn) = ctx.reserved_lsn {
+            debug_assert!(
+                self.storage.is_commit_lsn_reserved(start_ts, txn_lsn),
+                "reserved commit lsn missing before clog write: start_ts={}, lsn={}",
+                start_ts,
+                txn_lsn
+            );
+            self.clog_service
+                .write_ops_with_lsn(txn_id, &ops, commit_ts, txn_lsn, true)
+        } else {
+            self.clog_service.write_ops(txn_id, &ops, commit_ts, true)
+        };
+
+        #[cfg(feature = "failpoints")]
+        fail_point!("txn_after_clog_write_before_fsync_wait_v26");
 
         // Release borrows on mutations (ops → read_values → mutations).
         drop(ops);
@@ -512,11 +569,36 @@ impl<S: PessimisticStorage + 'static, L: ClogService + 'static, T: TsoService> T
         match clog_result {
             Ok(fsync_future) => match fsync_future.await {
                 Ok(lsn) => {
+                    #[cfg(feature = "failpoints")]
+                    fail_point!("txn_after_clog_fsync_before_finalize_v26");
+
+                    let commit_lsn = if let Some(reserved_lsn) = ctx.reserved_lsn {
+                        debug_assert_eq!(
+                            reserved_lsn, lsn,
+                            "clog returned lsn differs from reserved lsn (start_ts={})",
+                            start_ts
+                        );
+                        reserved_lsn
+                    } else {
+                        lsn
+                    };
+
                     // Step 6: Finalize all pending nodes by setting commit_ts and
                     // tracking the clog LSN on touched memtables.
                     let keys: Vec<Key> = mutations.into_keys().collect();
                     self.storage
-                        .finalize_pending_with_lsn(&keys, start_ts, commit_ts, lsn);
+                        .finalize_pending_with_lsn(&keys, start_ts, commit_ts, commit_lsn);
+
+                    #[cfg(feature = "failpoints")]
+                    fail_point!("txn_after_finalize_before_reservation_release_v26");
+
+                    if let Some(guard) = reservation_guard.take() {
+                        let _ = guard.release();
+                    }
+                    ctx.reserved_lsn = None;
+
+                    #[cfg(feature = "failpoints")]
+                    fail_point!("txn_after_reservation_release_before_state_commit_v26");
 
                     // Step 7: Transition to Committed in state cache
                     self.concurrency_manager.commit_txn(start_ts, commit_ts)?;
@@ -525,10 +607,14 @@ impl<S: PessimisticStorage + 'static, L: ClogService + 'static, T: TsoService> T
                     Ok(CommitInfo {
                         txn_id,
                         commit_ts,
-                        lsn,
+                        lsn: commit_lsn,
                     })
                 }
                 Err(e) => {
+                    if let Some(guard) = reservation_guard.take() {
+                        let _ = guard.release();
+                    }
+                    ctx.reserved_lsn = None;
                     let keys: Vec<Key> = mutations.into_keys().collect();
                     self.storage.abort_pending(&keys, start_ts);
                     self.concurrency_manager.abort_txn(start_ts).ok();
@@ -537,6 +623,10 @@ impl<S: PessimisticStorage + 'static, L: ClogService + 'static, T: TsoService> T
                 }
             },
             Err(e) => {
+                if let Some(guard) = reservation_guard.take() {
+                    let _ = guard.release();
+                }
+                ctx.reserved_lsn = None;
                 let keys: Vec<Key> = mutations.into_keys().collect();
                 self.storage.abort_pending(&keys, start_ts);
                 self.concurrency_manager.abort_txn(start_ts).ok();
@@ -562,6 +652,10 @@ impl<S: PessimisticStorage + 'static, L: ClogService + 'static, T: TsoService> T
         if !mutations.is_empty() {
             let keys: Vec<Key> = mutations.into_keys().collect();
             self.storage.abort_pending(&keys, ctx.start_ts);
+        }
+
+        if ctx.reserved_lsn.take().is_some() {
+            let _ = self.storage.release_commit_lsn(ctx.start_ts);
         }
 
         // Update state cache

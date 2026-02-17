@@ -31,10 +31,11 @@ use fail::fail_point;
 use tisql::new_lsn_provider;
 use tisql::storage::WriteBatch;
 use tisql::testkit::{
-    ClogBatch, FileClogConfig, FileClogService, IlogConfig, IlogService, IlogTruncateStats,
-    LsmConfigBuilder, LsmEngine, LsmRecovery, RecoveryResult, TruncateStats, Version,
+    ClogBatch, ConcurrencyManager, FileClogConfig, FileClogService, IlogConfig, IlogService,
+    IlogTruncateStats, LocalTso, LsmConfigBuilder, LsmEngine, LsmRecovery, RecoveryResult,
+    TransactionService, TruncateStats, Version,
 };
-use tisql::{ClogService, StorageEngine};
+use tisql::{ClogService, StorageEngine, TxnService};
 
 /// Helper to create a test LSM engine with ilog for durability tests.
 async fn create_test_lsm_engine(
@@ -110,6 +111,28 @@ async fn create_test_lsm_engine_with_unified_logs(
     .unwrap();
 
     (Arc::new(engine), ilog, clog)
+}
+
+/// Helper to create txn service on top of LSM+clog with shared LSN provider.
+async fn create_test_txn_service_with_unified_logs(
+    dir: &TempDir,
+) -> (
+    Arc<LsmEngine>,
+    Arc<IlogService>,
+    Arc<FileClogService>,
+    Arc<TransactionService<LsmEngine, FileClogService, LocalTso>>,
+) {
+    let (engine, ilog, clog) = create_test_lsm_engine_with_unified_logs(dir).await;
+    let tso = Arc::new(LocalTso::new(1));
+    let cm = Arc::new(ConcurrencyManager::new(0));
+    let txn_service = Arc::new(TransactionService::new_with_commit_fence(
+        Arc::clone(&engine),
+        Arc::clone(&clog),
+        tso,
+        cm,
+        Some(engine.flush_gate()),
+    ));
+    (engine, ilog, clog, txn_service)
 }
 
 #[derive(Debug)]
@@ -212,6 +235,78 @@ async fn recover_engine(dir: &TempDir) -> RecoveryResult {
     recovery
         .recover(&tokio::runtime::Handle::current())
         .unwrap()
+}
+
+async fn run_v26_commit_cutpoint_panic_test(failpoint_name: &str) {
+    let scenario = fail::FailScenario::setup();
+    let dir = tempfile::tempdir().unwrap();
+
+    let (engine, _ilog, _clog, txn_service) = create_test_txn_service_with_unified_logs(&dir).await;
+
+    fail::cfg(failpoint_name, "panic").unwrap();
+    let join = {
+        let txn_service = Arc::clone(&txn_service);
+        tokio::spawn(async move {
+            let mut ctx = txn_service.begin(false).unwrap();
+            txn_service
+                .put(
+                    &mut ctx,
+                    b"phase2_cutpoint_key".to_vec(),
+                    b"phase2_cutpoint_value".to_vec(),
+                )
+                .await
+                .unwrap();
+            txn_service.commit(ctx).await
+        })
+    };
+
+    let result = join.await;
+    assert!(
+        result.is_err(),
+        "failpoint {failpoint_name} should panic in commit path"
+    );
+
+    fail::cfg(failpoint_name, "off").unwrap();
+
+    // In-process panic testing should still release reservations via guard drop.
+    assert_eq!(
+        engine.commit_reservation_stats().active,
+        0,
+        "reservation leak after cutpoint {failpoint_name}"
+    );
+
+    scenario.teardown();
+}
+
+#[tokio::test]
+async fn test_v26_commit_cutpoint_c0_after_alloc_before_reserve() {
+    run_v26_commit_cutpoint_panic_test("txn_after_lsn_alloc_before_reserve_v26").await;
+}
+
+#[tokio::test]
+async fn test_v26_commit_cutpoint_c1_after_reserve_before_clog() {
+    run_v26_commit_cutpoint_panic_test("txn_after_alloc_and_reserve_before_clog_write_v26").await;
+}
+
+#[tokio::test]
+async fn test_v26_commit_cutpoint_c2_after_clog_write_before_fsync_wait() {
+    run_v26_commit_cutpoint_panic_test("txn_after_clog_write_before_fsync_wait_v26").await;
+}
+
+#[tokio::test]
+async fn test_v26_commit_cutpoint_c3_after_fsync_before_finalize() {
+    run_v26_commit_cutpoint_panic_test("txn_after_clog_fsync_before_finalize_v26").await;
+}
+
+#[tokio::test]
+async fn test_v26_commit_cutpoint_c4_after_finalize_before_release() {
+    run_v26_commit_cutpoint_panic_test("txn_after_finalize_before_reservation_release_v26").await;
+}
+
+#[tokio::test]
+async fn test_v26_commit_cutpoint_after_release_before_state_commit() {
+    run_v26_commit_cutpoint_panic_test("txn_after_reservation_release_before_state_commit_v26")
+        .await;
 }
 
 // ============================================================================
@@ -2144,8 +2239,9 @@ async fn test_log_gc_repeated_cycles_never_over_truncate() {
 
 /// Write a multi-key transaction using write_ops (single LSN per transaction).
 ///
-/// This mirrors the production path: `TxnService::commit()` calls `clog.write_ops()`
-/// which allocates one LSN for all entries in the transaction.
+/// This mirrors the production path: `TxnService::commit()` writes one txn LSN
+/// for all entries in the transaction (`write_ops_with_lsn` on reservation path,
+/// `write_ops` on fallback path).
 /// Returns that transaction LSN.
 async fn write_durable_multi_put(
     engine: &LsmEngine,

@@ -486,6 +486,24 @@ pub trait PessimisticStorage: StorageEngine {
     /// * `Some(owner_start_ts)` - Key is locked by transaction with this start_ts
     fn get_lock_owner(&self, key: &[u8]) -> Option<Timestamp>;
 
+    /// Allocate and reserve a commit LSN for this transaction, when supported.
+    ///
+    /// Engines that do not participate in V2.6 reservation tracking can keep
+    /// the default `None` implementation.
+    fn alloc_and_reserve_commit_lsn(&self, _owner_start_ts: Timestamp) -> Option<u64> {
+        None
+    }
+
+    /// Release a previously reserved commit LSN, when supported.
+    fn release_commit_lsn(&self, _owner_start_ts: Timestamp) -> Option<u64> {
+        None
+    }
+
+    /// Check whether `(txn_start_ts, lsn)` is currently reserved.
+    fn is_commit_lsn_reserved(&self, _owner_start_ts: Timestamp, _lsn: u64) -> bool {
+        false
+    }
+
     /// Finalize all pending writes for a transaction.
     ///
     /// Called during commit. Converts pending nodes to committed by setting

@@ -143,6 +143,8 @@ pub struct TxnCtx {
     /// Used by the SQL layer to detect DDL changes before COMMIT.
     /// `None` means schema checking is not enabled for this context.
     pub(crate) schema_version: Option<u64>,
+    /// V2.6 commit reservation LSN (when storage reservation protocol is enabled).
+    pub(crate) reserved_lsn: Option<Lsn>,
 }
 
 impl TxnCtx {
@@ -157,6 +159,7 @@ impl TxnCtx {
             mutations: BTreeMap::new(),
             registered: false,
             schema_version: None,
+            reserved_lsn: None,
         }
     }
 
@@ -174,6 +177,7 @@ impl TxnCtx {
             mutations: BTreeMap::new(),
             registered: false,
             schema_version: None,
+            reserved_lsn: None,
         }
     }
 
@@ -197,6 +201,7 @@ impl TxnCtx {
             mutations: BTreeMap::new(),
             registered: false,
             schema_version: None,
+            reserved_lsn: None,
         }
     }
 

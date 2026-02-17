@@ -97,6 +97,9 @@ impl CommitLsnReservations {
         let mut inner = self.inner.lock();
         let lsn = alloc_lsn();
 
+        #[cfg(feature = "failpoints")]
+        fail_point!("txn_after_lsn_alloc_before_reserve_v26");
+
         if let Some(prev) = inner.by_txn_start_ts.remove(&txn_start_ts) {
             let removed = inner.by_lsn.remove(&prev.lsn);
             debug_assert!(
@@ -274,13 +277,16 @@ impl Drop for ReservationGuard<'_> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[cfg(feature = "failpoints")]
+    use std::sync::Arc;
+
     use crate::lsn::AtomicLsnProvider;
 
+    #[cfg(feature = "failpoints")]
     static TEST_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
     #[test]
     fn test_alloc_release_and_min() {
-        let _guard = TEST_LOCK.lock().unwrap();
         let reservations = CommitLsnReservations::new();
         let provider = AtomicLsnProvider::with_start(10);
 
@@ -300,7 +306,6 @@ mod tests {
 
     #[test]
     fn test_double_release_stats() {
-        let _guard = TEST_LOCK.lock().unwrap();
         let reservations = CommitLsnReservations::new();
         let provider = AtomicLsnProvider::with_start(1);
 
@@ -316,7 +321,6 @@ mod tests {
 
     #[test]
     fn test_force_release_if_stale() {
-        let _guard = TEST_LOCK.lock().unwrap();
         let reservations = CommitLsnReservations::new();
         reservations.reserve_with_lsn_for_test(11, 50);
         reservations.reserve_with_lsn_for_test(12, 60);
@@ -334,7 +338,6 @@ mod tests {
 
     #[test]
     fn test_reservation_guard_releases_on_drop() {
-        let _guard = TEST_LOCK.lock().unwrap();
         let reservations = CommitLsnReservations::new();
         reservations.reserve_with_lsn_for_test(77, 123);
 
@@ -392,5 +395,54 @@ mod tests {
         fail::cfg("reservation_sweep_force_release_v26", "off").unwrap();
 
         assert!(!reservations.is_reserved(77, 700));
+    }
+
+    #[cfg(feature = "failpoints")]
+    #[test]
+    fn test_f4_alloc_reserve_atomicity_blocks_min_read() {
+        use std::sync::mpsc;
+        use std::time::Duration;
+
+        let _guard = TEST_LOCK.lock().unwrap();
+        let _scenario = fail::FailScenario::setup();
+        let reservations = Arc::new(CommitLsnReservations::new());
+        let provider = Arc::new(AtomicLsnProvider::with_start(100));
+
+        fail::cfg("txn_after_lsn_alloc_before_reserve_v26", "pause").unwrap();
+
+        let (started_tx, started_rx) = mpsc::channel();
+        let (alloc_tx, alloc_rx) = mpsc::channel();
+        let reservations_for_alloc = Arc::clone(&reservations);
+        let provider_for_alloc = Arc::clone(&provider);
+        let alloc_handle = std::thread::spawn(move || {
+            started_tx.send(()).unwrap();
+            let lsn = reservations_for_alloc.alloc_and_reserve(42, provider_for_alloc.as_ref());
+            alloc_tx.send(lsn).unwrap();
+        });
+        started_rx.recv_timeout(Duration::from_secs(1)).unwrap();
+
+        let (min_tx, min_rx) = mpsc::channel();
+        let reservations_for_min = Arc::clone(&reservations);
+        let min_handle = std::thread::spawn(move || {
+            let min = reservations_for_min.min_reserved_lsn();
+            min_tx.send(min).unwrap();
+        });
+
+        // This test verifies F4 is impossible: while alloc+reserve is paused
+        // inside the mutex, min_reserved_lsn cannot observe an intermediate state.
+        assert!(
+            min_rx.recv_timeout(Duration::from_millis(50)).is_err(),
+            "min_reserved_lsn must block while alloc_and_reserve holds mutex"
+        );
+
+        fail::cfg("txn_after_lsn_alloc_before_reserve_v26", "off").unwrap();
+
+        let lsn = alloc_rx.recv_timeout(Duration::from_secs(1)).unwrap();
+        let min = min_rx.recv_timeout(Duration::from_secs(1)).unwrap();
+        assert_eq!(min, Some(lsn));
+
+        assert_eq!(reservations.release(42), Some(lsn));
+        alloc_handle.join().unwrap();
+        min_handle.join().unwrap();
     }
 }

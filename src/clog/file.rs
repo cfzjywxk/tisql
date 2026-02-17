@@ -532,18 +532,21 @@ struct PreparedBatch {
 }
 
 impl FileClogService {
-    /// Prepare pre-built ClogOpRef entries for clog writing: allocate LSNs, add commit
-    /// record, serialize. No I/O is performed here.
-    ///
-    /// This is the zero-copy variant — keys and values are borrowed from the caller's
-    /// mutations BTreeMap and storage reads. No cloning occurs.
-    fn prepare_ops(
+    /// Prepare pre-built ClogOpRef entries using caller-provided LSN.
+    fn prepare_ops_with_lsn(
         &self,
         txn_id: TxnId,
         ops: &[ClogOpRef<'_>],
         commit_ts: Timestamp,
+        txn_lsn: Lsn,
     ) -> Result<PreparedBatch> {
-        let txn_lsn = self.lsn_provider.alloc_lsn();
+        let current_lsn = self.lsn_provider.current_lsn();
+        if txn_lsn >= current_lsn {
+            return Err(TiSqlError::Internal(format!(
+                "write_ops_with_lsn expects pre-allocated lsn (< current_lsn): lsn={}, current_lsn={}",
+                txn_lsn, current_lsn
+            )));
+        }
 
         let entry_count = ops.len() + 1; // +1 for commit record
         let mut entries: Vec<super::ClogEntryRef<'_>> = Vec::with_capacity(entry_count);
@@ -639,7 +642,25 @@ impl ClogService for FileClogService {
             return Ok(ClogFsyncFuture::new(self.lsn_provider.current_lsn(), rx));
         }
 
-        let prepared = self.prepare_ops(txn_id, ops, commit_ts)?;
+        let txn_lsn = self.lsn_provider.alloc_lsn();
+        self.write_ops_with_lsn(txn_id, ops, commit_ts, txn_lsn, sync)
+    }
+
+    fn write_ops_with_lsn(
+        &self,
+        txn_id: TxnId,
+        ops: &[ClogOpRef<'_>],
+        commit_ts: Timestamp,
+        lsn: Lsn,
+        sync: bool,
+    ) -> Result<ClogFsyncFuture> {
+        if ops.is_empty() {
+            let (tx, rx) = tokio::sync::oneshot::channel();
+            let _ = tx.send(Ok(()));
+            return Ok(ClogFsyncFuture::new(self.lsn_provider.current_lsn(), rx));
+        }
+
+        let prepared = self.prepare_ops_with_lsn(txn_id, ops, commit_ts, lsn)?;
         let end_lsn = prepared.end_lsn;
 
         #[cfg(feature = "failpoints")]
@@ -2111,6 +2132,69 @@ mod tests {
     // ========================================================================
     // Transaction-boundary truncation tests
     // ========================================================================
+
+    #[tokio::test]
+    async fn test_write_ops_with_lsn_uses_preallocated_lsn() {
+        use crate::lsn::new_lsn_provider;
+
+        let dir = tempdir().unwrap();
+        let config = FileClogConfig::with_dir(dir.path());
+        let provider = new_lsn_provider();
+        let txn_lsn = provider.alloc_lsn();
+        assert_eq!(txn_lsn, 1);
+
+        let service = FileClogService::open_with_lsn_provider(
+            config,
+            provider,
+            &tokio::runtime::Handle::current(),
+        )
+        .unwrap();
+
+        let ops = [ClogOpRef::Put {
+            key: b"k1",
+            value: b"v1",
+        }];
+        let written_lsn = service
+            .write_ops_with_lsn(7, &ops, 100, txn_lsn, true)
+            .unwrap()
+            .await
+            .unwrap();
+        assert_eq!(written_lsn, txn_lsn);
+
+        let entries = service.read_all().unwrap();
+        assert_eq!(entries.len(), 2);
+        assert!(entries.iter().all(|entry| entry.lsn == txn_lsn));
+
+        service.close().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn test_write_ops_with_lsn_rejects_unallocated_lsn() {
+        use crate::lsn::new_lsn_provider;
+
+        let dir = tempdir().unwrap();
+        let config = FileClogConfig::with_dir(dir.path());
+        let provider = new_lsn_provider();
+        let service = FileClogService::open_with_lsn_provider(
+            config,
+            provider,
+            &tokio::runtime::Handle::current(),
+        )
+        .unwrap();
+
+        let ops = [ClogOpRef::Put {
+            key: b"k1",
+            value: b"v1",
+        }];
+        let err = match service.write_ops_with_lsn(7, &ops, 100, 1, true) {
+            Ok(_) => panic!("write_ops_with_lsn should reject unallocated LSN"),
+            Err(err) => format!("{err}"),
+        };
+        assert!(err.contains("pre-allocated lsn"), "unexpected error: {err}");
+        assert!(service.read_all().unwrap().is_empty());
+
+        service.close().await.unwrap();
+    }
 
     /// Verify truncate_to respects transaction boundaries: when safe_lsn falls
     /// below a transaction LSN, the entire transaction is kept (not split).

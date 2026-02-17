@@ -2896,6 +2896,21 @@ impl PessimisticStorage for LsmEngine {
         None
     }
 
+    fn alloc_and_reserve_commit_lsn(&self, owner_start_ts: Timestamp) -> Option<u64> {
+        Some(LsmEngine::alloc_and_reserve_commit_lsn(
+            self,
+            owner_start_ts,
+        ))
+    }
+
+    fn release_commit_lsn(&self, owner_start_ts: Timestamp) -> Option<u64> {
+        LsmEngine::release_commit_lsn(self, owner_start_ts)
+    }
+
+    fn is_commit_lsn_reserved(&self, owner_start_ts: Timestamp, lsn: u64) -> bool {
+        LsmEngine::is_commit_lsn_reserved(self, owner_start_ts, lsn)
+    }
+
     fn finalize_pending(&self, keys: &[Key], owner_start_ts: Timestamp, commit_ts: Timestamp) {
         self.finalize_pending_with_lsn(keys, owner_start_ts, commit_ts, 0);
     }

@@ -172,6 +172,19 @@ pub trait ClogService: Send + Sync {
         sync: bool,
     ) -> Result<ClogFsyncFuture>;
 
+    /// Write pre-built clog ops using a caller-provided transaction LSN.
+    ///
+    /// This is used by V2.6 reservation path where storage allocates+reserves
+    /// the commit LSN before WAL append.
+    fn write_ops_with_lsn(
+        &self,
+        txn_id: TxnId,
+        ops: &[ClogOpRef<'_>],
+        commit_ts: Timestamp,
+        lsn: Lsn,
+        sync: bool,
+    ) -> Result<ClogFsyncFuture>;
+
     /// Append single entry, returns future that yields the LSN.
     fn append(&self, entry: ClogEntry, sync: bool) -> Result<ClogFsyncFuture> {
         let mut batch = ClogBatch::new();
