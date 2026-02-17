@@ -41,19 +41,6 @@ impl<'a, C: Catalog> Binder<'a, C> {
         }
     }
 
-    /// Create a new Binder with a specific snapshot timestamp (for DML/DQL).
-    ///
-    /// This enables MVCC schema visibility - the Binder will see the schema
-    /// as it existed at the specified timestamp.
-    #[allow(dead_code)]
-    pub fn with_snapshot_ts(catalog: &'a C, current_schema: &str, ts: Timestamp) -> Self {
-        Self {
-            catalog,
-            current_schema: current_schema.to_string(),
-            snapshot_ts: Some(ts),
-        }
-    }
-
     /// Bind a SQL statement to a logical plan
     pub fn bind(&self, stmt: SqlStatement) -> Result<LogicalPlan> {
         match stmt {

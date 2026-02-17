@@ -36,17 +36,17 @@ fn create_test_db() -> (Arc<Database>, tempfile::TempDir) {
     (db, dir)
 }
 
-/// Helper: query via handle_mp_query and return rows as Vec<Vec<String>>.
+/// Helper: query via execute_query and return rows as Vec<Vec<String>>.
 async fn query_rows(db: &Database, sql: &str) -> Vec<Vec<String>> {
-    match db.handle_mp_query(sql).await.unwrap() {
+    match db.execute_query(sql).await.unwrap() {
         QueryResult::Rows { data, .. } => data,
         other => panic!("Expected rows, got: {other:?}"),
     }
 }
 
-/// Helper: execute SQL via handle_mp_query, expecting success.
+/// Helper: execute SQL via execute_query, expecting success.
 async fn exec(db: &Database, sql: &str) {
-    db.handle_mp_query(sql).await.unwrap();
+    db.execute_query(sql).await.unwrap();
 }
 
 /// Query GC tasks from inner table and return rows.
@@ -179,7 +179,7 @@ async fn test_drop_table_gc_recovery() {
         let db = Arc::new(Database::open(config.clone()).unwrap());
 
         // Table should still be gone
-        let result = db.handle_mp_query("SELECT * FROM recover_me").await;
+        let result = db.execute_query("SELECT * FROM recover_me").await;
         assert!(
             result.is_err(),
             "dropped table should not exist after restart"
@@ -227,7 +227,7 @@ async fn test_drop_table_gc_crash_recovery() {
         let db = Arc::new(Database::open(config.clone()).unwrap());
 
         // Table should be gone
-        let result = db.handle_mp_query("SELECT * FROM crash_test").await;
+        let result = db.execute_query("SELECT * FROM crash_test").await;
         assert!(
             result.is_err(),
             "dropped table should not exist after crash recovery"

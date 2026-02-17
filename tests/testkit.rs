@@ -53,7 +53,7 @@ impl TestKit {
     }
 
     async fn execute_with_timeout(&self, sql: &str) -> Result<QueryResult, QueryExecutionError> {
-        match tokio::time::timeout(self.query_timeout, self.db.handle_mp_query(sql)).await {
+        match tokio::time::timeout(self.query_timeout, self.db.execute_query(sql)).await {
             Ok(Ok(result)) => Ok(result),
             Ok(Err(e)) => Err(QueryExecutionError::Sql(e.to_string())),
             Err(_) => Err(QueryExecutionError::Timeout(self.query_timeout)),

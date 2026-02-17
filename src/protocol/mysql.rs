@@ -30,7 +30,7 @@ use opensrv_mysql::{
 use tokio::io::AsyncWrite;
 
 use crate::session::{ExecutionCtx, Session};
-use crate::types::{DataType, Value};
+use crate::types::Value;
 use crate::worker::{self, QueryResponse};
 use crate::{log_debug, log_info, Database};
 
@@ -345,27 +345,5 @@ fn write_value_col<W: AsyncWrite + Unpin>(
         Value::Time(v) => rw.write_col(format!("TIME({v})").as_str()),
         Value::DateTime(v) => rw.write_col(format!("DATETIME({v})").as_str()),
         Value::Timestamp(v) => rw.write_col(format!("TIMESTAMP({v})").as_str()),
-    }
-}
-
-#[allow(dead_code)]
-fn data_type_to_mysql(dt: &DataType) -> ColumnType {
-    match dt {
-        DataType::Boolean => ColumnType::MYSQL_TYPE_TINY,
-        DataType::TinyInt => ColumnType::MYSQL_TYPE_TINY,
-        DataType::SmallInt => ColumnType::MYSQL_TYPE_SHORT,
-        DataType::Int => ColumnType::MYSQL_TYPE_LONG,
-        DataType::BigInt => ColumnType::MYSQL_TYPE_LONGLONG,
-        DataType::Float => ColumnType::MYSQL_TYPE_FLOAT,
-        DataType::Double => ColumnType::MYSQL_TYPE_DOUBLE,
-        DataType::Decimal { .. } => ColumnType::MYSQL_TYPE_DECIMAL,
-        DataType::Char(_) => ColumnType::MYSQL_TYPE_STRING,
-        DataType::Varchar(_) => ColumnType::MYSQL_TYPE_VAR_STRING,
-        DataType::Text => ColumnType::MYSQL_TYPE_BLOB,
-        DataType::Blob => ColumnType::MYSQL_TYPE_BLOB,
-        DataType::Date => ColumnType::MYSQL_TYPE_DATE,
-        DataType::Time => ColumnType::MYSQL_TYPE_TIME,
-        DataType::DateTime => ColumnType::MYSQL_TYPE_DATETIME,
-        DataType::Timestamp => ColumnType::MYSQL_TYPE_TIMESTAMP,
     }
 }

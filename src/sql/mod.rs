@@ -17,7 +17,7 @@ mod parser;
 mod plan;
 
 // Crate-internal types - not exposed publicly
-// Parser, Binder, and LogicalPlan are encapsulated within SQLEngine
+// Parser, Binder, and LogicalPlan are encapsulated within Database
 pub(crate) use binder::Binder;
 pub(crate) use parser::Parser;
 pub(crate) use plan::{AggFunc, BinaryOp, Expr, LogicalPlan, OrderByExpr, UnaryOp};

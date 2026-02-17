@@ -143,7 +143,7 @@ impl Default for SessionRegistry {
 /// extraction won't be reflected.
 ///
 /// This struct is passed through the execution path (WorkerPool -> Database ->
-/// SQLEngine -> Executor) to provide access to session variables without
+/// Database -> Executor) to provide access to session variables without
 /// passing the mutable Session itself.
 #[derive(Clone, Debug)]
 pub struct ExecutionCtx {
@@ -418,7 +418,7 @@ pub enum Priority {
 /// ## Lifecycle
 ///
 /// 1. Created via `Session::new_query_ctx()` before statement execution
-/// 2. Passed to SQLEngine for query processing
+/// 2. Passed to Database for query processing
 /// 3. Accumulates execution state (affected rows, warnings, etc.)
 /// 4. Discarded after statement completes
 #[derive(Clone, Debug)]

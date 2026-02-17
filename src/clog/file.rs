@@ -543,8 +543,7 @@ impl FileClogService {
         let current_lsn = self.lsn_provider.current_lsn();
         if txn_lsn >= current_lsn {
             return Err(TiSqlError::Internal(format!(
-                "write_ops_with_lsn expects pre-allocated lsn (< current_lsn): lsn={}, current_lsn={}",
-                txn_lsn, current_lsn
+                "write_ops_with_lsn expects pre-allocated lsn (< current_lsn): lsn={txn_lsn}, current_lsn={current_lsn}"
             )));
         }
 

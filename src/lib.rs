@@ -28,7 +28,7 @@
 //   - clog - ClogService trait public, FileClogService internal
 //   - storage - StorageEngine trait public, implementations internal
 //   - transaction - TxnService trait public, TransactionService/ConcurrencyManager internal
-//   - sql, executor - encapsulated in SQLEngine
+//   - sql, executor - Parser and SimpleExecutor on Database
 
 // Public modules - common types and server infrastructure
 pub mod codec;
@@ -165,14 +165,13 @@ use catalog::MvccCatalog;
 use clog::{FileClogService, TruncateStats};
 use error::Result;
 use executor::{ExecutionOutput, ExecutionResult, Executor, SimpleExecutor};
-use sql::{Binder, Parser};
+use sql::Parser;
 use storage::{
     CompactionScheduler, FlushScheduler, IlogService, IlogTruncateStats, LsmEngine, LsmRecovery,
 };
 use transaction::{ConcurrencyManager, TransactionService};
 use tso::LocalTso;
 use types::{Lsn, Value};
-use util::Timer;
 
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -209,84 +208,6 @@ impl DatabaseConfig {
 }
 
 // ============================================================================
-// SQL Engine - Parser, Binder, Executor
-// ============================================================================
-
-/// SQL Engine handles SQL text processing: parsing, binding, and execution.
-///
-/// This is the core SQL processing pipeline that transforms SQL strings
-/// into query results through the transaction service.
-///
-/// All internal components (Parser, Binder, Executor) are encapsulated.
-/// External callers only see the `handle_mp_query` interface.
-struct SQLEngine {
-    parser: Parser,
-    executor: SimpleExecutor,
-}
-
-impl SQLEngine {
-    /// Create a new SQL engine.
-    fn new() -> Self {
-        Self {
-            parser: Parser::new(),
-            executor: SimpleExecutor::new(),
-        }
-    }
-
-    /// Handle MySQL protocol query text.
-    ///
-    /// Flow: SQL text -> parse -> bind -> execute through TxnService
-    ///
-    /// All SQL execution goes through this method. Internal components
-    /// (Parser, Binder, Executor) are not exposed to callers.
-    async fn handle_mp_query<T: TxnService, C: Catalog>(
-        &self,
-        sql: &str,
-        query_ctx: &session::QueryCtx,
-        txn_service: &T,
-        catalog: &C,
-    ) -> Result<ExecutionResult> {
-        // Parse SQL text into AST
-        let stmt = self.parser.parse_one(sql)?;
-
-        // Use latest schema for binding (Timestamp::MAX).
-        // For proper MVCC schema versioning within a transaction, the executor
-        // would need to use a start_ts from the transaction context.
-        let binder = Binder::new(catalog, &query_ctx.current_db);
-        let plan = binder.bind(stmt)?;
-
-        // Execute through TxnService
-        // TODO: Use query_ctx for execution options (priority, isolation level, etc.)
-        self.executor.execute(plan, txn_service, catalog).await
-    }
-
-    /// Execute SQL with session context for explicit transaction support.
-    ///
-    /// This method handles transaction control statements (BEGIN, COMMIT, ROLLBACK)
-    /// and uses the session's active transaction context when available.
-    async fn handle_mp_query_with_session<T: TxnService, C: Catalog>(
-        &self,
-        sql: &str,
-        query_ctx: &session::QueryCtx,
-        txn_service: &T,
-        catalog: &C,
-        session: &mut session::Session,
-    ) -> Result<ExecutionResult> {
-        // Parse SQL text into AST
-        let stmt = self.parser.parse_one(sql)?;
-
-        // Bind to logical plan
-        let binder = Binder::new(catalog, &query_ctx.current_db);
-        let plan = binder.bind(stmt)?;
-
-        // Execute with session context for transaction control
-        self.executor
-            .execute_with_session(plan, txn_service, catalog, session)
-            .await
-    }
-}
-
-// ============================================================================
 // Database - Main Entry Point
 // ============================================================================
 
@@ -300,31 +221,32 @@ type DbTxnService = TransactionService<DbStorage, FileClogService, LocalTso>;
 /// TiSQL Database instance.
 ///
 /// Database is the main entry point that coordinates:
-/// - SQL processing via SQLEngine
+/// - SQL processing via Parser + SimpleExecutor
 /// - Transaction management via TxnService
 /// - Schema metadata via Catalog
 ///
 /// ## Layer Separation
 ///
 /// All internal components are encapsulated:
-/// - SQLEngine (Parser, Binder, Executor) - not exposed
+/// - Parser, Binder, Executor - not exposed
 /// - TransactionService implementation - not exposed
 /// - Storage engine implementation - not exposed
 /// - Clog implementation - not exposed
 ///
-/// External callers interact only through public methods like `handle_mp_query`.
+/// External callers interact only through public methods like `execute_query`.
 /// Internal type alias for concrete catalog.
 type DbCatalog = MvccCatalog<DbTxnService>;
 
 pub struct Database {
-    /// SQL engine for parsing, binding, execution (encapsulated)
-    sql_engine: SQLEngine,
+    /// SQL parser (encapsulated)
+    parser: Parser,
+    /// SQL executor (encapsulated)
+    executor: SimpleExecutor,
     /// Transaction service - internal implementation hidden
     txn_service: Arc<DbTxnService>,
     /// Schema metadata catalog (MVCC-based, persistent)
     catalog: DbCatalog,
     /// Ilog service for SST metadata persistence (kept for proper shutdown)
-    #[allow(dead_code)]
     ilog: Arc<IlogService>,
     /// LSM storage engine (kept for flush on shutdown)
     storage: Arc<LsmEngine>,
@@ -524,7 +446,8 @@ impl Database {
         }
 
         Ok(Self {
-            sql_engine: SQLEngine::new(),
+            parser: Parser::new(),
+            executor: SimpleExecutor::new(),
             txn_service,
             catalog,
             ilog: recovery_result.ilog,
@@ -562,155 +485,74 @@ impl Database {
         &self.session_registry
     }
 
-    /// Handle MySQL protocol query text (COM_QUERY).
+    // ========================================================================
+    // Test / Convenience Query Execution
+    // ========================================================================
+
+    /// Execute SQL and return a materialized QueryResult.
     ///
-    /// This is the main entry point for SQL execution from the MySQL protocol.
-    /// For prepared statements, use `handle_mp_prepare` and `handle_mp_execute` (TODO).
-    ///
-    /// Note: This method creates a temporary QueryCtx for backward compatibility.
-    /// The proper way is to use `handle_mp_query_with_session` which takes a Session.
-    pub async fn handle_mp_query(&self, sql: &str) -> Result<QueryResult> {
-        // Create a temporary QueryCtx for backward compatibility
-        let query_ctx = session::QueryCtx::new();
-        self.handle_mp_query_with_ctx(sql, &query_ctx).await
+    /// Uses the production path: parse_and_bind → execute_plan → into_result.
+    /// This is a convenience wrapper for tests and the integration test runner.
+    pub async fn execute_query(&self, sql: &str) -> Result<QueryResult> {
+        let exec_ctx = session::ExecutionCtx::with_db("default");
+        let plan = self.parse_and_bind(sql, &exec_ctx)?;
+        let (output, _) = self.execute_plan(plan, &exec_ctx, None).await?;
+        Self::to_query_result(output.into_result().await?)
     }
 
-    /// Handle MySQL protocol query text with mutable Session for transaction control.
+    /// Execute SQL with session context (explicit transactions) and return QueryResult.
     ///
-    /// This is the preferred method for the protocol layer - it supports:
-    /// - BEGIN / START TRANSACTION: Starts explicit transaction
-    /// - COMMIT: Commits the current explicit transaction
-    /// - ROLLBACK: Rolls back the current explicit transaction
-    /// - Other statements: Uses session's active transaction or auto-commit mode
-    pub async fn handle_mp_query_with_session_mut(
+    /// Mirrors InnerSession::execute() pattern: takes + returns txn_ctx through session.
+    pub async fn execute_query_with_session(
         &self,
         sql: &str,
         session: &mut session::Session,
     ) -> Result<QueryResult> {
-        let timer = Timer::new("query");
-        let query_ctx = session.new_query_ctx();
+        let exec_ctx = session::ExecutionCtx::from_session(session);
+        let plan = self.parse_and_bind(sql, &exec_ctx)?;
 
-        // Use session-aware execution for transaction control
-        let result = self
-            .sql_engine
-            .handle_mp_query_with_session(
-                sql,
-                &query_ctx,
-                self.txn_service.as_ref(),
-                &self.catalog,
-                session,
-            )
-            .await?;
-
-        // Convert ExecutionResult to QueryResult
-        let query_result = match result {
-            ExecutionResult::Rows { schema, rows } => {
-                let row_count = rows.len();
-                let columns: Vec<String> = schema
-                    .columns()
-                    .iter()
-                    .map(|c| c.name().to_string())
-                    .collect();
-                let data: Vec<Vec<String>> = rows
-                    .iter()
-                    .map(|row| row.iter().map(value_to_string).collect())
-                    .collect();
-
-                log_trace!(
-                    "SQL: {} | elapsed={:.3}ms rows={}",
-                    truncate_sql(sql, 50),
-                    timer.elapsed_ms(),
-                    row_count
-                );
-
-                QueryResult::Rows { columns, data }
+        // Pre-check: execute_unified takes ownership of txn_ctx. If it errors,
+        // the txn_ctx is dropped (orphaning locks). Catch known error cases
+        // early to preserve the session's transaction state.
+        if session.has_active_txn() {
+            if matches!(&plan, sql::LogicalPlan::Begin { .. }) {
+                return Err(error::TiSqlError::Internal(
+                    "Nested transactions are not supported. Use COMMIT or ROLLBACK first.".into(),
+                ));
             }
-            ExecutionResult::Affected { count } => {
-                log_trace!(
-                    "SQL: {} | elapsed={:.3}ms affected={}",
-                    truncate_sql(sql, 50),
-                    timer.elapsed_ms(),
-                    count
-                );
-                QueryResult::Affected(count)
+            if plan.is_ddl() {
+                return Err(error::TiSqlError::Internal(
+                    "DDL statements are not allowed within explicit transactions. Use COMMIT first."
+                        .into(),
+                ));
             }
-            ExecutionResult::Ok | ExecutionResult::OkWithEffect(_) => {
-                log_trace!(
-                    "SQL: {} | elapsed={:.3}ms",
-                    truncate_sql(sql, 50),
-                    timer.elapsed_ms()
-                );
-                QueryResult::Ok
-            }
-        };
+        }
 
-        Ok(query_result)
+        let txn_ctx = session.take_current_txn();
+        let (output, returned_ctx) = self.execute_plan(plan, &exec_ctx, txn_ctx).await?;
+        if let Some(ctx) = returned_ctx {
+            session.set_current_txn(ctx);
+        }
+        Self::to_query_result(output.into_result().await?)
     }
 
-    /// Handle MySQL protocol query text with a QueryCtx.
-    ///
-    /// This method takes a pre-created QueryCtx that contains session context
-    /// (current_db, isolation_level, etc.). All SQL processing (parse, bind,
-    /// execute) is delegated to SQLEngine.
-    ///
-    /// This is the primary method used by the protocol layer via WorkerPool.
-    pub async fn handle_mp_query_with_ctx(
-        &self,
-        sql: &str,
-        query_ctx: &session::QueryCtx,
-    ) -> Result<QueryResult> {
-        let timer = Timer::new("query");
-
-        // Delegate all SQL processing to SQLEngine
-        // SQLEngine handles: parse -> bind -> execute through TxnService
-        let result = self
-            .sql_engine
-            .handle_mp_query(sql, query_ctx, self.txn_service.as_ref(), &self.catalog)
-            .await?;
-
-        // Convert ExecutionResult to QueryResult
-        let query_result = match result {
-            ExecutionResult::Rows { schema, rows } => {
-                let row_count = rows.len();
-                let columns: Vec<String> = schema
+    /// Convert ExecutionResult to QueryResult (stringified for wire/test output).
+    fn to_query_result(result: ExecutionResult) -> Result<QueryResult> {
+        Ok(match result {
+            ExecutionResult::Rows { schema, rows } => QueryResult::Rows {
+                columns: schema
                     .columns()
                     .iter()
                     .map(|c| c.name().to_string())
-                    .collect();
-                let data: Vec<Vec<String>> = rows
+                    .collect(),
+                data: rows
                     .iter()
                     .map(|row| row.iter().map(value_to_string).collect())
-                    .collect();
-
-                log_trace!(
-                    "SQL: {} | elapsed={:.3}ms rows={}",
-                    truncate_sql(sql, 50),
-                    timer.elapsed_ms(),
-                    row_count
-                );
-
-                QueryResult::Rows { columns, data }
-            }
-            ExecutionResult::Affected { count } => {
-                log_trace!(
-                    "SQL: {} | elapsed={:.3}ms affected={}",
-                    truncate_sql(sql, 50),
-                    timer.elapsed_ms(),
-                    count
-                );
-                QueryResult::Affected(count)
-            }
-            ExecutionResult::Ok | ExecutionResult::OkWithEffect(_) => {
-                log_trace!(
-                    "SQL: {} | elapsed={:.3}ms",
-                    truncate_sql(sql, 50),
-                    timer.elapsed_ms()
-                );
-                QueryResult::Ok
-            }
-        };
-
-        Ok(query_result)
+                    .collect(),
+            },
+            ExecutionResult::Affected { count } => QueryResult::Affected(count),
+            ExecutionResult::Ok | ExecutionResult::OkWithEffect(_) => QueryResult::Ok,
+        })
     }
 
     /// List tables in the specified schema.
@@ -853,7 +695,7 @@ impl Database {
         sql: &str,
         exec_ctx: &session::ExecutionCtx,
     ) -> Result<sql::LogicalPlan> {
-        let stmt = self.sql_engine.parser.parse_one(sql)?;
+        let stmt = self.parser.parse_one(sql)?;
         let binder = sql::Binder::new(&self.catalog, &exec_ctx.current_db);
         binder.bind(stmt)
     }
@@ -870,7 +712,6 @@ impl Database {
         txn_ctx: Option<transaction::TxnCtx>,
     ) -> Result<(ExecutionOutput, Option<transaction::TxnCtx>)> {
         let (output, ctx) = self
-            .sql_engine
             .executor
             .execute_unified(
                 plan,
@@ -1041,16 +882,6 @@ impl QueryResult {
 // Helper Functions
 // ============================================================================
 
-/// Truncate SQL for logging (avoid huge queries in logs)
-fn truncate_sql(sql: &str, max_len: usize) -> String {
-    let sql = sql.trim().replace('\n', " ");
-    if sql.len() <= max_len {
-        sql
-    } else {
-        format!("{}...", &sql[..max_len])
-    }
-}
-
 fn value_to_string(val: &Value) -> String {
     match val {
         Value::Null => "NULL".to_string(),
@@ -1092,7 +923,7 @@ mod tests {
     #[tokio::test]
     async fn test_select_literal() {
         let (db, _dir) = create_test_db();
-        let result = db.handle_mp_query("SELECT 1 + 1").await.unwrap();
+        let result = db.execute_query("SELECT 1 + 1").await.unwrap();
         match result {
             QueryResult::Rows { data, .. } => {
                 assert_eq!(data.len(), 1);
@@ -1106,12 +937,12 @@ mod tests {
     async fn test_create_and_insert() {
         let (db, _dir) = create_test_db();
 
-        db.handle_mp_query("CREATE TABLE users (id INT PRIMARY KEY, name VARCHAR(255))")
+        db.execute_query("CREATE TABLE users (id INT PRIMARY KEY, name VARCHAR(255))")
             .await
             .unwrap();
 
         let result = db
-            .handle_mp_query("INSERT INTO users (id, name) VALUES (1, 'Alice')")
+            .execute_query("INSERT INTO users (id, name) VALUES (1, 'Alice')")
             .await
             .unwrap();
         match result {
@@ -1120,7 +951,7 @@ mod tests {
         }
 
         let result = db
-            .handle_mp_query("SELECT id, name FROM users")
+            .execute_query("SELECT id, name FROM users")
             .await
             .unwrap();
         match result {
@@ -1142,13 +973,13 @@ mod tests {
         // Create database and insert data
         {
             let db = Database::open(config.clone()).unwrap();
-            db.handle_mp_query("CREATE TABLE t (id INT PRIMARY KEY, val VARCHAR(100))")
+            db.execute_query("CREATE TABLE t (id INT PRIMARY KEY, val VARCHAR(100))")
                 .await
                 .unwrap();
-            db.handle_mp_query("INSERT INTO t VALUES (1, 'hello')")
+            db.execute_query("INSERT INTO t VALUES (1, 'hello')")
                 .await
                 .unwrap();
-            db.handle_mp_query("INSERT INTO t VALUES (2, 'world')")
+            db.execute_query("INSERT INTO t VALUES (2, 'world')")
                 .await
                 .unwrap();
             db.close().await.unwrap();
@@ -1167,10 +998,10 @@ mod tests {
     async fn test_drop_table_gc_not_done_while_data_still_in_memtable() {
         let (db, _dir) = create_test_db();
 
-        db.handle_mp_query("CREATE TABLE gc_pending (id INT PRIMARY KEY, val INT)")
+        db.execute_query("CREATE TABLE gc_pending (id INT PRIMARY KEY, val INT)")
             .await
             .unwrap();
-        db.handle_mp_query("INSERT INTO gc_pending VALUES (1, 10), (2, 20), (3, 30)")
+        db.execute_query("INSERT INTO gc_pending VALUES (1, 10), (2, 20), (3, 30)")
             .await
             .unwrap();
 
@@ -1178,7 +1009,7 @@ mod tests {
         // not safe-point timing.
         db.storage.set_gc_safe_point(u64::MAX);
 
-        db.handle_mp_query("DROP TABLE gc_pending").await.unwrap();
+        db.execute_query("DROP TABLE gc_pending").await.unwrap();
 
         // Keep waking the worker; status should remain pending until memtable data
         // is flushed/compacted away.
@@ -1310,15 +1141,15 @@ mod tests {
     async fn test_where_clause() {
         let (db, _dir) = create_test_db();
 
-        db.handle_mp_query("CREATE TABLE t (a INT PRIMARY KEY, b INT)")
+        db.execute_query("CREATE TABLE t (a INT PRIMARY KEY, b INT)")
             .await
             .unwrap();
-        db.handle_mp_query("INSERT INTO t VALUES (1, 10), (2, 20), (3, 30)")
+        db.execute_query("INSERT INTO t VALUES (1, 10), (2, 20), (3, 30)")
             .await
             .unwrap();
 
         let result = db
-            .handle_mp_query("SELECT a, b FROM t WHERE a > 1")
+            .execute_query("SELECT a, b FROM t WHERE a > 1")
             .await
             .unwrap();
         match result {
@@ -1333,15 +1164,15 @@ mod tests {
     async fn test_order_by() {
         let (db, _dir) = create_test_db();
 
-        db.handle_mp_query("CREATE TABLE t (a INT PRIMARY KEY)")
+        db.execute_query("CREATE TABLE t (a INT PRIMARY KEY)")
             .await
             .unwrap();
-        db.handle_mp_query("INSERT INTO t VALUES (3), (1), (2)")
+        db.execute_query("INSERT INTO t VALUES (3), (1), (2)")
             .await
             .unwrap();
 
         let result = db
-            .handle_mp_query("SELECT a FROM t ORDER BY a")
+            .execute_query("SELECT a FROM t ORDER BY a")
             .await
             .unwrap();
         match result {
@@ -1358,14 +1189,14 @@ mod tests {
     async fn test_limit() {
         let (db, _dir) = create_test_db();
 
-        db.handle_mp_query("CREATE TABLE t (a INT PRIMARY KEY)")
+        db.execute_query("CREATE TABLE t (a INT PRIMARY KEY)")
             .await
             .unwrap();
-        db.handle_mp_query("INSERT INTO t VALUES (1), (2), (3), (4), (5)")
+        db.execute_query("INSERT INTO t VALUES (1), (2), (3), (4), (5)")
             .await
             .unwrap();
 
-        let result = db.handle_mp_query("SELECT a FROM t LIMIT 3").await.unwrap();
+        let result = db.execute_query("SELECT a FROM t LIMIT 3").await.unwrap();
         match result {
             QueryResult::Rows { data, .. } => {
                 assert_eq!(data.len(), 3);
@@ -1378,19 +1209,19 @@ mod tests {
     async fn test_update() {
         let (db, _dir) = create_test_db();
 
-        db.handle_mp_query("CREATE TABLE t (id INT PRIMARY KEY, val INT)")
+        db.execute_query("CREATE TABLE t (id INT PRIMARY KEY, val INT)")
             .await
             .unwrap();
-        db.handle_mp_query("INSERT INTO t VALUES (1, 100), (2, 200)")
+        db.execute_query("INSERT INTO t VALUES (1, 100), (2, 200)")
             .await
             .unwrap();
 
-        db.handle_mp_query("UPDATE t SET val = 999 WHERE id = 1")
+        db.execute_query("UPDATE t SET val = 999 WHERE id = 1")
             .await
             .unwrap();
 
         let result = db
-            .handle_mp_query("SELECT id, val FROM t WHERE id = 1")
+            .execute_query("SELECT id, val FROM t WHERE id = 1")
             .await
             .unwrap();
         match result {
@@ -1405,18 +1236,16 @@ mod tests {
     async fn test_delete() {
         let (db, _dir) = create_test_db();
 
-        db.handle_mp_query("CREATE TABLE t (a INT PRIMARY KEY)")
+        db.execute_query("CREATE TABLE t (a INT PRIMARY KEY)")
             .await
             .unwrap();
-        db.handle_mp_query("INSERT INTO t VALUES (1), (2), (3)")
-            .await
-            .unwrap();
-
-        db.handle_mp_query("DELETE FROM t WHERE a = 2")
+        db.execute_query("INSERT INTO t VALUES (1), (2), (3)")
             .await
             .unwrap();
 
-        let result = db.handle_mp_query("SELECT a FROM t").await.unwrap();
+        db.execute_query("DELETE FROM t WHERE a = 2").await.unwrap();
+
+        let result = db.execute_query("SELECT a FROM t").await.unwrap();
         match result {
             QueryResult::Rows { data, .. } => {
                 assert_eq!(data.len(), 2);

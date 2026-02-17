@@ -551,25 +551,21 @@ impl<S: PessimisticStorage + 'static, L: ClogService + 'static, T: TsoService> T
         let clog_result = if let Some(txn_lsn) = ctx.reserved_lsn {
             debug_assert!(
                 self.storage.is_commit_lsn_reserved(start_ts, txn_lsn),
-                "reserved commit lsn missing before clog write: start_ts={}, lsn={}",
-                start_ts,
-                txn_lsn
+                "reserved commit lsn missing before clog write: start_ts={start_ts}, lsn={txn_lsn}",
             );
             self.clog_service
                 .write_ops_with_lsn(txn_id, &ops, commit_ts, txn_lsn, true)
+        } else if self.allow_legacy_write_ops {
+            tracing::warn!(
+                txn_id,
+                start_ts,
+                "using legacy clog write_ops path without reservation; test compatibility mode"
+            );
+            self.clog_service.write_ops(txn_id, &ops, commit_ts, true)
         } else {
-            if self.allow_legacy_write_ops {
-                tracing::warn!(
-                    txn_id,
-                    start_ts,
-                    "using legacy clog write_ops path without reservation; test compatibility mode"
-                );
-                self.clog_service.write_ops(txn_id, &ops, commit_ts, true)
-            } else {
-                Err(TiSqlError::Internal(
-                    "storage does not support commit LSN reservation path".into(),
-                ))
-            }
+            Err(TiSqlError::Internal(
+                "storage does not support commit LSN reservation path".into(),
+            ))
         };
 
         #[cfg(feature = "failpoints")]
@@ -588,8 +584,7 @@ impl<S: PessimisticStorage + 'static, L: ClogService + 'static, T: TsoService> T
                     let commit_lsn = if let Some(reserved_lsn) = ctx.reserved_lsn {
                         debug_assert_eq!(
                             reserved_lsn, lsn,
-                            "clog returned lsn differs from reserved lsn (start_ts={})",
-                            start_ts
+                            "clog returned lsn differs from reserved lsn (start_ts={start_ts})",
                         );
                         reserved_lsn
                     } else {

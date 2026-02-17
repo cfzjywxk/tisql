@@ -22,7 +22,7 @@ use std::pin::Pin;
 
 use crate::catalog::Catalog;
 use crate::error::Result;
-use crate::session::{ExecutionCtx, Session};
+use crate::session::ExecutionCtx;
 use crate::sql::LogicalPlan;
 use crate::transaction::{TxnCtx, TxnService};
 use crate::types::{Row, Schema, TableId, Timestamp};
@@ -155,40 +155,6 @@ impl From<ExecutionResult> for ExecutionOutput {
 /// - Write statements: TxnService.begin(false) + commit() with durability
 /// - Transaction control: BEGIN/COMMIT/ROLLBACK managed via Session
 pub trait Executor: Send + Sync {
-    /// Execute a logical plan through the transaction service.
-    ///
-    /// For read operations (SELECT):
-    /// 1. Creates a read-only transaction via txn_service.begin(true)
-    /// 2. Reads are performed at transaction's start_ts
-    ///
-    /// For write operations (INSERT/UPDATE/DELETE):
-    /// 1. Creates a transaction via txn_service.begin(false)
-    /// 2. Writes are buffered in transaction
-    /// 3. Transaction is committed with durability
-    fn execute<T: TxnService, C: Catalog>(
-        &self,
-        plan: LogicalPlan,
-        txn_service: &T,
-        catalog: &C,
-    ) -> impl std::future::Future<Output = Result<ExecutionResult>> + Send;
-
-    /// Execute a logical plan with session context for explicit transactions.
-    ///
-    /// This method is used when a Session is available to manage transaction state
-    /// across multiple statements. It handles:
-    /// - BEGIN: Creates explicit transaction, stores in session
-    /// - COMMIT: Commits session's active transaction
-    /// - ROLLBACK: Rolls back session's active transaction
-    /// - Other statements: Uses session's active transaction if present,
-    ///   otherwise creates implicit transaction
-    fn execute_with_session<T: TxnService, C: Catalog>(
-        &self,
-        plan: LogicalPlan,
-        txn_service: &T,
-        catalog: &C,
-        session: &mut Session,
-    ) -> impl std::future::Future<Output = Result<ExecutionResult>> + Send;
-
     /// Execute a logical plan with optional TxnCtx (unified entry point).
     ///
     /// This is the new unified execution method that:

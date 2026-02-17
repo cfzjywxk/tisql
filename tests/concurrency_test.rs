@@ -838,7 +838,7 @@ mod ddl_concurrency {
 
                     // Each task creates a different table
                     let sql = format!("CREATE TABLE t{i} (id INT PRIMARY KEY, name VARCHAR(100))");
-                    match db.handle_mp_query(&sql).await {
+                    match db.execute_query(&sql).await {
                         Ok(_) => {
                             success_count.fetch_add(1, Ordering::SeqCst);
                         }
@@ -865,7 +865,7 @@ mod ddl_concurrency {
         for i in 0..num_threads {
             let sql = format!("SELECT * FROM t{i}");
             assert!(
-                db.handle_mp_query(&sql).await.is_ok(),
+                db.execute_query(&sql).await.is_ok(),
                 "Table t{i} should exist"
             );
         }
@@ -897,7 +897,7 @@ mod ddl_concurrency {
 
                     // All tasks try to create the same table
                     match db
-                        .handle_mp_query("CREATE TABLE conflict_table (id INT PRIMARY KEY)")
+                        .execute_query("CREATE TABLE conflict_table (id INT PRIMARY KEY)")
                         .await
                     {
                         Ok(_) => {
@@ -946,10 +946,10 @@ mod ddl_concurrency {
         let db = Arc::new(Database::open(config).unwrap());
 
         // Create initial table
-        db.handle_mp_query("CREATE TABLE users (id INT PRIMARY KEY, name VARCHAR(100))")
+        db.execute_query("CREATE TABLE users (id INT PRIMARY KEY, name VARCHAR(100))")
             .await
             .unwrap();
-        db.handle_mp_query("INSERT INTO users VALUES (1, 'Alice')")
+        db.execute_query("INSERT INTO users VALUES (1, 'Alice')")
             .await
             .unwrap();
 
@@ -960,20 +960,20 @@ mod ddl_concurrency {
         // For now, verify that the schema version mechanism works by checking
         // that after a DDL, subsequent operations see the updated schema.
         // Execute a query to exercise the catalog
-        db.handle_mp_query("SELECT * FROM users").await.unwrap();
+        db.execute_query("SELECT * FROM users").await.unwrap();
 
         // DDL changes schema
-        db.handle_mp_query("CREATE TABLE orders (id INT PRIMARY KEY)")
+        db.execute_query("CREATE TABLE orders (id INT PRIMARY KEY)")
             .await
             .unwrap();
 
         // DML on original table should still work (schema of 'users' didn't change)
-        db.handle_mp_query("INSERT INTO users VALUES (2, 'Bob')")
+        db.execute_query("INSERT INTO users VALUES (2, 'Bob')")
             .await
             .unwrap();
 
         // Verify data
-        let result = db.handle_mp_query("SELECT id FROM users ORDER BY id").await;
+        let result = db.execute_query("SELECT id FROM users ORDER BY id").await;
         match result {
             Ok(QueryResult::Rows { data, .. }) => {
                 assert_eq!(data.len(), 2);
@@ -995,7 +995,7 @@ mod ddl_concurrency {
 
         // Create tables sequentially to establish baseline
         for i in 0..5 {
-            db.handle_mp_query(&format!("CREATE TABLE seq_t{i} (id INT PRIMARY KEY)"))
+            db.execute_query(&format!("CREATE TABLE seq_t{i} (id INT PRIMARY KEY)"))
                 .await
                 .unwrap();
         }
@@ -1011,7 +1011,7 @@ mod ddl_concurrency {
 
                 tokio::spawn(async move {
                     barrier.wait().await;
-                    db.handle_mp_query(&format!("CREATE TABLE conc_t{i} (id INT PRIMARY KEY)"))
+                    db.execute_query(&format!("CREATE TABLE conc_t{i} (id INT PRIMARY KEY)"))
                         .await
                         .unwrap();
                 })
@@ -1025,7 +1025,7 @@ mod ddl_concurrency {
         // Verify all 9 tables exist (5 sequential + 4 concurrent)
         for i in 0..5 {
             assert!(
-                db.handle_mp_query(&format!("SELECT * FROM seq_t{i}"))
+                db.execute_query(&format!("SELECT * FROM seq_t{i}"))
                     .await
                     .is_ok(),
                 "seq_t{i} should exist"
@@ -1033,7 +1033,7 @@ mod ddl_concurrency {
         }
         for i in 0..num_threads {
             assert!(
-                db.handle_mp_query(&format!("SELECT * FROM conc_t{i}"))
+                db.execute_query(&format!("SELECT * FROM conc_t{i}"))
                     .await
                     .is_ok(),
                 "conc_t{i} should exist"
@@ -1051,22 +1051,22 @@ mod ddl_concurrency {
         let db = Arc::new(Database::open(config).unwrap());
 
         // Create, drop, recreate in sequence
-        db.handle_mp_query("CREATE TABLE temp (id INT PRIMARY KEY)")
+        db.execute_query("CREATE TABLE temp (id INT PRIMARY KEY)")
             .await
             .unwrap();
-        db.handle_mp_query("INSERT INTO temp VALUES (1)")
+        db.execute_query("INSERT INTO temp VALUES (1)")
             .await
             .unwrap();
-        db.handle_mp_query("DROP TABLE temp").await.unwrap();
-        db.handle_mp_query("CREATE TABLE temp (id INT PRIMARY KEY, name VARCHAR(50))")
+        db.execute_query("DROP TABLE temp").await.unwrap();
+        db.execute_query("CREATE TABLE temp (id INT PRIMARY KEY, name VARCHAR(50))")
             .await
             .unwrap();
-        db.handle_mp_query("INSERT INTO temp VALUES (2, 'test')")
+        db.execute_query("INSERT INTO temp VALUES (2, 'test')")
             .await
             .unwrap();
 
         // Verify new schema is in effect
-        let result = db.handle_mp_query("SELECT id, name FROM temp").await;
+        let result = db.execute_query("SELECT id, name FROM temp").await;
         match result {
             Ok(QueryResult::Rows { data, columns }) => {
                 assert_eq!(columns.len(), 2);
@@ -1396,7 +1396,7 @@ async fn test_e2e_key_is_locked_concurrent_inserts() {
     let db = Arc::new(Database::open(config).unwrap());
 
     // Create table with primary key
-    db.handle_mp_query("CREATE TABLE lock_test (id INT PRIMARY KEY, value VARCHAR(100))")
+    db.execute_query("CREATE TABLE lock_test (id INT PRIMARY KEY, value VARCHAR(100))")
         .await
         .unwrap();
 
@@ -1420,7 +1420,7 @@ async fn test_e2e_key_is_locked_concurrent_inserts() {
 
             // All tasks try to insert with the same primary key
             let sql = format!("INSERT INTO lock_test (id, value) VALUES (1, 'thread_{i}')");
-            match db.handle_mp_query(&sql).await {
+            match db.execute_query(&sql).await {
                 Ok(QueryResult::Affected(_)) => {
                     success_count.fetch_add(1, Ordering::Relaxed);
                 }
@@ -1466,7 +1466,7 @@ async fn test_e2e_key_is_locked_concurrent_inserts() {
 
     // Verify the data is consistent - exactly one row should exist
     match db
-        .handle_mp_query("SELECT COUNT(*) FROM lock_test")
+        .execute_query("SELECT COUNT(*) FROM lock_test")
         .await
         .unwrap()
     {
@@ -1493,10 +1493,10 @@ async fn test_e2e_key_is_locked_concurrent_updates() {
     let db = Arc::new(Database::open(config).unwrap());
 
     // Create table and insert initial row
-    db.handle_mp_query("CREATE TABLE update_lock_test (id INT PRIMARY KEY, counter INT)")
+    db.execute_query("CREATE TABLE update_lock_test (id INT PRIMARY KEY, counter INT)")
         .await
         .unwrap();
-    db.handle_mp_query("INSERT INTO update_lock_test VALUES (1, 0)")
+    db.execute_query("INSERT INTO update_lock_test VALUES (1, 0)")
         .await
         .unwrap();
 
@@ -1519,9 +1519,7 @@ async fn test_e2e_key_is_locked_concurrent_updates() {
 
             for _ in 0..updates_per_thread {
                 match db
-                    .handle_mp_query(
-                        "UPDATE update_lock_test SET counter = counter + 1 WHERE id = 1",
-                    )
+                    .execute_query("UPDATE update_lock_test SET counter = counter + 1 WHERE id = 1")
                     .await
                 {
                     Ok(QueryResult::Affected(_)) => {
@@ -1574,7 +1572,7 @@ async fn test_e2e_key_is_locked_concurrent_updates() {
     // at least 1 (at least one update succeeded) and at most successes (all updates
     // incremented unique values).
     match db
-        .handle_mp_query("SELECT counter FROM update_lock_test WHERE id = 1")
+        .execute_query("SELECT counter FROM update_lock_test WHERE id = 1")
         .await
         .unwrap()
     {
@@ -1609,7 +1607,7 @@ mod explicit_transaction_tests {
         let mut session = Session::new();
 
         // Create table
-        db.handle_mp_query("CREATE TABLE txn_test (id INT PRIMARY KEY, val VARCHAR(100))")
+        db.execute_query("CREATE TABLE txn_test (id INT PRIMARY KEY, val VARCHAR(100))")
             .await
             .unwrap();
 
@@ -1620,9 +1618,7 @@ mod explicit_transaction_tests {
         );
 
         // BEGIN should start a transaction
-        let result = db
-            .handle_mp_query_with_session_mut("BEGIN", &mut session)
-            .await;
+        let result = db.execute_query_with_session("BEGIN", &mut session).await;
         assert!(result.is_ok(), "BEGIN should succeed");
 
         // Session should now have active transaction
@@ -1643,13 +1639,13 @@ mod explicit_transaction_tests {
         let mut session = Session::new();
 
         // Create table
-        db.handle_mp_query("CREATE TABLE txn_test2 (id INT PRIMARY KEY)")
+        db.execute_query("CREATE TABLE txn_test2 (id INT PRIMARY KEY)")
             .await
             .unwrap();
 
         // START TRANSACTION should start a transaction
         let result = db
-            .handle_mp_query_with_session_mut("START TRANSACTION", &mut session)
+            .execute_query_with_session("START TRANSACTION", &mut session)
             .await;
         assert!(result.is_ok(), "START TRANSACTION should succeed");
 
@@ -1670,17 +1666,17 @@ mod explicit_transaction_tests {
         let mut session = Session::new();
 
         // Create table
-        db.handle_mp_query("CREATE TABLE commit_test (id INT PRIMARY KEY, val VARCHAR(100))")
+        db.execute_query("CREATE TABLE commit_test (id INT PRIMARY KEY, val VARCHAR(100))")
             .await
             .unwrap();
 
         // Begin transaction
-        db.handle_mp_query_with_session_mut("BEGIN", &mut session)
+        db.execute_query_with_session("BEGIN", &mut session)
             .await
             .unwrap();
 
         // Insert within transaction
-        db.handle_mp_query_with_session_mut(
+        db.execute_query_with_session(
             "INSERT INTO commit_test VALUES (1, 'committed')",
             &mut session,
         )
@@ -1688,7 +1684,7 @@ mod explicit_transaction_tests {
         .unwrap();
 
         // Commit
-        db.handle_mp_query_with_session_mut("COMMIT", &mut session)
+        db.execute_query_with_session("COMMIT", &mut session)
             .await
             .unwrap();
 
@@ -1700,7 +1696,7 @@ mod explicit_transaction_tests {
 
         // Data should be visible
         match db
-            .handle_mp_query("SELECT val FROM commit_test WHERE id = 1")
+            .execute_query("SELECT val FROM commit_test WHERE id = 1")
             .await
             .unwrap()
         {
@@ -1723,20 +1719,20 @@ mod explicit_transaction_tests {
         let mut session = Session::new();
 
         // Create table and insert initial data
-        db.handle_mp_query("CREATE TABLE rollback_test (id INT PRIMARY KEY, val VARCHAR(100))")
+        db.execute_query("CREATE TABLE rollback_test (id INT PRIMARY KEY, val VARCHAR(100))")
             .await
             .unwrap();
-        db.handle_mp_query("INSERT INTO rollback_test VALUES (1, 'original')")
+        db.execute_query("INSERT INTO rollback_test VALUES (1, 'original')")
             .await
             .unwrap();
 
         // Begin transaction
-        db.handle_mp_query_with_session_mut("BEGIN", &mut session)
+        db.execute_query_with_session("BEGIN", &mut session)
             .await
             .unwrap();
 
         // Update within transaction
-        db.handle_mp_query_with_session_mut(
+        db.execute_query_with_session(
             "UPDATE rollback_test SET val = 'modified' WHERE id = 1",
             &mut session,
         )
@@ -1744,7 +1740,7 @@ mod explicit_transaction_tests {
         .unwrap();
 
         // Rollback
-        db.handle_mp_query_with_session_mut("ROLLBACK", &mut session)
+        db.execute_query_with_session("ROLLBACK", &mut session)
             .await
             .unwrap();
 
@@ -1756,7 +1752,7 @@ mod explicit_transaction_tests {
 
         // Data should be unchanged
         match db
-            .handle_mp_query("SELECT val FROM rollback_test WHERE id = 1")
+            .execute_query("SELECT val FROM rollback_test WHERE id = 1")
             .await
             .unwrap()
         {
@@ -1783,37 +1779,28 @@ mod explicit_transaction_tests {
         let mut session = Session::new();
 
         // Create table
-        db.handle_mp_query("CREATE TABLE multi_insert_test (id INT PRIMARY KEY, val INT)")
+        db.execute_query("CREATE TABLE multi_insert_test (id INT PRIMARY KEY, val INT)")
             .await
             .unwrap();
 
         // Begin transaction
-        db.handle_mp_query_with_session_mut("BEGIN", &mut session)
+        db.execute_query_with_session("BEGIN", &mut session)
             .await
             .unwrap();
 
         // Multiple inserts within the transaction
-        db.handle_mp_query_with_session_mut(
-            "INSERT INTO multi_insert_test VALUES (1, 10)",
-            &mut session,
-        )
-        .await
-        .unwrap();
-        db.handle_mp_query_with_session_mut(
-            "INSERT INTO multi_insert_test VALUES (2, 20)",
-            &mut session,
-        )
-        .await
-        .unwrap();
-        db.handle_mp_query_with_session_mut(
-            "INSERT INTO multi_insert_test VALUES (3, 30)",
-            &mut session,
-        )
-        .await
-        .unwrap();
+        db.execute_query_with_session("INSERT INTO multi_insert_test VALUES (1, 10)", &mut session)
+            .await
+            .unwrap();
+        db.execute_query_with_session("INSERT INTO multi_insert_test VALUES (2, 20)", &mut session)
+            .await
+            .unwrap();
+        db.execute_query_with_session("INSERT INTO multi_insert_test VALUES (3, 30)", &mut session)
+            .await
+            .unwrap();
 
         // Commit
-        db.handle_mp_query_with_session_mut("COMMIT", &mut session)
+        db.execute_query_with_session("COMMIT", &mut session)
             .await
             .unwrap();
 
@@ -1825,7 +1812,7 @@ mod explicit_transaction_tests {
 
         // All inserts should be visible after commit
         match db
-            .handle_mp_query("SELECT id, val FROM multi_insert_test ORDER BY id")
+            .execute_query("SELECT id, val FROM multi_insert_test ORDER BY id")
             .await
             .unwrap()
         {
@@ -1856,26 +1843,23 @@ mod explicit_transaction_tests {
         let mut session = Session::new();
 
         // Create table
-        db.handle_mp_query("CREATE TABLE ryw_test (id INT PRIMARY KEY, val VARCHAR(100))")
+        db.execute_query("CREATE TABLE ryw_test (id INT PRIMARY KEY, val VARCHAR(100))")
             .await
             .unwrap();
 
         // Begin transaction
-        db.handle_mp_query_with_session_mut("BEGIN", &mut session)
+        db.execute_query_with_session("BEGIN", &mut session)
             .await
             .unwrap();
 
         // Insert within transaction
-        db.handle_mp_query_with_session_mut(
-            "INSERT INTO ryw_test VALUES (1, 'first')",
-            &mut session,
-        )
-        .await
-        .unwrap();
+        db.execute_query_with_session("INSERT INTO ryw_test VALUES (1, 'first')", &mut session)
+            .await
+            .unwrap();
 
         // Read should see the uncommitted insert (read-your-writes)
         match db
-            .handle_mp_query_with_session_mut("SELECT val FROM ryw_test WHERE id = 1", &mut session)
+            .execute_query_with_session("SELECT val FROM ryw_test WHERE id = 1", &mut session)
             .await
             .unwrap()
         {
@@ -1887,7 +1871,7 @@ mod explicit_transaction_tests {
         }
 
         // Update within transaction
-        db.handle_mp_query_with_session_mut(
+        db.execute_query_with_session(
             "UPDATE ryw_test SET val = 'updated' WHERE id = 1",
             &mut session,
         )
@@ -1896,7 +1880,7 @@ mod explicit_transaction_tests {
 
         // Read should see the updated value
         match db
-            .handle_mp_query_with_session_mut("SELECT val FROM ryw_test WHERE id = 1", &mut session)
+            .execute_query_with_session("SELECT val FROM ryw_test WHERE id = 1", &mut session)
             .await
             .unwrap()
         {
@@ -1907,7 +1891,7 @@ mod explicit_transaction_tests {
         }
 
         // Commit
-        db.handle_mp_query_with_session_mut("COMMIT", &mut session)
+        db.execute_query_with_session("COMMIT", &mut session)
             .await
             .unwrap();
 
@@ -1926,19 +1910,19 @@ mod explicit_transaction_tests {
         let mut s1 = Session::new();
         let mut s2 = Session::new();
 
-        db.handle_mp_query("CREATE TABLE ms_iso_t (id INT PRIMARY KEY, v INT)")
+        db.execute_query("CREATE TABLE ms_iso_t (id INT PRIMARY KEY, v INT)")
             .await
             .unwrap();
-        db.handle_mp_query("INSERT INTO ms_iso_t VALUES (1, 10)")
+        db.execute_query("INSERT INTO ms_iso_t VALUES (1, 10)")
             .await
             .unwrap();
 
         // s1 starts explicit transaction and reads initial snapshot.
-        db.handle_mp_query_with_session_mut("BEGIN", &mut s1)
+        db.execute_query_with_session("BEGIN", &mut s1)
             .await
             .unwrap();
         match db
-            .handle_mp_query_with_session_mut("SELECT v FROM ms_iso_t WHERE id = 1", &mut s1)
+            .execute_query_with_session("SELECT v FROM ms_iso_t WHERE id = 1", &mut s1)
             .await
             .unwrap()
         {
@@ -1950,16 +1934,16 @@ mod explicit_transaction_tests {
         }
 
         // Concurrent commits from s2 after s1 snapshot is established.
-        db.handle_mp_query_with_session_mut("UPDATE ms_iso_t SET v = 20 WHERE id = 1", &mut s2)
+        db.execute_query_with_session("UPDATE ms_iso_t SET v = 20 WHERE id = 1", &mut s2)
             .await
             .unwrap();
-        db.handle_mp_query_with_session_mut("INSERT INTO ms_iso_t VALUES (2, 200)", &mut s2)
+        db.execute_query_with_session("INSERT INTO ms_iso_t VALUES (2, 200)", &mut s2)
             .await
             .unwrap();
 
         // s1 should still read old snapshot values, not s2's newly committed ones.
         match db
-            .handle_mp_query_with_session_mut("SELECT v FROM ms_iso_t WHERE id = 1", &mut s1)
+            .execute_query_with_session("SELECT v FROM ms_iso_t WHERE id = 1", &mut s1)
             .await
             .unwrap()
         {
@@ -1973,7 +1957,7 @@ mod explicit_transaction_tests {
             other => panic!("Expected rows, got: {other:?}"),
         }
         match db
-            .handle_mp_query_with_session_mut("SELECT COUNT(*) FROM ms_iso_t", &mut s1)
+            .execute_query_with_session("SELECT COUNT(*) FROM ms_iso_t", &mut s1)
             .await
             .unwrap()
         {
@@ -1988,11 +1972,11 @@ mod explicit_transaction_tests {
         }
 
         // s1 should still see its own writes.
-        db.handle_mp_query_with_session_mut("INSERT INTO ms_iso_t VALUES (3, 300)", &mut s1)
+        db.execute_query_with_session("INSERT INTO ms_iso_t VALUES (3, 300)", &mut s1)
             .await
             .unwrap();
         match db
-            .handle_mp_query_with_session_mut("SELECT v FROM ms_iso_t WHERE id = 3", &mut s1)
+            .execute_query_with_session("SELECT v FROM ms_iso_t WHERE id = 3", &mut s1)
             .await
             .unwrap()
         {
@@ -2003,13 +1987,13 @@ mod explicit_transaction_tests {
             other => panic!("Expected rows, got: {other:?}"),
         }
 
-        db.handle_mp_query_with_session_mut("COMMIT", &mut s1)
+        db.execute_query_with_session("COMMIT", &mut s1)
             .await
             .unwrap();
 
         // After commit, latest view should include both s2 and s1 committed writes.
         match db
-            .handle_mp_query("SELECT id, v FROM ms_iso_t ORDER BY id")
+            .execute_query("SELECT id, v FROM ms_iso_t ORDER BY id")
             .await
             .unwrap()
         {
@@ -2034,14 +2018,12 @@ mod explicit_transaction_tests {
         let mut session = Session::new();
 
         // Create table
-        db.handle_mp_query("CREATE TABLE noop_test (id INT PRIMARY KEY)")
+        db.execute_query("CREATE TABLE noop_test (id INT PRIMARY KEY)")
             .await
             .unwrap();
 
         // COMMIT without BEGIN should succeed (MySQL behavior)
-        let result = db
-            .handle_mp_query_with_session_mut("COMMIT", &mut session)
-            .await;
+        let result = db.execute_query_with_session("COMMIT", &mut session).await;
         assert!(result.is_ok(), "COMMIT without txn should be no-op");
 
         db.close().await.unwrap();
@@ -2056,13 +2038,13 @@ mod explicit_transaction_tests {
         let mut session = Session::new();
 
         // Create table
-        db.handle_mp_query("CREATE TABLE noop_rb_test (id INT PRIMARY KEY)")
+        db.execute_query("CREATE TABLE noop_rb_test (id INT PRIMARY KEY)")
             .await
             .unwrap();
 
         // ROLLBACK without BEGIN should succeed (MySQL behavior)
         let result = db
-            .handle_mp_query_with_session_mut("ROLLBACK", &mut session)
+            .execute_query_with_session("ROLLBACK", &mut session)
             .await;
         assert!(result.is_ok(), "ROLLBACK without txn should be no-op");
 
@@ -2081,27 +2063,22 @@ mod explicit_transaction_tests {
         let mut session = Session::new();
 
         // Create table
-        db.handle_mp_query("CREATE TABLE nested_test (id INT PRIMARY KEY, val INT)")
+        db.execute_query("CREATE TABLE nested_test (id INT PRIMARY KEY, val INT)")
             .await
             .unwrap();
 
         // Begin first transaction
-        db.handle_mp_query_with_session_mut("BEGIN", &mut session)
+        db.execute_query_with_session("BEGIN", &mut session)
             .await
             .unwrap();
 
         // Insert data
-        db.handle_mp_query_with_session_mut(
-            "INSERT INTO nested_test VALUES (1, 100)",
-            &mut session,
-        )
-        .await
-        .unwrap();
+        db.execute_query_with_session("INSERT INTO nested_test VALUES (1, 100)", &mut session)
+            .await
+            .unwrap();
 
         // Nested BEGIN should return an error (not supported yet)
-        let result = db
-            .handle_mp_query_with_session_mut("BEGIN", &mut session)
-            .await;
+        let result = db.execute_query_with_session("BEGIN", &mut session).await;
         assert!(result.is_err(), "Nested BEGIN should return error");
         assert!(
             result
@@ -2119,13 +2096,13 @@ mod explicit_transaction_tests {
         );
 
         // Commit the original transaction
-        db.handle_mp_query_with_session_mut("COMMIT", &mut session)
+        db.execute_query_with_session("COMMIT", &mut session)
             .await
             .unwrap();
 
         // Data should be visible after commit
         match db
-            .handle_mp_query("SELECT val FROM nested_test WHERE id = 1")
+            .execute_query("SELECT val FROM nested_test WHERE id = 1")
             .await
             .unwrap()
         {
@@ -2148,19 +2125,19 @@ mod explicit_transaction_tests {
         let mut s1 = Session::new();
         let mut s2 = Session::new();
 
-        db.handle_mp_query("CREATE TABLE schema_guard_t (id INT PRIMARY KEY, v INT)")
+        db.execute_query("CREATE TABLE schema_guard_t (id INT PRIMARY KEY, v INT)")
             .await
             .unwrap();
 
-        db.handle_mp_query_with_session_mut("BEGIN", &mut s1)
+        db.execute_query_with_session("BEGIN", &mut s1)
             .await
             .unwrap();
-        db.handle_mp_query_with_session_mut("INSERT INTO schema_guard_t VALUES (1, 10)", &mut s1)
+        db.execute_query_with_session("INSERT INTO schema_guard_t VALUES (1, 10)", &mut s1)
             .await
             .unwrap();
 
         // Concurrent DDL from another session bumps schema version.
-        db.handle_mp_query_with_session_mut(
+        db.execute_query_with_session(
             "CREATE TABLE schema_guard_other (id INT PRIMARY KEY)",
             &mut s2,
         )
@@ -2168,7 +2145,7 @@ mod explicit_transaction_tests {
         .unwrap();
 
         let err = db
-            .handle_mp_query_with_session_mut("COMMIT", &mut s1)
+            .execute_query_with_session("COMMIT", &mut s1)
             .await
             .unwrap_err();
         assert!(
@@ -2184,7 +2161,7 @@ mod explicit_transaction_tests {
 
         // Write should have been rolled back.
         match db
-            .handle_mp_query("SELECT id FROM schema_guard_t ORDER BY id")
+            .execute_query("SELECT id FROM schema_guard_t ORDER BY id")
             .await
             .unwrap()
         {

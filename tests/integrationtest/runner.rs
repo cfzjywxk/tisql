@@ -273,7 +273,7 @@ async fn run_test(config: &Config, test_case: &TestCase) -> TestResult {
         output.push('\n');
 
         let statement_result =
-            tokio::time::timeout(config.statement_timeout, db.handle_mp_query(&stmt.sql)).await;
+            tokio::time::timeout(config.statement_timeout, db.execute_query(&stmt.sql)).await;
 
         // Execute
         match statement_result {
