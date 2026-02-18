@@ -2429,8 +2429,8 @@ async fn test_log_gc_repeated_cycles_never_over_truncate() {
 /// Write a multi-key transaction using write_ops (single LSN per transaction).
 ///
 /// This mirrors the production path: `TxnService::commit()` writes one txn LSN
-/// for all entries in the transaction (`write_ops_with_lsn` on reservation path,
-/// `write_ops` on fallback path).
+/// for all entries in the transaction (`write_ops(..., Some(lsn), ...)` on
+/// reservation path, `write_ops(..., None, ...)` on fallback path).
 /// Returns that transaction LSN.
 async fn write_durable_multi_put(
     engine: &LsmEngine,
@@ -2447,7 +2447,7 @@ async fn write_durable_multi_put(
         .collect();
 
     let commit_lsn = clog
-        .write_ops(txn_id, &ops, commit_ts, true)
+        .write_ops(txn_id, &ops, commit_ts, None, true)
         .unwrap()
         .await
         .unwrap();

@@ -530,7 +530,7 @@ impl<S: PessimisticStorage + 'static, L: ClogService + 'static, T: TsoService> T
         );
         let clog_result = self
             .clog_service
-            .write_ops_with_lsn(txn_id, &ops, commit_ts, txn_lsn, true);
+            .write_ops(txn_id, &ops, commit_ts, Some(txn_lsn), true);
 
         #[cfg(feature = "failpoints")]
         fail_point!("txn_after_clog_write_before_fsync_wait_v26");

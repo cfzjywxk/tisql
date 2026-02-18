@@ -162,29 +162,18 @@ pub trait ClogService: Send + Sync {
     ///
     /// This is the zero-copy commit path: the caller builds `ClogOpRef` entries
     /// that borrow keys from the transaction's mutations BTreeMap and values from
-    /// storage reads. The clog allocates LSNs, appends a Commit record, serializes,
-    /// and submits to group commit. No key or value cloning occurs.
+    /// storage reads. The clog appends a Commit record, serializes, and submits to
+    /// group commit. No key or value cloning occurs.
     ///
-    /// V2.6 production commit paths should prefer `write_ops_with_lsn` via strict
-    /// reservation flow. `write_ops` remains for compatibility/test paths.
+    /// - `lsn = Some(reserved_lsn)`: use caller-provided pre-allocated LSN
+    ///   (V2.6 reservation path).
+    /// - `lsn = None`: allocate transaction LSN inside clog (compat/test path).
     fn write_ops(
         &self,
         txn_id: TxnId,
         ops: &[ClogOpRef<'_>],
         commit_ts: Timestamp,
-        sync: bool,
-    ) -> Result<ClogFsyncFuture>;
-
-    /// Write pre-built clog ops using a caller-provided transaction LSN.
-    ///
-    /// This is used by V2.6 reservation path where storage allocates+reserves
-    /// the commit LSN before WAL append.
-    fn write_ops_with_lsn(
-        &self,
-        txn_id: TxnId,
-        ops: &[ClogOpRef<'_>],
-        commit_ts: Timestamp,
-        lsn: Lsn,
+        lsn: Option<Lsn>,
         sync: bool,
     ) -> Result<ClogFsyncFuture>;
 

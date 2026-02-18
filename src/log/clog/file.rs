@@ -545,19 +545,22 @@ struct PreparedBatch {
 }
 
 impl FileClogService {
-    /// Prepare pre-built ClogOpRef entries using caller-provided LSN.
-    fn prepare_ops_with_lsn(
+    /// Prepare pre-built ClogOpRef entries using the transaction LSN.
+    fn prepare_ops(
         &self,
         txn_id: TxnId,
         ops: &[ClogOpRef<'_>],
         commit_ts: Timestamp,
         txn_lsn: Lsn,
+        require_preallocated_lsn: bool,
     ) -> Result<PreparedBatch> {
-        let current_lsn = self.lsn_provider.current_lsn();
-        if txn_lsn >= current_lsn {
-            return Err(TiSqlError::Internal(format!(
-                "write_ops_with_lsn expects pre-allocated lsn (< current_lsn): lsn={txn_lsn}, current_lsn={current_lsn}"
-            )));
+        if require_preallocated_lsn {
+            let current_lsn = self.lsn_provider.current_lsn();
+            if txn_lsn >= current_lsn {
+                return Err(TiSqlError::Internal(format!(
+                    "write_ops with reserved lsn expects pre-allocated lsn (< current_lsn): lsn={txn_lsn}, current_lsn={current_lsn}"
+                )));
+            }
         }
 
         let entry_count = ops.len() + 1; // +1 for commit record
@@ -645,6 +648,7 @@ impl ClogService for FileClogService {
         txn_id: TxnId,
         ops: &[ClogOpRef<'_>],
         commit_ts: Timestamp,
+        lsn: Option<Lsn>,
         sync: bool,
     ) -> Result<ClogFsyncFuture> {
         if ops.is_empty() {
@@ -653,25 +657,12 @@ impl ClogService for FileClogService {
             return Ok(ClogFsyncFuture::new(self.lsn_provider.current_lsn(), rx));
         }
 
-        let txn_lsn = self.lsn_provider.alloc_lsn();
-        self.write_ops_with_lsn(txn_id, ops, commit_ts, txn_lsn, sync)
-    }
-
-    fn write_ops_with_lsn(
-        &self,
-        txn_id: TxnId,
-        ops: &[ClogOpRef<'_>],
-        commit_ts: Timestamp,
-        lsn: Lsn,
-        sync: bool,
-    ) -> Result<ClogFsyncFuture> {
-        if ops.is_empty() {
-            let (tx, rx) = tokio::sync::oneshot::channel();
-            let _ = tx.send(Ok(()));
-            return Ok(ClogFsyncFuture::new(self.lsn_provider.current_lsn(), rx));
-        }
-
-        let prepared = self.prepare_ops_with_lsn(txn_id, ops, commit_ts, lsn)?;
+        let (txn_lsn, require_preallocated_lsn) = match lsn {
+            Some(lsn) => (lsn, true),
+            None => (self.lsn_provider.alloc_lsn(), false),
+        };
+        let prepared =
+            self.prepare_ops(txn_id, ops, commit_ts, txn_lsn, require_preallocated_lsn)?;
         let end_lsn = prepared.end_lsn;
 
         #[cfg(feature = "failpoints")]
@@ -2291,7 +2282,7 @@ mod tests {
     // ========================================================================
 
     #[tokio::test]
-    async fn test_write_ops_with_lsn_uses_preallocated_lsn() {
+    async fn test_write_ops_with_reserved_lsn_uses_preallocated_lsn() {
         use crate::lsn::new_lsn_provider;
 
         let dir = tempdir().unwrap();
@@ -2313,7 +2304,7 @@ mod tests {
             value: b"v1",
         }];
         let written_lsn = service
-            .write_ops_with_lsn(7, &ops, 100, txn_lsn, true)
+            .write_ops(7, &ops, 100, Some(txn_lsn), true)
             .unwrap()
             .await
             .unwrap();
@@ -2327,7 +2318,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_write_ops_with_lsn_rejects_unallocated_lsn() {
+    async fn test_write_ops_with_reserved_lsn_rejects_unallocated_lsn() {
         use crate::lsn::new_lsn_provider;
 
         let dir = tempdir().unwrap();
@@ -2345,8 +2336,8 @@ mod tests {
             key: b"k1",
             value: b"v1",
         }];
-        let err = match service.write_ops_with_lsn(7, &ops, 100, 1, true) {
-            Ok(_) => panic!("write_ops_with_lsn should reject unallocated LSN"),
+        let err = match service.write_ops(7, &ops, 100, Some(1), true) {
+            Ok(_) => panic!("write_ops should reject unallocated reserved LSN"),
             Err(err) => format!("{err}"),
         };
         assert!(err.contains("pre-allocated lsn"), "unexpected error: {err}");
@@ -2380,7 +2371,7 @@ mod tests {
             },
         ];
         let commit_lsn = service
-            .write_ops(1, &ops, 100, true)
+            .write_ops(1, &ops, 100, None, true)
             .unwrap()
             .await
             .unwrap();
@@ -2427,7 +2418,7 @@ mod tests {
             value: b"v1",
         }];
         service
-            .write_ops(1, &ops1, 100, true)
+            .write_ops(1, &ops1, 100, None, true)
             .unwrap()
             .await
             .unwrap();
@@ -2448,7 +2439,7 @@ mod tests {
             },
         ];
         let commit_lsn = service
-            .write_ops(2, &ops2, 200, true)
+            .write_ops(2, &ops2, 200, None, true)
             .unwrap()
             .await
             .unwrap();
@@ -2496,7 +2487,7 @@ mod tests {
             },
         ];
         service
-            .write_ops(1, &ops, 100, true)
+            .write_ops(1, &ops, 100, None, true)
             .unwrap()
             .await
             .unwrap();
@@ -2536,7 +2527,7 @@ mod tests {
                 },
             ];
             service
-                .write_ops(txn_id, &ops, txn_id * 100, true)
+                .write_ops(txn_id, &ops, txn_id * 100, None, true)
                 .unwrap()
                 .await
                 .unwrap();
