@@ -37,9 +37,10 @@ use super::{
 
 /// Storage facade that routes all operations through `TabletManager`.
 ///
-/// Routing rule in phase-3:
-/// - compute logical tablet from key/range
-/// - if that tablet is not mounted yet, conservatively fallback to system tablet
+/// Preferred routing is metadata-first (`*_on_tablet` trait methods).
+/// Key-only trait methods still exist for legacy/internal callers and use
+/// conservative key decoding fallback. If a logical tablet is not mounted yet,
+/// operations are routed to `TabletId::System`.
 #[derive(Clone)]
 pub struct RoutedTabletStorage {
     manager: Arc<TabletManager>,
@@ -63,6 +64,7 @@ impl RoutedTabletStorage {
     }
 
     fn resolve_key_tablet(&self, key: &[u8]) -> (TabletId, Arc<TabletEngine>) {
+        // Legacy/internal key-only fallback path.
         let logical = route_key_to_tablet(key);
         self.resolve_mounted_tablet(logical)
     }

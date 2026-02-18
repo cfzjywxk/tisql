@@ -49,10 +49,10 @@
 //! let mut ctx = txn_service.begin(false)?;  // read_only = false
 //!
 //! // Read operations
-//! let value = txn_service.get(&ctx, key)?;
+//! let value = txn_service.get(&ctx, table_id, key)?;
 //!
 //! // Write operations
-//! txn_service.put(&mut ctx, key, value)?;
+//! txn_service.put(&mut ctx, table_id, key, value)?;
 //!
 //! // Commit
 //! let info = txn_service.commit(ctx)?;

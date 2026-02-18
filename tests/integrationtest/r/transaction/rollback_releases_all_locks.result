@@ -1,0 +1,41 @@
+CREATE TABLE lock_release_test (id INT PRIMARY KEY, val VARCHAR(100))
+INSERT INTO lock_release_test VALUES (1, 'original1')
+AFFECTED 1
+INSERT INTO lock_release_test VALUES (2, 'original2')
+AFFECTED 1
+INSERT INTO lock_release_test VALUES (3, 'original3')
+AFFECTED 1
+BEGIN
+UPDATE lock_release_test SET val = 'locked1' WHERE id = 1
+AFFECTED 1
+UPDATE lock_release_test SET val = 'locked2' WHERE id = 2
+AFFECTED 1
+UPDATE lock_release_test SET val = 'locked3' WHERE id = 3
+AFFECTED 1
+BEGIN
+UPDATE lock_release_test SET val = 's2_attempt1' WHERE id = 1
+ERROR 1105: KeyIsLocked
+UPDATE lock_release_test SET val = 's2_attempt2' WHERE id = 2
+ERROR 1105: KeyIsLocked
+SELECT 1
+?column?
+1
+ROLLBACK
+UPDATE lock_release_test SET val = 's2_success1' WHERE id = 1
+AFFECTED 1
+UPDATE lock_release_test SET val = 's2_success2' WHERE id = 2
+AFFECTED 1
+UPDATE lock_release_test SET val = 's2_success3' WHERE id = 3
+AFFECTED 1
+SELECT * FROM lock_release_test ORDER BY id
+id	val
+1	s2_success1
+2	s2_success2
+3	s2_success3
+COMMIT
+SELECT * FROM lock_release_test ORDER BY id
+id	val
+1	s2_success1
+2	s2_success2
+3	s2_success3
+DROP TABLE lock_release_test

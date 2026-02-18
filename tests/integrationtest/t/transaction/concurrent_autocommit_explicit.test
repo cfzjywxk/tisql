@@ -1,0 +1,38 @@
+# TXN-001: Concurrent Autocommit vs Explicit Transaction
+# 
+# Verify that autocommit operations don't see uncommitted explicit transaction data.
+# This tests the fundamental isolation between autocommit and explicit transactions.
+
+# Setup
+CREATE TABLE txn_test (id INT PRIMARY KEY, val VARCHAR(100));
+INSERT INTO txn_test VALUES (1, 'original');
+
+# Session s1: Start explicit transaction and modify data
+--session s1
+BEGIN;
+UPDATE txn_test SET val = 'modified_by_s1' WHERE id = 1;
+
+# Session s2 (autocommit): Should see original value, not modified
+--session s2
+SELECT val FROM txn_test WHERE id = 1;
+
+# Session s1: Rollback the changes
+--session s1
+ROLLBACK;
+
+# Session s2: Should still see original value
+--session s2
+SELECT val FROM txn_test WHERE id = 1;
+
+# Now test with commit - s2 should see committed value
+--session s1
+BEGIN;
+UPDATE txn_test SET val = 'committed_by_s1' WHERE id = 1;
+COMMIT;
+
+# Session s2: Should now see committed value
+--session s2
+SELECT val FROM txn_test WHERE id = 1;
+
+# Cleanup
+DROP TABLE txn_test;

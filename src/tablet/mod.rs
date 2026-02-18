@@ -27,8 +27,8 @@
 //! ```ignore
 //! // CORRECT: Use TxnService for reads
 //! let ctx = txn_service.begin(true)?;  // read-only transaction
-//! let value = txn_service.get(&ctx, key)?;
-//! let iter = txn_service.scan_iter(&ctx, range)?;
+//! let value = txn_service.get(&ctx, table_id, key)?;
+//! let iter = txn_service.scan_iter(&ctx, table_id, range)?;
 //!
 //! // WRONG: Direct storage access bypasses MVCC and buffered writes
 //! let value = storage.get(key)?;  // DON'T DO THIS
@@ -109,9 +109,7 @@ pub use commit_reservations::{
 pub use lsm::{LevelStats, LsmEngine, LsmStats, TabletEngine, TieredMergeIterator};
 pub use manager::{derive_tablet_inventory, TabletManager};
 pub use routed_storage::RoutedTabletStorage;
-pub use router::{
-    is_system_table_id, route_index_to_tablet, route_key_to_tablet, route_table_to_tablet, TabletId,
-};
+pub use router::{is_system_table_id, route_index_to_tablet, route_table_to_tablet, TabletId};
 
 // Re-export flush scheduler
 pub use flush_scheduler::FlushScheduler;

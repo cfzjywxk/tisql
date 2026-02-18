@@ -109,6 +109,7 @@ pub mod testkit {
 
     // Test helper extension trait for TransactionService
     use crate::clog::ClogService;
+    use crate::inner_table::core_tables::ALL_META_TABLE_ID;
     use crate::tablet::PessimisticStorage;
     use crate::transaction::{CommitInfo, TxnService};
     use crate::tso::TsoService;
@@ -140,7 +141,10 @@ pub mod testkit {
     {
         async fn autocommit_put(&self, key: &[u8], value: &[u8]) -> Result<CommitInfo> {
             let mut ctx = self.begin(false)?;
-            match self.put(&mut ctx, key.to_vec(), value.to_vec()).await {
+            match self
+                .put(&mut ctx, ALL_META_TABLE_ID, key.to_vec(), value.to_vec())
+                .await
+            {
                 Ok(()) => self.commit(ctx).await,
                 Err(e) => {
                     let _ = self.rollback(ctx);
@@ -151,7 +155,7 @@ pub mod testkit {
 
         async fn autocommit_delete(&self, key: &[u8]) -> Result<CommitInfo> {
             let mut ctx = self.begin(false)?;
-            match self.delete(&mut ctx, key.to_vec()).await {
+            match self.delete(&mut ctx, ALL_META_TABLE_ID, key.to_vec()).await {
                 Ok(()) => self.commit(ctx).await,
                 Err(e) => {
                     let _ = self.rollback(ctx);
@@ -169,8 +173,8 @@ use clog::{FileClogService, TruncateStats};
 use executor::{ExecutionOutput, ExecutionResult, Executor, SimpleExecutor};
 use sql::Parser;
 use tablet::{
-    CompactionScheduler, FlushScheduler, IlogService, IlogTruncateStats, LsmEngine, LsmRecovery,
-    RoutedTabletStorage, TabletManager,
+    IlogService, IlogTruncateStats, LsmEngine, LsmRecovery, RoutedTabletStorage, TabletId,
+    TabletManager,
 };
 use transaction::{ConcurrencyManager, TransactionService};
 use tso::LocalTso;
@@ -253,13 +257,8 @@ pub struct Database {
     ilog: Arc<IlogService>,
     /// LSM storage engine (kept for flush on shutdown)
     storage: Arc<LsmEngine>,
-    /// Tablet lifecycle manager (phase-2 scaffold: mounted system tablet + inventory dirs).
+    /// Tablet lifecycle manager (phase-4: per-tablet manifest + background workers).
     tablet_manager: Arc<TabletManager>,
-    /// Background flush scheduler (Drop stops the worker)
-    /// Declared before compaction_scheduler so it's dropped first (Rust drops in declaration order).
-    flush_scheduler: FlushScheduler,
-    /// Background compaction scheduler (Drop stops the worker)
-    compaction_scheduler: CompactionScheduler,
     /// Background GC worker for drop-table data cleanup (Drop stops the worker)
     gc_worker: inner_table::gc_worker::GcWorker<DbTxnService>,
     /// Dedicated worker runtime for query execution (separate from protocol I/O).
@@ -271,6 +270,49 @@ pub struct Database {
     io_runtime: Option<tokio::runtime::Runtime>,
     /// Registry of active explicit transactions for GC safe point computation.
     session_registry: Arc<session::SessionRegistry>,
+}
+
+fn drop_runtime_safely(runtime: tokio::runtime::Runtime) {
+    if tokio::runtime::Handle::try_current().is_ok() {
+        std::thread::spawn(move || {
+            drop(runtime);
+        });
+    } else {
+        drop(runtime);
+    }
+}
+
+struct OpenRuntimeGuard {
+    runtime: Option<tokio::runtime::Runtime>,
+}
+
+impl OpenRuntimeGuard {
+    fn new(runtime: tokio::runtime::Runtime) -> Self {
+        Self {
+            runtime: Some(runtime),
+        }
+    }
+
+    fn handle(&self) -> &tokio::runtime::Handle {
+        self.runtime
+            .as_ref()
+            .expect("runtime guard must hold runtime")
+            .handle()
+    }
+
+    fn into_inner(mut self) -> tokio::runtime::Runtime {
+        self.runtime
+            .take()
+            .expect("runtime guard must hold runtime")
+    }
+}
+
+impl Drop for OpenRuntimeGuard {
+    fn drop(&mut self) {
+        if let Some(runtime) = self.runtime.take() {
+            drop_runtime_safely(runtime);
+        }
+    }
 }
 
 /// One-shot log GC statistics.
@@ -301,78 +343,75 @@ impl Database {
         log_info!("Opening TiSQL database at {:?}", config.data_dir);
 
         // 1. Create I/O runtime FIRST — recovery needs it for GroupCommitWriter + IoService
-        let io_runtime = tokio::runtime::Builder::new_multi_thread()
-            .worker_threads(2)
-            .thread_name("tisql-io")
-            .enable_all()
-            .build()
-            .map_err(|e| {
-                crate::util::error::TiSqlError::Internal(format!(
-                    "Failed to create I/O runtime: {e}"
-                ))
-            })?;
+        let io_runtime = OpenRuntimeGuard::new(
+            tokio::runtime::Builder::new_multi_thread()
+                .worker_threads(2)
+                .thread_name("tisql-io")
+                .enable_all()
+                .build()
+                .map_err(|e| {
+                    crate::util::error::TiSqlError::Internal(format!(
+                        "Failed to create I/O runtime: {e}"
+                    ))
+                })?,
+        );
 
         log_info!("I/O runtime created with 2 threads");
 
-        // 2. Recovery uses io_runtime handle for GroupCommitWriter + IoService
-        let recovery = LsmRecovery::new(&config.data_dir);
-        let recovery_result = recovery.recover(io_runtime.handle())?;
+        // 2. Staged recovery bootstrap (system ilog + raw clog, no replay yet).
+        let mut recovery =
+            LsmRecovery::new(&config.data_dir).recover_bootstrap(io_runtime.handle())?;
 
-        log_info!(
-            "LSM recovery complete: {} clog entries replayed, {} txns, flushed_lsn={}, max_commit_ts={}",
-            recovery_result.stats.clog_entries,
-            recovery_result.stats.txn_count,
-            recovery_result.stats.flushed_lsn,
-            recovery_result.stats.max_commit_ts
-        );
-
-        // Wrap storage in Arc
-        let storage = Arc::new(recovery_result.engine);
+        // Wrap recovered system tablet in manager first.
+        let storage = Arc::new(recovery.engine);
         let tablet_manager = Arc::new(TabletManager::new(
             &config.data_dir,
-            Arc::clone(&recovery_result.lsn_provider),
+            Arc::clone(&recovery.lsn_provider),
             Arc::clone(&storage),
         )?);
 
-        // 3. Create background runtime for flush, compaction, GC
-        let bg_runtime = tokio::runtime::Builder::new_multi_thread()
-            .worker_threads(2)
-            .thread_name("tisql-bg")
-            .enable_all()
-            .build()
-            .map_err(|e| {
-                crate::util::error::TiSqlError::Internal(format!(
-                    "Failed to create background runtime: {e}"
-                ))
-            })?;
+        // Recover previously-mounted non-system tablets from disk before TSO init,
+        // so startup max_commit_ts accounts for their SST metadata too.
+        let mut mounted_recovered = 0usize;
+        let mut max_commit_ts = recovery.stats.max_commit_ts;
+        let recovered_dirs = tablet_manager.discover_existing_tablet_dirs_for_recovery()?;
+        for tablet_id in recovered_dirs {
+            if tablet_id == TabletId::System {
+                continue;
+            }
+            if !tablet_manager.has_persisted_tablet_state(tablet_id)? {
+                continue;
+            }
+            let recovered = LsmRecovery::recover_tablet(
+                &tablet_manager.tablet_dir(tablet_id),
+                Arc::clone(&recovery.lsn_provider),
+                Arc::clone(&recovery.io_service),
+                io_runtime.handle(),
+            )?;
+            max_commit_ts = max_commit_ts.max(recovered.max_ts_from_ssts);
+            recovery.stats.orphan_ssts_cleaned += recovered.orphan_ssts_cleaned;
+            tablet_manager.insert_tablet(tablet_id, Arc::new(recovered.engine))?;
+            mounted_recovered += 1;
+        }
 
-        log_info!("Background runtime created with 2 threads");
+        // Stage-A replay: system-only transactions first, so catalog state is
+        // up-to-date before catalog-derived inventory registration.
+        let system_replay = LsmRecovery::replay_clog_to_tablets(
+            tablet_manager.as_ref(),
+            &recovery.clog_entries,
+            false,
+        )?;
+        max_commit_ts = max_commit_ts.max(system_replay.max_commit_ts);
 
-        storage.start_manifest_writer(bg_runtime.handle())?;
+        // Create TSO/concurrency services using conservative recovered max ts.
+        let tso = Arc::new(LocalTso::new(max_commit_ts + 1));
+        let concurrency_manager = Arc::new(ConcurrencyManager::new(max_commit_ts));
 
-        // Start background flush scheduler on bg runtime
-        let flush_scheduler = FlushScheduler::new(Arc::clone(&storage));
-        flush_scheduler.start(bg_runtime.handle());
-
-        // Start background compaction scheduler on bg runtime
-        let compaction_scheduler = CompactionScheduler::new(Arc::clone(&storage));
-        compaction_scheduler.start(bg_runtime.handle());
-
-        // Wire: flush completion → notify compaction scheduler
-        storage.set_compaction_notify(compaction_scheduler.notifier());
-
-        // Create TSO service, starting from recovered max_commit_ts + 1
-        let tso = Arc::new(LocalTso::new(recovery_result.stats.max_commit_ts + 1));
-
-        // Create concurrency manager with recovered max_ts
-        let concurrency_manager =
-            Arc::new(ConcurrencyManager::new(recovery_result.stats.max_commit_ts));
-
-        // Create transaction service with recovered components
+        // Create transaction service with recovered shared clog.
         let routed_storage = Arc::new(RoutedTabletStorage::new(Arc::clone(&tablet_manager)));
         let txn_service = Arc::new(TransactionService::new(
             Arc::clone(&routed_storage),
-            recovery_result.clog,
+            Arc::clone(&recovery.clog),
             Arc::clone(&tso),
             Arc::clone(&concurrency_manager),
         ));
@@ -390,20 +429,78 @@ impl Database {
         }
 
         // Build desired tablet inventory from catalog metadata.
-        //
-        // Phase-2 behavior remains single-tablet equivalent (only system tablet
-        // is mounted), but we pre-create canonical tablet directories for user
-        // tables/indexes discovered from catalog state.
         {
             use inner_table::catalog_loader::load_catalog;
             let (cache, _) = load_catalog(txn_service.as_ref())?;
             let discovered = tablet_manager.register_catalog_inventory(&cache)?;
             log_info!(
-                "Tablet inventory prepared: mounted={}, desired={}",
+                "Tablet inventory prepared: mounted={}, desired={}, recovered_non_system={}",
                 tablet_manager.all_tablets().len(),
-                discovered.len()
+                discovered.len(),
+                mounted_recovered
             );
+            let mounted: std::collections::BTreeSet<_> = tablet_manager
+                .all_tablets()
+                .into_iter()
+                .map(|(tablet_id, _)| tablet_id)
+                .collect();
+            let unmounted_non_system: Vec<_> = tablet_manager
+                .desired_tablets()
+                .into_iter()
+                .filter(|tablet_id| *tablet_id != TabletId::System && !mounted.contains(tablet_id))
+                .collect();
+            if !unmounted_non_system.is_empty() {
+                let sample: Vec<_> = unmounted_non_system.iter().copied().take(8).collect();
+                log_warn!(
+                    "Phase-4 startup: {} desired non-system tablets have no mounted local state yet; non-system replay conservatively falls back to system tablet for historical keys (sample={:?})",
+                    unmounted_non_system.len(),
+                    sample
+                );
+            }
         }
+
+        // Stage-B replay: transactions touching non-system keyspace.
+        let tablet_replay = LsmRecovery::replay_clog_to_tablets(
+            tablet_manager.as_ref(),
+            &recovery.clog_entries,
+            true,
+        )?;
+        max_commit_ts = max_commit_ts.max(tablet_replay.max_commit_ts);
+
+        let total_txn_replayed = system_replay.txn_count + tablet_replay.txn_count;
+        recovery.stats.clog_entries = recovery.clog_entries.len();
+        recovery.stats.txn_count = total_txn_replayed;
+        recovery.stats.max_commit_ts = max_commit_ts;
+        recovery.stats.final_lsn = recovery.lsn_provider.current_lsn();
+
+        // Keep runtime TSO/visibility guards aligned with final recovered max.
+        tso.set_ts(max_commit_ts + 1);
+        concurrency_manager.update_max_ts(max_commit_ts);
+
+        log_info!(
+            "LSM recovery complete: {} clog entries loaded, {} txns replayed, flushed_lsn={}, max_commit_ts={}",
+            recovery.stats.clog_entries,
+            recovery.stats.txn_count,
+            recovery.stats.flushed_lsn,
+            recovery.stats.max_commit_ts
+        );
+
+        // 3. Create background runtime for per-tablet flush/compaction/GC.
+        let bg_runtime = OpenRuntimeGuard::new(
+            tokio::runtime::Builder::new_multi_thread()
+                .worker_threads(2)
+                .thread_name("tisql-bg")
+                .enable_all()
+                .build()
+                .map_err(|e| {
+                    crate::util::error::TiSqlError::Internal(format!(
+                        "Failed to create background runtime: {e}"
+                    ))
+                })?,
+        );
+
+        log_info!("Background runtime created with 2 threads");
+        tablet_manager.bind_background_runtime(bg_runtime.handle())?;
 
         // Load pending GC tasks from inner tables and register with storage engine
         {
@@ -446,16 +543,18 @@ impl Database {
         let worker_threads = std::thread::available_parallelism()
             .map(|n| n.get())
             .unwrap_or(4);
-        let worker_runtime = tokio::runtime::Builder::new_multi_thread()
-            .worker_threads(worker_threads)
-            .thread_name("tisql-worker")
-            .enable_all()
-            .build()
-            .map_err(|e| {
-                crate::util::error::TiSqlError::Internal(format!(
-                    "Failed to create worker runtime: {e}"
-                ))
-            })?;
+        let worker_runtime = OpenRuntimeGuard::new(
+            tokio::runtime::Builder::new_multi_thread()
+                .worker_threads(worker_threads)
+                .thread_name("tisql-worker")
+                .enable_all()
+                .build()
+                .map_err(|e| {
+                    crate::util::error::TiSqlError::Internal(format!(
+                        "Failed to create worker runtime: {e}"
+                    ))
+                })?,
+        );
 
         log_info!("Worker runtime created with {} threads", worker_threads);
 
@@ -483,15 +582,13 @@ impl Database {
             executor: SimpleExecutor::new(),
             txn_service,
             catalog,
-            ilog: recovery_result.ilog,
+            ilog: recovery.ilog,
             storage,
             tablet_manager,
-            flush_scheduler,
-            compaction_scheduler,
             gc_worker,
-            worker_runtime: Some(worker_runtime),
-            bg_runtime: Some(bg_runtime),
-            io_runtime: Some(io_runtime),
+            worker_runtime: Some(worker_runtime.into_inner()),
+            bg_runtime: Some(bg_runtime.into_inner()),
+            io_runtime: Some(io_runtime.into_inner()),
             session_registry,
         })
     }
@@ -648,6 +745,12 @@ impl Database {
     /// newer (unflushed) memtable. Using `flushed_lsn` alone would risk deleting
     /// clog entries that are still only in volatile memory.
     pub async fn run_log_gc_once(&self) -> Result<LogGcStats> {
+        if !self.tablet_manager.has_only_system_tablet_mounted() {
+            return Err(crate::util::error::TiSqlError::Storage(
+                "run_log_gc_once currently supports only the system tablet; refusing GC with mounted non-system tablets".into(),
+            ));
+        }
+
         #[cfg(feature = "failpoints")]
         fail_point!("log_gc_before_checkpoint");
 
@@ -755,21 +858,21 @@ impl Database {
     pub async fn close(&self) -> Result<()> {
         // Stop background workers first so no new manifest edits are submitted.
         self.gc_worker.stop();
-        self.flush_scheduler.stop();
-        self.compaction_scheduler.stop();
+        self.tablet_manager.stop_background_workers();
 
         // Flush any pending memtable data to SSTs
-        if let Err(e) = self.storage.flush_all_with_active() {
+        if let Err(e) = self.tablet_manager.flush_all_with_active() {
             log_warn!("Error flushing memtables on close: {}", e);
         }
 
         // Drain/stop manifest writer before closing ilog.
-        self.storage.shutdown_manifest_writer();
+        self.tablet_manager.shutdown_manifest_writers();
 
         // Close commit log
         self.txn_service.clog_service().close().await?;
 
-        // Close ilog
+        // Close mounted user-tablet ilogs first, then the shared system ilog.
+        self.tablet_manager.close_non_system_tablet_ilogs()?;
         self.ilog.close()?;
 
         log_info!("Database closed");
@@ -781,17 +884,17 @@ impl Drop for Database {
     fn drop(&mut self) {
         // 1. Stop background schedulers and GC worker
         self.gc_worker.stop();
-        self.flush_scheduler.stop();
-        self.compaction_scheduler.stop();
+        self.tablet_manager.stop_background_workers();
 
         // 2. Final flush (needs I/O runtime — ilog writes go through group commit)
-        let _ = self.storage.flush_all_with_active();
+        let _ = self.tablet_manager.flush_all_with_active();
 
         // 3. Drain/stop manifest writer before ilog close.
-        self.storage.shutdown_manifest_writer();
+        self.tablet_manager.shutdown_manifest_writers();
 
         // 4. Close clog + ilog (sync pending writes)
         let _ = crate::io::block_on_sync(self.txn_service.clog_service().close());
+        let _ = self.tablet_manager.close_non_system_tablet_ilogs();
         let _ = self.ilog.close();
 
         // 5. Shutdown all spawn_blocking task channels BEFORE dropping io_runtime.
@@ -801,6 +904,7 @@ impl Drop for Database {
         // causes recv() to return Err, exiting the loops. Without this,
         // io_runtime.drop() blocks forever waiting for those tasks.
         self.txn_service.clog_service().shutdown();
+        self.tablet_manager.shutdown_non_system_tablet_ilogs();
         self.ilog.shutdown();
         self.storage.io_service().shutdown();
 
@@ -942,7 +1046,8 @@ mod tests {
         ALL_SCHEMA_TABLE_ID, ALL_TABLE_TABLE_ID, USER_TABLE_ID_START,
     };
     use crate::tablet::{
-        encode_key, encode_pk, LsmConfig, MvccIterator, MvccKey, TabletEngine, TabletId,
+        encode_key, encode_pk, is_tombstone, IlogConfig, IlogService, LsmConfig, MvccIterator,
+        MvccKey, TabletEngine, TabletId, Version,
     };
     use tempfile::tempdir;
     use tokio::time::{sleep, Duration};
@@ -988,6 +1093,165 @@ mod tests {
             iter.advance().await.unwrap();
             iter.valid()
         })
+    }
+
+    fn tablet_get_value(tablet: &TabletEngine, key: &[u8]) -> Option<Vec<u8>> {
+        let start = MvccKey::encode(key, u64::MAX);
+        let end = MvccKey::encode(key, 0)
+            .next_key()
+            .unwrap_or_else(MvccKey::unbounded);
+        let range = start..end;
+        let mut iter = tablet.scan_iter(range, 0).unwrap();
+        crate::io::block_on_sync(async {
+            iter.advance().await.unwrap();
+            while iter.valid() {
+                if iter.user_key() == key {
+                    if is_tombstone(iter.value()) {
+                        return None;
+                    }
+                    return Some(iter.value().to_vec());
+                }
+                iter.advance().await.unwrap();
+            }
+            None
+        })
+    }
+
+    async fn prepare_phase4_two_tablet_recovery_case(
+        dir: &std::path::Path,
+        flush_table1: bool,
+        flush_table2: bool,
+    ) -> (u64, u64, Vec<u8>, Vec<u8>, Vec<u8>, Vec<u8>, u64) {
+        use crate::clog::{
+            ClogBatch, ClogEntry, ClogOp, ClogService, FileClogConfig, FileClogService,
+        };
+        use crate::lsn::new_lsn_provider;
+
+        let io = crate::io::IoService::new_for_test(64).unwrap();
+        let lsn_provider = new_lsn_provider();
+
+        let system_dir = dir.join("tablets").join("system");
+        std::fs::create_dir_all(&system_dir).unwrap();
+        let system_ilog = Arc::new(
+            IlogService::open(
+                IlogConfig::new(&system_dir),
+                Arc::clone(&lsn_provider),
+                Arc::clone(&io),
+                &tokio::runtime::Handle::current(),
+            )
+            .unwrap(),
+        );
+        let system_tablet = Arc::new(
+            TabletEngine::open_with_recovery(
+                LsmConfig::new(&system_dir),
+                Arc::clone(&lsn_provider),
+                Arc::clone(&system_ilog),
+                Version::new(),
+                Arc::clone(&io),
+            )
+            .unwrap(),
+        );
+
+        let manager =
+            TabletManager::new(dir, Arc::clone(&lsn_provider), Arc::clone(&system_tablet)).unwrap();
+
+        let table1_id = USER_TABLE_ID_START + 410;
+        let table2_id = USER_TABLE_ID_START + 411;
+        let tablet1_id = TabletId::Table {
+            table_id: table1_id,
+        };
+        let tablet2_id = TabletId::Table {
+            table_id: table2_id,
+        };
+
+        for tablet_id in [tablet1_id, tablet2_id] {
+            let tablet_dir = manager.tablet_dir(tablet_id);
+            let ilog = Arc::new(
+                IlogService::open(
+                    IlogConfig::new(&tablet_dir),
+                    Arc::clone(&lsn_provider),
+                    Arc::clone(&io),
+                    &tokio::runtime::Handle::current(),
+                )
+                .unwrap(),
+            );
+            let tablet = Arc::new(
+                TabletEngine::open_with_recovery(
+                    LsmConfig::new(&tablet_dir),
+                    Arc::clone(&lsn_provider),
+                    ilog,
+                    Version::new(),
+                    Arc::clone(&io),
+                )
+                .unwrap(),
+            );
+            manager.insert_tablet(tablet_id, tablet).unwrap();
+        }
+
+        let key1 = table_int_pk_key(table1_id, 1);
+        let key2 = table_int_pk_key(table2_id, 1);
+        let val1 = b"phase4_v1".to_vec();
+        let val2 = b"phase4_v2".to_vec();
+
+        let clog = FileClogService::open_with_lsn_provider(
+            FileClogConfig::with_dir(dir),
+            Arc::clone(&lsn_provider),
+            Arc::clone(&io),
+            &tokio::runtime::Handle::current(),
+        )
+        .unwrap();
+
+        let mut clog_batch = ClogBatch::new();
+        clog_batch.add(ClogEntry {
+            lsn: 0,
+            txn_id: 9001,
+            op: ClogOp::Put {
+                key: key1.clone(),
+                value: val1.clone(),
+            },
+        });
+        clog_batch.add(ClogEntry {
+            lsn: 0,
+            txn_id: 9001,
+            op: ClogOp::Put {
+                key: key2.clone(),
+                value: val2.clone(),
+            },
+        });
+        clog_batch.add(ClogEntry {
+            lsn: 0,
+            txn_id: 9001,
+            op: ClogOp::Commit { commit_ts: 9001 },
+        });
+        let commit_lsn = clog.write(&mut clog_batch, true).unwrap().await.unwrap();
+
+        let tablet1 = manager.get_tablet(tablet1_id).unwrap();
+        let tablet2 = manager.get_tablet(tablet2_id).unwrap();
+
+        let mut wb1 = crate::tablet::WriteBatch::new();
+        wb1.set_commit_ts(9001);
+        wb1.set_clog_lsn(commit_lsn);
+        wb1.put(key1.clone(), val1.clone());
+        tablet1.write_batch(wb1).unwrap();
+
+        let mut wb2 = crate::tablet::WriteBatch::new();
+        wb2.set_commit_ts(9001);
+        wb2.set_clog_lsn(commit_lsn);
+        wb2.put(key2.clone(), val2.clone());
+        tablet2.write_batch(wb2).unwrap();
+
+        if flush_table1 {
+            tablet1.flush_all_with_active().unwrap();
+        }
+        if flush_table2 {
+            tablet2.flush_all_with_active().unwrap();
+        }
+
+        clog.close().await.unwrap();
+        clog.shutdown();
+        io.shutdown();
+
+        (table1_id, table2_id, key1, val1, key2, val2, commit_lsn)
     }
 
     #[tokio::test]
@@ -1547,11 +1811,11 @@ mod tests {
 
         let mut writer = db.txn_service.begin_explicit(false).unwrap();
         db.txn_service
-            .put_on_table(&mut writer, table1, key1.clone(), b"v1".to_vec())
+            .put(&mut writer, table1, key1.clone(), b"v1".to_vec())
             .await
             .unwrap();
         db.txn_service
-            .put_on_table(&mut writer, table2, key2.clone(), b"v2".to_vec())
+            .put(&mut writer, table2, key2.clone(), b"v2".to_vec())
             .await
             .unwrap();
 
@@ -1560,14 +1824,14 @@ mod tests {
 
         assert_eq!(
             db.txn_service
-                .get_on_table(&reader_before, table1, &key1)
+                .get(&reader_before, table1, &key1)
                 .await
                 .unwrap(),
             None
         );
         assert_eq!(
             db.txn_service
-                .get_on_table(&reader_before, table2, &key2)
+                .get(&reader_before, table2, &key2)
                 .await
                 .unwrap(),
             None
@@ -1576,14 +1840,14 @@ mod tests {
         let reader_after = db.txn_service.begin(true).unwrap();
         assert_eq!(
             db.txn_service
-                .get_on_table(&reader_after, table1, &key1)
+                .get(&reader_after, table1, &key1)
                 .await
                 .unwrap(),
             Some(b"v1".to_vec())
         );
         assert_eq!(
             db.txn_service
-                .get_on_table(&reader_after, table2, &key2)
+                .get(&reader_after, table2, &key2)
                 .await
                 .unwrap(),
             Some(b"v2".to_vec())
@@ -1612,20 +1876,20 @@ mod tests {
 
         let mut txn1 = db.txn_service.begin_explicit(false).unwrap();
         db.txn_service
-            .put_on_table(&mut txn1, table1, key1.clone(), b"owner1".to_vec())
+            .put(&mut txn1, table1, key1.clone(), b"owner1".to_vec())
             .await
             .unwrap();
 
         let mut txn2 = db.txn_service.begin_explicit(false).unwrap();
         db.txn_service
-            .put_on_table(&mut txn2, table2, key2.clone(), b"owner2".to_vec())
+            .put(&mut txn2, table2, key2.clone(), b"owner2".to_vec())
             .await
             .unwrap();
 
         let mut txn3 = db.txn_service.begin_explicit(false).unwrap();
         let conflict = db
             .txn_service
-            .put_on_table(&mut txn3, table1, key1.clone(), b"conflict".to_vec())
+            .put(&mut txn3, table1, key1.clone(), b"conflict".to_vec())
             .await;
         assert!(matches!(
             conflict,
@@ -1663,11 +1927,11 @@ mod tests {
 
         let mut ctx = db.txn_service.begin_explicit(false).unwrap();
         db.txn_service
-            .put_on_table(&mut ctx, table1, key1.clone(), b"t1_val".to_vec())
+            .put(&mut ctx, table1, key1.clone(), b"t1_val".to_vec())
             .await
             .unwrap();
         db.txn_service
-            .put_on_table(&mut ctx, table2, key2.clone(), b"t2_val".to_vec())
+            .put(&mut ctx, table2, key2.clone(), b"t2_val".to_vec())
             .await
             .unwrap();
         db.txn_service.commit(ctx).await.unwrap();
@@ -1675,17 +1939,11 @@ mod tests {
         // Both values visible to a new reader
         let reader = db.txn_service.begin(true).unwrap();
         assert_eq!(
-            db.txn_service
-                .get_on_table(&reader, table1, &key1)
-                .await
-                .unwrap(),
+            db.txn_service.get(&reader, table1, &key1).await.unwrap(),
             Some(b"t1_val".to_vec())
         );
         assert_eq!(
-            db.txn_service
-                .get_on_table(&reader, table2, &key2)
-                .await
-                .unwrap(),
+            db.txn_service.get(&reader, table2, &key2).await.unwrap(),
             Some(b"t2_val".to_vec())
         );
 
@@ -1729,11 +1987,11 @@ mod tests {
 
         let mut ctx = db.txn_service.begin_explicit(false).unwrap();
         db.txn_service
-            .put_on_table(&mut ctx, table1, key1.clone(), b"rb_v1".to_vec())
+            .put(&mut ctx, table1, key1.clone(), b"rb_v1".to_vec())
             .await
             .unwrap();
         db.txn_service
-            .put_on_table(&mut ctx, table2, key2.clone(), b"rb_v2".to_vec())
+            .put(&mut ctx, table2, key2.clone(), b"rb_v2".to_vec())
             .await
             .unwrap();
         db.txn_service.rollback(ctx).unwrap();
@@ -1741,18 +1999,12 @@ mod tests {
         // Neither value visible to new reader
         let reader = db.txn_service.begin(true).unwrap();
         assert_eq!(
-            db.txn_service
-                .get_on_table(&reader, table1, &key1)
-                .await
-                .unwrap(),
+            db.txn_service.get(&reader, table1, &key1).await.unwrap(),
             None,
             "rolled-back key on tablet1 should not be visible"
         );
         assert_eq!(
-            db.txn_service
-                .get_on_table(&reader, table2, &key2)
-                .await
-                .unwrap(),
+            db.txn_service.get(&reader, table2, &key2).await.unwrap(),
             None,
             "rolled-back key on tablet2 should not be visible"
         );
@@ -1794,25 +2046,17 @@ mod tests {
 
         let mut ctx = db.txn_service.begin_explicit(false).unwrap();
         db.txn_service
-            .put_on_table(&mut ctx, table1, key1.clone(), b"ryw_v1".to_vec())
+            .put(&mut ctx, table1, key1.clone(), b"ryw_v1".to_vec())
             .await
             .unwrap();
         db.txn_service
-            .put_on_table(&mut ctx, table2, key2.clone(), b"ryw_v2".to_vec())
+            .put(&mut ctx, table2, key2.clone(), b"ryw_v2".to_vec())
             .await
             .unwrap();
 
         // Read own writes BEFORE commit — should see pending data
-        let val1 = db
-            .txn_service
-            .get_on_table(&ctx, table1, &key1)
-            .await
-            .unwrap();
-        let val2 = db
-            .txn_service
-            .get_on_table(&ctx, table2, &key2)
-            .await
-            .unwrap();
+        let val1 = db.txn_service.get(&ctx, table1, &key1).await.unwrap();
+        let val2 = db.txn_service.get(&ctx, table2, &key2).await.unwrap();
 
         assert_eq!(
             val1,
@@ -1853,11 +2097,11 @@ mod tests {
         // Writer txn
         let mut writer = db.txn_service.begin_explicit(false).unwrap();
         db.txn_service
-            .put_on_table(&mut writer, table1, key1.clone(), b"si_v1".to_vec())
+            .put(&mut writer, table1, key1.clone(), b"si_v1".to_vec())
             .await
             .unwrap();
         db.txn_service
-            .put_on_table(&mut writer, table2, key2.clone(), b"si_v2".to_vec())
+            .put(&mut writer, table2, key2.clone(), b"si_v2".to_vec())
             .await
             .unwrap();
 
@@ -1869,7 +2113,7 @@ mod tests {
         // Reader-before sees neither (snapshot isolation)
         assert_eq!(
             db.txn_service
-                .get_on_table(&reader_before, table1, &key1)
+                .get(&reader_before, table1, &key1)
                 .await
                 .unwrap(),
             None,
@@ -1877,7 +2121,7 @@ mod tests {
         );
         assert_eq!(
             db.txn_service
-                .get_on_table(&reader_before, table2, &key2)
+                .get(&reader_before, table2, &key2)
                 .await
                 .unwrap(),
             None,
@@ -1888,14 +2132,14 @@ mod tests {
         let reader_after = db.txn_service.begin(true).unwrap();
         assert_eq!(
             db.txn_service
-                .get_on_table(&reader_after, table1, &key1)
+                .get(&reader_after, table1, &key1)
                 .await
                 .unwrap(),
             Some(b"si_v1".to_vec()),
         );
         assert_eq!(
             db.txn_service
-                .get_on_table(&reader_after, table2, &key2)
+                .get(&reader_after, table2, &key2)
                 .await
                 .unwrap(),
             Some(b"si_v2".to_vec()),
@@ -1926,11 +2170,11 @@ mod tests {
 
         let mut ctx = db.txn_service.begin_explicit(false).unwrap();
         db.txn_service
-            .put_on_table(&mut ctx, table1, key1.clone(), b"lsn_v1".to_vec())
+            .put(&mut ctx, table1, key1.clone(), b"lsn_v1".to_vec())
             .await
             .unwrap();
         db.txn_service
-            .put_on_table(&mut ctx, table2, key2.clone(), b"lsn_v2".to_vec())
+            .put(&mut ctx, table2, key2.clone(), b"lsn_v2".to_vec())
             .await
             .unwrap();
         let info = db.txn_service.commit(ctx).await.unwrap();
@@ -1995,11 +2239,11 @@ mod tests {
 
         let mut ctx = db.txn_service.begin_explicit(false).unwrap();
         db.txn_service
-            .put_on_table(&mut ctx, table1, key1, b"r_v1".to_vec())
+            .put(&mut ctx, table1, key1, b"r_v1".to_vec())
             .await
             .unwrap();
         db.txn_service
-            .put_on_table(&mut ctx, table2, key2, b"r_v2".to_vec())
+            .put(&mut ctx, table2, key2, b"r_v2".to_vec())
             .await
             .unwrap();
         db.txn_service.commit(ctx).await.unwrap();
@@ -2021,8 +2265,8 @@ mod tests {
         );
     }
 
-    /// T3.5 (QA): mutation_tablets properly records tablet routing from put_on_table.
-    /// After writes via put_on_table, the commit path should use grouped operations.
+    /// T3.5 (QA): mutation_tablets properly records tablet routing from metadata-first put.
+    /// After writes via put, the commit path should use grouped operations.
     #[tokio::test]
     async fn test_qa_phase3_mutation_tablets_recording() {
         let dir = tempdir().unwrap();
@@ -2048,15 +2292,15 @@ mod tests {
 
         let mut ctx = db.txn_service.begin_explicit(false).unwrap();
         db.txn_service
-            .put_on_table(&mut ctx, table1, key1.clone(), b"mv1".to_vec())
+            .put(&mut ctx, table1, key1.clone(), b"mv1".to_vec())
             .await
             .unwrap();
         db.txn_service
-            .put_on_table(&mut ctx, table1, key1b.clone(), b"mv1b".to_vec())
+            .put(&mut ctx, table1, key1b.clone(), b"mv1b".to_vec())
             .await
             .unwrap();
         db.txn_service
-            .put_on_table(&mut ctx, table2, key2.clone(), b"mv2".to_vec())
+            .put(&mut ctx, table2, key2.clone(), b"mv2".to_vec())
             .await
             .unwrap();
 
@@ -2139,6 +2383,169 @@ mod tests {
         assert!(tablet_has_table_entries(&tablet_b, table_b));
         assert!(!tablet_has_table_entries(&tablet_a, table_b));
         assert!(!tablet_has_table_entries(&tablet_b, table_a));
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn test_phase4_recovery_one_flushed_one_unflushed_routes_to_correct_tablets() {
+        let dir = tempdir().unwrap();
+        let config = DatabaseConfig::with_data_dir(dir.path());
+        let (table1, table2, key1, val1, key2, val2, commit_lsn) =
+            prepare_phase4_two_tablet_recovery_case(dir.path(), true, false).await;
+
+        let db = Database::open(config).unwrap();
+        let tablet1 = db
+            .tablet_manager()
+            .get_tablet(TabletId::Table { table_id: table1 })
+            .expect("tablet1 should recover from per-tablet ilog");
+        let tablet2 = db
+            .tablet_manager()
+            .get_tablet(TabletId::Table { table_id: table2 })
+            .expect("tablet2 should be mounted for clog replay");
+        let system = db.tablet_manager().system_tablet();
+
+        assert_eq!(tablet_get_value(&tablet1, &key1), Some(val1));
+        assert_eq!(
+            tablet_get_value(&tablet2, &key2),
+            Some(val2),
+            "system_value={:?}",
+            tablet_get_value(&system, &key2),
+        );
+        assert!(!tablet_has_table_entries(&system, table1));
+        assert!(!tablet_has_table_entries(&system, table2));
+        let _ = commit_lsn;
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn test_phase4_recovery_two_tablets_after_flush() {
+        let dir = tempdir().unwrap();
+        let config = DatabaseConfig::with_data_dir(dir.path());
+        let (table1, table2, key1, val1, key2, val2, _) =
+            prepare_phase4_two_tablet_recovery_case(dir.path(), true, true).await;
+
+        let db = Database::open(config).unwrap();
+        let tablet1 = db
+            .tablet_manager()
+            .get_tablet(TabletId::Table { table_id: table1 })
+            .expect("tablet1 should recover from per-tablet ilog");
+        let tablet2 = db
+            .tablet_manager()
+            .get_tablet(TabletId::Table { table_id: table2 })
+            .expect("tablet2 should recover from per-tablet ilog");
+        let system = db.tablet_manager().system_tablet();
+
+        assert_eq!(tablet_get_value(&tablet1, &key1), Some(val1));
+        assert_eq!(tablet_get_value(&tablet2, &key2), Some(val2));
+        assert!(!tablet_has_table_entries(&system, table1));
+        assert!(!tablet_has_table_entries(&system, table2));
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn test_phase4_recovery_clog_replay_routes_to_correct_tablets() {
+        let dir = tempdir().unwrap();
+        let config = DatabaseConfig::with_data_dir(dir.path());
+        let (table1, table2, key1, val1, key2, val2, _) =
+            prepare_phase4_two_tablet_recovery_case(dir.path(), false, false).await;
+
+        let db = Database::open(config).unwrap();
+        let tablet1 = db
+            .tablet_manager()
+            .get_tablet(TabletId::Table { table_id: table1 })
+            .expect("tablet1 should be mounted for replay");
+        let tablet2 = db
+            .tablet_manager()
+            .get_tablet(TabletId::Table { table_id: table2 })
+            .expect("tablet2 should be mounted for replay");
+        let system = db.tablet_manager().system_tablet();
+
+        assert_eq!(tablet_get_value(&tablet1, &key1), Some(val1));
+        assert_eq!(tablet_get_value(&tablet2, &key2), Some(val2));
+        assert!(!tablet_has_table_entries(&system, table1));
+        assert!(!tablet_has_table_entries(&system, table2));
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn test_phase4_recovery_repeated_reopen_idempotent() {
+        let dir = tempdir().unwrap();
+        let config = DatabaseConfig::with_data_dir(dir.path());
+        let (table1, table2, key1, val1, key2, val2, _) =
+            prepare_phase4_two_tablet_recovery_case(dir.path(), false, false).await;
+
+        let db1 = Database::open(config.clone()).unwrap();
+        let t1 = db1
+            .tablet_manager()
+            .get_tablet(TabletId::Table { table_id: table1 })
+            .unwrap();
+        let t2 = db1
+            .tablet_manager()
+            .get_tablet(TabletId::Table { table_id: table2 })
+            .unwrap();
+        assert_eq!(tablet_get_value(&t1, &key1), Some(val1.clone()));
+        assert_eq!(tablet_get_value(&t2, &key2), Some(val2.clone()));
+        drop(db1);
+
+        let db2 = Database::open(config).unwrap();
+        let t1 = db2
+            .tablet_manager()
+            .get_tablet(TabletId::Table { table_id: table1 })
+            .unwrap();
+        let t2 = db2
+            .tablet_manager()
+            .get_tablet(TabletId::Table { table_id: table2 })
+            .unwrap();
+        assert_eq!(tablet_get_value(&t1, &key1), Some(val1));
+        assert_eq!(tablet_get_value(&t2, &key2), Some(val2));
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn test_phase4_recovery_ilog_failure_one_tablet_isolated() {
+        let dir = tempdir().unwrap();
+        let config = DatabaseConfig::with_data_dir(dir.path());
+        let (table1, table2, _key1, _val1, key2, val2, _) =
+            prepare_phase4_two_tablet_recovery_case(dir.path(), true, true).await;
+
+        let broken_ilog = dir
+            .path()
+            .join("tablets")
+            .join(format!("t_{table1}"))
+            .join("ilog")
+            .join("tisql.ilog");
+        {
+            use std::io::Write;
+            let mut f = std::fs::OpenOptions::new()
+                .write(true)
+                .truncate(true)
+                .open(&broken_ilog)
+                .unwrap();
+            f.write_all(b"bad!").unwrap();
+            f.flush().unwrap();
+        }
+
+        let open_err = match Database::open(config) {
+            Ok(_) => panic!("open should fail with corrupted tablet ilog"),
+            Err(e) => e,
+        };
+        let msg = format!("{open_err}");
+        assert!(
+            msg.contains("Invalid ilog file magic")
+                || msg.contains("Failed")
+                || msg.contains("ilog"),
+            "unexpected error message: {msg}"
+        );
+
+        let lsn_provider = crate::lsn::new_lsn_provider();
+        let io = crate::io::IoService::new_for_test(64).unwrap();
+        let recovered = LsmRecovery::recover_tablet(
+            &dir.path().join("tablets").join(format!("t_{table2}")),
+            lsn_provider,
+            io,
+            &tokio::runtime::Handle::current(),
+        )
+        .expect("healthy tablet must remain recoverable when another tablet ilog is corrupted");
+        assert_eq!(
+            tablet_get_value(&recovered.engine, &key2),
+            Some(val2),
+            "healthy tablet data must remain intact"
+        );
     }
 
     #[tokio::test]
@@ -2282,6 +2689,25 @@ mod tests {
         let db2 = Database::open(config).unwrap();
         assert_eq!(db2.storage.get(&key1).await.unwrap(), Some(value1));
         assert_eq!(db2.storage.get(&key2).await.unwrap(), Some(value2));
+    }
+
+    #[tokio::test]
+    async fn test_phase4_run_log_gc_once_refuses_non_system_mounts() {
+        let dir = tempdir().unwrap();
+        let db = Database::open(DatabaseConfig::with_data_dir(dir.path())).unwrap();
+
+        db.execute_query("CREATE TABLE gc_guard_t (id INT PRIMARY KEY, v INT)")
+            .await
+            .unwrap();
+        let table_id = table_id_by_name(&db, "gc_guard_t");
+        mount_user_tablet(&db, table_id);
+
+        let err = db.run_log_gc_once().await.unwrap_err();
+        let msg = format!("{err}");
+        assert!(
+            msg.contains("run_log_gc_once currently supports only the system tablet"),
+            "unexpected error: {msg}"
+        );
     }
 
     #[tokio::test]

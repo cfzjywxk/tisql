@@ -32,7 +32,19 @@ use crate::tablet::commit_reservations::{CommitLsnReservations, CommitReservatio
 use crate::util::error::Result;
 
 use super::router::{route_index_to_tablet, route_table_to_tablet, TabletId};
-use super::TabletEngine;
+use super::{CompactionScheduler, FlushScheduler, TabletEngine, Version};
+
+/// One tablet checkpoint capture result.
+pub struct TabletCheckpointCapture {
+    pub tablet_id: TabletId,
+    pub version: Arc<Version>,
+    pub checkpoint_lsn: Lsn,
+}
+
+struct TabletWorkerSet {
+    flush: FlushScheduler,
+    compaction: CompactionScheduler,
+}
 
 /// Derive desired tablet inventory from loaded catalog metadata.
 ///
@@ -65,6 +77,8 @@ pub struct TabletManager {
     data_dir: PathBuf,
     tablets: RwLock<BTreeMap<TabletId, Arc<TabletEngine>>>,
     desired_tablets: RwLock<BTreeSet<TabletId>>,
+    background_runtime: RwLock<Option<tokio::runtime::Handle>>,
+    tablet_workers: RwLock<BTreeMap<TabletId, TabletWorkerSet>>,
     lsn_provider: SharedLsnProvider,
     commit_reservations: CommitLsnReservations,
 }
@@ -84,6 +98,8 @@ impl TabletManager {
             data_dir,
             tablets: RwLock::new(BTreeMap::from([(TabletId::System, system_tablet)])),
             desired_tablets: RwLock::new(BTreeSet::from([TabletId::System])),
+            background_runtime: RwLock::new(None),
+            tablet_workers: RwLock::new(BTreeMap::new()),
             lsn_provider,
             commit_reservations: CommitLsnReservations::new(),
         };
@@ -133,6 +149,88 @@ impl TabletManager {
             .collect()
     }
 
+    /// Shared LSN provider used by all tablets in this manager.
+    pub fn shared_lsn_provider(&self) -> SharedLsnProvider {
+        Arc::clone(&self.lsn_provider)
+    }
+
+    /// Bind background runtime and start per-tablet workers for currently mounted tablets.
+    pub fn bind_background_runtime(&self, handle: &tokio::runtime::Handle) -> Result<()> {
+        *self.background_runtime.write() = Some(handle.clone());
+        let tablets = self.all_tablets();
+        for (tablet_id, tablet) in tablets {
+            self.start_tablet_workers(tablet_id, tablet)?;
+        }
+        Ok(())
+    }
+
+    /// Stop all per-tablet flush/compaction workers.
+    pub fn stop_background_workers(&self) {
+        let mut workers = self.tablet_workers.write();
+        let drained = std::mem::take(&mut *workers);
+        for (_, worker_set) in drained {
+            worker_set.flush.stop();
+            worker_set.compaction.stop();
+        }
+    }
+
+    /// Shutdown all manifest writers for mounted tablets.
+    pub fn shutdown_manifest_writers(&self) {
+        for (_, tablet) in self.all_tablets() {
+            tablet.shutdown_manifest_writer();
+        }
+    }
+
+    /// Close non-system tablet ilogs, flushing pending durable records.
+    pub fn close_non_system_tablet_ilogs(&self) -> Result<()> {
+        for (tablet_id, tablet) in self.all_tablets() {
+            if tablet_id == TabletId::System {
+                continue;
+            }
+            tablet.close_ilog()?;
+        }
+        Ok(())
+    }
+
+    /// Shutdown non-system tablet ilog writer channels before runtime drop.
+    pub fn shutdown_non_system_tablet_ilogs(&self) {
+        for (tablet_id, tablet) in self.all_tablets() {
+            if tablet_id == TabletId::System {
+                continue;
+            }
+            tablet.shutdown_ilog();
+        }
+    }
+
+    /// Flush all mounted tablets (including active memtables).
+    pub fn flush_all_with_active(&self) -> Result<()> {
+        for (_, tablet) in self.all_tablets() {
+            tablet.reset_aborted_flush_states();
+            tablet.flush_all_with_active()?;
+        }
+        Ok(())
+    }
+
+    /// Whether mounted tablets are exactly `{system}`.
+    pub fn has_only_system_tablet_mounted(&self) -> bool {
+        let tablets = self.tablets.read();
+        tablets.len() == 1 && tablets.contains_key(&TabletId::System)
+    }
+
+    /// Whether a mounted tablet currently has background workers running.
+    pub fn has_running_workers(&self, tablet_id: TabletId) -> bool {
+        self.tablet_workers
+            .read()
+            .get(&tablet_id)
+            .map(|workers| workers.flush.is_running() && workers.compaction.is_running())
+            .unwrap_or(false)
+    }
+
+    /// Number of tablets with worker sets.
+    pub fn worker_tablet_count(&self) -> usize {
+        self.tablet_workers.read().len()
+    }
+
     /// Register desired tablets and materialize canonical directories.
     ///
     /// In phase-2 this does not mount new engines yet; only system tablet is
@@ -161,6 +259,33 @@ impl TabletManager {
         Ok(inventory.into_iter().collect())
     }
 
+    /// Whether a tablet directory already contains durable state worth
+    /// recovering/mounting (ilog file or SST files).
+    pub fn has_persisted_tablet_state(&self, tablet_id: TabletId) -> Result<bool> {
+        let dir = self.tablet_dir(tablet_id);
+        let ilog_path = dir.join("ilog").join("tisql.ilog");
+        if ilog_path.exists() {
+            return Ok(true);
+        }
+
+        let sst_dir = dir.join("sst");
+        if !sst_dir.exists() {
+            return Ok(false);
+        }
+
+        for entry in std::fs::read_dir(&sst_dir)? {
+            let entry = entry?;
+            if !entry.file_type()?.is_file() {
+                continue;
+            }
+            if entry.path().extension().is_some_and(|ext| ext == "sst") {
+                return Ok(true);
+            }
+        }
+
+        Ok(false)
+    }
+
     /// Snapshot of desired tablet IDs (mounted + not-yet-mounted).
     pub fn desired_tablets(&self) -> Vec<TabletId> {
         self.desired_tablets.read().iter().copied().collect()
@@ -170,8 +295,72 @@ impl TabletManager {
     pub fn insert_tablet(&self, tablet_id: TabletId, tablet: Arc<TabletEngine>) -> Result<()> {
         self.ensure_tablet_dir(tablet_id)?;
         self.desired_tablets.write().insert(tablet_id);
-        self.tablets.write().insert(tablet_id, tablet);
+        self.tablets.write().insert(tablet_id, Arc::clone(&tablet));
+        self.start_tablet_workers(tablet_id, tablet)?;
         Ok(())
+    }
+
+    /// Remove a mounted tablet and stop its per-tablet workers.
+    ///
+    /// To avoid dropping unflushed data, this flushes pending memtables before
+    /// unmounting the tablet.
+    ///
+    /// System tablet is never removed.
+    pub fn remove_tablet(&self, tablet_id: TabletId) -> Result<Option<Arc<TabletEngine>>> {
+        if tablet_id == TabletId::System {
+            return Ok(None);
+        }
+
+        let tablet = match self.get_tablet(tablet_id) {
+            Some(tablet) => tablet,
+            None => {
+                self.desired_tablets.write().remove(&tablet_id);
+                return Ok(None);
+            }
+        };
+
+        self.stop_tablet_workers(tablet_id);
+        tablet.reset_aborted_flush_states();
+        tablet.flush_all_with_active()?;
+        tablet.shutdown_manifest_writer();
+
+        self.desired_tablets.write().remove(&tablet_id);
+        let removed = self.tablets.write().remove(&tablet_id);
+        Ok(removed)
+    }
+
+    /// Capture one tablet checkpoint via its manifest writer.
+    pub async fn checkpoint_and_capture_tablet(
+        &self,
+        tablet_id: TabletId,
+    ) -> Result<TabletCheckpointCapture> {
+        let tablet = self.get_tablet(tablet_id).ok_or_else(|| {
+            crate::util::error::TiSqlError::Storage(format!("tablet {tablet_id:?} not mounted"))
+        })?;
+        let (version, checkpoint_lsn) = tablet.checkpoint_and_capture_manifest().await?;
+        Ok(TabletCheckpointCapture {
+            tablet_id,
+            version,
+            checkpoint_lsn,
+        })
+    }
+
+    /// Capture checkpoints for all mounted tablets.
+    pub async fn checkpoint_and_capture_all_tablets(&self) -> Result<Vec<TabletCheckpointCapture>> {
+        let tablets = self.all_tablets();
+        let mut captures = Vec::with_capacity(tablets.len());
+        // Phase-4 keeps this sequential for deterministic ordering/simpler
+        // failure handling. Phase-5 may parallelize to reduce tail latency.
+        for (tablet_id, tablet) in tablets {
+            let (version, checkpoint_lsn) = tablet.checkpoint_and_capture_manifest().await?;
+            captures.push(TabletCheckpointCapture {
+                tablet_id,
+                version,
+                checkpoint_lsn,
+            });
+        }
+        captures.sort_by_key(|capture| capture.tablet_id);
+        Ok(captures)
     }
 
     /// Global min flushed_lsn across mounted tablets.
@@ -224,6 +413,37 @@ impl TabletManager {
         self.commit_reservations.stats()
     }
 
+    fn start_tablet_workers(&self, tablet_id: TabletId, tablet: Arc<TabletEngine>) -> Result<()> {
+        let handle = match self.background_runtime.read().as_ref() {
+            Some(handle) => handle.clone(),
+            None => return Ok(()),
+        };
+
+        let mut workers = self.tablet_workers.write();
+        if workers.contains_key(&tablet_id) {
+            return Ok(());
+        }
+
+        tablet.start_manifest_writer(&handle)?;
+
+        let flush = FlushScheduler::new(Arc::clone(&tablet));
+        flush.start(&handle);
+
+        let compaction = CompactionScheduler::new(Arc::clone(&tablet));
+        compaction.start(&handle);
+        tablet.set_compaction_notify(compaction.notifier());
+
+        workers.insert(tablet_id, TabletWorkerSet { flush, compaction });
+        Ok(())
+    }
+
+    fn stop_tablet_workers(&self, tablet_id: TabletId) {
+        if let Some(workers) = self.tablet_workers.write().remove(&tablet_id) {
+            workers.flush.stop();
+            workers.compaction.stop();
+        }
+    }
+
     fn prepare_tablet_layout(&self) -> Result<()> {
         let tablets_root = self.tablets_root();
         if !tablets_root.exists() && legacy_flat_layout_detected(&self.data_dir) {
@@ -237,6 +457,11 @@ impl TabletManager {
         std::fs::create_dir_all(&tablets_root)?;
         self.ensure_tablet_dir(TabletId::System)?;
         Ok(())
+    }
+
+    /// Discover tablet directories currently present on disk.
+    pub fn discover_existing_tablet_dirs_for_recovery(&self) -> Result<BTreeSet<TabletId>> {
+        self.discover_existing_tablet_dirs()
     }
 
     fn discover_existing_tablet_dirs(&self) -> Result<BTreeSet<TabletId>> {
@@ -310,12 +535,42 @@ mod tests {
     use crate::catalog::{IndexDef, TableDef};
     use crate::inner_table::core_tables::{ALL_TABLE_TABLE_ID, USER_TABLE_ID_START};
     use crate::lsn::new_lsn_provider;
-    use crate::tablet::LsmConfig;
+    use crate::tablet::memtable::FlushState;
+    use crate::tablet::{IlogConfig, IlogService, LsmConfig, StorageEngine, Version, WriteBatch};
     use std::collections::HashMap;
     use tempfile::TempDir;
+    use tokio::time::{timeout, Duration};
 
     fn open_test_system_tablet(dir: &Path) -> Arc<TabletEngine> {
         Arc::new(TabletEngine::open(LsmConfig::new(dir)).unwrap())
+    }
+
+    fn open_durable_tablet(
+        dir: &Path,
+        lsn_provider: crate::lsn::SharedLsnProvider,
+    ) -> Arc<TabletEngine> {
+        let io = crate::io::IoService::new_for_test(32).unwrap();
+        let ilog = Arc::new(
+            IlogService::open_with_thread(IlogConfig::new(dir), Arc::clone(&lsn_provider)).unwrap(),
+        );
+        Arc::new(
+            TabletEngine::open_with_recovery(
+                LsmConfig::new(dir),
+                lsn_provider,
+                ilog,
+                Version::new(),
+                io,
+            )
+            .unwrap(),
+        )
+    }
+
+    fn count_sst_files(dir: &Path) -> usize {
+        std::fs::read_dir(dir.join("sst"))
+            .unwrap()
+            .filter_map(std::result::Result::ok)
+            .filter(|entry| entry.path().extension().is_some_and(|ext| ext == "sst"))
+            .count()
     }
 
     fn empty_cache() -> CatalogCache {
@@ -842,5 +1097,598 @@ mod tests {
         // The file should be ignored; the valid dir should be discovered
         assert!(inventory.contains(&valid_tid));
         assert!(!inventory.contains(&TabletId::Table { table_id: 1000 }));
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn test_phase4_bind_runtime_starts_system_workers() {
+        let dir = TempDir::new().unwrap();
+        let manager = TabletManager::new(
+            dir.path(),
+            new_lsn_provider(),
+            open_test_system_tablet(dir.path()),
+        )
+        .unwrap();
+
+        manager
+            .bind_background_runtime(&tokio::runtime::Handle::current())
+            .unwrap();
+        assert!(manager.has_only_system_tablet_mounted());
+        assert!(manager.has_running_workers(TabletId::System));
+        assert_eq!(manager.worker_tablet_count(), 1);
+
+        manager.stop_background_workers();
+        assert!(!manager.has_running_workers(TabletId::System));
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn test_phase4_insert_remove_tablet_workers_lifecycle() {
+        let dir = TempDir::new().unwrap();
+        let manager = TabletManager::new(
+            dir.path(),
+            new_lsn_provider(),
+            open_test_system_tablet(dir.path()),
+        )
+        .unwrap();
+        manager
+            .bind_background_runtime(&tokio::runtime::Handle::current())
+            .unwrap();
+
+        let user_tablet_id = TabletId::Table {
+            table_id: USER_TABLE_ID_START + 55,
+        };
+        let user_engine = Arc::new(
+            TabletEngine::open(LsmConfig::new(manager.tablet_dir(user_tablet_id))).unwrap(),
+        );
+        manager
+            .insert_tablet(user_tablet_id, Arc::clone(&user_engine))
+            .unwrap();
+        assert!(!manager.has_only_system_tablet_mounted());
+
+        let mut wb = WriteBatch::new();
+        wb.set_commit_ts(7);
+        wb.put(b"k".to_vec(), b"v".to_vec());
+        user_engine.write_batch(wb).unwrap();
+        user_engine.freeze_active();
+
+        assert!(manager.has_running_workers(user_tablet_id));
+        assert_eq!(manager.worker_tablet_count(), 2);
+
+        let removed = manager.remove_tablet(user_tablet_id).unwrap();
+        assert!(removed.is_some());
+        let removed = removed.unwrap();
+        assert!(
+            removed.min_unflushed_lsn().is_none(),
+            "remove_tablet must flush dirty memtables before unmount"
+        );
+        assert!(
+            count_sst_files(&manager.tablet_dir(user_tablet_id)) > 0,
+            "remove_tablet should persist frozen/active data before unmount"
+        );
+        assert!(!manager.has_running_workers(user_tablet_id));
+        assert_eq!(manager.worker_tablet_count(), 1);
+        assert!(manager.has_only_system_tablet_mounted());
+
+        manager.stop_background_workers();
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn test_phase4_remove_tablet_resets_in_progress_flush_and_persists_data() {
+        let dir = TempDir::new().unwrap();
+        let manager = TabletManager::new(
+            dir.path(),
+            new_lsn_provider(),
+            open_test_system_tablet(dir.path()),
+        )
+        .unwrap();
+        manager
+            .bind_background_runtime(&tokio::runtime::Handle::current())
+            .unwrap();
+
+        let user_tablet_id = TabletId::Table {
+            table_id: USER_TABLE_ID_START + 77,
+        };
+        let user_engine = Arc::new(
+            TabletEngine::open(LsmConfig::new(manager.tablet_dir(user_tablet_id))).unwrap(),
+        );
+        manager
+            .insert_tablet(user_tablet_id, Arc::clone(&user_engine))
+            .unwrap();
+
+        let mut wb = WriteBatch::new();
+        wb.set_commit_ts(17);
+        wb.put(b"remove_flush_key".to_vec(), b"remove_flush_val".to_vec());
+        user_engine.write_batch(wb).unwrap();
+
+        let frozen = user_engine
+            .freeze_active()
+            .expect("must create frozen memtable for flush-state simulation");
+        frozen.set_flush_state(FlushState::Flushing);
+
+        let removed = manager
+            .remove_tablet(user_tablet_id)
+            .unwrap()
+            .expect("tablet should be removed");
+        assert!(
+            removed.min_unflushed_lsn().is_none(),
+            "remove_tablet should recover interrupted flushing state and persist remaining data"
+        );
+        assert!(
+            count_sst_files(&manager.tablet_dir(user_tablet_id)) > 0,
+            "remove_tablet should flush frozen memtable after reset_aborted_flush_states"
+        );
+        assert!(!manager.has_running_workers(user_tablet_id));
+
+        manager.stop_background_workers();
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn test_phase4_checkpoint_capture_all_tablets_and_isolated_paths() {
+        let dir = TempDir::new().unwrap();
+        let lsn_provider = new_lsn_provider();
+
+        let system_tablet_dir = dir.path().join("tablets").join("system");
+        std::fs::create_dir_all(&system_tablet_dir).unwrap();
+        let system_tablet = open_durable_tablet(&system_tablet_dir, Arc::clone(&lsn_provider));
+
+        let manager =
+            TabletManager::new(dir.path(), Arc::clone(&lsn_provider), system_tablet).unwrap();
+        manager
+            .bind_background_runtime(&tokio::runtime::Handle::current())
+            .unwrap();
+
+        let user_tablet_id = TabletId::Table {
+            table_id: USER_TABLE_ID_START,
+        };
+        let user_tablet_dir = manager.tablet_dir(user_tablet_id);
+        let user_tablet = open_durable_tablet(&user_tablet_dir, Arc::clone(&lsn_provider));
+        manager.insert_tablet(user_tablet_id, user_tablet).unwrap();
+
+        let mut wb1 = WriteBatch::new();
+        wb1.set_commit_ts(10);
+        wb1.put(b"sys_k".to_vec(), b"sys_v".to_vec());
+        manager.system_tablet().write_batch(wb1).unwrap();
+
+        let mut wb2 = WriteBatch::new();
+        wb2.set_commit_ts(11);
+        wb2.put(b"user_k".to_vec(), b"user_v".to_vec());
+        manager
+            .get_tablet(user_tablet_id)
+            .expect("mounted user tablet")
+            .write_batch(wb2)
+            .unwrap();
+
+        manager.flush_all_with_active().unwrap();
+
+        let captures = manager.checkpoint_and_capture_all_tablets().await.unwrap();
+        assert_eq!(captures.len(), 2);
+        assert!(captures
+            .iter()
+            .any(|capture| capture.tablet_id == TabletId::System));
+        assert!(captures
+            .iter()
+            .any(|capture| capture.tablet_id == user_tablet_id));
+
+        let system_ilog = manager
+            .tablet_dir(TabletId::System)
+            .join("ilog")
+            .join("tisql.ilog");
+        let user_ilog = manager
+            .tablet_dir(user_tablet_id)
+            .join("ilog")
+            .join("tisql.ilog");
+        assert!(system_ilog.exists());
+        assert!(user_ilog.exists());
+        assert_ne!(system_ilog, user_ilog);
+
+        let system_sst_dir = manager.tablet_dir(TabletId::System).join("sst");
+        let user_sst_dir = manager.tablet_dir(user_tablet_id).join("sst");
+        let system_sst_count = std::fs::read_dir(system_sst_dir)
+            .unwrap()
+            .filter_map(std::result::Result::ok)
+            .count();
+        let user_sst_count = std::fs::read_dir(user_sst_dir)
+            .unwrap()
+            .filter_map(std::result::Result::ok)
+            .count();
+        assert!(system_sst_count > 0);
+        assert!(user_sst_count > 0);
+
+        manager.stop_background_workers();
+        manager.shutdown_manifest_writers();
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn test_phase4_tablet_ilog_checkpoint_independent() {
+        let dir = TempDir::new().unwrap();
+        let lsn_provider = new_lsn_provider();
+
+        let system_tablet_dir = dir.path().join("tablets").join("system");
+        std::fs::create_dir_all(&system_tablet_dir).unwrap();
+        let system_tablet = open_durable_tablet(&system_tablet_dir, Arc::clone(&lsn_provider));
+        let manager =
+            TabletManager::new(dir.path(), Arc::clone(&lsn_provider), system_tablet).unwrap();
+        manager
+            .bind_background_runtime(&tokio::runtime::Handle::current())
+            .unwrap();
+
+        let tablet_a = TabletId::Table {
+            table_id: USER_TABLE_ID_START + 11,
+        };
+        let tablet_b = TabletId::Table {
+            table_id: USER_TABLE_ID_START + 12,
+        };
+        manager
+            .insert_tablet(
+                tablet_a,
+                open_durable_tablet(&manager.tablet_dir(tablet_a), Arc::clone(&lsn_provider)),
+            )
+            .unwrap();
+        manager
+            .insert_tablet(
+                tablet_b,
+                open_durable_tablet(&manager.tablet_dir(tablet_b), Arc::clone(&lsn_provider)),
+            )
+            .unwrap();
+
+        let mut wba = WriteBatch::new();
+        wba.set_commit_ts(101);
+        wba.put(b"ka".to_vec(), b"va".to_vec());
+        manager
+            .get_tablet(tablet_a)
+            .unwrap()
+            .write_batch(wba)
+            .unwrap();
+
+        let mut wbb = WriteBatch::new();
+        wbb.set_commit_ts(102);
+        wbb.put(b"kb".to_vec(), b"vb".to_vec());
+        manager
+            .get_tablet(tablet_b)
+            .unwrap()
+            .write_batch(wbb)
+            .unwrap();
+
+        manager.flush_all_with_active().unwrap();
+
+        // Stabilize tablet B's checkpoint state, then verify checkpointing A does
+        // not append anything to B's ilog.
+        manager
+            .checkpoint_and_capture_tablet(tablet_b)
+            .await
+            .unwrap();
+        let tablet_b_ilog = manager.tablet_dir(tablet_b).join("ilog").join("tisql.ilog");
+        let b_size_before = std::fs::metadata(&tablet_b_ilog).unwrap().len();
+
+        manager
+            .checkpoint_and_capture_tablet(tablet_a)
+            .await
+            .unwrap();
+
+        let b_size_after = std::fs::metadata(&tablet_b_ilog).unwrap().len();
+        assert_eq!(
+            b_size_before, b_size_after,
+            "checkpointing tablet A must not mutate tablet B ilog"
+        );
+
+        manager.stop_background_workers();
+        manager.shutdown_manifest_writers();
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn test_phase4_tablet_ilog_truncate_independent() {
+        let dir = TempDir::new().unwrap();
+        let lsn_provider = new_lsn_provider();
+
+        let system_tablet_dir = dir.path().join("tablets").join("system");
+        std::fs::create_dir_all(&system_tablet_dir).unwrap();
+        let system_tablet = open_durable_tablet(&system_tablet_dir, Arc::clone(&lsn_provider));
+        let manager =
+            TabletManager::new(dir.path(), Arc::clone(&lsn_provider), system_tablet).unwrap();
+        manager
+            .bind_background_runtime(&tokio::runtime::Handle::current())
+            .unwrap();
+
+        let tablet_a = TabletId::Table {
+            table_id: USER_TABLE_ID_START + 13,
+        };
+        let tablet_b = TabletId::Table {
+            table_id: USER_TABLE_ID_START + 14,
+        };
+        manager
+            .insert_tablet(
+                tablet_a,
+                open_durable_tablet(&manager.tablet_dir(tablet_a), Arc::clone(&lsn_provider)),
+            )
+            .unwrap();
+        manager
+            .insert_tablet(
+                tablet_b,
+                open_durable_tablet(&manager.tablet_dir(tablet_b), Arc::clone(&lsn_provider)),
+            )
+            .unwrap();
+
+        let mut wba = WriteBatch::new();
+        wba.set_commit_ts(111);
+        wba.put(b"ta".to_vec(), b"va".to_vec());
+        manager
+            .get_tablet(tablet_a)
+            .unwrap()
+            .write_batch(wba)
+            .unwrap();
+
+        let mut wbb = WriteBatch::new();
+        wbb.set_commit_ts(112);
+        wbb.put(b"tb".to_vec(), b"vb".to_vec());
+        manager
+            .get_tablet(tablet_b)
+            .unwrap()
+            .write_batch(wbb)
+            .unwrap();
+
+        manager.flush_all_with_active().unwrap();
+
+        let capture_a = manager
+            .checkpoint_and_capture_tablet(tablet_a)
+            .await
+            .unwrap();
+        manager
+            .checkpoint_and_capture_tablet(tablet_b)
+            .await
+            .unwrap();
+
+        let tablet_a_ilog = manager.tablet_dir(tablet_a).join("ilog").join("tisql.ilog");
+        let tablet_b_ilog = manager.tablet_dir(tablet_b).join("ilog").join("tisql.ilog");
+        let a_size_before = std::fs::metadata(&tablet_a_ilog).unwrap().len();
+        let b_size_before = std::fs::metadata(&tablet_b_ilog).unwrap().len();
+
+        let a_tablet = manager.get_tablet(tablet_a).unwrap();
+        let truncate_stats = a_tablet
+            .truncate_ilog_before(capture_a.checkpoint_lsn)
+            .await
+            .unwrap();
+        let a_size_after = std::fs::metadata(&tablet_a_ilog).unwrap().len();
+        let b_size_after = std::fs::metadata(&tablet_b_ilog).unwrap().len();
+
+        assert_eq!(truncate_stats.new_file_size, a_size_after);
+        assert!(
+            a_size_after <= a_size_before,
+            "truncate should not grow tablet A ilog"
+        );
+        assert_eq!(
+            b_size_before, b_size_after,
+            "truncating tablet A ilog must not mutate tablet B ilog"
+        );
+
+        manager.stop_background_workers();
+        manager.shutdown_manifest_writers();
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn test_phase4_manifest_no_cross_contention_on_concurrent_flush() {
+        let dir = TempDir::new().unwrap();
+        let lsn_provider = new_lsn_provider();
+
+        let system_tablet_dir = dir.path().join("tablets").join("system");
+        std::fs::create_dir_all(&system_tablet_dir).unwrap();
+        let system_tablet = open_durable_tablet(&system_tablet_dir, Arc::clone(&lsn_provider));
+        let manager =
+            TabletManager::new(dir.path(), Arc::clone(&lsn_provider), system_tablet).unwrap();
+        manager
+            .bind_background_runtime(&tokio::runtime::Handle::current())
+            .unwrap();
+
+        let tablet_a = TabletId::Table {
+            table_id: USER_TABLE_ID_START + 41,
+        };
+        let tablet_b = TabletId::Table {
+            table_id: USER_TABLE_ID_START + 42,
+        };
+        let engine_a =
+            open_durable_tablet(&manager.tablet_dir(tablet_a), Arc::clone(&lsn_provider));
+        let engine_b =
+            open_durable_tablet(&manager.tablet_dir(tablet_b), Arc::clone(&lsn_provider));
+        manager
+            .insert_tablet(tablet_a, Arc::clone(&engine_a))
+            .unwrap();
+        manager
+            .insert_tablet(tablet_b, Arc::clone(&engine_b))
+            .unwrap();
+
+        let mut wba = WriteBatch::new();
+        wba.set_commit_ts(1001);
+        wba.put(b"a".to_vec(), vec![b'a'; 128 * 1024]);
+        engine_a.write_batch(wba).unwrap();
+        engine_a.freeze_active();
+
+        let mut wbb = WriteBatch::new();
+        wbb.set_commit_ts(1002);
+        wbb.put(b"b".to_vec(), vec![b'b'; 128 * 1024]);
+        engine_b.write_batch(wbb).unwrap();
+        engine_b.freeze_active();
+
+        let flush_a = {
+            let engine = Arc::clone(&engine_a);
+            tokio::spawn(async move { engine.flush_all_with_active_async().await })
+        };
+        let flush_b = {
+            let engine = Arc::clone(&engine_b);
+            tokio::spawn(async move { engine.flush_all_with_active_async().await })
+        };
+
+        let (res_a, res_b) = timeout(Duration::from_secs(3), async {
+            tokio::join!(flush_a, flush_b)
+        })
+        .await
+        .expect("concurrent per-tablet flushes should not deadlock");
+
+        assert!(!res_a.unwrap().unwrap().is_empty());
+        assert!(!res_b.unwrap().unwrap().is_empty());
+        assert!(count_sst_files(&manager.tablet_dir(tablet_a)) > 0);
+        assert!(count_sst_files(&manager.tablet_dir(tablet_b)) > 0);
+
+        manager.stop_background_workers();
+        manager.shutdown_manifest_writers();
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn test_phase4_shutdown_non_system_ilogs_keeps_system_tablet_alive() {
+        let dir = TempDir::new().unwrap();
+        let lsn_provider = new_lsn_provider();
+
+        let system_tablet_dir = dir.path().join("tablets").join("system");
+        std::fs::create_dir_all(&system_tablet_dir).unwrap();
+        let system_tablet = open_durable_tablet(&system_tablet_dir, Arc::clone(&lsn_provider));
+
+        let manager =
+            TabletManager::new(dir.path(), Arc::clone(&lsn_provider), system_tablet).unwrap();
+        manager
+            .bind_background_runtime(&tokio::runtime::Handle::current())
+            .unwrap();
+
+        let user_tablet_id = TabletId::Table {
+            table_id: USER_TABLE_ID_START + 1,
+        };
+        let user_tablet_dir = manager.tablet_dir(user_tablet_id);
+        let user_tablet = open_durable_tablet(&user_tablet_dir, Arc::clone(&lsn_provider));
+        manager.insert_tablet(user_tablet_id, user_tablet).unwrap();
+
+        manager.close_non_system_tablet_ilogs().unwrap();
+        manager.shutdown_non_system_tablet_ilogs();
+
+        let system_checkpoint = manager
+            .checkpoint_and_capture_tablet(TabletId::System)
+            .await
+            .unwrap();
+        assert_eq!(system_checkpoint.tablet_id, TabletId::System);
+
+        manager.stop_background_workers();
+        manager.shutdown_manifest_writers();
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn test_phase4_per_tablet_flush_scheduler_isolation() {
+        let dir = TempDir::new().unwrap();
+        let lsn_provider = new_lsn_provider();
+
+        let system_tablet_dir = dir.path().join("tablets").join("system");
+        std::fs::create_dir_all(&system_tablet_dir).unwrap();
+        let system_tablet = open_durable_tablet(&system_tablet_dir, Arc::clone(&lsn_provider));
+        let manager =
+            TabletManager::new(dir.path(), Arc::clone(&lsn_provider), system_tablet).unwrap();
+        manager
+            .bind_background_runtime(&tokio::runtime::Handle::current())
+            .unwrap();
+
+        let tablet_a = TabletId::Table {
+            table_id: USER_TABLE_ID_START + 21,
+        };
+        let tablet_b = TabletId::Table {
+            table_id: USER_TABLE_ID_START + 22,
+        };
+        let engine_a =
+            open_durable_tablet(&manager.tablet_dir(tablet_a), Arc::clone(&lsn_provider));
+        let engine_b =
+            open_durable_tablet(&manager.tablet_dir(tablet_b), Arc::clone(&lsn_provider));
+        manager
+            .insert_tablet(tablet_a, Arc::clone(&engine_a))
+            .unwrap();
+        manager
+            .insert_tablet(tablet_b, Arc::clone(&engine_b))
+            .unwrap();
+
+        let mut wb = WriteBatch::new();
+        wb.set_commit_ts(100);
+        wb.put(b"a".to_vec(), vec![b'x'; 64 * 1024]);
+        engine_a.write_batch(wb).unwrap();
+        engine_a.freeze_active();
+
+        timeout(Duration::from_secs(3), async {
+            loop {
+                if count_sst_files(&manager.tablet_dir(tablet_a)) > 0 {
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(20)).await;
+            }
+        })
+        .await
+        .expect("tablet A should flush in background");
+
+        assert_eq!(
+            count_sst_files(&manager.tablet_dir(tablet_b)),
+            0,
+            "tablet B should not flush when only tablet A rotates"
+        );
+
+        manager.stop_background_workers();
+        manager.shutdown_manifest_writers();
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn test_phase4_concurrent_checkpoint_capture_across_tablets() {
+        let dir = TempDir::new().unwrap();
+        let lsn_provider = new_lsn_provider();
+
+        let system_tablet_dir = dir.path().join("tablets").join("system");
+        std::fs::create_dir_all(&system_tablet_dir).unwrap();
+        let system_tablet = open_durable_tablet(&system_tablet_dir, Arc::clone(&lsn_provider));
+        let manager =
+            TabletManager::new(dir.path(), Arc::clone(&lsn_provider), system_tablet).unwrap();
+        manager
+            .bind_background_runtime(&tokio::runtime::Handle::current())
+            .unwrap();
+
+        let tablet_a = TabletId::Table {
+            table_id: USER_TABLE_ID_START + 31,
+        };
+        let tablet_b = TabletId::Table {
+            table_id: USER_TABLE_ID_START + 32,
+        };
+        manager
+            .insert_tablet(
+                tablet_a,
+                open_durable_tablet(&manager.tablet_dir(tablet_a), Arc::clone(&lsn_provider)),
+            )
+            .unwrap();
+        manager
+            .insert_tablet(
+                tablet_b,
+                open_durable_tablet(&manager.tablet_dir(tablet_b), Arc::clone(&lsn_provider)),
+            )
+            .unwrap();
+
+        let mut wba = WriteBatch::new();
+        wba.set_commit_ts(200);
+        wba.put(b"ka".to_vec(), b"va".to_vec());
+        manager
+            .get_tablet(tablet_a)
+            .unwrap()
+            .write_batch(wba)
+            .unwrap();
+
+        let mut wbb = WriteBatch::new();
+        wbb.set_commit_ts(201);
+        wbb.put(b"kb".to_vec(), b"vb".to_vec());
+        manager
+            .get_tablet(tablet_b)
+            .unwrap()
+            .write_batch(wbb)
+            .unwrap();
+
+        manager.flush_all_with_active().unwrap();
+
+        let captures = timeout(Duration::from_secs(2), async {
+            tokio::join!(
+                manager.checkpoint_and_capture_tablet(tablet_a),
+                manager.checkpoint_and_capture_tablet(tablet_b),
+            )
+        })
+        .await
+        .expect("concurrent tablet checkpoints should complete");
+
+        assert_eq!(captures.0.unwrap().tablet_id, tablet_a);
+        assert_eq!(captures.1.unwrap().tablet_id, tablet_b);
+
+        manager.stop_background_workers();
+        manager.shutdown_manifest_writers();
     }
 }

@@ -31,10 +31,10 @@
 //! let mut ctx = txn_service.begin(false)?;  // read_only = false
 //!
 //! // Read operations
-//! let value = txn_service.get(&ctx, key)?;
+//! let value = txn_service.get(&ctx, table_id, key)?;
 //!
 //! // Write operations
-//! txn_service.put(&mut ctx, key, value)?;
+//! txn_service.put(&mut ctx, table_id, key, value)?;
 //!
 //! // Commit
 //! let info = txn_service.commit(ctx)?;
@@ -279,8 +279,8 @@ impl TxnCtx {
 /// ```ignore
 /// // CORRECT: MVCC-aware read with transaction semantics
 /// let ctx = txn_service.begin(true)?;  // read-only transaction
-/// let value = txn_service.get(&ctx, key)?;
-/// let iter = txn_service.scan_iter(&ctx, range)?;
+/// let value = txn_service.get(&ctx, table_id, key)?;
+/// let iter = txn_service.scan_iter(&ctx, table_id, range)?;
 ///
 /// // WRONG: Bypasses MVCC visibility rules
 /// let value = storage.get(key)?;  // DON'T DO THIS
@@ -345,41 +345,27 @@ pub trait TxnService: Send + Sync {
     /// Reads from storage at `start_ts`, returning the latest visible version.
     /// Returns `None` if the key doesn't exist or was deleted.
     /// Sees own pending writes (read-your-writes).
+    ///
     fn get<'a>(
-        &'a self,
-        ctx: &'a TxnCtx,
-        key: &'a [u8],
-    ) -> impl Future<Output = Result<Option<RawValue>>> + Send + 'a;
-
-    /// Metadata-first read path for a known table target.
-    fn get_on_table<'a>(
         &'a self,
         ctx: &'a TxnCtx,
         table_id: TableId,
         key: &'a [u8],
-    ) -> impl Future<Output = Result<Option<RawValue>>> + Send + 'a {
-        let _ = table_id;
-        self.get(ctx, key)
-    }
+    ) -> impl Future<Output = Result<Option<RawValue>>> + Send + 'a;
 
-    /// Scan a range of keys within the transaction (streaming).
+    /// Scan a range of keys within one table target (streaming).
     ///
     /// Returns an iterator over key-value pairs visible at `start_ts`.
     /// Each item is wrapped in `Result` to propagate I/O or corruption errors
     /// that may occur during streaming iteration over storage.
     /// For explicit transactions, sees own pending writes (read-your-writes).
-    fn scan_iter(&self, ctx: &TxnCtx, range: Range<Key>) -> Result<Self::ScanIter>;
-
-    /// Metadata-first scan path for a known table target.
-    fn scan_iter_on_table(
+    ///
+    fn scan_iter(
         &self,
         ctx: &TxnCtx,
         table_id: TableId,
         range: Range<Key>,
-    ) -> Result<Self::ScanIter> {
-        let _ = table_id;
-        self.scan_iter(ctx, range)
-    }
+    ) -> Result<Self::ScanIter>;
 
     /// Write a pending put to storage.
     ///
@@ -390,24 +376,14 @@ pub trait TxnService: Send + Sync {
     ///
     /// - `ReadOnlyTransaction` if the transaction was started with `read_only = true`
     /// - `TransactionNotActive` if the transaction is not in `Active` state
+    ///
     fn put<'a>(
-        &'a self,
-        ctx: &'a mut TxnCtx,
-        key: Key,
-        value: RawValue,
-    ) -> impl Future<Output = Result<()>> + Send + 'a;
-
-    /// Metadata-first put path for a known table target.
-    fn put_on_table<'a>(
         &'a self,
         ctx: &'a mut TxnCtx,
         table_id: TableId,
         key: Key,
         value: RawValue,
-    ) -> impl Future<Output = Result<()>> + Send + 'a {
-        let _ = table_id;
-        self.put(ctx, key, value)
-    }
+    ) -> impl Future<Output = Result<()>> + Send + 'a;
 
     /// Write a pending delete to storage.
     ///
@@ -418,22 +394,13 @@ pub trait TxnService: Send + Sync {
     ///
     /// - `ReadOnlyTransaction` if the transaction was started with `read_only = true`
     /// - `TransactionNotActive` if the transaction is not in `Active` state
+    ///
     fn delete<'a>(
-        &'a self,
-        ctx: &'a mut TxnCtx,
-        key: Key,
-    ) -> impl Future<Output = Result<()>> + Send + 'a;
-
-    /// Metadata-first delete path for a known table target.
-    fn delete_on_table<'a>(
         &'a self,
         ctx: &'a mut TxnCtx,
         table_id: TableId,
         key: Key,
-    ) -> impl Future<Output = Result<()>> + Send + 'a {
-        let _ = table_id;
-        self.delete(ctx, key)
-    }
+    ) -> impl Future<Output = Result<()>> + Send + 'a;
 
     // === Finalization ===
 

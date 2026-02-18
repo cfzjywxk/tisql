@@ -1,0 +1,27 @@
+CREATE TABLE update_isolation_test (id INT PRIMARY KEY, val VARCHAR(100))
+INSERT INTO update_isolation_test VALUES (1, 'original')
+AFFECTED 1
+INSERT INTO update_isolation_test VALUES (2, 'original2')
+AFFECTED 1
+BEGIN
+UPDATE update_isolation_test SET val = 'modified_by_s1' WHERE id = 1
+AFFECTED 1
+SELECT * FROM update_isolation_test WHERE id = 1
+id	val
+1	original
+SELECT * FROM update_isolation_test ORDER BY id
+id	val
+1	original
+2	original2
+ROLLBACK
+SELECT * FROM update_isolation_test WHERE id = 1
+id	val
+1	original
+BEGIN
+UPDATE update_isolation_test SET val = 'committed_update' WHERE id = 1
+AFFECTED 1
+COMMIT
+SELECT * FROM update_isolation_test WHERE id = 1
+id	val
+1	committed_update
+DROP TABLE update_isolation_test

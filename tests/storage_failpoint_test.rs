@@ -38,6 +38,8 @@ use tisql::testkit::{
 };
 use tisql::{ClogService, PessimisticStorage, StorageEngine, TxnService, V26BoundaryMode};
 
+const SYS_TABLE_ID: u64 = 1;
+
 fn make_test_io() -> std::sync::Arc<tisql::io::IoService> {
     tisql::io::IoService::new(32).unwrap()
 }
@@ -357,11 +359,11 @@ async fn test_phase3_failpoint_partial_finalize_across_tablets() {
 
     let mut ctx = txn_service.begin_explicit(false).unwrap();
     txn_service
-        .put_on_table(&mut ctx, table1, key1.clone(), b"v1".to_vec())
+        .put(&mut ctx, table1, key1.clone(), b"v1".to_vec())
         .await
         .unwrap();
     txn_service
-        .put_on_table(&mut ctx, table2, key2.clone(), b"v2".to_vec())
+        .put(&mut ctx, table2, key2.clone(), b"v2".to_vec())
         .await
         .unwrap();
 
@@ -406,11 +408,11 @@ async fn test_phase3_failpoint_partial_abort_across_tablets() {
     let mut ctx = txn_service.begin_explicit(false).unwrap();
     let owner_ts = ctx.start_ts();
     txn_service
-        .put_on_table(&mut ctx, table1, key1.clone(), b"v11".to_vec())
+        .put(&mut ctx, table1, key1.clone(), b"v11".to_vec())
         .await
         .unwrap();
     txn_service
-        .put_on_table(&mut ctx, table2, key2.clone(), b"v22".to_vec())
+        .put(&mut ctx, table2, key2.clone(), b"v22".to_vec())
         .await
         .unwrap();
 
@@ -496,6 +498,7 @@ async fn run_v26_commit_cutpoint_panic_test(failpoint_name: &str) {
             txn_service
                 .put(
                     &mut ctx,
+                    SYS_TABLE_ID,
                     b"phase2_cutpoint_key".to_vec(),
                     b"phase2_cutpoint_value".to_vec(),
                 )

@@ -108,7 +108,7 @@ fn scan_table_rows<T: TxnService>(
         *last = last.saturating_add(1);
     }
 
-    let mut iter = txn.scan_iter(ctx, prefix..end)?;
+    let mut iter = txn.scan_iter(ctx, table_id, prefix..end)?;
     let mut rows = Vec::new();
 
     crate::io::block_on_sync(iter.advance())?;
@@ -140,7 +140,7 @@ fn load_counters<T: TxnService>(txn: &T, ctx: &TxnCtx) -> Result<CatalogCounters
         META_NEXT_GC_TASK_ID,
     ] {
         let key = encode_record_key_with_handle(ALL_META_TABLE_ID, meta_id);
-        if let Some(data) = crate::io::block_on_sync(txn.get(ctx, &key))? {
+        if let Some(data) = crate::io::block_on_sync(txn.get(ctx, ALL_META_TABLE_ID, &key))? {
             let col_ids = &[0, 1, 2, 3];
             let data_types = &[
                 DataType::BigInt,
@@ -658,7 +658,7 @@ pub fn get_table_by_id_at<T: TxnService>(
 
     // Read the table row directly by handle
     let key = encode_record_key_with_handle(ALL_TABLE_TABLE_ID, id as i64);
-    let table_data = match crate::io::block_on_sync(txn.get(&ctx, &key))? {
+    let table_data = match crate::io::block_on_sync(txn.get(&ctx, ALL_TABLE_TABLE_ID, &key))? {
         Some(data) => data,
         None => return Ok(None),
     };

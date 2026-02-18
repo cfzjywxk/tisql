@@ -106,8 +106,11 @@ impl FlushScheduler {
 
     /// Stop the background flush worker.
     ///
-    /// Signals the worker to stop and waits for it to finish.
-    /// Any in-progress flush will complete before the worker exits.
+    /// Signals the worker to stop and aborts the worker task.
+    ///
+    /// An in-progress flush may be interrupted. Callers that follow stop with a
+    /// synchronous final flush should reset interrupted `Flushing` states first
+    /// (see `LsmEngine::reset_aborted_flush_states`).
     pub fn stop(&self) {
         // Signal shutdown
         self.inner.shutdown.store(true, Ordering::SeqCst);

@@ -30,7 +30,7 @@ use crate::util::error::Result;
 pub async fn is_bootstrapped<T: TxnService>(txn: &T) -> Result<bool> {
     let ctx = txn.begin(true)?;
     let key = encode_record_key_with_handle(ALL_META_TABLE_ID, META_BOOTSTRAP_VERSION);
-    Ok(txn.get(&ctx, &key).await?.is_some())
+    Ok(txn.get(&ctx, ALL_META_TABLE_ID, &key).await?.is_some())
 }
 
 /// Bootstrap all core system tables via direct KV writes in a single transaction.
@@ -114,7 +114,7 @@ async fn write_meta_row<T: TxnService>(
         Value::BigInt(0), // updated_ts placeholder
     ];
     let row_data = encode_row(col_ids, values);
-    txn.put(ctx, key, row_data).await
+    txn.put(ctx, ALL_META_TABLE_ID, key, row_data).await
 }
 
 /// Write a row into `__all_schema` (table_id=2).
@@ -131,7 +131,7 @@ async fn write_schema_row<T: TxnService>(
         Value::String(schema_name.to_string()),
     ];
     let row_data = encode_row(col_ids, values);
-    txn.put(ctx, key, row_data).await
+    txn.put(ctx, ALL_SCHEMA_TABLE_ID, key, row_data).await
 }
 
 /// Write a row into `__all_table` (table_id=3).
@@ -158,7 +158,7 @@ async fn write_table_row<T: TxnService>(
         Value::BigInt(table.auto_increment_id() as i64),
     ];
     let row_data = encode_row(col_ids, values);
-    txn.put(ctx, key, row_data).await
+    txn.put(ctx, ALL_TABLE_TABLE_ID, key, row_data).await
 }
 
 /// Write a row into `__all_column` (table_id=4).
@@ -190,7 +190,7 @@ async fn write_column_row<T: TxnService>(
         Value::Int(col.auto_increment() as i32),
     ];
     let row_data = encode_row(col_ids, values);
-    txn.put(ctx, key, row_data).await
+    txn.put(ctx, ALL_COLUMN_TABLE_ID, key, row_data).await
 }
 
 /// Write a row into `__all_table` for a user table with an explicit schema_id.
@@ -217,7 +217,7 @@ pub(crate) async fn write_user_table_row<T: TxnService>(
         Value::BigInt(table.auto_increment_id() as i64),
     ];
     let row_data = encode_row(col_ids, values);
-    txn.put(ctx, key, row_data).await
+    txn.put(ctx, ALL_TABLE_TABLE_ID, key, row_data).await
 }
 
 /// Write column rows into `__all_column` for a user table.
@@ -260,7 +260,7 @@ pub(crate) async fn write_index_row<T: TxnService>(
         Value::Int(index.unique() as i32),
     ];
     let row_data = encode_row(col_ids, values);
-    txn.put(ctx, key, row_data).await
+    txn.put(ctx, ALL_INDEX_TABLE_ID, key, row_data).await
 }
 
 /// Delete all column rows for a table from `__all_column`.
@@ -273,7 +273,7 @@ pub(crate) async fn delete_column_rows<T: TxnService>(
     for col in columns {
         let column_key = table_id * 10000 + col.id() as u64;
         let key = encode_record_key_with_handle(ALL_COLUMN_TABLE_ID, column_key as i64);
-        txn.delete(ctx, key).await?;
+        txn.delete(ctx, ALL_COLUMN_TABLE_ID, key).await?;
     }
     Ok(())
 }
@@ -288,7 +288,7 @@ pub(crate) async fn delete_index_rows<T: TxnService>(
     for index in indexes {
         let index_key = table_id * 10000 + index.id();
         let key = encode_record_key_with_handle(ALL_INDEX_TABLE_ID, index_key as i64);
-        txn.delete(ctx, key).await?;
+        txn.delete(ctx, ALL_INDEX_TABLE_ID, key).await?;
     }
     Ok(())
 }
@@ -316,7 +316,8 @@ pub(crate) async fn write_gc_task_row<T: TxnService>(
         Value::String(status.to_string()),
     ];
     let row_data = encode_row(col_ids, values);
-    txn.put(ctx, key, row_data).await
+    txn.put(ctx, ALL_GC_DELETE_RANGE_TABLE_ID, key, row_data)
+        .await
 }
 
 /// Update the status of a GC task in `__all_gc_delete_range`.
@@ -428,7 +429,10 @@ mod tests {
         for meta_id in 1..=6i64 {
             let key = encode_record_key_with_handle(ALL_META_TABLE_ID, meta_id);
             assert!(
-                txn.get(&ctx, &key).await.unwrap().is_some(),
+                txn.get(&ctx, ALL_META_TABLE_ID, &key)
+                    .await
+                    .unwrap()
+                    .is_some(),
                 "Meta row {meta_id} missing"
             );
         }
@@ -444,7 +448,10 @@ mod tests {
         for schema_id in [INNER_SCHEMA_ID, DEFAULT_SCHEMA_ID, TEST_SCHEMA_ID] {
             let key = encode_record_key_with_handle(ALL_SCHEMA_TABLE_ID, schema_id as i64);
             assert!(
-                txn.get(&ctx, &key).await.unwrap().is_some(),
+                txn.get(&ctx, ALL_META_TABLE_ID, &key)
+                    .await
+                    .unwrap()
+                    .is_some(),
                 "Schema row {schema_id} missing"
             );
         }
@@ -459,7 +466,10 @@ mod tests {
         for table_id in 1..=5u64 {
             let key = encode_record_key_with_handle(ALL_TABLE_TABLE_ID, table_id as i64);
             assert!(
-                txn.get(&ctx, &key).await.unwrap().is_some(),
+                txn.get(&ctx, ALL_META_TABLE_ID, &key)
+                    .await
+                    .unwrap()
+                    .is_some(),
                 "Table row {table_id} missing"
             );
         }

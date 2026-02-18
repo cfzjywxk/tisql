@@ -1,0 +1,24 @@
+CREATE TABLE dirty_read_test (id INT PRIMARY KEY, val VARCHAR(100))
+BEGIN
+INSERT INTO dirty_read_test VALUES (1, 'uncommitted_s1')
+AFFECTED 1
+SELECT * FROM dirty_read_test
+id	val
+SELECT * FROM dirty_read_test
+id	val
+ROLLBACK
+SELECT * FROM dirty_read_test
+id	val
+SELECT * FROM dirty_read_test
+id	val
+BEGIN
+INSERT INTO dirty_read_test VALUES (2, 'committed_s1')
+AFFECTED 1
+COMMIT
+SELECT * FROM dirty_read_test
+id	val
+2	committed_s1
+SELECT * FROM dirty_read_test
+id	val
+2	committed_s1
+DROP TABLE dirty_read_test

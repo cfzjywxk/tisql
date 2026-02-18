@@ -1,0 +1,47 @@
+# TXN-006: No Dirty Read - Uncommitted INSERT
+#
+# Ensure that uncommitted INSERT operations are not visible to other sessions.
+# This is a fundamental ACID property test for isolation.
+
+# Setup
+CREATE TABLE dirty_read_test (id INT PRIMARY KEY, val VARCHAR(100));
+
+# Session s1: Begin transaction and insert (not committed)
+--session s1
+BEGIN;
+INSERT INTO dirty_read_test VALUES (1, 'uncommitted_s1');
+
+# Session s2: Should see no rows (dirty read prevention)
+--session s2
+SELECT * FROM dirty_read_test;
+
+# Session s3: Also verify autocommit session sees nothing
+--session s3
+SELECT * FROM dirty_read_test;
+
+# Session s1: Rollback - the insert should be discarded
+--session s1
+ROLLBACK;
+
+# All sessions should still see no rows after rollback
+--session s2
+SELECT * FROM dirty_read_test;
+
+--session s3
+SELECT * FROM dirty_read_test;
+
+# Now test that committed data is visible
+--session s1
+BEGIN;
+INSERT INTO dirty_read_test VALUES (2, 'committed_s1');
+COMMIT;
+
+# All sessions should see the committed row
+--session s2
+SELECT * FROM dirty_read_test;
+
+--session s3
+SELECT * FROM dirty_read_test;
+
+# Cleanup
+DROP TABLE dirty_read_test;

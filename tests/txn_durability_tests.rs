@@ -29,6 +29,8 @@ use tisql::testkit::{
 };
 use tisql::{ClogService, StorageEngine, TxnService};
 
+const SYS_TABLE_ID: u64 = 1;
+
 use tisql::catalog::types::Timestamp;
 use tisql::tablet::{is_tombstone, MvccIterator, MvccKey};
 
@@ -176,15 +178,15 @@ async fn test_explicit_txn_crash_recovery() {
 
         let mut ctx = txn_service.begin_explicit(false).unwrap();
         txn_service
-            .put(&mut ctx, b"ek1".to_vec(), b"ev1".to_vec())
+            .put(&mut ctx, SYS_TABLE_ID, b"ek1".to_vec(), b"ev1".to_vec())
             .await
             .unwrap();
         txn_service
-            .put(&mut ctx, b"ek2".to_vec(), b"ev2".to_vec())
+            .put(&mut ctx, SYS_TABLE_ID, b"ek2".to_vec(), b"ev2".to_vec())
             .await
             .unwrap();
         txn_service
-            .put(&mut ctx, b"ek3".to_vec(), b"ev3".to_vec())
+            .put(&mut ctx, SYS_TABLE_ID, b"ek3".to_vec(), b"ev3".to_vec())
             .await
             .unwrap();
         let info = txn_service.commit(ctx).await.unwrap();
@@ -231,7 +233,7 @@ async fn test_explicit_txn_delete_crash_recovery() {
 
         let mut ctx = txn_service.begin_explicit(false).unwrap();
         txn_service
-            .delete(&mut ctx, b"key1".to_vec())
+            .delete(&mut ctx, SYS_TABLE_ID, b"key1".to_vec())
             .await
             .unwrap();
         let info = txn_service.commit(ctx).await.unwrap();
@@ -267,11 +269,11 @@ async fn test_mixed_implicit_explicit_crash_recovery() {
         // Explicit: put key2, delete key1
         let mut ctx = txn_service.begin_explicit(false).unwrap();
         txn_service
-            .put(&mut ctx, b"key2".to_vec(), b"v2".to_vec())
+            .put(&mut ctx, SYS_TABLE_ID, b"key2".to_vec(), b"v2".to_vec())
             .await
             .unwrap();
         txn_service
-            .delete(&mut ctx, b"key1".to_vec())
+            .delete(&mut ctx, SYS_TABLE_ID, b"key1".to_vec())
             .await
             .unwrap();
         txn_service.commit(ctx).await.unwrap();
@@ -317,7 +319,7 @@ async fn test_explicit_txn_rollback_not_recovered() {
         // Explicit txn 1: put key1, rollback
         let mut ctx1 = txn_service.begin_explicit(false).unwrap();
         txn_service
-            .put(&mut ctx1, b"key1".to_vec(), b"v1".to_vec())
+            .put(&mut ctx1, SYS_TABLE_ID, b"key1".to_vec(), b"v1".to_vec())
             .await
             .unwrap();
         txn_service.rollback(ctx1).unwrap();
@@ -325,7 +327,7 @@ async fn test_explicit_txn_rollback_not_recovered() {
         // Explicit txn 2: put key2, commit
         let mut ctx2 = txn_service.begin_explicit(false).unwrap();
         txn_service
-            .put(&mut ctx2, b"key2".to_vec(), b"v2".to_vec())
+            .put(&mut ctx2, SYS_TABLE_ID, b"key2".to_vec(), b"v2".to_vec())
             .await
             .unwrap();
         let info = txn_service.commit(ctx2).await.unwrap();
@@ -365,6 +367,7 @@ async fn test_large_explicit_txn_10k_keys_crash_recovery() {
             txn_service
                 .put(
                     &mut ctx,
+                    SYS_TABLE_ID,
                     format!("bulk_key_{i:05}").into_bytes(),
                     format!("bulk_val_{i:05}").into_bytes(),
                 )

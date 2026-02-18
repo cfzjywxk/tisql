@@ -63,7 +63,7 @@ use crate::util::error::{Result, TiSqlError};
 
 use super::commit_reservations::{CommitLsnReservations, CommitReservationStats};
 use super::config::{LsmConfig, V26BoundaryMode};
-use super::ilog::IlogService;
+use super::ilog::{IlogService, IlogTruncateStats};
 use super::memtable::{FlushState, MemTable};
 use super::sstable::{
     AsyncSstBuilder, SstBuilderOptions, SstIterator, SstMeta, SstMvccIterator, SstReaderRef,
@@ -907,12 +907,62 @@ impl LsmEngine {
         manifest.checkpoint_and_capture().await
     }
 
+    /// Close this tablet's ilog writer, flushing pending records.
+    ///
+    /// No-op for in-memory tablets without a durable ilog.
+    pub fn close_ilog(&self) -> Result<()> {
+        if let Some(ilog) = &self.ilog {
+            ilog.close()?;
+        }
+        Ok(())
+    }
+
+    /// Shutdown this tablet's ilog writer channel before runtime teardown.
+    ///
+    /// No-op for in-memory tablets without a durable ilog.
+    pub fn shutdown_ilog(&self) {
+        if let Some(ilog) = &self.ilog {
+            ilog.shutdown();
+        }
+    }
+
+    /// Convert any interrupted `Flushing` memtables back to retryable state.
+    ///
+    /// Background worker stop currently aborts worker tasks, which can leave a
+    /// memtable marked as `Flushing` if cancellation happened mid-flush. Before
+    /// a synchronous shutdown/remove flush, reset those states so data is not
+    /// stranded in memory.
+    pub fn reset_aborted_flush_states(&self) {
+        let state = self.state.read();
+        if state.active.flush_state() == FlushState::Flushing {
+            state.active.set_flush_state(FlushState::NeedsFlush);
+        }
+        for frozen in &state.frozen {
+            if frozen.flush_state() == FlushState::Flushing {
+                frozen.set_flush_state(FlushState::NeedsFlush);
+            }
+        }
+    }
+
+    /// Truncate this tablet's ilog before `min_keep_lsn`.
+    ///
+    /// No-op is not allowed: callers should only invoke this on durable tablets.
+    pub async fn truncate_ilog_before(&self, min_keep_lsn: Lsn) -> Result<IlogTruncateStats> {
+        let ilog = self
+            .ilog
+            .as_ref()
+            .ok_or_else(|| TiSqlError::Internal("Tablet has no durable ilog".into()))?;
+        ilog.truncate_before(min_keep_lsn).await
+    }
+
     pub fn shutdown_manifest_writer(&self) {
         self.manifest_writer.lock().take();
         let wait_start = std::time::Instant::now();
         while self.manifest_writer_running.load(AtomicOrdering::SeqCst)
             && wait_start.elapsed() < Duration::from_secs(2)
         {
+            // This path runs in sync drop/close contexts where awaiting an
+            // async sleep is not possible; keep the wait bounded and short.
             std::thread::sleep(Duration::from_millis(1));
         }
         if self.manifest_writer_running.load(AtomicOrdering::SeqCst) {

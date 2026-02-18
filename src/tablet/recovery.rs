@@ -42,18 +42,19 @@
 //! let (lsm_engine, clog_service, ilog_service) = recovery.recover()?;
 //! ```
 
-use std::collections::HashMap;
-use std::path::PathBuf;
+use std::collections::{BTreeMap, BTreeSet, HashMap};
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use crate::catalog::types::{Lsn, Timestamp, TxnId};
 use crate::clog::{ClogEntry, ClogOp, FileClogConfig, FileClogService};
 use crate::lsn::{new_lsn_provider, SharedLsnProvider};
-use crate::tablet::{LsmConfig, LsmEngine, StorageEngine, WriteBatch};
+use crate::tablet::{LsmConfig, LsmEngine, StorageEngine, TabletId, TabletManager, WriteBatch};
 use crate::util::error::Result;
 use crate::{log_info, log_warn};
 
 use super::ilog::{IlogConfig, IlogService};
+use super::router::route_key_to_tablet;
 
 /// Recovery state for a transaction during clog replay.
 #[derive(Default)]
@@ -78,6 +79,36 @@ pub struct RecoveryResult {
     pub lsn_provider: SharedLsnProvider,
     /// Recovery statistics
     pub stats: RecoveryStats,
+}
+
+/// Bootstrap output for staged recovery orchestration.
+///
+/// This includes system-tablet ilog recovery and clog loading, but does not
+/// replay clog entries yet. Callers can decide replay ordering.
+pub struct RecoveryBootstrap {
+    /// Recovered system-tablet engine from system ilog.
+    pub engine: LsmEngine,
+    /// Recovered shared clog service.
+    pub clog: Arc<FileClogService>,
+    /// Recovered system ilog service.
+    pub ilog: Arc<IlogService>,
+    /// Shared LSN provider.
+    pub lsn_provider: SharedLsnProvider,
+    /// Shared I/O service for recovering additional tablets.
+    pub io_service: Arc<crate::io::IoService>,
+    /// Raw clog entries loaded from disk.
+    pub clog_entries: Vec<ClogEntry>,
+    /// Max commit_ts observed from recovered system SST metadata.
+    pub max_ts_from_ssts: Timestamp,
+    /// Recovery statistics accumulated so far.
+    pub stats: RecoveryStats,
+}
+
+/// One recovered tablet-local engine from tablet-scoped ilog.
+pub struct RecoveredTablet {
+    pub engine: LsmEngine,
+    pub max_ts_from_ssts: Timestamp,
+    pub orphan_ssts_cleaned: usize,
 }
 
 /// Statistics from recovery.
@@ -135,12 +166,11 @@ impl LsmRecovery {
         }
     }
 
-    /// Perform recovery.
-    ///
-    /// Returns the recovered LSM engine along with clog and ilog services.
-    /// `io_handle` is the I/O runtime handle for spawning GroupCommitWriter
-    /// and IoService tasks.
-    pub fn recover(self, io_handle: &tokio::runtime::Handle) -> Result<RecoveryResult> {
+    /// Recover the system tablet and load clog entries without replaying them.
+    pub fn recover_bootstrap(
+        self,
+        io_handle: &tokio::runtime::Handle,
+    ) -> Result<RecoveryBootstrap> {
         let mut stats = RecoveryStats::default();
 
         // Create shared LSN provider
@@ -214,22 +244,209 @@ impl LsmRecovery {
             flushed_lsn,
         );
 
-        // Step 5: Replay clog entries, skipping committed txns already in SSTs.
-        //
-        // Entries with commit_lsn <= flushed_lsn are already durably in SSTs
-        // and can be skipped. This is safe because flush_memtable_async()
-        // computes a safe flushed_lsn that never exceeds a straggler's LSN
-        // in another memtable (via min_lsn_excluding).
-        let replay_result = Self::replay_clog(&engine, &clog_entries, flushed_lsn)?;
+        stats.clog_entries = clog_entries.len();
+        stats.max_commit_ts = max_commit_ts_from_entries(&clog_entries).max(max_ts_from_ssts);
+        stats.final_lsn = lsn_provider.current_lsn();
+
+        Ok(RecoveryBootstrap {
+            engine,
+            clog,
+            ilog,
+            lsn_provider,
+            io_service,
+            clog_entries,
+            max_ts_from_ssts,
+            stats,
+        })
+    }
+
+    /// Recover one non-system tablet from its tablet-scoped ilog.
+    pub fn recover_tablet(
+        tablet_dir: &Path,
+        lsn_provider: SharedLsnProvider,
+        io_service: Arc<crate::io::IoService>,
+        io_handle: &tokio::runtime::Handle,
+    ) -> Result<RecoveredTablet> {
+        let ilog_config = IlogConfig::new(tablet_dir);
+        let lsm_config = LsmConfig::new(tablet_dir);
+
+        let (ilog, version, orphan_ssts) = IlogService::recover(
+            ilog_config,
+            Arc::clone(&lsn_provider),
+            Arc::clone(&io_service),
+            io_handle,
+        )?;
+        let ilog = Arc::new(ilog);
+
+        let max_ts_from_ssts = version.max_ts();
+        let orphan_ssts_cleaned = if orphan_ssts.is_empty() {
+            0
+        } else {
+            ilog.cleanup_orphan_ssts(&version, &orphan_ssts)?
+        };
+
+        let engine =
+            LsmEngine::open_with_recovery(lsm_config, lsn_provider, ilog, version, io_service)?;
+
+        Ok(RecoveredTablet {
+            engine,
+            max_ts_from_ssts,
+            orphan_ssts_cleaned,
+        })
+    }
+
+    /// Replay shared clog entries into mounted tablets.
+    ///
+    /// `include_non_system == false` replays only transactions whose keys route
+    /// entirely to `TabletId::System`.
+    /// `include_non_system == true` replays only transactions touching at least
+    /// one non-system tablet.
+    ///
+    /// Phase-4 note: if a logical tablet is not mounted yet, replay
+    /// conservatively falls back to `TabletId::System` (same as runtime
+    /// routing fallback). This preserves durability, and dedicated-tablet
+    /// ownership is tightened in later phases.
+    pub fn replay_clog_to_tablets(
+        manager: &TabletManager,
+        entries: &[ClogEntry],
+        include_non_system: bool,
+    ) -> Result<ReplayResult> {
+        let mut txn_states: HashMap<TxnId, TxnReplayState> = HashMap::new();
+        let mut result = ReplayResult::default();
+
+        // First pass: collect all entries and track max commit ts globally.
+        for entry in entries {
+            if let ClogOp::Commit { commit_ts } = &entry.op {
+                result.max_commit_ts = result.max_commit_ts.max(*commit_ts);
+            }
+            result.entries_replayed += 1;
+
+            match &entry.op {
+                ClogOp::Put { key, value } => {
+                    let state = txn_states.entry(entry.txn_id).or_default();
+                    state.writes.push((key.clone(), Some(value.clone())));
+                }
+                ClogOp::Delete { key } => {
+                    let state = txn_states.entry(entry.txn_id).or_default();
+                    state.writes.push((key.clone(), None));
+                }
+                ClogOp::Commit { commit_ts } => {
+                    if let Some(state) = txn_states.get_mut(&entry.txn_id) {
+                        state.commit_ts = Some(*commit_ts);
+                        state.commit_lsn = Some(entry.lsn);
+                    }
+                }
+                ClogOp::Rollback => {
+                    txn_states.remove(&entry.txn_id);
+                }
+            }
+        }
+
+        let mut committed_txns: Vec<(TxnId, TxnReplayState)> = txn_states
+            .into_iter()
+            .filter(|(_, state)| state.commit_ts.is_some() && !state.writes.is_empty())
+            .collect();
+        committed_txns.sort_by_key(|(_, state)| state.commit_lsn);
+
+        for (_txn_id, state) in committed_txns {
+            let commit_ts = state.commit_ts.expect("filtered committed");
+            let commit_lsn = state.commit_lsn.unwrap_or(0);
+
+            let logical_tablets = touched_logical_tablets(&state.writes);
+            let touches_non_system = logical_tablets.iter().any(|id| *id != TabletId::System);
+            if include_non_system != touches_non_system {
+                continue;
+            }
+
+            let mut mounted_tablets = BTreeSet::new();
+            let mut fallback_logical_tablets = BTreeSet::new();
+            for logical in logical_tablets {
+                let mounted = if manager.get_tablet(logical).is_some() {
+                    logical
+                } else {
+                    fallback_logical_tablets.insert(logical);
+                    TabletId::System
+                };
+                mounted_tablets.insert(mounted);
+            }
+            if include_non_system && !fallback_logical_tablets.is_empty() {
+                log_warn!(
+                    "replay_clog_to_tablets: falling back to system tablet for unmounted logical tablets: {:?}",
+                    fallback_logical_tablets
+                );
+            }
+            if mounted_tablets.is_empty() {
+                mounted_tablets.insert(TabletId::System);
+            }
+
+            // Skip txns already flushed on every touched mounted tablet.
+            let fully_flushed = mounted_tablets.iter().all(|tablet_id| {
+                manager
+                    .get_tablet(*tablet_id)
+                    .or_else(|| {
+                        if *tablet_id == TabletId::System {
+                            Some(manager.system_tablet())
+                        } else {
+                            None
+                        }
+                    })
+                    .is_some_and(|tablet| tablet.current_version().flushed_lsn() >= commit_lsn)
+            });
+            if fully_flushed {
+                continue;
+            }
+
+            let mut per_tablet: BTreeMap<TabletId, WriteBatch> = BTreeMap::new();
+            for (key, value) in state.writes {
+                let logical = route_key_to_tablet(&key);
+                let tablet_id = if manager.get_tablet(logical).is_some() {
+                    logical
+                } else {
+                    TabletId::System
+                };
+                let batch = per_tablet.entry(tablet_id).or_default();
+                match value {
+                    Some(v) => batch.put(key, v),
+                    None => batch.delete(key),
+                }
+            }
+
+            for (tablet_id, mut batch) in per_tablet {
+                batch.set_commit_ts(commit_ts);
+                batch.set_clog_lsn(commit_lsn);
+                let tablet = if tablet_id == TabletId::System {
+                    manager.system_tablet()
+                } else {
+                    manager
+                        .get_tablet(tablet_id)
+                        .unwrap_or_else(|| manager.system_tablet())
+                };
+                tablet.write_batch(batch)?;
+            }
+            result.txn_count += 1;
+        }
+
+        Ok(result)
+    }
+
+    /// Perform legacy one-engine recovery (system-only replay).
+    ///
+    /// Returns the recovered LSM engine along with clog and ilog services.
+    /// `io_handle` is the I/O runtime handle for spawning GroupCommitWriter
+    /// and IoService tasks.
+    pub fn recover(self, io_handle: &tokio::runtime::Handle) -> Result<RecoveryResult> {
+        let bootstrap = self.recover_bootstrap(io_handle)?;
+        let replay_result = Self::replay_clog(
+            &bootstrap.engine,
+            &bootstrap.clog_entries,
+            bootstrap.stats.flushed_lsn,
+        )?;
+
+        let mut stats = bootstrap.stats;
         stats.clog_entries = replay_result.entries_replayed;
         stats.txn_count = replay_result.txn_count;
-        // Use max of clog and SST timestamps to handle clog truncation correctly.
-        // If clog was truncated, old commit timestamps would be missing from clog
-        // but preserved in SST metadata. This ensures TSO never goes backwards.
-        stats.max_commit_ts = replay_result.max_commit_ts.max(max_ts_from_ssts);
-
-        // LSN provider is automatically updated by clog recovery to be at least max(clog_lsn) + 1
-        stats.final_lsn = lsn_provider.current_lsn();
+        stats.max_commit_ts = replay_result.max_commit_ts.max(bootstrap.max_ts_from_ssts);
+        stats.final_lsn = bootstrap.lsn_provider.current_lsn();
 
         log_info!(
             "Recovery complete: replayed {} clog entries, {} transactions, final_lsn={}",
@@ -239,10 +456,10 @@ impl LsmRecovery {
         );
 
         Ok(RecoveryResult {
-            engine,
-            clog,
-            ilog,
-            lsn_provider,
+            engine: bootstrap.engine,
+            clog: bootstrap.clog,
+            ilog: bootstrap.ilog,
+            lsn_provider: bootstrap.lsn_provider,
             stats,
         })
     }
@@ -336,11 +553,30 @@ impl LsmRecovery {
 
 /// Result of clog replay.
 #[derive(Default)]
-struct ReplayResult {
-    entries_replayed: usize,
-    txn_count: usize,
+pub struct ReplayResult {
+    pub entries_replayed: usize,
+    pub txn_count: usize,
     /// Max commit_ts seen across ALL entries (for TSO initialization)
-    max_commit_ts: Timestamp,
+    pub max_commit_ts: Timestamp,
+}
+
+fn max_commit_ts_from_entries(entries: &[ClogEntry]) -> Timestamp {
+    entries
+        .iter()
+        .filter_map(|entry| match &entry.op {
+            ClogOp::Commit { commit_ts } => Some(*commit_ts),
+            _ => None,
+        })
+        .max()
+        .unwrap_or(0)
+}
+
+fn touched_logical_tablets(writes: &[(Vec<u8>, Option<Vec<u8>>)]) -> BTreeSet<TabletId> {
+    let mut tablets = BTreeSet::new();
+    for (key, _) in writes {
+        tablets.insert(route_key_to_tablet(key));
+    }
+    tablets
 }
 
 #[cfg(test)]

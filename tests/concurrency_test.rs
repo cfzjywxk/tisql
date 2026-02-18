@@ -36,6 +36,8 @@ use tisql::testkit::{
 use tisql::util::error::TiSqlError;
 use tisql::StorageEngine;
 
+const SYS_TABLE_ID: u64 = 1;
+
 fn make_test_io() -> Arc<tisql::io::IoService> {
     tisql::io::IoService::new(32).unwrap()
 }
@@ -469,15 +471,15 @@ async fn test_implicit_multiple_puts_same_key() {
     // Start a transaction and put the same key multiple times
     let mut ctx = txn_service.begin(false).unwrap();
     txn_service
-        .put(&mut ctx, key.to_vec(), value1.to_vec())
+        .put(&mut ctx, SYS_TABLE_ID, key.to_vec(), value1.to_vec())
         .await
         .unwrap();
     txn_service
-        .put(&mut ctx, key.to_vec(), value2.to_vec())
+        .put(&mut ctx, SYS_TABLE_ID, key.to_vec(), value2.to_vec())
         .await
         .unwrap();
     txn_service
-        .put(&mut ctx, key.to_vec(), value3.to_vec())
+        .put(&mut ctx, SYS_TABLE_ID, key.to_vec(), value3.to_vec())
         .await
         .unwrap();
 
@@ -486,7 +488,7 @@ async fn test_implicit_multiple_puts_same_key() {
 
     // Read after commit should see the last value
     let read_ctx = txn_service.begin(true).unwrap();
-    let result = txn_service.get(&read_ctx, key).await.unwrap();
+    let result = txn_service.get(&read_ctx, SYS_TABLE_ID, key).await.unwrap();
     assert_eq!(
         result,
         Some(value3.to_vec()),
@@ -509,17 +511,20 @@ async fn test_implicit_put_then_delete() {
     // Start a transaction, put then delete
     let mut ctx = txn_service.begin(false).unwrap();
     txn_service
-        .put(&mut ctx, key.to_vec(), value.to_vec())
+        .put(&mut ctx, SYS_TABLE_ID, key.to_vec(), value.to_vec())
         .await
         .unwrap();
-    txn_service.delete(&mut ctx, key.to_vec()).await.unwrap();
+    txn_service
+        .delete(&mut ctx, SYS_TABLE_ID, key.to_vec())
+        .await
+        .unwrap();
 
     // Commit the transaction
     txn_service.commit(ctx).await.unwrap();
 
     // Read after commit should see None (delete wins)
     let read_ctx = txn_service.begin(true).unwrap();
-    let result = txn_service.get(&read_ctx, key).await.unwrap();
+    let result = txn_service.get(&read_ctx, SYS_TABLE_ID, key).await.unwrap();
     assert_eq!(result, None, "Committed result should be delete (None)");
 }
 
@@ -538,16 +543,24 @@ async fn test_implicit_delete_then_put() {
     // First, insert an initial value
     let mut setup_ctx = txn_service.begin(false).unwrap();
     txn_service
-        .put(&mut setup_ctx, key.to_vec(), b"initial".to_vec())
+        .put(
+            &mut setup_ctx,
+            SYS_TABLE_ID,
+            key.to_vec(),
+            b"initial".to_vec(),
+        )
         .await
         .unwrap();
     txn_service.commit(setup_ctx).await.unwrap();
 
     // Start a new transaction, delete then put
     let mut ctx = txn_service.begin(false).unwrap();
-    txn_service.delete(&mut ctx, key.to_vec()).await.unwrap();
     txn_service
-        .put(&mut ctx, key.to_vec(), value.to_vec())
+        .delete(&mut ctx, SYS_TABLE_ID, key.to_vec())
+        .await
+        .unwrap();
+    txn_service
+        .put(&mut ctx, SYS_TABLE_ID, key.to_vec(), value.to_vec())
         .await
         .unwrap();
 
@@ -556,7 +569,7 @@ async fn test_implicit_delete_then_put() {
 
     // Read after commit should see the new value (put wins)
     let read_ctx = txn_service.begin(true).unwrap();
-    let result = txn_service.get(&read_ctx, key).await.unwrap();
+    let result = txn_service.get(&read_ctx, SYS_TABLE_ID, key).await.unwrap();
     assert_eq!(
         result,
         Some(value.to_vec()),
@@ -576,24 +589,27 @@ async fn test_implicit_dedup_commit() {
 
     // Key "a" - multiple puts, last should win
     txn_service
-        .put(&mut ctx, b"a".to_vec(), b"a1".to_vec())
+        .put(&mut ctx, SYS_TABLE_ID, b"a".to_vec(), b"a1".to_vec())
         .await
         .unwrap();
     txn_service
-        .put(&mut ctx, b"a".to_vec(), b"a2".to_vec())
+        .put(&mut ctx, SYS_TABLE_ID, b"a".to_vec(), b"a2".to_vec())
         .await
         .unwrap();
 
     // Key "b" - put then delete, should be absent
     txn_service
-        .put(&mut ctx, b"b".to_vec(), b"b1".to_vec())
+        .put(&mut ctx, SYS_TABLE_ID, b"b".to_vec(), b"b1".to_vec())
         .await
         .unwrap();
-    txn_service.delete(&mut ctx, b"b".to_vec()).await.unwrap();
+    txn_service
+        .delete(&mut ctx, SYS_TABLE_ID, b"b".to_vec())
+        .await
+        .unwrap();
 
     // Key "c" - single put
     txn_service
-        .put(&mut ctx, b"c".to_vec(), b"c1".to_vec())
+        .put(&mut ctx, SYS_TABLE_ID, b"c".to_vec(), b"c1".to_vec())
         .await
         .unwrap();
 
@@ -603,7 +619,9 @@ async fn test_implicit_dedup_commit() {
     // Scan after commit should show: a=a2, c=c1 (b is deleted/absent)
     let read_ctx = txn_service.begin(true).unwrap();
     let range = b"a".to_vec()..b"d".to_vec();
-    let mut iter = txn_service.scan_iter(&read_ctx, range).unwrap();
+    let mut iter = txn_service
+        .scan_iter(&read_ctx, SYS_TABLE_ID, range)
+        .unwrap();
     let mut results = Vec::new();
     iter.advance().await.unwrap();
     while iter.valid() {
@@ -741,7 +759,10 @@ mod failpoint_tests {
         // Now verify snapshot isolation works correctly:
         // Reader with start_ts < commit_ts should NOT see the committed data
         // (correct behavior - reader started before the logical commit point)
-        let value = txn_service.get(&reader_ctx, key).await.unwrap();
+        let value = txn_service
+            .get(&reader_ctx, SYS_TABLE_ID, key)
+            .await
+            .unwrap();
         assert!(
             value.is_none(),
             "Reader with start_ts < commit_ts should not see the data"
@@ -749,7 +770,10 @@ mod failpoint_tests {
 
         // A new reader starting now should see the data
         let new_reader_ctx = txn_service.begin(true).unwrap();
-        let value = txn_service.get(&new_reader_ctx, key).await.unwrap();
+        let value = txn_service
+            .get(&new_reader_ctx, SYS_TABLE_ID, key)
+            .await
+            .unwrap();
         assert_eq!(
             value,
             Some(b"value".to_vec()),
@@ -805,7 +829,7 @@ mod failpoint_tests {
             );
 
             // None of them should see the data
-            let value = txn_service.get(ctx, key).await.unwrap();
+            let value = txn_service.get(ctx, SYS_TABLE_ID, key).await.unwrap();
             assert!(
                 value.is_none(),
                 "Reader {i} should not see data committed after its start_ts"
@@ -1166,7 +1190,7 @@ async fn test_concurrent_scan_while_writers_run() {
 
                 // Scan the safe range - should always succeed (no writers here)
                 let range = b"safe_00".to_vec()..b"safe_99".to_vec();
-                match txn_service.scan_iter(&ctx, range) {
+                match txn_service.scan_iter(&ctx, SYS_TABLE_ID, range) {
                     Ok(mut iter) => {
                         iter.advance().await.unwrap();
                         let mut count = 0;
@@ -1359,7 +1383,7 @@ async fn test_mvcc_scan_iterator_returns_latest_visible_only() {
     // Start a transaction that sees all latest versions
     let ctx = txn_service.begin(true).unwrap();
     let range = b"key_a".to_vec()..b"key_d".to_vec();
-    let mut iter = txn_service.scan_iter(&ctx, range).unwrap();
+    let mut iter = txn_service.scan_iter(&ctx, SYS_TABLE_ID, range).unwrap();
     iter.advance().await.unwrap();
 
     let mut results: Vec<(Vec<u8>, Vec<u8>)> = Vec::new();

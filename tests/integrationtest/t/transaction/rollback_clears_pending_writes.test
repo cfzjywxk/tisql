@@ -1,0 +1,35 @@
+# TXN-011: ROLLBACK Clears Pending Writes
+#
+# Verify that ROLLBACK properly clears pending writes from storage
+# and releases all locks.
+
+# Setup
+CREATE TABLE rollback_test (id INT PRIMARY KEY, val INT);
+INSERT INTO rollback_test VALUES (1, 100);
+INSERT INTO rollback_test VALUES (2, 200);
+
+# Session s1: Begin, update multiple rows, then rollback
+--session s1
+BEGIN;
+UPDATE rollback_test SET val = 999 WHERE id = 1;
+UPDATE rollback_test SET val = 888 WHERE id = 2;
+
+# Verify s1 sees its own uncommitted changes (read-your-writes)
+SELECT * FROM rollback_test ORDER BY id;
+
+# Rollback all changes
+ROLLBACK;
+
+# After rollback, s1 should see original values
+SELECT * FROM rollback_test ORDER BY id;
+
+# Session s2: Should also see original values (rollback was effective)
+--session s2
+SELECT * FROM rollback_test ORDER BY id;
+
+# Session s2: Should be able to update (locks were released)
+UPDATE rollback_test SET val = 300 WHERE id = 1;
+SELECT * FROM rollback_test WHERE id = 1;
+
+# Cleanup
+DROP TABLE rollback_test;

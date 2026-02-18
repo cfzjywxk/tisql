@@ -1,0 +1,49 @@
+# TXN-012: ROLLBACK Releases All Locks
+#
+# Verify that after ROLLBACK, other transactions can write to previously locked keys.
+
+# Setup
+CREATE TABLE lock_release_test (id INT PRIMARY KEY, val VARCHAR(100));
+INSERT INTO lock_release_test VALUES (1, 'original1');
+INSERT INTO lock_release_test VALUES (2, 'original2');
+INSERT INTO lock_release_test VALUES (3, 'original3');
+
+# Session s1: Begin and lock multiple rows
+--session s1
+BEGIN;
+UPDATE lock_release_test SET val = 'locked1' WHERE id = 1;
+UPDATE lock_release_test SET val = 'locked2' WHERE id = 2;
+UPDATE lock_release_test SET val = 'locked3' WHERE id = 3;
+
+# Session s2: Try to update locked rows - should conflict
+--session s2
+BEGIN;
+--error
+UPDATE lock_release_test SET val = 's2_attempt1' WHERE id = 1;
+--error
+UPDATE lock_release_test SET val = 's2_attempt2' WHERE id = 2;
+
+# Session s2: Verify still in transaction after conflicts
+SELECT 1;
+
+# Session s1: Rollback to release all locks
+--session s1
+ROLLBACK;
+
+# Session s2: Now should be able to update all previously locked rows
+UPDATE lock_release_test SET val = 's2_success1' WHERE id = 1;
+UPDATE lock_release_test SET val = 's2_success2' WHERE id = 2;
+UPDATE lock_release_test SET val = 's2_success3' WHERE id = 3;
+
+# Verify s2's changes
+SELECT * FROM lock_release_test ORDER BY id;
+
+# Commit s2's changes
+COMMIT;
+
+# Session s1: Verify committed changes are visible
+--session s1
+SELECT * FROM lock_release_test ORDER BY id;
+
+# Cleanup
+DROP TABLE lock_release_test;

@@ -1,0 +1,58 @@
+# TXN-026: Explicit Transaction Survives Statement Error
+#
+# Ensure that explicit transaction remains active after statement-level errors
+# like lock conflicts. This prevents premature commit of partial transaction work.
+
+# Setup
+CREATE TABLE error_survive_test (id INT PRIMARY KEY, val INT);
+INSERT INTO error_survive_test VALUES (1, 100);
+INSERT INTO error_survive_test VALUES (2, 200);
+INSERT INTO error_survive_test VALUES (3, 300);
+
+# Session s1: Lock row 1
+--session s1
+BEGIN;
+UPDATE error_survive_test SET val = 999 WHERE id = 1;
+
+# Session s2: Begin, try to update locked row (conflict)
+--session s2
+BEGIN;
+--error
+UPDATE error_survive_test SET val = 888 WHERE id = 1;
+
+# CRITICAL: Session s2 should STILL be in explicit transaction
+# This prevents the bug where error would implicitly commit partial work
+SELECT 1;
+
+# Session s2: Can still operate within the transaction
+# Should be able to read
+SELECT * FROM error_survive_test WHERE id = 2;
+
+# Should be able to update unlocked rows
+UPDATE error_survive_test SET val = 777 WHERE id = 2;
+SELECT * FROM error_survive_test WHERE id = 2;
+
+# Insert new row
+INSERT INTO error_survive_test VALUES (4, 400);
+SELECT * FROM error_survive_test WHERE id = 4;
+
+# Session s1: Release lock
+--session s1
+ROLLBACK;
+
+# Session s2: Can now update previously locked row
+UPDATE error_survive_test SET val = 666 WHERE id = 1;
+SELECT * FROM error_survive_test WHERE id = 1;
+
+# Commit all of s2's work atomically
+COMMIT;
+
+# Verify s2's changes are all committed
+SELECT * FROM error_survive_test ORDER BY id;
+
+# Session s1: Verify all changes visible
+--session s1
+SELECT * FROM error_survive_test ORDER BY id;
+
+# Cleanup
+DROP TABLE error_survive_test;

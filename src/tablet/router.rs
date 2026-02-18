@@ -119,10 +119,10 @@ pub fn route_index_to_tablet(table_id: TableId, index_id: IndexId) -> TabletId {
     }
 }
 
-/// Route a raw user key to exactly one logical tablet.
+/// Route a raw encoded key to one logical tablet.
 ///
-/// This is a low-level fallback for key-only call sites (e.g. recovery or
-/// defensive validation). Upper layers should prefer
+/// This is crate-internal for recovery/defensive fallback only. Upper layers
+/// should prefer
 /// `route_table_to_tablet` / `route_index_to_tablet`.
 ///
 /// Routing priority (locked by review):
@@ -131,7 +131,7 @@ pub fn route_index_to_tablet(table_id: TableId, index_id: IndexId) -> TabletId {
 /// 3) user `_r` keys -> table tablet
 /// 4) user `_i` keys -> index tablet
 /// 5) anything else -> system (conservative fallback)
-pub fn route_key_to_tablet(key: &[u8]) -> TabletId {
+pub(crate) fn route_key_to_tablet(key: &[u8]) -> TabletId {
     let table_id = match decode_table_id(key) {
         Ok(id) => id,
         Err(_) => return TabletId::System,
@@ -141,7 +141,10 @@ pub fn route_key_to_tablet(key: &[u8]) -> TabletId {
         return TabletId::System;
     }
 
-    if is_record_key(key) {
+    // `is_record_key` validates legacy/int-handle row keys. For common-handle
+    // row keys, the handle payload can be shorter than that legacy minimum, so
+    // we also accept the canonical record prefix marker directly.
+    if is_record_key(key) || has_record_prefix(key) {
         return route_table_to_tablet(table_id);
     }
 
@@ -155,6 +158,12 @@ pub fn route_key_to_tablet(key: &[u8]) -> TabletId {
     }
 
     TabletId::System
+}
+
+#[inline]
+fn has_record_prefix(key: &[u8]) -> bool {
+    // 't' (1 byte) + table_id (8 bytes) + "_r" (2 bytes)
+    key.len() >= 11 && &key[9..11] == b"_r"
 }
 
 fn parse_u64(raw: &str, label: &str, full_name: &str) -> Result<u64> {
@@ -174,7 +183,8 @@ mod tests {
         ALL_SCHEMA_TABLE_ID, ALL_TABLE_TABLE_ID, USER_TABLE_ID_START,
     };
     use crate::util::codec::key::{
-        encode_index_seek_key, encode_record_key_with_handle, encode_value_for_key,
+        encode_index_seek_key, encode_record_key, encode_record_key_with_handle,
+        encode_value_for_key, encode_values_for_key,
     };
 
     #[test]
@@ -265,6 +275,18 @@ mod tests {
                 table_id,
                 index_id: 2001,
             }
+        );
+    }
+
+    #[test]
+    fn route_common_handle_record_key_to_table_tablet() {
+        let table_id = USER_TABLE_ID_START + 90;
+        // Short common-handle payload (5 bytes for INT) used by SQL primary key rows.
+        let common_handle = encode_values_for_key(&[Value::Int(1)]);
+        let record_key = encode_record_key(table_id, &common_handle);
+        assert_eq!(
+            route_key_to_tablet(&record_key),
+            TabletId::Table { table_id }
         );
     }
 

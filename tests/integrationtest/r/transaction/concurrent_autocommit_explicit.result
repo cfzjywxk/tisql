@@ -1,0 +1,21 @@
+CREATE TABLE txn_test (id INT PRIMARY KEY, val VARCHAR(100))
+INSERT INTO txn_test VALUES (1, 'original')
+AFFECTED 1
+BEGIN
+UPDATE txn_test SET val = 'modified_by_s1' WHERE id = 1
+AFFECTED 1
+SELECT val FROM txn_test WHERE id = 1
+val
+original
+ROLLBACK
+SELECT val FROM txn_test WHERE id = 1
+val
+original
+BEGIN
+UPDATE txn_test SET val = 'committed_by_s1' WHERE id = 1
+AFFECTED 1
+COMMIT
+SELECT val FROM txn_test WHERE id = 1
+val
+committed_by_s1
+DROP TABLE txn_test

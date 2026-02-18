@@ -1,0 +1,47 @@
+CREATE TABLE error_survive_test (id INT PRIMARY KEY, val INT)
+INSERT INTO error_survive_test VALUES (1, 100)
+AFFECTED 1
+INSERT INTO error_survive_test VALUES (2, 200)
+AFFECTED 1
+INSERT INTO error_survive_test VALUES (3, 300)
+AFFECTED 1
+BEGIN
+UPDATE error_survive_test SET val = 999 WHERE id = 1
+AFFECTED 1
+BEGIN
+UPDATE error_survive_test SET val = 888 WHERE id = 1
+ERROR 1105: KeyIsLocked
+SELECT 1
+?column?
+1
+SELECT * FROM error_survive_test WHERE id = 2
+id	val
+2	200
+UPDATE error_survive_test SET val = 777 WHERE id = 2
+AFFECTED 1
+SELECT * FROM error_survive_test WHERE id = 2
+id	val
+2	777
+INSERT INTO error_survive_test VALUES (4, 400)
+AFFECTED 1
+SELECT * FROM error_survive_test WHERE id = 4
+id	val
+4	400
+ROLLBACK
+UPDATE error_survive_test SET val = 666 WHERE id = 1
+AFFECTED 1
+SELECT * FROM error_survive_test WHERE id = 1
+id	val
+1	666
+COMMIT
+SELECT * FROM error_survive_test ORDER BY id
+id	val
+1	666
+2	200
+3	300
+SELECT * FROM error_survive_test ORDER BY id
+id	val
+1	666
+2	200
+3	300
+DROP TABLE error_survive_test

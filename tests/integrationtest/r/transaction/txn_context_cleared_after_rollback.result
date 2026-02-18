@@ -1,0 +1,49 @@
+CREATE TABLE ctx_test (id INT PRIMARY KEY, val VARCHAR(100))
+INSERT INTO ctx_test VALUES (1, 'autocommit_insert')
+AFFECTED 1
+SELECT * FROM ctx_test
+id	val
+1	autocommit_insert
+BEGIN
+INSERT INTO ctx_test VALUES (2, 'txn_insert')
+AFFECTED 1
+SELECT * FROM ctx_test ORDER BY id
+id	val
+1	autocommit_insert
+2	txn_insert
+ROLLBACK
+INSERT INTO ctx_test VALUES (3, 'after_rollback_autocommit')
+AFFECTED 1
+SELECT * FROM ctx_test ORDER BY id
+id	val
+1	autocommit_insert
+3	after_rollback_autocommit
+BEGIN
+INSERT INTO ctx_test VALUES (4, 'new_txn')
+AFFECTED 1
+COMMIT
+SELECT * FROM ctx_test ORDER BY id
+id	val
+1	autocommit_insert
+3	after_rollback_autocommit
+4	new_txn
+BEGIN
+INSERT INTO ctx_test VALUES (5, 'will_rollback')
+AFFECTED 1
+ROLLBACK
+SELECT * FROM ctx_test ORDER BY id
+id	val
+1	autocommit_insert
+3	after_rollback_autocommit
+4	new_txn
+BEGIN
+INSERT INTO ctx_test VALUES (6, 'will_commit')
+AFFECTED 1
+COMMIT
+SELECT * FROM ctx_test ORDER BY id
+id	val
+1	autocommit_insert
+3	after_rollback_autocommit
+4	new_txn
+6	will_commit
+DROP TABLE ctx_test

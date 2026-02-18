@@ -1,0 +1,54 @@
+# TXN-013: Transaction Context Cleared After ROLLBACK
+#
+# Ensure that transaction context is properly cleared after ROLLBACK,
+# allowing the session to return to autocommit mode and start new transactions.
+
+# Setup
+CREATE TABLE ctx_test (id INT PRIMARY KEY, val VARCHAR(100));
+
+# Session s1: Verify initial autocommit behavior
+--session s1
+INSERT INTO ctx_test VALUES (1, 'autocommit_insert');
+SELECT * FROM ctx_test;
+
+# Begin explicit transaction
+BEGIN;
+INSERT INTO ctx_test VALUES (2, 'txn_insert');
+SELECT * FROM ctx_test ORDER BY id;
+
+# Rollback
+ROLLBACK;
+
+# After rollback:
+# 1. Should be back in autocommit mode
+# 2. Row 2 should not exist (was rolled back)
+# 3. Should be able to do autocommit operations
+INSERT INTO ctx_test VALUES (3, 'after_rollback_autocommit');
+SELECT * FROM ctx_test ORDER BY id;
+
+# Should be able to start new explicit transaction
+BEGIN;
+INSERT INTO ctx_test VALUES (4, 'new_txn');
+COMMIT;
+
+# Verify final state
+SELECT * FROM ctx_test ORDER BY id;
+
+# Test multiple rollbacks don't cause issues
+BEGIN;
+INSERT INTO ctx_test VALUES (5, 'will_rollback');
+ROLLBACK;
+
+# Verify state unchanged
+SELECT * FROM ctx_test ORDER BY id;
+
+# Start another transaction immediately
+BEGIN;
+INSERT INTO ctx_test VALUES (6, 'will_commit');
+COMMIT;
+
+# Final verification
+SELECT * FROM ctx_test ORDER BY id;
+
+# Cleanup
+DROP TABLE ctx_test;

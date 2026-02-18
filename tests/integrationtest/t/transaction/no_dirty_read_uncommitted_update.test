@@ -1,0 +1,42 @@
+# TXN-007: No Dirty Read - Uncommitted UPDATE
+#
+# Ensure that uncommitted UPDATE operations are not visible to other sessions.
+
+# Setup
+CREATE TABLE update_isolation_test (id INT PRIMARY KEY, val VARCHAR(100));
+INSERT INTO update_isolation_test VALUES (1, 'original');
+INSERT INTO update_isolation_test VALUES (2, 'original2');
+
+# Session s1: Begin and update
+--session s1
+BEGIN;
+UPDATE update_isolation_test SET val = 'modified_by_s1' WHERE id = 1;
+
+# Session s2: Should see original value
+--session s2
+SELECT * FROM update_isolation_test WHERE id = 1;
+
+# Session s2: Scan should also see original
+--session s2
+SELECT * FROM update_isolation_test ORDER BY id;
+
+# Session s1: Rollback
+--session s1
+ROLLBACK;
+
+# Session s2: Should still see original
+--session s2
+SELECT * FROM update_isolation_test WHERE id = 1;
+
+# Now test committed update is visible
+--session s1
+BEGIN;
+UPDATE update_isolation_test SET val = 'committed_update' WHERE id = 1;
+COMMIT;
+
+# Session s2: Should see committed value
+--session s2
+SELECT * FROM update_isolation_test WHERE id = 1;
+
+# Cleanup
+DROP TABLE update_isolation_test;
