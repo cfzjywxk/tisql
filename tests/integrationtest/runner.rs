@@ -14,14 +14,15 @@
 
 //! MySQL-test style E2E test runner for TiSQL
 //!
-//! This runner executes .test files against a TiSQL database and compares
-//! results with .result files.
+//! This runner executes mysql-test style files (`.test` or `.t`) against a
+//! TiSQL database and compares outputs with (`.result` or `.r`) files.
 //!
 //! Usage:
 //!   cargo run --bin mysqltest-runner -- --test crud/basic
 //!   cargo run --bin mysqltest-runner -- --record crud/basic
 //!   cargo run --bin mysqltest-runner -- --all
 
+use std::collections::HashMap;
 use std::fs;
 use std::io::{BufRead, BufReader};
 use std::path::{Path, PathBuf};
@@ -29,7 +30,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use tisql::util::error::TiSqlError;
-use tisql::{Database, DatabaseConfig, QueryResult};
+use tisql::{Database, DatabaseConfig, QueryResult, Session};
 
 /// Test runner configuration
 struct Config {
@@ -52,6 +53,7 @@ struct TestCase {
 /// SQL statement with optional error expectation
 struct Statement {
     sql: String,
+    session: Option<String>,
     expectations: Expectations,
     line_number: usize,
 }
@@ -173,13 +175,19 @@ struct ExpectedError {
 }
 
 fn find_test_case(config: &Config, name: &str) -> TestCase {
-    let test_file = config.test_dir.join(format!("{name}.test"));
-    let result_file = config.result_dir.join(format!("{name}.result"));
-
-    if !test_file.exists() {
-        eprintln!("Test file not found: {test_file:?}");
+    let test_file_test = config.test_dir.join(format!("{name}.test"));
+    let test_file_t = config.test_dir.join(format!("{name}.t"));
+    let (test_file, result_file) = if test_file_test.exists() {
+        (
+            test_file_test,
+            config.result_dir.join(format!("{name}.result")),
+        )
+    } else if test_file_t.exists() {
+        (test_file_t, config.result_dir.join(format!("{name}.r")))
+    } else {
+        eprintln!("Test file not found: {test_file_test:?} or {test_file_t:?}");
         std::process::exit(1);
-    }
+    };
 
     TestCase {
         name: name.to_string(),
@@ -213,17 +221,18 @@ fn find_tests_recursive(
                 let subdir_name = path.file_name().unwrap().to_str().unwrap();
                 let result_subdir = result_base.join(subdir_name);
                 find_tests_recursive(base, &path, &result_subdir, cases);
-            } else if path.extension().is_some_and(|e| e == "test") {
+            } else if path.extension().is_some_and(|e| e == "test" || e == "t") {
                 let relative = path.strip_prefix(base).unwrap();
                 let name = relative
                     .with_extension("")
                     .to_str()
                     .unwrap()
                     .replace('\\', "/");
-                let result_file = result_base.join(format!(
-                    "{}.result",
-                    path.file_stem().unwrap().to_str().unwrap()
-                ));
+                let stem = path.file_stem().unwrap().to_str().unwrap();
+                let result_file = match path.extension().and_then(|e| e.to_str()) {
+                    Some("t") => result_base.join(format!("{stem}.r")),
+                    _ => result_base.join(format!("{stem}.result")),
+                };
 
                 cases.push(TestCase {
                     name,
@@ -265,6 +274,7 @@ async fn run_test(config: &Config, test_case: &TestCase) -> TestResult {
     let _temp_guard = TempDirGuard(temp_dir);
 
     // Execute statements and collect output
+    let mut sessions: HashMap<String, Session> = HashMap::new();
     let mut output = String::new();
 
     for stmt in &statements {
@@ -272,8 +282,16 @@ async fn run_test(config: &Config, test_case: &TestCase) -> TestResult {
         output.push_str(&stmt.sql);
         output.push('\n');
 
-        let statement_result =
-            tokio::time::timeout(config.statement_timeout, db.execute_query(&stmt.sql)).await;
+        let statement_result = if let Some(session_name) = &stmt.session {
+            let session = sessions.entry(session_name.clone()).or_default();
+            tokio::time::timeout(
+                config.statement_timeout,
+                db.execute_query_with_session(&stmt.sql, session),
+            )
+            .await
+        } else {
+            tokio::time::timeout(config.statement_timeout, db.execute_query(&stmt.sql)).await
+        };
 
         // Execute
         match statement_result {
@@ -494,6 +512,7 @@ fn parse_test_file(path: &Path) -> Result<Vec<Statement>, String> {
     let mut statements = Vec::new();
     let mut current_sql = String::new();
     let mut expectations = Expectations::default();
+    let mut current_session: Option<String> = None;
     let mut start_line: usize = 0;
 
     // Simple SQL lexer state for splitting on semicolons.
@@ -556,6 +575,16 @@ fn parse_test_file(path: &Path) -> Result<Vec<Statement>, String> {
             // --rows <n>
             let parts: Vec<&str> = trimmed.split_whitespace().collect();
             expectations.expected_rows = parts.get(1).and_then(|s| s.parse::<usize>().ok());
+            continue;
+        }
+        if trimmed.starts_with("--session") {
+            // --session <name>
+            let parts: Vec<&str> = trimmed.split_whitespace().collect();
+            current_session = parts
+                .get(1)
+                .map(|name| name.trim())
+                .filter(|name| !name.is_empty())
+                .map(ToString::to_string);
             continue;
         }
 
@@ -669,6 +698,7 @@ fn parse_test_file(path: &Path) -> Result<Vec<Statement>, String> {
                     if !sql.is_empty() {
                         statements.push(Statement {
                             sql,
+                            session: current_session.clone(),
                             expectations: expectations.clone(),
                             line_number: start_line,
                         });
@@ -697,6 +727,7 @@ fn parse_test_file(path: &Path) -> Result<Vec<Statement>, String> {
     if !tail.is_empty() {
         statements.push(Statement {
             sql: tail.to_string(),
+            session: current_session,
             expectations,
             line_number: start_line,
         });
@@ -832,6 +863,22 @@ mod tests {
         assert_eq!(stmts.len(), 2);
         assert_eq!(stmts[0].expectations.expected_rows, Some(1));
         assert_eq!(stmts[1].expectations.expected_rows, None);
+    }
+
+    #[test]
+    fn session_directive_applies_to_subsequent_statements() {
+        let tmp = tempfile::NamedTempFile::new().unwrap();
+        fs::write(
+            tmp.path(),
+            "--session s1\nBEGIN;\n--session s2\nBEGIN;\n--session\nSELECT 1;",
+        )
+        .unwrap();
+
+        let stmts = parse_test_file(tmp.path()).unwrap();
+        assert_eq!(stmts.len(), 3);
+        assert_eq!(stmts[0].session.as_deref(), Some("s1"));
+        assert_eq!(stmts[1].session.as_deref(), Some("s2"));
+        assert_eq!(stmts[2].session, None);
     }
 
     #[test]
