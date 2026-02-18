@@ -52,10 +52,6 @@ pub struct TransactionService<S: StorageEngine, L: ClogService, T: TsoService> {
     tso: Arc<T>,
     /// ConcurrencyManager for lock table and max_ts tracking
     concurrency_manager: Arc<ConcurrencyManager>,
-    /// Compatibility switch for legacy commit path that bypasses reservations.
-    ///
-    /// Production must keep this disabled.
-    allow_legacy_write_ops: bool,
 }
 
 /// Ensures commit reservations are released on every exit path.
@@ -97,32 +93,11 @@ impl<S: StorageEngine, L: ClogService, T: TsoService> TransactionService<S, L, T
         tso: Arc<T>,
         concurrency_manager: Arc<ConcurrencyManager>,
     ) -> Self {
-        Self::new_with_policy(storage, clog_service, tso, concurrency_manager, true)
-    }
-
-    /// Create a production transaction service that requires reservation path.
-    pub fn new_strict(
-        storage: Arc<S>,
-        clog_service: Arc<L>,
-        tso: Arc<T>,
-        concurrency_manager: Arc<ConcurrencyManager>,
-    ) -> Self {
-        Self::new_with_policy(storage, clog_service, tso, concurrency_manager, false)
-    }
-
-    fn new_with_policy(
-        storage: Arc<S>,
-        clog_service: Arc<L>,
-        tso: Arc<T>,
-        concurrency_manager: Arc<ConcurrencyManager>,
-        allow_legacy_write_ops: bool,
-    ) -> Self {
         Self {
             storage,
             clog_service,
             tso,
             concurrency_manager,
-            allow_legacy_write_ops,
         }
     }
 
@@ -534,39 +509,28 @@ impl<S: PessimisticStorage + 'static, L: ClogService + 'static, T: TsoService> T
                 None => ClogOpRef::Delete { key },
             })
             .collect();
+        let has_wal_ops = !ops.is_empty();
 
-        // V2.6: reserve commit LSN ahead of WAL write when storage supports it.
-        ctx.reserved_lsn = self.storage.alloc_and_reserve_commit_lsn(start_ts);
-        let mut reservation_guard = ctx
-            .reserved_lsn
-            .map(|_| CommitReservationReleaseGuard::new(self.storage.as_ref(), start_ts));
+        // V2.6: reserve commit LSN ahead of WAL write.
+        let txn_lsn = self.storage.alloc_and_reserve_commit_lsn(start_ts);
+        ctx.reserved_lsn = Some(txn_lsn);
+        let mut reservation_guard = Some(CommitReservationReleaseGuard::new(
+            self.storage.as_ref(),
+            start_ts,
+        ));
 
         #[cfg(feature = "failpoints")]
-        if ctx.reserved_lsn.is_some() {
-            fail_point!("txn_after_alloc_and_reserve_before_clog_write_v26");
-        }
+        fail_point!("txn_after_alloc_and_reserve_before_clog_write_v26");
 
         // Step 5: Write to clog for durability (serializes synchronously, returns
         // future for fsync). After this call, ops/read_values are no longer needed.
-        let clog_result = if let Some(txn_lsn) = ctx.reserved_lsn {
-            debug_assert!(
-                self.storage.is_commit_lsn_reserved(start_ts, txn_lsn),
-                "reserved commit lsn missing before clog write: start_ts={start_ts}, lsn={txn_lsn}",
-            );
-            self.clog_service
-                .write_ops_with_lsn(txn_id, &ops, commit_ts, txn_lsn, true)
-        } else if self.allow_legacy_write_ops {
-            tracing::warn!(
-                txn_id,
-                start_ts,
-                "using legacy clog write_ops path without reservation; test compatibility mode"
-            );
-            self.clog_service.write_ops(txn_id, &ops, commit_ts, true)
-        } else {
-            Err(TiSqlError::Internal(
-                "storage does not support commit LSN reservation path".into(),
-            ))
-        };
+        debug_assert!(
+            self.storage.is_commit_lsn_reserved(start_ts, txn_lsn),
+            "reserved commit lsn missing before clog write: start_ts={start_ts}, lsn={txn_lsn}",
+        );
+        let clog_result = self
+            .clog_service
+            .write_ops_with_lsn(txn_id, &ops, commit_ts, txn_lsn, true);
 
         #[cfg(feature = "failpoints")]
         fail_point!("txn_after_clog_write_before_fsync_wait_v26");
@@ -581,15 +545,13 @@ impl<S: PessimisticStorage + 'static, L: ClogService + 'static, T: TsoService> T
                     #[cfg(feature = "failpoints")]
                     fail_point!("txn_after_clog_fsync_before_finalize_v26");
 
-                    let commit_lsn = if let Some(reserved_lsn) = ctx.reserved_lsn {
+                    if has_wal_ops {
                         debug_assert_eq!(
-                            reserved_lsn, lsn,
+                            txn_lsn, lsn,
                             "clog returned lsn differs from reserved lsn (start_ts={start_ts})",
                         );
-                        reserved_lsn
-                    } else {
-                        lsn
-                    };
+                    }
+                    let commit_lsn = txn_lsn;
 
                     // Step 6: Finalize all pending nodes by setting commit_ts and
                     // tracking the clog LSN on touched memtables.
@@ -999,30 +961,19 @@ mod tests {
         let dir = tempdir().unwrap();
         let config = FileClogConfig::with_dir(dir.path());
         let io_handle = tokio::runtime::Handle::current();
-        let clog_service =
-            Arc::new(FileClogService::open(config, make_test_io(), &io_handle).unwrap());
+        let storage = Arc::new(MemTableEngine::new());
+        let clog_service = Arc::new(
+            FileClogService::open_with_lsn_provider(
+                config,
+                storage.lsn_provider(),
+                make_test_io(),
+                &io_handle,
+            )
+            .unwrap(),
+        );
         let tso = Arc::new(LocalTso::new(1));
         let cm = Arc::new(ConcurrencyManager::new(0));
-        let storage = Arc::new(MemTableEngine::new());
         let txn_service = TransactionService::new(Arc::clone(&storage), clog_service, tso, cm);
-        (storage, txn_service, dir)
-    }
-
-    fn create_strict_test_service() -> (
-        Arc<TestStorage>,
-        TransactionService<TestStorage, FileClogService, LocalTso>,
-        tempfile::TempDir,
-    ) {
-        let dir = tempdir().unwrap();
-        let config = FileClogConfig::with_dir(dir.path());
-        let io_handle = tokio::runtime::Handle::current();
-        let clog_service =
-            Arc::new(FileClogService::open(config, make_test_io(), &io_handle).unwrap());
-        let tso = Arc::new(LocalTso::new(1));
-        let cm = Arc::new(ConcurrencyManager::new(0));
-        let storage = Arc::new(MemTableEngine::new());
-        let txn_service =
-            TransactionService::new_strict(Arc::clone(&storage), clog_service, tso, cm);
         (storage, txn_service, dir)
     }
 
@@ -1092,28 +1043,6 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_strict_mode_rejects_storage_without_reservations() {
-        let (_storage, txn_service, _dir) = create_strict_test_service();
-
-        let mut ctx = txn_service.begin(false).unwrap();
-        txn_service
-            .put(&mut ctx, b"strict_key".to_vec(), b"strict_value".to_vec())
-            .await
-            .unwrap();
-
-        let err = txn_service.commit(ctx).await.unwrap_err();
-        match err {
-            TiSqlError::Internal(msg) => {
-                assert!(
-                    msg.contains("reservation"),
-                    "unexpected strict mode error message: {msg}"
-                );
-            }
-            other => panic!("expected strict mode Internal error, got {other:?}"),
-        }
-    }
-
-    #[tokio::test]
     async fn test_recover() {
         let dir = tempdir().unwrap();
         let config = FileClogConfig::with_dir(dir.path());
@@ -1121,12 +1050,18 @@ mod tests {
 
         // Write some data
         {
+            let storage = Arc::new(MemTableEngine::new());
             let clog_service = Arc::new(
-                FileClogService::open(config.clone(), make_test_io(), &io_handle).unwrap(),
+                FileClogService::open_with_lsn_provider(
+                    config.clone(),
+                    storage.lsn_provider(),
+                    make_test_io(),
+                    &io_handle,
+                )
+                .unwrap(),
             );
             let tso = Arc::new(LocalTso::new(1));
             let cm = Arc::new(ConcurrencyManager::new(0));
-            let storage = Arc::new(MemTableEngine::new());
             let txn_service = TransactionService::new(storage, clog_service.clone(), tso, cm);
 
             txn_service.autocommit_put(b"k1", b"v1").await.unwrap();
@@ -1137,12 +1072,17 @@ mod tests {
         }
 
         // Recover
-        let (clog_service, entries) =
-            FileClogService::recover(config, make_test_io(), &io_handle).unwrap();
+        let storage = Arc::new(MemTableEngine::new());
+        let (clog_service, entries) = FileClogService::recover_with_lsn_provider(
+            config,
+            storage.lsn_provider(),
+            make_test_io(),
+            &io_handle,
+        )
+        .unwrap();
         let clog_service = Arc::new(clog_service);
         let tso = Arc::new(LocalTso::new(1));
         let cm = Arc::new(ConcurrencyManager::new(0));
-        let storage = Arc::new(MemTableEngine::new());
         let txn_service = TransactionService::new(Arc::clone(&storage), clog_service, tso, cm);
 
         let stats = txn_service.recover(&entries).unwrap();
@@ -2327,12 +2267,17 @@ mod tests {
         }
 
         // Recover
-        let (clog_service, entries) =
-            FileClogService::recover(config, make_test_io(), &io_handle).unwrap();
+        let storage = Arc::new(MemTableEngine::new());
+        let (clog_service, entries) = FileClogService::recover_with_lsn_provider(
+            config,
+            storage.lsn_provider(),
+            make_test_io(),
+            &io_handle,
+        )
+        .unwrap();
         let clog_service = Arc::new(clog_service);
         let tso = Arc::new(LocalTso::new(1));
         let cm = Arc::new(ConcurrencyManager::new(0));
-        let storage = Arc::new(MemTableEngine::new());
         let txn_service = TransactionService::new(Arc::clone(&storage), clog_service, tso, cm);
 
         let stats = txn_service.recover(&entries).unwrap();
@@ -2504,12 +2449,18 @@ mod tests {
         let io_handle = tokio::runtime::Handle::current();
 
         {
+            let storage = Arc::new(MemTableEngine::new());
             let clog_service = Arc::new(
-                FileClogService::open(config.clone(), make_test_io(), &io_handle).unwrap(),
+                FileClogService::open_with_lsn_provider(
+                    config.clone(),
+                    storage.lsn_provider(),
+                    make_test_io(),
+                    &io_handle,
+                )
+                .unwrap(),
             );
             let tso = Arc::new(LocalTso::new(1));
             let cm = Arc::new(ConcurrencyManager::new(0));
-            let storage = Arc::new(MemTableEngine::new());
             let txn_service = TransactionService::new(storage, clog_service.clone(), tso, cm);
 
             // Put then delete
@@ -2523,12 +2474,17 @@ mod tests {
         }
 
         // Recover
-        let (clog_service, entries) =
-            FileClogService::recover(config, make_test_io(), &io_handle).unwrap();
+        let storage = Arc::new(MemTableEngine::new());
+        let (clog_service, entries) = FileClogService::recover_with_lsn_provider(
+            config,
+            storage.lsn_provider(),
+            make_test_io(),
+            &io_handle,
+        )
+        .unwrap();
         let clog_service = Arc::new(clog_service);
         let tso = Arc::new(LocalTso::new(1));
         let cm = Arc::new(ConcurrencyManager::new(0));
-        let storage = Arc::new(MemTableEngine::new());
         let txn_service = TransactionService::new(Arc::clone(&storage), clog_service, tso, cm);
 
         let stats = txn_service.recover(&entries).unwrap();
@@ -2546,11 +2502,18 @@ mod tests {
         let dir = tempdir().unwrap();
         let config = FileClogConfig::with_dir(dir.path());
         let io_handle = tokio::runtime::Handle::current();
-        let clog_service =
-            Arc::new(FileClogService::open(config, make_test_io(), &io_handle).unwrap());
+        let storage = Arc::new(MemTableEngine::new());
+        let clog_service = Arc::new(
+            FileClogService::open_with_lsn_provider(
+                config,
+                storage.lsn_provider(),
+                make_test_io(),
+                &io_handle,
+            )
+            .unwrap(),
+        );
         let tso = Arc::new(LocalTso::new(1));
         let cm = Arc::new(ConcurrencyManager::new(0));
-        let storage = Arc::new(MemTableEngine::new());
         let txn_service = TransactionService::new(Arc::clone(&storage), clog_service, tso, cm);
 
         // Recover with empty entries

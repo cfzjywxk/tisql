@@ -140,7 +140,7 @@ async fn create_test_txn_service_with_unified_logs(
     let (engine, ilog, clog) = create_test_lsm_engine_with_unified_logs(dir).await;
     let tso = Arc::new(LocalTso::new(1));
     let cm = Arc::new(ConcurrencyManager::new(0));
-    let txn_service = Arc::new(TransactionService::new_strict(
+    let txn_service = Arc::new(TransactionService::new(
         Arc::clone(&engine),
         Arc::clone(&clog),
         tso,

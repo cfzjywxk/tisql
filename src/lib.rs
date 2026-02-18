@@ -361,7 +361,7 @@ impl Database {
             Arc::new(ConcurrencyManager::new(recovery_result.stats.max_commit_ts));
 
         // Create transaction service with recovered components
-        let txn_service = Arc::new(TransactionService::new_strict(
+        let txn_service = Arc::new(TransactionService::new(
             Arc::clone(&storage),
             recovery_result.clog,
             Arc::clone(&tso),

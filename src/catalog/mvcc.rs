@@ -690,13 +690,18 @@ mod tests {
         let dir = tempdir().unwrap();
         let clog_config = FileClogConfig::with_dir(dir.path());
         let io_handle = tokio::runtime::Handle::current();
-        let (clog_service, _) =
-            FileClogService::recover(clog_config, make_test_io(), &io_handle).unwrap();
+        let storage = Arc::new(MemTableEngine::new());
+        let (clog_service, _) = FileClogService::recover_with_lsn_provider(
+            clog_config,
+            storage.lsn_provider(),
+            make_test_io(),
+            &io_handle,
+        )
+        .unwrap();
         let clog_service = Arc::new(clog_service);
 
         let tso = Arc::new(LocalTso::new(1));
         let concurrency_manager = Arc::new(ConcurrencyManager::new(0));
-        let storage = Arc::new(MemTableEngine::new());
 
         let txn_service = Arc::new(TransactionService::new(
             Arc::clone(&storage),
@@ -895,13 +900,18 @@ mod tests {
         // First session: create catalog and tables
         {
             let clog_config = FileClogConfig::with_dir(dir.path());
-            let (clog_service, _) =
-                FileClogService::recover(clog_config, make_test_io(), &io_handle).unwrap();
+            let storage = Arc::new(MemTableEngine::new());
+            let (clog_service, _) = FileClogService::recover_with_lsn_provider(
+                clog_config,
+                storage.lsn_provider(),
+                make_test_io(),
+                &io_handle,
+            )
+            .unwrap();
             let clog_service = Arc::new(clog_service);
 
             let tso = Arc::new(LocalTso::new(1));
             let concurrency_manager = Arc::new(ConcurrencyManager::new(0));
-            let storage = Arc::new(MemTableEngine::new());
 
             let txn_service = Arc::new(TransactionService::new(
                 Arc::clone(&storage),
@@ -929,13 +939,18 @@ mod tests {
         // Second session: reload and verify version
         {
             let clog_config = FileClogConfig::with_dir(dir.path());
-            let (clog_service, entries) =
-                FileClogService::recover(clog_config, make_test_io(), &io_handle).unwrap();
+            let storage = Arc::new(MemTableEngine::new());
+            let (clog_service, entries) = FileClogService::recover_with_lsn_provider(
+                clog_config,
+                storage.lsn_provider(),
+                make_test_io(),
+                &io_handle,
+            )
+            .unwrap();
             let clog_service = Arc::new(clog_service);
 
             let tso = Arc::new(LocalTso::new(1));
             let concurrency_manager = Arc::new(ConcurrencyManager::new(0));
-            let storage = Arc::new(MemTableEngine::new());
 
             let txn_service = Arc::new(TransactionService::new(
                 Arc::clone(&storage),

@@ -91,10 +91,18 @@ fn create_test_service() -> TestServiceTuple {
     let dir = tempfile::tempdir().unwrap();
     let handle = tokio::runtime::Handle::current();
     let config = FileClogConfig::with_dir(dir.path());
-    let clog_service = Arc::new(FileClogService::open(config, make_test_io(), &handle).unwrap());
+    let storage = Arc::new(MemTableEngine::new());
+    let clog_service = Arc::new(
+        FileClogService::open_with_lsn_provider(
+            config,
+            storage.lsn_provider(),
+            make_test_io(),
+            &handle,
+        )
+        .unwrap(),
+    );
     let tso = Arc::new(LocalTso::new(1));
     let cm = Arc::new(ConcurrencyManager::new(0));
-    let storage = Arc::new(MemTableEngine::new());
     let txn_service = Arc::new(TransactionService::new(
         Arc::clone(&storage),
         clog_service,

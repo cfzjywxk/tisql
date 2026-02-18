@@ -64,6 +64,8 @@ use crossbeam_skiplist::map::Entry;
 use crossbeam_skiplist::SkipMap;
 
 use crate::catalog::types::{Key, RawValue, Timestamp};
+use crate::lsn::{new_lsn_provider, SharedLsnProvider};
+use crate::tablet::commit_reservations::CommitLsnReservations;
 use crate::tablet::mvcc::{
     is_lock, is_tombstone, MvccIterator, MvccKey, SharedMvccRange, LOCK, TOMBSTONE,
 };
@@ -752,6 +754,10 @@ pub struct VersionedMemTableEngineInner {
 pub struct VersionedMemTableEngine {
     /// Inner data wrapped in Arc for owned iterator support
     inner: Arc<VersionedMemTableEngineInner>,
+    /// LSN provider shared with clog in tests using this engine.
+    lsn_provider: SharedLsnProvider,
+    /// Commit-path LSN reservations.
+    commit_reservations: CommitLsnReservations,
 }
 
 impl VersionedMemTableEngine {
@@ -762,7 +768,14 @@ impl VersionedMemTableEngine {
                 index: SkipMap::new(),
                 entry_count: AtomicUsize::new(0),
             }),
+            lsn_provider: new_lsn_provider(),
+            commit_reservations: CommitLsnReservations::new(),
         }
+    }
+
+    /// Shared LSN provider used by this engine's reservation tracker.
+    pub fn lsn_provider(&self) -> SharedLsnProvider {
+        Arc::clone(&self.lsn_provider)
     }
 
     /// Internal put implementation.
@@ -1062,6 +1075,19 @@ impl PessimisticStorage for VersionedMemTableEngine {
     fn get_lock_owner(&self, key: &[u8]) -> Option<Timestamp> {
         // Delegate to the inherent method
         VersionedMemTableEngine::get_lock_owner(self, key)
+    }
+
+    fn alloc_and_reserve_commit_lsn(&self, owner_start_ts: Timestamp) -> u64 {
+        self.commit_reservations
+            .alloc_and_reserve(owner_start_ts, self.lsn_provider.as_ref())
+    }
+
+    fn release_commit_lsn(&self, owner_start_ts: Timestamp) -> Option<u64> {
+        self.commit_reservations.release(owner_start_ts)
+    }
+
+    fn is_commit_lsn_reserved(&self, owner_start_ts: Timestamp, lsn: u64) -> bool {
+        self.commit_reservations.is_reserved(owner_start_ts, lsn)
     }
 
     fn finalize_pending(&self, keys: &[Key], owner_start_ts: Timestamp, commit_ts: Timestamp) {
