@@ -24,6 +24,7 @@
 #![cfg(feature = "failpoints")]
 
 use std::sync::Arc;
+use std::time::{Duration, Instant};
 
 use tempfile::TempDir;
 
@@ -36,7 +37,10 @@ use tisql::testkit::{
     IlogTruncateStats, LocalTso, LsmConfigBuilder, LsmEngine, LsmRecovery, RecoveryResult,
     TabletManager, TransactionService, TruncateStats, Version,
 };
-use tisql::{ClogService, PessimisticStorage, StorageEngine, TxnService, V26BoundaryMode};
+use tisql::{
+    ClogService, Database, DatabaseConfig, PessimisticStorage, QueryResult, StorageEngine,
+    TxnService, V26BoundaryMode,
+};
 
 const SYS_TABLE_ID: u64 = 1;
 
@@ -224,6 +228,51 @@ async fn create_multi_tablet_routed_txn_service(
     (manager, txn_service, table1, table2)
 }
 
+fn mount_user_tablet_durable(db: &Database, table_id: u64) {
+    let tablet_id = TabletId::Table { table_id };
+    if db.tablet_manager().get_tablet(tablet_id).is_some() {
+        return;
+    }
+
+    let tablet_dir = db.tablet_manager().tablet_dir(tablet_id);
+    std::fs::create_dir_all(&tablet_dir).unwrap();
+
+    let lsn_provider = db.tablet_manager().shared_lsn_provider();
+    let io = make_test_io();
+    let ilog = Arc::new(
+        IlogService::open(
+            IlogConfig::new(&tablet_dir),
+            Arc::clone(&lsn_provider),
+            Arc::clone(&io),
+            &tokio::runtime::Handle::current(),
+        )
+        .unwrap(),
+    );
+    let tablet = Arc::new(
+        LsmEngine::open_with_recovery(
+            LsmConfigBuilder::new(&tablet_dir)
+                .memtable_size(256)
+                .max_frozen_memtables(8)
+                .build_unchecked(),
+            lsn_provider,
+            ilog,
+            Version::new(),
+            io,
+        )
+        .unwrap(),
+    );
+    db.tablet_manager()
+        .insert_tablet(tablet_id, tablet)
+        .unwrap();
+}
+
+async fn assert_select_rows(db: &Database, sql: &str, expected_rows: usize) {
+    match db.execute_query(sql).await.unwrap() {
+        QueryResult::Rows { data, .. } => assert_eq!(data.len(), expected_rows, "sql={sql}"),
+        other => panic!("unexpected query result for {sql}: {other:?}"),
+    }
+}
+
 #[derive(Debug)]
 struct LogGcCycleStats {
     flushed_lsn: u64,
@@ -344,6 +393,71 @@ async fn test_v26_mode_runtime_switch_normalizes_to_on() {
 
     let stats = run_log_gc_cycle(&engine, &ilog, &clog).await.unwrap();
     assert_eq!(stats.safe_lsn, safe_expected);
+
+    scenario.teardown();
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn test_phase5_gc_boundary_inflight_cap_global() {
+    let scenario = fail::FailScenario::setup();
+    let dir = tempfile::tempdir().unwrap();
+    let (manager, _txn_service, table1, table2) =
+        create_multi_tablet_routed_txn_service(&dir).await;
+
+    let system = manager.get_tablet(TabletId::System).unwrap();
+    let tablet1 = manager
+        .get_tablet(TabletId::Table { table_id: table1 })
+        .unwrap();
+    let tablet2 = manager
+        .get_tablet(TabletId::Table { table_id: table2 })
+        .unwrap();
+
+    // Raise all checkpointed flushed caps first, then inject a lower in-flight LSN.
+    for (tablet, lsn, key) in [
+        (Arc::clone(&system), 900u64, b"sys_preflush".as_slice()),
+        (Arc::clone(&tablet1), 901u64, b"t1_preflush".as_slice()),
+        (Arc::clone(&tablet2), 902u64, b"t2_preflush".as_slice()),
+    ] {
+        let mut wb = WriteBatch::new();
+        wb.put(key.to_vec(), b"v".to_vec());
+        wb.set_commit_ts(lsn);
+        wb.set_clog_lsn(lsn);
+        tablet.write_batch(wb).unwrap();
+        tablet.flush_all_with_active().unwrap();
+    }
+
+    let inflight_pause_guard =
+        fail::FailGuard::new("write_batch_after_inflight_register", "pause").unwrap();
+    let tablet2_writer = Arc::clone(&tablet2);
+    let writer = std::thread::spawn(move || {
+        let mut wb = WriteBatch::new();
+        wb.put(b"t2_inflight".to_vec(), b"v".to_vec());
+        wb.set_commit_ts(303);
+        wb.set_clog_lsn(303);
+        tablet2_writer.write_batch(wb).unwrap();
+    });
+
+    let deadline = Instant::now() + Duration::from_secs(5);
+    while tablet2.min_in_flight_lsn() != Some(303) {
+        assert!(
+            Instant::now() < deadline,
+            "in-flight write did not register within 5s"
+        );
+        std::thread::sleep(Duration::from_millis(1));
+    }
+
+    let captures = manager.checkpoint_and_capture_all_tablets().await.unwrap();
+    let boundary = manager
+        .compute_global_log_gc_boundary_with_caps(&captures)
+        .unwrap();
+    assert_eq!(boundary.inflight_cap, Some(302));
+    assert!(
+        boundary.safe_lsn <= 302,
+        "global safe boundary must not exceed in-flight cap"
+    );
+
+    drop(inflight_pause_guard);
+    writer.join().unwrap();
 
     scenario.teardown();
 }
@@ -1660,6 +1774,58 @@ async fn run_log_gc_cutpoint_crash_test(failpoint_name: &str, mode: Option<V26Bo
     scenario.teardown();
 }
 
+async fn run_phase5_multitablet_log_gc_cutpoint_crash_test(failpoint_name: &str) {
+    let scenario = fail::FailScenario::setup();
+    let dir = tempfile::tempdir().unwrap();
+    let config = DatabaseConfig::with_data_dir(dir.path());
+    let db = Arc::new(Database::open(config.clone()).unwrap());
+
+    db.execute_query("CREATE TABLE gc_mt_cut_a (id INT PRIMARY KEY, v INT)")
+        .await
+        .unwrap();
+    db.execute_query("CREATE TABLE gc_mt_cut_b (id INT PRIMARY KEY, v INT)")
+        .await
+        .unwrap();
+
+    // Fresh DB allocates user table ids from USER_TABLE_ID_START (=1000).
+    let table_a = 1000u64;
+    let table_b = 1001u64;
+    mount_user_tablet_durable(db.as_ref(), table_a);
+    mount_user_tablet_durable(db.as_ref(), table_b);
+
+    db.execute_query("INSERT INTO gc_mt_cut_a VALUES (1, 101)")
+        .await
+        .unwrap();
+    db.execute_query("INSERT INTO gc_mt_cut_b VALUES (1, 202)")
+        .await
+        .unwrap();
+
+    // Force asymmetric progress so global boundary computes from mixed states.
+    db.tablet_manager()
+        .get_tablet(TabletId::Table { table_id: table_a })
+        .unwrap()
+        .flush_all_with_active()
+        .unwrap();
+
+    let fail_guard = fail::FailGuard::new(failpoint_name, "panic").unwrap();
+    let db_for_gc = Arc::clone(&db);
+    let join = tokio::spawn(async move { db_for_gc.run_log_gc_once().await }).await;
+    assert!(
+        join.is_err(),
+        "failpoint {failpoint_name} should panic in multi-tablet GC path"
+    );
+    drop(fail_guard);
+
+    drop(db);
+
+    let db2 = Database::open(config).unwrap();
+    assert_select_rows(&db2, "SELECT v FROM gc_mt_cut_a WHERE id = 1", 1).await;
+    assert_select_rows(&db2, "SELECT v FROM gc_mt_cut_b WHERE id = 1", 1).await;
+    db2.close().await.unwrap();
+
+    scenario.teardown();
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn test_log_gc_crash_before_checkpoint() {
     run_log_gc_cutpoint_crash_test("log_gc_before_checkpoint", None).await;
@@ -1696,6 +1862,20 @@ async fn test_log_gc_crash_after_clog_truncate_before_ilog_truncate() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn test_log_gc_crash_after_ilog_truncate() {
     run_log_gc_cutpoint_crash_test("log_gc_after_ilog_truncate", None).await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn test_phase5_multitablet_log_gc_crash_matrix_cutpoints() {
+    for failpoint in [
+        "log_gc_before_checkpoint",
+        "log_gc_after_checkpoint_before_clog_truncate",
+        "log_gc_after_checkpoint_before_safe_compute_v26",
+        "log_gc_after_safe_compute_before_clog_truncate_v26",
+        "log_gc_after_clog_truncate_before_ilog_truncate",
+        "log_gc_after_ilog_truncate",
+    ] {
+        run_phase5_multitablet_log_gc_cutpoint_crash_test(failpoint).await;
+    }
 }
 
 // ============================================================================
