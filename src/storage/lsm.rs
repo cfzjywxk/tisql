@@ -44,20 +44,22 @@
 
 use std::collections::{HashMap, VecDeque};
 use std::ops::Range;
-use std::sync::atomic::{AtomicU64, AtomicU8, AtomicUsize, Ordering as AtomicOrdering};
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicU8, AtomicUsize, Ordering as AtomicOrdering};
 use std::sync::Arc;
 
 use parking_lot::{RwLock, RwLockWriteGuard};
 use std::time::Duration;
+use tokio::sync::{mpsc, oneshot};
 
 #[cfg(feature = "failpoints")]
 use fail::fail_point;
 
 use crate::error::{Result, TiSqlError};
+use crate::log_error;
 use crate::lsn::SharedLsnProvider;
 use crate::storage::mvcc::{decode_mvcc_key, is_tombstone, MvccIterator, MvccKey, SharedMvccRange};
 use crate::storage::{PessimisticStorage, PessimisticWriteError, StorageEngine, WriteBatch};
-use crate::types::{Key, RawValue, Timestamp};
+use crate::types::{Key, Lsn, RawValue, Timestamp};
 
 use super::commit_reservations::{CommitLsnReservations, CommitReservationStats};
 use super::config::{LsmConfig, V26BoundaryMode};
@@ -228,6 +230,239 @@ impl LsmState {
     }
 }
 
+#[derive(Debug, Clone)]
+enum ManifestEdit {
+    Flush {
+        sst_meta: SstMeta,
+        flushed_lsn: Lsn,
+    },
+    Compact {
+        deleted_ssts: Vec<(u32, u64)>,
+        new_ssts: Vec<SstMeta>,
+    },
+    TrivialMove {
+        delta: ManifestDelta,
+    },
+}
+
+enum ManifestRequest {
+    Apply {
+        edit: ManifestEdit,
+        reply: oneshot::Sender<Result<()>>,
+    },
+    CheckpointAndCapture {
+        reply: oneshot::Sender<Result<(Arc<Version>, Lsn)>>,
+    },
+}
+
+#[derive(Clone)]
+struct ManifestWriterHandle {
+    tx: mpsc::Sender<ManifestRequest>,
+    error_flag: Arc<AtomicBool>,
+}
+
+impl ManifestWriterHandle {
+    fn new(tx: mpsc::Sender<ManifestRequest>, error_flag: Arc<AtomicBool>) -> Self {
+        Self { tx, error_flag }
+    }
+
+    fn fast_fail(&self) -> Result<()> {
+        if self.error_flag.load(AtomicOrdering::SeqCst) {
+            return Err(TiSqlError::Internal(
+                "Manifest writer is in failed state".into(),
+            ));
+        }
+        Ok(())
+    }
+
+    async fn submit(&self, edit: ManifestEdit) -> Result<()> {
+        self.fast_fail()?;
+        let (reply_tx, reply_rx) = oneshot::channel();
+        self.tx
+            .send(ManifestRequest::Apply {
+                edit,
+                reply: reply_tx,
+            })
+            .await
+            .map_err(|_| TiSqlError::Internal("Manifest writer is shut down".into()))?;
+        reply_rx
+            .await
+            .map_err(|_| TiSqlError::Internal("Manifest writer dropped reply".into()))?
+    }
+
+    async fn checkpoint_and_capture(&self) -> Result<(Arc<Version>, Lsn)> {
+        self.fast_fail()?;
+        let (reply_tx, reply_rx) = oneshot::channel();
+        self.tx
+            .send(ManifestRequest::CheckpointAndCapture { reply: reply_tx })
+            .await
+            .map_err(|_| TiSqlError::Internal("Manifest writer is shut down".into()))?;
+        reply_rx
+            .await
+            .map_err(|_| TiSqlError::Internal("Manifest writer dropped reply".into()))?
+    }
+}
+
+fn manifest_delta_from_edit(edit: &ManifestEdit) -> ManifestDelta {
+    match edit {
+        ManifestEdit::Flush {
+            sst_meta,
+            flushed_lsn,
+        } => ManifestDelta::flush(sst_meta.clone(), *flushed_lsn),
+        ManifestEdit::Compact {
+            deleted_ssts,
+            new_ssts,
+        } => {
+            let mut delta = ManifestDelta::new();
+            for (level, sst_id) in deleted_ssts {
+                delta.delete_sst(*level, *sst_id);
+            }
+            for sst in new_ssts {
+                delta.add_sst(sst.clone());
+            }
+            delta
+        }
+        ManifestEdit::TrivialMove { delta } => delta.clone(),
+    }
+}
+
+async fn write_manifest_ilog_record(ilog: &IlogService, edit: &ManifestEdit) -> Result<()> {
+    match edit {
+        ManifestEdit::Flush {
+            sst_meta,
+            flushed_lsn,
+        } => ilog
+            .write_flush_commit_async(sst_meta.clone(), *flushed_lsn)
+            .await
+            .map(|_| ()),
+        ManifestEdit::Compact {
+            deleted_ssts,
+            new_ssts,
+        } => ilog
+            .write_compact_commit_async(deleted_ssts.clone(), new_ssts.clone())
+            .await
+            .map(|_| ()),
+        // TODO: Trivial move currently has no dedicated ilog record. Durability
+        // still relies on periodic/forced checkpoints, same as pre-queue behavior.
+        ManifestEdit::TrivialMove { .. } => Ok(()),
+    }
+}
+
+fn reply_manifest_batch_error(batch: &mut Vec<ManifestRequest>, msg: &str) {
+    for req in batch.drain(..) {
+        let err = TiSqlError::Internal(msg.to_string());
+        match req {
+            ManifestRequest::Apply { reply, .. } => {
+                let _ = reply.send(Err(err));
+            }
+            ManifestRequest::CheckpointAndCapture { reply } => {
+                let _ = reply.send(Err(err));
+            }
+        }
+    }
+}
+
+async fn manifest_writer_loop(
+    ilog: Arc<IlogService>,
+    version_set: Arc<VersionSet>,
+    mut rx: mpsc::Receiver<ManifestRequest>,
+    error_flag: Arc<AtomicBool>,
+    running_flag: Arc<AtomicBool>,
+) {
+    struct RunningGuard {
+        flag: Arc<AtomicBool>,
+    }
+
+    impl Drop for RunningGuard {
+        fn drop(&mut self) {
+            self.flag.store(false, AtomicOrdering::SeqCst);
+        }
+    }
+
+    running_flag.store(true, AtomicOrdering::SeqCst);
+    let _running_guard = RunningGuard {
+        flag: Arc::clone(&running_flag),
+    };
+    let mut batch: Vec<ManifestRequest> = Vec::with_capacity(8);
+
+    while let Some(first_req) = rx.recv().await {
+        batch.push(first_req);
+        while let Ok(req) = rx.try_recv() {
+            batch.push(req);
+        }
+
+        // Phase 1: persist ilog records for all edits in this batch.
+        for req in &batch {
+            let edit = match req {
+                ManifestRequest::Apply { edit, .. } => edit,
+                ManifestRequest::CheckpointAndCapture { .. } => continue,
+            };
+            if let Err(e) = write_manifest_ilog_record(ilog.as_ref(), edit).await {
+                // Some prefix edits in this batch may already be durable in ilog.
+                // We still fail-stop the whole writer task on any ilog error:
+                // callers treat this as fatal, and recovery replays any durable
+                // prefix on next restart.
+                let msg = format!("Manifest writer ilog apply failed: {e}");
+                error_flag.store(true, AtomicOrdering::SeqCst);
+                reply_manifest_batch_error(&mut batch, &msg);
+                log_error!("{msg}");
+                return;
+            }
+        }
+
+        // Phase 2: apply in-memory deltas in FIFO order.
+        for req in &batch {
+            if let ManifestRequest::Apply { edit, .. } = req {
+                let delta = manifest_delta_from_edit(edit);
+                version_set.apply_delta(&delta);
+            }
+        }
+
+        // Phase 3: write at most one checkpoint for the whole batch.
+        let has_capture_request = batch
+            .iter()
+            .any(|req| matches!(req, ManifestRequest::CheckpointAndCapture { .. }));
+        let mut captured: Option<(Arc<Version>, Lsn)> = None;
+        if has_capture_request || ilog.needs_checkpoint() {
+            let version = version_set.current();
+            match ilog.write_checkpoint_async(version.as_ref()).await {
+                Ok(lsn) => {
+                    captured = Some((version, lsn));
+                }
+                Err(e) => {
+                    let msg = format!("Manifest writer checkpoint failed: {e}");
+                    error_flag.store(true, AtomicOrdering::SeqCst);
+                    reply_manifest_batch_error(&mut batch, &msg);
+                    log_error!("{msg}");
+                    return;
+                }
+            }
+        }
+
+        // Phase 4: reply to all waiters.
+        for req in batch.drain(..) {
+            match req {
+                ManifestRequest::Apply { reply, .. } => {
+                    let _ = reply.send(Ok(()));
+                }
+                ManifestRequest::CheckpointAndCapture { reply } => {
+                    let capture = match &captured {
+                        Some((version, lsn)) => (Arc::clone(version), *lsn),
+                        None => {
+                            let msg = "Manifest writer missing checkpoint capture".to_string();
+                            error_flag.store(true, AtomicOrdering::SeqCst);
+                            let _ = reply.send(Err(TiSqlError::Internal(msg.clone())));
+                            log_error!("{msg}");
+                            return;
+                        }
+                    };
+                    let _ = reply.send(Ok(capture));
+                }
+            }
+        }
+    }
+}
+
 /// LSM-tree storage engine.
 ///
 /// This is the main entry point for persistent storage. It manages:
@@ -266,7 +501,7 @@ pub struct LsmEngine {
     state: RwLock<LsmState>,
 
     /// Version management (separate from memtable state).
-    version_set: VersionSet,
+    version_set: Arc<VersionSet>,
 
     /// Next memtable ID.
     next_memtable_id: AtomicU64,
@@ -328,16 +563,19 @@ pub struct LsmEngine {
     /// Runtime-switchable V2.6 boundary mode (off/shadow/on).
     v26_mode: AtomicU8,
 
-    /// Serializes all ilog mutations with version updates.
-    ///
-    /// Ensures that every checkpoint reflects the latest version, and that
-    /// ilog commit + apply_delta are atomic with respect to concurrent
-    /// checkpoint writes. Without this:
-    /// - A concurrent compaction could write a CompactCommit (LSN < checkpoint_lsn)
-    ///   not yet applied to the checkpointed version — GC truncation removes it.
-    /// - A background checkpoint could use a stale version — recovery's rposition
-    ///   skips CompactCommit records that precede it in the file.
-    manifest_lock: parking_lot::Mutex<()>,
+    /// Single-writer manifest queue handle (durable mode only).
+    manifest_writer: parking_lot::Mutex<Option<ManifestWriterHandle>>,
+
+    /// Dedicated runtime used only when the engine runs standalone without
+    /// an external tokio runtime (mostly sync test helpers).
+    manifest_runtime: parking_lot::Mutex<Option<tokio::runtime::Runtime>>,
+
+    /// Writer-task liveness flag used by shutdown ordering.
+    manifest_writer_running: Arc<AtomicBool>,
+
+    /// Sticky fatal flag set when the manifest writer hits an unrecoverable
+    /// ilog/checkpoint error.
+    manifest_error: Arc<AtomicBool>,
 }
 
 impl LsmEngine {
@@ -365,7 +603,7 @@ impl LsmEngine {
 
         // Create initial state and version_set
         let initial_state = LsmState::new(1);
-        let version_set = VersionSet::new(version);
+        let version_set = Arc::new(VersionSet::new(version));
 
         // Create initial SuperVersion
         let initial_sv = Arc::new(SuperVersion::new(
@@ -394,7 +632,10 @@ impl LsmEngine {
             in_flight_tracker: InFlightLsnTracker::new_auto(),
             commit_reservations: CommitLsnReservations::new(),
             v26_mode: AtomicU8::new(initial_v26_mode),
-            manifest_lock: parking_lot::Mutex::new(()),
+            manifest_writer: parking_lot::Mutex::new(None),
+            manifest_runtime: parking_lot::Mutex::new(None),
+            manifest_writer_running: Arc::new(AtomicBool::new(false)),
+            manifest_error: Arc::new(AtomicBool::new(false)),
         })
     }
 
@@ -568,13 +809,122 @@ impl LsmEngine {
         self.version_set.current()
     }
 
-    /// Acquire the manifest lock.
-    ///
-    /// Must be held during log GC's version capture + checkpoint write.
-    /// Also held internally during flush/compaction commit + apply_delta +
-    /// background checkpoint writes.
-    pub fn manifest_guard(&self) -> parking_lot::MutexGuard<'_, ()> {
-        self.manifest_lock.lock()
+    fn start_manifest_writer_inner(&self, handle: &tokio::runtime::Handle) -> Result<()> {
+        if self.ilog.is_none() {
+            return Ok(());
+        }
+        if self.manifest_error.load(AtomicOrdering::SeqCst) {
+            return Err(TiSqlError::Internal(
+                "Manifest writer is in failed state".into(),
+            ));
+        }
+
+        let mut writer_guard = self.manifest_writer.lock();
+        if writer_guard.is_some() {
+            return Ok(());
+        }
+
+        let (tx, rx) = mpsc::channel(8);
+        let ilog = Arc::clone(self.ilog.as_ref().expect("checked Some above"));
+        let version_set = Arc::clone(&self.version_set);
+        let error_flag = Arc::clone(&self.manifest_error);
+        let running_flag = Arc::clone(&self.manifest_writer_running);
+        handle.spawn(manifest_writer_loop(
+            ilog,
+            version_set,
+            rx,
+            error_flag,
+            running_flag,
+        ));
+
+        *writer_guard = Some(ManifestWriterHandle::new(
+            tx,
+            Arc::clone(&self.manifest_error),
+        ));
+        Ok(())
+    }
+
+    /// Start manifest writer on the given runtime.
+    pub fn start_manifest_writer(&self, handle: &tokio::runtime::Handle) -> Result<()> {
+        self.start_manifest_writer_inner(handle)
+    }
+
+    fn ensure_manifest_writer(&self) -> Result<()> {
+        if self.ilog.is_none() {
+            return Ok(());
+        }
+        if self.manifest_error.load(AtomicOrdering::SeqCst) {
+            return Err(TiSqlError::Internal(
+                "Manifest writer is in failed state".into(),
+            ));
+        }
+        if self.manifest_writer.lock().is_some() {
+            return Ok(());
+        }
+
+        let mut runtime_guard = self.manifest_runtime.lock();
+        if runtime_guard.is_none() {
+            tracing::warn!(
+                "manifest writer started with standalone runtime (outside managed database runtimes)"
+            );
+            let runtime = tokio::runtime::Builder::new_multi_thread()
+                .worker_threads(1)
+                .thread_name("tisql-manifest")
+                .enable_all()
+                .build()
+                .map_err(|e| {
+                    TiSqlError::Internal(format!("Failed to create manifest runtime: {e}"))
+                })?;
+            self.start_manifest_writer_inner(runtime.handle())?;
+            *runtime_guard = Some(runtime);
+        } else {
+            let handle = runtime_guard
+                .as_ref()
+                .expect("checked Some")
+                .handle()
+                .clone();
+            drop(runtime_guard);
+            self.start_manifest_writer_inner(&handle)?;
+        }
+        Ok(())
+    }
+
+    fn manifest_writer_handle(&self) -> Result<ManifestWriterHandle> {
+        self.ensure_manifest_writer()?;
+        self.manifest_writer
+            .lock()
+            .clone()
+            .ok_or_else(|| TiSqlError::Internal("Manifest writer is not available".into()))
+    }
+
+    pub async fn checkpoint_and_capture_manifest(&self) -> Result<(Arc<Version>, Lsn)> {
+        if self.ilog.is_none() {
+            return Err(TiSqlError::Internal(
+                "Manifest checkpoint requires durable ilog".into(),
+            ));
+        }
+        let manifest = self.manifest_writer_handle()?;
+        manifest.checkpoint_and_capture().await
+    }
+
+    pub fn shutdown_manifest_writer(&self) {
+        self.manifest_writer.lock().take();
+        let wait_start = std::time::Instant::now();
+        while self.manifest_writer_running.load(AtomicOrdering::SeqCst)
+            && wait_start.elapsed() < Duration::from_secs(2)
+        {
+            std::thread::sleep(Duration::from_millis(1));
+        }
+        if self.manifest_writer_running.load(AtomicOrdering::SeqCst) {
+            tracing::warn!("timed out waiting for manifest writer to stop");
+        }
+        if let Some(runtime) = self.manifest_runtime.lock().take() {
+            if tokio::runtime::Handle::try_current().is_ok() {
+                runtime.shutdown_background();
+            } else {
+                runtime.shutdown_timeout(Duration::from_secs(2));
+            }
+        }
     }
 
     /// Compute the minimum LSN across all in-memory memtables (active + frozen).
@@ -921,57 +1271,50 @@ impl LsmEngine {
             .compute_flush_boundary_with_caps(memtable.id(), base_flushed_lsn)
             .safe_lsn;
 
-        // Commit manifest mutation atomically under manifest lock.
-        {
-            #[cfg(feature = "failpoints")]
-            fail_point!("lsm_flush_after_boundary_before_manifest_commit_v26");
+        #[cfg(feature = "failpoints")]
+        fail_point!("lsm_flush_after_boundary_before_manifest_commit_v26");
 
-            let commit_result: Result<()> = {
-                let _manifest = self.manifest_lock.lock();
+        let commit_result = if self.ilog.is_some() {
+            let manifest = self.manifest_writer_handle()?;
+            manifest
+                .submit(ManifestEdit::Flush {
+                    sst_meta: meta.clone(),
+                    flushed_lsn: safe_flushed_lsn,
+                })
+                .await
+        } else {
+            let delta = ManifestDelta::flush(meta.clone(), safe_flushed_lsn);
+            self.version_set.apply_delta(&delta);
+            Ok(())
+        };
 
-                if let Some(ref ilog) = self.ilog {
-                    ilog.write_flush_commit(meta.clone(), safe_flushed_lsn)?;
-                }
+        if let Err(e) = commit_result {
+            let _ =
+                memtable.compare_exchange_flush_state(FlushState::Flushing, FlushState::NeedsFlush);
+            return Err(e);
+        }
 
-                // Failpoint: crash after ilog commit, before version update
-                #[cfg(feature = "failpoints")]
-                fail_point!("lsm_flush_after_ilog_commit");
+        // Failpoint: crash after durable manifest commit.
+        #[cfg(feature = "failpoints")]
+        fail_point!("lsm_flush_after_ilog_commit");
 
-                let delta = ManifestDelta::flush(meta.clone(), safe_flushed_lsn);
-                self.version_set.apply_delta(&delta);
+        #[cfg(feature = "failpoints")]
+        fail_point!("lsm_flush_after_manifest_commit_before_state_transition_v26");
 
-                if let Some(ref ilog) = self.ilog {
-                    if ilog.needs_checkpoint() {
-                        ilog.write_checkpoint(self.version_set.current().as_ref())?;
-                    }
-                }
-                Ok(())
-            };
-
-            if let Err(e) = commit_result {
-                let _ = memtable
-                    .compare_exchange_flush_state(FlushState::Flushing, FlushState::NeedsFlush);
-                return Err(e);
-            }
-
-            #[cfg(feature = "failpoints")]
-            fail_point!("lsm_flush_after_manifest_commit_before_state_transition_v26");
-
-            if memtable.pending_count() == 0 {
-                if memtable
-                    .compare_exchange_flush_state(FlushState::Flushing, FlushState::FlushedClean)
-                    .is_err()
-                {
-                    memtable.set_flush_state(FlushState::FlushedDirty);
-                }
-            } else {
+        if memtable.pending_count() == 0 {
+            if memtable
+                .compare_exchange_flush_state(FlushState::Flushing, FlushState::FlushedClean)
+                .is_err()
+            {
                 memtable.set_flush_state(FlushState::FlushedDirty);
             }
-
-            let mut state = self.state.write();
-            let _removed = self.cleanup_flushed_clean_frozen_locked(&mut state);
-            self.install_super_version(&state);
+        } else {
+            memtable.set_flush_state(FlushState::FlushedDirty);
         }
+
+        let mut state = self.state.write();
+        let _removed = self.cleanup_flushed_clean_frozen_locked(&mut state);
+        self.install_super_version(&state);
 
         // Failpoint: crash after version update
         #[cfg(feature = "failpoints")]
@@ -1257,7 +1600,7 @@ impl LsmEngine {
     /// CompactCommit (ilog) → apply_delta → install_super_version → delete files.
     ///
     /// Returns the number of SSTs removed.
-    pub fn remove_obsolete_dropped_table_ssts(&self) -> Result<usize> {
+    pub async fn remove_obsolete_dropped_table_ssts(&self) -> Result<usize> {
         let dropped_tables = self.dropped_table_ids();
         let gc_safe_point = self.gc_safe_point();
 
@@ -1289,24 +1632,19 @@ impl LsmEngine {
             delta.delete_sst(*level, *sst_id);
         }
 
-        // Atomically write CompactCommit + apply_delta + checkpoint under manifest_lock.
-        {
-            let _manifest = self.manifest_lock.lock();
-
-            if let Some(ref ilog) = self.ilog {
-                ilog.write_compact_commit(obsolete_ssts, vec![])?;
-            }
-
+        if self.ilog.is_some() {
+            let manifest = self.manifest_writer_handle()?;
+            manifest
+                .submit(ManifestEdit::Compact {
+                    deleted_ssts: obsolete_ssts,
+                    new_ssts: vec![],
+                })
+                .await?;
+        } else {
             self.version_set.apply_delta(&delta);
-
-            if let Some(ref ilog) = self.ilog {
-                if ilog.needs_checkpoint() {
-                    ilog.write_checkpoint(self.version_set.current().as_ref())?;
-                }
-            }
         }
 
-        // Install new SuperVersion (after manifest_lock released)
+        // Install new SuperVersion after manifest mutation.
         {
             #[allow(clippy::readonly_write_lock)]
             let state = self.state.write();
@@ -1497,23 +1835,14 @@ impl LsmEngine {
                 )
                 .await?;
 
-            // Apply delta + optional checkpoint under manifest_lock.
-            // Even though trivial moves don't write ilog commit records,
-            // their checkpoint must be serialized with other operations to
-            // prevent Bug 3 (stale checkpoint via rposition).
-            {
-                let _manifest = self.manifest_lock.lock();
-
+            if self.ilog.is_some() {
+                let manifest = self.manifest_writer_handle()?;
+                manifest.submit(ManifestEdit::TrivialMove { delta }).await?;
+            } else {
                 self.version_set.apply_delta(&delta);
-
-                if let Some(ref ilog) = self.ilog {
-                    if ilog.needs_checkpoint() {
-                        ilog.write_checkpoint(self.version_set.current().as_ref())?;
-                    }
-                }
             }
 
-            // Install new SuperVersion (after manifest_lock released)
+            // Install new SuperVersion after manifest mutation.
             {
                 #[allow(clippy::readonly_write_lock)]
                 let state = self.state.write();
@@ -1554,26 +1883,20 @@ impl LsmEngine {
             )
             .await?;
 
-        // Phase 4 + 5: Atomically write ilog commit, update version, and
-        // optionally checkpoint — all under manifest_lock.
-        {
-            let _manifest = self.manifest_lock.lock();
-
-            if let Some(ref ilog) = self.ilog {
-                let new_ssts: Vec<SstMeta> = delta.new_ssts.iter().map(|m| (**m).clone()).collect();
-                ilog.write_compact_commit(delta.deleted_ssts.clone(), new_ssts)?;
-            }
-
+        if self.ilog.is_some() {
+            let manifest = self.manifest_writer_handle()?;
+            let new_ssts: Vec<SstMeta> = delta.new_ssts.iter().map(|m| (**m).clone()).collect();
+            manifest
+                .submit(ManifestEdit::Compact {
+                    deleted_ssts: delta.deleted_ssts.clone(),
+                    new_ssts,
+                })
+                .await?;
+        } else {
             self.version_set.apply_delta(&delta);
-
-            if let Some(ref ilog) = self.ilog {
-                if ilog.needs_checkpoint() {
-                    ilog.write_checkpoint(self.version_set.current().as_ref())?;
-                }
-            }
         }
 
-        // Phase 6: Install new SuperVersion (after manifest_lock released)
+        // Phase 6: Install new SuperVersion after manifest mutation.
         {
             #[allow(clippy::readonly_write_lock)]
             let state = self.state.write();
@@ -2536,9 +2859,6 @@ impl TieredMergeIterator {
 // MockMvccIterator is placed outside the tests module so it can be used
 // by the ChildIterator::Mock variant (which needs to be in the main enum).
 
-#[cfg(test)]
-use std::sync::atomic::AtomicBool;
-
 /// Mock iterator that tracks whether seek() has been called.
 /// Used to verify lazy initialization behavior.
 #[cfg(test)]
@@ -2821,6 +3141,8 @@ impl TieredMergeIterator {
 
 impl Drop for LsmEngine {
     fn drop(&mut self) {
+        self.shutdown_manifest_writer();
+
         // Shutdown spawn_blocking tasks before the runtime drops.
         //
         // IoService and GroupCommitWriter (in IlogService) each run a
@@ -3201,7 +3523,7 @@ mod tests {
 
             // Create initial state and version_set
             let initial_state = LsmState::new(1);
-            let version_set = VersionSet::new(Version::new());
+            let version_set = Arc::new(VersionSet::new(Version::new()));
 
             // Create initial SuperVersion
             let initial_sv = Arc::new(SuperVersion::new(
@@ -3230,7 +3552,10 @@ mod tests {
                 in_flight_tracker: InFlightLsnTracker::new_auto(),
                 commit_reservations: CommitLsnReservations::new(),
                 v26_mode: AtomicU8::new(initial_v26_mode),
-                manifest_lock: parking_lot::Mutex::new(()),
+                manifest_writer: parking_lot::Mutex::new(None),
+                manifest_runtime: parking_lot::Mutex::new(None),
+                manifest_writer_running: Arc::new(AtomicBool::new(false)),
+                manifest_error: Arc::new(AtomicBool::new(false)),
             })
         }
     }

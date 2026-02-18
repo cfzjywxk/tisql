@@ -161,24 +161,16 @@ struct LogGcCycleStats {
 /// Run one safe log GC cycle on standalone LSM components.
 ///
 /// Mirrors the production `Database::run_log_gc_once()` flow:
-/// 1. Hold manifest_lock during version capture + checkpoint write
+/// 1. Checkpoint via manifest writer queue and capture version snapshot
 /// 2. Compute authoritative V2.6 boundary (checkpoint + mem + reservation + in-flight caps)
 async fn run_log_gc_cycle(
     engine: &LsmEngine,
     ilog: &IlogService,
     clog: &FileClogService,
 ) -> Result<LogGcCycleStats, tisql::error::TiSqlError> {
-    let (version, checkpoint_lsn) = {
-        let _manifest = engine.manifest_guard();
+    fail_point!("log_gc_before_checkpoint");
 
-        let version = engine.current_version();
-
-        fail_point!("log_gc_before_checkpoint");
-
-        let checkpoint_lsn = ilog.write_checkpoint(version.as_ref())?;
-
-        (version, checkpoint_lsn)
-    };
+    let (version, checkpoint_lsn) = engine.checkpoint_and_capture_manifest().await?;
 
     let flushed_lsn = version.flushed_lsn();
     #[cfg(feature = "failpoints")]

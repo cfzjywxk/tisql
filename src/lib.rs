@@ -336,6 +336,8 @@ impl Database {
 
         log_info!("Background runtime created with 2 threads");
 
+        storage.start_manifest_writer(bg_runtime.handle())?;
+
         // Start background flush scheduler on bg runtime
         let flush_scheduler = FlushScheduler::new(Arc::clone(&storage));
         flush_scheduler.start(bg_runtime.handle());
@@ -625,22 +627,10 @@ impl Database {
     /// newer (unflushed) memtable. Using `flushed_lsn` alone would risk deleting
     /// clog entries that are still only in volatile memory.
     pub async fn run_log_gc_once(&self) -> Result<LogGcStats> {
-        // Hold manifest_lock during version capture + checkpoint write.
-        // This ensures all ilog records with LSN < checkpoint_lsn are
-        // reflected in `version` — safe to truncate.
-        let (version, checkpoint_lsn) = {
-            let _manifest = self.storage.manifest_guard();
+        #[cfg(feature = "failpoints")]
+        fail_point!("log_gc_before_checkpoint");
 
-            let version = self.storage.current_version();
-
-            #[cfg(feature = "failpoints")]
-            fail_point!("log_gc_before_checkpoint");
-
-            let checkpoint_lsn = self.ilog.write_checkpoint(version.as_ref())?;
-
-            (version, checkpoint_lsn)
-        };
-        // manifest_lock released — flush/compaction can proceed
+        let (version, checkpoint_lsn) = self.storage.checkpoint_and_capture_manifest().await?;
 
         // Compute authoritative V2.6 boundary from the SAME checkpointed version.
         let flushed_lsn = version.flushed_lsn();
@@ -741,10 +731,18 @@ impl Database {
 
     /// Close the database (flush memtables and sync logs).
     pub async fn close(&self) -> Result<()> {
+        // Stop background workers first so no new manifest edits are submitted.
+        self.gc_worker.stop();
+        self.flush_scheduler.stop();
+        self.compaction_scheduler.stop();
+
         // Flush any pending memtable data to SSTs
         if let Err(e) = self.storage.flush_all_with_active() {
             log_warn!("Error flushing memtables on close: {}", e);
         }
+
+        // Drain/stop manifest writer before closing ilog.
+        self.storage.shutdown_manifest_writer();
 
         // Close commit log
         self.txn_service.clog_service().close().await?;
@@ -767,11 +765,14 @@ impl Drop for Database {
         // 2. Final flush (needs I/O runtime — ilog writes go through group commit)
         let _ = self.storage.flush_all_with_active();
 
-        // 3. Close clog + ilog (sync pending writes)
+        // 3. Drain/stop manifest writer before ilog close.
+        self.storage.shutdown_manifest_writer();
+
+        // 4. Close clog + ilog (sync pending writes)
         let _ = crate::io::block_on_sync(self.txn_service.clog_service().close());
         let _ = self.ilog.close();
 
-        // 4. Shutdown all spawn_blocking task channels BEFORE dropping io_runtime.
+        // 5. Shutdown all spawn_blocking task channels BEFORE dropping io_runtime.
         //
         // GroupCommitWriter (clog + ilog) and IoService each run a spawn_blocking
         // task on io_runtime that blocks on rx.recv(). Closing the sender channels
@@ -781,7 +782,7 @@ impl Drop for Database {
         self.ilog.shutdown();
         self.storage.io_service().shutdown();
 
-        // 5. Shut down runtimes.
+        // 6. Shut down runtimes.
         //
         // Tokio runtimes cannot be dropped from within an async context (panics).
         // If we are inside a tokio runtime (tests, or nested drop), move the

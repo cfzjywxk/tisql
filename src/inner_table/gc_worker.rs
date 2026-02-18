@@ -133,7 +133,7 @@ impl<T: TxnService + 'static> GcWorkerInner<T> {
         }
 
         // Proactive step 1: Remove obsolete SSTs (direct deletion, no compaction I/O)
-        match self.engine.remove_obsolete_dropped_table_ssts() {
+        match self.engine.remove_obsolete_dropped_table_ssts().await {
             Ok(count) if count > 0 => {
                 tracing::info!("GC worker: removed {count} obsolete SSTs from dropped tables");
             }
