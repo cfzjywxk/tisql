@@ -33,7 +33,7 @@ use tokio::sync::Notify;
 
 use crate::inner_table::bootstrap::update_gc_task_status;
 use crate::inner_table::catalog_loader::{load_gc_tasks, GcTask};
-use crate::storage::lsm::LsmEngine;
+use crate::tablet::lsm::LsmEngine;
 use crate::transaction::{TxnService, TxnState};
 
 /// Background GC worker that marks completed drop-table tasks as done.
@@ -238,7 +238,7 @@ impl<T: TxnService + 'static> GcWorkerInner<T> {
     }
 
     /// Mark a GC task as 'done' in the inner table.
-    async fn mark_task_done(&self, task: &GcTask) -> crate::error::Result<()> {
+    async fn mark_task_done(&self, task: &GcTask) -> crate::util::error::Result<()> {
         let mut ctx = self.txn_service.begin(false)?;
         update_gc_task_status(
             &mut ctx,

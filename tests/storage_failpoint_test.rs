@@ -29,7 +29,7 @@ use tempfile::TempDir;
 
 use fail::fail_point;
 use tisql::new_lsn_provider;
-use tisql::storage::WriteBatch;
+use tisql::tablet::WriteBatch;
 use tisql::testkit::{
     ClogBatch, ConcurrencyManager, FileClogConfig, FileClogService, IlogConfig, IlogService,
     IlogTruncateStats, LocalTso, LsmConfigBuilder, LsmEngine, LsmRecovery, RecoveryResult,
@@ -167,7 +167,7 @@ async fn run_log_gc_cycle(
     engine: &LsmEngine,
     ilog: &IlogService,
     clog: &FileClogService,
-) -> Result<LogGcCycleStats, tisql::error::TiSqlError> {
+) -> Result<LogGcCycleStats, tisql::util::error::TiSqlError> {
     fail_point!("log_gc_before_checkpoint");
 
     let (version, checkpoint_lsn) = engine.checkpoint_and_capture_manifest().await?;
@@ -1843,7 +1843,7 @@ async fn test_clog_metadata_apis() {
 /// When SST file opening fails, the scan_iter should propagate the error.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn test_level_iterator_open_file_error() {
-    use tisql::storage::mvcc::MvccIterator;
+    use tisql::tablet::mvcc::MvccIterator;
 
     let scenario = fail::FailScenario::setup();
     let dir = tempfile::tempdir().unwrap();
@@ -1866,7 +1866,7 @@ async fn test_level_iterator_open_file_error() {
     fail::cfg("l0_sst_iterator_open_file", "return").unwrap();
 
     // Now scan should fail when trying to read from SST
-    use tisql::storage::mvcc::MvccKey;
+    use tisql::tablet::mvcc::MvccKey;
     let range = MvccKey::unbounded()..MvccKey::unbounded();
     let iter_result = engine.scan_iter(range, 0);
 
@@ -1888,7 +1888,7 @@ async fn test_level_iterator_open_file_error() {
 /// Test L0SstIterator seek failpoint.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn test_level_iterator_seek_error() {
-    use tisql::storage::mvcc::MvccIterator;
+    use tisql::tablet::mvcc::MvccIterator;
 
     let scenario = fail::FailScenario::setup();
     let dir = tempfile::tempdir().unwrap();
@@ -1904,7 +1904,7 @@ async fn test_level_iterator_seek_error() {
     fail::cfg("l0_sst_iterator_seek", "return").unwrap();
 
     // scan_iter should fail on seek
-    use tisql::storage::mvcc::MvccKey;
+    use tisql::tablet::mvcc::MvccKey;
     let range = MvccKey::unbounded()..MvccKey::unbounded();
     let iter_result = engine.scan_iter(range, 0);
 
@@ -1932,7 +1932,7 @@ async fn test_level_iterator_seek_error() {
 /// on the next call to advance(). So we need to call advance twice to see the error.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn test_level_iterator_advance_error() {
-    use tisql::storage::mvcc::MvccIterator;
+    use tisql::tablet::mvcc::MvccIterator;
 
     let scenario = fail::FailScenario::setup();
     let dir = tempfile::tempdir().unwrap();
@@ -1948,7 +1948,7 @@ async fn test_level_iterator_advance_error() {
     // Enable fail point for advance errors on L0 SST
     fail::cfg("l0_sst_iterator_advance", "return").unwrap();
 
-    use tisql::storage::mvcc::MvccKey;
+    use tisql::tablet::mvcc::MvccKey;
     let range = MvccKey::unbounded()..MvccKey::unbounded();
     let mut iter = engine.scan_iter(range, 0).unwrap();
 
@@ -2052,7 +2052,7 @@ async fn test_lsm_engine_getters() {
 /// Test scan with data in both memtable and SST.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn test_scan_iter_memtable_and_sst() {
-    use tisql::storage::mvcc::MvccIterator;
+    use tisql::tablet::mvcc::MvccIterator;
 
     let scenario = fail::FailScenario::setup();
     let dir = tempfile::tempdir().unwrap();
@@ -2072,7 +2072,7 @@ async fn test_scan_iter_memtable_and_sst() {
     write_test_data(&engine, b"ddd", b"value_d", 4);
 
     // Scan all - should see data from both memtable and SST
-    use tisql::storage::mvcc::MvccKey;
+    use tisql::tablet::mvcc::MvccKey;
     let range = MvccKey::unbounded()..MvccKey::unbounded();
     let mut iter = engine.scan_iter(range, 0).unwrap();
 

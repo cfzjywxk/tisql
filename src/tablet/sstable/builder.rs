@@ -54,10 +54,10 @@ use serde::{Deserialize, Serialize};
 
 use std::collections::HashMap;
 
-use crate::error::{Result, TiSqlError};
+use crate::catalog::types::Timestamp;
 use crate::io::{AlignedBuf, DmaFile, IoService, DMA_ALIGNMENT};
-use crate::storage::mvcc::extract_key;
-use crate::types::Timestamp;
+use crate::tablet::mvcc::extract_key;
+use crate::util::error::{Result, TiSqlError};
 use crate::util::fs::sync_dir;
 
 use super::block::{DataBlockBuilder, IndexBlockBuilder, DEFAULT_BLOCK_SIZE};

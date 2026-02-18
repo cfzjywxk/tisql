@@ -64,8 +64,8 @@
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicU64, Ordering};
 
+use crate::catalog::types::Timestamp;
 use crate::transaction::{IsolationLevel, TxnCtx};
-use crate::types::Timestamp;
 
 // ============================================================================
 // Session ID Generator

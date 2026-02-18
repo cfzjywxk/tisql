@@ -52,10 +52,10 @@ use std::sync::{Arc, Mutex};
 use std::thread;
 use std::time::{Duration, Instant};
 
-use tisql::storage::memtable::VersionedMemTableEngine;
-use tisql::storage::mvcc::{MvccIterator, MvccKey};
-use tisql::storage::{StorageEngine, WriteBatch};
-use tisql::types::Timestamp;
+use tisql::catalog::types::Timestamp;
+use tisql::tablet::memtable::VersionedMemTableEngine;
+use tisql::tablet::mvcc::{MvccIterator, MvccKey};
+use tisql::tablet::{StorageEngine, WriteBatch};
 
 // ============================================================================
 // Value Encoding

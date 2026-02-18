@@ -26,8 +26,8 @@ use std::time::Instant;
 use fail::{eval as eval_failpoint, fail_point};
 use parking_lot::Mutex;
 
+use crate::catalog::types::{Lsn, Timestamp};
 use crate::lsn::LsnProvider;
-use crate::types::{Lsn, Timestamp};
 
 /// One reservation owned by a transaction.
 #[derive(Debug, Clone)]

@@ -55,7 +55,6 @@ pub mod compaction;
 pub mod compaction_scheduler;
 pub mod config;
 pub mod flush_scheduler;
-pub mod ilog;
 pub mod lsm;
 pub mod memtable;
 pub mod mvcc;
@@ -63,6 +62,11 @@ pub mod recovery;
 pub mod sstable;
 pub mod version;
 pub mod version_set;
+
+// Backward-compatible module path: crate::tablet::ilog::{...}
+pub mod ilog {
+    pub use crate::log::ilog::*;
+}
 
 // ============================================================================
 // Storage Implementation
@@ -154,8 +158,8 @@ use std::collections::BTreeMap;
 use std::ops::Range;
 use std::time::Duration;
 
-use crate::error::Result;
-use crate::types::{Key, RawValue, TableId, Timestamp};
+use crate::catalog::types::{Key, RawValue, TableId, Timestamp};
+use crate::util::error::Result;
 
 // ============================================================================
 // Key Encoding (re-exports from codec for convenience)

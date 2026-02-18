@@ -20,8 +20,8 @@
 // Allow dead code for future features that are defined but not yet implemented
 #![allow(dead_code)]
 
+use crate::catalog::types::{ColumnId, DataType, Schema, Value};
 use crate::catalog::TableDef;
-use crate::types::{ColumnId, DataType, Schema, Value};
 
 /// Logical plan tree
 #[derive(Debug, Clone)]

@@ -34,12 +34,12 @@
 //! - Small row: colID = 1 byte, offset = 2 bytes (for common cases)
 //! - Large row: colID = 4 bytes, offset = 4 bytes (for > 255 columns or > 64KB data)
 
+use crate::catalog::types::{ColumnId, DataType, Value};
 use crate::codec::number::{
     decode_compact_i64, decode_compact_u64, encode_compact_i64, encode_compact_u64,
 };
 use crate::codec::CODEC_VER;
-use crate::error::{Result, TiSqlError};
-use crate::types::{ColumnId, DataType, Value};
+use crate::util::error::{Result, TiSqlError};
 
 /// Row format flags
 const ROW_FLAG_LARGE: u8 = 0x01;
@@ -744,7 +744,7 @@ mod tests {
 
     #[test]
     fn test_decode_row_to_values_roundtrip() {
-        use crate::types::DataType;
+        use crate::catalog::types::DataType;
 
         let col_ids = vec![1, 2, 3, 4, 5];
         let data_types = vec![
@@ -780,7 +780,7 @@ mod tests {
 
     #[test]
     fn test_decode_row_to_values_with_nulls() {
-        use crate::types::DataType;
+        use crate::catalog::types::DataType;
 
         let col_ids = vec![1, 2, 3];
         let data_types = vec![DataType::Int, DataType::Varchar(100), DataType::BigInt];

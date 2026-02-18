@@ -51,9 +51,9 @@ use std::sync::Arc;
 use fail::fail_point;
 use serde::{Deserialize, Serialize};
 
-use crate::error::{Result, TiSqlError};
+use crate::catalog::types::Lsn;
 use crate::lsn::SharedLsnProvider;
-use crate::types::Lsn;
+use crate::util::error::{Result, TiSqlError};
 use crate::util::fs::{create_dir_durable, rename_durable, sync_dir};
 use crate::{log_info, log_trace, log_warn};
 

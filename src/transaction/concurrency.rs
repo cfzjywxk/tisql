@@ -41,8 +41,8 @@
 
 use std::sync::atomic::{AtomicU64, Ordering};
 
-use crate::error::Result;
-use crate::types::Timestamp;
+use crate::catalog::types::Timestamp;
+use crate::util::error::Result;
 
 use super::api::TxnState;
 use super::txn_state_cache::TxnStateCache;

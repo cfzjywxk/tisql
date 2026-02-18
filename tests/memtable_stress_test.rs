@@ -33,9 +33,9 @@ use std::sync::{Arc, Barrier};
 use std::thread;
 use std::time::{Duration, Instant};
 
-use tisql::storage::mvcc::{is_tombstone, MvccIterator, MvccKey};
-use tisql::storage::{ArcVersionedMemTableIterator, VersionedMemTableEngine, WriteBatch};
-use tisql::types::{RawValue, Timestamp};
+use tisql::catalog::types::{RawValue, Timestamp};
+use tisql::tablet::mvcc::{is_tombstone, MvccIterator, MvccKey};
+use tisql::tablet::{ArcVersionedMemTableIterator, VersionedMemTableEngine, WriteBatch};
 
 // ==================== Test Helpers ====================
 

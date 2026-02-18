@@ -26,15 +26,15 @@
 use std::future::Future;
 use std::pin::Pin;
 
+use crate::catalog::types::{ColumnId, ColumnInfo, DataType, Row, Schema, Value};
 use crate::catalog::Catalog;
-use crate::error::{Result, TiSqlError};
 use crate::session::ExecutionCtx;
 use crate::sql::{AggFunc, BinaryOp, Expr, LogicalPlan, OrderByExpr, UnaryOp};
-use crate::storage::{
+use crate::tablet::{
     decode_row_to_values, encode_int_key, encode_key, encode_pk, encode_row, MvccIterator,
 };
 use crate::transaction::{TxnCtx, TxnService};
-use crate::types::{ColumnId, ColumnInfo, DataType, Row, Schema, Value};
+use crate::util::error::{Result, TiSqlError};
 
 use super::{DdlEffect, Execution, ExecutionOutput, ExecutionResult, Executor, RowPuller};
 

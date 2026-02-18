@@ -35,9 +35,9 @@
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicU8, AtomicUsize, Ordering};
 use std::time::Instant;
 
-use crate::error::Result;
-use crate::storage::mvcc::TOMBSTONE;
-use crate::storage::{PessimisticWriteError, WriteBatch};
+use crate::tablet::mvcc::TOMBSTONE;
+use crate::tablet::{PessimisticWriteError, WriteBatch};
+use crate::util::error::Result;
 
 use super::versioned_memtable::PendingResolveStats;
 use super::VersionedMemTableEngine;
@@ -284,7 +284,7 @@ impl MemTable {
     /// Returns an error if the memtable is frozen.
     pub fn write_batch_with_lsn(&self, batch: WriteBatch, lsn: u64) -> Result<()> {
         if self.is_frozen() {
-            return Err(crate::error::TiSqlError::Storage(
+            return Err(crate::util::error::TiSqlError::Storage(
                 "Cannot write to frozen memtable".to_string(),
             ));
         }
@@ -341,7 +341,7 @@ impl MemTable {
         &self,
         key: &[u8],
         value: Vec<u8>,
-        owner_start_ts: crate::types::Timestamp,
+        owner_start_ts: crate::catalog::types::Timestamp,
     ) -> std::result::Result<(), PessimisticWriteError> {
         if self.is_frozen() {
             // Frozen memtables cannot accept new writes
@@ -374,16 +374,16 @@ impl MemTable {
     }
 
     /// Check if a key is locked by a pending write.
-    pub fn get_lock_owner(&self, key: &[u8]) -> Option<crate::types::Timestamp> {
+    pub fn get_lock_owner(&self, key: &[u8]) -> Option<crate::catalog::types::Timestamp> {
         self.inner.get_lock_owner(key)
     }
 
     /// Finalize all pending writes for a transaction.
     pub fn finalize_pending(
         &self,
-        keys: &[crate::types::Key],
-        owner_start_ts: crate::types::Timestamp,
-        commit_ts: crate::types::Timestamp,
+        keys: &[crate::catalog::types::Key],
+        owner_start_ts: crate::catalog::types::Timestamp,
+        commit_ts: crate::catalog::types::Timestamp,
     ) -> PendingResolveStats {
         let stats = self
             .inner
@@ -395,8 +395,8 @@ impl MemTable {
     /// Abort all pending writes for a transaction.
     pub fn abort_pending(
         &self,
-        keys: &[crate::types::Key],
-        owner_start_ts: crate::types::Timestamp,
+        keys: &[crate::catalog::types::Key],
+        owner_start_ts: crate::catalog::types::Timestamp,
     ) -> usize {
         let resolved = self.inner.abort_pending_counted(keys, owner_start_ts);
         self.dec_pending_count(resolved);
@@ -413,7 +413,7 @@ impl MemTable {
     pub fn delete_pending(
         &self,
         key: &[u8],
-        owner_start_ts: crate::types::Timestamp,
+        owner_start_ts: crate::catalog::types::Timestamp,
     ) -> std::result::Result<bool, PessimisticWriteError> {
         if self.is_frozen() {
             // Frozen memtables cannot accept new writes
@@ -439,9 +439,9 @@ impl MemTable {
     pub fn get_with_owner(
         &self,
         key: &[u8],
-        read_ts: crate::types::Timestamp,
-        owner_start_ts: crate::types::Timestamp,
-    ) -> Option<crate::types::RawValue> {
+        read_ts: crate::catalog::types::Timestamp,
+        owner_start_ts: crate::catalog::types::Timestamp,
+    ) -> Option<crate::catalog::types::RawValue> {
         self.inner.get_with_owner(key, read_ts, owner_start_ts)
     }
 }
@@ -453,8 +453,8 @@ fn estimate_batch_size(batch: &WriteBatch) -> usize {
     batch
         .iter()
         .map(|(key, op)| match op {
-            crate::storage::WriteOp::Put { value } => estimate_entry_size(key.len(), value.len()),
-            crate::storage::WriteOp::Delete => estimate_entry_size(key.len(), 0),
+            crate::tablet::WriteOp::Put { value } => estimate_entry_size(key.len(), value.len()),
+            crate::tablet::WriteOp::Delete => estimate_entry_size(key.len(), 0),
         })
         .sum()
 }
@@ -470,8 +470,8 @@ mod tests {
     use std::thread;
 
     use super::*;
-    use crate::storage::mvcc::{is_tombstone, MvccIterator, MvccKey};
-    use crate::types::{Key, RawValue, Timestamp};
+    use crate::catalog::types::{Key, RawValue, Timestamp};
+    use crate::tablet::mvcc::{is_tombstone, MvccIterator, MvccKey};
 
     fn new_batch(commit_ts: Timestamp) -> WriteBatch {
         let mut batch = WriteBatch::new();
@@ -976,7 +976,7 @@ mod tests {
         // Non-owner should not see pending value (returns LOCK sentinel or None)
         let result = mt.get_with_owner(b"key", Timestamp::MAX, 200);
         // The raw result may be LOCK sentinel, which filtering removes
-        assert!(result.is_none() || crate::storage::mvcc::is_lock(&result.unwrap()));
+        assert!(result.is_none() || crate::tablet::mvcc::is_lock(&result.unwrap()));
     }
 
     #[test]

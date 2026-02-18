@@ -22,9 +22,9 @@ use std::sync::atomic::{AtomicU64, Ordering};
 
 use parking_lot::RwLock;
 
+use crate::catalog::types::{IndexId, TableId, Timestamp, Value};
 use crate::codec::key::{encode_record_key_with_handle, gen_table_record_prefix};
 use crate::codec::row::encode_row;
-use crate::error::{Result, TiSqlError};
 use crate::inner_table::bootstrap::{
     self, delete_column_rows, delete_index_rows, update_meta_row, write_gc_task_row,
     write_index_row, write_user_column_rows, write_user_table_row,
@@ -32,7 +32,7 @@ use crate::inner_table::bootstrap::{
 use crate::inner_table::catalog_loader::{self, CatalogCache};
 use crate::inner_table::core_tables::*;
 use crate::transaction::{TxnCtx, TxnService};
-use crate::types::{IndexId, TableId, Timestamp, Value};
+use crate::util::error::{Result, TiSqlError};
 
 use super::{Catalog, IndexDef, TableDef};
 
@@ -671,12 +671,12 @@ impl<T: TxnService> Catalog for MvccCatalog<T> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::catalog::types::DataType;
     use crate::catalog::ColumnDef;
     use crate::clog::{FileClogConfig, FileClogService};
-    use crate::storage::MemTableEngine;
+    use crate::tablet::MemTableEngine;
     use crate::transaction::{ConcurrencyManager, TransactionService};
     use crate::tso::LocalTso;
-    use crate::types::DataType;
     use std::sync::Arc;
     use tempfile::tempdir;
 

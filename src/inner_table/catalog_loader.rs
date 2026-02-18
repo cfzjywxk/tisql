@@ -19,14 +19,14 @@
 
 use std::collections::HashMap;
 
+use crate::catalog::types::{DataType, TableId, Timestamp, Value};
 use crate::catalog::{ColumnDef, IndexDef, TableDef};
 use crate::codec::key::{encode_record_key_with_handle, gen_table_record_prefix};
 use crate::codec::row::decode_row_to_values;
-use crate::error::{Result, TiSqlError};
 use crate::inner_table::core_tables::*;
-use crate::storage::MvccIterator;
+use crate::tablet::MvccIterator;
 use crate::transaction::{TxnCtx, TxnService};
-use crate::types::{DataType, TableId, Timestamp, Value};
+use crate::util::error::{Result, TiSqlError};
 
 // ============================================================================
 // CatalogCache
@@ -950,7 +950,7 @@ mod tests {
     use super::*;
     use crate::clog::{FileClogConfig, FileClogService};
     use crate::inner_table::bootstrap;
-    use crate::storage::MemTableEngine;
+    use crate::tablet::MemTableEngine;
     use crate::transaction::{ConcurrencyManager, TransactionService};
     use crate::tso::LocalTso;
     use std::sync::Arc;

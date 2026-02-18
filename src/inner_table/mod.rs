@@ -45,9 +45,9 @@ pub(crate) mod gc_worker;
 
 use std::sync::Arc;
 
-use crate::error::Result;
 use crate::executor::ExecutionResult;
 use crate::session::{ExecutionCtx, Session};
+use crate::util::error::Result;
 use crate::Database;
 
 /// Inner session for internal SQL execution.
@@ -138,7 +138,7 @@ impl Drop for InnerSession {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::types::Value;
+    use crate::catalog::types::Value;
     use crate::DatabaseConfig;
     use tempfile::tempdir;
 

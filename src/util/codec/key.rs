@@ -29,10 +29,10 @@
 //! All integer components use comparable encoding (big-endian with sign bit XOR)
 //! to ensure correct lexicographic ordering.
 
+use crate::catalog::types::{IndexId, TableId, Value};
 use crate::codec::bytes::encode_bytes;
 use crate::codec::number::{decode_comparable_i64, encode_comparable_i64};
-use crate::error::{Result, TiSqlError};
-use crate::types::{IndexId, TableId, Value};
+use crate::util::error::{Result, TiSqlError};
 
 /// Table prefix byte: 't'
 pub const TABLE_PREFIX: u8 = b't';

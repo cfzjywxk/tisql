@@ -39,7 +39,7 @@ mod local;
 
 pub use local::LocalTso;
 
-use crate::types::Timestamp;
+use crate::catalog::types::Timestamp;
 
 /// Timestamp Oracle service trait.
 ///

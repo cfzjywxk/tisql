@@ -24,8 +24,8 @@
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
-use crate::error::{Result, TiSqlError};
 use crate::io::{DmaFile, IoService};
+use crate::util::error::{Result, TiSqlError};
 
 use super::block::{DataBlock, IndexBlock, IndexEntry};
 use super::builder::{Footer, FOOTER_SIZE};
@@ -298,7 +298,7 @@ impl SstReaderRef {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::storage::sstable::builder::{SstBuilder, SstBuilderOptions};
+    use crate::tablet::sstable::builder::{SstBuilder, SstBuilderOptions};
     use tempfile::tempdir;
 
     // Helper to create MVCC key
@@ -720,7 +720,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_reader_corrupted_index_offset_too_large() {
-        use crate::storage::sstable::builder::{FOOTER_SIZE, SST_MAGIC};
+        use crate::tablet::sstable::builder::{FOOTER_SIZE, SST_MAGIC};
 
         let dir = tempdir().unwrap();
         let path = dir.path().join("corrupt_offset.sst");
@@ -752,7 +752,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_reader_corrupted_index_size_overflow() {
-        use crate::storage::sstable::builder::{FOOTER_SIZE, SST_MAGIC};
+        use crate::tablet::sstable::builder::{FOOTER_SIZE, SST_MAGIC};
 
         let dir = tempdir().unwrap();
         let path = dir.path().join("corrupt_size_overflow.sst");
@@ -789,7 +789,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_reader_corrupted_index_end_exceeds_data() {
-        use crate::storage::sstable::builder::{FOOTER_SIZE, SST_MAGIC};
+        use crate::tablet::sstable::builder::{FOOTER_SIZE, SST_MAGIC};
 
         let dir = tempdir().unwrap();
         let path = dir.path().join("corrupt_index_end.sst");
@@ -825,7 +825,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_reader_corrupted_index_size_exceeds_max() {
-        use crate::storage::sstable::builder::{FOOTER_SIZE, SST_MAGIC};
+        use crate::tablet::sstable::builder::{FOOTER_SIZE, SST_MAGIC};
 
         let dir = tempdir().unwrap();
         let path = dir.path().join("corrupt_max_size.sst");

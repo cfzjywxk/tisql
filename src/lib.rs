@@ -19,35 +19,37 @@
 // Layer separation: upper layers only access lower layers via traits (interfaces)
 //
 // Public modules (expose interfaces/traits):
-//   - error, types, util, codec - common types
+//   - util - shared utilities
+//   - catalog - metadata traits and catalog::types
+//   - catalog::types - SQL schema/value types
 //   - session - Session/QueryCtx (needed by protocol layer)
 //   - protocol, worker - server infrastructure
+//   - tablet - storage/tablet engine module
+//   - log - clog/ilog/lsn durability modules
 //
 // Internal modules (implementations hidden):
-//   - catalog - Catalog trait public, MemoryCatalog internal
-//   - clog - ClogService trait public, FileClogService internal
-//   - storage - StorageEngine trait public, implementations internal
 //   - transaction - TxnService trait public, TransactionService/ConcurrencyManager internal
 //   - sql, executor - Parser and SimpleExecutor on Database
 
 // Public modules - common types and server infrastructure
-pub mod codec;
-pub mod error;
-pub mod io;
-pub mod lsn;
+pub mod log;
 pub mod protocol;
 pub mod session;
-pub mod types;
+pub mod tablet;
 pub mod util;
 pub mod worker;
 
-// Internal modules - only traits are re-exported, not implementations
-mod catalog;
-mod clog;
+// Backward-compatible module aliases for existing paths.
+pub use log::clog;
+pub use log::lsn;
+pub use util::codec;
+pub use util::io;
+
+// Internal modules - only traits are re-exported, not concrete implementations
+pub mod catalog;
 mod executor;
 pub(crate) mod inner_table;
 mod sql;
-pub mod storage;
 mod transaction;
 mod tso;
 
@@ -57,7 +59,7 @@ pub use clog::{ClogFsyncFuture, ClogService};
 pub use lsn::{new_lsn_provider, LsnProvider, SharedLsnProvider};
 pub use protocol::{MySqlServer, MYSQL_DEFAULT_PORT};
 pub use session::{ExecutionCtx, Priority, QueryCtx, Session, SessionRegistry, SessionVars};
-pub use storage::{PessimisticStorage, StorageEngine, V26BoundaryMode};
+pub use tablet::{PessimisticStorage, StorageEngine, V26BoundaryMode};
 pub use transaction::{CommitInfo, TxnCtx, TxnService, TxnState};
 pub use tso::TsoService;
 pub use worker::QueryResponse;
@@ -80,10 +82,10 @@ pub mod testkit {
     pub use crate::util::{ArenaConfig, PageArena, DEFAULT_PAGE_SIZE};
 
     // Production memtable engine
-    pub use crate::storage::{MemTableEngine, MemoryStats, VersionedMemTableEngine};
+    pub use crate::tablet::{MemTableEngine, MemoryStats, VersionedMemTableEngine};
 
     // LSM storage engine for testing
-    pub use crate::storage::{
+    pub use crate::tablet::{
         CompactionExecutor, CompactionPicker, CompactionScheduler, CompactionTask, IlogConfig,
         IlogService, IlogTruncateStats, LsmConfig, LsmConfigBuilder, LsmEngine, LsmRecovery,
         LsmStats, ManifestDelta, MemTable, RecoveryResult, SstBuilder, SstBuilderOptions,
@@ -91,7 +93,7 @@ pub mod testkit {
     };
 
     // Re-export FlushScheduler for testing
-    pub use crate::storage::FlushScheduler;
+    pub use crate::tablet::FlushScheduler;
 
     // Re-export IoService for testing
     pub use crate::io::IoService;
@@ -107,10 +109,10 @@ pub mod testkit {
 
     // Test helper extension trait for TransactionService
     use crate::clog::ClogService;
-    use crate::error::Result;
-    use crate::storage::PessimisticStorage;
+    use crate::tablet::PessimisticStorage;
     use crate::transaction::{CommitInfo, TxnService};
     use crate::tso::TsoService;
+    use crate::util::error::Result;
 
     use std::future::Future;
 
@@ -161,17 +163,17 @@ pub mod testkit {
 }
 
 // Internal imports (not re-exported)
+use catalog::types::{Lsn, Value};
 use catalog::MvccCatalog;
 use clog::{FileClogService, TruncateStats};
-use error::Result;
 use executor::{ExecutionOutput, ExecutionResult, Executor, SimpleExecutor};
 use sql::Parser;
-use storage::{
+use tablet::{
     CompactionScheduler, FlushScheduler, IlogService, IlogTruncateStats, LsmEngine, LsmRecovery,
 };
 use transaction::{ConcurrencyManager, TransactionService};
 use tso::LocalTso;
-use types::{Lsn, Value};
+use util::error::{Result, TiSqlError};
 
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -302,7 +304,9 @@ impl Database {
             .enable_all()
             .build()
             .map_err(|e| {
-                crate::error::TiSqlError::Internal(format!("Failed to create I/O runtime: {e}"))
+                crate::util::error::TiSqlError::Internal(format!(
+                    "Failed to create I/O runtime: {e}"
+                ))
             })?;
 
         log_info!("I/O runtime created with 2 threads");
@@ -329,7 +333,7 @@ impl Database {
             .enable_all()
             .build()
             .map_err(|e| {
-                crate::error::TiSqlError::Internal(format!(
+                crate::util::error::TiSqlError::Internal(format!(
                     "Failed to create background runtime: {e}"
                 ))
             })?;
@@ -423,7 +427,9 @@ impl Database {
             .enable_all()
             .build()
             .map_err(|e| {
-                crate::error::TiSqlError::Internal(format!("Failed to create worker runtime: {e}"))
+                crate::util::error::TiSqlError::Internal(format!(
+                    "Failed to create worker runtime: {e}"
+                ))
             })?;
 
         log_info!("Worker runtime created with {} threads", worker_threads);
@@ -518,12 +524,12 @@ impl Database {
         // early to preserve the session's transaction state.
         if session.has_active_txn() {
             if matches!(&plan, sql::LogicalPlan::Begin { .. }) {
-                return Err(error::TiSqlError::Internal(
+                return Err(TiSqlError::Internal(
                     "Nested transactions are not supported. Use COMMIT or ROLLBACK first.".into(),
                 ));
             }
             if plan.is_ddl() {
-                return Err(error::TiSqlError::Internal(
+                return Err(TiSqlError::Internal(
                     "DDL statements are not allowed within explicit transactions. Use COMMIT first."
                         .into(),
                 ));
@@ -1042,7 +1048,7 @@ mod tests {
     #[tokio::test]
     async fn test_run_log_gc_once_reclaims_logs_and_recovers() {
         use crate::clog::{ClogBatch, ClogEntry, ClogOp, ClogService};
-        use crate::storage::WriteBatch;
+        use crate::tablet::WriteBatch;
 
         let dir = tempdir().unwrap();
         let config = DatabaseConfig::with_data_dir(dir.path());

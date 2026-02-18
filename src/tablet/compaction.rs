@@ -47,8 +47,8 @@ use std::sync::Arc;
 #[cfg(feature = "failpoints")]
 use fail::fail_point;
 
-use crate::error::Result;
-use crate::types::{RawValue, Timestamp};
+use crate::catalog::types::{RawValue, Timestamp};
+use crate::util::error::Result;
 
 use super::config::LsmConfig;
 use super::mvcc::{decode_mvcc_key, is_tombstone};
@@ -523,7 +523,7 @@ impl CompactionExecutor {
         }
 
         if pre_allocated_ids.is_empty() {
-            return Err(crate::error::TiSqlError::Storage(
+            return Err(crate::util::error::TiSqlError::Storage(
                 "pre_allocated_ids must not be empty for non-trivial compaction".to_string(),
             ));
         }
@@ -630,7 +630,7 @@ impl CompactionExecutor {
 
                         // Start new output file
                         if id_idx >= pre_allocated_ids.len() {
-                            return Err(crate::error::TiSqlError::Storage(
+                            return Err(crate::util::error::TiSqlError::Storage(
                                 "Ran out of pre-allocated SST IDs during compaction".to_string(),
                             ));
                         }
@@ -681,7 +681,7 @@ impl CompactionExecutor {
             .iter()
             .find(|sst| sst.id == input_id)
             .ok_or_else(|| {
-                crate::error::TiSqlError::Storage(format!("SST {input_id} not found"))
+                crate::util::error::TiSqlError::Storage(format!("SST {input_id} not found"))
             })?;
 
         // Create new metadata with updated level
@@ -702,7 +702,7 @@ impl CompactionExecutor {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::storage::sstable::SstBuilder;
+    use crate::tablet::sstable::SstBuilder;
     use tempfile::TempDir;
 
     fn test_io() -> Arc<crate::io::IoService> {

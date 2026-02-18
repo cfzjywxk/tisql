@@ -20,7 +20,7 @@
 use std::sync::atomic::{AtomicU64, Ordering};
 
 use super::TsoService;
-use crate::types::Timestamp;
+use crate::catalog::types::Timestamp;
 
 /// Local TSO implementation using an atomic counter.
 ///

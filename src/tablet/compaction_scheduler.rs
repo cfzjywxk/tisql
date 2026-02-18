@@ -208,7 +208,7 @@ impl CompactionSchedulerInner {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::storage::{LsmConfig, StorageEngine, WriteBatch};
+    use crate::tablet::{LsmConfig, StorageEngine, WriteBatch};
     use tempfile::TempDir;
 
     fn test_config(dir: &std::path::Path) -> LsmConfig {

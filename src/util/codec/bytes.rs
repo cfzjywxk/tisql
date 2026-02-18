@@ -32,7 +32,7 @@
 //! More space-efficient but not suitable for key ordering.
 
 use crate::codec::number::{decode_varuint, encode_varuint};
-use crate::error::{Result, TiSqlError};
+use crate::util::error::{Result, TiSqlError};
 
 /// Group size for memcomparable encoding (8 bytes per group)
 const ENC_GROUP_SIZE: usize = 8;

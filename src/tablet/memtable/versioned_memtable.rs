@@ -63,14 +63,14 @@ use std::sync::Arc;
 use crossbeam_skiplist::map::Entry;
 use crossbeam_skiplist::SkipMap;
 
-use crate::error::{Result, TiSqlError};
-use crate::storage::mvcc::{
+use crate::catalog::types::{Key, RawValue, Timestamp};
+use crate::tablet::mvcc::{
     is_lock, is_tombstone, MvccIterator, MvccKey, SharedMvccRange, LOCK, TOMBSTONE,
 };
-use crate::storage::{
+use crate::tablet::{
     PessimisticStorage, PessimisticWriteError, StorageEngine, WriteBatch, WriteOp,
 };
-use crate::types::{Key, RawValue, Timestamp};
+use crate::util::error::{Result, TiSqlError};
 
 // ============================================================================
 // VersionNode - Single version in the chain
@@ -1693,7 +1693,7 @@ impl MvccIterator for ArcVersionedMemTableIterator {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::storage::mvcc::is_tombstone;
+    use crate::tablet::mvcc::is_tombstone;
     use std::collections::HashSet;
 
     fn new_engine() -> VersionedMemTableEngine {
@@ -3009,7 +3009,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_get_at_with_owner_lock_skips_to_previous() {
-        use crate::storage::mvcc::LOCK;
+        use crate::tablet::mvcc::LOCK;
 
         let row = MvccRow::new_empty();
 
@@ -3030,7 +3030,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_get_at_with_owner_lock_no_previous_returns_none() {
-        use crate::storage::mvcc::LOCK;
+        use crate::tablet::mvcc::LOCK;
 
         let row = MvccRow::new_empty();
 
@@ -3125,7 +3125,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_get_at_with_owner_insert_delete_insert_pattern() {
-        use crate::storage::mvcc::LOCK;
+        use crate::tablet::mvcc::LOCK;
 
         let row = MvccRow::new_empty();
 
@@ -3374,7 +3374,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_iterator_with_owner_sees_pending_value() {
-        use crate::storage::mvcc::MvccKey;
+        use crate::tablet::mvcc::MvccKey;
 
         let engine = VersionedMemTableEngine::new();
 
@@ -3418,7 +3418,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_iterator_with_owner_skips_lock_node() {
-        use crate::storage::mvcc::MvccKey;
+        use crate::tablet::mvcc::MvccKey;
 
         let engine = VersionedMemTableEngine::new();
 
@@ -3446,7 +3446,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_iterator_with_owner_multiple_keys() {
-        use crate::storage::mvcc::MvccKey;
+        use crate::tablet::mvcc::MvccKey;
 
         let engine = VersionedMemTableEngine::new();
 
@@ -3506,7 +3506,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_iterator_with_owner_does_not_see_other_txn_pending() {
-        use crate::storage::mvcc::MvccKey;
+        use crate::tablet::mvcc::MvccKey;
 
         let engine = VersionedMemTableEngine::new();
 
@@ -3534,7 +3534,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_arc_iterator_with_owner() {
-        use crate::storage::mvcc::MvccKey;
+        use crate::tablet::mvcc::MvccKey;
 
         let engine = VersionedMemTableEngine::new();
 
@@ -3562,8 +3562,8 @@ mod tests {
 
     #[tokio::test]
     async fn test_scan_iter_with_owner_via_storage_engine() {
-        use crate::storage::mvcc::MvccKey;
-        use crate::storage::{MvccIterator, PessimisticStorage, StorageEngine};
+        use crate::tablet::mvcc::MvccKey;
+        use crate::tablet::{MvccIterator, PessimisticStorage, StorageEngine};
 
         let engine = VersionedMemTableEngine::new();
 
@@ -3588,7 +3588,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_iterator_with_owner_pending_only_key() {
-        use crate::storage::mvcc::MvccKey;
+        use crate::tablet::mvcc::MvccKey;
 
         let engine = VersionedMemTableEngine::new();
 
@@ -3625,7 +3625,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_iterator_with_owner_lock_only_key() {
-        use crate::storage::mvcc::MvccKey;
+        use crate::tablet::mvcc::MvccKey;
 
         let engine = VersionedMemTableEngine::new();
 
@@ -3887,7 +3887,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_scan_iter_with_range_boundaries() {
-        use crate::storage::StorageEngine;
+        use crate::tablet::StorageEngine;
 
         let engine = VersionedMemTableEngine::new();
 

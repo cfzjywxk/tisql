@@ -18,8 +18,8 @@ use parking_lot::RwLock;
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicU64, Ordering};
 
-use crate::error::{Result, TiSqlError};
-use crate::types::{IndexId, TableId};
+use crate::catalog::types::{IndexId, TableId};
+use crate::util::error::{Result, TiSqlError};
 
 use super::{Catalog, IndexDef, TableDef};
 
@@ -256,8 +256,8 @@ impl Catalog for MemoryCatalog {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::catalog::types::DataType;
     use crate::catalog::ColumnDef;
-    use crate::types::DataType;
 
     fn make_test_table(catalog: &MemoryCatalog, name: &str) -> TableDef {
         let table_id = catalog.next_table_id().unwrap();

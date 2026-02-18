@@ -46,11 +46,11 @@ use std::collections::HashMap;
 use std::path::PathBuf;
 use std::sync::Arc;
 
+use crate::catalog::types::{Lsn, Timestamp, TxnId};
 use crate::clog::{ClogEntry, ClogOp, FileClogConfig, FileClogService};
-use crate::error::Result;
 use crate::lsn::{new_lsn_provider, SharedLsnProvider};
-use crate::storage::{LsmConfig, LsmEngine, StorageEngine, WriteBatch};
-use crate::types::{Lsn, Timestamp, TxnId};
+use crate::tablet::{LsmConfig, LsmEngine, StorageEngine, WriteBatch};
+use crate::util::error::Result;
 use crate::{log_info, log_warn};
 
 use super::ilog::{IlogConfig, IlogService};
@@ -148,7 +148,7 @@ impl LsmRecovery {
 
         // Create shared IoService for clog/ilog group commit writers
         let io_service = crate::io::IoService::new(256).map_err(|e| {
-            crate::error::TiSqlError::Storage(format!("Failed to create IoService: {e}"))
+            crate::util::error::TiSqlError::Storage(format!("Failed to create IoService: {e}"))
         })?;
 
         // Step 1: Recover ilog to rebuild Version
@@ -346,12 +346,12 @@ struct ReplayResult {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::catalog::types::RawValue;
     use crate::clog::{ClogBatch, ClogEntry, ClogOp, ClogService};
-    use crate::storage::ilog::IlogService;
-    use crate::storage::mvcc::{is_tombstone, MvccIterator, MvccKey};
-    use crate::storage::version::Version;
-    use crate::storage::StorageEngine;
-    use crate::types::RawValue;
+    use crate::tablet::ilog::IlogService;
+    use crate::tablet::mvcc::{is_tombstone, MvccIterator, MvccKey};
+    use crate::tablet::version::Version;
+    use crate::tablet::StorageEngine;
     use tempfile::TempDir;
 
     fn make_test_io() -> Arc<crate::io::IoService> {
@@ -359,7 +359,7 @@ mod tests {
     }
 
     async fn get_at_for_test(engine: &LsmEngine, key: &[u8], ts: Timestamp) -> Option<RawValue> {
-        use crate::storage::StorageEngine;
+        use crate::tablet::StorageEngine;
         let start = MvccKey::encode(key, ts);
         let end = MvccKey::encode(key, 0)
             .next_key()

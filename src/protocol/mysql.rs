@@ -29,8 +29,8 @@ use opensrv_mysql::{
 };
 use tokio::io::AsyncWrite;
 
+use crate::catalog::types::Value;
 use crate::session::{ExecutionCtx, Session};
-use crate::types::Value;
 use crate::worker::{self, QueryResponse};
 use crate::{log_debug, log_info, Database};
 

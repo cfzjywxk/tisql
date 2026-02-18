@@ -52,8 +52,8 @@
 //! +---------------------+-----------------+------------------+------------+
 //! ```
 
-use crate::error::{Result, TiSqlError};
-use crate::types::RawValue;
+use crate::catalog::types::RawValue;
+use crate::util::error::{Result, TiSqlError};
 
 // ============================================================================
 // Constants

@@ -41,9 +41,9 @@
 //! iter.seek(b"target_key")?;
 //! ```
 
-use crate::error::Result;
-use crate::storage::mvcc::{MvccIterator, MvccKey, SharedMvccRange, TIMESTAMP_SIZE};
-use crate::types::{RawValue, Timestamp};
+use crate::catalog::types::{RawValue, Timestamp};
+use crate::tablet::mvcc::{MvccIterator, MvccKey, SharedMvccRange, TIMESTAMP_SIZE};
+use crate::util::error::Result;
 
 use super::block::DataBlock;
 use super::reader::SstReaderRef;
@@ -624,7 +624,7 @@ impl MvccIterator for SstMvccIterator {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::storage::sstable::builder::{SstBuilder, SstBuilderOptions};
+    use crate::tablet::sstable::builder::{SstBuilder, SstBuilderOptions};
     use tempfile::tempdir;
 
     fn test_io() -> std::sync::Arc<crate::io::IoService> {
@@ -642,7 +642,7 @@ mod tests {
     async fn create_test_sst(
         path: &std::path::Path,
         entries: &[(&[u8], &[u8])],
-    ) -> crate::error::Result<SstReaderRef> {
+    ) -> crate::util::error::Result<SstReaderRef> {
         let mut builder = SstBuilder::new(path, SstBuilderOptions::default())?;
         for (key, value) in entries {
             builder.add(key, value)?;
@@ -656,7 +656,7 @@ mod tests {
         path: &std::path::Path,
         start: usize,
         count: usize,
-    ) -> crate::error::Result<SstReaderRef> {
+    ) -> crate::util::error::Result<SstReaderRef> {
         let mut builder = SstBuilder::new(path, SstBuilderOptions::default())?;
         for i in start..start + count {
             let key = format!("key_{i:05}");

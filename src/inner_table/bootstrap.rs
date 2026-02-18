@@ -18,12 +18,12 @@
 //! All writes happen in a single transaction — if bootstrap fails mid-write,
 //! the transaction is not committed and next startup retries from scratch.
 
+use crate::catalog::types::Value;
 use crate::codec::key::encode_record_key_with_handle;
 use crate::codec::row::encode_row;
-use crate::error::Result;
 use crate::inner_table::core_tables::*;
 use crate::transaction::{TxnCtx, TxnService};
-use crate::types::Value;
+use crate::util::error::Result;
 
 /// Check if the database has been bootstrapped by reading the `__all_meta`
 /// bootstrap_version row (meta_id=1) via direct KV read.
@@ -359,7 +359,7 @@ pub(crate) async fn update_meta_row<T: TxnService>(
 mod tests {
     use super::*;
     use crate::clog::{FileClogConfig, FileClogService};
-    use crate::storage::MemTableEngine;
+    use crate::tablet::MemTableEngine;
     use crate::transaction::{ConcurrencyManager, TransactionService};
     use crate::tso::LocalTso;
     use std::sync::Arc;

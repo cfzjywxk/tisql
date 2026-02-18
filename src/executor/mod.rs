@@ -20,12 +20,12 @@ pub(crate) use simple::SimpleExecutor;
 use std::future::Future;
 use std::pin::Pin;
 
+use crate::catalog::types::{Row, Schema, TableId, Timestamp};
 use crate::catalog::Catalog;
-use crate::error::Result;
 use crate::session::ExecutionCtx;
 use crate::sql::LogicalPlan;
 use crate::transaction::{TxnCtx, TxnService};
-use crate::types::{Row, Schema, TableId, Timestamp};
+use crate::util::error::Result;
 
 /// Side effect from a DDL operation that requires post-execution action.
 pub enum DdlEffect {

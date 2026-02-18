@@ -26,6 +26,7 @@
 
 mod memory;
 mod mvcc;
+pub mod types;
 
 // Crate-internal implementation - not exposed publicly
 // External users only see the Catalog trait
@@ -33,8 +34,8 @@ mod mvcc;
 pub(crate) use memory::MemoryCatalog;
 pub(crate) use mvcc::MvccCatalog;
 
-use crate::error::Result;
-use crate::types::{ColumnId, DataType, IndexId, TableId, Timestamp};
+use crate::catalog::types::{ColumnId, DataType, IndexId, TableId, Timestamp};
+use crate::util::error::Result;
 use serde::{Deserialize, Serialize};
 use std::future::Future;
 

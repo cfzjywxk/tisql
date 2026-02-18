@@ -143,22 +143,26 @@ Side runtimes/services:
 src/
 ├── lib.rs           # Database entry point and wiring
 ├── main.rs          # CLI server binary
-├── lsn.rs           # Shared LSN allocator for clog/ilog
 ├── catalog/         # MVCC catalog (inner-table-backed)
+│   └── types.rs     # SQL data/value/type definitions
 ├── inner_table/     # Bootstrap, core system tables, GC worker
 ├── sql/             # Parser, binder, logical plan
 ├── executor/        # Volcano-style executor
 ├── transaction/     # TxnService, concurrency manager, txn state
-├── storage/         # LSM engine, memtable, SST, recovery
-├── clog/            # WAL with group commit
-├── io/              # SST I/O service (Linux io_uring + non-Linux fallback) and DMA buffers
+├── tablet/          # LSM engine, memtable, SST, recovery
+├── log/             # Durability logs
+│   ├── clog/        # WAL with group commit
+│   ├── ilog.rs      # Manifest/flush/compaction metadata log
+│   └── lsn.rs       # Shared LSN allocator for clog/ilog
 ├── protocol/        # MySQL wire protocol handler
 ├── worker/          # Worker dispatch + row batch streaming
 ├── session/         # Per-connection session state
-├── codec/           # TiDB-compatible key/row codec
 ├── tso/             # Local timestamp oracle
-├── util/            # Logging, fs utils, timing, arena
-└── types.rs         # Core value/key/timestamp types
+├── util/            # Shared utilities
+│   ├── error.rs     # Shared error definitions
+│   ├── codec/       # TiDB-compatible key/row codec
+│   ├── io/          # IoFuture/IoService and DMA file abstractions
+│   └── ...          # Logging, fs utils, timing, arena, etc.
 ```
 
 ## Extra Tools

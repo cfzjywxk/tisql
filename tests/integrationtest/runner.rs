@@ -28,7 +28,7 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::Duration;
 
-use tisql::error::TiSqlError;
+use tisql::util::error::TiSqlError;
 use tisql::{Database, DatabaseConfig, QueryResult};
 
 /// Test runner configuration

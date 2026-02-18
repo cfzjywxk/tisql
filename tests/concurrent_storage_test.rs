@@ -33,13 +33,13 @@ use std::time::Duration;
 
 use tempfile::TempDir;
 
+use tisql::catalog::types::{RawValue, Timestamp};
 use tisql::new_lsn_provider;
-use tisql::storage::mvcc::{is_tombstone, MvccIterator, MvccKey};
-use tisql::storage::WriteBatch;
+use tisql::tablet::mvcc::{is_tombstone, MvccIterator, MvccKey};
+use tisql::tablet::WriteBatch;
 use tisql::testkit::{
     IlogConfig, IlogService, LsmConfigBuilder, LsmEngine, LsmRecovery, RecoveryResult, Version,
 };
-use tisql::types::{RawValue, Timestamp};
 use tisql::StorageEngine;
 
 fn make_test_io() -> std::sync::Arc<tisql::io::IoService> {

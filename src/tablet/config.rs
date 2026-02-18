@@ -42,7 +42,7 @@
 use std::path::PathBuf;
 use std::time::Duration;
 
-use crate::storage::sstable::CompressionType;
+use crate::tablet::sstable::CompressionType;
 
 /// Default memtable size (64 MB).
 pub const DEFAULT_MEMTABLE_SIZE: usize = 64 * 1024 * 1024;

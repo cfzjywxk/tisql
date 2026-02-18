@@ -29,14 +29,14 @@ use std::time::Duration;
 
 use tempfile::TempDir;
 
+use tisql::catalog::types::{RawValue, Timestamp};
 use tisql::new_lsn_provider;
-use tisql::storage::mvcc::{is_tombstone, MvccIterator, MvccKey};
-use tisql::storage::WriteBatch;
+use tisql::tablet::mvcc::{is_tombstone, MvccIterator, MvccKey};
+use tisql::tablet::WriteBatch;
 use tisql::testkit::{
     IlogConfig, IlogService, IoService, LsmConfigBuilder, LsmEngine, SstBuilder, SstBuilderOptions,
     SstIterator, SstReaderRef, Version,
 };
-use tisql::types::{RawValue, Timestamp};
 use tisql::StorageEngine;
 
 // ==================== Test Helpers Using MvccKey ====================

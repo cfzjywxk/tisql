@@ -27,13 +27,13 @@
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::Arc;
 
-use tisql::error::TiSqlError;
-use tisql::storage::mvcc::{is_tombstone, MvccIterator, MvccKey};
+use tisql::catalog::types::{RawValue, Timestamp};
+use tisql::tablet::mvcc::{is_tombstone, MvccIterator, MvccKey};
 use tisql::testkit::{
     ConcurrencyManager, FileClogConfig, FileClogService, LocalTso, MemTableEngine,
     TransactionService, TxnServiceTestExt,
 };
-use tisql::types::{RawValue, Timestamp};
+use tisql::util::error::TiSqlError;
 use tisql::StorageEngine;
 
 fn make_test_io() -> Arc<tisql::io::IoService> {

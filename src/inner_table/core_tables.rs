@@ -18,9 +18,9 @@
 //! the OceanBase bootstrap pattern. These tables are the single source
 //! of truth for all schema metadata.
 
+use crate::catalog::types::DataType;
 use crate::catalog::{ColumnDef, DefaultValue, TableDef};
-use crate::error::{Result, TiSqlError};
-use crate::types::DataType;
+use crate::util::error::{Result, TiSqlError};
 
 // ============================================================================
 // Constants

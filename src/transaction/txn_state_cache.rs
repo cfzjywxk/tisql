@@ -50,8 +50,8 @@
 
 use dashmap::DashMap;
 
-use crate::error::{Result, TiSqlError};
-use crate::types::Timestamp;
+use crate::catalog::types::Timestamp;
+use crate::util::error::{Result, TiSqlError};
 
 use super::api::TxnState;
 

@@ -28,9 +28,9 @@ use std::sync::Arc;
 #[cfg(feature = "failpoints")]
 use fail::fail_point;
 
-use crate::error::{Result, TiSqlError};
+use crate::catalog::types::{Lsn, Timestamp, TxnId};
 use crate::lsn::{AtomicLsnProvider, LsnProvider, SharedLsnProvider};
-use crate::types::{Lsn, Timestamp, TxnId};
+use crate::util::error::{Result, TiSqlError};
 use crate::util::fs::{rename_durable, sync_dir};
 use crate::{log_info, log_trace, log_warn};
 

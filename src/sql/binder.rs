@@ -17,9 +17,9 @@ use sqlparser::ast::{
     Statement as SqlStatement, TableFactor, TableWithJoins, Value as SqlValue,
 };
 
+use crate::catalog::types::{ColumnInfo, DataType, Schema, Timestamp, Value};
 use crate::catalog::{Catalog, ColumnDef, TableDef};
-use crate::error::{Result, TiSqlError};
-use crate::types::{ColumnInfo, DataType, Schema, Timestamp, Value};
+use crate::util::error::{Result, TiSqlError};
 
 use super::plan::{AggFunc, BinaryOp, Expr, JoinType, LogicalPlan, OrderByExpr, UnaryOp};
 

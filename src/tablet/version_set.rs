@@ -182,7 +182,7 @@ impl std::fmt::Debug for SuperVersion {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::storage::sstable::SstMeta;
+    use crate::tablet::sstable::SstMeta;
 
     fn make_sst(id: u64, level: u32, smallest: &[u8], largest: &[u8]) -> SstMeta {
         SstMeta {

@@ -27,11 +27,11 @@ use std::sync::Arc;
 
 use tokio::sync::{mpsc, oneshot};
 
-use crate::error::TiSqlError;
+use crate::catalog::types::Row;
 use crate::executor::ExecutionOutput;
 use crate::session::ExecutionCtx;
 use crate::transaction::TxnCtx;
-use crate::types::Row;
+use crate::util::error::TiSqlError;
 use crate::Database;
 
 /// A batch of rows streamed from worker to protocol task.
@@ -206,7 +206,7 @@ fn handle_show(db: &Database, sql_lower: &str, exec_ctx: &ExecutionCtx) -> Query
             Ok(databases) => {
                 let rows: Vec<Row> = databases
                     .into_iter()
-                    .map(|name| Row::new(vec![crate::types::Value::String(name)]))
+                    .map(|name| Row::new(vec![crate::catalog::types::Value::String(name)]))
                     .collect();
                 make_show_response(vec!["Database".to_string()], rows)
             }
@@ -222,7 +222,7 @@ fn handle_show(db: &Database, sql_lower: &str, exec_ctx: &ExecutionCtx) -> Query
             Ok(tables) => {
                 let rows: Vec<Row> = tables
                     .into_iter()
-                    .map(|name| Row::new(vec![crate::types::Value::String(name)]))
+                    .map(|name| Row::new(vec![crate::catalog::types::Value::String(name)]))
                     .collect();
                 make_show_response(vec![col_name], rows)
             }

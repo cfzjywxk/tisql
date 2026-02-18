@@ -44,9 +44,9 @@ use std::collections::BTreeMap;
 use std::future::Future;
 use std::ops::Range;
 
-use crate::error::Result;
-use crate::storage::MvccIterator;
-use crate::types::{Key, Lsn, RawValue, Timestamp, TxnId};
+use crate::catalog::types::{Key, Lsn, RawValue, Timestamp, TxnId};
+use crate::tablet::MvccIterator;
+use crate::util::error::Result;
 
 /// Mutation type for keys tracked in a transaction.
 ///
@@ -90,13 +90,13 @@ pub enum TxnState {
     /// must wait because they cannot determine if commit_ts will be <= read_ts.
     Prepared {
         /// prepared_ts = max(current_max_ts, tso_ts)
-        prepared_ts: crate::types::Timestamp,
+        prepared_ts: crate::catalog::types::Timestamp,
     },
     /// Transaction has been committed.
     /// commit_ts = prepared_ts for single-server 1PC.
     Committed {
         /// The commit timestamp at which all writes became visible.
-        commit_ts: crate::types::Timestamp,
+        commit_ts: crate::catalog::types::Timestamp,
     },
     /// Transaction has been aborted/rolled back.
     Aborted,

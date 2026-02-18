@@ -16,7 +16,7 @@ use sqlparser::ast::Statement as SqlStatement;
 use sqlparser::dialect::MySqlDialect;
 use sqlparser::parser::Parser as SqlParser;
 
-use crate::error::{Result, TiSqlError};
+use crate::util::error::{Result, TiSqlError};
 
 /// SQL Parser wrapper around sqlparser-rs
 pub struct Parser {

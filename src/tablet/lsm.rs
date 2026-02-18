@@ -54,12 +54,12 @@ use tokio::sync::{mpsc, oneshot};
 #[cfg(feature = "failpoints")]
 use fail::fail_point;
 
-use crate::error::{Result, TiSqlError};
+use crate::catalog::types::{Key, Lsn, RawValue, Timestamp};
 use crate::log_error;
 use crate::lsn::SharedLsnProvider;
-use crate::storage::mvcc::{decode_mvcc_key, is_tombstone, MvccIterator, MvccKey, SharedMvccRange};
-use crate::storage::{PessimisticStorage, PessimisticWriteError, StorageEngine, WriteBatch};
-use crate::types::{Key, Lsn, RawValue, Timestamp};
+use crate::tablet::mvcc::{decode_mvcc_key, is_tombstone, MvccIterator, MvccKey, SharedMvccRange};
+use crate::tablet::{PessimisticStorage, PessimisticWriteError, StorageEngine, WriteBatch};
+use crate::util::error::{Result, TiSqlError};
 
 use super::commit_reservations::{CommitLsnReservations, CommitReservationStats};
 use super::config::{LsmConfig, V26BoundaryMode};
@@ -475,7 +475,7 @@ async fn manifest_writer_loop(
 /// ## Usage
 ///
 /// ```ignore
-/// use tisql::storage::{LsmConfig, Version, IlogConfig, IlogService};
+/// use tisql::tablet::{LsmConfig, Version, IlogConfig, IlogService};
 /// use tisql::lsn::new_lsn_provider;
 ///
 /// let lsn_provider = new_lsn_provider();
@@ -3491,8 +3491,8 @@ pub struct LsmStats {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::storage::mvcc::{is_tombstone, LOCK, TOMBSTONE};
-    use crate::storage::PessimisticWriteError;
+    use crate::tablet::mvcc::{is_tombstone, LOCK, TOMBSTONE};
+    use crate::tablet::PessimisticWriteError;
     use crate::transaction::TxnState;
     use std::path::Path;
     use tempfile::TempDir;
@@ -4115,7 +4115,7 @@ mod tests {
     // ==================== Durable Engine Tests ====================
 
     use crate::lsn::new_lsn_provider;
-    use crate::storage::ilog::{IlogConfig, IlogService};
+    use crate::tablet::ilog::{IlogConfig, IlogService};
 
     #[tokio::test]
     async fn test_lsm_durable_flush() {
@@ -5138,7 +5138,7 @@ mod tests {
 
         // Session 2: Recover, flush more, "crash" again
         {
-            use crate::storage::recovery::LsmRecovery;
+            use crate::tablet::recovery::LsmRecovery;
 
             let recovery = LsmRecovery::new(tmp.path());
             let result = recovery.recover(&handle).unwrap();
@@ -5162,7 +5162,7 @@ mod tests {
 
         // Session 3: Final recovery - verify no data loss
         {
-            use crate::storage::recovery::LsmRecovery;
+            use crate::tablet::recovery::LsmRecovery;
 
             let recovery = LsmRecovery::new(tmp.path());
             let result = recovery.recover(&handle).unwrap();

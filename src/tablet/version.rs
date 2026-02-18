@@ -42,7 +42,7 @@
 
 use std::sync::Arc;
 
-use crate::storage::SstMeta;
+use crate::tablet::SstMeta;
 
 /// Maximum number of levels in the LSM-tree.
 pub const MAX_LEVELS: usize = 7;

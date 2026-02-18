@@ -41,7 +41,7 @@ use std::cmp::Ordering;
 use std::ops::{Deref, Range};
 use std::sync::Arc;
 
-use crate::types::{Key, Timestamp};
+use crate::catalog::types::{Key, Timestamp};
 
 /// Size of the timestamp suffix in MVCC keys (8 bytes).
 pub const TIMESTAMP_SIZE: usize = 8;
@@ -70,7 +70,7 @@ pub type SharedMvccRange = Arc<Range<MvccKey>>;
 /// ## Usage
 ///
 /// ```ignore
-/// use tisql::storage::mvcc::MvccKey;
+/// use tisql::tablet::mvcc::MvccKey;
 ///
 /// // Create from key and timestamp
 /// let mvcc_key = MvccKey::encode(b"my_key", 100);
@@ -408,7 +408,7 @@ impl Ord for MvccKey {
 
 use std::future::Future;
 
-use crate::error::Result;
+use crate::util::error::Result;
 
 /// Streaming iterator over MVCC key-value pairs.
 ///

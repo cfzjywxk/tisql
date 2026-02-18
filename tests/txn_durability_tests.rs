@@ -29,8 +29,8 @@ use tisql::testkit::{
 };
 use tisql::{ClogService, StorageEngine, TxnService};
 
-use tisql::storage::{is_tombstone, MvccIterator, MvccKey};
-use tisql::types::Timestamp;
+use tisql::catalog::types::Timestamp;
+use tisql::tablet::{is_tombstone, MvccIterator, MvccKey};
 
 /// Helper: get value at read_ts from LsmEngine (for verification after recovery).
 async fn get_value(engine: &LsmEngine, key: &[u8], read_ts: Timestamp) -> Option<Vec<u8>> {

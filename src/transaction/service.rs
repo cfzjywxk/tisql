@@ -24,14 +24,14 @@ use std::sync::Arc;
 use fail::fail_point;
 
 use crate::clog::{ClogEntry, ClogOp, ClogOpRef, ClogService};
-use crate::error::{Result, TiSqlError};
 use crate::tso::TsoService;
+use crate::util::error::{Result, TiSqlError};
 
 use super::api::{CommitInfo, MutationType, TxnCtx, TxnService, TxnState};
 use super::concurrency::ConcurrencyManager;
-use crate::storage::mvcc::{is_tombstone, MvccIterator, MvccKey, LOCK, TOMBSTONE};
-use crate::storage::{PessimisticStorage, PessimisticWriteError, StorageEngine, WriteBatch};
-use crate::types::{Key, RawValue, Timestamp, TxnId};
+use crate::catalog::types::{Key, RawValue, Timestamp, TxnId};
+use crate::tablet::mvcc::{is_tombstone, MvccIterator, MvccKey, LOCK, TOMBSTONE};
+use crate::tablet::{PessimisticStorage, PessimisticWriteError, StorageEngine, WriteBatch};
 
 /// Transaction service manages transactions with durability and MVCC.
 ///
@@ -267,16 +267,16 @@ impl<S: StorageEngine, L: ClogService, T: TsoService> TransactionService<S, L, T
     fn check_active(ctx: &TxnCtx) -> Result<()> {
         match ctx.state {
             TxnState::Running => Ok(()),
-            TxnState::Preparing => Err(crate::error::TiSqlError::Internal(
+            TxnState::Preparing => Err(crate::util::error::TiSqlError::Internal(
                 "Transaction in preparing state".into(),
             )),
-            TxnState::Prepared { .. } => Err(crate::error::TiSqlError::Internal(
+            TxnState::Prepared { .. } => Err(crate::util::error::TiSqlError::Internal(
                 "Transaction already in prepared state".into(),
             )),
-            TxnState::Committed { .. } => Err(crate::error::TiSqlError::Internal(
+            TxnState::Committed { .. } => Err(crate::util::error::TiSqlError::Internal(
                 "Transaction already committed".into(),
             )),
-            TxnState::Aborted => Err(crate::error::TiSqlError::Internal(
+            TxnState::Aborted => Err(crate::util::error::TiSqlError::Internal(
                 "Transaction already aborted".into(),
             )),
         }
@@ -762,7 +762,10 @@ impl<I: MvccIterator> MvccScanIterator<I> {
     ///
     /// This determines whether the pending node should be skipped or is visible
     /// based on the owning transaction's current state.
-    fn resolve_pending(&self, owner_ts: Timestamp) -> crate::error::Result<PendingResolution> {
+    fn resolve_pending(
+        &self,
+        owner_ts: Timestamp,
+    ) -> crate::util::error::Result<PendingResolution> {
         let cm = match &self.concurrency_manager {
             Some(cm) => cm,
             None => {
@@ -831,7 +834,7 @@ impl<I: MvccIterator> MvccScanIterator<I> {
     ///
     /// After finding a visible entry, the storage iterator stays positioned on it.
     /// The key is recorded in `last_returned_key` for skipping on the next call.
-    async fn find_next_visible(&mut self) -> crate::error::Result<()> {
+    async fn find_next_visible(&mut self) -> crate::util::error::Result<()> {
         // Lazy skip: skip older versions of the previously returned key
         if let Some(ref skip_key) = self.last_returned_key {
             while self.storage_iter.valid() && self.storage_iter.user_key() == skip_key.as_slice() {
@@ -920,14 +923,14 @@ impl<I: MvccIterator> MvccScanIterator<I> {
 }
 
 impl<I: MvccIterator> MvccIterator for MvccScanIterator<I> {
-    async fn seek(&mut self, _target: &MvccKey) -> crate::error::Result<()> {
+    async fn seek(&mut self, _target: &MvccKey) -> crate::util::error::Result<()> {
         // MvccScanIterator is created for a specific range.
         // Seeking within the result is not supported - this is a forward-only iterator.
         // The iterator should be created with the appropriate range instead.
         Ok(())
     }
 
-    async fn advance(&mut self) -> crate::error::Result<()> {
+    async fn advance(&mut self) -> crate::util::error::Result<()> {
         self.find_next_visible().await
     }
 
@@ -978,7 +981,7 @@ impl RecoveryStats {
 mod tests {
     use super::*;
     use crate::clog::{FileClogConfig, FileClogService};
-    use crate::storage::MemTableEngine;
+    use crate::tablet::MemTableEngine;
     use crate::tso::LocalTso;
     use tempfile::tempdir;
 

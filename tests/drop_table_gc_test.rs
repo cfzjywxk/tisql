@@ -24,8 +24,8 @@ use std::sync::Arc;
 
 use tempfile::tempdir;
 
+use tisql::catalog::types::Value;
 use tisql::testkit::ExecutionResult;
-use tisql::types::Value;
 use tisql::{Database, DatabaseConfig, QueryResult};
 
 /// Create a fresh database in a temp directory.
@@ -50,7 +50,7 @@ async fn exec(db: &Database, sql: &str) {
 }
 
 /// Query GC tasks from inner table and return rows.
-async fn query_gc_tasks(db: &Arc<Database>) -> Vec<tisql::types::Row> {
+async fn query_gc_tasks(db: &Arc<Database>) -> Vec<tisql::catalog::types::Row> {
     let sess = db.new_inner_session("__tisql_inner");
     let result = sess.execute_inner_sql(
         "SELECT task_id, table_id, start_key, end_key, drop_commit_ts, status FROM __all_gc_delete_range ORDER BY task_id",

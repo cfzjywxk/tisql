@@ -30,7 +30,7 @@
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 
-use crate::types::Lsn;
+use crate::catalog::types::Lsn;
 
 /// Trait for LSN allocation.
 ///

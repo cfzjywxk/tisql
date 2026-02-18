@@ -37,8 +37,8 @@ use std::future::Future;
 use std::pin::Pin;
 use std::task::{Context, Poll};
 
-use crate::error::{Result, TiSqlError};
-use crate::types::{Key, Lsn, RawValue, Timestamp, TxnId};
+use crate::catalog::types::{Key, Lsn, RawValue, Timestamp, TxnId};
+use crate::util::error::{Result, TiSqlError};
 use serde::{Deserialize, Serialize};
 
 /// Commit log entry

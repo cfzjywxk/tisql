@@ -30,7 +30,7 @@
 //! - Variable-length encoding for unsigned integers
 //! - More space-efficient for small values
 
-use crate::error::{Result, TiSqlError};
+use crate::util::error::{Result, TiSqlError};
 
 /// Sign bit mask for i64 -> comparable u64 conversion
 const SIGN_MASK: u64 = 0x8000_0000_0000_0000;

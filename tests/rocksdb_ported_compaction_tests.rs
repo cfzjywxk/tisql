@@ -25,15 +25,15 @@ use std::time::Duration;
 
 use tempfile::TempDir;
 
+use tisql::catalog::types::{Key, RawValue, Timestamp};
 use tisql::new_lsn_provider;
-use tisql::storage::mvcc::{is_tombstone, MvccIterator, MvccKey};
-use tisql::storage::WriteBatch;
+use tisql::tablet::mvcc::{is_tombstone, MvccIterator, MvccKey};
+use tisql::tablet::WriteBatch;
 use tisql::testkit::{
     CompactionExecutor, CompactionPicker, CompactionScheduler, CompactionTask, FlushScheduler,
     IlogConfig, IlogService, IoService, LsmConfigBuilder, LsmEngine, ManifestDelta, SstBuilder,
     SstBuilderOptions, SstMeta, SstReaderRef, Version,
 };
-use tisql::types::{Key, RawValue, Timestamp};
 use tisql::StorageEngine;
 
 // ==================== Test Helpers Using MvccKey ====================
@@ -1769,7 +1769,7 @@ async fn test_gc_tombstone_at_bottommost() {
     let executor = CompactionExecutor::new(Arc::clone(&config));
 
     // key: ts=30 → value, ts=20 → TOMBSTONE, ts=10 → old value
-    let tombstone = tisql::storage::mvcc::TOMBSTONE;
+    let tombstone = tisql::tablet::mvcc::TOMBSTONE;
     let sst_path = sst_dir.join("00000001.sst");
     let mut builder = SstBuilder::new(&sst_path, SstBuilderOptions::default()).unwrap();
     builder.add(&mvcc_key(b"k", 30), b"v30").unwrap();
@@ -1836,7 +1836,7 @@ async fn test_gc_tombstone_not_bottommost() {
     );
     let executor = CompactionExecutor::new(Arc::clone(&config));
 
-    let tombstone = tisql::storage::mvcc::TOMBSTONE;
+    let tombstone = tisql::tablet::mvcc::TOMBSTONE;
     let sst_path = sst_dir.join("00000001.sst");
     let mut builder = SstBuilder::new(&sst_path, SstBuilderOptions::default()).unwrap();
     builder.add(&mvcc_key(b"k", 30), b"v30").unwrap();
@@ -1905,7 +1905,7 @@ async fn test_gc_mixed_keys() {
     );
     let executor = CompactionExecutor::new(Arc::clone(&config));
 
-    let tombstone = tisql::storage::mvcc::TOMBSTONE;
+    let tombstone = tisql::tablet::mvcc::TOMBSTONE;
     let sst_path = sst_dir.join("00000001.sst");
     let mut builder = SstBuilder::new(&sst_path, SstBuilderOptions::default()).unwrap();
     // key "a": 3 versions, all above safe point → all kept
