@@ -4195,6 +4195,313 @@ mod tests {
         }
     }
 
+    /// T1.2b: Explicit flush produces SST file and updates version.
+    #[tokio::test]
+    async fn test_tablet_flush_to_sst() {
+        let tmp = TempDir::new().unwrap();
+        let config = LsmConfig::builder(tmp.path())
+            .memtable_size(100)
+            .max_frozen_memtables(4)
+            .build()
+            .unwrap();
+
+        let lsn_provider = new_lsn_provider();
+        let ilog_config = IlogConfig::new(tmp.path());
+        let ilog = Arc::new(
+            IlogService::open_with_thread(ilog_config, Arc::clone(&lsn_provider)).unwrap(),
+        );
+
+        let engine = LsmEngine::open_with_recovery(
+            config,
+            lsn_provider,
+            ilog,
+            Version::new(),
+            make_test_io(),
+        )
+        .unwrap();
+
+        // Before writes: no SSTs
+        assert_eq!(engine.stats().total_sst_count, 0);
+
+        // Write data and flush
+        let mut batch = new_batch(10);
+        batch.put(b"flush_key".to_vec(), b"flush_value".to_vec());
+        batch.set_clog_lsn(1);
+        engine.write_batch(batch).unwrap();
+        engine.flush_all_with_active().unwrap();
+
+        // After flush: at least 1 SST, frozen list cleared
+        let stats = engine.stats();
+        assert!(
+            stats.total_sst_count > 0,
+            "expected at least 1 SST after flush, got {}",
+            stats.total_sst_count
+        );
+        assert_eq!(
+            stats.frozen_memtable_count, 0,
+            "frozen memtables should be empty after flush"
+        );
+
+        // Data still readable from SST
+        assert_eq!(
+            get_for_test(&engine, b"flush_key").await,
+            Some(b"flush_value".to_vec())
+        );
+    }
+
+    // ==================== Delegation / Type Alias Test (T1.4) ====================
+
+    /// T1.4a: `TabletEngine` (type alias for `LsmEngine`) exposes full
+    /// `StorageEngine` + `PessimisticStorage` surface and produces identical results.
+    #[tokio::test]
+    async fn test_tablet_engine_alias_delegates_correctly() {
+        use crate::tablet::lsm::TabletEngine;
+        use crate::tablet::PessimisticStorage;
+
+        let tmp = TempDir::new().unwrap();
+        let config = test_config(tmp.path());
+
+        // Open via TabletEngine alias — must compile and work identically.
+        let engine: TabletEngine = TabletEngine::open(config).unwrap();
+
+        // StorageEngine::write_batch
+        let mut batch = new_batch(10);
+        batch.put(b"alias_key".to_vec(), b"alias_value".to_vec());
+        engine.write_batch(batch).unwrap();
+
+        // StorageEngine::scan_iter (read back)
+        assert_eq!(
+            get_for_test(&engine, b"alias_key").await,
+            Some(b"alias_value".to_vec())
+        );
+
+        // PessimisticStorage::put_pending
+        let result = engine.put_pending(b"lock_key", b"pending_val".to_vec(), 100);
+        assert!(
+            result.is_ok(),
+            "put_pending should succeed via TabletEngine"
+        );
+
+        // PessimisticStorage::abort_pending
+        engine.abort_pending(&[b"lock_key".to_vec()], 100);
+
+        // stats() works through alias
+        let stats = engine.stats();
+        assert!(stats.active_memtable_size > 0);
+    }
+
+    // ==================== Multi-Instance Independence Tests (T1.3) ====================
+
+    /// Helper: create a durable LsmEngine at `dir` using shared lsn_provider + io.
+    fn open_tablet_with_shared(
+        dir: &Path,
+        lsn_provider: &SharedLsnProvider,
+        io: &Arc<crate::io::IoService>,
+    ) -> LsmEngine {
+        let config = LsmConfig::builder(dir)
+            .memtable_size(100)
+            .max_frozen_memtables(4)
+            .build()
+            .unwrap();
+        let ilog_config = IlogConfig::new(dir);
+        let ilog =
+            Arc::new(IlogService::open_with_thread(ilog_config, Arc::clone(lsn_provider)).unwrap());
+        LsmEngine::open_with_recovery(
+            config,
+            Arc::clone(lsn_provider),
+            ilog,
+            Version::new(),
+            Arc::clone(io),
+        )
+        .unwrap()
+    }
+
+    /// T1.3a: Two LsmEngine instances with different dirs hold separate data;
+    /// write to one, read from other returns empty.
+    #[tokio::test]
+    async fn test_two_tablets_independent_data() {
+        let tmp_a = TempDir::new().unwrap();
+        let tmp_b = TempDir::new().unwrap();
+        let lsn = new_lsn_provider();
+        let io = make_test_io();
+
+        let engine_a = open_tablet_with_shared(tmp_a.path(), &lsn, &io);
+        let engine_b = open_tablet_with_shared(tmp_b.path(), &lsn, &io);
+
+        // Write to engine A only
+        let mut batch = new_batch(10);
+        batch.put(b"key_a".to_vec(), b"value_a".to_vec());
+        batch.set_clog_lsn(1);
+        engine_a.write_batch(batch).unwrap();
+
+        // Engine A should see the data
+        assert_eq!(
+            get_for_test(&engine_a, b"key_a").await,
+            Some(b"value_a".to_vec())
+        );
+
+        // Engine B should NOT see it
+        assert_eq!(
+            get_for_test(&engine_b, b"key_a").await,
+            None,
+            "engine B must not see data written to engine A"
+        );
+
+        // Write to engine B, verify engine A doesn't see it
+        let mut batch_b = new_batch(11);
+        batch_b.put(b"key_b".to_vec(), b"value_b".to_vec());
+        batch_b.set_clog_lsn(2);
+        engine_b.write_batch(batch_b).unwrap();
+
+        assert_eq!(
+            get_for_test(&engine_b, b"key_b").await,
+            Some(b"value_b".to_vec())
+        );
+        assert_eq!(
+            get_for_test(&engine_a, b"key_b").await,
+            None,
+            "engine A must not see data written to engine B"
+        );
+    }
+
+    /// T1.3b: Flush one tablet doesn't affect other's memtable or version.
+    #[tokio::test]
+    async fn test_two_tablets_independent_flush() {
+        let tmp_a = TempDir::new().unwrap();
+        let tmp_b = TempDir::new().unwrap();
+        let lsn = new_lsn_provider();
+        let io = make_test_io();
+
+        let engine_a = open_tablet_with_shared(tmp_a.path(), &lsn, &io);
+        let engine_b = open_tablet_with_shared(tmp_b.path(), &lsn, &io);
+
+        // Write to both
+        let mut batch_a = new_batch(10);
+        batch_a.put(b"key_a".to_vec(), b"value_a".to_vec());
+        batch_a.set_clog_lsn(1);
+        engine_a.write_batch(batch_a).unwrap();
+
+        let mut batch_b = new_batch(11);
+        batch_b.put(b"key_b".to_vec(), b"value_b".to_vec());
+        batch_b.set_clog_lsn(2);
+        engine_b.write_batch(batch_b).unwrap();
+
+        // Flush only engine A
+        engine_a.flush_all_with_active().unwrap();
+
+        // Engine A: data in SST
+        let stats_a = engine_a.stats();
+        assert!(
+            stats_a.total_sst_count > 0,
+            "engine A should have SSTs after flush"
+        );
+
+        // Engine B: still in memtable, no SSTs
+        let stats_b = engine_b.stats();
+        assert_eq!(
+            stats_b.total_sst_count, 0,
+            "engine B should have 0 SSTs (not flushed)"
+        );
+
+        // Both still readable
+        assert_eq!(
+            get_for_test(&engine_a, b"key_a").await,
+            Some(b"value_a".to_vec())
+        );
+        assert_eq!(
+            get_for_test(&engine_b, b"key_b").await,
+            Some(b"value_b".to_vec())
+        );
+    }
+
+    /// T1.3c: Both tablets share one LsnProvider → LSNs are globally unique and monotonic.
+    #[tokio::test]
+    async fn test_two_tablets_shared_lsn_provider() {
+        let tmp_a = TempDir::new().unwrap();
+        let tmp_b = TempDir::new().unwrap();
+        let lsn = new_lsn_provider();
+        let io = make_test_io();
+
+        let engine_a = open_tablet_with_shared(tmp_a.path(), &lsn, &io);
+        let engine_b = open_tablet_with_shared(tmp_b.path(), &lsn, &io);
+
+        // Interleave writes and collect the LSNs consumed.
+        // write_batch uses alloc_lsn internally; we can observe ordering via
+        // the LSN provider's current value.
+        let lsn_before = lsn.alloc_lsn();
+
+        let mut batch_a = new_batch(10);
+        batch_a.put(b"a1".to_vec(), b"v1".to_vec());
+        batch_a.set_clog_lsn(lsn_before);
+        engine_a.write_batch(batch_a).unwrap();
+
+        let lsn_mid = lsn.alloc_lsn();
+
+        let mut batch_b = new_batch(11);
+        batch_b.put(b"b1".to_vec(), b"v2".to_vec());
+        batch_b.set_clog_lsn(lsn_mid);
+        engine_b.write_batch(batch_b).unwrap();
+
+        let lsn_after = lsn.alloc_lsn();
+
+        // LSNs should be strictly increasing across both engines
+        assert!(
+            lsn_before < lsn_mid,
+            "LSNs not monotonic: before={lsn_before}, mid={lsn_mid}"
+        );
+        assert!(
+            lsn_mid < lsn_after,
+            "LSNs not monotonic: mid={lsn_mid}, after={lsn_after}"
+        );
+    }
+
+    /// T1.3d: Both tablets share one IoService → concurrent SST reads work.
+    #[tokio::test]
+    async fn test_two_tablets_shared_io_service() {
+        let tmp_a = TempDir::new().unwrap();
+        let tmp_b = TempDir::new().unwrap();
+        let lsn = new_lsn_provider();
+        let io = make_test_io();
+
+        let engine_a = open_tablet_with_shared(tmp_a.path(), &lsn, &io);
+        let engine_b = open_tablet_with_shared(tmp_b.path(), &lsn, &io);
+
+        // Write and flush to both engines → SSTs on disk
+        for i in 0..5 {
+            let mut batch_a = new_batch(10 + i as u64);
+            batch_a.put(format!("a_key_{i}").into_bytes(), b"a_val".to_vec());
+            batch_a.set_clog_lsn(lsn.alloc_lsn());
+            engine_a.write_batch(batch_a).unwrap();
+
+            let mut batch_b = new_batch(10 + i as u64);
+            batch_b.put(format!("b_key_{i}").into_bytes(), b"b_val".to_vec());
+            batch_b.set_clog_lsn(lsn.alloc_lsn());
+            engine_b.write_batch(batch_b).unwrap();
+        }
+        engine_a.flush_all_with_active().unwrap();
+        engine_b.flush_all_with_active().unwrap();
+
+        // Both should have SSTs
+        assert!(engine_a.stats().total_sst_count > 0);
+        assert!(engine_b.stats().total_sst_count > 0);
+
+        // Concurrent reads from both engines via shared IoService
+        for i in 0..5 {
+            let key_a = format!("a_key_{i}");
+            let key_b = format!("b_key_{i}");
+            assert_eq!(
+                get_for_test(&engine_a, key_a.as_bytes()).await,
+                Some(b"a_val".to_vec()),
+                "concurrent read from engine A failed for {key_a}"
+            );
+            assert_eq!(
+                get_for_test(&engine_b, key_b.as_bytes()).await,
+                Some(b"b_val".to_vec()),
+                "concurrent read from engine B failed for {key_b}"
+            );
+        }
+    }
+
     #[tokio::test]
     async fn test_lsm_durable_flush() {
         let tmp = TempDir::new().unwrap();

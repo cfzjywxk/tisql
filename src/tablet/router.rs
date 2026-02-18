@@ -173,7 +173,10 @@ fn parse_u64(raw: &str, label: &str, full_name: &str) -> Result<u64> {
 mod tests {
     use super::*;
     use crate::catalog::types::Value;
-    use crate::inner_table::core_tables::{ALL_TABLE_TABLE_ID, USER_TABLE_ID_START};
+    use crate::inner_table::core_tables::{
+        ALL_COLUMN_TABLE_ID, ALL_GC_DELETE_RANGE_TABLE_ID, ALL_INDEX_TABLE_ID, ALL_META_TABLE_ID,
+        ALL_SCHEMA_TABLE_ID, ALL_TABLE_TABLE_ID, USER_TABLE_ID_START,
+    };
     use crate::util::codec::key::{
         encode_index_seek_key, encode_record_key_with_handle, encode_value_for_key,
     };
@@ -330,6 +333,76 @@ mod tests {
             .to_string(),
             format!("i_{USER_TABLE_ID_START}_2001")
         );
+    }
+
+    /// T1.5h: Verify `_r` routes to Table and `_i` routes to LocalIndex for same table_id.
+    #[test]
+    fn route_key_kind_discriminator() {
+        let table_id = USER_TABLE_ID_START + 42;
+
+        // `_r` key (record) → Table tablet
+        let record_key = encode_record_key_with_handle(table_id, 1);
+        assert_eq!(
+            route_key_to_tablet(&record_key),
+            TabletId::Table { table_id },
+            "_r key should route to Table tablet"
+        );
+
+        // `_i` key (index) → LocalIndex tablet
+        let mut encoded_values = Vec::new();
+        encode_value_for_key(&mut encoded_values, &Value::BigInt(99));
+        let index_key = encode_index_seek_key(table_id, 500, &encoded_values);
+        assert_eq!(
+            route_key_to_tablet(&index_key),
+            TabletId::LocalIndex {
+                table_id,
+                index_id: 500,
+            },
+            "_i key should route to LocalIndex tablet"
+        );
+    }
+
+    /// T1.5i: All 6 inner/system table IDs (1-6) must route to System.
+    #[test]
+    fn route_all_inner_table_ids_to_system() {
+        let inner_table_ids = [
+            ALL_META_TABLE_ID,
+            ALL_SCHEMA_TABLE_ID,
+            ALL_TABLE_TABLE_ID,
+            ALL_COLUMN_TABLE_ID,
+            ALL_INDEX_TABLE_ID,
+            ALL_GC_DELETE_RANGE_TABLE_ID,
+        ];
+
+        for &tid in &inner_table_ids {
+            // Record key for inner table → System
+            let record_key = encode_record_key_with_handle(tid, 1);
+            assert_eq!(
+                route_key_to_tablet(&record_key),
+                TabletId::System,
+                "inner table record key (table_id={tid}) must route to System"
+            );
+
+            // Index key for inner table → System
+            let index_key = encode_index_seek_key(tid, 1, b"v");
+            assert_eq!(
+                route_key_to_tablet(&index_key),
+                TabletId::System,
+                "inner table index key (table_id={tid}) must route to System"
+            );
+
+            // Metadata-first routing for inner table → System
+            assert_eq!(
+                route_table_to_tablet(tid),
+                TabletId::System,
+                "route_table_to_tablet({tid}) must return System"
+            );
+            assert_eq!(
+                route_index_to_tablet(tid, 1),
+                TabletId::System,
+                "route_index_to_tablet({tid}, 1) must return System"
+            );
+        }
     }
 
     #[test]
