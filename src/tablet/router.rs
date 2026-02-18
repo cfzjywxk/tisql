@@ -1,0 +1,360 @@
+// Copyright 2024 TiSQL Contributors
+//
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+//     http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
+
+//! Tablet routing and tablet-id path codec helpers.
+//!
+//! Phase-1 routing is deterministic but behavior-preserving: callers can still
+//! route all traffic to system in higher-level code. This module provides the
+//! stable mapping rules and disk name codec used by later phases.
+
+use crate::catalog::types::{IndexId, TableId};
+use crate::inner_table::core_tables::USER_TABLE_ID_START;
+use crate::util::codec::key::{decode_index_key, decode_table_id, is_index_key, is_record_key};
+use crate::util::error::{Result, TiSqlError};
+use std::fmt;
+
+/// Stable tablet identifier used by routing and disk layout.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
+pub enum TabletId {
+    /// Shared system/inner-table tablet.
+    System,
+    /// User table data tablet.
+    Table { table_id: TableId },
+    /// User local secondary index tablet.
+    LocalIndex {
+        table_id: TableId,
+        index_id: IndexId,
+    },
+}
+
+impl fmt::Display for TabletId {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::System => f.write_str("system"),
+            Self::Table { table_id } => write!(f, "t_{table_id}"),
+            Self::LocalIndex { table_id, index_id } => write!(f, "i_{table_id}_{index_id}"),
+        }
+    }
+}
+
+impl TabletId {
+    /// Canonical on-disk directory name for this tablet.
+    pub fn dir_name(self) -> String {
+        match self {
+            Self::System => "system".to_string(),
+            Self::Table { table_id } => format!("t_{table_id}"),
+            Self::LocalIndex { table_id, index_id } => format!("i_{table_id}_{index_id}"),
+        }
+    }
+
+    /// Parse a canonical on-disk directory name into `TabletId`.
+    pub fn from_dir_name(name: &str) -> Result<Self> {
+        if name == "system" {
+            return Ok(Self::System);
+        }
+
+        if let Some(raw_table_id) = name.strip_prefix("t_") {
+            let table_id = parse_u64(raw_table_id, "table id", name)?;
+            return Ok(Self::Table { table_id });
+        }
+
+        if let Some(raw) = name.strip_prefix("i_") {
+            let mut parts = raw.split('_');
+            let table = parts.next();
+            let index = parts.next();
+            let extra = parts.next();
+            if table.is_none() || index.is_none() || extra.is_some() {
+                return Err(TiSqlError::Codec(format!(
+                    "invalid index tablet dir name: {name}"
+                )));
+            }
+
+            let table_id = parse_u64(table.unwrap(), "table id", name)?;
+            let index_id = parse_u64(index.unwrap(), "index id", name)?;
+            return Ok(Self::LocalIndex { table_id, index_id });
+        }
+
+        Err(TiSqlError::Codec(format!(
+            "invalid tablet dir name: {name}"
+        )))
+    }
+}
+
+/// True when `table_id` belongs to inner/system space.
+#[inline]
+pub fn is_system_table_id(table_id: TableId) -> bool {
+    table_id < USER_TABLE_ID_START
+}
+
+/// Route a planned record-table target (no key decoding required).
+///
+/// This is the preferred upper-layer routing entrypoint once planner/executor
+/// provide table metadata.
+#[inline]
+pub fn route_table_to_tablet(table_id: TableId) -> TabletId {
+    if is_system_table_id(table_id) {
+        TabletId::System
+    } else {
+        TabletId::Table { table_id }
+    }
+}
+
+/// Route a planned local-index target (no key decoding required).
+///
+/// This is the preferred upper-layer routing entrypoint once planner/executor
+/// provide index metadata.
+#[inline]
+pub fn route_index_to_tablet(table_id: TableId, index_id: IndexId) -> TabletId {
+    if is_system_table_id(table_id) {
+        TabletId::System
+    } else {
+        TabletId::LocalIndex { table_id, index_id }
+    }
+}
+
+/// Route a raw user key to exactly one logical tablet.
+///
+/// This is a low-level fallback for key-only call sites (e.g. recovery or
+/// defensive validation). Upper layers should prefer
+/// `route_table_to_tablet` / `route_index_to_tablet`.
+///
+/// Routing priority (locked by review):
+/// 1) decode table id; non-table/malformed keys -> system
+/// 2) inner/system table id range (`USER_TABLE_ID_START`) -> system
+/// 3) user `_r` keys -> table tablet
+/// 4) user `_i` keys -> index tablet
+/// 5) anything else -> system (conservative fallback)
+pub fn route_key_to_tablet(key: &[u8]) -> TabletId {
+    let table_id = match decode_table_id(key) {
+        Ok(id) => id,
+        Err(_) => return TabletId::System,
+    };
+
+    if is_system_table_id(table_id) {
+        return TabletId::System;
+    }
+
+    if is_record_key(key) {
+        return route_table_to_tablet(table_id);
+    }
+
+    if is_index_key(key) {
+        return match decode_index_key(key) {
+            Ok((decoded_table_id, index_id, _)) if decoded_table_id == table_id => {
+                route_index_to_tablet(table_id, index_id)
+            }
+            _ => TabletId::System,
+        };
+    }
+
+    TabletId::System
+}
+
+fn parse_u64(raw: &str, label: &str, full_name: &str) -> Result<u64> {
+    raw.parse::<u64>().map_err(|_| {
+        TiSqlError::Codec(format!(
+            "invalid {label} in tablet dir name {full_name}: {raw}"
+        ))
+    })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::catalog::types::Value;
+    use crate::inner_table::core_tables::{ALL_TABLE_TABLE_ID, USER_TABLE_ID_START};
+    use crate::util::codec::key::{
+        encode_index_seek_key, encode_record_key_with_handle, encode_value_for_key,
+    };
+
+    #[test]
+    fn route_non_table_key_to_system() {
+        assert_eq!(route_key_to_tablet(b"meta:key"), TabletId::System);
+        assert_eq!(route_key_to_tablet(b""), TabletId::System);
+    }
+
+    #[test]
+    fn route_planned_targets_without_key_decode() {
+        assert_eq!(
+            route_table_to_tablet(USER_TABLE_ID_START - 1),
+            TabletId::System
+        );
+        assert_eq!(
+            route_table_to_tablet(USER_TABLE_ID_START),
+            TabletId::Table {
+                table_id: USER_TABLE_ID_START,
+            }
+        );
+
+        assert_eq!(
+            route_index_to_tablet(USER_TABLE_ID_START - 1, 77),
+            TabletId::System
+        );
+        assert_eq!(
+            route_index_to_tablet(USER_TABLE_ID_START, 77),
+            TabletId::LocalIndex {
+                table_id: USER_TABLE_ID_START,
+                index_id: 77,
+            }
+        );
+    }
+
+    #[test]
+    fn route_system_table_keys_to_system_tablet() {
+        let record_key = encode_record_key_with_handle(ALL_TABLE_TABLE_ID, 1);
+        assert_eq!(route_key_to_tablet(&record_key), TabletId::System);
+
+        let mut encoded_values = Vec::new();
+        encode_value_for_key(&mut encoded_values, &Value::BigInt(7));
+        let index_key = encode_index_seek_key(ALL_TABLE_TABLE_ID, 77, &encoded_values);
+        assert_eq!(route_key_to_tablet(&index_key), TabletId::System);
+    }
+
+    #[test]
+    fn route_boundary_around_user_table_id_start() {
+        let system_boundary = USER_TABLE_ID_START - 1;
+
+        let system_record_key = encode_record_key_with_handle(system_boundary, 1);
+        assert_eq!(route_key_to_tablet(&system_record_key), TabletId::System);
+
+        let user_record_key = encode_record_key_with_handle(USER_TABLE_ID_START, 1);
+        assert_eq!(
+            route_key_to_tablet(&user_record_key),
+            TabletId::Table {
+                table_id: USER_TABLE_ID_START,
+            }
+        );
+
+        let system_index_key = encode_index_seek_key(system_boundary, 201, b"v");
+        assert_eq!(route_key_to_tablet(&system_index_key), TabletId::System);
+
+        let user_index_key = encode_index_seek_key(USER_TABLE_ID_START, 202, b"v");
+        assert_eq!(
+            route_key_to_tablet(&user_index_key),
+            TabletId::LocalIndex {
+                table_id: USER_TABLE_ID_START,
+                index_id: 202,
+            }
+        );
+    }
+
+    #[test]
+    fn route_user_table_record_and_index_keys() {
+        let table_id = USER_TABLE_ID_START + 88;
+
+        let record_key = encode_record_key_with_handle(table_id, 123);
+        assert_eq!(
+            route_key_to_tablet(&record_key),
+            TabletId::Table { table_id }
+        );
+
+        let index_key = encode_index_seek_key(table_id, 2001, b"abc");
+        assert_eq!(
+            route_key_to_tablet(&index_key),
+            TabletId::LocalIndex {
+                table_id,
+                index_id: 2001,
+            }
+        );
+    }
+
+    #[test]
+    fn route_malformed_table_keys_fallback_to_system() {
+        // Valid table id (user), but unknown kind marker `_x`.
+        let mut unknown_marker = encode_record_key_with_handle(USER_TABLE_ID_START, 7);
+        unknown_marker[9] = b'_';
+        unknown_marker[10] = b'x';
+        assert_eq!(route_key_to_tablet(&unknown_marker), TabletId::System);
+
+        // `_i` marker but missing full index id payload.
+        let mut short_index = encode_record_key_with_handle(USER_TABLE_ID_START, 9);
+        short_index[9] = b'_';
+        short_index[10] = b'i';
+        short_index.truncate(13);
+        assert_eq!(route_key_to_tablet(&short_index), TabletId::System);
+    }
+
+    #[test]
+    fn tablet_id_dir_name_roundtrip() {
+        let ids = [
+            TabletId::System,
+            TabletId::Table {
+                table_id: USER_TABLE_ID_START,
+            },
+            TabletId::LocalIndex {
+                table_id: USER_TABLE_ID_START,
+                index_id: 2001,
+            },
+        ];
+
+        for id in ids {
+            let name = id.dir_name();
+            let parsed = TabletId::from_dir_name(&name).unwrap();
+            assert_eq!(parsed, id, "roundtrip mismatch for {name}");
+        }
+    }
+
+    #[test]
+    fn tablet_id_dir_name_rejects_invalid_inputs() {
+        for invalid in ["", "sys", "t_", "t_x", "i_", "i_1", "i_1_", "i_1_2_3"] {
+            assert!(TabletId::from_dir_name(invalid).is_err(), "input={invalid}");
+        }
+    }
+
+    #[test]
+    fn tablet_id_display_uses_canonical_names() {
+        assert_eq!(TabletId::System.to_string(), "system");
+        assert_eq!(
+            TabletId::Table {
+                table_id: USER_TABLE_ID_START,
+            }
+            .to_string(),
+            format!("t_{USER_TABLE_ID_START}")
+        );
+        assert_eq!(
+            TabletId::LocalIndex {
+                table_id: USER_TABLE_ID_START,
+                index_id: 2001,
+            }
+            .to_string(),
+            format!("i_{USER_TABLE_ID_START}_2001")
+        );
+    }
+
+    #[test]
+    fn route_key_to_tablet_random_bytes_fallback_safety() {
+        // Simple deterministic LCG so this remains CI-stable without external RNG crates.
+        let mut seed: u64 = 0x1234_5678_9abc_def0;
+        for len in 0..=64usize {
+            for _ in 0..128usize {
+                let mut key = Vec::with_capacity(len);
+                for _ in 0..len {
+                    seed = seed
+                        .wrapping_mul(6364136223846793005)
+                        .wrapping_add(1442695040888963407);
+                    key.push((seed >> 24) as u8);
+                }
+
+                let routed = route_key_to_tablet(&key);
+                if key.first().copied() != Some(b't') {
+                    assert_eq!(
+                        routed,
+                        TabletId::System,
+                        "non-table prefix routed incorrectly for key={key:?}"
+                    );
+                }
+            }
+        }
+    }
+}
