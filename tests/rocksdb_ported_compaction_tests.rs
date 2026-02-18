@@ -19,7 +19,6 @@
 //!
 //! Run with: cargo test --test rocksdb_ported_compaction_tests
 
-use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -260,7 +259,7 @@ async fn test_picker_l0_below_threshold() {
         .build();
 
     assert!(
-        picker.pick(&version, &HashMap::new(), 0).is_none(),
+        picker.pick(&version).is_none(),
         "Should not trigger compaction with only 2 L0 files"
     );
 }
@@ -289,9 +288,7 @@ async fn test_picker_l0_includes_all_overlapping() {
         .add_sst(make_sst(12, 1, b"o", b"z"))
         .build();
 
-    let task = picker
-        .pick(&version, &HashMap::new(), 0)
-        .expect("Should trigger L0 compaction");
+    let task = picker.pick(&version).expect("Should trigger L0 compaction");
 
     // All 4 L0 files should be included
     let l0_inputs: Vec<_> = task.inputs.iter().filter(|(l, _)| *l == 0).collect();
@@ -330,9 +327,7 @@ async fn test_picker_level_picks_oldest() {
         .add_sst(make_sst(7, 1, b"aa", b"mm")) // Newest
         .build();
 
-    let task = picker
-        .pick(&version, &HashMap::new(), 0)
-        .expect("Should trigger L1 compaction");
+    let task = picker.pick(&version).expect("Should trigger L1 compaction");
 
     // Should include the oldest L1 file (ID=5)
     let l1_input = task.inputs.iter().find(|(l, _)| *l == 1);
@@ -362,9 +357,7 @@ async fn test_picker_trivial_move_no_overlap() {
         .add_sst(make_sst(10, 2, b"x", b"z")) // L2 file doesn't overlap with L1
         .build();
 
-    let task = picker
-        .pick(&version, &HashMap::new(), 0)
-        .expect("Should trigger L1 compaction");
+    let task = picker.pick(&version).expect("Should trigger L1 compaction");
 
     assert!(task.is_trivial_move, "Should be a trivial move");
     assert_eq!(task.output_level, 2);
@@ -430,7 +423,6 @@ async fn test_executor_merge_keys() {
             IoService::new(32).unwrap(),
             0, // gc_safe_point = 0 → no GC
             false,
-            &HashMap::new(),
         )
         .await
         .unwrap();
@@ -525,7 +517,6 @@ async fn test_executor_mvcc_ordering() {
             IoService::new(32).unwrap(),
             0, // gc_safe_point = 0 → no GC
             false,
-            &HashMap::new(),
         )
         .await
         .unwrap();
@@ -599,7 +590,6 @@ async fn test_executor_tombstones() {
             IoService::new(32).unwrap(),
             0, // gc_safe_point = 0 → no GC
             false,
-            &HashMap::new(),
         )
         .await
         .unwrap();
@@ -1668,7 +1658,6 @@ async fn test_gc_safe_point_zero_no_gc() {
             IoService::new(32).unwrap(),
             0, // gc_safe_point = 0 → no GC
             true,
-            &HashMap::new(),
         )
         .await
         .unwrap();
@@ -1729,7 +1718,6 @@ async fn test_gc_drops_old_versions() {
             IoService::new(32).unwrap(),
             25, // gc_safe_point = 25
             true,
-            &HashMap::new(),
         )
         .await
         .unwrap();
@@ -1795,7 +1783,6 @@ async fn test_gc_tombstone_at_bottommost() {
             IoService::new(32).unwrap(),
             25,
             true, // is_bottommost
-            &HashMap::new(),
         )
         .await
         .unwrap();
@@ -1862,7 +1849,6 @@ async fn test_gc_tombstone_not_bottommost() {
             IoService::new(32).unwrap(),
             25,
             false, // NOT bottommost
-            &HashMap::new(),
         )
         .await
         .unwrap();
@@ -1940,7 +1926,6 @@ async fn test_gc_mixed_keys() {
             IoService::new(32).unwrap(),
             25,
             true, // bottommost
-            &HashMap::new(),
         )
         .await
         .unwrap();
@@ -2381,9 +2366,9 @@ fn table_record_key(table_id: u64, handle: i64) -> Vec<u8> {
     tisql::codec::key::encode_record_key_with_handle(table_id, handle)
 }
 
-/// Test: compaction with dropped table filters out all versions of keys belonging to that table.
+/// Test: compaction keeps one GC barrier version per user key at bottommost.
 #[tokio::test]
-async fn test_gc_dropped_table_filters_all_versions() {
+async fn test_gc_barrier_kept_per_user_key_across_tables() {
     let dir = TempDir::new().unwrap();
     let sst_dir = dir.path().join("sst");
     std::fs::create_dir_all(&sst_dir).unwrap();
@@ -2440,10 +2425,6 @@ async fn test_gc_dropped_table_filters_all_versions() {
         is_trivial_move: false,
     };
 
-    // Mark table 1000 as dropped at ts=15, gc_safe_point=20 (eligible for GC)
-    let mut dropped_tables = HashMap::new();
-    dropped_tables.insert(1000u64, 15u64);
-
     let pre_allocated_ids = vec![2, 3];
     let delta = executor
         .execute(
@@ -2454,7 +2435,6 @@ async fn test_gc_dropped_table_filters_all_versions() {
             IoService::new(32).unwrap(),
             20, // gc_safe_point = 20
             true,
-            &dropped_tables,
         )
         .await
         .unwrap();
@@ -2473,24 +2453,22 @@ async fn test_gc_dropped_table_filters_all_versions() {
         iter.advance().await.unwrap();
     }
 
-    // Table 1000 should be completely filtered out (3 entries removed)
-    // Table 1001 should remain (3 entries: r1@10, r1@5, r2@8)
-    // But GC also drops old versions: with gc_safe_point=20, all ts <= 20
-    // For table 1001: ts=10 is the GC barrier for r1, ts=5 dropped; ts=8 is barrier for r2
-    // So: t1001_r1@10 (barrier), t1001_r2@8 (barrier) = 2 entries
+    // No table-level filtering in phase 6: MVCC GC keeps one barrier version
+    // per user key at/below safe point.
     assert_eq!(
         entries.len(),
-        2,
-        "Should have 2 entries (table 1001 barriers only)"
+        4,
+        "Should have one retained barrier version per user key"
     );
-    assert_eq!(entries[0].1, b"t1001_r1_v10");
-    assert_eq!(entries[1].1, b"t1001_r2_v8");
+    assert_eq!(entries[0].1, b"t1000_r1_v10");
+    assert_eq!(entries[1].1, b"t1000_r2_v10");
+    assert_eq!(entries[2].1, b"t1001_r1_v10");
+    assert_eq!(entries[3].1, b"t1001_r2_v8");
 }
 
-/// Test: dropped table GC respects gc_safe_point — if drop_ts > gc_safe_point,
-/// the table data is NOT filtered.
+/// Test: GC keeps one barrier value when safe point is enabled.
 #[tokio::test]
-async fn test_gc_dropped_table_respects_safe_point() {
+async fn test_gc_barrier_kept_with_safe_point_enabled() {
     let dir = TempDir::new().unwrap();
     let sst_dir = dir.path().join("sst");
     std::fs::create_dir_all(&sst_dir).unwrap();
@@ -2519,10 +2497,6 @@ async fn test_gc_dropped_table_respects_safe_point() {
         is_trivial_move: false,
     };
 
-    // Table dropped at ts=30, but gc_safe_point=20 — NOT eligible (drop_ts > safe_point)
-    let mut dropped_tables = HashMap::new();
-    dropped_tables.insert(2000u64, 30u64);
-
     let pre_allocated_ids = vec![2, 3];
     let delta = executor
         .execute(
@@ -2533,7 +2507,6 @@ async fn test_gc_dropped_table_respects_safe_point() {
             IoService::new(32).unwrap(),
             20, // gc_safe_point = 20
             true,
-            &dropped_tables,
         )
         .await
         .unwrap();
@@ -2552,17 +2525,16 @@ async fn test_gc_dropped_table_respects_safe_point() {
         iter.advance().await.unwrap();
     }
 
-    // Table drop_ts (30) > gc_safe_point (20), so normal MVCC GC applies:
-    // ts=10 is GC barrier, ts=5 is below → 1 entry kept
+    // Normal MVCC GC applies: ts=10 is barrier, ts=5 is dropped.
     assert_eq!(
         count, 1,
         "Normal MVCC GC should apply (barrier kept, old dropped)"
     );
 }
 
-/// Test: with gc_safe_point=0 (no GC), dropped table data is preserved.
+/// Test: with gc_safe_point=0 (no GC), all versions are preserved.
 #[tokio::test]
-async fn test_gc_dropped_table_no_gc_when_safe_point_zero() {
+async fn test_gc_disabled_when_safe_point_zero() {
     let dir = TempDir::new().unwrap();
     let sst_dir = dir.path().join("sst");
     std::fs::create_dir_all(&sst_dir).unwrap();
@@ -2590,10 +2562,6 @@ async fn test_gc_dropped_table_no_gc_when_safe_point_zero() {
         is_trivial_move: false,
     };
 
-    // Table dropped at ts=8, but gc_safe_point=0 — GC disabled
-    let mut dropped_tables = HashMap::new();
-    dropped_tables.insert(3000u64, 8u64);
-
     let pre_allocated_ids = vec![2, 3];
     let delta = executor
         .execute(
@@ -2604,7 +2572,6 @@ async fn test_gc_dropped_table_no_gc_when_safe_point_zero() {
             IoService::new(32).unwrap(),
             0, // gc_safe_point = 0 (no GC)
             true,
-            &dropped_tables,
         )
         .await
         .unwrap();

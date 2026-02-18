@@ -12,18 +12,12 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-//! Background GC worker for drop-table data cleanup.
+//! Background GC worker for tablet-level DROP cleanup.
 //!
-//! Periodically scans `__all_gc_delete_range` for pending tasks and checks
-//! whether all SSTs overlapping the dropped table's key range have been
-//! compacted away. When no overlap remains, the task is marked 'done'.
-//!
-//! ## Design
-//!
-//! Follows the same pattern as `CompactionScheduler`:
-//! - tokio::spawn (preferred) or std::thread::spawn (fallback)
-//! - `Notify` for immediate wake, 30s poll interval
-//! - Clean shutdown via `AtomicBool`
+//! Periodically scans `__all_gc_delete_range` for pending tasks. Once
+//! `drop_commit_ts <= gc_safe_point`, the worker retires the target tablet
+//! (stop workers + flush + unmount) and removes the full tablet directory.
+//! The task row is then marked `done`.
 
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
@@ -33,29 +27,36 @@ use tokio::sync::Notify;
 
 use crate::inner_table::bootstrap::update_gc_task_status;
 use crate::inner_table::catalog_loader::{load_gc_tasks, GcTask};
-use crate::tablet::lsm::LsmEngine;
+use crate::tablet::{TabletId, TabletManager};
 use crate::transaction::{TxnService, TxnState};
+use crate::util::error::{Result, TiSqlError};
 
-/// Background GC worker that marks completed drop-table tasks as done.
+/// Background GC worker that completes tablet-retirement tasks.
 pub struct GcWorker<T: TxnService + 'static> {
     inner: Arc<GcWorkerInner<T>>,
     worker_handle: parking_lot::Mutex<Option<tokio::task::JoinHandle<()>>>,
 }
 
 struct GcWorkerInner<T: TxnService + 'static> {
-    engine: Arc<LsmEngine>,
+    tablet_manager: Arc<TabletManager>,
     txn_service: Arc<T>,
+    gc_safe_point: Arc<dyn Fn() -> u64 + Send + Sync>,
     shutdown: AtomicBool,
     notify: Notify,
 }
 
 impl<T: TxnService + 'static> GcWorker<T> {
     /// Create a new GC worker.
-    pub fn new(engine: Arc<LsmEngine>, txn_service: Arc<T>) -> Self {
+    pub fn new(
+        tablet_manager: Arc<TabletManager>,
+        txn_service: Arc<T>,
+        gc_safe_point: Arc<dyn Fn() -> u64 + Send + Sync>,
+    ) -> Self {
         Self {
             inner: Arc::new(GcWorkerInner {
-                engine,
+                tablet_manager,
                 txn_service,
+                gc_safe_point,
                 shutdown: AtomicBool::new(false),
                 notify: Notify::new(),
             }),
@@ -81,9 +82,11 @@ impl<T: TxnService + 'static> GcWorker<T> {
         self.inner.shutdown.store(true, Ordering::SeqCst);
         self.inner.notify.notify_one();
 
-        let mut handle = self.worker_handle.lock();
-        if let Some(jh) = handle.take() {
-            jh.abort();
+        let handle = self.worker_handle.lock().take();
+        if let Some(jh) = handle {
+            // Drain the worker task to avoid leaving an in-flight tablet retire
+            // operation detached during Database::close/drop.
+            let _ = crate::io::block_on_sync(jh);
         }
     }
 
@@ -120,31 +123,20 @@ impl<T: TxnService + 'static> GcWorkerInner<T> {
     async fn process_gc_tasks(&self) {
         // Defense in depth: periodically force-release stale commit reservations.
         // Keep reservations for active txn states only.
-        let released = self.engine.sweep_stale_commit_reservations(|txn_start_ts| {
-            matches!(
-                self.txn_service.get_txn_state(txn_start_ts),
-                Some(TxnState::Running)
-                    | Some(TxnState::Preparing)
-                    | Some(TxnState::Prepared { .. })
-            )
-        });
+        let released = self
+            .tablet_manager
+            .system_tablet()
+            .sweep_stale_commit_reservations(|txn_start_ts| {
+                matches!(
+                    self.txn_service.get_txn_state(txn_start_ts),
+                    Some(TxnState::Running)
+                        | Some(TxnState::Preparing)
+                        | Some(TxnState::Prepared { .. })
+                )
+            });
         if released > 0 {
             tracing::warn!("GC worker: force-released {released} stale commit reservations");
         }
-
-        // Proactive step 1: Remove obsolete SSTs (direct deletion, no compaction I/O)
-        match self.engine.remove_obsolete_dropped_table_ssts().await {
-            Ok(count) if count > 0 => {
-                tracing::info!("GC worker: removed {count} obsolete SSTs from dropped tables");
-            }
-            Err(e) => {
-                tracing::warn!("GC worker: failed to remove obsolete SSTs: {e}");
-            }
-            _ => {}
-        }
-
-        // Proactive step 2: Trigger compaction for levels with remaining dropped table SSTs
-        self.engine.trigger_compaction();
 
         let tasks = match load_gc_tasks(self.txn_service.as_ref()) {
             Ok(tasks) => tasks,
@@ -154,7 +146,7 @@ impl<T: TxnService + 'static> GcWorkerInner<T> {
             }
         };
 
-        let gc_safe_point = self.engine.gc_safe_point();
+        let gc_safe_point = (self.gc_safe_point)();
 
         for task in tasks {
             if self.shutdown.load(Ordering::Relaxed) {
@@ -169,19 +161,12 @@ impl<T: TxnService + 'static> GcWorkerInner<T> {
                 continue;
             }
 
-            // Ensure table is registered for compaction filtering
-            self.engine
-                .add_dropped_table(task.table_id, task.drop_commit_ts);
-
-            // Memtables still contain dropped-table keys. Do not mark done yet,
-            // otherwise those keys may flush later without table-drop filtering.
-            if self.check_memtable_overlap(&task) {
-                continue;
-            }
-
-            // Check if all SSTs overlapping the key range have been compacted
-            if self.check_sst_overlap(&task) {
-                // Still overlapping — compaction will filter on next round
+            if let Err(e) = self.retire_tablet(task.tablet_id).await {
+                tracing::warn!(
+                    "GC worker: failed to retire tablet {:?} for task {}: {e}",
+                    task.tablet_id,
+                    task.task_id
+                );
                 continue;
             }
 
@@ -191,54 +176,40 @@ impl<T: TxnService + 'static> GcWorkerInner<T> {
                 continue;
             }
 
-            self.engine.remove_dropped_table(task.table_id);
             tracing::info!(
-                "GC worker: completed task {} (table_id={})",
+                "GC worker: completed task {} (tablet_id={:?}, table_id={})",
                 task.task_id,
+                task.tablet_id,
                 task.table_id
             );
         }
     }
 
-    /// Check if active/frozen memtables overlap the task's key range.
-    fn check_memtable_overlap(&self, task: &GcTask) -> bool {
-        let start_key = match hex_decode(&task.start_key_hex) {
-            Some(k) => k,
-            None => return true, // Can't decode — assume overlap
-        };
-        let end_key = match hex_decode(&task.end_key_hex) {
-            Some(k) => k,
-            None => return true,
-        };
-
-        self.engine.has_memtable_overlap(&start_key, &end_key)
-    }
-
-    /// Check if any SST file overlaps the task's key range.
-    fn check_sst_overlap(&self, task: &GcTask) -> bool {
-        let start_key = match hex_decode(&task.start_key_hex) {
-            Some(k) => k,
-            None => return true, // Can't decode — assume overlap
-        };
-        let end_key = match hex_decode(&task.end_key_hex) {
-            Some(k) => k,
-            None => return true,
-        };
-
-        let version = self.engine.current_version();
-        for level_idx in 0..self.engine.config().max_levels {
-            let level_files = version.level(level_idx);
-            for sst in level_files {
-                if sst.overlaps(&start_key, &end_key) {
-                    return true;
-                }
-            }
+    async fn retire_tablet(&self, tablet_id: TabletId) -> Result<()> {
+        if tablet_id == TabletId::System {
+            return Err(TiSqlError::Storage(
+                "GC task attempted to retire system tablet".to_string(),
+            ));
         }
-        false
+
+        let tablet_dir = self.tablet_manager.tablet_dir(tablet_id);
+        let manager = Arc::clone(&self.tablet_manager);
+        let remove_result = tokio::task::spawn_blocking(move || manager.remove_tablet(tablet_id))
+            .await
+            .map_err(|e| TiSqlError::Storage(format!("retire tablet join error: {e}")))?;
+        let _ = remove_result?;
+
+        if tablet_dir.exists() {
+            let dir = tablet_dir.clone();
+            tokio::task::spawn_blocking(move || std::fs::remove_dir_all(&dir))
+                .await
+                .map_err(|e| TiSqlError::Storage(format!("delete tablet dir join error: {e}")))??;
+        }
+        Ok(())
     }
 
     /// Mark a GC task as 'done' in the inner table.
-    async fn mark_task_done(&self, task: &GcTask) -> crate::util::error::Result<()> {
+    async fn mark_task_done(&self, task: &GcTask) -> Result<()> {
         let mut ctx = self.txn_service.begin(false)?;
         update_gc_task_status(
             &mut ctx,
@@ -254,17 +225,4 @@ impl<T: TxnService + 'static> GcWorkerInner<T> {
         self.txn_service.commit(ctx).await?;
         Ok(())
     }
-}
-
-/// Decode a hex string to bytes.
-fn hex_decode(s: &str) -> Option<Vec<u8>> {
-    if s.len() % 2 != 0 {
-        return None;
-    }
-    let mut bytes = Vec::with_capacity(s.len() / 2);
-    for i in (0..s.len()).step_by(2) {
-        let byte = u8::from_str_radix(&s[i..i + 2], 16).ok()?;
-        bytes.push(byte);
-    }
-    Some(bytes)
 }

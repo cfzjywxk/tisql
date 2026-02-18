@@ -23,7 +23,9 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use parking_lot::RwLock;
 
 use crate::catalog::types::{IndexId, TableId, Timestamp, Value};
-use crate::codec::key::{encode_record_key_with_handle, gen_table_record_prefix};
+use crate::codec::key::{
+    encode_index_seek_key, encode_record_key_with_handle, gen_table_record_prefix,
+};
 use crate::codec::row::encode_row;
 use crate::inner_table::bootstrap::{
     self, delete_column_rows, delete_index_rows, update_meta_row, write_gc_task_row,
@@ -166,6 +168,42 @@ impl<T: TxnService> MvccCatalog<T> {
     async fn commit_internal(&self, ctx: TxnCtx) -> Result<crate::transaction::CommitInfo> {
         self.txn_service.commit(ctx).await
     }
+}
+
+struct GcTaskSpec {
+    task_id: i64,
+    table_id: u64,
+    start_key_hex: String,
+    end_key_hex: String,
+}
+
+fn hex_encode(bytes: &[u8]) -> String {
+    bytes.iter().map(|b| format!("{b:02x}")).collect::<String>()
+}
+
+fn exclusive_end_for_prefix(prefix: &[u8]) -> Vec<u8> {
+    let mut end = prefix.to_vec();
+    for idx in (0..end.len()).rev() {
+        if end[idx] != 0xff {
+            end[idx] += 1;
+            end.truncate(idx + 1);
+            return end;
+        }
+    }
+    end.push(0);
+    end
+}
+
+fn table_gc_range_hex(table_id: u64) -> (String, String) {
+    let start = gen_table_record_prefix(table_id);
+    let end = exclusive_end_for_prefix(&start);
+    (hex_encode(&start), hex_encode(&end))
+}
+
+fn index_gc_range_hex(table_id: u64, index_id: u64) -> (String, String) {
+    let start = encode_index_seek_key(table_id, index_id, &[]);
+    let end = exclusive_end_for_prefix(&start);
+    (hex_encode(&start), hex_encode(&end))
 }
 
 impl<T: TxnService> Catalog for MvccCatalog<T> {
@@ -349,7 +387,7 @@ impl<T: TxnService> Catalog for MvccCatalog<T> {
         let _ddl = self.ddl_mutex.lock().await;
 
         // Phase 1: Validate + extract data (brief read lock)
-        let (table_def, new_version, start_key_hex, end_key_hex, gc_task_id) = {
+        let (table_def, new_version, gc_tasks) = {
             let state = self.schema_state.read();
             let key = (schema.to_string(), table.to_string());
             let table_def = match state.cache.tables.get(&key) {
@@ -359,29 +397,32 @@ impl<T: TxnService> Catalog for MvccCatalog<T> {
                 }
             };
 
-            let table_id = table_def.id();
-            let start_key = gen_table_record_prefix(table_id);
-            let mut end_key = start_key.clone();
-            if let Some(last) = end_key.last_mut() {
-                *last = last.saturating_add(1);
-            }
-            let start_key_hex = start_key
-                .iter()
-                .map(|b| format!("{b:02x}"))
-                .collect::<String>();
-            let end_key_hex = end_key
-                .iter()
-                .map(|b| format!("{b:02x}"))
-                .collect::<String>();
+            let task_count = 1 + table_def.indexes().len();
+            let first_task = self
+                .next_gc_task_id
+                .fetch_add(task_count as u64, Ordering::SeqCst);
+            let mut gc_tasks = Vec::with_capacity(task_count);
 
-            let gc_task_id = self.next_gc_task_id.fetch_add(1, Ordering::SeqCst) as i64;
-            (
-                table_def,
-                state.version + 1,
-                start_key_hex,
-                end_key_hex,
-                gc_task_id,
-            )
+            let table_id = table_def.id();
+            let (table_start, table_end) = table_gc_range_hex(table_id);
+            gc_tasks.push(GcTaskSpec {
+                task_id: first_task as i64,
+                table_id,
+                start_key_hex: table_start,
+                end_key_hex: table_end,
+            });
+
+            for (idx, index) in table_def.indexes().iter().enumerate() {
+                let (start_key_hex, end_key_hex) = index_gc_range_hex(table_id, index.id());
+                gc_tasks.push(GcTaskSpec {
+                    task_id: (first_task + idx as u64 + 1) as i64,
+                    table_id,
+                    start_key_hex,
+                    end_key_hex,
+                });
+            }
+
+            (table_def, state.version + 1, gc_tasks)
         };
 
         let table_id = table_def.id();
@@ -410,17 +451,19 @@ impl<T: TxnService> Catalog for MvccCatalog<T> {
         )
         .await?;
 
-        write_gc_task_row(
-            &mut ctx,
-            self.txn_service.as_ref(),
-            gc_task_id,
-            table_id,
-            &start_key_hex,
-            &end_key_hex,
-            0,
-            "pending",
-        )
-        .await?;
+        for task in &gc_tasks {
+            write_gc_task_row(
+                &mut ctx,
+                self.txn_service.as_ref(),
+                task.task_id,
+                task.table_id,
+                &task.start_key_hex,
+                &task.end_key_hex,
+                0,
+                "pending",
+            )
+            .await?;
+        }
 
         let current_next = self.next_gc_task_id.load(Ordering::SeqCst);
         update_meta_row(
@@ -440,17 +483,19 @@ impl<T: TxnService> Catalog for MvccCatalog<T> {
         // Update GC task with the real drop_commit_ts in a new auto-commit txn
         {
             let mut ctx2 = self.begin_internal()?;
-            write_gc_task_row(
-                &mut ctx2,
-                self.txn_service.as_ref(),
-                gc_task_id,
-                table_id,
-                &start_key_hex,
-                &end_key_hex,
-                commit_ts,
-                "pending",
-            )
-            .await?;
+            for task in &gc_tasks {
+                write_gc_task_row(
+                    &mut ctx2,
+                    self.txn_service.as_ref(),
+                    task.task_id,
+                    task.table_id,
+                    &task.start_key_hex,
+                    &task.end_key_hex,
+                    commit_ts,
+                    "pending",
+                )
+                .await?;
+            }
             self.commit_internal(ctx2).await?;
         }
 
@@ -552,7 +597,7 @@ impl<T: TxnService> Catalog for MvccCatalog<T> {
         let _ddl = self.ddl_mutex.lock().await;
 
         // Phase 1: Validate (brief read lock)
-        let (table_key, index_key, new_version) = {
+        let (table_key, index_key, index_id, new_version, gc_task_id, start_key_hex, end_key_hex) = {
             let state = self.schema_state.read();
             let table_key = match state.cache.table_id_map.get(&table_id) {
                 Some(k) => k.clone(),
@@ -571,7 +616,17 @@ impl<T: TxnService> Catalog for MvccCatalog<T> {
                 .find(|i| i.name() == index_name)
                 .ok_or_else(|| TiSqlError::Catalog(format!("Index '{index_name}' not found")))?;
             let index_key = table_id * 10000 + index.id();
-            (table_key, index_key, state.version + 1)
+            let gc_task_id = self.next_gc_task_id.fetch_add(1, Ordering::SeqCst) as i64;
+            let (start_key_hex, end_key_hex) = index_gc_range_hex(table_id, index.id());
+            (
+                table_key,
+                index_key,
+                index.id(),
+                state.version + 1,
+                gc_task_id,
+                start_key_hex,
+                end_key_hex,
+            )
         };
 
         // Phase 2: Async txn work
@@ -582,15 +637,58 @@ impl<T: TxnService> Catalog for MvccCatalog<T> {
             .delete(&mut ctx, ALL_INDEX_TABLE_ID, key)
             .await?;
 
+        write_gc_task_row(
+            &mut ctx,
+            self.txn_service.as_ref(),
+            gc_task_id,
+            table_id,
+            &start_key_hex,
+            &end_key_hex,
+            0,
+            "pending",
+        )
+        .await?;
+
+        let current_next = self.next_gc_task_id.load(Ordering::SeqCst);
+        update_meta_row(
+            &mut ctx,
+            self.txn_service.as_ref(),
+            META_NEXT_GC_TASK_ID,
+            current_next,
+        )
+        .await?;
+
         self.write_schema_version_to_meta(&mut ctx, new_version)
             .await?;
-        self.commit_internal(ctx).await?;
+        let commit_info = self.commit_internal(ctx).await?;
+        let commit_ts = commit_info.commit_ts;
+
+        // Backfill drop_commit_ts after DDL commit.
+        {
+            let mut ctx2 = self.begin_internal()?;
+            write_gc_task_row(
+                &mut ctx2,
+                self.txn_service.as_ref(),
+                gc_task_id,
+                table_id,
+                &start_key_hex,
+                &end_key_hex,
+                commit_ts,
+                "pending",
+            )
+            .await?;
+            self.commit_internal(ctx2).await?;
+        }
 
         // Phase 3: Update cache
         let mut state = self.schema_state.write();
         state.version = new_version;
         if let Some(cached_table) = state.cache.tables.get_mut(&table_key) {
-            cached_table.remove_index(index_name);
+            let removed = cached_table.remove_index(index_name);
+            debug_assert!(
+                removed.as_ref().map(|idx| idx.id()) == Some(index_id),
+                "removed index id mismatch while dropping index"
+            );
         }
 
         Ok(())

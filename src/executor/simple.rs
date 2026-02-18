@@ -1047,8 +1047,10 @@ impl SimpleExecutor {
                     )));
                 }
 
-                catalog.create_table(table).await?;
-                Ok(ExecutionResult::Ok)
+                let table_id = catalog.create_table(table).await?;
+                Ok(ExecutionResult::OkWithEffect(DdlEffect::TableCreated {
+                    table_id,
+                }))
             }
 
             LogicalPlan::DropTable {
@@ -1063,11 +1065,8 @@ impl SimpleExecutor {
                     return Err(TiSqlError::TableNotFound(format!("{schema}.{table}")));
                 }
 
-                let info = catalog.drop_table(&schema, &table).await?;
-                Ok(ExecutionResult::OkWithEffect(DdlEffect::TableDropped {
-                    table_id: info.table_id,
-                    commit_ts: info.commit_ts,
-                }))
+                let _info = catalog.drop_table(&schema, &table).await?;
+                Ok(ExecutionResult::OkWithEffect(DdlEffect::TableDropped))
             }
 
             _ => Err(TiSqlError::Execution("Not a DDL operation".into())),

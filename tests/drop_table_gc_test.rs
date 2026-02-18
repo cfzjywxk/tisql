@@ -12,288 +12,227 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-//! Integration tests for Drop Table GC.
-//!
-//! Tests the end-to-end flow: DROP TABLE creates a GC task row in
-//! `__all_gc_delete_range`, and on recovery the dropped table IDs
-//! are rebuilt from the inner table.
-//!
-//! Run with: cargo test --test drop_table_gc_test
+//! Integration tests for Phase-6 tablet lifecycle + tablet-level drop GC.
 
 use std::sync::Arc;
+use std::time::{Duration, Instant};
 
 use tempfile::tempdir;
 
 use tisql::catalog::types::Value;
+use tisql::tablet::TabletId;
 use tisql::testkit::ExecutionResult;
-use tisql::{Database, DatabaseConfig, QueryResult};
+use tisql::{Database, DatabaseConfig};
 
-/// Create a fresh database in a temp directory.
 fn create_test_db() -> (Arc<Database>, tempfile::TempDir) {
     let dir = tempdir().unwrap();
-    let config = DatabaseConfig::with_data_dir(dir.path());
-    let db = Arc::new(Database::open(config).unwrap());
+    let db = Arc::new(Database::open(DatabaseConfig::with_data_dir(dir.path())).unwrap());
     (db, dir)
 }
 
-/// Helper: query via execute_query and return rows as Vec<Vec<String>>.
-async fn query_rows(db: &Database, sql: &str) -> Vec<Vec<String>> {
-    match db.execute_query(sql).await.unwrap() {
-        QueryResult::Rows { data, .. } => data,
-        other => panic!("Expected rows, got: {other:?}"),
-    }
-}
-
-/// Helper: execute SQL via execute_query, expecting success.
 async fn exec(db: &Database, sql: &str) {
     db.execute_query(sql).await.unwrap();
 }
 
-/// Query GC tasks from inner table and return rows.
-async fn query_gc_tasks(db: &Arc<Database>) -> Vec<tisql::catalog::types::Row> {
+async fn table_id_by_name(db: &Arc<Database>, table_name: &str) -> u64 {
     let sess = db.new_inner_session("__tisql_inner");
-    let result = sess.execute_inner_sql(
-        "SELECT task_id, table_id, start_key, end_key, drop_commit_ts, status FROM __all_gc_delete_range ORDER BY task_id",
-    )
-    .await
-    .unwrap();
-    match result {
+    let sql = format!(
+        "SELECT table_id FROM __all_table WHERE table_name = '{table_name}' ORDER BY table_id LIMIT 1"
+    );
+    let result = sess.execute_inner_sql(&sql).await.unwrap();
+    let rows = match result {
         ExecutionResult::Rows { rows, .. } => rows,
-        _ => panic!("expected rows from GC task query"),
+        _ => panic!("expected rows for table id query"),
+    };
+    match rows.first().and_then(|row| row.get(0)) {
+        Some(Value::BigInt(id)) => *id as u64,
+        other => panic!("unexpected table_id row: {other:?}"),
     }
 }
 
-/// After DROP TABLE, a GC task row should exist in `__all_gc_delete_range`.
+async fn gc_task_statuses_for_table(db: &Arc<Database>, table_id: u64) -> Vec<String> {
+    let sess = db.new_inner_session("__tisql_inner");
+    let sql = format!(
+        "SELECT status FROM __all_gc_delete_range WHERE table_id = {table_id} ORDER BY task_id"
+    );
+    let result = sess.execute_inner_sql(&sql).await.unwrap();
+    let rows = match result {
+        ExecutionResult::Rows { rows, .. } => rows,
+        _ => panic!("expected rows for gc task query"),
+    };
+    rows.into_iter()
+        .filter_map(|row| match row.get(0) {
+            Some(Value::String(s)) => Some(s.clone()),
+            _ => None,
+        })
+        .collect()
+}
+
+async fn wait_until<F>(timeout: Duration, mut cond: F)
+where
+    F: FnMut() -> bool,
+{
+    let deadline = Instant::now() + timeout;
+    while Instant::now() < deadline {
+        if cond() {
+            return;
+        }
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    panic!("condition not met within {timeout:?}");
+}
+
 #[tokio::test]
-async fn test_drop_table_gc_task_persists() {
-    let (db, _dir) = create_test_db();
+async fn test_phase6_create_table_creates_and_mounts_tablet() {
+    let (db, dir) = create_test_db();
 
-    // Create and populate a table
-    exec(&db, "CREATE TABLE gc_test (id INT PRIMARY KEY, val INT)").await;
-    exec(&db, "INSERT INTO gc_test VALUES (1, 100), (2, 200)").await;
+    exec(&db, "CREATE TABLE t_gc_create (id INT PRIMARY KEY, v INT)").await;
+    let table_id = table_id_by_name(&db, "t_gc_create").await;
+    let tablet_id = TabletId::Table { table_id };
+    let tablet_dir = dir.path().join("tablets").join(format!("t_{table_id}"));
 
-    // Drop the table — this should create a GC task
-    exec(&db, "DROP TABLE gc_test").await;
+    assert!(tablet_dir.exists(), "tablet directory should be created");
+    assert!(
+        tablet_dir.join("ilog").join("tisql.ilog").exists(),
+        "tablet ilog file should be created"
+    );
+    assert!(db.tablet_manager().get_tablet(tablet_id).is_some());
+    assert!(db.tablet_manager().has_running_workers(tablet_id));
 
-    let rows = query_gc_tasks(&db).await;
-    assert!(!rows.is_empty(), "Should have at least one GC task");
-    let row = &rows[0];
+    db.close().await.unwrap();
+}
 
-    // task_id should be 1 (first GC task)
-    assert_eq!(
-        *row.get(0).unwrap(),
-        Value::BigInt(1),
-        "task_id should be 1"
+#[tokio::test]
+async fn test_phase6_inner_tables_remain_in_system_tablet() {
+    let (db, dir) = create_test_db();
+    let tablets_root = dir.path().join("tablets");
+
+    assert!(tablets_root.join("system").exists());
+    for table_id in 1..=6 {
+        assert!(
+            !tablets_root.join(format!("t_{table_id}")).exists(),
+            "inner table {table_id} must not have dedicated tablet dir"
+        );
+    }
+
+    db.close().await.unwrap();
+}
+
+#[tokio::test]
+async fn test_phase6_drop_table_gc_removes_tablet_directory() {
+    let (db, dir) = create_test_db();
+
+    exec(&db, "CREATE TABLE t_gc_drop (id INT PRIMARY KEY, v INT)").await;
+    exec(&db, "INSERT INTO t_gc_drop VALUES (1, 10), (2, 20)").await;
+
+    let table_id = table_id_by_name(&db, "t_gc_drop").await;
+    let tablet_id = TabletId::Table { table_id };
+    let tablet_dir = dir.path().join("tablets").join(format!("t_{table_id}"));
+    assert!(tablet_dir.exists());
+
+    exec(&db, "DROP TABLE t_gc_drop").await;
+    let statuses_after_drop = gc_task_statuses_for_table(&db, table_id).await;
+    assert!(
+        !statuses_after_drop.is_empty(),
+        "drop should enqueue at least one GC task row"
+    );
+    db.notify_gc_worker();
+
+    wait_until(Duration::from_secs(5), || {
+        db.notify_gc_worker();
+        db.tablet_manager().get_tablet(tablet_id).is_none() && !tablet_dir.exists()
+    })
+    .await;
+
+    let statuses = gc_task_statuses_for_table(&db, table_id).await;
+    assert!(!statuses.is_empty(), "drop should create GC task rows");
+    assert!(statuses.iter().all(|s| s == "done"));
+
+    db.close().await.unwrap();
+}
+
+#[tokio::test]
+async fn test_phase6_gc_waits_for_active_reader_safe_point() {
+    let (db, dir) = create_test_db();
+
+    exec(&db, "CREATE TABLE t_gc_pin (id INT PRIMARY KEY, v INT)").await;
+    exec(&db, "INSERT INTO t_gc_pin VALUES (1, 100)").await;
+    let table_id = table_id_by_name(&db, "t_gc_pin").await;
+    let tablet_id = TabletId::Table { table_id };
+    let tablet_dir = dir.path().join("tablets").join(format!("t_{table_id}"));
+
+    // Pin GC safe point to 0 (simulates a long-running explicit reader).
+    db.session_registry().register(42, 1);
+
+    exec(&db, "DROP TABLE t_gc_pin").await;
+    db.notify_gc_worker();
+
+    tokio::time::sleep(Duration::from_millis(200)).await;
+    assert!(
+        tablet_dir.exists(),
+        "tablet must not be deleted while pinned"
+    );
+    assert!(db.tablet_manager().get_tablet(tablet_id).is_some());
+
+    let statuses = gc_task_statuses_for_table(&db, table_id).await;
+    assert!(
+        statuses.iter().any(|s| s == "pending"),
+        "task should stay pending while safe point is pinned"
     );
 
-    // table_id should be a valid table ID (>= 1000 for user tables)
-    match row.get(1).unwrap() {
-        Value::BigInt(table_id) => {
-            assert!(
-                *table_id >= 1000,
-                "table_id should be >= 1000 for user tables, got {table_id}"
-            );
-        }
-        other => panic!("Expected BigInt for table_id, got: {other:?}"),
-    }
+    db.session_registry().unregister(42);
+    db.notify_gc_worker();
 
-    // start_key and end_key should be non-empty hex strings
-    match row.get(2).unwrap() {
-        Value::String(s) => {
-            assert!(!s.is_empty(), "start_key should not be empty");
-            assert!(s.len() % 2 == 0, "start_key should be even-length hex");
-        }
-        other => panic!("Expected String for start_key, got: {other:?}"),
-    }
+    wait_until(Duration::from_secs(5), || {
+        db.notify_gc_worker();
+        db.tablet_manager().get_tablet(tablet_id).is_none() && !tablet_dir.exists()
+    })
+    .await;
 
-    match row.get(3).unwrap() {
-        Value::String(s) => {
-            assert!(!s.is_empty(), "end_key should not be empty");
-            assert!(s.len() % 2 == 0, "end_key should be even-length hex");
-        }
-        other => panic!("Expected String for end_key, got: {other:?}"),
-    }
+    let statuses = gc_task_statuses_for_table(&db, table_id).await;
+    assert!(statuses.iter().all(|s| s == "done"));
 
-    // drop_commit_ts should be > 0 (updated after commit)
-    match row.get(4).unwrap() {
-        Value::BigInt(ts) => {
-            assert!(*ts > 0, "drop_commit_ts should be > 0, got {ts}");
-        }
-        other => panic!("Expected BigInt for drop_commit_ts, got: {other:?}"),
-    }
+    db.close().await.unwrap();
+}
 
-    // status should be "pending"
-    assert_eq!(
-        *row.get(5).unwrap(),
-        Value::String("pending".into()),
-        "status should be 'pending'"
+#[tokio::test]
+async fn test_phase6_pending_drop_gc_resumes_after_restart() {
+    let dir = tempdir().unwrap();
+    let config = DatabaseConfig::with_data_dir(dir.path());
+
+    let table_id = {
+        let db = Arc::new(Database::open(config.clone()).unwrap());
+        exec(&db, "CREATE TABLE t_gc_restart (id INT PRIMARY KEY, v INT)").await;
+        exec(&db, "INSERT INTO t_gc_restart VALUES (1, 1), (2, 2)").await;
+        let table_id = table_id_by_name(&db, "t_gc_restart").await;
+
+        db.session_registry().register(7, 1);
+        exec(&db, "DROP TABLE t_gc_restart").await;
+        db.notify_gc_worker();
+        tokio::time::sleep(Duration::from_millis(200)).await;
+
+        let statuses = gc_task_statuses_for_table(&db, table_id).await;
+        assert!(statuses.iter().any(|s| s == "pending"));
+
+        db.close().await.unwrap();
+        table_id
+    };
+
+    let db2 = Arc::new(Database::open(config).unwrap());
+    let tablet_dir = dir.path().join("tablets").join(format!("t_{table_id}"));
+
+    db2.notify_gc_worker();
+    wait_until(Duration::from_secs(5), || {
+        db2.notify_gc_worker();
+        !tablet_dir.exists()
+    })
+    .await;
+
+    let statuses = gc_task_statuses_for_table(&db2, table_id).await;
+    assert!(
+        !statuses.is_empty() && statuses.iter().all(|s| s == "done"),
+        "pending GC tasks should be resumed and completed after restart"
     );
-}
 
-/// After dropping multiple tables, multiple GC tasks should exist.
-#[tokio::test]
-async fn test_drop_table_multiple_gc_tasks() {
-    let (db, _dir) = create_test_db();
-
-    exec(&db, "CREATE TABLE t1 (id INT PRIMARY KEY)").await;
-    exec(&db, "INSERT INTO t1 VALUES (1)").await;
-    exec(&db, "CREATE TABLE t2 (id INT PRIMARY KEY)").await;
-    exec(&db, "INSERT INTO t2 VALUES (1)").await;
-    exec(&db, "CREATE TABLE t3 (id INT PRIMARY KEY)").await;
-    exec(&db, "INSERT INTO t3 VALUES (1)").await;
-
-    exec(&db, "DROP TABLE t1").await;
-    exec(&db, "DROP TABLE t2").await;
-    exec(&db, "DROP TABLE t3").await;
-
-    let rows = query_gc_tasks(&db).await;
-    assert_eq!(rows.len(), 3, "Should have 3 GC tasks");
-    // Task IDs should be sequential: 1, 2, 3
-    assert_eq!(*rows[0].get(0).unwrap(), Value::BigInt(1));
-    assert_eq!(*rows[1].get(0).unwrap(), Value::BigInt(2));
-    assert_eq!(*rows[2].get(0).unwrap(), Value::BigInt(3));
-}
-
-/// After DROP TABLE + restart, the GC task should still be present.
-#[tokio::test]
-async fn test_drop_table_gc_recovery() {
-    let dir = tempdir().unwrap();
-    let config = DatabaseConfig::with_data_dir(dir.path());
-
-    // First session: create table, insert data, drop table
-    {
-        let db = Arc::new(Database::open(config.clone()).unwrap());
-        exec(&db, "CREATE TABLE recover_me (id INT PRIMARY KEY, val INT)").await;
-        exec(&db, "INSERT INTO recover_me VALUES (1, 42), (2, 84)").await;
-        exec(&db, "DROP TABLE recover_me").await;
-
-        let rows = query_gc_tasks(&db).await;
-        assert_eq!(rows.len(), 1);
-        assert_eq!(*rows[0].get(5).unwrap(), Value::String("pending".into()));
-
-        db.close().await.unwrap();
-    }
-
-    // Second session: verify GC task survives restart
-    {
-        let db = Arc::new(Database::open(config.clone()).unwrap());
-
-        // Table should still be gone
-        let result = db.execute_query("SELECT * FROM recover_me").await;
-        assert!(
-            result.is_err(),
-            "dropped table should not exist after restart"
-        );
-
-        // GC task should still be present in inner table
-        let rows = query_gc_tasks(&db).await;
-        assert_eq!(rows.len(), 1, "GC task should survive restart");
-        assert_eq!(*rows[0].get(0).unwrap(), Value::BigInt(1));
-        match rows[0].get(4).unwrap() {
-            Value::BigInt(ts) => {
-                assert!(*ts > 0, "drop_commit_ts should be > 0 after recovery");
-            }
-            other => panic!("Expected BigInt, got: {other:?}"),
-        }
-        assert_eq!(*rows[0].get(5).unwrap(), Value::String("pending".into()));
-
-        db.close().await.unwrap();
-    }
-}
-
-/// After DROP TABLE + crash (no explicit close), the GC task should be recovered.
-#[tokio::test]
-async fn test_drop_table_gc_crash_recovery() {
-    let dir = tempdir().unwrap();
-    let config = DatabaseConfig::with_data_dir(dir.path());
-
-    // First session: create and populate
-    {
-        let db = Arc::new(Database::open(config.clone()).unwrap());
-        exec(&db, "CREATE TABLE crash_test (id INT PRIMARY KEY)").await;
-        exec(&db, "INSERT INTO crash_test VALUES (1), (2), (3)").await;
-        db.close().await.unwrap();
-    }
-
-    // Second session: drop table + crash (no close)
-    {
-        let db = Arc::new(Database::open(config.clone()).unwrap());
-        exec(&db, "DROP TABLE crash_test").await;
-        // Intentional crash — no db.close()
-    }
-
-    // Third session: verify recovery
-    {
-        let db = Arc::new(Database::open(config.clone()).unwrap());
-
-        // Table should be gone
-        let result = db.execute_query("SELECT * FROM crash_test").await;
-        assert!(
-            result.is_err(),
-            "dropped table should not exist after crash recovery"
-        );
-
-        // GC task should be recovered
-        let rows = query_gc_tasks(&db).await;
-        assert_eq!(rows.len(), 1, "GC task should survive crash recovery");
-
-        db.close().await.unwrap();
-    }
-}
-
-/// Verify GC task ID counter persists across restarts.
-#[tokio::test]
-async fn test_gc_task_id_counter_persists() {
-    let dir = tempdir().unwrap();
-    let config = DatabaseConfig::with_data_dir(dir.path());
-
-    // First session: create and drop two tables
-    {
-        let db = Arc::new(Database::open(config.clone()).unwrap());
-        exec(&db, "CREATE TABLE t1 (id INT PRIMARY KEY)").await;
-        exec(&db, "CREATE TABLE t2 (id INT PRIMARY KEY)").await;
-        exec(&db, "DROP TABLE t1").await;
-        exec(&db, "DROP TABLE t2").await;
-        db.close().await.unwrap();
-    }
-
-    // Second session: drop another table — task_id should continue from 3
-    {
-        let db = Arc::new(Database::open(config.clone()).unwrap());
-        exec(&db, "CREATE TABLE t3 (id INT PRIMARY KEY)").await;
-        exec(&db, "DROP TABLE t3").await;
-
-        let rows = query_gc_tasks(&db).await;
-        assert_eq!(rows.len(), 3, "Should have 3 GC tasks total");
-        assert_eq!(*rows[0].get(0).unwrap(), Value::BigInt(1));
-        assert_eq!(*rows[1].get(0).unwrap(), Value::BigInt(2));
-        assert_eq!(*rows[2].get(0).unwrap(), Value::BigInt(3));
-
-        db.close().await.unwrap();
-    }
-}
-
-/// After DROP TABLE, creating a new table with the same name should work.
-#[tokio::test]
-async fn test_drop_and_recreate_table() {
-    let (db, _dir) = create_test_db();
-
-    exec(&db, "CREATE TABLE reuse (id INT PRIMARY KEY)").await;
-    exec(&db, "INSERT INTO reuse VALUES (1)").await;
-    exec(&db, "DROP TABLE reuse").await;
-
-    // Recreate with same name
-    exec(&db, "CREATE TABLE reuse (id INT PRIMARY KEY, val INT)").await;
-    exec(&db, "INSERT INTO reuse VALUES (10, 100)").await;
-
-    // New table should work
-    let rows = query_rows(&db, "SELECT id, val FROM reuse").await;
-    assert_eq!(rows.len(), 1);
-    assert_eq!(rows[0][0], "10");
-    assert_eq!(rows[0][1], "100");
-
-    // GC task for old table should still exist
-    let gc_rows = query_gc_tasks(&db).await;
-    assert_eq!(gc_rows.len(), 1, "Should have 1 GC task for old table");
-    assert_eq!(*gc_rows[0].get(5).unwrap(), Value::String("pending".into()));
+    db2.close().await.unwrap();
 }

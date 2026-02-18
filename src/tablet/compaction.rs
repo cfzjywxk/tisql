@@ -40,7 +40,7 @@
 //! the oldest active read timestamp (GC safe point).
 
 use std::cmp::Ordering;
-use std::collections::{BinaryHeap, HashMap};
+use std::collections::BinaryHeap;
 use std::path::Path;
 use std::sync::Arc;
 
@@ -136,17 +136,9 @@ impl CompactionPicker {
     /// level, sorts by score descending, and picks the highest-scoring level
     /// with score >= 1.0. This ensures the most urgent compaction runs first.
     ///
-    /// Levels containing SSTs from dropped tables get a +1.0 score boost,
-    /// ensuring they always reach the compaction threshold.
-    ///
     /// Returns None if no compaction is needed (all scores < 1.0).
-    pub fn pick(
-        &self,
-        version: &Version,
-        dropped_tables: &HashMap<u64, Timestamp>,
-        gc_safe_point: u64,
-    ) -> Option<CompactionTask> {
-        let scores = self.compute_compaction_scores(version, dropped_tables, gc_safe_point);
+    pub fn pick(&self, version: &Version) -> Option<CompactionTask> {
+        let scores = self.compute_compaction_scores(version);
 
         // Find highest-scoring level with score >= 1.0
         for (level, score) in &scores {
@@ -173,14 +165,7 @@ impl CompactionPicker {
     /// - L0: `score = max(file_count / trigger, total_bytes / l1_max_size)`
     /// - Ln (n>=1): `score = level_size_bytes / level_max_size(n)`
     ///
-    /// Levels containing SSTs from dropped tables get a +1.0 boost to ensure
-    /// they always reach the compaction threshold.
-    pub fn compute_compaction_scores(
-        &self,
-        version: &Version,
-        dropped_tables: &HashMap<u64, Timestamp>,
-        gc_safe_point: u64,
-    ) -> Vec<(usize, f64)> {
+    pub fn compute_compaction_scores(&self, version: &Version) -> Vec<(usize, f64)> {
         let mut scores = Vec::new();
 
         // L0 score: based on file count and size
@@ -192,36 +177,17 @@ impl CompactionPicker {
         } else {
             0.0
         };
-        let mut l0_score = file_score.max(size_score);
-
-        // Boost score if L0 contains dropped table SSTs
-        let has_dropped = version
-            .ssts_at_level(0)
-            .iter()
-            .any(|sst| sst.belongs_to_dropped_table(dropped_tables, gc_safe_point));
-        if has_dropped {
-            l0_score += 1.0;
-        }
-        scores.push((0, l0_score));
+        scores.push((0, file_score.max(size_score)));
 
         // Ln scores (n >= 1): based on level size vs max size
         for level in 1..self.config.max_levels - 1 {
             let level_bytes = version.level_size_bytes(level);
             let max_bytes = self.config.level_max_size(level) as u64;
-            let mut score = if max_bytes > 0 {
+            let score = if max_bytes > 0 {
                 level_bytes as f64 / max_bytes as f64
             } else {
                 0.0
             };
-
-            // Boost score if level contains dropped table SSTs
-            let has_dropped = version
-                .ssts_at_level(level as u32)
-                .iter()
-                .any(|sst| sst.belongs_to_dropped_table(dropped_tables, gc_safe_point));
-            if has_dropped {
-                score += 1.0;
-            }
             scores.push((level, score));
         }
 
@@ -502,9 +468,6 @@ impl CompactionExecutor {
     /// `is_bottommost`: when true, tombstones at the GC barrier are dropped
     /// (no data below to mask). When false, tombstones are preserved.
     ///
-    /// `dropped_tables`: table_id → drop_commit_ts. All keys belonging to a
-    /// dropped table with drop_ts <= gc_safe_point are unconditionally filtered.
-    ///
     /// Returns the manifest delta to apply on success.
     pub async fn execute(
         &self,
@@ -515,7 +478,6 @@ impl CompactionExecutor {
         io: std::sync::Arc<crate::io::IoService>,
         gc_safe_point: Timestamp,
         is_bottommost: bool,
-        dropped_tables: &HashMap<u64, Timestamp>,
     ) -> Result<ManifestDelta> {
         // Handle trivial move (just update metadata, no I/O)
         if task.is_trivial_move {
@@ -585,18 +547,8 @@ impl CompactionExecutor {
                         skip_remaining = false;
                     }
 
-                    // Pre-check: if the key belongs to a dropped table whose
-                    // drop_ts <= gc_safe_point, skip all versions unconditionally.
-                    if let Ok(table_id) = crate::codec::key::decode_table_id(&user_key) {
-                        if let Some(&drop_ts) = dropped_tables.get(&table_id) {
-                            if drop_ts > 0 && drop_ts <= gc_safe_point {
-                                skip_remaining = true;
-                            }
-                        }
-                    }
-
                     if skip_remaining {
-                        false // Below GC barrier or dropped table — drop
+                        false // Below GC barrier — drop
                     } else if ts > gc_safe_point {
                         true // Above safe point — keep for active readers
                     } else if !found_gc_barrier {
@@ -742,7 +694,7 @@ mod tests {
         let picker = CompactionPicker::new(config);
 
         let version = Version::new();
-        assert!(picker.pick(&version, &HashMap::new(), 0).is_none());
+        assert!(picker.pick(&version).is_none());
     }
 
     #[tokio::test]
@@ -759,7 +711,7 @@ mod tests {
             .add_sst(make_sst(4, 0, b"p", b"z"))
             .build();
 
-        let task = picker.pick(&version, &HashMap::new(), 0).unwrap();
+        let task = picker.pick(&version).unwrap();
         assert_eq!(task.output_level, 1);
         assert!(!task.is_trivial_move);
         assert_eq!(task.inputs.len(), 4); // All 4 L0 files
@@ -782,7 +734,7 @@ mod tests {
             .add_sst(make_sst(7, 1, b"m", b"r")) // Overlaps
             .build();
 
-        let task = picker.pick(&version, &HashMap::new(), 0).unwrap();
+        let task = picker.pick(&version).unwrap();
         assert_eq!(task.output_level, 1);
 
         // Should include all L0 files and overlapping L1 files
@@ -812,7 +764,7 @@ mod tests {
             .add_sst(make_sst(2, 1, b"n", b"z"))
             .build();
 
-        let task = picker.pick(&version, &HashMap::new(), 0).unwrap();
+        let task = picker.pick(&version).unwrap();
         assert_eq!(task.output_level, 2);
     }
 
@@ -835,7 +787,7 @@ mod tests {
             // No L2 files
             .build();
 
-        let task = picker.pick(&version, &HashMap::new(), 0).unwrap();
+        let task = picker.pick(&version).unwrap();
         assert_eq!(task.output_level, 2);
         assert!(task.is_trivial_move);
         assert_eq!(task.inputs.len(), 1);
@@ -1000,7 +952,6 @@ mod tests {
 
         // Execute compaction with pre-allocated IDs (tests use standard I/O)
         let pre_allocated_ids = vec![3, 4]; // Over-allocate for safety
-        let no_dropped = HashMap::new();
         let delta = executor
             .execute(
                 &task,
@@ -1010,7 +961,6 @@ mod tests {
                 test_io(),
                 0, // gc_safe_point = 0 → no GC
                 false,
-                &no_dropped,
             )
             .await
             .unwrap();
@@ -1388,7 +1338,7 @@ mod tests {
             .build();
 
         // Should NOT trigger compaction
-        assert!(picker.pick(&version, &HashMap::new(), 0).is_none());
+        assert!(picker.pick(&version).is_none());
     }
 
     #[tokio::test]
@@ -1412,7 +1362,7 @@ mod tests {
             .add_sst(make_sst(2, 1, b"n", b"z"))
             .build();
 
-        let task = picker.pick(&version, &HashMap::new(), 0);
+        let task = picker.pick(&version);
         assert!(task.is_some());
         let task = task.unwrap();
         assert_eq!(task.output_level, 2);
@@ -1452,7 +1402,6 @@ mod tests {
         };
 
         let pre_allocated_ids = vec![3, 4];
-        let no_dropped = HashMap::new();
         let delta = executor
             .execute(
                 &task,
@@ -1462,7 +1411,6 @@ mod tests {
                 test_io(),
                 0, // gc_safe_point = 0 → no GC
                 false,
-                &no_dropped,
             )
             .await
             .unwrap();
@@ -1493,7 +1441,7 @@ mod tests {
             .add_sst(make_sst(2, 0, b"n", b"z"))
             .build();
 
-        let scores = picker.compute_compaction_scores(&version, &HashMap::new(), 0);
+        let scores = picker.compute_compaction_scores(&version);
         let l0_score = scores.iter().find(|(level, _)| *level == 0).unwrap().1;
         assert!(
             (l0_score - 0.5).abs() < 0.01,
@@ -1508,7 +1456,7 @@ mod tests {
             .add_sst(make_sst(4, 0, b"t", b"z"))
             .build();
 
-        let scores = picker.compute_compaction_scores(&version, &HashMap::new(), 0);
+        let scores = picker.compute_compaction_scores(&version);
         let l0_score = scores.iter().find(|(level, _)| *level == 0).unwrap().1;
         assert!(
             l0_score >= 1.0,
@@ -1538,7 +1486,7 @@ mod tests {
             .add_sst(make_sst(2, 1, b"n", b"z")) // file_size = 1000
             .build();
 
-        let scores = picker.compute_compaction_scores(&version, &HashMap::new(), 0);
+        let scores = picker.compute_compaction_scores(&version);
         let l1_score = scores.iter().find(|(level, _)| *level == 1).unwrap().1;
         assert!(
             (l1_score - 1.0).abs() < 0.01,
@@ -1571,7 +1519,7 @@ mod tests {
             .add_sst(big_sst) // 80000 bytes in L2
             .build();
 
-        let scores = picker.compute_compaction_scores(&version, &HashMap::new(), 0);
+        let scores = picker.compute_compaction_scores(&version);
 
         // Scores should be sorted descending
         assert!(
@@ -1603,13 +1551,13 @@ mod tests {
             .add_sst(make_sst(2, 1, b"a", b"z"))
             .build();
 
-        let scores = picker.compute_compaction_scores(&version, &HashMap::new(), 0);
+        let scores = picker.compute_compaction_scores(&version);
         for (_level, score) in &scores {
             assert!(*score < 1.0, "All scores should be below 1.0");
         }
 
         // pick() should return None
-        assert!(picker.pick(&version, &HashMap::new(), 0).is_none());
+        assert!(picker.pick(&version).is_none());
     }
 
     #[tokio::test]
@@ -1619,7 +1567,7 @@ mod tests {
         let picker = CompactionPicker::new(config);
 
         let version = Version::new();
-        let scores = picker.compute_compaction_scores(&version, &HashMap::new(), 0);
+        let scores = picker.compute_compaction_scores(&version);
 
         // All scores should be 0
         for (_level, score) in &scores {

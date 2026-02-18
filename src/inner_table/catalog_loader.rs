@@ -21,10 +21,13 @@ use std::collections::HashMap;
 
 use crate::catalog::types::{DataType, TableId, Timestamp, Value};
 use crate::catalog::{ColumnDef, IndexDef, TableDef};
-use crate::codec::key::{encode_record_key_with_handle, gen_table_record_prefix};
+use crate::codec::key::{
+    decode_index_key, decode_table_id, encode_record_key_with_handle, gen_table_record_prefix,
+    is_index_key,
+};
 use crate::codec::row::decode_row_to_values;
 use crate::inner_table::core_tables::*;
-use crate::tablet::MvccIterator;
+use crate::tablet::{route_index_to_tablet, route_table_to_tablet, MvccIterator, TabletId};
 use crate::transaction::{TxnCtx, TxnService};
 use crate::util::error::{Result, TiSqlError};
 
@@ -881,6 +884,7 @@ fn reconstruct_table_def(
 pub struct GcTask {
     pub task_id: i64,
     pub table_id: u64,
+    pub tablet_id: TabletId,
     pub start_key_hex: String,
     pub end_key_hex: String,
     pub drop_commit_ts: u64,
@@ -931,10 +935,12 @@ pub fn load_gc_tasks<T: TxnService>(txn: &T) -> Result<Vec<GcTask>> {
             Value::String(s) => s.clone(),
             _ => continue,
         };
+        let tablet_id = tablet_id_from_gc_task(table_id, &start_key_hex);
 
         tasks.push(GcTask {
             task_id,
             table_id,
+            tablet_id,
             start_key_hex,
             end_key_hex,
             drop_commit_ts,
@@ -943,6 +949,39 @@ pub fn load_gc_tasks<T: TxnService>(txn: &T) -> Result<Vec<GcTask>> {
     }
 
     Ok(tasks)
+}
+
+fn tablet_id_from_gc_task(table_id: u64, start_key_hex: &str) -> TabletId {
+    let bytes = match hex_decode(start_key_hex) {
+        Some(bytes) => bytes,
+        None => return route_table_to_tablet(table_id),
+    };
+    let decoded_table = match decode_table_id(&bytes) {
+        Ok(table_id) => table_id,
+        Err(_) => return route_table_to_tablet(table_id),
+    };
+
+    if is_index_key(&bytes) {
+        if let Ok((indexed_table_id, index_id, _)) = decode_index_key(&bytes) {
+            if indexed_table_id == decoded_table {
+                return route_index_to_tablet(indexed_table_id, index_id);
+            }
+        }
+    }
+
+    route_table_to_tablet(decoded_table)
+}
+
+fn hex_decode(s: &str) -> Option<Vec<u8>> {
+    if !s.len().is_multiple_of(2) {
+        return None;
+    }
+    let mut bytes = Vec::with_capacity(s.len() / 2);
+    for i in (0..s.len()).step_by(2) {
+        let byte = u8::from_str_radix(&s[i..i + 2], 16).ok()?;
+        bytes.push(byte);
+    }
+    Some(bytes)
 }
 
 #[cfg(test)]

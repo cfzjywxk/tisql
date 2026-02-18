@@ -346,6 +346,8 @@ impl TabletManager {
         tablet.reset_aborted_flush_states();
         tablet.flush_all_with_active()?;
         tablet.shutdown_manifest_writer();
+        tablet.close_ilog()?;
+        tablet.shutdown_ilog();
 
         self.desired_tablets.write().remove(&tablet_id);
         let removed = self.tablets.write().remove(&tablet_id);

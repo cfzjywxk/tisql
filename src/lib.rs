@@ -173,8 +173,8 @@ use clog::{FileClogService, TruncateStats};
 use executor::{ExecutionOutput, ExecutionResult, Executor, SimpleExecutor};
 use sql::Parser;
 use tablet::{
-    GlobalLogGcBoundary, IlogService, IlogTruncateStats, LsmEngine, LsmRecovery,
-    RoutedTabletStorage, TabletId, TabletManager,
+    route_index_to_tablet, route_table_to_tablet, GlobalLogGcBoundary, IlogService,
+    IlogTruncateStats, LsmEngine, LsmRecovery, RoutedTabletStorage, TabletId, TabletManager,
 };
 use transaction::{ConcurrencyManager, TransactionService};
 use tso::LocalTso;
@@ -457,31 +457,32 @@ impl Database {
         {
             use inner_table::catalog_loader::load_catalog;
             let (cache, _) = load_catalog(txn_service.as_ref())?;
-            let discovered = tablet_manager.register_catalog_inventory(&cache)?;
-            log_info!(
-                "Tablet inventory prepared: mounted={}, desired={}, recovered_non_system={}",
-                tablet_manager.all_tablets().len(),
-                discovered.len(),
-                mounted_recovered
-            );
-            let mounted: std::collections::BTreeSet<_> = tablet_manager
-                .all_tablets()
-                .into_iter()
-                .map(|(tablet_id, _)| tablet_id)
-                .collect();
-            let unmounted_non_system: Vec<_> = tablet_manager
-                .desired_tablets()
-                .into_iter()
-                .filter(|tablet_id| *tablet_id != TabletId::System && !mounted.contains(tablet_id))
-                .collect();
-            if !unmounted_non_system.is_empty() {
-                let sample: Vec<_> = unmounted_non_system.iter().copied().take(8).collect();
-                log_warn!(
-                    "Phase-4 startup: {} desired non-system tablets have no mounted local state yet; non-system replay conservatively falls back to system tablet for historical keys (sample={:?})",
-                    unmounted_non_system.len(),
-                    sample
-                );
+            let desired = tablet_manager.register_catalog_inventory(&cache)?;
+
+            let mut mounted_from_catalog = 0usize;
+            for tablet_id in tablet_manager.desired_tablets() {
+                if tablet_id == TabletId::System || tablet_manager.get_tablet(tablet_id).is_some() {
+                    continue;
+                }
+                let recovered = LsmRecovery::recover_tablet(
+                    &tablet_manager.tablet_dir(tablet_id),
+                    Arc::clone(&recovery.lsn_provider),
+                    Arc::clone(&recovery.io_service),
+                    io_runtime.handle(),
+                )?;
+                max_commit_ts = max_commit_ts.max(recovered.max_ts_from_ssts);
+                recovery.stats.orphan_ssts_cleaned += recovered.orphan_ssts_cleaned;
+                tablet_manager.insert_tablet(tablet_id, Arc::new(recovered.engine))?;
+                mounted_from_catalog += 1;
             }
+
+            log_info!(
+                "Tablet inventory prepared: mounted={}, desired={}, recovered_non_system={}, mounted_from_catalog={}",
+                tablet_manager.all_tablets().len(),
+                desired.len(),
+                mounted_recovered,
+                mounted_from_catalog
+            );
         }
 
         // Stage-B replay: transactions touching non-system keyspace.
@@ -527,27 +528,30 @@ impl Database {
         log_info!("Background runtime created with 2 threads");
         tablet_manager.bind_background_runtime(bg_runtime.handle())?;
 
-        // Load pending GC tasks from inner tables and register with storage engine
+        // Create session registry and wire GC safe point.
+        let session_registry = Arc::new(session::SessionRegistry::new());
+        let gc_safe_point_updater: Arc<dyn Fn() -> u64 + Send + Sync> = {
+            let registry = Arc::clone(&session_registry);
+            let txn_svc = Arc::clone(&txn_service);
+            Arc::new(move || -> u64 {
+                match registry.min_start_ts() {
+                    Some(min_ts) if min_ts > 0 => min_ts - 1,
+                    _ => txn_svc.tso().get_ts(),
+                }
+            })
+        };
+
+        // Set initial GC safe point from TSO and keep compaction GC pinned to
+        // active explicit readers.
+        storage.set_gc_safe_point(tso.get_ts());
+        storage.set_gc_safe_point_updater(Arc::clone(&gc_safe_point_updater));
+
+        // Load pending GC tasks from inner tables (for observability).
         {
             use inner_table::catalog_loader::load_gc_tasks;
             match load_gc_tasks(txn_service.as_ref()) {
                 Ok(tasks) => {
-                    let mut pending_count = 0u32;
-                    for task in tasks {
-                        if task.status == "done" {
-                            continue;
-                        }
-                        if task.drop_commit_ts > 0 {
-                            storage.add_dropped_table(task.table_id, task.drop_commit_ts);
-                            pending_count += 1;
-                        } else {
-                            // drop_commit_ts=0 means the commit happened but the
-                            // follow-up update didn't complete. Use TSO as upper bound.
-                            let ts = tso.get_ts();
-                            storage.add_dropped_table(task.table_id, ts);
-                            pending_count += 1;
-                        }
-                    }
+                    let pending_count = tasks.iter().filter(|task| task.status != "done").count();
                     if pending_count > 0 {
                         log_info!("Recovered {} pending GC delete-range tasks", pending_count);
                     }
@@ -559,8 +563,11 @@ impl Database {
         }
 
         // Start background GC worker for drop-table cleanup
-        let gc_worker =
-            inner_table::gc_worker::GcWorker::new(Arc::clone(&storage), Arc::clone(&txn_service));
+        let gc_worker = inner_table::gc_worker::GcWorker::new(
+            Arc::clone(&tablet_manager),
+            Arc::clone(&txn_service),
+            Arc::clone(&gc_safe_point_updater),
+        );
         gc_worker.start(bg_runtime.handle());
 
         // Create dedicated worker runtime for query execution.
@@ -582,25 +589,6 @@ impl Database {
         );
 
         log_info!("Worker runtime created with {} threads", worker_threads);
-
-        // Create session registry and wire GC safe point
-        let session_registry = Arc::new(session::SessionRegistry::new());
-
-        // Set initial GC safe point from TSO
-        let initial_gc_ts = tso.get_ts();
-        storage.set_gc_safe_point(initial_gc_ts);
-
-        // Wire GC safe point updater: computes safe_point from active sessions
-        {
-            let registry = Arc::clone(&session_registry);
-            let txn_svc = Arc::clone(&txn_service);
-            storage.set_gc_safe_point_updater(Arc::new(move || -> u64 {
-                match registry.min_start_ts() {
-                    Some(min_ts) if min_ts > 0 => min_ts - 1,
-                    _ => txn_svc.last_ts(),
-                }
-            }));
-        }
 
         Ok(Self {
             parser: Parser::new(),
@@ -644,6 +632,40 @@ impl Database {
     /// Get the session registry for tracking active transactions.
     pub fn session_registry(&self) -> &Arc<session::SessionRegistry> {
         &self.session_registry
+    }
+
+    /// Trigger one immediate GC-worker wake-up.
+    pub fn notify_gc_worker(&self) {
+        self.gc_worker.notify();
+    }
+
+    fn mount_tablet_if_needed(&self, tablet_id: TabletId) -> Result<()> {
+        if tablet_id == TabletId::System || self.tablet_manager.get_tablet(tablet_id).is_some() {
+            return Ok(());
+        }
+
+        let io_rt = self.io_runtime.as_ref().ok_or_else(|| {
+            util::error::TiSqlError::Internal(
+                "I/O runtime not available while mounting tablet".to_string(),
+            )
+        })?;
+        let recovered = LsmRecovery::recover_tablet(
+            &self.tablet_manager.tablet_dir(tablet_id),
+            self.tablet_manager.shared_lsn_provider(),
+            Arc::clone(self.storage.io_service()),
+            io_rt.handle(),
+        )?;
+        self.tablet_manager
+            .insert_tablet(tablet_id, Arc::new(recovered.engine))?;
+        Ok(())
+    }
+
+    fn mount_table_tablet_if_needed(&self, table_id: u64) -> Result<()> {
+        self.mount_tablet_if_needed(route_table_to_tablet(table_id))
+    }
+
+    fn mount_index_tablet_if_needed(&self, table_id: u64, index_id: u64) -> Result<()> {
+        self.mount_tablet_if_needed(route_index_to_tablet(table_id, index_id))
     }
 
     // ========================================================================
@@ -881,7 +903,7 @@ impl Database {
         exec_ctx: &session::ExecutionCtx,
         txn_ctx: Option<transaction::TxnCtx>,
     ) -> (Result<ExecutionOutput>, Option<transaction::TxnCtx>) {
-        let (output, ctx) = self
+        let (mut output, ctx) = self
             .executor
             .execute_unified(
                 plan,
@@ -892,14 +914,22 @@ impl Database {
             )
             .await;
 
-        if let Ok(ExecutionOutput::OkWithEffect(executor::DdlEffect::TableDropped {
-            table_id,
-            commit_ts,
-        })) = &output
-        {
-            // Intercept DDL effects to register dropped tables for GC.
-            self.storage.add_dropped_table(*table_id, *commit_ts);
-            self.gc_worker.notify();
+        if let Ok(ExecutionOutput::OkWithEffect(effect)) = &output {
+            let post_effect = match effect {
+                executor::DdlEffect::TableCreated { table_id } => {
+                    self.mount_table_tablet_if_needed(*table_id)
+                }
+                executor::DdlEffect::IndexCreated { table_id, index_id } => {
+                    self.mount_index_tablet_if_needed(*table_id, *index_id)
+                }
+                executor::DdlEffect::TableDropped | executor::DdlEffect::IndexDropped => {
+                    self.gc_worker.notify();
+                    Ok(())
+                }
+            };
+            if let Err(e) = post_effect {
+                output = Err(e);
+            }
         }
 
         (output, ctx)
@@ -1477,8 +1507,8 @@ mod tests {
             "catalog-derived user table should be present in desired inventory on reopen"
         );
         assert!(
-            db.tablet_manager.get_tablet(user_tablet).is_none(),
-            "phase-2 keeps user tablets unmounted (directory inventory only)"
+            db.tablet_manager.get_tablet(user_tablet).is_some(),
+            "reopen should mount catalog-derived user tablet at runtime"
         );
     }
 
@@ -1506,8 +1536,8 @@ mod tests {
         let desired = db.tablet_manager.desired_tablets();
         assert!(desired.contains(&table_tablet));
         assert!(desired.contains(&index_tablet));
-        assert!(db.tablet_manager.get_tablet(table_tablet).is_none());
-        assert!(db.tablet_manager.get_tablet(index_tablet).is_none());
+        assert!(db.tablet_manager.get_tablet(table_tablet).is_some());
+        assert!(db.tablet_manager.get_tablet(index_tablet).is_some());
     }
 
     #[tokio::test]
@@ -2640,7 +2670,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_drop_table_gc_not_done_while_data_still_in_memtable() {
+    async fn test_drop_table_gc_waits_for_safe_point_pin() {
         let (db, _dir) = create_test_db();
 
         db.execute_query("CREATE TABLE gc_pending (id INT PRIMARY KEY, val INT)")
@@ -2649,15 +2679,17 @@ mod tests {
         db.execute_query("INSERT INTO gc_pending VALUES (1, 10), (2, 20), (3, 30)")
             .await
             .unwrap();
+        let table_id = table_id_by_name(&db, "gc_pending");
+        let tablet_id = TabletId::Table { table_id };
+        let tablet_dir = db.tablet_manager().tablet_dir(tablet_id);
+        assert!(tablet_dir.exists());
 
-        // Make the task immediately eligible. The regression is about overlap checks,
-        // not safe-point timing.
-        db.storage.set_gc_safe_point(u64::MAX);
+        // Pin safe point to 0 so drop GC cannot retire the tablet yet.
+        db.session_registry().register(99, 1);
 
         db.execute_query("DROP TABLE gc_pending").await.unwrap();
 
-        // Keep waking the worker; status should remain pending until memtable data
-        // is flushed/compacted away.
+        // Keep waking the worker; task should stay pending while pinned.
         let mut latest_status: Option<String> = None;
         for _ in 0..30 {
             db.gc_worker.notify();
@@ -2666,17 +2698,27 @@ mod tests {
             let tasks = load_gc_tasks(db.txn_service.as_ref()).unwrap();
             if let Some(task) = tasks.first() {
                 latest_status = Some(task.status.clone());
-                if task.status == "done" {
-                    break;
-                }
             }
         }
 
         let status = latest_status.expect("expected at least one gc task row");
         assert_eq!(
             status, "pending",
-            "GC task should stay pending while dropped-table keys are still in memtables"
+            "GC task should stay pending while safe point is pinned"
         );
+        assert!(tablet_dir.exists());
+        assert!(db.tablet_manager().get_tablet(tablet_id).is_some());
+
+        db.session_registry().unregister(99);
+        for _ in 0..100 {
+            db.gc_worker.notify();
+            sleep(Duration::from_millis(20)).await;
+            if !tablet_dir.exists() {
+                break;
+            }
+        }
+        assert!(!tablet_dir.exists());
+        assert!(db.tablet_manager().get_tablet(tablet_id).is_none());
     }
 
     #[tokio::test]
