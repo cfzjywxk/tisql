@@ -1637,6 +1637,510 @@ mod tests {
         db.txn_service.rollback(txn3).unwrap();
     }
 
+    // ==================== Phase-3 QA Tests ====================
+
+    /// T3.5a (QA): Cross-tablet commit via TxnService API (not SQL).
+    /// Two user tablets, explicit txn writes to both, commit → both visible.
+    #[tokio::test]
+    async fn test_qa_phase3_cross_tablet_commit_via_txn_api() {
+        let dir = tempdir().unwrap();
+        let db = Database::open(DatabaseConfig::with_data_dir(dir.path())).unwrap();
+
+        db.execute_query("CREATE TABLE qa_t1 (id INT PRIMARY KEY, v INT)")
+            .await
+            .unwrap();
+        db.execute_query("CREATE TABLE qa_t2 (id INT PRIMARY KEY, v INT)")
+            .await
+            .unwrap();
+
+        let table1 = table_id_by_name(&db, "qa_t1");
+        let table2 = table_id_by_name(&db, "qa_t2");
+        mount_user_tablet(&db, table1);
+        mount_user_tablet(&db, table2);
+
+        let key1 = table_int_pk_key(table1, 1);
+        let key2 = table_int_pk_key(table2, 1);
+
+        let mut ctx = db.txn_service.begin_explicit(false).unwrap();
+        db.txn_service
+            .put_on_table(&mut ctx, table1, key1.clone(), b"t1_val".to_vec())
+            .await
+            .unwrap();
+        db.txn_service
+            .put_on_table(&mut ctx, table2, key2.clone(), b"t2_val".to_vec())
+            .await
+            .unwrap();
+        db.txn_service.commit(ctx).await.unwrap();
+
+        // Both values visible to a new reader
+        let reader = db.txn_service.begin(true).unwrap();
+        assert_eq!(
+            db.txn_service
+                .get_on_table(&reader, table1, &key1)
+                .await
+                .unwrap(),
+            Some(b"t1_val".to_vec())
+        );
+        assert_eq!(
+            db.txn_service
+                .get_on_table(&reader, table2, &key2)
+                .await
+                .unwrap(),
+            Some(b"t2_val".to_vec())
+        );
+
+        // Verify data landed on correct tablets (not system)
+        let system = db.tablet_manager().system_tablet();
+        let tablet1 = db
+            .tablet_manager()
+            .get_tablet(TabletId::Table { table_id: table1 })
+            .unwrap();
+        let tablet2 = db
+            .tablet_manager()
+            .get_tablet(TabletId::Table { table_id: table2 })
+            .unwrap();
+        assert!(tablet_has_table_entries(&tablet1, table1));
+        assert!(tablet_has_table_entries(&tablet2, table2));
+        assert!(!tablet_has_table_entries(&system, table1));
+        assert!(!tablet_has_table_entries(&system, table2));
+    }
+
+    /// T3.5b (QA): Cross-tablet rollback via TxnService API.
+    /// Explicit txn writes to both tablets, rollback → neither visible.
+    #[tokio::test]
+    async fn test_qa_phase3_cross_tablet_rollback_via_txn_api() {
+        let dir = tempdir().unwrap();
+        let db = Database::open(DatabaseConfig::with_data_dir(dir.path())).unwrap();
+
+        db.execute_query("CREATE TABLE qa_rb_t1 (id INT PRIMARY KEY, v INT)")
+            .await
+            .unwrap();
+        db.execute_query("CREATE TABLE qa_rb_t2 (id INT PRIMARY KEY, v INT)")
+            .await
+            .unwrap();
+
+        let table1 = table_id_by_name(&db, "qa_rb_t1");
+        let table2 = table_id_by_name(&db, "qa_rb_t2");
+        mount_user_tablet(&db, table1);
+        mount_user_tablet(&db, table2);
+
+        let key1 = table_int_pk_key(table1, 1);
+        let key2 = table_int_pk_key(table2, 1);
+
+        let mut ctx = db.txn_service.begin_explicit(false).unwrap();
+        db.txn_service
+            .put_on_table(&mut ctx, table1, key1.clone(), b"rb_v1".to_vec())
+            .await
+            .unwrap();
+        db.txn_service
+            .put_on_table(&mut ctx, table2, key2.clone(), b"rb_v2".to_vec())
+            .await
+            .unwrap();
+        db.txn_service.rollback(ctx).unwrap();
+
+        // Neither value visible to new reader
+        let reader = db.txn_service.begin(true).unwrap();
+        assert_eq!(
+            db.txn_service
+                .get_on_table(&reader, table1, &key1)
+                .await
+                .unwrap(),
+            None,
+            "rolled-back key on tablet1 should not be visible"
+        );
+        assert_eq!(
+            db.txn_service
+                .get_on_table(&reader, table2, &key2)
+                .await
+                .unwrap(),
+            None,
+            "rolled-back key on tablet2 should not be visible"
+        );
+
+        // Tablets should have no entries for these tables
+        let tablet1 = db
+            .tablet_manager()
+            .get_tablet(TabletId::Table { table_id: table1 })
+            .unwrap();
+        let tablet2 = db
+            .tablet_manager()
+            .get_tablet(TabletId::Table { table_id: table2 })
+            .unwrap();
+        assert!(!tablet_has_table_entries(&tablet1, table1));
+        assert!(!tablet_has_table_entries(&tablet2, table2));
+    }
+
+    /// T3.5c (QA): Read-your-writes within an explicit cross-tablet txn.
+    /// Write to t1 and t2, read both back within the same explicit txn.
+    #[tokio::test]
+    async fn test_qa_phase3_cross_tablet_read_your_writes() {
+        let dir = tempdir().unwrap();
+        let db = Database::open(DatabaseConfig::with_data_dir(dir.path())).unwrap();
+
+        db.execute_query("CREATE TABLE qa_ryw_t1 (id INT PRIMARY KEY, v INT)")
+            .await
+            .unwrap();
+        db.execute_query("CREATE TABLE qa_ryw_t2 (id INT PRIMARY KEY, v INT)")
+            .await
+            .unwrap();
+
+        let table1 = table_id_by_name(&db, "qa_ryw_t1");
+        let table2 = table_id_by_name(&db, "qa_ryw_t2");
+        mount_user_tablet(&db, table1);
+        mount_user_tablet(&db, table2);
+
+        let key1 = table_int_pk_key(table1, 1);
+        let key2 = table_int_pk_key(table2, 1);
+
+        let mut ctx = db.txn_service.begin_explicit(false).unwrap();
+        db.txn_service
+            .put_on_table(&mut ctx, table1, key1.clone(), b"ryw_v1".to_vec())
+            .await
+            .unwrap();
+        db.txn_service
+            .put_on_table(&mut ctx, table2, key2.clone(), b"ryw_v2".to_vec())
+            .await
+            .unwrap();
+
+        // Read own writes BEFORE commit — should see pending data
+        let val1 = db
+            .txn_service
+            .get_on_table(&ctx, table1, &key1)
+            .await
+            .unwrap();
+        let val2 = db
+            .txn_service
+            .get_on_table(&ctx, table2, &key2)
+            .await
+            .unwrap();
+
+        assert_eq!(
+            val1,
+            Some(b"ryw_v1".to_vec()),
+            "explicit txn should see own pending write on tablet1"
+        );
+        assert_eq!(
+            val2,
+            Some(b"ryw_v2".to_vec()),
+            "explicit txn should see own pending write on tablet2"
+        );
+
+        db.txn_service.rollback(ctx).unwrap();
+    }
+
+    /// T3.5d (QA): Cross-tablet snapshot isolation via TxnService API.
+    /// Writer commits to t1+t2; reader-before sees neither; reader-after sees both.
+    #[tokio::test]
+    async fn test_qa_phase3_cross_tablet_snapshot_isolation_api() {
+        let dir = tempdir().unwrap();
+        let db = Database::open(DatabaseConfig::with_data_dir(dir.path())).unwrap();
+
+        db.execute_query("CREATE TABLE qa_si_t1 (id INT PRIMARY KEY, v INT)")
+            .await
+            .unwrap();
+        db.execute_query("CREATE TABLE qa_si_t2 (id INT PRIMARY KEY, v INT)")
+            .await
+            .unwrap();
+
+        let table1 = table_id_by_name(&db, "qa_si_t1");
+        let table2 = table_id_by_name(&db, "qa_si_t2");
+        mount_user_tablet(&db, table1);
+        mount_user_tablet(&db, table2);
+
+        let key1 = table_int_pk_key(table1, 1);
+        let key2 = table_int_pk_key(table2, 1);
+
+        // Writer txn
+        let mut writer = db.txn_service.begin_explicit(false).unwrap();
+        db.txn_service
+            .put_on_table(&mut writer, table1, key1.clone(), b"si_v1".to_vec())
+            .await
+            .unwrap();
+        db.txn_service
+            .put_on_table(&mut writer, table2, key2.clone(), b"si_v2".to_vec())
+            .await
+            .unwrap();
+
+        // Reader-before: snapshot taken before commit
+        let reader_before = db.txn_service.begin(true).unwrap();
+
+        db.txn_service.commit(writer).await.unwrap();
+
+        // Reader-before sees neither (snapshot isolation)
+        assert_eq!(
+            db.txn_service
+                .get_on_table(&reader_before, table1, &key1)
+                .await
+                .unwrap(),
+            None,
+            "reader-before should not see committed data on tablet1"
+        );
+        assert_eq!(
+            db.txn_service
+                .get_on_table(&reader_before, table2, &key2)
+                .await
+                .unwrap(),
+            None,
+            "reader-before should not see committed data on tablet2"
+        );
+
+        // Reader-after sees both
+        let reader_after = db.txn_service.begin(true).unwrap();
+        assert_eq!(
+            db.txn_service
+                .get_on_table(&reader_after, table1, &key1)
+                .await
+                .unwrap(),
+            Some(b"si_v1".to_vec()),
+        );
+        assert_eq!(
+            db.txn_service
+                .get_on_table(&reader_after, table2, &key2)
+                .await
+                .unwrap(),
+            Some(b"si_v2".to_vec()),
+        );
+    }
+
+    /// T3.4d (QA): finalize tracks clog_lsn on EVERY touched tablet's memtable.
+    /// Verify via min_unflushed_lsn on each tablet.
+    #[tokio::test]
+    async fn test_qa_phase3_finalize_tracks_clog_lsn_on_every_tablet() {
+        let dir = tempdir().unwrap();
+        let db = Database::open(DatabaseConfig::with_data_dir(dir.path())).unwrap();
+
+        db.execute_query("CREATE TABLE qa_lsn_t1 (id INT PRIMARY KEY, v INT)")
+            .await
+            .unwrap();
+        db.execute_query("CREATE TABLE qa_lsn_t2 (id INT PRIMARY KEY, v INT)")
+            .await
+            .unwrap();
+
+        let table1 = table_id_by_name(&db, "qa_lsn_t1");
+        let table2 = table_id_by_name(&db, "qa_lsn_t2");
+        mount_user_tablet(&db, table1);
+        mount_user_tablet(&db, table2);
+
+        let key1 = table_int_pk_key(table1, 1);
+        let key2 = table_int_pk_key(table2, 1);
+
+        let mut ctx = db.txn_service.begin_explicit(false).unwrap();
+        db.txn_service
+            .put_on_table(&mut ctx, table1, key1.clone(), b"lsn_v1".to_vec())
+            .await
+            .unwrap();
+        db.txn_service
+            .put_on_table(&mut ctx, table2, key2.clone(), b"lsn_v2".to_vec())
+            .await
+            .unwrap();
+        let info = db.txn_service.commit(ctx).await.unwrap();
+
+        let tablet1 = db
+            .tablet_manager()
+            .get_tablet(TabletId::Table { table_id: table1 })
+            .unwrap();
+        let tablet2 = db
+            .tablet_manager()
+            .get_tablet(TabletId::Table { table_id: table2 })
+            .unwrap();
+
+        // Both tablets should have min_unflushed_lsn equal to the commit LSN
+        let lsn1 = tablet1.min_unflushed_lsn();
+        let lsn2 = tablet2.min_unflushed_lsn();
+        assert!(
+            lsn1.is_some(),
+            "tablet1 should have unflushed LSN after commit"
+        );
+        assert!(
+            lsn2.is_some(),
+            "tablet2 should have unflushed LSN after commit"
+        );
+        assert_eq!(
+            lsn1.unwrap(),
+            info.lsn,
+            "tablet1's min_unflushed_lsn should match commit LSN"
+        );
+        assert_eq!(
+            lsn2.unwrap(),
+            info.lsn,
+            "tablet2's min_unflushed_lsn should match commit LSN"
+        );
+    }
+
+    /// T3.6b (QA): Reservation is released only after all tablets finalized.
+    /// Check that no reservation is active after a successful cross-tablet commit.
+    #[tokio::test]
+    async fn test_qa_phase3_reservation_released_after_commit() {
+        let dir = tempdir().unwrap();
+        let db = Database::open(DatabaseConfig::with_data_dir(dir.path())).unwrap();
+
+        db.execute_query("CREATE TABLE qa_res_t1 (id INT PRIMARY KEY, v INT)")
+            .await
+            .unwrap();
+        db.execute_query("CREATE TABLE qa_res_t2 (id INT PRIMARY KEY, v INT)")
+            .await
+            .unwrap();
+
+        let table1 = table_id_by_name(&db, "qa_res_t1");
+        let table2 = table_id_by_name(&db, "qa_res_t2");
+        mount_user_tablet(&db, table1);
+        mount_user_tablet(&db, table2);
+
+        // Verify no reservation before
+        let stats_before = db.tablet_manager().commit_reservation_stats();
+        let active_before = stats_before.active;
+
+        let key1 = table_int_pk_key(table1, 1);
+        let key2 = table_int_pk_key(table2, 1);
+
+        let mut ctx = db.txn_service.begin_explicit(false).unwrap();
+        db.txn_service
+            .put_on_table(&mut ctx, table1, key1, b"r_v1".to_vec())
+            .await
+            .unwrap();
+        db.txn_service
+            .put_on_table(&mut ctx, table2, key2, b"r_v2".to_vec())
+            .await
+            .unwrap();
+        db.txn_service.commit(ctx).await.unwrap();
+
+        // After commit, reservation should be released
+        let stats_after = db.tablet_manager().commit_reservation_stats();
+        assert_eq!(
+            stats_after.active, active_before,
+            "reservation should be released after successful cross-tablet commit"
+        );
+        assert!(
+            stats_after.total_allocated > stats_before.total_allocated,
+            "should have allocated at least one reservation"
+        );
+        assert_eq!(
+            stats_after.total_allocated - stats_before.total_allocated,
+            stats_after.total_released - stats_before.total_released,
+            "alloc count should equal release count after commit"
+        );
+    }
+
+    /// T3.5 (QA): mutation_tablets properly records tablet routing from put_on_table.
+    /// After writes via put_on_table, the commit path should use grouped operations.
+    #[tokio::test]
+    async fn test_qa_phase3_mutation_tablets_recording() {
+        let dir = tempdir().unwrap();
+        let db = Database::open(DatabaseConfig::with_data_dir(dir.path())).unwrap();
+
+        db.execute_query("CREATE TABLE qa_mt_t1 (id INT PRIMARY KEY, v INT)")
+            .await
+            .unwrap();
+        db.execute_query("CREATE TABLE qa_mt_t2 (id INT PRIMARY KEY, v INT)")
+            .await
+            .unwrap();
+
+        let table1 = table_id_by_name(&db, "qa_mt_t1");
+        let table2 = table_id_by_name(&db, "qa_mt_t2");
+        mount_user_tablet(&db, table1);
+        mount_user_tablet(&db, table2);
+
+        let key1 = table_int_pk_key(table1, 1);
+        let key2 = table_int_pk_key(table2, 1);
+
+        // Multiple writes to same table — should all share same tablet
+        let key1b = table_int_pk_key(table1, 2);
+
+        let mut ctx = db.txn_service.begin_explicit(false).unwrap();
+        db.txn_service
+            .put_on_table(&mut ctx, table1, key1.clone(), b"mv1".to_vec())
+            .await
+            .unwrap();
+        db.txn_service
+            .put_on_table(&mut ctx, table1, key1b.clone(), b"mv1b".to_vec())
+            .await
+            .unwrap();
+        db.txn_service
+            .put_on_table(&mut ctx, table2, key2.clone(), b"mv2".to_vec())
+            .await
+            .unwrap();
+
+        // Verify mutation_tablets has entries for all keys
+        assert_eq!(ctx.mutation_tablets.len(), 3);
+        assert_eq!(
+            ctx.mutation_tablets.get(&key1).copied(),
+            Some(TabletId::Table { table_id: table1 })
+        );
+        assert_eq!(
+            ctx.mutation_tablets.get(&key1b).copied(),
+            Some(TabletId::Table { table_id: table1 })
+        );
+        assert_eq!(
+            ctx.mutation_tablets.get(&key2).copied(),
+            Some(TabletId::Table { table_id: table2 })
+        );
+
+        db.txn_service.commit(ctx).await.unwrap();
+    }
+
+    /// T3.3 (QA): SQL scan routes correctly — cross-table SELECT sees isolated data.
+    #[tokio::test]
+    async fn test_qa_phase3_sql_scan_isolation_across_tablets() {
+        let dir = tempdir().unwrap();
+        let db = Database::open(DatabaseConfig::with_data_dir(dir.path())).unwrap();
+
+        db.execute_query("CREATE TABLE qa_scan_a (id INT PRIMARY KEY, v INT)")
+            .await
+            .unwrap();
+        db.execute_query("CREATE TABLE qa_scan_b (id INT PRIMARY KEY, v INT)")
+            .await
+            .unwrap();
+
+        let table_a = table_id_by_name(&db, "qa_scan_a");
+        let table_b = table_id_by_name(&db, "qa_scan_b");
+        mount_user_tablet(&db, table_a);
+        mount_user_tablet(&db, table_b);
+
+        // Insert into both tables
+        db.execute_query("INSERT INTO qa_scan_a VALUES (1, 100), (2, 200)")
+            .await
+            .unwrap();
+        db.execute_query("INSERT INTO qa_scan_b VALUES (1, 300), (2, 400), (3, 500)")
+            .await
+            .unwrap();
+
+        // Verify each table scan returns only its own data
+        match db
+            .execute_query("SELECT id, v FROM qa_scan_a")
+            .await
+            .unwrap()
+        {
+            QueryResult::Rows { data, .. } => {
+                assert_eq!(data.len(), 2, "qa_scan_a should have exactly 2 rows");
+            }
+            other => panic!("expected rows for qa_scan_a, got {other:?}"),
+        }
+        match db
+            .execute_query("SELECT id, v FROM qa_scan_b")
+            .await
+            .unwrap()
+        {
+            QueryResult::Rows { data, .. } => {
+                assert_eq!(data.len(), 3, "qa_scan_b should have exactly 3 rows");
+            }
+            other => panic!("expected rows for qa_scan_b, got {other:?}"),
+        }
+
+        // Verify data is on correct tablets
+        let tablet_a = db
+            .tablet_manager()
+            .get_tablet(TabletId::Table { table_id: table_a })
+            .unwrap();
+        let tablet_b = db
+            .tablet_manager()
+            .get_tablet(TabletId::Table { table_id: table_b })
+            .unwrap();
+        assert!(tablet_has_table_entries(&tablet_a, table_a));
+        assert!(tablet_has_table_entries(&tablet_b, table_b));
+        assert!(!tablet_has_table_entries(&tablet_a, table_b));
+        assert!(!tablet_has_table_entries(&tablet_b, table_a));
+    }
+
     #[tokio::test]
     async fn test_drop_table_gc_not_done_while_data_still_in_memtable() {
         let (db, _dir) = create_test_db();

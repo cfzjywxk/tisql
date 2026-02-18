@@ -658,4 +658,418 @@ mod tests {
         assert_eq!(storage.release_commit_lsn(701), Some(lsn));
         assert!(!storage.is_commit_lsn_reserved(701, lsn));
     }
+
+    // ==================== Phase-3 QA Tests ====================
+
+    /// T3.2b: Batch with keys from two user tables → 2 sub-batches, each
+    /// routed to its own tablet (no system tablet involved).
+    #[test]
+    fn test_qa_split_batch_two_user_tables() {
+        let dir = TempDir::new().unwrap();
+        let system = open_tablet(&dir.path().join("system_engine"));
+        let lsn = new_lsn_provider();
+        let manager = Arc::new(
+            TabletManager::new(dir.path(), Arc::clone(&lsn), Arc::clone(&system)).unwrap(),
+        );
+
+        let tid_a = TabletId::Table {
+            table_id: USER_TABLE_ID_START,
+        };
+        let tid_b = TabletId::Table {
+            table_id: USER_TABLE_ID_START + 1,
+        };
+        let tablet_a = open_tablet(&manager.tablet_dir(tid_a));
+        let tablet_b = open_tablet(&manager.tablet_dir(tid_b));
+        manager.insert_tablet(tid_a, Arc::clone(&tablet_a)).unwrap();
+        manager.insert_tablet(tid_b, Arc::clone(&tablet_b)).unwrap();
+
+        let storage = RoutedTabletStorage::new(Arc::clone(&manager));
+
+        let key_a = encode_record_key_with_handle(USER_TABLE_ID_START, 1);
+        let key_b = encode_record_key_with_handle(USER_TABLE_ID_START + 1, 2);
+
+        let mut batch = WriteBatch::new();
+        batch.put(key_a.clone(), b"va".to_vec());
+        batch.put(key_b.clone(), b"vb".to_vec());
+        batch.set_commit_ts(50);
+
+        let groups = storage.split_write_batch_by_tablet(batch);
+        // Two user tablets, no system tablet
+        assert_eq!(groups.len(), 2, "should split into exactly 2 sub-batches");
+        assert!(!groups.contains_key(&TabletId::System));
+        assert!(groups.contains_key(&tid_a));
+        assert!(groups.contains_key(&tid_b));
+        assert_eq!(groups[&tid_a].len(), 1);
+        assert_eq!(groups[&tid_b].len(), 1);
+    }
+
+    /// T3.2e: Empty batch → no sub-batches.
+    #[test]
+    fn test_qa_split_batch_empty() {
+        let dir = TempDir::new().unwrap();
+        let system = open_tablet(&dir.path().join("system_engine"));
+        let manager = Arc::new(
+            TabletManager::new(dir.path(), new_lsn_provider(), Arc::clone(&system)).unwrap(),
+        );
+        let storage = RoutedTabletStorage::new(Arc::clone(&manager));
+
+        let batch = WriteBatch::new();
+        let groups = storage.split_write_batch_by_tablet(batch);
+        assert!(
+            groups.is_empty(),
+            "empty batch should produce zero sub-batches"
+        );
+    }
+
+    /// T3.2d: Split preserves Delete ops (not just Puts).
+    #[test]
+    fn test_qa_split_batch_preserves_delete_ops() {
+        let dir = TempDir::new().unwrap();
+        let system = open_tablet(&dir.path().join("system_engine"));
+        let lsn = new_lsn_provider();
+        let manager = Arc::new(
+            TabletManager::new(dir.path(), Arc::clone(&lsn), Arc::clone(&system)).unwrap(),
+        );
+
+        let tid = TabletId::Table {
+            table_id: USER_TABLE_ID_START,
+        };
+        let tablet = open_tablet(&manager.tablet_dir(tid));
+        manager.insert_tablet(tid, tablet).unwrap();
+
+        let storage = RoutedTabletStorage::new(Arc::clone(&manager));
+
+        let key_put = encode_record_key_with_handle(USER_TABLE_ID_START, 1);
+        let key_del = encode_record_key_with_handle(USER_TABLE_ID_START, 2);
+
+        let mut batch = WriteBatch::new();
+        batch.put(key_put.clone(), b"v".to_vec());
+        batch.delete(key_del.clone());
+        batch.set_commit_ts(77);
+        batch.set_clog_lsn(88);
+
+        let groups = storage.split_write_batch_by_tablet(batch);
+        assert_eq!(groups.len(), 1);
+        let sub = &groups[&tid];
+        assert_eq!(sub.len(), 2);
+        assert!(matches!(sub.get(&key_put), Some(WriteOp::Put { .. })));
+        assert!(matches!(sub.get(&key_del), Some(WriteOp::Delete)));
+        assert_eq!(sub.commit_ts(), Some(77));
+        assert_eq!(sub.clog_lsn(), Some(88));
+    }
+
+    /// T3.3c: Write to two tablets, scan one → only that tablet's data visible.
+    #[test]
+    fn test_qa_scan_does_not_cross_tablets() {
+        let dir = TempDir::new().unwrap();
+        let system = open_tablet(&dir.path().join("system_engine"));
+        let lsn = new_lsn_provider();
+        let manager = Arc::new(
+            TabletManager::new(dir.path(), Arc::clone(&lsn), Arc::clone(&system)).unwrap(),
+        );
+
+        let tid_a = TabletId::Table {
+            table_id: USER_TABLE_ID_START,
+        };
+        let tid_b = TabletId::Table {
+            table_id: USER_TABLE_ID_START + 1,
+        };
+        let tablet_a = open_tablet(&manager.tablet_dir(tid_a));
+        let tablet_b = open_tablet(&manager.tablet_dir(tid_b));
+        manager.insert_tablet(tid_a, Arc::clone(&tablet_a)).unwrap();
+        manager.insert_tablet(tid_b, Arc::clone(&tablet_b)).unwrap();
+
+        let storage = RoutedTabletStorage::new(Arc::clone(&manager));
+
+        // Write to both tablets
+        let key_a = encode_record_key_with_handle(USER_TABLE_ID_START, 1);
+        let key_b = encode_record_key_with_handle(USER_TABLE_ID_START + 1, 1);
+
+        let mut batch_a = WriteBatch::new();
+        batch_a.put(key_a.clone(), b"data_a".to_vec());
+        batch_a.set_commit_ts(10);
+        tablet_a.write_batch(batch_a).unwrap();
+
+        let mut batch_b = WriteBatch::new();
+        batch_b.put(key_b.clone(), b"data_b".to_vec());
+        batch_b.set_commit_ts(10);
+        tablet_b.write_batch(batch_b).unwrap();
+
+        // Scan tablet A's range via RoutedTabletStorage
+        let start_a = encode_key(USER_TABLE_ID_START, &[]);
+        let end_a = encode_key(USER_TABLE_ID_START + 1, &[]);
+        let range_a = MvccKey::encode(&start_a, Timestamp::MAX)..MvccKey::encode(&end_a, 0);
+
+        let mut iter = storage.scan_iter(range_a, 0).unwrap();
+        let mut count = 0;
+        crate::io::block_on_sync(async {
+            iter.advance().await.unwrap();
+            while iter.valid() {
+                count += 1;
+                assert_eq!(
+                    iter.user_key(),
+                    key_a.as_slice(),
+                    "scan of tablet A should only see tablet A's keys"
+                );
+                iter.advance().await.unwrap();
+            }
+        });
+        assert_eq!(count, 1, "should see exactly 1 entry from tablet A");
+    }
+
+    /// T3.4a: put_pending routes by key — verify lock appears on correct tablet.
+    #[test]
+    fn test_qa_put_pending_routes_by_key() {
+        let dir = TempDir::new().unwrap();
+        let system = open_tablet(&dir.path().join("system_engine"));
+        let lsn = new_lsn_provider();
+        let manager = Arc::new(
+            TabletManager::new(dir.path(), Arc::clone(&lsn), Arc::clone(&system)).unwrap(),
+        );
+
+        let tid = TabletId::Table {
+            table_id: USER_TABLE_ID_START,
+        };
+        let tablet = open_tablet(&manager.tablet_dir(tid));
+        manager.insert_tablet(tid, Arc::clone(&tablet)).unwrap();
+
+        let storage = RoutedTabletStorage::new(Arc::clone(&manager));
+
+        let key = encode_record_key_with_handle(USER_TABLE_ID_START, 42);
+        let owner_ts = 100;
+        storage
+            .put_pending(&key, b"pending_v".to_vec(), owner_ts)
+            .unwrap();
+
+        // Lock is on user tablet, not system tablet
+        assert_eq!(tablet.get_lock_owner(&key), Some(owner_ts));
+        assert_eq!(system.get_lock_owner(&key), None);
+
+        // Cleanup
+        tablet.abort_pending(&[key], owner_ts);
+    }
+
+    /// T3.4b: delete_pending routes by key.
+    #[test]
+    fn test_qa_delete_pending_routes_by_key() {
+        let dir = TempDir::new().unwrap();
+        let system = open_tablet(&dir.path().join("system_engine"));
+        let lsn = new_lsn_provider();
+        let manager = Arc::new(
+            TabletManager::new(dir.path(), Arc::clone(&lsn), Arc::clone(&system)).unwrap(),
+        );
+
+        let tid = TabletId::Table {
+            table_id: USER_TABLE_ID_START,
+        };
+        let tablet = open_tablet(&manager.tablet_dir(tid));
+        manager.insert_tablet(tid, Arc::clone(&tablet)).unwrap();
+
+        let storage = RoutedTabletStorage::new(Arc::clone(&manager));
+
+        // First insert a committed value so delete_pending has something to delete
+        let key = encode_record_key_with_handle(USER_TABLE_ID_START, 55);
+        let mut batch = WriteBatch::new();
+        batch.put(key.clone(), b"existing".to_vec());
+        batch.set_commit_ts(10);
+        tablet.write_batch(batch).unwrap();
+
+        let owner_ts = 200;
+        let deleted = storage.delete_pending(&key, owner_ts).unwrap();
+        assert!(deleted, "delete_pending on existing key should return true");
+
+        // Lock is on user tablet
+        assert_eq!(tablet.get_lock_owner(&key), Some(owner_ts));
+        assert_eq!(system.get_lock_owner(&key), None);
+
+        // Cleanup
+        tablet.abort_pending(&[key], owner_ts);
+    }
+
+    /// T3.4f: Two txns lock same key on same tablet → LockConflict.
+    #[test]
+    fn test_qa_lock_conflict_same_tablet() {
+        let dir = TempDir::new().unwrap();
+        let system = open_tablet(&dir.path().join("system_engine"));
+        let lsn = new_lsn_provider();
+        let manager = Arc::new(
+            TabletManager::new(dir.path(), Arc::clone(&lsn), Arc::clone(&system)).unwrap(),
+        );
+
+        let tid = TabletId::Table {
+            table_id: USER_TABLE_ID_START,
+        };
+        let tablet = open_tablet(&manager.tablet_dir(tid));
+        manager.insert_tablet(tid, Arc::clone(&tablet)).unwrap();
+
+        let storage = RoutedTabletStorage::new(Arc::clone(&manager));
+
+        let key = encode_record_key_with_handle(USER_TABLE_ID_START, 1);
+        storage.put_pending(&key, b"v1".to_vec(), 100).unwrap();
+
+        let conflict = storage.put_pending(&key, b"v2".to_vec(), 200);
+        assert!(
+            matches!(
+                conflict,
+                Err(crate::tablet::PessimisticWriteError::LockConflict(100))
+            ),
+            "second put_pending on same key should conflict, got {conflict:?}"
+        );
+
+        // Cleanup
+        tablet.abort_pending(&[key], 100);
+    }
+
+    /// T3.4g: Two txns lock different keys on different tablets → no conflict.
+    #[test]
+    fn test_qa_no_lock_conflict_different_tablets() {
+        let dir = TempDir::new().unwrap();
+        let system = open_tablet(&dir.path().join("system_engine"));
+        let lsn = new_lsn_provider();
+        let manager = Arc::new(
+            TabletManager::new(dir.path(), Arc::clone(&lsn), Arc::clone(&system)).unwrap(),
+        );
+
+        let tid_a = TabletId::Table {
+            table_id: USER_TABLE_ID_START,
+        };
+        let tid_b = TabletId::Table {
+            table_id: USER_TABLE_ID_START + 1,
+        };
+        let tablet_a = open_tablet(&manager.tablet_dir(tid_a));
+        let tablet_b = open_tablet(&manager.tablet_dir(tid_b));
+        manager.insert_tablet(tid_a, Arc::clone(&tablet_a)).unwrap();
+        manager.insert_tablet(tid_b, Arc::clone(&tablet_b)).unwrap();
+
+        let storage = RoutedTabletStorage::new(Arc::clone(&manager));
+
+        let key_a = encode_record_key_with_handle(USER_TABLE_ID_START, 1);
+        let key_b = encode_record_key_with_handle(USER_TABLE_ID_START + 1, 1);
+
+        // Different tablets → no conflict
+        storage.put_pending(&key_a, b"v_a".to_vec(), 100).unwrap();
+        storage.put_pending(&key_b, b"v_b".to_vec(), 200).unwrap();
+
+        assert_eq!(tablet_a.get_lock_owner(&key_a), Some(100));
+        assert_eq!(tablet_b.get_lock_owner(&key_b), Some(200));
+
+        // Cleanup
+        tablet_a.abort_pending(&[key_a], 100);
+        tablet_b.abort_pending(&[key_b], 200);
+    }
+
+    /// T3.3d: scan_iter with owner_ts reads pending writes from correct tablet.
+    #[test]
+    fn test_qa_scan_with_owner_ts_routes_correctly() {
+        let dir = TempDir::new().unwrap();
+        let system = open_tablet(&dir.path().join("system_engine"));
+        let lsn = new_lsn_provider();
+        let manager = Arc::new(
+            TabletManager::new(dir.path(), Arc::clone(&lsn), Arc::clone(&system)).unwrap(),
+        );
+
+        let tid = TabletId::Table {
+            table_id: USER_TABLE_ID_START,
+        };
+        let tablet = open_tablet(&manager.tablet_dir(tid));
+        manager.insert_tablet(tid, Arc::clone(&tablet)).unwrap();
+
+        let storage = RoutedTabletStorage::new(Arc::clone(&manager));
+
+        let key = encode_record_key_with_handle(USER_TABLE_ID_START, 7);
+        let owner_ts = 300;
+        storage
+            .put_pending(&key, b"pending_val".to_vec(), owner_ts)
+            .unwrap();
+
+        // Scan with owner_ts=300 should see the pending write
+        let start = encode_key(USER_TABLE_ID_START, &[]);
+        let end = encode_key(USER_TABLE_ID_START + 1, &[]);
+        let range = MvccKey::encode(&start, Timestamp::MAX)..MvccKey::encode(&end, 0);
+
+        let mut iter = storage.scan_iter(range, owner_ts).unwrap();
+        crate::io::block_on_sync(async {
+            iter.advance().await.unwrap();
+            assert!(
+                iter.valid(),
+                "pending write should be visible with owner_ts"
+            );
+            assert_eq!(iter.user_key(), key.as_slice());
+            assert_eq!(iter.value(), b"pending_val");
+        });
+
+        // Cleanup
+        tablet.abort_pending(&[key], owner_ts);
+    }
+
+    /// T3.6a: Reservation is global (one per txn, not per tablet).
+    /// Allocate+reserve once, verify it's visible through manager and both tablets,
+    /// but NOT on any individual tablet engine.
+    #[test]
+    fn test_qa_reservation_global_not_per_tablet() {
+        let dir = TempDir::new().unwrap();
+        let system = open_tablet(&dir.path().join("system_engine"));
+        let lsn = new_lsn_provider();
+        let manager = Arc::new(
+            TabletManager::new(dir.path(), Arc::clone(&lsn), Arc::clone(&system)).unwrap(),
+        );
+
+        let tid = TabletId::Table {
+            table_id: USER_TABLE_ID_START,
+        };
+        let tablet = open_tablet(&manager.tablet_dir(tid));
+        manager.insert_tablet(tid, Arc::clone(&tablet)).unwrap();
+
+        let storage = RoutedTabletStorage::new(Arc::clone(&manager));
+
+        let lsn_val = storage.alloc_and_reserve_commit_lsn(500);
+        // Visible through RoutedTabletStorage and TabletManager
+        assert!(storage.is_commit_lsn_reserved(500, lsn_val));
+        assert!(manager.is_commit_lsn_reserved(500, lsn_val));
+        // NOT on individual tablet engines
+        assert!(!system.is_commit_lsn_reserved(500, lsn_val));
+        assert!(!tablet.is_commit_lsn_reserved(500, lsn_val));
+
+        storage.release_commit_lsn(500);
+    }
+
+    /// T3.6c: Active reservation pins min_reserved_lsn on manager, preventing
+    /// boundary from advancing past it.
+    #[test]
+    fn test_qa_reservation_pins_min_reserved_lsn() {
+        let dir = TempDir::new().unwrap();
+        let system = open_tablet(&dir.path().join("system_engine"));
+        let lsn = new_lsn_provider();
+        let manager = Arc::new(
+            TabletManager::new(dir.path(), Arc::clone(&lsn), Arc::clone(&system)).unwrap(),
+        );
+
+        let storage = RoutedTabletStorage::new(Arc::clone(&manager));
+
+        assert_eq!(manager.min_reserved_lsn(), None, "no reservations yet");
+
+        let lsn1 = storage.alloc_and_reserve_commit_lsn(600);
+        let lsn2 = storage.alloc_and_reserve_commit_lsn(601);
+        assert!(lsn1 < lsn2);
+        assert_eq!(
+            manager.min_reserved_lsn(),
+            Some(lsn1),
+            "min_reserved should be first reservation"
+        );
+
+        // Release first → min advances
+        storage.release_commit_lsn(600);
+        assert_eq!(
+            manager.min_reserved_lsn(),
+            Some(lsn2),
+            "min_reserved should advance to second after first released"
+        );
+
+        storage.release_commit_lsn(601);
+        assert_eq!(
+            manager.min_reserved_lsn(),
+            None,
+            "min_reserved should be None after all released"
+        );
+    }
 }
