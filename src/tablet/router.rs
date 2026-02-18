@@ -51,11 +51,7 @@ impl fmt::Display for TabletId {
 impl TabletId {
     /// Canonical on-disk directory name for this tablet.
     pub fn dir_name(self) -> String {
-        match self {
-            Self::System => "system".to_string(),
-            Self::Table { table_id } => format!("t_{table_id}"),
-            Self::LocalIndex { table_id, index_id } => format!("i_{table_id}_{index_id}"),
-        }
+        self.to_string()
     }
 
     /// Parse a canonical on-disk directory name into `TabletId`.

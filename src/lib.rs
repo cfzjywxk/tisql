@@ -89,7 +89,7 @@ pub mod testkit {
         CompactionExecutor, CompactionPicker, CompactionScheduler, CompactionTask, IlogConfig,
         IlogService, IlogTruncateStats, LsmConfig, LsmConfigBuilder, LsmEngine, LsmRecovery,
         LsmStats, ManifestDelta, MemTable, RecoveryResult, SstBuilder, SstBuilderOptions,
-        SstIterator, SstMeta, SstReader, SstReaderRef, Version,
+        SstIterator, SstMeta, SstReader, SstReaderRef, TabletManager, Version,
     };
 
     // Re-export FlushScheduler for testing
@@ -170,6 +170,7 @@ use executor::{ExecutionOutput, ExecutionResult, Executor, SimpleExecutor};
 use sql::Parser;
 use tablet::{
     CompactionScheduler, FlushScheduler, IlogService, IlogTruncateStats, LsmEngine, LsmRecovery,
+    TabletManager,
 };
 use transaction::{ConcurrencyManager, TransactionService};
 use tso::LocalTso;
@@ -252,6 +253,8 @@ pub struct Database {
     ilog: Arc<IlogService>,
     /// LSM storage engine (kept for flush on shutdown)
     storage: Arc<LsmEngine>,
+    /// Tablet lifecycle manager (phase-2 scaffold: mounted system tablet + inventory dirs).
+    tablet_manager: Arc<TabletManager>,
     /// Background flush scheduler (Drop stops the worker)
     /// Declared before compaction_scheduler so it's dropped first (Rust drops in declaration order).
     flush_scheduler: FlushScheduler,
@@ -325,6 +328,11 @@ impl Database {
 
         // Wrap storage in Arc
         let storage = Arc::new(recovery_result.engine);
+        let tablet_manager = Arc::new(TabletManager::new(
+            &config.data_dir,
+            Arc::clone(&recovery_result.lsn_provider),
+            Arc::clone(&storage),
+        )?);
 
         // 3. Create background runtime for flush, compaction, GC
         let bg_runtime = tokio::runtime::Builder::new_multi_thread()
@@ -378,6 +386,22 @@ impl Database {
         } else {
             // Load schema version from storage for existing database
             catalog.load_schema_version()?;
+        }
+
+        // Build desired tablet inventory from catalog metadata.
+        //
+        // Phase-2 behavior remains single-tablet equivalent (only system tablet
+        // is mounted), but we pre-create canonical tablet directories for user
+        // tables/indexes discovered from catalog state.
+        {
+            use inner_table::catalog_loader::load_catalog;
+            let (cache, _) = load_catalog(txn_service.as_ref())?;
+            let discovered = tablet_manager.register_catalog_inventory(&cache)?;
+            log_info!(
+                "Tablet inventory prepared: mounted={}, desired={}",
+                tablet_manager.all_tablets().len(),
+                discovered.len()
+            );
         }
 
         // Load pending GC tasks from inner tables and register with storage engine
@@ -460,6 +484,7 @@ impl Database {
             catalog,
             ilog: recovery_result.ilog,
             storage,
+            tablet_manager,
             flush_scheduler,
             compaction_scheduler,
             gc_worker,
@@ -486,6 +511,11 @@ impl Database {
     /// Get a handle to the I/O runtime, if available.
     pub fn io_handle(&self) -> Option<&tokio::runtime::Handle> {
         self.io_runtime.as_ref().map(|rt| rt.handle())
+    }
+
+    /// Get the tablet manager.
+    pub fn tablet_manager(&self) -> &Arc<TabletManager> {
+        &self.tablet_manager
     }
 
     /// Get the session registry for tracking active transactions.
@@ -906,6 +936,11 @@ fn value_to_string(val: &Value) -> String {
 mod tests {
     use super::*;
     use crate::inner_table::catalog_loader::load_gc_tasks;
+    use crate::inner_table::core_tables::{
+        ALL_COLUMN_TABLE_ID, ALL_GC_DELETE_RANGE_TABLE_ID, ALL_INDEX_TABLE_ID, ALL_META_TABLE_ID,
+        ALL_SCHEMA_TABLE_ID, ALL_TABLE_TABLE_ID, USER_TABLE_ID_START,
+    };
+    use crate::tablet::TabletId;
     use tempfile::tempdir;
     use tokio::time::{sleep, Duration};
 
@@ -987,6 +1022,133 @@ mod tests {
             let _db = Database::open(config).unwrap();
             // Note: Catalog is not persisted yet, so CREATE TABLE won't survive
             // But commit log entries are persisted
+        }
+    }
+
+    #[tokio::test]
+    async fn test_phase2_fresh_db_creates_system_tablet_dir() {
+        let dir = tempdir().unwrap();
+        let db = Database::open(DatabaseConfig::with_data_dir(dir.path())).unwrap();
+        assert!(dir.path().join("tablets").join("system").exists());
+        assert_eq!(db.tablet_manager.all_tablets().len(), 1);
+        assert!(db.tablet_manager.get_tablet(TabletId::System).is_some());
+    }
+
+    #[tokio::test]
+    async fn test_phase2_bootstrap_inner_tables_do_not_create_dedicated_tablets() {
+        let dir = tempdir().unwrap();
+        let _db = Database::open(DatabaseConfig::with_data_dir(dir.path())).unwrap();
+
+        let tablets_dir = dir.path().join("tablets");
+        assert!(tablets_dir.join("system").exists());
+        for inner_table_id in [
+            ALL_META_TABLE_ID,
+            ALL_SCHEMA_TABLE_ID,
+            ALL_TABLE_TABLE_ID,
+            ALL_COLUMN_TABLE_ID,
+            ALL_INDEX_TABLE_ID,
+            ALL_GC_DELETE_RANGE_TABLE_ID,
+        ] {
+            assert!(
+                !tablets_dir.join(format!("t_{inner_table_id}")).exists(),
+                "inner table id {inner_table_id} must stay on system tablet"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn test_phase2_reopen_registers_user_tablet_inventory() {
+        let dir = tempdir().unwrap();
+        let config = DatabaseConfig::with_data_dir(dir.path());
+
+        {
+            let db = Database::open(config.clone()).unwrap();
+            db.execute_query("CREATE TABLE t_phase2 (id INT PRIMARY KEY, v INT)")
+                .await
+                .unwrap();
+            db.close().await.unwrap();
+        }
+
+        let db = Database::open(config).unwrap();
+        let user_tablet = TabletId::Table {
+            table_id: USER_TABLE_ID_START,
+        };
+        assert!(dir
+            .path()
+            .join("tablets")
+            .join(user_tablet.dir_name())
+            .exists());
+        assert!(
+            db.tablet_manager.desired_tablets().contains(&user_tablet),
+            "catalog-derived user table should be present in desired inventory on reopen"
+        );
+        assert!(
+            db.tablet_manager.get_tablet(user_tablet).is_none(),
+            "phase-2 keeps user tablets unmounted (directory inventory only)"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_phase2_reopen_discovers_existing_user_tablet_dirs() {
+        let dir = tempdir().unwrap();
+        let config = DatabaseConfig::with_data_dir(dir.path());
+
+        {
+            let db = Database::open(config.clone()).unwrap();
+            db.close().await.unwrap();
+        }
+
+        let table_tablet = TabletId::Table {
+            table_id: USER_TABLE_ID_START + 77,
+        };
+        let index_tablet = TabletId::LocalIndex {
+            table_id: USER_TABLE_ID_START + 77,
+            index_id: 9001,
+        };
+        std::fs::create_dir_all(dir.path().join("tablets").join(table_tablet.dir_name())).unwrap();
+        std::fs::create_dir_all(dir.path().join("tablets").join(index_tablet.dir_name())).unwrap();
+
+        let db = Database::open(config).unwrap();
+        let desired = db.tablet_manager.desired_tablets();
+        assert!(desired.contains(&table_tablet));
+        assert!(desired.contains(&index_tablet));
+        assert!(db.tablet_manager.get_tablet(table_tablet).is_none());
+        assert!(db.tablet_manager.get_tablet(index_tablet).is_none());
+    }
+
+    #[tokio::test]
+    async fn test_phase2_reopen_without_tablets_dir_stays_compatible() {
+        let dir = tempdir().unwrap();
+        let config = DatabaseConfig::with_data_dir(dir.path());
+
+        {
+            let db = Database::open(config.clone()).unwrap();
+            db.execute_query("CREATE TABLE t_phase2_legacy (id INT PRIMARY KEY, v INT)")
+                .await
+                .unwrap();
+            db.execute_query("INSERT INTO t_phase2_legacy VALUES (1, 10)")
+                .await
+                .unwrap();
+            db.close().await.unwrap();
+        }
+
+        let tablets_dir = dir.path().join("tablets");
+        assert!(tablets_dir.exists());
+        std::fs::remove_dir_all(&tablets_dir).unwrap();
+        assert!(!tablets_dir.exists());
+
+        let db = Database::open(config).unwrap();
+        assert!(tablets_dir.join("system").exists());
+        match db
+            .execute_query("SELECT v FROM t_phase2_legacy WHERE id = 1")
+            .await
+            .unwrap()
+        {
+            QueryResult::Rows { data, .. } => {
+                assert_eq!(data.len(), 1);
+                assert_eq!(data[0][0], "10");
+            }
+            other => panic!("expected row result after legacy reopen, got {other:?}"),
         }
     }
 

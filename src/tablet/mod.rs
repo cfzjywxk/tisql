@@ -57,6 +57,7 @@ pub mod config;
 pub mod engine;
 pub mod flush_scheduler;
 pub mod lsm;
+pub mod manager;
 pub mod memtable;
 pub mod mvcc;
 pub mod recovery;
@@ -105,6 +106,7 @@ pub use commit_reservations::{
     CommitLsnReservations, CommitReservation, CommitReservationStats, ReservationGuard,
 };
 pub use lsm::{LevelStats, LsmEngine, LsmStats, TabletEngine, TieredMergeIterator};
+pub use manager::{derive_tablet_inventory, TabletManager};
 pub use router::{
     is_system_table_id, route_index_to_tablet, route_key_to_tablet, route_table_to_tablet, TabletId,
 };

@@ -19,9 +19,7 @@
 //! so existing imports (`crate::tablet::lsm::LsmEngine`) continue to work.
 //! Re-export only the stable surface needed by existing call sites.
 
-pub use super::engine::{
-    BoundaryComputation, InFlightLsnTracker, LevelStats, LsmEngine, LsmStats, TieredMergeIterator,
-};
+pub use super::engine::{LevelStats, LsmEngine, LsmStats, TieredMergeIterator};
 
 /// Phase-1 compatibility alias. `TabletEngine` will evolve into a dedicated
 /// tablet-local engine type in later phases.
