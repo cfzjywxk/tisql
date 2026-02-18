@@ -17,6 +17,7 @@
 //! All transaction operations go through this service, with transaction
 //! state held in `TxnCtx` and passed to each operation.
 
+use std::collections::BTreeMap;
 use std::ops::Range;
 use std::sync::Arc;
 
@@ -29,9 +30,12 @@ use crate::util::error::{Result, TiSqlError};
 
 use super::api::{CommitInfo, MutationType, TxnCtx, TxnService, TxnState};
 use super::concurrency::ConcurrencyManager;
-use crate::catalog::types::{Key, RawValue, Timestamp, TxnId};
+use crate::catalog::types::{Key, RawValue, TableId, Timestamp, TxnId};
 use crate::tablet::mvcc::{is_tombstone, MvccIterator, MvccKey, LOCK, TOMBSTONE};
-use crate::tablet::{PessimisticStorage, PessimisticWriteError, StorageEngine, WriteBatch};
+use crate::tablet::{
+    route_key_to_tablet, route_table_to_tablet, PessimisticStorage, PessimisticWriteError,
+    StorageEngine, TabletId, WriteBatch,
+};
 
 /// Transaction service manages transactions with durability and MVCC.
 ///
@@ -132,6 +136,7 @@ impl<S: StorageEngine, L: ClogService, T: TsoService> TransactionService<S, L, T
     /// can apply `tokio::time::sleep` for backpressure hints.
     async fn put_pending_with_retry(
         &self,
+        tablet_id: Option<TabletId>,
         key: &[u8],
         value: RawValue,
         owner_start_ts: Timestamp,
@@ -144,7 +149,15 @@ impl<S: StorageEngine, L: ClogService, T: TsoService> TransactionService<S, L, T
         const MAX_SLOWDOWN_RETRIES: usize = 32;
         let mut retries = 0;
         loop {
-            match self.storage.put_pending(key, value.clone(), owner_start_ts) {
+            let result = match tablet_id {
+                Some(id) => {
+                    self.storage
+                        .put_pending_on_tablet(id, key, value.clone(), owner_start_ts)
+                }
+                None => self.storage.put_pending(key, value.clone(), owner_start_ts),
+            };
+
+            match result {
                 Ok(()) => return Ok(()),
                 Err(PessimisticWriteError::WriteStall { delay: Some(delay) }) => {
                     if retries >= MAX_SLOWDOWN_RETRIES {
@@ -256,6 +269,21 @@ impl<S: StorageEngine, L: ClogService, T: TsoService> TransactionService<S, L, T
             )),
         }
     }
+
+    fn group_mutation_keys_by_tablet(
+        mutations: &BTreeMap<Key, MutationType>,
+        mutation_tablets: &BTreeMap<Key, TabletId>,
+    ) -> Vec<(TabletId, Vec<Key>)> {
+        let mut grouped: BTreeMap<TabletId, Vec<Key>> = BTreeMap::new();
+        for key in mutations.keys() {
+            let tablet_id = mutation_tablets
+                .get(key)
+                .copied()
+                .unwrap_or_else(|| route_key_to_tablet(key));
+            grouped.entry(tablet_id).or_default().push(key.clone());
+        }
+        grouped.into_iter().collect()
+    }
 }
 
 /// Implement TxnService trait for TransactionService
@@ -289,11 +317,24 @@ impl<S: PessimisticStorage + 'static, L: ClogService + 'static, T: TsoService> T
     }
 
     async fn get(&self, ctx: &TxnCtx, key: &[u8]) -> Result<Option<RawValue>> {
-        // Use get_with_owner with owner_ts=start_ts for read-your-writes.
-        // This sees own pending writes and committed data at start_ts.
+        // Key-only fallback path for callers without table metadata.
         let value = self
             .storage
             .get_with_owner(key, ctx.start_ts, ctx.start_ts)
+            .await;
+        Ok(value.filter(|v| !is_tombstone(v)))
+    }
+
+    async fn get_on_table(
+        &self,
+        ctx: &TxnCtx,
+        table_id: TableId,
+        key: &[u8],
+    ) -> Result<Option<RawValue>> {
+        let tablet_id = route_table_to_tablet(table_id);
+        let value = self
+            .storage
+            .get_with_owner_on_tablet(tablet_id, key, ctx.start_ts, ctx.start_ts)
             .await;
         Ok(value.filter(|v| !is_tombstone(v)))
     }
@@ -317,6 +358,7 @@ impl<S: PessimisticStorage + 'static, L: ClogService + 'static, T: TsoService> T
         // must not re-scan rows it just inserted). Pending resolution via
         // concurrency_manager handles other txns' pending writes for both paths.
         let owner_ts = if ctx.is_explicit() { ctx.start_ts } else { 0 };
+        // Key-only fallback path for callers without table metadata.
         let storage_iter = self.storage.scan_iter(mvcc_range, owner_ts)?;
 
         // Always pass concurrency_manager for pending resolution of other txns.
@@ -324,7 +366,74 @@ impl<S: PessimisticStorage + 'static, L: ClogService + 'static, T: TsoService> T
         Ok(MvccScanIterator::new(storage_iter, ctx.start_ts, range, cm))
     }
 
+    fn scan_iter_on_table(
+        &self,
+        ctx: &TxnCtx,
+        table_id: TableId,
+        range: Range<Key>,
+    ) -> Result<MvccScanIterator<S::Iter>> {
+        let start_mvcc = MvccKey::encode(&range.start, Timestamp::MAX);
+        let end_mvcc = if range.end.is_empty() {
+            MvccKey::unbounded()
+        } else {
+            MvccKey::encode(&range.end, 0)
+        };
+        let mvcc_range = start_mvcc..end_mvcc;
+
+        let owner_ts = if ctx.is_explicit() { ctx.start_ts } else { 0 };
+        let tablet_id = route_table_to_tablet(table_id);
+        let storage_iter = self
+            .storage
+            .scan_iter_on_tablet(tablet_id, mvcc_range, owner_ts)?;
+
+        let cm = Some(Arc::clone(&self.concurrency_manager));
+        Ok(MvccScanIterator::new(storage_iter, ctx.start_ts, range, cm))
+    }
+
     async fn put(&self, ctx: &mut TxnCtx, key: Key, value: RawValue) -> Result<()> {
+        if ctx.state != TxnState::Running {
+            return Err(TiSqlError::TransactionNotActive(format!("{:?}", ctx.state)));
+        }
+        if ctx.read_only {
+            return Err(TiSqlError::ReadOnlyTransaction);
+        }
+
+        if !ctx.registered {
+            self.concurrency_manager.register_txn(ctx.start_ts);
+            ctx.registered = true;
+        }
+
+        let tablet_id = route_key_to_tablet(&key);
+        match self
+            .put_pending_with_retry(Some(tablet_id), &key, value, ctx.start_ts)
+            .await
+        {
+            Ok(()) => {
+                ctx.mutation_tablets.insert(key.clone(), tablet_id);
+                ctx.mutations.insert(key, MutationType::Write);
+                Ok(())
+            }
+            Err(PessimisticWriteError::LockConflict(lock_owner)) => Err(TiSqlError::KeyIsLocked {
+                key,
+                lock_ts: lock_owner,
+                primary: vec![],
+            }),
+            Err(PessimisticWriteError::WriteStall { delay: None }) => Err(TiSqlError::Storage(
+                "Write stalled: storage backpressure, retry later".to_string(),
+            )),
+            Err(PessimisticWriteError::WriteStall { delay: Some(_) }) => {
+                unreachable!("put_pending_with_retry returns only LockConflict or hard WriteStall")
+            }
+        }
+    }
+
+    async fn put_on_table(
+        &self,
+        ctx: &mut TxnCtx,
+        table_id: TableId,
+        key: Key,
+        value: RawValue,
+    ) -> Result<()> {
         if ctx.state != TxnState::Running {
             return Err(TiSqlError::TransactionNotActive(format!("{:?}", ctx.state)));
         }
@@ -341,11 +450,17 @@ impl<S: PessimisticStorage + 'static, L: ClogService + 'static, T: TsoService> T
             ctx.registered = true;
         }
 
+        let tablet_id = route_table_to_tablet(table_id);
+
         // Write pending node directly to storage.
-        match self.put_pending_with_retry(&key, value, ctx.start_ts).await {
+        match self
+            .put_pending_with_retry(Some(tablet_id), &key, value, ctx.start_ts)
+            .await
+        {
             Ok(()) => {
                 // Single insert handles both: adding a new Write entry AND
                 // upgrading Lock→Write (overwrite) if key had a prior LOCK.
+                ctx.mutation_tablets.insert(key.clone(), tablet_id);
                 ctx.mutations.insert(key, MutationType::Write);
                 Ok(())
             }
@@ -371,27 +486,101 @@ impl<S: PessimisticStorage + 'static, L: ClogService + 'static, T: TsoService> T
             return Err(TiSqlError::ReadOnlyTransaction);
         }
 
+        if !ctx.registered {
+            self.concurrency_manager.register_txn(ctx.start_ts);
+            ctx.registered = true;
+        }
+
+        let tablet_id = route_key_to_tablet(&key);
+        let value_exists = self
+            .storage
+            .get_with_owner_on_tablet(tablet_id, &key, ctx.start_ts, ctx.start_ts)
+            .await
+            .is_some();
+
+        if value_exists {
+            match self
+                .put_pending_with_retry(Some(tablet_id), &key, TOMBSTONE.to_vec(), ctx.start_ts)
+                .await
+            {
+                Ok(()) => {
+                    ctx.mutation_tablets.insert(key.clone(), tablet_id);
+                    ctx.mutations.insert(key, MutationType::Write);
+                    Ok(())
+                }
+                Err(PessimisticWriteError::LockConflict(lock_owner)) => {
+                    Err(TiSqlError::KeyIsLocked {
+                        key,
+                        lock_ts: lock_owner,
+                        primary: vec![],
+                    })
+                }
+                Err(PessimisticWriteError::WriteStall { delay: None }) => Err(TiSqlError::Storage(
+                    "Write stalled: storage backpressure, retry later".into(),
+                )),
+                Err(PessimisticWriteError::WriteStall { delay: Some(_) }) => unreachable!(
+                    "put_pending_with_retry returns only LockConflict or hard WriteStall"
+                ),
+            }
+        } else {
+            match self
+                .put_pending_with_retry(Some(tablet_id), &key, LOCK.to_vec(), ctx.start_ts)
+                .await
+            {
+                Ok(()) => {
+                    ctx.mutation_tablets.insert(key.clone(), tablet_id);
+                    ctx.mutations.entry(key).or_insert(MutationType::Lock);
+                    Ok(())
+                }
+                Err(PessimisticWriteError::LockConflict(lock_owner)) => {
+                    Err(TiSqlError::KeyIsLocked {
+                        key,
+                        lock_ts: lock_owner,
+                        primary: vec![],
+                    })
+                }
+                Err(PessimisticWriteError::WriteStall { delay: None }) => Err(TiSqlError::Storage(
+                    "Write stalled: storage backpressure, retry later".into(),
+                )),
+                Err(PessimisticWriteError::WriteStall { delay: Some(_) }) => unreachable!(
+                    "put_pending_with_retry returns only LockConflict or hard WriteStall"
+                ),
+            }
+        }
+    }
+
+    async fn delete_on_table(&self, ctx: &mut TxnCtx, table_id: TableId, key: Key) -> Result<()> {
+        if ctx.state != TxnState::Running {
+            return Err(TiSqlError::TransactionNotActive(format!("{:?}", ctx.state)));
+        }
+        if ctx.read_only {
+            return Err(TiSqlError::ReadOnlyTransaction);
+        }
+
         // Register before writing pending (same reason as put()).
         if !ctx.registered {
             self.concurrency_manager.register_txn(ctx.start_ts);
             ctx.registered = true;
         }
 
+        let tablet_id = route_table_to_tablet(table_id);
+
         // Check committed OR own pending value (owner_ts=start_ts sees own pending).
         // This fixes put(k)+delete(k) on non-existing key: sees own pending put → TOMBSTONE.
         let value_exists = self
             .storage
-            .get_with_owner(&key, ctx.start_ts, ctx.start_ts)
+            .get_with_owner_on_tablet(tablet_id, &key, ctx.start_ts, ctx.start_ts)
             .await
             .is_some();
 
         if value_exists {
             // Value exists (committed or own pending) → TOMBSTONE
             match self
-                .put_pending_with_retry(&key, TOMBSTONE.to_vec(), ctx.start_ts)
+                .put_pending_with_retry(Some(tablet_id), &key, TOMBSTONE.to_vec(), ctx.start_ts)
                 .await
             {
                 Ok(()) => {
+                    ctx.mutation_tablets.insert(key.clone(), tablet_id);
                     ctx.mutations.insert(key, MutationType::Write);
                     Ok(())
                 }
@@ -412,10 +601,11 @@ impl<S: PessimisticStorage + 'static, L: ClogService + 'static, T: TsoService> T
         } else {
             // No value exists → LOCK (pessimistic lock only, not persisted to clog)
             match self
-                .put_pending_with_retry(&key, LOCK.to_vec(), ctx.start_ts)
+                .put_pending_with_retry(Some(tablet_id), &key, LOCK.to_vec(), ctx.start_ts)
                 .await
             {
                 Ok(()) => {
+                    ctx.mutation_tablets.insert(key.clone(), tablet_id);
                     // or_insert preserves existing Write if key was previously put
                     // (won't downgrade Write→Lock).
                     ctx.mutations.entry(key).or_insert(MutationType::Lock);
@@ -445,6 +635,7 @@ impl<S: PessimisticStorage + 'static, L: ClogService + 'static, T: TsoService> T
         let start_ts = ctx.start_ts;
 
         let mutations = std::mem::take(&mut ctx.mutations);
+        let mutation_tablets = std::mem::take(&mut ctx.mutation_tablets);
 
         // No-write transaction: clean up and return
         if mutations.is_empty() {
@@ -469,9 +660,17 @@ impl<S: PessimisticStorage + 'static, L: ClogService + 'static, T: TsoService> T
             if *mt == MutationType::Lock {
                 continue;
             }
+            let tablet_id = mutation_tablets
+                .get(key)
+                .copied()
+                .unwrap_or_else(|| route_key_to_tablet(key));
             // TOMBSTONE: MemTableEngine returns Some(TOMBSTONE),
             // LsmEngine returns None. Both handled as Delete in clog.
-            match self.storage.get_with_owner(key, start_ts, start_ts).await {
+            match self
+                .storage
+                .get_with_owner_on_tablet(tablet_id, key, start_ts, start_ts)
+                .await
+            {
                 Some(value) if !is_tombstone(&value) => {
                     read_values.push((key.as_slice(), Some(value)));
                 }
@@ -552,12 +751,17 @@ impl<S: PessimisticStorage + 'static, L: ClogService + 'static, T: TsoService> T
                         );
                     }
                     let commit_lsn = txn_lsn;
+                    let grouped_keys =
+                        Self::group_mutation_keys_by_tablet(&mutations, &mutation_tablets);
 
                     // Step 6: Finalize all pending nodes by setting commit_ts and
                     // tracking the clog LSN on touched memtables.
-                    let keys: Vec<Key> = mutations.into_keys().collect();
-                    self.storage
-                        .finalize_pending_with_lsn(&keys, start_ts, commit_ts, commit_lsn);
+                    self.storage.finalize_pending_grouped_with_lsn(
+                        &grouped_keys,
+                        start_ts,
+                        commit_ts,
+                        commit_lsn,
+                    );
 
                     #[cfg(feature = "failpoints")]
                     fail_point!("txn_after_finalize_before_reservation_release_v26");
@@ -585,8 +789,9 @@ impl<S: PessimisticStorage + 'static, L: ClogService + 'static, T: TsoService> T
                         let _ = guard.release();
                     }
                     ctx.reserved_lsn = None;
-                    let keys: Vec<Key> = mutations.into_keys().collect();
-                    self.storage.abort_pending(&keys, start_ts);
+                    let grouped_keys =
+                        Self::group_mutation_keys_by_tablet(&mutations, &mutation_tablets);
+                    self.storage.abort_pending_grouped(&grouped_keys, start_ts);
                     self.concurrency_manager.abort_txn(start_ts).ok();
                     self.concurrency_manager.remove_txn(start_ts);
                     Err(e)
@@ -597,8 +802,9 @@ impl<S: PessimisticStorage + 'static, L: ClogService + 'static, T: TsoService> T
                     let _ = guard.release();
                 }
                 ctx.reserved_lsn = None;
-                let keys: Vec<Key> = mutations.into_keys().collect();
-                self.storage.abort_pending(&keys, start_ts);
+                let grouped_keys =
+                    Self::group_mutation_keys_by_tablet(&mutations, &mutation_tablets);
+                self.storage.abort_pending_grouped(&grouped_keys, start_ts);
                 self.concurrency_manager.abort_txn(start_ts).ok();
                 self.concurrency_manager.remove_txn(start_ts);
                 Err(e)
@@ -610,11 +816,13 @@ impl<S: PessimisticStorage + 'static, L: ClogService + 'static, T: TsoService> T
         Self::check_active(&ctx)?;
 
         let mutations = std::mem::take(&mut ctx.mutations);
+        let mutation_tablets = std::mem::take(&mut ctx.mutation_tablets);
 
         // Abort all pending nodes in storage
         if !mutations.is_empty() {
-            let keys: Vec<Key> = mutations.into_keys().collect();
-            self.storage.abort_pending(&keys, ctx.start_ts);
+            let grouped_keys = Self::group_mutation_keys_by_tablet(&mutations, &mutation_tablets);
+            self.storage
+                .abort_pending_grouped(&grouped_keys, ctx.start_ts);
         }
 
         if ctx.reserved_lsn.take().is_some() {

@@ -44,8 +44,8 @@ use std::collections::BTreeMap;
 use std::future::Future;
 use std::ops::Range;
 
-use crate::catalog::types::{Key, Lsn, RawValue, Timestamp, TxnId};
-use crate::tablet::MvccIterator;
+use crate::catalog::types::{Key, Lsn, RawValue, TableId, Timestamp, TxnId};
+use crate::tablet::{MvccIterator, TabletId};
 use crate::util::error::Result;
 
 /// Mutation type for keys tracked in a transaction.
@@ -134,6 +134,11 @@ pub struct TxnCtx {
     /// on non-existent keys (skipped during clog persist).
     /// BTreeMap ensures O(log n) insert/lookup and deterministic iteration order.
     pub(crate) mutations: BTreeMap<Key, MutationType>,
+    /// Metadata-first routing map for mutated keys.
+    ///
+    /// Upper layers may record route using table/index metadata so commit/abort
+    /// does not rely on key-prefix decode on the hot path.
+    pub(crate) mutation_tablets: BTreeMap<Key, TabletId>,
     /// Whether this transaction has been registered in the state cache.
     /// Registration happens on first write (put/delete) for implicit txns,
     /// or at begin_explicit() for explicit txns.
@@ -157,6 +162,7 @@ impl TxnCtx {
             read_only,
             explicit: false,
             mutations: BTreeMap::new(),
+            mutation_tablets: BTreeMap::new(),
             registered: false,
             schema_version: None,
             reserved_lsn: None,
@@ -175,6 +181,7 @@ impl TxnCtx {
             read_only,
             explicit: true,
             mutations: BTreeMap::new(),
+            mutation_tablets: BTreeMap::new(),
             registered: false,
             schema_version: None,
             reserved_lsn: None,
@@ -199,6 +206,7 @@ impl TxnCtx {
             read_only,
             explicit,
             mutations: BTreeMap::new(),
+            mutation_tablets: BTreeMap::new(),
             registered: false,
             schema_version: None,
             reserved_lsn: None,
@@ -343,6 +351,17 @@ pub trait TxnService: Send + Sync {
         key: &'a [u8],
     ) -> impl Future<Output = Result<Option<RawValue>>> + Send + 'a;
 
+    /// Metadata-first read path for a known table target.
+    fn get_on_table<'a>(
+        &'a self,
+        ctx: &'a TxnCtx,
+        table_id: TableId,
+        key: &'a [u8],
+    ) -> impl Future<Output = Result<Option<RawValue>>> + Send + 'a {
+        let _ = table_id;
+        self.get(ctx, key)
+    }
+
     /// Scan a range of keys within the transaction (streaming).
     ///
     /// Returns an iterator over key-value pairs visible at `start_ts`.
@@ -350,6 +369,17 @@ pub trait TxnService: Send + Sync {
     /// that may occur during streaming iteration over storage.
     /// For explicit transactions, sees own pending writes (read-your-writes).
     fn scan_iter(&self, ctx: &TxnCtx, range: Range<Key>) -> Result<Self::ScanIter>;
+
+    /// Metadata-first scan path for a known table target.
+    fn scan_iter_on_table(
+        &self,
+        ctx: &TxnCtx,
+        table_id: TableId,
+        range: Range<Key>,
+    ) -> Result<Self::ScanIter> {
+        let _ = table_id;
+        self.scan_iter(ctx, range)
+    }
 
     /// Write a pending put to storage.
     ///
@@ -367,6 +397,18 @@ pub trait TxnService: Send + Sync {
         value: RawValue,
     ) -> impl Future<Output = Result<()>> + Send + 'a;
 
+    /// Metadata-first put path for a known table target.
+    fn put_on_table<'a>(
+        &'a self,
+        ctx: &'a mut TxnCtx,
+        table_id: TableId,
+        key: Key,
+        value: RawValue,
+    ) -> impl Future<Output = Result<()>> + Send + 'a {
+        let _ = table_id;
+        self.put(ctx, key, value)
+    }
+
     /// Write a pending delete to storage.
     ///
     /// The delete is not visible to other transactions until commit.
@@ -381,6 +423,17 @@ pub trait TxnService: Send + Sync {
         ctx: &'a mut TxnCtx,
         key: Key,
     ) -> impl Future<Output = Result<()>> + Send + 'a;
+
+    /// Metadata-first delete path for a known table target.
+    fn delete_on_table<'a>(
+        &'a self,
+        ctx: &'a mut TxnCtx,
+        table_id: TableId,
+        key: Key,
+    ) -> impl Future<Output = Result<()>> + Send + 'a {
+        let _ = table_id;
+        self.delete(ctx, key)
+    }
 
     // === Finalization ===
 

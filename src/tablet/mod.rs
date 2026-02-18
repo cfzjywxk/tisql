@@ -61,6 +61,7 @@ pub mod manager;
 pub mod memtable;
 pub mod mvcc;
 pub mod recovery;
+pub mod routed_storage;
 pub mod router;
 pub mod sstable;
 pub mod version;
@@ -107,6 +108,7 @@ pub use commit_reservations::{
 };
 pub use lsm::{LevelStats, LsmEngine, LsmStats, TabletEngine, TieredMergeIterator};
 pub use manager::{derive_tablet_inventory, TabletManager};
+pub use routed_storage::RoutedTabletStorage;
 pub use router::{
     is_system_table_id, route_index_to_tablet, route_key_to_tablet, route_table_to_tablet, TabletId,
 };
@@ -264,6 +266,19 @@ pub trait StorageEngine: Send + Sync + 'static {
     ///
     /// An iterator that yields entries in MVCC key order.
     fn scan_iter(&self, range: Range<MvccKey>, owner_ts: Timestamp) -> Result<Self::Iter>;
+
+    /// Create a streaming iterator over one logical tablet.
+    ///
+    /// Upper layers should prefer this metadata-first method when table/index
+    /// planning has already resolved the target tablet.
+    fn scan_iter_on_tablet(
+        &self,
+        _tablet_id: router::TabletId,
+        range: Range<MvccKey>,
+        owner_ts: Timestamp,
+    ) -> Result<Self::Iter> {
+        self.scan_iter(range, owner_ts)
+    }
 
     /// Apply a batch of writes atomically.
     ///
@@ -489,6 +504,17 @@ pub trait PessimisticStorage: StorageEngine {
         owner_start_ts: Timestamp,
     ) -> std::result::Result<(), PessimisticWriteError>;
 
+    /// Metadata-first pending write path for callers that already know target tablet.
+    fn put_pending_on_tablet(
+        &self,
+        _tablet_id: router::TabletId,
+        key: &[u8],
+        value: RawValue,
+        owner_start_ts: Timestamp,
+    ) -> std::result::Result<(), PessimisticWriteError> {
+        self.put_pending(key, value, owner_start_ts)
+    }
+
     /// Check if a key is locked by a pending write.
     ///
     /// # Returns
@@ -496,6 +522,15 @@ pub trait PessimisticStorage: StorageEngine {
     /// * `None` - Key is not locked
     /// * `Some(owner_start_ts)` - Key is locked by transaction with this start_ts
     fn get_lock_owner(&self, key: &[u8]) -> Option<Timestamp>;
+
+    /// Metadata-first lock-owner lookup for callers that already know target tablet.
+    fn get_lock_owner_on_tablet(
+        &self,
+        _tablet_id: router::TabletId,
+        key: &[u8],
+    ) -> Option<Timestamp> {
+        self.get_lock_owner(key)
+    }
 
     /// Allocate and reserve a commit LSN for this transaction.
     fn alloc_and_reserve_commit_lsn(&self, owner_start_ts: Timestamp) -> u64;
@@ -527,6 +562,23 @@ pub trait PessimisticStorage: StorageEngine {
         self.finalize_pending(keys, owner_start_ts, commit_ts);
     }
 
+    /// Metadata-first grouped finalize path.
+    ///
+    /// Default implementation keeps backward compatibility by flattening keys.
+    fn finalize_pending_grouped_with_lsn(
+        &self,
+        tablet_groups: &[(router::TabletId, Vec<Key>)],
+        owner_start_ts: Timestamp,
+        commit_ts: Timestamp,
+        clog_lsn: u64,
+    ) {
+        let keys: Vec<Key> = tablet_groups
+            .iter()
+            .flat_map(|(_, keys)| keys.iter().cloned())
+            .collect();
+        self.finalize_pending_with_lsn(&keys, owner_start_ts, commit_ts, clog_lsn);
+    }
+
     /// Abort all pending writes for a transaction.
     ///
     /// Called during rollback. Marks pending nodes as aborted so readers skip them.
@@ -534,6 +586,21 @@ pub trait PessimisticStorage: StorageEngine {
     ///
     /// Only affects nodes where `owner_start_ts` matches.
     fn abort_pending(&self, keys: &[Key], owner_start_ts: Timestamp);
+
+    /// Metadata-first grouped abort path.
+    ///
+    /// Default implementation keeps backward compatibility by flattening keys.
+    fn abort_pending_grouped(
+        &self,
+        tablet_groups: &[(router::TabletId, Vec<Key>)],
+        owner_start_ts: Timestamp,
+    ) {
+        let keys: Vec<Key> = tablet_groups
+            .iter()
+            .flat_map(|(_, keys)| keys.iter().cloned())
+            .collect();
+        self.abort_pending(&keys, owner_start_ts);
+    }
 
     /// Delete a key with pessimistic locking.
     ///
@@ -554,6 +621,16 @@ pub trait PessimisticStorage: StorageEngine {
         key: &[u8],
         owner_start_ts: Timestamp,
     ) -> std::result::Result<bool, PessimisticWriteError>;
+
+    /// Metadata-first delete path for callers that already know target tablet.
+    fn delete_pending_on_tablet(
+        &self,
+        _tablet_id: router::TabletId,
+        key: &[u8],
+        owner_start_ts: Timestamp,
+    ) -> std::result::Result<bool, PessimisticWriteError> {
+        self.delete_pending(key, owner_start_ts)
+    }
 
     /// Get a value with read-your-writes support.
     ///
@@ -576,4 +653,15 @@ pub trait PessimisticStorage: StorageEngine {
         read_ts: Timestamp,
         owner_start_ts: Timestamp,
     ) -> impl std::future::Future<Output = Option<RawValue>> + Send + 'a;
+
+    /// Metadata-first read path for callers that already know target tablet.
+    fn get_with_owner_on_tablet<'a>(
+        &'a self,
+        _tablet_id: router::TabletId,
+        key: &'a [u8],
+        read_ts: Timestamp,
+        owner_start_ts: Timestamp,
+    ) -> impl std::future::Future<Output = Option<RawValue>> + Send + 'a {
+        self.get_with_owner(key, read_ts, owner_start_ts)
+    }
 }

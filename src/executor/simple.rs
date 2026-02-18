@@ -699,7 +699,7 @@ fn build_read_operator<T: TxnService>(
                     .collect(),
             );
 
-            let iter = txn_service.scan_iter(ctx, start_key..end_key)?;
+            let iter = txn_service.scan_iter_on_table(ctx, table_id, start_key..end_key)?;
 
             Ok(Operator::Scan(ScanOp {
                 iter,
@@ -1159,7 +1159,11 @@ impl SimpleExecutor {
                     };
 
                     // Check for duplicate primary key
-                    if txn_service.get(ctx, &key).await?.is_some() {
+                    if txn_service
+                        .get_on_table(ctx, table.id(), &key)
+                        .await?
+                        .is_some()
+                    {
                         let pk_desc = if pk_indices.is_empty() {
                             format!("row_id={}", row_id_for_key.unwrap_or(0))
                         } else {
@@ -1178,7 +1182,9 @@ impl SimpleExecutor {
                     let value = encode_row(&col_ids, &row_values);
 
                     // Buffer write in transaction
-                    txn_service.put(ctx, key, value).await?;
+                    txn_service
+                        .put_on_table(ctx, table.id(), key, value)
+                        .await?;
                     count += 1;
                 }
 
@@ -1201,7 +1207,7 @@ impl SimpleExecutor {
 
                 // Scan using transaction's snapshot (reads at start_ts)
                 // Use zero-copy streaming iteration - process one row at a time
-                let mut iter = txn_service.scan_iter(ctx, start_key..end_key)?;
+                let mut iter = txn_service.scan_iter_on_table(ctx, table_id, start_key..end_key)?;
 
                 iter.advance().await?; // Position on first entry
                 while iter.valid() {
@@ -1221,7 +1227,9 @@ impl SimpleExecutor {
                     }
 
                     // Buffer delete in transaction (need to clone key for ownership)
-                    txn_service.delete(ctx, key.to_vec()).await?;
+                    txn_service
+                        .delete_on_table(ctx, table_id, key.to_vec())
+                        .await?;
                     count += 1;
                     iter.advance().await?;
                 }
@@ -1250,7 +1258,7 @@ impl SimpleExecutor {
 
                 // Scan using transaction's snapshot
                 // Use zero-copy streaming iteration - process one row at a time
-                let mut iter = txn_service.scan_iter(ctx, start_key..end_key)?;
+                let mut iter = txn_service.scan_iter_on_table(ctx, table_id, start_key..end_key)?;
 
                 iter.advance().await?; // Position on first entry
                 while iter.valid() {
@@ -1296,7 +1304,11 @@ impl SimpleExecutor {
                     // Check for duplicate key when PK changed
                     if !pk_indices.is_empty() && new_key.as_slice() != key_ref {
                         // Check if new key already exists (would conflict with another row)
-                        if txn_service.get(ctx, &new_key).await?.is_some() {
+                        if txn_service
+                            .get_on_table(ctx, table_id, &new_key)
+                            .await?
+                            .is_some()
+                        {
                             let pk_values: Vec<_> = pk_indices
                                 .iter()
                                 .map(|&i| row.get(i).cloned().unwrap_or(Value::Null))
@@ -1307,12 +1319,16 @@ impl SimpleExecutor {
                             )));
                         }
                         // Delete old key (need to clone for ownership)
-                        txn_service.delete(ctx, key_ref.to_vec()).await?;
+                        txn_service
+                            .delete_on_table(ctx, table_id, key_ref.to_vec())
+                            .await?;
                     }
 
                     // Write new row
                     let new_value = encode_row(&col_ids, row.values());
-                    txn_service.put(ctx, new_key, new_value).await?;
+                    txn_service
+                        .put_on_table(ctx, table_id, new_key, new_value)
+                        .await?;
                     count += 1;
                     iter.advance().await?;
                 }

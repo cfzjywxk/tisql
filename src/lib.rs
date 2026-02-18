@@ -170,7 +170,7 @@ use executor::{ExecutionOutput, ExecutionResult, Executor, SimpleExecutor};
 use sql::Parser;
 use tablet::{
     CompactionScheduler, FlushScheduler, IlogService, IlogTruncateStats, LsmEngine, LsmRecovery,
-    TabletManager,
+    RoutedTabletStorage, TabletManager,
 };
 use transaction::{ConcurrencyManager, TransactionService};
 use tso::LocalTso;
@@ -215,7 +215,7 @@ impl DatabaseConfig {
 // ============================================================================
 
 /// Internal type alias for concrete storage engine.
-type DbStorage = LsmEngine;
+type DbStorage = RoutedTabletStorage;
 
 /// Internal type alias for concrete transaction service.
 /// Not exposed publicly - callers only see TxnService trait.
@@ -369,8 +369,9 @@ impl Database {
             Arc::new(ConcurrencyManager::new(recovery_result.stats.max_commit_ts));
 
         // Create transaction service with recovered components
+        let routed_storage = Arc::new(RoutedTabletStorage::new(Arc::clone(&tablet_manager)));
         let txn_service = Arc::new(TransactionService::new(
-            Arc::clone(&storage),
+            Arc::clone(&routed_storage),
             recovery_result.clog,
             Arc::clone(&tso),
             Arc::clone(&concurrency_manager),
@@ -940,7 +941,9 @@ mod tests {
         ALL_COLUMN_TABLE_ID, ALL_GC_DELETE_RANGE_TABLE_ID, ALL_INDEX_TABLE_ID, ALL_META_TABLE_ID,
         ALL_SCHEMA_TABLE_ID, ALL_TABLE_TABLE_ID, USER_TABLE_ID_START,
     };
-    use crate::tablet::TabletId;
+    use crate::tablet::{
+        encode_key, encode_pk, LsmConfig, MvccIterator, MvccKey, TabletEngine, TabletId,
+    };
     use tempfile::tempdir;
     use tokio::time::{sleep, Duration};
 
@@ -949,6 +952,42 @@ mod tests {
         let config = DatabaseConfig::with_data_dir(dir.path());
         let db = Database::open(config).unwrap();
         (db, dir)
+    }
+
+    fn mount_user_tablet(db: &Database, table_id: u64) {
+        let tablet_id = TabletId::Table { table_id };
+        if db.tablet_manager().get_tablet(tablet_id).is_some() {
+            return;
+        }
+        let dir = db.tablet_manager().tablet_dir(tablet_id);
+        let tablet = Arc::new(TabletEngine::open(LsmConfig::new(&dir)).unwrap());
+        db.tablet_manager()
+            .insert_tablet(tablet_id, tablet)
+            .unwrap();
+    }
+
+    fn table_int_pk_key(table_id: u64, id: i32) -> Vec<u8> {
+        let pk = encode_pk(&[Value::Int(id)]);
+        encode_key(table_id, &pk)
+    }
+
+    fn table_id_by_name(db: &Database, table_name: &str) -> u64 {
+        db.catalog
+            .get_table("default", table_name)
+            .unwrap()
+            .unwrap_or_else(|| panic!("table {table_name} not found"))
+            .id()
+    }
+
+    fn tablet_has_table_entries(tablet: &TabletEngine, table_id: u64) -> bool {
+        let start = encode_key(table_id, &[]);
+        let end = encode_key(table_id + 1, &[]);
+        let range = MvccKey::encode(&start, u64::MAX)..MvccKey::encode(&end, 0);
+        let mut iter = tablet.scan_iter(range, 0).unwrap();
+        crate::io::block_on_sync(async {
+            iter.advance().await.unwrap();
+            iter.valid()
+        })
     }
 
     #[tokio::test]
@@ -1350,6 +1389,223 @@ mod tests {
             flushed_after >= flushed_before,
             "flushed_lsn should not regress after flush (before={flushed_before}, after={flushed_after})"
         );
+    }
+
+    #[tokio::test]
+    async fn test_phase3_cross_tablet_commit_routes_to_mounted_tablets() {
+        let dir = tempdir().unwrap();
+        let db = Database::open(DatabaseConfig::with_data_dir(dir.path())).unwrap();
+
+        db.execute_query("CREATE TABLE p3_t1 (id INT PRIMARY KEY, v INT)")
+            .await
+            .unwrap();
+        db.execute_query("CREATE TABLE p3_t2 (id INT PRIMARY KEY, v INT)")
+            .await
+            .unwrap();
+
+        let table1 = table_id_by_name(&db, "p3_t1");
+        let table2 = table_id_by_name(&db, "p3_t2");
+        mount_user_tablet(&db, table1);
+        mount_user_tablet(&db, table2);
+
+        db.execute_query("BEGIN").await.unwrap();
+        db.execute_query("INSERT INTO p3_t1 VALUES (1, 10)")
+            .await
+            .unwrap();
+        db.execute_query("INSERT INTO p3_t2 VALUES (1, 20)")
+            .await
+            .unwrap();
+        db.execute_query("COMMIT").await.unwrap();
+
+        match db
+            .execute_query("SELECT v FROM p3_t1 WHERE id = 1")
+            .await
+            .unwrap()
+        {
+            QueryResult::Rows { data, .. } => {
+                assert_eq!(data.len(), 1);
+                assert_eq!(data[0][0], "10");
+            }
+            other => panic!("expected rows for p3_t1, got {other:?}"),
+        }
+        match db
+            .execute_query("SELECT v FROM p3_t2 WHERE id = 1")
+            .await
+            .unwrap()
+        {
+            QueryResult::Rows { data, .. } => {
+                assert_eq!(data.len(), 1);
+                assert_eq!(data[0][0], "20");
+            }
+            other => panic!("expected rows for p3_t2, got {other:?}"),
+        }
+
+        let system = db.tablet_manager().system_tablet();
+        let tablet1 = db
+            .tablet_manager()
+            .get_tablet(TabletId::Table { table_id: table1 })
+            .unwrap();
+        let tablet2 = db
+            .tablet_manager()
+            .get_tablet(TabletId::Table { table_id: table2 })
+            .unwrap();
+
+        assert!(!tablet_has_table_entries(&system, table1));
+        assert!(!tablet_has_table_entries(&system, table2));
+        assert!(tablet_has_table_entries(&tablet1, table1));
+        assert!(tablet_has_table_entries(&tablet2, table2));
+    }
+
+    #[tokio::test]
+    async fn test_phase3_cross_tablet_rollback_cleans_all_tablets() {
+        let dir = tempdir().unwrap();
+        let db = Database::open(DatabaseConfig::with_data_dir(dir.path())).unwrap();
+
+        db.execute_query("CREATE TABLE p3_rb_t1 (id INT PRIMARY KEY, v INT)")
+            .await
+            .unwrap();
+        db.execute_query("CREATE TABLE p3_rb_t2 (id INT PRIMARY KEY, v INT)")
+            .await
+            .unwrap();
+
+        let table1 = table_id_by_name(&db, "p3_rb_t1");
+        let table2 = table_id_by_name(&db, "p3_rb_t2");
+        mount_user_tablet(&db, table1);
+        mount_user_tablet(&db, table2);
+
+        db.execute_query("BEGIN").await.unwrap();
+        db.execute_query("INSERT INTO p3_rb_t1 VALUES (1, 10)")
+            .await
+            .unwrap();
+        db.execute_query("INSERT INTO p3_rb_t2 VALUES (1, 20)")
+            .await
+            .unwrap();
+        db.execute_query("ROLLBACK").await.unwrap();
+
+        let key1 = table_int_pk_key(table1, 1);
+        let key2 = table_int_pk_key(table2, 1);
+        let tablet1 = db
+            .tablet_manager()
+            .get_tablet(TabletId::Table { table_id: table1 })
+            .unwrap();
+        let tablet2 = db
+            .tablet_manager()
+            .get_tablet(TabletId::Table { table_id: table2 })
+            .unwrap();
+        assert!(crate::io::block_on_sync(tablet1.get_with_owner(&key1, u64::MAX, 0)).is_none());
+        assert!(crate::io::block_on_sync(tablet2.get_with_owner(&key2, u64::MAX, 0)).is_none());
+    }
+
+    #[tokio::test]
+    async fn test_phase3_cross_tablet_snapshot_isolation() {
+        let dir = tempdir().unwrap();
+        let db = Database::open(DatabaseConfig::with_data_dir(dir.path())).unwrap();
+
+        db.execute_query("CREATE TABLE p3_si_t1 (id INT PRIMARY KEY, v INT)")
+            .await
+            .unwrap();
+        db.execute_query("CREATE TABLE p3_si_t2 (id INT PRIMARY KEY, v INT)")
+            .await
+            .unwrap();
+
+        let table1 = table_id_by_name(&db, "p3_si_t1");
+        let table2 = table_id_by_name(&db, "p3_si_t2");
+        mount_user_tablet(&db, table1);
+        mount_user_tablet(&db, table2);
+
+        let key1 = table_int_pk_key(table1, 1);
+        let key2 = table_int_pk_key(table2, 1);
+
+        let mut writer = db.txn_service.begin_explicit(false).unwrap();
+        db.txn_service
+            .put_on_table(&mut writer, table1, key1.clone(), b"v1".to_vec())
+            .await
+            .unwrap();
+        db.txn_service
+            .put_on_table(&mut writer, table2, key2.clone(), b"v2".to_vec())
+            .await
+            .unwrap();
+
+        let reader_before = db.txn_service.begin(true).unwrap();
+        db.txn_service.commit(writer).await.unwrap();
+
+        assert_eq!(
+            db.txn_service
+                .get_on_table(&reader_before, table1, &key1)
+                .await
+                .unwrap(),
+            None
+        );
+        assert_eq!(
+            db.txn_service
+                .get_on_table(&reader_before, table2, &key2)
+                .await
+                .unwrap(),
+            None
+        );
+
+        let reader_after = db.txn_service.begin(true).unwrap();
+        assert_eq!(
+            db.txn_service
+                .get_on_table(&reader_after, table1, &key1)
+                .await
+                .unwrap(),
+            Some(b"v1".to_vec())
+        );
+        assert_eq!(
+            db.txn_service
+                .get_on_table(&reader_after, table2, &key2)
+                .await
+                .unwrap(),
+            Some(b"v2".to_vec())
+        );
+    }
+
+    #[tokio::test]
+    async fn test_phase3_lock_conflict_only_on_same_tablet() {
+        let dir = tempdir().unwrap();
+        let db = Database::open(DatabaseConfig::with_data_dir(dir.path())).unwrap();
+
+        db.execute_query("CREATE TABLE p3_lock_t1 (id INT PRIMARY KEY, v INT)")
+            .await
+            .unwrap();
+        db.execute_query("CREATE TABLE p3_lock_t2 (id INT PRIMARY KEY, v INT)")
+            .await
+            .unwrap();
+
+        let table1 = table_id_by_name(&db, "p3_lock_t1");
+        let table2 = table_id_by_name(&db, "p3_lock_t2");
+        mount_user_tablet(&db, table1);
+        mount_user_tablet(&db, table2);
+
+        let key1 = table_int_pk_key(table1, 1);
+        let key2 = table_int_pk_key(table2, 1);
+
+        let mut txn1 = db.txn_service.begin_explicit(false).unwrap();
+        db.txn_service
+            .put_on_table(&mut txn1, table1, key1.clone(), b"owner1".to_vec())
+            .await
+            .unwrap();
+
+        let mut txn2 = db.txn_service.begin_explicit(false).unwrap();
+        db.txn_service
+            .put_on_table(&mut txn2, table2, key2.clone(), b"owner2".to_vec())
+            .await
+            .unwrap();
+
+        let mut txn3 = db.txn_service.begin_explicit(false).unwrap();
+        let conflict = db
+            .txn_service
+            .put_on_table(&mut txn3, table1, key1.clone(), b"conflict".to_vec())
+            .await;
+        assert!(matches!(
+            conflict,
+            Err(crate::util::error::TiSqlError::KeyIsLocked { .. })
+        ));
+
+        db.txn_service.commit(txn2).await.unwrap();
+        db.txn_service.rollback(txn1).unwrap();
+        db.txn_service.rollback(txn3).unwrap();
     }
 
     #[tokio::test]

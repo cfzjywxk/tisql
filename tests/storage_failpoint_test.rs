@@ -30,12 +30,13 @@ use tempfile::TempDir;
 use fail::fail_point;
 use tisql::new_lsn_provider;
 use tisql::tablet::WriteBatch;
+use tisql::tablet::{RoutedTabletStorage, TabletId};
 use tisql::testkit::{
     ClogBatch, ConcurrencyManager, FileClogConfig, FileClogService, IlogConfig, IlogService,
     IlogTruncateStats, LocalTso, LsmConfigBuilder, LsmEngine, LsmRecovery, RecoveryResult,
-    TransactionService, TruncateStats, Version,
+    TabletManager, TransactionService, TruncateStats, Version,
 };
-use tisql::{ClogService, StorageEngine, TxnService, V26BoundaryMode};
+use tisql::{ClogService, PessimisticStorage, StorageEngine, TxnService, V26BoundaryMode};
 
 fn make_test_io() -> std::sync::Arc<tisql::io::IoService> {
     tisql::io::IoService::new(32).unwrap()
@@ -147,6 +148,78 @@ async fn create_test_txn_service_with_unified_logs(
         cm,
     ));
     (engine, ilog, clog, txn_service)
+}
+
+async fn create_multi_tablet_routed_txn_service(
+    dir: &TempDir,
+) -> (
+    Arc<TabletManager>,
+    Arc<TransactionService<RoutedTabletStorage, FileClogService, LocalTso>>,
+    u64,
+    u64,
+) {
+    let lsn_provider = new_lsn_provider();
+
+    let open_tablet = |tablet_dir: &std::path::Path| -> Arc<LsmEngine> {
+        let ilog = Arc::new(
+            IlogService::open(
+                IlogConfig::new(tablet_dir),
+                Arc::clone(&lsn_provider),
+                make_test_io(),
+                &tokio::runtime::Handle::current(),
+            )
+            .unwrap(),
+        );
+        Arc::new(
+            LsmEngine::open_with_recovery(
+                LsmConfigBuilder::new(tablet_dir)
+                    .memtable_size(256)
+                    .max_frozen_memtables(8)
+                    .build_unchecked(),
+                Arc::clone(&lsn_provider),
+                ilog,
+                Version::new(),
+                make_test_io(),
+            )
+            .unwrap(),
+        )
+    };
+
+    let system_dir = dir.path().join("system_engine");
+    let system_engine = open_tablet(&system_dir);
+
+    let manager = Arc::new(
+        TabletManager::new(
+            dir.path(),
+            Arc::clone(&lsn_provider),
+            Arc::clone(&system_engine),
+        )
+        .unwrap(),
+    );
+
+    let table1 = 1000;
+    let table2 = 1001;
+    for table_id in [table1, table2] {
+        let tablet_id = TabletId::Table { table_id };
+        let tablet_dir = manager.tablet_dir(tablet_id);
+        let tablet = open_tablet(&tablet_dir);
+        manager.insert_tablet(tablet_id, tablet).unwrap();
+    }
+
+    let routed = Arc::new(RoutedTabletStorage::new(Arc::clone(&manager)));
+    let clog = Arc::new(
+        FileClogService::open_with_lsn_provider(
+            FileClogConfig::with_dir(dir.path()),
+            Arc::clone(&lsn_provider),
+            make_test_io(),
+            &tokio::runtime::Handle::current(),
+        )
+        .unwrap(),
+    );
+    let tso = Arc::new(LocalTso::new(1));
+    let cm = Arc::new(ConcurrencyManager::new(0));
+    let txn_service = Arc::new(TransactionService::new(routed, clog, tso, cm));
+    (manager, txn_service, table1, table2)
 }
 
 #[derive(Debug)]
@@ -269,6 +342,99 @@ async fn test_v26_mode_runtime_switch_normalizes_to_on() {
 
     let stats = run_log_gc_cycle(&engine, &ilog, &clog).await.unwrap();
     assert_eq!(stats.safe_lsn, safe_expected);
+
+    scenario.teardown();
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn test_phase3_failpoint_partial_finalize_across_tablets() {
+    let scenario = fail::FailScenario::setup();
+    let dir = tempfile::tempdir().unwrap();
+    let (manager, txn_service, table1, table2) = create_multi_tablet_routed_txn_service(&dir).await;
+
+    let key1 = tisql::codec::key::encode_record_key_with_handle(table1, 1);
+    let key2 = tisql::codec::key::encode_record_key_with_handle(table2, 1);
+
+    let mut ctx = txn_service.begin_explicit(false).unwrap();
+    txn_service
+        .put_on_table(&mut ctx, table1, key1.clone(), b"v1".to_vec())
+        .await
+        .unwrap();
+    txn_service
+        .put_on_table(&mut ctx, table2, key2.clone(), b"v2".to_vec())
+        .await
+        .unwrap();
+
+    fail::cfg("tablet_routed_finalize_after_first_tablet", "panic").unwrap();
+    let join = tokio::spawn({
+        let txn_service = Arc::clone(&txn_service);
+        async move { txn_service.commit(ctx).await }
+    })
+    .await;
+    assert!(
+        join.is_err(),
+        "failpoint should interrupt commit after first-tablet finalize"
+    );
+    fail::remove("tablet_routed_finalize_after_first_tablet");
+
+    let tablet1 = manager
+        .get_tablet(TabletId::Table { table_id: table1 })
+        .unwrap();
+    let tablet2 = manager
+        .get_tablet(TabletId::Table { table_id: table2 })
+        .unwrap();
+
+    // Deterministic BTree tablet order finalizes table1 first, then failpoint trips.
+    assert_eq!(
+        tablet1.get_with_owner(&key1, u64::MAX, 0).await,
+        Some(b"v1".to_vec())
+    );
+    assert_eq!(tablet2.get_with_owner(&key2, u64::MAX, 0).await, None);
+
+    scenario.teardown();
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn test_phase3_failpoint_partial_abort_across_tablets() {
+    let scenario = fail::FailScenario::setup();
+    let dir = tempfile::tempdir().unwrap();
+    let (manager, txn_service, table1, table2) = create_multi_tablet_routed_txn_service(&dir).await;
+
+    let key1 = tisql::codec::key::encode_record_key_with_handle(table1, 11);
+    let key2 = tisql::codec::key::encode_record_key_with_handle(table2, 22);
+
+    let mut ctx = txn_service.begin_explicit(false).unwrap();
+    let owner_ts = ctx.start_ts();
+    txn_service
+        .put_on_table(&mut ctx, table1, key1.clone(), b"v11".to_vec())
+        .await
+        .unwrap();
+    txn_service
+        .put_on_table(&mut ctx, table2, key2.clone(), b"v22".to_vec())
+        .await
+        .unwrap();
+
+    fail::cfg("tablet_routed_abort_after_first_tablet", "panic").unwrap();
+    let panic =
+        std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| txn_service.rollback(ctx)));
+    assert!(
+        panic.is_err(),
+        "failpoint should interrupt rollback after first-tablet abort"
+    );
+    fail::remove("tablet_routed_abort_after_first_tablet");
+
+    let tablet1 = manager
+        .get_tablet(TabletId::Table { table_id: table1 })
+        .unwrap();
+    let tablet2 = manager
+        .get_tablet(TabletId::Table { table_id: table2 })
+        .unwrap();
+
+    assert_eq!(tablet1.get_lock_owner(&key1), None);
+    assert_eq!(tablet2.get_lock_owner(&key2), Some(owner_ts));
+
+    // Cleanup residual pending lock on table2 so drop checks stay clean.
+    tablet2.abort_pending(&[key2], owner_ts);
 
     scenario.teardown();
 }
