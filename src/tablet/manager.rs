@@ -554,4 +554,293 @@ mod tests {
         assert!(system_dir.exists());
         assert!(legacy_sst.exists());
     }
+
+    // ==================== Phase-2 QA Tests ====================
+
+    /// T2.2: insert_tablet adds a mounted tablet and registers it in desired_tablets.
+    #[test]
+    fn test_insert_tablet_mounts_and_registers() {
+        let dir = TempDir::new().unwrap();
+        let lsn = new_lsn_provider();
+        let manager = TabletManager::new(
+            dir.path(),
+            Arc::clone(&lsn),
+            open_test_system_tablet(dir.path()),
+        )
+        .unwrap();
+
+        let user_tablet_id = TabletId::Table {
+            table_id: USER_TABLE_ID_START + 42,
+        };
+        let user_engine =
+            Arc::new(TabletEngine::open(LsmConfig::new(dir.path().join("user42"))).unwrap());
+
+        manager
+            .insert_tablet(user_tablet_id, Arc::clone(&user_engine))
+            .unwrap();
+
+        // Mounted: get_tablet returns Some
+        assert!(
+            manager.get_tablet(user_tablet_id).is_some(),
+            "inserted tablet should be retrievable via get_tablet"
+        );
+        // all_tablets includes both system and user
+        let all = manager.all_tablets();
+        assert_eq!(all.len(), 2);
+        // desired_tablets includes the new tablet
+        let desired = manager.desired_tablets();
+        assert!(desired.contains(&user_tablet_id));
+        // Directory was created
+        assert!(manager.tablet_dir(user_tablet_id).exists());
+    }
+
+    /// T2.2: register_desired_tablets is additive and idempotent.
+    #[test]
+    fn test_register_desired_tablets_idempotent() {
+        let dir = TempDir::new().unwrap();
+        let manager = TabletManager::new(
+            dir.path(),
+            new_lsn_provider(),
+            open_test_system_tablet(dir.path()),
+        )
+        .unwrap();
+
+        let tid = TabletId::Table {
+            table_id: USER_TABLE_ID_START + 1,
+        };
+
+        // Register once
+        manager.register_desired_tablets([tid]).unwrap();
+        assert!(manager.desired_tablets().contains(&tid));
+        assert!(manager.tablet_dir(tid).exists());
+
+        // Register same tablet again — no error, no duplication
+        manager.register_desired_tablets([tid]).unwrap();
+        let desired = manager.desired_tablets();
+        assert_eq!(
+            desired.iter().filter(|&&t| t == tid).count(),
+            1,
+            "desired_tablets should not duplicate on re-registration"
+        );
+    }
+
+    /// T2.2: ensure_tablet_dir is idempotent — calling twice succeeds.
+    #[test]
+    fn test_ensure_tablet_dir_idempotent() {
+        let dir = TempDir::new().unwrap();
+        let manager = TabletManager::new(
+            dir.path(),
+            new_lsn_provider(),
+            open_test_system_tablet(dir.path()),
+        )
+        .unwrap();
+
+        let tid = TabletId::LocalIndex {
+            table_id: USER_TABLE_ID_START,
+            index_id: 999,
+        };
+        let path1 = manager.ensure_tablet_dir(tid).unwrap();
+        let path2 = manager.ensure_tablet_dir(tid).unwrap();
+        assert_eq!(path1, path2);
+        assert!(path1.exists());
+    }
+
+    /// T2.2: tablet_dir produces canonical paths matching TabletId::dir_name.
+    #[test]
+    fn test_tablet_dir_path_correctness() {
+        let dir = TempDir::new().unwrap();
+        let manager = TabletManager::new(
+            dir.path(),
+            new_lsn_provider(),
+            open_test_system_tablet(dir.path()),
+        )
+        .unwrap();
+
+        assert_eq!(
+            manager.tablet_dir(TabletId::System),
+            dir.path().join("tablets").join("system")
+        );
+        assert_eq!(
+            manager.tablet_dir(TabletId::Table {
+                table_id: USER_TABLE_ID_START
+            }),
+            dir.path()
+                .join("tablets")
+                .join(format!("t_{USER_TABLE_ID_START}"))
+        );
+        assert_eq!(
+            manager.tablet_dir(TabletId::LocalIndex {
+                table_id: USER_TABLE_ID_START,
+                index_id: 77
+            }),
+            dir.path()
+                .join("tablets")
+                .join(format!("i_{USER_TABLE_ID_START}_77"))
+        );
+    }
+
+    /// T2.5: commit_reservation_stats reflects alloc/release counters.
+    #[test]
+    fn test_commit_reservation_stats_counters() {
+        let dir = TempDir::new().unwrap();
+        let manager = TabletManager::new(
+            dir.path(),
+            new_lsn_provider(),
+            open_test_system_tablet(dir.path()),
+        )
+        .unwrap();
+
+        let stats_before = manager.commit_reservation_stats();
+        assert_eq!(stats_before.active, 0);
+        assert_eq!(stats_before.total_allocated, 0);
+        assert_eq!(stats_before.total_released, 0);
+
+        let _lsn1 = manager.alloc_and_reserve_commit_lsn(200);
+        let _lsn2 = manager.alloc_and_reserve_commit_lsn(201);
+
+        let stats_mid = manager.commit_reservation_stats();
+        assert_eq!(stats_mid.active, 2);
+        assert_eq!(stats_mid.total_allocated, 2);
+
+        manager.release_commit_lsn(200);
+
+        let stats_after = manager.commit_reservation_stats();
+        assert_eq!(stats_after.active, 1);
+        assert_eq!(stats_after.total_released, 1);
+
+        manager.release_commit_lsn(201);
+
+        let stats_final = manager.commit_reservation_stats();
+        assert_eq!(stats_final.active, 0);
+        assert_eq!(stats_final.total_allocated, 2);
+        assert_eq!(stats_final.total_released, 2);
+    }
+
+    /// T2.5: multiple reservations — min_reserved_lsn returns the smallest.
+    #[test]
+    fn test_multiple_reservations_min_ordering() {
+        let dir = TempDir::new().unwrap();
+        let manager = TabletManager::new(
+            dir.path(),
+            new_lsn_provider(),
+            open_test_system_tablet(dir.path()),
+        )
+        .unwrap();
+
+        let lsn1 = manager.alloc_and_reserve_commit_lsn(300);
+        let lsn2 = manager.alloc_and_reserve_commit_lsn(301);
+        assert!(lsn1 < lsn2, "LSNs should be monotonically increasing");
+        assert_eq!(
+            manager.min_reserved_lsn(),
+            Some(lsn1),
+            "min_reserved_lsn should return the earlier reservation"
+        );
+
+        // Release the smaller → min advances to second
+        manager.release_commit_lsn(300);
+        assert_eq!(
+            manager.min_reserved_lsn(),
+            Some(lsn2),
+            "after releasing first, min should advance to second"
+        );
+
+        manager.release_commit_lsn(301);
+        assert_eq!(manager.min_reserved_lsn(), None);
+    }
+
+    /// T2.2: tablets_root returns the canonical tablets/ subdirectory.
+    #[test]
+    fn test_tablets_root_created_on_init() {
+        let dir = TempDir::new().unwrap();
+        let _manager = TabletManager::new(
+            dir.path(),
+            new_lsn_provider(),
+            open_test_system_tablet(dir.path()),
+        )
+        .unwrap();
+
+        assert!(
+            dir.path().join("tablets").exists(),
+            "tablets root should be created by TabletManager::new"
+        );
+        assert!(
+            dir.path().join("tablets").join("system").exists(),
+            "system tablet dir should be created by TabletManager::new"
+        );
+    }
+
+    /// T2.2: derive_tablet_inventory with multiple user tables and indexes
+    /// produces distinct tablet IDs per table and per index.
+    #[test]
+    fn test_derive_inventory_multiple_user_tables() {
+        let mut cache = empty_cache();
+
+        // Two user tables with indexes
+        for offset in [0u64, 1] {
+            let tid = USER_TABLE_ID_START + offset;
+            let name = format!("t_{offset}");
+            let mut table = TableDef::new(tid, name.clone(), "default".to_string(), vec![], vec![]);
+            table.add_index(IndexDef::new(
+                5000 + offset,
+                format!("idx_{offset}"),
+                vec![1],
+                false,
+            ));
+            cache
+                .tables
+                .insert(("default".to_string(), name.clone()), table);
+            cache
+                .table_id_map
+                .insert(tid, ("default".to_string(), name));
+        }
+
+        let inventory = derive_tablet_inventory(&cache);
+
+        // System + 2 table tablets + 2 index tablets = 5
+        assert_eq!(inventory.len(), 5);
+        assert!(inventory.contains(&TabletId::System));
+        assert!(inventory.contains(&TabletId::Table {
+            table_id: USER_TABLE_ID_START
+        }));
+        assert!(inventory.contains(&TabletId::Table {
+            table_id: USER_TABLE_ID_START + 1
+        }));
+        assert!(inventory.contains(&TabletId::LocalIndex {
+            table_id: USER_TABLE_ID_START,
+            index_id: 5000
+        }));
+        assert!(inventory.contains(&TabletId::LocalIndex {
+            table_id: USER_TABLE_ID_START + 1,
+            index_id: 5001
+        }));
+    }
+
+    /// T2.2: discover_existing_tablet_dirs skips non-directory entries (files).
+    #[test]
+    fn test_discover_skips_non_directory_entries() {
+        let dir = TempDir::new().unwrap();
+        let manager = TabletManager::new(
+            dir.path(),
+            new_lsn_provider(),
+            open_test_system_tablet(dir.path()),
+        )
+        .unwrap();
+
+        // Create a regular file (not a directory) in tablets/
+        let tablets_root = manager.tablets_root();
+        std::fs::write(tablets_root.join("t_1000"), b"not a dir").unwrap();
+
+        // Also create a valid user tablet dir
+        let valid_tid = TabletId::Table {
+            table_id: USER_TABLE_ID_START + 99,
+        };
+        std::fs::create_dir_all(tablets_root.join(valid_tid.dir_name())).unwrap();
+
+        let inventory = manager.register_catalog_inventory(&empty_cache()).unwrap();
+        let inventory: BTreeSet<_> = inventory.into_iter().collect();
+
+        // The file should be ignored; the valid dir should be discovered
+        assert!(inventory.contains(&valid_tid));
+        assert!(!inventory.contains(&TabletId::Table { table_id: 1000 }));
+    }
 }

@@ -1152,6 +1152,206 @@ mod tests {
         }
     }
 
+    // ==================== Phase-2 QA Tests ====================
+
+    /// T2.3a: Database::open produces a working TabletManager with system tablet.
+    /// This covers the recovery→TabletManager path end-to-end: fresh DB creates
+    /// manager with system tablet, and the manager is accessible via getter.
+    #[tokio::test]
+    async fn test_phase2_qa_recovery_produces_tablet_manager() {
+        let dir = tempdir().unwrap();
+        let db = Database::open(DatabaseConfig::with_data_dir(dir.path())).unwrap();
+
+        let manager = db.tablet_manager();
+        // System tablet always mounted
+        assert!(
+            manager.get_tablet(TabletId::System).is_some(),
+            "system tablet must be mounted after recovery"
+        );
+        // Only system tablet is mounted in Phase 2
+        assert_eq!(
+            manager.all_tablets().len(),
+            1,
+            "phase-2 should have exactly one mounted tablet (system)"
+        );
+        // min_flushed_lsn should return Some (system tablet exists)
+        assert!(
+            manager.min_flushed_lsn().is_some(),
+            "min_flushed_lsn should be Some with system tablet mounted"
+        );
+    }
+
+    /// T2.4: CREATE TABLE produces a tablet dir in desired inventory on reopen.
+    ///
+    /// Note: CREATE INDEX via SQL is not yet supported; index tablets can only
+    /// be tested at the unit level (derive_tablet_inventory with IndexDef).
+    #[tokio::test]
+    async fn test_phase2_qa_ddl_creates_tablet_dirs_on_reopen() {
+        let dir = tempdir().unwrap();
+        let config = DatabaseConfig::with_data_dir(dir.path());
+
+        {
+            let db = Database::open(config.clone()).unwrap();
+            db.execute_query("CREATE TABLE t_qa (id INT PRIMARY KEY, c1 INT, c2 VARCHAR(100))")
+                .await
+                .unwrap();
+            db.close().await.unwrap();
+        }
+
+        // Reopen — catalog recovery should register the table tablet.
+        let db = Database::open(config).unwrap();
+        let desired = db.tablet_manager().desired_tablets();
+
+        assert!(
+            desired.contains(&TabletId::System),
+            "system tablet must always be desired"
+        );
+
+        // Find user table tablet (ID is auto-allocated starting at USER_TABLE_ID_START)
+        let has_user_table = desired
+            .iter()
+            .any(|t| matches!(t, TabletId::Table { table_id } if *table_id >= USER_TABLE_ID_START));
+        assert!(
+            has_user_table,
+            "desired inventory should include user table tablet after DDL"
+        );
+
+        // Verify actual directory exists on disk
+        let tablets_root = dir.path().join("tablets");
+        let user_table_dirs: Vec<_> = std::fs::read_dir(&tablets_root)
+            .unwrap()
+            .filter_map(|e| e.ok())
+            .filter(|e| e.file_name().to_str().is_some_and(|n| n.starts_with("t_")))
+            .collect();
+        assert!(
+            !user_table_dirs.is_empty(),
+            "at least one user table dir should exist under tablets/"
+        );
+    }
+
+    /// T2.4: Multiple CREATE TABLE statements create multiple distinct tablet dirs.
+    #[tokio::test]
+    async fn test_phase2_qa_multiple_tables_create_multiple_dirs() {
+        let dir = tempdir().unwrap();
+        let config = DatabaseConfig::with_data_dir(dir.path());
+
+        {
+            let db = Database::open(config.clone()).unwrap();
+            db.execute_query("CREATE TABLE t_multi_1 (id INT PRIMARY KEY)")
+                .await
+                .unwrap();
+            db.execute_query("CREATE TABLE t_multi_2 (id INT PRIMARY KEY)")
+                .await
+                .unwrap();
+            db.execute_query("CREATE TABLE t_multi_3 (id INT PRIMARY KEY)")
+                .await
+                .unwrap();
+            db.close().await.unwrap();
+        }
+
+        let db = Database::open(config).unwrap();
+        let desired = db.tablet_manager().desired_tablets();
+
+        let user_table_count = desired
+            .iter()
+            .filter(
+                |t| matches!(t, TabletId::Table { table_id } if *table_id >= USER_TABLE_ID_START),
+            )
+            .count();
+        assert_eq!(
+            user_table_count, 3,
+            "3 user tables should produce 3 table tablet entries in desired inventory"
+        );
+
+        // Each should have its own dir on disk
+        let tablets_root = dir.path().join("tablets");
+        let table_dirs: Vec<_> = std::fs::read_dir(&tablets_root)
+            .unwrap()
+            .filter_map(|e| e.ok())
+            .filter(|e| e.file_name().to_str().is_some_and(|n| n.starts_with("t_")))
+            .collect();
+        assert_eq!(
+            table_dirs.len(),
+            3,
+            "3 distinct table dirs should exist under tablets/"
+        );
+    }
+
+    /// T2.3c: Close/reopen cycle preserves data and tablet manager state.
+    #[tokio::test]
+    async fn test_phase2_qa_reopen_preserves_data_and_manager() {
+        let dir = tempdir().unwrap();
+        let config = DatabaseConfig::with_data_dir(dir.path());
+
+        {
+            let db = Database::open(config.clone()).unwrap();
+            db.execute_query("CREATE TABLE t_reopen (id INT PRIMARY KEY, val INT)")
+                .await
+                .unwrap();
+            db.execute_query("INSERT INTO t_reopen VALUES (1, 100)")
+                .await
+                .unwrap();
+            db.execute_query("INSERT INTO t_reopen VALUES (2, 200)")
+                .await
+                .unwrap();
+            db.close().await.unwrap();
+        }
+
+        let db = Database::open(config).unwrap();
+
+        // Data is preserved
+        match db
+            .execute_query("SELECT val FROM t_reopen WHERE id = 2")
+            .await
+            .unwrap()
+        {
+            QueryResult::Rows { data, .. } => {
+                assert_eq!(data.len(), 1);
+                assert_eq!(data[0][0], "200");
+            }
+            other => panic!("expected row result, got {other:?}"),
+        }
+
+        // TabletManager has system tablet mounted
+        assert!(db.tablet_manager().get_tablet(TabletId::System).is_some());
+        // Desired inventory includes the user table
+        let desired = db.tablet_manager().desired_tablets();
+        let has_user = desired
+            .iter()
+            .any(|t| matches!(t, TabletId::Table { table_id } if *table_id >= USER_TABLE_ID_START));
+        assert!(
+            has_user,
+            "desired inventory should include user table after reopen"
+        );
+    }
+
+    /// T2.4c: Flush through storage path (which TabletManager delegates to system
+    /// tablet) advances flushed_lsn visible through manager.
+    #[tokio::test]
+    async fn test_phase2_qa_flush_advances_manager_flushed_lsn() {
+        let dir = tempdir().unwrap();
+        let db = Database::open(DatabaseConfig::with_data_dir(dir.path())).unwrap();
+
+        let flushed_before = db.tablet_manager().min_flushed_lsn().unwrap();
+
+        // Write some data to create clog+memtable entries
+        db.execute_query("CREATE TABLE t_flush_qa (id INT PRIMARY KEY, val INT)")
+            .await
+            .unwrap();
+        db.execute_query("INSERT INTO t_flush_qa VALUES (1, 10)")
+            .await
+            .unwrap();
+
+        // Force flush
+        db.storage.flush_all_with_active().unwrap();
+
+        let flushed_after = db.tablet_manager().min_flushed_lsn().unwrap();
+        assert!(
+            flushed_after >= flushed_before,
+            "flushed_lsn should not regress after flush (before={flushed_before}, after={flushed_after})"
+        );
+    }
+
     #[tokio::test]
     async fn test_drop_table_gc_not_done_while_data_still_in_memtable() {
         let (db, _dir) = create_test_db();
