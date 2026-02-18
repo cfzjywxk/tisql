@@ -104,10 +104,11 @@ impl InnerSession {
         let exec_ctx = ExecutionCtx::from_session(&self.session);
         let plan = self.db.parse_and_bind(sql, &exec_ctx)?;
         let txn_ctx = self.session.take_current_txn();
-        let (output, returned_ctx) = self.db.execute_plan(plan, &exec_ctx, txn_ctx).await?;
+        let (output, returned_ctx) = self.db.execute_plan(plan, &exec_ctx, txn_ctx).await;
         if let Some(ctx) = returned_ctx {
             self.session.set_current_txn(ctx);
         }
+        let output = output?;
         output.into_result().await
     }
 
@@ -118,7 +119,8 @@ impl InnerSession {
     pub async fn execute_inner_sql(&self, sql: &str) -> Result<ExecutionResult> {
         let exec_ctx = ExecutionCtx::from_session(&self.session);
         let plan = self.db.parse_and_bind(sql, &exec_ctx)?;
-        let (output, _) = self.db.execute_plan(plan, &exec_ctx, None).await?;
+        let (output, _) = self.db.execute_plan(plan, &exec_ctx, None).await;
+        let output = output?;
         output.into_result().await
     }
 }

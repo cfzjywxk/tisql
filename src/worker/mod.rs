@@ -107,10 +107,10 @@ pub async fn dispatch_full_query(
         };
 
         // Execute plan (async — iterators yield during SST I/O)
-        let exec_result = db.execute_plan(plan, &exec_ctx, txn_ctx).await;
+        let (exec_result, returned_ctx) = db.execute_plan(plan, &exec_ctx, txn_ctx).await;
 
-        match exec_result {
-            Ok((ExecutionOutput::Rows { exec, .. }, returned_ctx)) => {
+        match (exec_result, returned_ctx) {
+            (Ok(ExecutionOutput::Rows { exec, .. }), returned_ctx) => {
                 // Create mpsc channel for row batches
                 let (batch_tx, batch_rx) = mpsc::channel(CHANNEL_CAPACITY);
 
@@ -124,23 +124,23 @@ pub async fn dispatch_full_query(
                 // Pull rows from operator tree and stream batches
                 stream_rows(exec, batch_tx).await;
             }
-            Ok((ExecutionOutput::Affected { count }, ctx)) => {
+            (Ok(ExecutionOutput::Affected { count }), ctx) => {
                 let _ = response_tx.send(QueryResponse::Affected {
                     count,
                     txn_ctx: ctx,
                 });
             }
-            Ok((ExecutionOutput::Ok, ctx)) => {
+            (Ok(ExecutionOutput::Ok), ctx) => {
                 let _ = response_tx.send(QueryResponse::Ok { txn_ctx: ctx });
             }
-            Ok((ExecutionOutput::OkWithEffect(_), ctx)) => {
+            (Ok(ExecutionOutput::OkWithEffect(_)), ctx) => {
                 // Effect already handled in Database::execute_plan
                 let _ = response_tx.send(QueryResponse::Ok { txn_ctx: ctx });
             }
-            Err(e) => {
+            (Err(e), ctx) => {
                 let _ = response_tx.send(QueryResponse::Error {
                     error: e,
-                    txn_ctx: None,
+                    txn_ctx: ctx,
                 });
             }
         }

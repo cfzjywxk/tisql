@@ -834,38 +834,55 @@ impl Executor for SimpleExecutor {
         txn_service: &T,
         catalog: &C,
         txn_ctx: Option<TxnCtx>,
-    ) -> Result<(ExecutionOutput, Option<TxnCtx>)> {
+    ) -> (Result<ExecutionOutput>, Option<TxnCtx>) {
         // Handle session-level commands (USE database is handled at protocol layer)
         if let LogicalPlan::UseDatabase { .. } = &plan {
-            return Ok((ExecutionOutput::Ok, txn_ctx));
+            return (Ok(ExecutionOutput::Ok), txn_ctx);
         }
 
         // Handle transaction control statements directly.
         if plan.is_transaction_control() {
             return match plan {
                 LogicalPlan::Begin { read_only } => {
-                    if txn_ctx.is_some() {
-                        return Err(TiSqlError::Internal(
-                            "Nested transactions are not supported. Use COMMIT or ROLLBACK first."
-                                .into(),
-                        ));
+                    if let Some(ctx) = txn_ctx {
+                        return (
+                            Err(TiSqlError::Internal(
+                                "Nested transactions are not supported. Use COMMIT or ROLLBACK first."
+                                    .into(),
+                            )),
+                            Some(ctx),
+                        );
                     }
-                    let mut ctx = txn_service.begin_explicit(read_only)?;
-                    ctx.set_schema_version(catalog.current_schema_version());
-                    Ok((ExecutionOutput::Ok, Some(ctx)))
+                    match txn_service.begin_explicit(read_only) {
+                        Ok(mut ctx) => {
+                            ctx.set_schema_version(catalog.current_schema_version());
+                            (Ok(ExecutionOutput::Ok), Some(ctx))
+                        }
+                        Err(e) => (Err(e), None),
+                    }
                 }
                 LogicalPlan::Commit => {
                     if let Some(ctx) = txn_ctx {
-                        self.commit_with_schema_check(ctx, txn_service, catalog)
-                            .await?;
+                        match self
+                            .commit_with_schema_check(ctx, txn_service, catalog)
+                            .await
+                        {
+                            Ok(()) => (Ok(ExecutionOutput::Ok), None),
+                            Err(e) => (Err(e), None),
+                        }
+                    } else {
+                        (Ok(ExecutionOutput::Ok), None)
                     }
-                    Ok((ExecutionOutput::Ok, None))
                 }
                 LogicalPlan::Rollback => {
                     if let Some(ctx) = txn_ctx {
-                        txn_service.rollback(ctx)?;
+                        match txn_service.rollback(ctx) {
+                            Ok(()) => (Ok(ExecutionOutput::Ok), None),
+                            Err(e) => (Err(e), None),
+                        }
+                    } else {
+                        (Ok(ExecutionOutput::Ok), None)
                     }
-                    Ok((ExecutionOutput::Ok, None))
                 }
                 _ => unreachable!(),
             };
@@ -875,35 +892,51 @@ impl Executor for SimpleExecutor {
             Some(mut ctx) => {
                 if plan.is_write() {
                     if plan.is_ddl() {
-                        return Err(TiSqlError::Internal(
-                            "DDL statements are not allowed within explicit transactions. Use COMMIT first."
-                                .into(),
-                        ));
+                        return (
+                            Err(TiSqlError::Internal(
+                                "DDL statements are not allowed within explicit transactions. Use COMMIT first."
+                                    .into(),
+                            )),
+                            Some(ctx),
+                        );
                     }
 
-                    let result = self
+                    match self
                         .execute_write_with_ctx(plan, &mut ctx, txn_service, catalog)
-                        .await?;
-                    Ok((result.into(), Some(ctx)))
+                        .await
+                    {
+                        Ok(result) => (Ok(result.into()), Some(ctx)),
+                        Err(e) => (Err(e), Some(ctx)),
+                    }
                 } else {
                     // Streaming read in explicit txn — no materialization
-                    let output = self
+                    match self
                         .execute_with_ctx(plan, &ctx, txn_service, catalog)
-                        .await?;
-                    Ok((output, Some(ctx)))
+                        .await
+                    {
+                        Ok(output) => (Ok(output), Some(ctx)),
+                        Err(e) => (Err(e), Some(ctx)),
+                    }
                 }
             }
             None => {
                 if plan.is_write() {
-                    let result = self.execute_write(plan, txn_service, catalog).await?;
-                    Ok((result.into(), None))
+                    match self.execute_write(plan, txn_service, catalog).await {
+                        Ok(result) => (Ok(result.into()), None),
+                        Err(e) => (Err(e), None),
+                    }
                 } else {
                     // Auto-commit streaming read — no materialization
-                    let ctx = txn_service.begin(true)?;
-                    let output = self
-                        .execute_with_ctx(plan, &ctx, txn_service, catalog)
-                        .await?;
-                    Ok((output, None))
+                    match txn_service.begin(true) {
+                        Ok(ctx) => match self
+                            .execute_with_ctx(plan, &ctx, txn_service, catalog)
+                            .await
+                        {
+                            Ok(output) => (Ok(output), None),
+                            Err(e) => (Err(e), None),
+                        },
+                        Err(e) => (Err(e), None),
+                    }
                 }
             }
         }

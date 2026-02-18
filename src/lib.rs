@@ -173,7 +173,7 @@ use tablet::{
 };
 use transaction::{ConcurrencyManager, TransactionService};
 use tso::LocalTso;
-use util::error::{Result, TiSqlError};
+use util::error::Result;
 
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -504,7 +504,8 @@ impl Database {
     pub async fn execute_query(&self, sql: &str) -> Result<QueryResult> {
         let exec_ctx = session::ExecutionCtx::with_db("default");
         let plan = self.parse_and_bind(sql, &exec_ctx)?;
-        let (output, _) = self.execute_plan(plan, &exec_ctx, None).await?;
+        let (output, _) = self.execute_plan(plan, &exec_ctx, None).await;
+        let output = output?;
         Self::to_query_result(output.into_result().await?)
     }
 
@@ -518,29 +519,12 @@ impl Database {
     ) -> Result<QueryResult> {
         let exec_ctx = session::ExecutionCtx::from_session(session);
         let plan = self.parse_and_bind(sql, &exec_ctx)?;
-
-        // Pre-check: execute_unified takes ownership of txn_ctx. If it errors,
-        // the txn_ctx is dropped (orphaning locks). Catch known error cases
-        // early to preserve the session's transaction state.
-        if session.has_active_txn() {
-            if matches!(&plan, sql::LogicalPlan::Begin { .. }) {
-                return Err(TiSqlError::Internal(
-                    "Nested transactions are not supported. Use COMMIT or ROLLBACK first.".into(),
-                ));
-            }
-            if plan.is_ddl() {
-                return Err(TiSqlError::Internal(
-                    "DDL statements are not allowed within explicit transactions. Use COMMIT first."
-                        .into(),
-                ));
-            }
-        }
-
         let txn_ctx = session.take_current_txn();
-        let (output, returned_ctx) = self.execute_plan(plan, &exec_ctx, txn_ctx).await?;
+        let (output, returned_ctx) = self.execute_plan(plan, &exec_ctx, txn_ctx).await;
         if let Some(ctx) = returned_ctx {
             session.set_current_txn(ctx);
         }
+        let output = output?;
         Self::to_query_result(output.into_result().await?)
     }
 
@@ -702,15 +686,16 @@ impl Database {
 
     /// Execute a pre-bound logical plan.
     ///
-    /// Returns `ExecutionOutput` (with lazy `Execution` for reads) and the
-    /// optionally-updated `TxnCtx`. This method runs blocking I/O and should
-    /// be called inside `tokio::task::spawn_blocking`.
+    /// Returns statement execution result and the optionally-updated `TxnCtx`.
+    ///
+    /// On explicit transaction statement failure, this still returns the
+    /// original `TxnCtx` so callers can keep the transaction open.
     pub(crate) async fn execute_plan(
         &self,
         plan: sql::LogicalPlan,
         exec_ctx: &session::ExecutionCtx,
         txn_ctx: Option<transaction::TxnCtx>,
-    ) -> Result<(ExecutionOutput, Option<transaction::TxnCtx>)> {
+    ) -> (Result<ExecutionOutput>, Option<transaction::TxnCtx>) {
         let (output, ctx) = self
             .executor
             .execute_unified(
@@ -720,19 +705,19 @@ impl Database {
                 &self.catalog,
                 txn_ctx,
             )
-            .await?;
+            .await;
 
-        // Intercept DDL effects to register dropped tables for GC
-        if let ExecutionOutput::OkWithEffect(executor::DdlEffect::TableDropped {
+        if let Ok(ExecutionOutput::OkWithEffect(executor::DdlEffect::TableDropped {
             table_id,
             commit_ts,
-        }) = &output
+        })) = &output
         {
+            // Intercept DDL effects to register dropped tables for GC.
             self.storage.add_dropped_table(*table_id, *commit_ts);
             self.gc_worker.notify();
         }
 
-        Ok((output, ctx))
+        (output, ctx)
     }
 
     /// Close the database (flush memtables and sync logs).

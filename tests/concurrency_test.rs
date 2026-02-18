@@ -1778,6 +1778,94 @@ mod explicit_transaction_tests {
         db.close().await.unwrap();
     }
 
+    /// Statement lock-conflict errors should keep explicit transaction context.
+    #[tokio::test]
+    async fn test_lock_conflict_keeps_explicit_txn_active() {
+        let dir = tempdir().unwrap();
+        let config = DatabaseConfig::with_data_dir(dir.path());
+        let db = Database::open(config).unwrap();
+        let mut s1 = Session::new();
+        let mut s2 = Session::new();
+
+        db.execute_query("CREATE TABLE lock_ctx_local (a INT PRIMARY KEY, b INT)")
+            .await
+            .unwrap();
+
+        db.execute_query_with_session("BEGIN", &mut s1)
+            .await
+            .unwrap();
+        db.execute_query_with_session("INSERT INTO lock_ctx_local VALUES (2, 0)", &mut s1)
+            .await
+            .unwrap();
+
+        db.execute_query_with_session("BEGIN", &mut s2)
+            .await
+            .unwrap();
+        let err = db
+            .execute_query_with_session("INSERT INTO lock_ctx_local VALUES (2, 22)", &mut s2)
+            .await
+            .unwrap_err();
+        assert!(
+            err.to_string().to_lowercase().contains("locked"),
+            "expected lock conflict, got: {err}"
+        );
+        assert!(
+            s2.has_active_txn(),
+            "explicit txn should remain active after statement lock error"
+        );
+
+        db.execute_query_with_session("ROLLBACK", &mut s1)
+            .await
+            .unwrap();
+
+        db.execute_query_with_session("INSERT INTO lock_ctx_local VALUES (2, 22)", &mut s2)
+            .await
+            .unwrap();
+
+        db.execute_query_with_session("BEGIN", &mut s1)
+            .await
+            .unwrap();
+        let err = db
+            .execute_query_with_session("INSERT INTO lock_ctx_local VALUES (2, 20)", &mut s1)
+            .await
+            .unwrap_err();
+        assert!(
+            err.to_string().to_lowercase().contains("locked"),
+            "s1 should hit lock conflict, got: {err}"
+        );
+
+        match db
+            .execute_query_with_session("SELECT a, b FROM lock_ctx_local", &mut s1)
+            .await
+            .unwrap()
+        {
+            QueryResult::Rows { data, .. } => {
+                assert!(data.is_empty(), "must not see conn2 uncommitted row");
+            }
+            other => panic!("Expected rows, got: {other:?}"),
+        }
+
+        db.execute_query_with_session("ROLLBACK", &mut s1)
+            .await
+            .unwrap();
+        db.execute_query_with_session("ROLLBACK", &mut s2)
+            .await
+            .unwrap();
+
+        match db
+            .execute_query("SELECT a, b FROM lock_ctx_local")
+            .await
+            .unwrap()
+        {
+            QueryResult::Rows { data, .. } => {
+                assert!(data.is_empty(), "table should remain empty after rollbacks");
+            }
+            other => panic!("Expected rows, got: {other:?}"),
+        }
+
+        db.close().await.unwrap();
+    }
+
     /// Test multiple INSERT statements within a transaction.
     ///
     /// Note: Read-your-writes is not yet supported, so UPDATE/DELETE within the same

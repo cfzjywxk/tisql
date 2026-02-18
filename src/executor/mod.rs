@@ -171,7 +171,11 @@ pub trait Executor: Send + Sync {
     /// - `txn_ctx`: Optional TxnCtx for explicit transactions
     ///
     /// ## Returns
-    /// - `(ExecutionResult, Option<TxnCtx>)`: Result and returned TxnCtx (if still active)
+    /// - `(Result<ExecutionOutput>, Option<TxnCtx>)`:
+    ///   - `Ok(output)` on successful statement execution
+    ///   - `Err(error)` on statement failure
+    ///   - `Option<TxnCtx>` always carries the post-statement transaction context
+    ///     (for explicit transactions, statement errors should keep the txn open)
     fn execute_unified<T: TxnService, C: Catalog>(
         &self,
         plan: LogicalPlan,
@@ -179,5 +183,5 @@ pub trait Executor: Send + Sync {
         txn_service: &T,
         catalog: &C,
         txn_ctx: Option<TxnCtx>,
-    ) -> impl std::future::Future<Output = Result<(ExecutionOutput, Option<TxnCtx>)>> + Send;
+    ) -> impl std::future::Future<Output = (Result<ExecutionOutput>, Option<TxnCtx>)> + Send;
 }

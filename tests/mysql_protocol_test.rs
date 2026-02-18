@@ -1010,6 +1010,66 @@ async fn test_write_write_conflict_insert() {
     assert_eq!(val, "from_conn1");
 }
 
+/// Statement-level lock conflict must not drop explicit transaction state.
+#[tokio::test]
+async fn test_lock_conflict_keeps_explicit_txn_context() {
+    let ctx = TestContext::new().await;
+    let mut conn1 = ctx.conn().await;
+    let mut conn2 = ctx.conn().await;
+
+    exec(
+        &mut conn1,
+        "CREATE TABLE lock_ctx (a INT PRIMARY KEY, b INT)",
+    )
+    .await;
+
+    // Conn1 holds the key lock first.
+    exec(&mut conn1, "BEGIN").await;
+    exec(&mut conn1, "INSERT INTO lock_ctx VALUES (2, 0)").await;
+
+    // Conn2 starts explicit txn and hits lock conflict.
+    exec(&mut conn2, "BEGIN").await;
+    let err = conn2
+        .query_drop("INSERT INTO lock_ctx VALUES (2, 22)")
+        .await;
+    assert!(err.is_err(), "expected lock conflict on conn2");
+    let err_msg = format!("{:?}", err.unwrap_err()).to_lowercase();
+    assert!(
+        err_msg.contains("locked") || err_msg.contains("conflict"),
+        "error should indicate lock conflict: {err_msg}"
+    );
+
+    // Release conn1 lock, then retry on conn2.
+    exec(&mut conn1, "ROLLBACK").await;
+    exec(&mut conn2, "INSERT INTO lock_ctx VALUES (2, 22)").await;
+
+    // Conn2 must still be in explicit txn: conn1 should see lock conflict, not duplicate key.
+    exec(&mut conn1, "BEGIN").await;
+    let err = conn1
+        .query_drop("INSERT INTO lock_ctx VALUES (2, 20)")
+        .await;
+    assert!(err.is_err(), "conn1 insert should conflict with conn2 lock");
+    let err_msg = format!("{:?}", err.unwrap_err()).to_lowercase();
+    assert!(
+        err_msg.contains("locked") || err_msg.contains("conflict"),
+        "expected lock conflict (txn should still be explicit), got: {err_msg}"
+    );
+
+    // Conn1 must not see conn2's uncommitted row.
+    let rows = query_all(&mut conn1, "SELECT a, b FROM lock_ctx").await;
+    assert!(
+        rows.is_empty(),
+        "conn1 should not observe conn2 uncommitted data"
+    );
+
+    exec(&mut conn1, "ROLLBACK").await;
+    exec(&mut conn2, "ROLLBACK").await;
+
+    // After both rollbacks, table stays empty.
+    let rows = query_all(&mut conn1, "SELECT a, b FROM lock_ctx").await;
+    assert!(rows.is_empty(), "table should be empty after rollbacks");
+}
+
 /// Test that concurrent UPDATE to the same key results in lock conflict.
 #[tokio::test]
 async fn test_write_write_conflict_update() {
