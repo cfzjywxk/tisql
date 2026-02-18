@@ -1408,14 +1408,19 @@ mod tests {
         mount_user_tablet(&db, table1);
         mount_user_tablet(&db, table2);
 
-        db.execute_query("BEGIN").await.unwrap();
-        db.execute_query("INSERT INTO p3_t1 VALUES (1, 10)")
+        let mut session = Session::new();
+        db.execute_query_with_session("BEGIN", &mut session)
             .await
             .unwrap();
-        db.execute_query("INSERT INTO p3_t2 VALUES (1, 20)")
+        db.execute_query_with_session("INSERT INTO p3_t1 VALUES (1, 10)", &mut session)
             .await
             .unwrap();
-        db.execute_query("COMMIT").await.unwrap();
+        db.execute_query_with_session("INSERT INTO p3_t2 VALUES (1, 20)", &mut session)
+            .await
+            .unwrap();
+        db.execute_query_with_session("COMMIT", &mut session)
+            .await
+            .unwrap();
 
         match db
             .execute_query("SELECT v FROM p3_t1 WHERE id = 1")
@@ -1473,17 +1478,20 @@ mod tests {
         mount_user_tablet(&db, table1);
         mount_user_tablet(&db, table2);
 
-        db.execute_query("BEGIN").await.unwrap();
-        db.execute_query("INSERT INTO p3_rb_t1 VALUES (1, 10)")
+        let mut session = Session::new();
+        db.execute_query_with_session("BEGIN", &mut session)
             .await
             .unwrap();
-        db.execute_query("INSERT INTO p3_rb_t2 VALUES (1, 20)")
+        db.execute_query_with_session("INSERT INTO p3_rb_t1 VALUES (1, 10)", &mut session)
             .await
             .unwrap();
-        db.execute_query("ROLLBACK").await.unwrap();
+        db.execute_query_with_session("INSERT INTO p3_rb_t2 VALUES (1, 20)", &mut session)
+            .await
+            .unwrap();
+        db.execute_query_with_session("ROLLBACK", &mut session)
+            .await
+            .unwrap();
 
-        let key1 = table_int_pk_key(table1, 1);
-        let key2 = table_int_pk_key(table2, 1);
         let tablet1 = db
             .tablet_manager()
             .get_tablet(TabletId::Table { table_id: table1 })
@@ -1492,8 +1500,29 @@ mod tests {
             .tablet_manager()
             .get_tablet(TabletId::Table { table_id: table2 })
             .unwrap();
-        assert!(crate::io::block_on_sync(tablet1.get_with_owner(&key1, u64::MAX, 0)).is_none());
-        assert!(crate::io::block_on_sync(tablet2.get_with_owner(&key2, u64::MAX, 0)).is_none());
+        assert!(!tablet_has_table_entries(&tablet1, table1));
+        assert!(!tablet_has_table_entries(&tablet2, table2));
+
+        match db
+            .execute_query("SELECT v FROM p3_rb_t1 WHERE id = 1")
+            .await
+            .unwrap()
+        {
+            QueryResult::Rows { data, .. } => {
+                assert!(data.is_empty(), "p3_rb_t1 should be empty after rollback");
+            }
+            other => panic!("expected rows for p3_rb_t1 lookup, got {other:?}"),
+        }
+        match db
+            .execute_query("SELECT v FROM p3_rb_t2 WHERE id = 1")
+            .await
+            .unwrap()
+        {
+            QueryResult::Rows { data, .. } => {
+                assert!(data.is_empty(), "p3_rb_t2 should be empty after rollback");
+            }
+            other => panic!("expected rows for p3_rb_t2 lookup, got {other:?}"),
+        }
     }
 
     #[tokio::test]
