@@ -2922,6 +2922,182 @@ mod tests {
         }
     }
 
+    /// T5.3d (QA): Cross-tablet txn clog entries are kept as a complete transaction
+    /// group during clog truncation — never split.
+    ///
+    /// Scenario:
+    /// 1. Baseline txn (system-only) — establishes truncatable clog entries.
+    /// 2. Flush all tablets so baseline is fully durable in SSTs.
+    /// 3. Cross-tablet txn: INSERT into table_a (tablet A) + table_b (tablet B).
+    /// 4. Flush only tablet A (asymmetric progress).
+    /// 5. Run log GC — boundary must protect the cross-tablet txn.
+    /// 6. Verify clog retained enough entries for recovery.
+    /// 7. Drop DB (simulate crash — tablet B data only in clog).
+    /// 8. Reopen and verify both tables have their cross-tablet txn data.
+    ///
+    /// If the clog truncation split the cross-tablet txn (removed Puts but kept
+    /// Commit, or vice versa), recovery would lose data on tablet B.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn test_phase5_clog_truncation_preserves_cross_tablet_txn_group() {
+        let dir = tempdir().unwrap();
+        let config = DatabaseConfig::with_data_dir(dir.path());
+        let db = Database::open(config.clone()).unwrap();
+
+        // Create two user tables.
+        db.execute_query("CREATE TABLE txn_split_a (id INT PRIMARY KEY, v INT)")
+            .await
+            .unwrap();
+        db.execute_query("CREATE TABLE txn_split_b (id INT PRIMARY KEY, v INT)")
+            .await
+            .unwrap();
+        let table_a = table_id_by_name(&db, "txn_split_a");
+        let table_b = table_id_by_name(&db, "txn_split_b");
+        mount_user_tablet_durable(&db, table_a);
+        mount_user_tablet_durable(&db, table_b);
+
+        // Step 1-2: Write baseline data and flush everything so that the
+        // baseline clog entries become truncatable.
+        db.execute_query("INSERT INTO txn_split_a VALUES (100, 1000)")
+            .await
+            .unwrap();
+        db.execute_query("INSERT INTO txn_split_b VALUES (100, 2000)")
+            .await
+            .unwrap();
+        db.tablet_manager().flush_all_with_active().unwrap();
+
+        // Run one GC cycle to truncate the baseline entries.
+        let baseline_gc = db.run_log_gc_once().await.unwrap();
+        assert!(
+            baseline_gc.clog.entries_removed > 0 || baseline_gc.safe_lsn == 0,
+            "baseline GC should either truncate entries or have safe_lsn=0 (fresh db)"
+        );
+
+        // Step 3: Cross-tablet explicit txn — writes to both tablets.
+        db.execute_query("BEGIN").await.unwrap();
+        db.execute_query("INSERT INTO txn_split_a VALUES (200, 3000)")
+            .await
+            .unwrap();
+        db.execute_query("INSERT INTO txn_split_b VALUES (200, 4000)")
+            .await
+            .unwrap();
+        db.execute_query("COMMIT").await.unwrap();
+
+        // Step 4: Flush only tablet A — creates asymmetric progress.
+        // Tablet A: cross-tablet txn data is in SSTs (flushed).
+        // Tablet B: cross-tablet txn data is only in memtable (unflushed).
+        let tablet_a_engine = db
+            .tablet_manager()
+            .get_tablet(TabletId::Table { table_id: table_a })
+            .unwrap();
+        tablet_a_engine.flush_all_with_active().unwrap();
+
+        let tablet_b_engine = db
+            .tablet_manager()
+            .get_tablet(TabletId::Table { table_id: table_b })
+            .unwrap();
+        let b_unflushed = tablet_b_engine.min_unflushed_lsn();
+        assert!(
+            b_unflushed.is_some(),
+            "tablet B must have unflushed data from the cross-tablet txn"
+        );
+
+        // Step 5: Run log GC — the global boundary must protect the cross-tablet
+        // txn because tablet B still has unflushed data.
+        let gc_stats = db.run_log_gc_once().await.unwrap();
+        assert!(
+            gc_stats.safe_lsn < b_unflushed.unwrap(),
+            "safe_lsn={} must be < tablet B's min_unflushed_lsn={} to protect the cross-tablet txn",
+            gc_stats.safe_lsn,
+            b_unflushed.unwrap(),
+        );
+
+        // Verify the cross-tablet txn data is still readable before crash.
+        match db
+            .execute_query("SELECT v FROM txn_split_a WHERE id = 200")
+            .await
+            .unwrap()
+        {
+            QueryResult::Rows { data, .. } => {
+                assert_eq!(data.len(), 1, "tablet A cross-txn row must be readable");
+                assert_eq!(data[0][0], "3000");
+            }
+            other => panic!("unexpected result: {other:?}"),
+        }
+        match db
+            .execute_query("SELECT v FROM txn_split_b WHERE id = 200")
+            .await
+            .unwrap()
+        {
+            QueryResult::Rows { data, .. } => {
+                assert_eq!(data.len(), 1, "tablet B cross-txn row must be readable");
+                assert_eq!(data[0][0], "4000");
+            }
+            other => panic!("unexpected result: {other:?}"),
+        }
+
+        // Step 7: Simulate crash — drop without flushing tablet B.
+        // Tablet B's cross-tablet txn data is only recoverable from clog replay.
+        drop(db);
+
+        // Step 8: Reopen and verify both tablets have the cross-tablet txn data.
+        // If clog truncation split the txn group, tablet B's data would be lost.
+        let db2 = Database::open(config).unwrap();
+
+        // Baseline data (from step 1) must survive (it was flushed to SSTs).
+        match db2
+            .execute_query("SELECT v FROM txn_split_a WHERE id = 100")
+            .await
+            .unwrap()
+        {
+            QueryResult::Rows { data, .. } => {
+                assert_eq!(data.len(), 1, "tablet A baseline row must survive recovery");
+            }
+            other => panic!("unexpected result: {other:?}"),
+        }
+        match db2
+            .execute_query("SELECT v FROM txn_split_b WHERE id = 100")
+            .await
+            .unwrap()
+        {
+            QueryResult::Rows { data, .. } => {
+                assert_eq!(data.len(), 1, "tablet B baseline row must survive recovery");
+            }
+            other => panic!("unexpected result: {other:?}"),
+        }
+
+        // Cross-tablet txn data — the critical assertion.
+        match db2
+            .execute_query("SELECT v FROM txn_split_a WHERE id = 200")
+            .await
+            .unwrap()
+        {
+            QueryResult::Rows { data, .. } => {
+                assert_eq!(
+                    data.len(),
+                    1,
+                    "tablet A cross-txn row must survive clog truncation + recovery"
+                );
+                assert_eq!(data[0][0], "3000");
+            }
+            other => panic!("unexpected result: {other:?}"),
+        }
+        match db2
+            .execute_query("SELECT v FROM txn_split_b WHERE id = 200")
+            .await
+            .unwrap()
+        {
+            QueryResult::Rows { data, .. } => {
+                assert_eq!(
+                    data.len(),
+                    1,
+                    "tablet B cross-txn row must survive clog truncation + recovery (txn group intact)"
+                );
+                assert_eq!(data[0][0], "4000");
+            }
+            other => panic!("unexpected result: {other:?}"),
+        }
+    }
+
     #[tokio::test]
     async fn test_where_clause() {
         let (db, _dir) = create_test_db();
