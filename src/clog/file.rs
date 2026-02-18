@@ -746,7 +746,6 @@ pub struct TruncateStats {
 }
 
 impl FileClogService {
-    /// Block the current thread waiting for a group commit reply.
     /// Truncate clog entries with lsn <= safe_lsn.
     ///
     /// This rewrites the clog file keeping only entries with lsn > safe_lsn.
@@ -774,101 +773,105 @@ impl FileClogService {
             .await
             .map_err(|e| TiSqlError::Internal(format!("Clog stop_and_drain failed: {e}")))?;
 
-        let clog_path = self.config.clog_path();
-        let old_size = std::fs::metadata(&clog_path).map(|m| m.len()).unwrap_or(0);
+        let result: Result<TruncateStats> = async {
+            let clog_path = self.config.clog_path();
+            let old_size = std::fs::metadata(&clog_path).map(|m| m.len()).unwrap_or(0);
 
-        // Read all entries (safe — writer is drained)
-        let entries = self.read_all()?;
+            // Read all entries (safe — writer is drained)
+            let entries = self.read_all()?;
 
-        // Compute the max LSN per transaction. A transaction's entries must be
-        // kept or removed as a unit: individual per-entry LSN partitioning would
-        // split Put(lsn=N) / Commit(lsn=N+K) when safe_lsn falls between them.
-        let mut txn_max_lsn: std::collections::HashMap<u64, Lsn> = std::collections::HashMap::new();
-        for entry in &entries {
-            let max = txn_max_lsn.entry(entry.txn_id).or_insert(0);
-            *max = (*max).max(entry.lsn);
-        }
-
-        // Partition by transaction: keep entire txn if its max LSN > safe_lsn.
-        let (to_keep, to_remove): (Vec<_>, Vec<_>) = entries
-            .into_iter()
-            .partition(|e| txn_max_lsn[&e.txn_id] > safe_lsn);
-
-        if to_remove.is_empty() {
-            // Nothing to truncate — restart the writer
-            let file = crate::io::DmaFile::open_append_buffered(&clog_path)
-                .map_err(|e| TiSqlError::Internal(format!("Failed to reopen clog: {e}")))?;
-            self.group_writer
-                .restart(file, Arc::clone(&self.io_service), Some(&self.io_handle));
-            return Ok(TruncateStats {
-                entries_removed: 0,
-                entries_kept: to_keep.len(),
-                bytes_freed: 0,
-                new_file_size: old_size,
-            });
-        }
-
-        // Rewrite kept entries via spawn_blocking (file I/O)
-        let config_clone = self.config.clone();
-        let rewrite_result = tokio::task::spawn_blocking(move || -> Result<(usize, usize)> {
-            let clog_path = config_clone.clog_path();
-            let temp_path = clog_path.with_extension("clog.tmp");
-            {
-                let temp_file = std::fs::OpenOptions::new()
-                    .write(true)
-                    .create(true)
-                    .truncate(true)
-                    .open(&temp_path)?;
-                let mut temp_writer = BufWriter::new(temp_file);
-
-                Self::write_header(&mut temp_writer)?;
-                if !to_keep.is_empty() {
-                    Self::write_record(&mut temp_writer, &to_keep)?;
-                }
-
-                temp_writer.flush()?;
-                temp_writer.get_ref().sync_data()?;
+            // Compute the max LSN per transaction. A transaction's entries must be
+            // kept or removed as a unit: individual per-entry LSN partitioning would
+            // split Put(lsn=N) / Commit(lsn=N+K) when safe_lsn falls between them.
+            let mut txn_max_lsn: std::collections::HashMap<u64, Lsn> =
+                std::collections::HashMap::new();
+            for entry in &entries {
+                let max = txn_max_lsn.entry(entry.txn_id).or_insert(0);
+                *max = (*max).max(entry.lsn);
             }
 
-            rename_durable(&temp_path, &clog_path)?;
-            Ok((to_remove.len(), to_keep.len()))
-        })
-        .await
-        .map_err(|e| TiSqlError::Internal(format!("Clog rewrite task panicked: {e}")))?;
+            // Partition by transaction: keep entire txn if its max LSN > safe_lsn.
+            let (to_keep, to_remove): (Vec<_>, Vec<_>) = entries
+                .into_iter()
+                .partition(|e| txn_max_lsn[&e.txn_id] > safe_lsn);
 
-        match rewrite_result {
-            Ok((removed, kept)) => {
-                let file = crate::io::DmaFile::open_append_buffered(self.config.clog_path())
+            if to_remove.is_empty() {
+                // Nothing to truncate — restart the writer
+                let file = crate::io::DmaFile::open_append_buffered(&clog_path)
                     .map_err(|e| TiSqlError::Internal(format!("Failed to reopen clog: {e}")))?;
                 self.group_writer.restart(
                     file,
                     Arc::clone(&self.io_service),
                     Some(&self.io_handle),
                 );
-
-                let new_size = std::fs::metadata(self.config.clog_path())
-                    .map(|m| m.len())
-                    .unwrap_or(0);
-
-                log_info!(
-                    "Truncated clog to safe_lsn={}: removed {} entries, kept {}",
-                    safe_lsn,
-                    removed,
-                    kept
-                );
-
-                Ok(TruncateStats {
-                    entries_removed: removed,
-                    entries_kept: kept,
-                    bytes_freed: old_size.saturating_sub(new_size),
-                    new_file_size: new_size,
-                })
+                return Ok(TruncateStats {
+                    entries_removed: 0,
+                    entries_kept: to_keep.len(),
+                    bytes_freed: 0,
+                    new_file_size: old_size,
+                });
             }
-            Err(e) => {
-                self.group_writer.set_failed(format!("{e}"));
-                Err(e)
-            }
+
+            // Rewrite kept entries via spawn_blocking (file I/O)
+            let config_clone = self.config.clone();
+            let (removed, kept) = tokio::task::spawn_blocking(move || -> Result<(usize, usize)> {
+                let clog_path = config_clone.clog_path();
+                let temp_path = clog_path.with_extension("clog.tmp");
+                {
+                    let temp_file = std::fs::OpenOptions::new()
+                        .write(true)
+                        .create(true)
+                        .truncate(true)
+                        .open(&temp_path)?;
+                    let mut temp_writer = BufWriter::new(temp_file);
+
+                    Self::write_header(&mut temp_writer)?;
+                    if !to_keep.is_empty() {
+                        Self::write_record(&mut temp_writer, &to_keep)?;
+                    }
+
+                    temp_writer.flush()?;
+                    temp_writer.get_ref().sync_data()?;
+                }
+
+                rename_durable(&temp_path, &clog_path)?;
+                Ok((to_remove.len(), to_keep.len()))
+            })
+            .await
+            .map_err(|e| TiSqlError::Internal(format!("Clog rewrite task panicked: {e}")))??;
+
+            let file = crate::io::DmaFile::open_append_buffered(self.config.clog_path())
+                .map_err(|e| TiSqlError::Internal(format!("Failed to reopen clog: {e}")))?;
+            self.group_writer
+                .restart(file, Arc::clone(&self.io_service), Some(&self.io_handle));
+
+            let new_size = std::fs::metadata(self.config.clog_path())
+                .map(|m| m.len())
+                .unwrap_or(0);
+
+            log_info!(
+                "Truncated clog to safe_lsn={}: removed {} entries, kept {}",
+                safe_lsn,
+                removed,
+                kept
+            );
+
+            Ok(TruncateStats {
+                entries_removed: removed,
+                entries_kept: kept,
+                bytes_freed: old_size.saturating_sub(new_size),
+                new_file_size: new_size,
+            })
         }
+        .await;
+
+        if let Err(e) = &result {
+            // stop_and_drain() moved writer to Draining; any error before restart
+            // must transition to Failed so submitters return error instead of waiting.
+            self.group_writer.set_failed(format!("{e}"));
+        }
+
+        result
     }
 
     /// Get the oldest LSN still in the clog.
@@ -2576,8 +2579,8 @@ mod tests {
     // ========================================================================
 
     /// Test that truncate_to() drains pending group commit writes before
-    /// reading the file. Without the drain barrier, writes enqueued to the
-    /// crossbeam channel but not yet processed by the writer loop could be
+    /// reading the file. Without the drain barrier, writes enqueued on the
+    /// writer queue but not yet processed by the writer loop could be
     /// lost when the file is rewritten.
     #[tokio::test]
     async fn test_truncate_to_drains_pending_writes() {
@@ -2591,7 +2594,7 @@ mod tests {
         .unwrap();
 
         // Submit 10 writes without waiting for replies. Some may still be
-        // in the crossbeam channel when truncate_to runs.
+        // queued when truncate_to runs.
         for i in 1..=10u64 {
             let mut batch = ClogBatch::new();
             batch.add_put(
@@ -2614,6 +2617,31 @@ mod tests {
         assert_eq!(stats.entries_removed, 0);
 
         service.close().await.unwrap();
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn test_truncate_to_read_error_sets_writer_failed() {
+        let dir = tempdir().unwrap();
+        let config = FileClogConfig::with_dir(dir.path());
+        let service = FileClogService::open(
+            config.clone(),
+            make_test_io(),
+            &tokio::runtime::Handle::current(),
+        )
+        .unwrap();
+
+        let mut batch = ClogBatch::new();
+        batch.add_put(1, b"key".to_vec(), b"value".to_vec());
+        service.write(&mut batch, true).unwrap().await.unwrap();
+
+        std::fs::remove_file(config.clog_path()).unwrap();
+
+        assert!(service.truncate_to(0).await.is_err());
+
+        let err1 = service.group_writer.stop_and_drain().await.unwrap_err();
+        let err2 = service.group_writer.stop_and_drain().await.unwrap_err();
+        assert_eq!(err1, err2);
+        assert!(!err1.contains("Already draining"));
     }
 
     // ========================================================================

@@ -177,40 +177,49 @@ impl GroupCommitWriter {
     pub async fn stop_and_drain(&self) -> Result<(), String> {
         let drain_handle = {
             let mut guard = self.inner.lock();
-            match std::mem::replace(&mut *guard, WriterInner::Draining) {
-                WriterInner::Active(state) => {
-                    // Drop tx to close channel — writer loop exits
-                    drop(state.tx);
-                    state.drain_handle
-                }
-                WriterInner::Draining => {
-                    return Err("Already draining".to_string());
-                }
-                WriterInner::Failed(msg) => {
-                    return Err(msg);
-                }
+            if matches!(&*guard, WriterInner::Draining) {
+                return Err("Already draining".to_string());
             }
+
+            if let WriterInner::Failed(msg) = &*guard {
+                return Err(msg.clone());
+            }
+
+            let WriterInner::Active(state) = std::mem::replace(&mut *guard, WriterInner::Draining)
+            else {
+                unreachable!("writer state checked above")
+            };
+
+            // Drop tx to close channel — writer loop exits
+            drop(state.tx);
+            state.drain_handle
         };
         // Lock released — await without holding it
 
-        match drain_handle {
-            DrainHandle::Tokio(handle) => {
-                handle
-                    .await
-                    .map_err(|e| format!("Writer task panicked: {e}"))?;
-            }
+        let drain_result: Result<(), String> = match drain_handle {
+            DrainHandle::Tokio(handle) => handle
+                .await
+                .map_err(|e| format!("Writer task panicked: {e}")),
             DrainHandle::Thread(Some(handle)) => {
-                tokio::task::spawn_blocking(move || handle.join())
-                    .await
-                    .map_err(|e| format!("spawn_blocking failed: {e}"))?
-                    .map_err(|_| "Writer thread panicked".to_string())?;
+                match tokio::task::spawn_blocking(move || handle.join()).await {
+                    Ok(join_result) => {
+                        join_result.map_err(|_| "Writer thread panicked".to_string())
+                    }
+                    Err(e) => Err(format!("spawn_blocking failed: {e}")),
+                }
             }
-            DrainHandle::Thread(None) => {
-                return Err("Thread handle already taken".to_string());
+            DrainHandle::Thread(None) => Err("Thread handle already taken".to_string()),
+        };
+
+        if let Err(msg) = &drain_result {
+            let mut guard = self.inner.lock();
+            if matches!(&*guard, WriterInner::Draining) {
+                *guard = WriterInner::Failed(msg.clone());
+                self.available.notify_all();
             }
         }
 
-        Ok(())
+        drain_result
     }
 
     /// Set the writer to `Failed` state and wake all waiters.
@@ -564,5 +573,42 @@ mod tests {
 
         let content = std::fs::read(tmp.path()).unwrap();
         assert_eq!(&content, b"sync_async");
+    }
+
+    #[tokio::test]
+    async fn test_stop_and_drain_keeps_failed_state() {
+        let (file, io, _tmp) = make_writer();
+        let gc = GroupCommitWriter::new_with_thread(file, io);
+
+        gc.set_failed("writer failed".to_string());
+
+        let err1 = gc.stop_and_drain().await.unwrap_err();
+        let err2 = gc.stop_and_drain().await.unwrap_err();
+
+        assert_eq!(err1, "writer failed");
+        assert_eq!(err2, "writer failed");
+    }
+
+    #[tokio::test]
+    async fn test_stop_and_drain_error_transitions_to_failed() {
+        let (file, io, _tmp) = make_writer();
+        let gc = GroupCommitWriter::new_with_thread(file, io);
+
+        let (tx, _rx) = tokio::sync::mpsc::unbounded_channel();
+        {
+            let mut guard = gc.inner.lock();
+            *guard = WriterInner::Active(WriterState {
+                tx,
+                drain_handle: DrainHandle::Thread(None),
+            });
+        }
+
+        let err1 = gc.stop_and_drain().await.unwrap_err();
+        let err2 = gc.stop_and_drain().await.unwrap_err();
+        let submit_err = gc.submit(b"x".to_vec(), true).unwrap_err();
+
+        assert_eq!(err1, "Thread handle already taken");
+        assert_eq!(err2, "Thread handle already taken");
+        assert_eq!(submit_err, "Thread handle already taken");
     }
 }

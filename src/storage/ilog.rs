@@ -582,89 +582,92 @@ impl IlogService {
             .await
             .map_err(|e| TiSqlError::Internal(format!("Ilog stop_and_drain failed: {e}")))?;
 
-        let ilog_path = self.config.ilog_path();
-        let old_size = std::fs::metadata(&ilog_path).map(|m| m.len()).unwrap_or(0);
+        let result: Result<IlogTruncateStats> = async {
+            let ilog_path = self.config.ilog_path();
+            let old_size = std::fs::metadata(&ilog_path).map(|m| m.len()).unwrap_or(0);
 
-        // Safe to read now: writer is drained.
-        let records = self.read_all_records()?;
-        let (to_keep, to_remove): (Vec<_>, Vec<_>) = records
-            .into_iter()
-            .partition(|record| record.lsn() >= min_keep_lsn);
+            // Safe to read now: writer is drained.
+            let records = self.read_all_records()?;
+            let (to_keep, to_remove): (Vec<_>, Vec<_>) = records
+                .into_iter()
+                .partition(|record| record.lsn() >= min_keep_lsn);
 
-        if to_remove.is_empty() {
-            // Nothing to truncate — restart the writer.
-            let file = crate::io::DmaFile::open_append_buffered(&ilog_path)
-                .map_err(|e| TiSqlError::Internal(format!("Failed to reopen ilog: {e}")))?;
-            self.group_writer
-                .restart(file, Arc::clone(&self.io_service), self.io_handle.as_ref());
-            return Ok(IlogTruncateStats {
-                records_removed: 0,
-                records_kept: to_keep.len(),
-                bytes_freed: 0,
-                new_file_size: old_size,
-            });
-        }
-
-        // Rewrite kept records via spawn_blocking (file I/O).
-        let config_clone = self.config.clone();
-        let rewrite_result = tokio::task::spawn_blocking(move || -> Result<(usize, usize)> {
-            let ilog_path = config_clone.ilog_path();
-            let temp_path = ilog_path.with_extension("ilog.tmp");
-            {
-                let temp_file = OpenOptions::new()
-                    .write(true)
-                    .create(true)
-                    .truncate(true)
-                    .open(&temp_path)?;
-                let mut temp_writer = BufWriter::new(temp_file);
-                Self::write_header(&mut temp_writer)?;
-                for record in &to_keep {
-                    let framed = Self::encode_record(record)?;
-                    temp_writer.write_all(&framed)?;
-                }
-                temp_writer.flush()?;
-                temp_writer.get_ref().sync_data()?;
-            }
-
-            rename_durable(&temp_path, &ilog_path)?;
-            Ok((to_remove.len(), to_keep.len()))
-        })
-        .await
-        .map_err(|e| TiSqlError::Internal(format!("Ilog rewrite task panicked: {e}")))?;
-
-        match rewrite_result {
-            Ok((removed, kept)) => {
-                let file = crate::io::DmaFile::open_append_buffered(self.config.ilog_path())
+            if to_remove.is_empty() {
+                // Nothing to truncate — restart the writer.
+                let file = crate::io::DmaFile::open_append_buffered(&ilog_path)
                     .map_err(|e| TiSqlError::Internal(format!("Failed to reopen ilog: {e}")))?;
                 self.group_writer.restart(
                     file,
                     Arc::clone(&self.io_service),
                     self.io_handle.as_ref(),
                 );
-
-                let new_size = std::fs::metadata(self.config.ilog_path())
-                    .map(|m| m.len())
-                    .unwrap_or(0);
-
-                log_info!(
-                    "Truncated ilog before min_keep_lsn={}: removed {} records, kept {}",
-                    min_keep_lsn,
-                    removed,
-                    kept
-                );
-
-                Ok(IlogTruncateStats {
-                    records_removed: removed,
-                    records_kept: kept,
-                    bytes_freed: old_size.saturating_sub(new_size),
-                    new_file_size: new_size,
-                })
+                return Ok(IlogTruncateStats {
+                    records_removed: 0,
+                    records_kept: to_keep.len(),
+                    bytes_freed: 0,
+                    new_file_size: old_size,
+                });
             }
-            Err(e) => {
-                self.group_writer.set_failed(format!("{e}"));
-                Err(e)
-            }
+
+            // Rewrite kept records via spawn_blocking (file I/O).
+            let config_clone = self.config.clone();
+            let (removed, kept) = tokio::task::spawn_blocking(move || -> Result<(usize, usize)> {
+                let ilog_path = config_clone.ilog_path();
+                let temp_path = ilog_path.with_extension("ilog.tmp");
+                {
+                    let temp_file = OpenOptions::new()
+                        .write(true)
+                        .create(true)
+                        .truncate(true)
+                        .open(&temp_path)?;
+                    let mut temp_writer = BufWriter::new(temp_file);
+                    Self::write_header(&mut temp_writer)?;
+                    for record in &to_keep {
+                        let framed = Self::encode_record(record)?;
+                        temp_writer.write_all(&framed)?;
+                    }
+                    temp_writer.flush()?;
+                    temp_writer.get_ref().sync_data()?;
+                }
+
+                rename_durable(&temp_path, &ilog_path)?;
+                Ok((to_remove.len(), to_keep.len()))
+            })
+            .await
+            .map_err(|e| TiSqlError::Internal(format!("Ilog rewrite task panicked: {e}")))??;
+
+            let file = crate::io::DmaFile::open_append_buffered(self.config.ilog_path())
+                .map_err(|e| TiSqlError::Internal(format!("Failed to reopen ilog: {e}")))?;
+            self.group_writer
+                .restart(file, Arc::clone(&self.io_service), self.io_handle.as_ref());
+
+            let new_size = std::fs::metadata(self.config.ilog_path())
+                .map(|m| m.len())
+                .unwrap_or(0);
+
+            log_info!(
+                "Truncated ilog before min_keep_lsn={}: removed {} records, kept {}",
+                min_keep_lsn,
+                removed,
+                kept
+            );
+
+            Ok(IlogTruncateStats {
+                records_removed: removed,
+                records_kept: kept,
+                bytes_freed: old_size.saturating_sub(new_size),
+                new_file_size: new_size,
+            })
         }
+        .await;
+
+        if let Err(e) = &result {
+            // stop_and_drain() moved writer to Draining; any error before restart
+            // must transition to Failed so submitters return error instead of waiting.
+            self.group_writer.set_failed(format!("{e}"));
+        }
+
+        result
     }
 
     /// Get the ilog file size in bytes.
@@ -1587,6 +1590,33 @@ mod tests {
         assert!(!version.has_sst(1));
         assert!(version.has_sst(2));
         assert!(version.has_sst(3));
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn test_ilog_truncate_before_read_error_sets_writer_failed() {
+        let tmp = TempDir::new().unwrap();
+        let config = test_config(tmp.path());
+        let lsn_provider = new_lsn_provider();
+
+        let service = IlogService::open(
+            config.clone(),
+            Arc::clone(&lsn_provider),
+            make_test_io(),
+            &tokio::runtime::Handle::current(),
+        )
+        .unwrap();
+        service.write_flush_intent(1, 100).unwrap();
+        service.write_flush_commit(test_sst_meta(1, 0), 50).unwrap();
+        service.sync().unwrap();
+
+        std::fs::remove_file(config.ilog_path()).unwrap();
+
+        assert!(service.truncate_before(1).await.is_err());
+
+        let err1 = service.group_writer.stop_and_drain().await.unwrap_err();
+        let err2 = service.group_writer.stop_and_drain().await.unwrap_err();
+        assert_eq!(err1, err2);
+        assert!(!err1.contains("Already draining"));
     }
 
     #[test]
