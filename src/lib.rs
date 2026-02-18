@@ -173,8 +173,8 @@ use clog::{FileClogService, TruncateStats};
 use executor::{ExecutionOutput, ExecutionResult, Executor, SimpleExecutor};
 use sql::Parser;
 use tablet::{
-    IlogService, IlogTruncateStats, LsmEngine, LsmRecovery, RoutedTabletStorage, TabletId,
-    TabletManager,
+    GlobalLogGcBoundary, IlogService, IlogTruncateStats, LsmEngine, LsmRecovery,
+    RoutedTabletStorage, TabletId, TabletManager,
 };
 use transaction::{ConcurrencyManager, TransactionService};
 use tso::LocalTso;
@@ -318,20 +318,45 @@ impl Drop for OpenRuntimeGuard {
 /// One-shot log GC statistics.
 #[derive(Debug, Default)]
 pub struct LogGcStats {
-    /// `Version.flushed_lsn` — the max LSN persisted to SST files.
+    /// Global checkpoint flushed cap: min(`Version.flushed_lsn`) across tablets.
     pub flushed_lsn: Lsn,
-    /// Safe clog truncation boundary: `min(flushed_lsn, min_unflushed_lsn - 1)`.
+    /// Safe shared-clog truncation boundary across all mounted tablets.
     ///
-    /// This accounts for the race window in `write_batch_inner()` where a
-    /// lower-LSN write can land in a newer memtable than a higher-LSN write.
-    /// Without this, clog truncation could delete entries still only in memory.
+    /// Computed as min of checkpoint cap and all conservative runtime caps
+    /// (unflushed/in-flight/reservation).
     pub safe_lsn: Lsn,
-    /// Checkpoint LSN written in this GC cycle.
+    /// System-tablet checkpoint LSN written in this GC cycle.
+    ///
+    /// Kept for backward compatibility with existing single-tablet checks.
     pub checkpoint_lsn: Lsn,
     /// Clog truncation result.
     pub clog: TruncateStats,
-    /// Ilog truncation result.
+    /// System-tablet ilog truncation result.
+    ///
+    /// Kept for backward compatibility with existing single-tablet checks.
     pub ilog: IlogTruncateStats,
+    /// Detailed global boundary decomposition.
+    pub boundary: GlobalLogGcBoundary,
+    /// Checkpoint snapshots captured for each tablet.
+    pub tablet_checkpoints: Vec<TabletGcCheckpoint>,
+    /// Ilog truncation results for each tablet.
+    pub tablet_ilogs: Vec<TabletIlogGcStats>,
+}
+
+/// One tablet checkpoint snapshot used during one GC cycle.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct TabletGcCheckpoint {
+    pub tablet_id: TabletId,
+    pub flushed_lsn: Lsn,
+    pub checkpoint_lsn: Lsn,
+}
+
+/// One tablet ilog truncation result from one GC cycle.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TabletIlogGcStats {
+    pub tablet_id: TabletId,
+    pub checkpoint_lsn: Lsn,
+    pub truncate: IlogTruncateStats,
 }
 
 impl Database {
@@ -736,34 +761,34 @@ impl Database {
     }
 
     /// Run one log GC cycle:
-    /// 1) checkpoint ilog
-    /// 2) truncate clog up to safe_lsn
-    /// 3) truncate ilog before checkpoint_lsn
+    /// 1) checkpoint every mounted tablet manifest
+    /// 2) truncate shared clog up to global safe_lsn
+    /// 3) truncate each tablet ilog before its own checkpoint_lsn
     ///
-    /// The safe truncation boundary is `min(flushed_lsn, min_unflushed_lsn - 1)`,
-    /// which accounts for the race window where a lower-LSN write can land in a
-    /// newer (unflushed) memtable. Using `flushed_lsn` alone would risk deleting
-    /// clog entries that are still only in volatile memory.
+    /// Shared-clog safety uses global minimum caps across all mounted tablets.
     pub async fn run_log_gc_once(&self) -> Result<LogGcStats> {
-        if !self.tablet_manager.has_only_system_tablet_mounted() {
-            return Err(crate::util::error::TiSqlError::Storage(
-                "run_log_gc_once currently supports only the system tablet; refusing GC with mounted non-system tablets".into(),
-            ));
-        }
-
         #[cfg(feature = "failpoints")]
         fail_point!("log_gc_before_checkpoint");
 
-        let (version, checkpoint_lsn) = self.storage.checkpoint_and_capture_manifest().await?;
+        let captures = self
+            .tablet_manager
+            .checkpoint_and_capture_all_tablets()
+            .await?;
+        let tablet_checkpoints: Vec<_> = captures
+            .iter()
+            .map(|capture| TabletGcCheckpoint {
+                tablet_id: capture.tablet_id,
+                flushed_lsn: capture.version.flushed_lsn(),
+                checkpoint_lsn: capture.checkpoint_lsn,
+            })
+            .collect();
 
-        // Compute authoritative V2.6 boundary from the SAME checkpointed version.
-        let flushed_lsn = version.flushed_lsn();
         #[cfg(feature = "failpoints")]
         fail_point!("log_gc_after_checkpoint_before_safe_compute_v26");
-        let safe_lsn = self
-            .storage
-            .compute_log_gc_boundary_with_caps(flushed_lsn)
-            .safe_lsn;
+        let boundary = self
+            .tablet_manager
+            .compute_global_log_gc_boundary_with_caps(&captures)?;
+        let safe_lsn = boundary.safe_lsn;
 
         #[cfg(feature = "failpoints")]
         fail_point!("log_gc_after_safe_compute_before_clog_truncate_v26");
@@ -780,22 +805,48 @@ impl Database {
         #[cfg(feature = "failpoints")]
         fail_point!("log_gc_after_clog_truncate_before_ilog_truncate");
 
-        let ilog = self.ilog.truncate_before(checkpoint_lsn).await?;
+        let tablet_ilogs_raw = self
+            .tablet_manager
+            .truncate_tablet_ilogs_before(&captures)
+            .await?;
+        let tablet_ilogs: Vec<_> = tablet_ilogs_raw
+            .iter()
+            .map(|entry| TabletIlogGcStats {
+                tablet_id: entry.tablet_id,
+                checkpoint_lsn: entry.checkpoint_lsn,
+                truncate: entry.stats.clone(),
+            })
+            .collect();
 
         #[cfg(feature = "failpoints")]
         fail_point!("log_gc_after_ilog_truncate");
 
+        let system_checkpoint = captures
+            .iter()
+            .find(|capture| capture.tablet_id == TabletId::System)
+            .map(|capture| capture.checkpoint_lsn)
+            .unwrap_or(0);
+        let system_ilog = tablet_ilogs_raw
+            .iter()
+            .find(|entry| entry.tablet_id == TabletId::System)
+            .map(|entry| entry.stats.clone())
+            .unwrap_or_default();
+
         debug_assert!(
-            safe_lsn <= flushed_lsn,
-            "safe_lsn ({safe_lsn}) exceeds checkpointed flushed_lsn ({flushed_lsn})"
+            safe_lsn <= boundary.checkpoint_flushed_cap,
+            "safe_lsn ({safe_lsn}) exceeds checkpoint cap ({})",
+            boundary.checkpoint_flushed_cap
         );
 
         Ok(LogGcStats {
-            flushed_lsn,
+            flushed_lsn: boundary.checkpoint_flushed_cap,
             safe_lsn,
-            checkpoint_lsn,
+            checkpoint_lsn: system_checkpoint,
             clog,
-            ilog,
+            ilog: system_ilog,
+            boundary,
+            tablet_checkpoints,
+            tablet_ilogs,
         })
     }
 
@@ -1066,6 +1117,46 @@ mod tests {
         }
         let dir = db.tablet_manager().tablet_dir(tablet_id);
         let tablet = Arc::new(TabletEngine::open(LsmConfig::new(&dir)).unwrap());
+        db.tablet_manager()
+            .insert_tablet(tablet_id, tablet)
+            .unwrap();
+    }
+
+    fn mount_user_tablet_durable(db: &Database, table_id: u64) {
+        let tablet_id = TabletId::Table { table_id };
+        if db.tablet_manager().get_tablet(tablet_id).is_some() {
+            return;
+        }
+
+        let dir = db.tablet_manager().tablet_dir(tablet_id);
+        std::fs::create_dir_all(&dir).unwrap();
+
+        let lsn_provider = db.tablet_manager().shared_lsn_provider();
+        let io = Arc::clone(db.storage.io_service());
+        let io_handle = db
+            .io_runtime
+            .as_ref()
+            .expect("database must have io runtime")
+            .handle();
+        let ilog = Arc::new(
+            IlogService::open(
+                IlogConfig::new(&dir),
+                Arc::clone(&lsn_provider),
+                Arc::clone(&io),
+                io_handle,
+            )
+            .unwrap(),
+        );
+        let tablet = Arc::new(
+            TabletEngine::open_with_recovery(
+                LsmConfig::new(&dir),
+                lsn_provider,
+                ilog,
+                Version::new(),
+                io,
+            )
+            .unwrap(),
+        );
         db.tablet_manager()
             .insert_tablet(tablet_id, tablet)
             .unwrap();
@@ -2692,22 +2783,143 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_phase4_run_log_gc_once_refuses_non_system_mounts() {
+    async fn test_phase5_run_log_gc_once_uses_global_min_boundary() {
+        let dir = tempdir().unwrap();
+        let config = DatabaseConfig::with_data_dir(dir.path());
+        let db = Database::open(config.clone()).unwrap();
+
+        db.execute_query("CREATE TABLE gc_fast (id INT PRIMARY KEY, v INT)")
+            .await
+            .unwrap();
+        db.execute_query("CREATE TABLE gc_slow (id INT PRIMARY KEY, v INT)")
+            .await
+            .unwrap();
+
+        let fast_id = table_id_by_name(&db, "gc_fast");
+        let slow_id = table_id_by_name(&db, "gc_slow");
+        mount_user_tablet_durable(&db, fast_id);
+        mount_user_tablet_durable(&db, slow_id);
+
+        db.execute_query("INSERT INTO gc_fast VALUES (1, 10)")
+            .await
+            .unwrap();
+        db.execute_query("INSERT INTO gc_slow VALUES (1, 20)")
+            .await
+            .unwrap();
+
+        let fast_tablet = db
+            .tablet_manager()
+            .get_tablet(TabletId::Table { table_id: fast_id })
+            .unwrap();
+        let slow_tablet = db
+            .tablet_manager()
+            .get_tablet(TabletId::Table { table_id: slow_id })
+            .unwrap();
+        fast_tablet.flush_all_with_active().unwrap();
+        let slow_cap = slow_tablet.min_unflushed_lsn().unwrap().saturating_sub(1);
+
+        let clog_size_before = db.txn_service.clog_service().file_size().unwrap();
+        let stats = db.run_log_gc_once().await.unwrap();
+        assert!(
+            stats.safe_lsn <= slow_cap,
+            "safe_lsn={} must be <= slow-tablet cap={slow_cap}",
+            stats.safe_lsn
+        );
+        assert!(
+            stats.tablet_checkpoints.len() >= 3,
+            "expected checkpoints for system + two user tablets"
+        );
+        assert!(
+            db.txn_service.clog_service().file_size().unwrap() <= clog_size_before,
+            "clog file should not grow after GC truncation"
+        );
+
+        db.close().await.unwrap();
+        drop(db);
+
+        let db2 = Database::open(config).unwrap();
+        match db2
+            .execute_query("SELECT v FROM gc_fast WHERE id = 1")
+            .await
+            .unwrap()
+        {
+            QueryResult::Rows { data, .. } => assert_eq!(data.len(), 1),
+            other => panic!("unexpected result for gc_fast: {other:?}"),
+        }
+        match db2
+            .execute_query("SELECT v FROM gc_slow WHERE id = 1")
+            .await
+            .unwrap()
+        {
+            QueryResult::Rows { data, .. } => assert_eq!(data.len(), 1),
+            other => panic!("unexpected result for gc_slow: {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn test_phase5_run_log_gc_once_truncates_each_tablet_ilog() {
         let dir = tempdir().unwrap();
         let db = Database::open(DatabaseConfig::with_data_dir(dir.path())).unwrap();
 
-        db.execute_query("CREATE TABLE gc_guard_t (id INT PRIMARY KEY, v INT)")
+        db.execute_query("CREATE TABLE gc_ilog_a (id INT PRIMARY KEY, v INT)")
             .await
             .unwrap();
-        let table_id = table_id_by_name(&db, "gc_guard_t");
-        mount_user_tablet(&db, table_id);
+        db.execute_query("CREATE TABLE gc_ilog_b (id INT PRIMARY KEY, v INT)")
+            .await
+            .unwrap();
 
-        let err = db.run_log_gc_once().await.unwrap_err();
-        let msg = format!("{err}");
+        let a_id = table_id_by_name(&db, "gc_ilog_a");
+        let b_id = table_id_by_name(&db, "gc_ilog_b");
+        mount_user_tablet_durable(&db, a_id);
+        mount_user_tablet_durable(&db, b_id);
+
+        db.execute_query("INSERT INTO gc_ilog_a VALUES (1, 100)")
+            .await
+            .unwrap();
+        db.execute_query("INSERT INTO gc_ilog_b VALUES (1, 200)")
+            .await
+            .unwrap();
+
+        let stats = db.run_log_gc_once().await.unwrap();
         assert!(
-            msg.contains("run_log_gc_once currently supports only the system tablet"),
-            "unexpected error: {msg}"
+            stats
+                .tablet_ilogs
+                .iter()
+                .any(|entry| entry.tablet_id == TabletId::System),
+            "system tablet ilog truncation must be recorded"
         );
+        assert!(
+            stats
+                .tablet_ilogs
+                .iter()
+                .any(|entry| entry.tablet_id == TabletId::Table { table_id: a_id }),
+            "tablet A ilog truncation must be recorded"
+        );
+        assert!(
+            stats
+                .tablet_ilogs
+                .iter()
+                .any(|entry| entry.tablet_id == TabletId::Table { table_id: b_id }),
+            "tablet B ilog truncation must be recorded"
+        );
+
+        for entry in &stats.tablet_ilogs {
+            let file_size = if entry.tablet_id == TabletId::System {
+                db.ilog.file_size().unwrap()
+            } else {
+                let ilog_path = db
+                    .tablet_manager()
+                    .tablet_dir(entry.tablet_id)
+                    .join("ilog")
+                    .join("tisql.ilog");
+                std::fs::metadata(&ilog_path).unwrap().len()
+            };
+            assert_eq!(
+                file_size, entry.truncate.new_file_size,
+                "reported ilog size must match on-disk size for {:?}",
+                entry.tablet_id
+            );
+        }
     }
 
     #[tokio::test]

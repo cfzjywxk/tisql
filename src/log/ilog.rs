@@ -252,7 +252,7 @@ pub struct IlogService {
 }
 
 /// Statistics returned from ilog truncation.
-#[derive(Debug, Default)]
+#[derive(Debug, Default, Clone, PartialEq, Eq)]
 pub struct IlogTruncateStats {
     /// Number of records removed
     pub records_removed: usize,

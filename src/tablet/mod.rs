@@ -107,7 +107,10 @@ pub use commit_reservations::{
     CommitLsnReservations, CommitReservation, CommitReservationStats, ReservationGuard,
 };
 pub use lsm::{LevelStats, LsmEngine, LsmStats, TabletEngine, TieredMergeIterator};
-pub use manager::{derive_tablet_inventory, TabletManager};
+pub use manager::{
+    derive_tablet_inventory, GlobalLogGcBoundary, TabletCheckpointCapture,
+    TabletIlogTruncateCapture, TabletManager,
+};
 pub use routed_storage::RoutedTabletStorage;
 pub use router::{is_system_table_id, route_index_to_tablet, route_table_to_tablet, TabletId};
 

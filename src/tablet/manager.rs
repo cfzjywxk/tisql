@@ -29,16 +29,39 @@ use crate::log_info;
 use crate::log_warn;
 use crate::lsn::SharedLsnProvider;
 use crate::tablet::commit_reservations::{CommitLsnReservations, CommitReservationStats};
-use crate::util::error::Result;
+use crate::util::error::{Result, TiSqlError};
 
 use super::router::{route_index_to_tablet, route_table_to_tablet, TabletId};
-use super::{CompactionScheduler, FlushScheduler, TabletEngine, Version};
+use super::{CompactionScheduler, FlushScheduler, IlogTruncateStats, TabletEngine, Version};
 
 /// One tablet checkpoint capture result.
 pub struct TabletCheckpointCapture {
     pub tablet_id: TabletId,
     pub version: Arc<Version>,
     pub checkpoint_lsn: Lsn,
+}
+
+/// Global shared-clog boundary computed from all mounted tablet caps.
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+pub struct GlobalLogGcBoundary {
+    /// Min checkpointed flushed_lsn across tablets.
+    pub checkpoint_flushed_cap: Lsn,
+    /// Min `min_unflushed_lsn - 1` across tablets with unflushed data.
+    pub unflushed_cap: Option<Lsn>,
+    /// Global shared reservation cap (`min_reserved_lsn - 1`).
+    pub reservation_cap: Option<Lsn>,
+    /// Global per-tablet in-flight cap (`min_in_flight_lsn - 1`).
+    pub inflight_cap: Option<Lsn>,
+    /// Final safe shared-clog truncation boundary.
+    pub safe_lsn: Lsn,
+}
+
+/// One tablet-ilog truncation result.
+#[derive(Debug)]
+pub struct TabletIlogTruncateCapture {
+    pub tablet_id: TabletId,
+    pub checkpoint_lsn: Lsn,
+    pub stats: IlogTruncateStats,
 }
 
 struct TabletWorkerSet {
@@ -363,6 +386,84 @@ impl TabletManager {
         Ok(captures)
     }
 
+    /// Compute shared-clog GC boundary using global-min caps across tablets.
+    pub fn compute_global_log_gc_boundary_with_caps(
+        &self,
+        captures: &[TabletCheckpointCapture],
+    ) -> Result<GlobalLogGcBoundary> {
+        if captures.is_empty() {
+            return Err(TiSqlError::Storage(
+                "cannot compute global log-GC boundary without tablet checkpoints".into(),
+            ));
+        }
+
+        let checkpoint_flushed_cap = captures
+            .iter()
+            .map(|capture| capture.version.flushed_lsn())
+            .min()
+            .expect("captures is non-empty");
+
+        let mut unflushed_cap: Option<Lsn> = None;
+        for capture in captures {
+            let tablet = self.get_tablet(capture.tablet_id).ok_or_else(|| {
+                TiSqlError::Storage(format!(
+                    "tablet {:?} missing while computing global log-GC boundary",
+                    capture.tablet_id
+                ))
+            })?;
+            if let Some(min_unflushed) = tablet.min_unflushed_lsn() {
+                let cap = min_unflushed.saturating_sub(1);
+                unflushed_cap = Some(unflushed_cap.map_or(cap, |cur| cur.min(cap)));
+            }
+        }
+
+        let reservation_cap = self.min_reserved_lsn().map(|lsn| lsn.saturating_sub(1));
+        let inflight_cap = self.min_in_flight_lsn().map(|lsn| lsn.saturating_sub(1));
+
+        let mut safe_lsn = checkpoint_flushed_cap;
+        if let Some(cap) = unflushed_cap {
+            safe_lsn = safe_lsn.min(cap);
+        }
+        if let Some(cap) = reservation_cap {
+            safe_lsn = safe_lsn.min(cap);
+        }
+        if let Some(cap) = inflight_cap {
+            safe_lsn = safe_lsn.min(cap);
+        }
+
+        Ok(GlobalLogGcBoundary {
+            checkpoint_flushed_cap,
+            unflushed_cap,
+            reservation_cap,
+            inflight_cap,
+            safe_lsn,
+        })
+    }
+
+    /// Truncate each mounted tablet's ilog before that tablet's checkpoint_lsn.
+    pub async fn truncate_tablet_ilogs_before(
+        &self,
+        captures: &[TabletCheckpointCapture],
+    ) -> Result<Vec<TabletIlogTruncateCapture>> {
+        let mut truncates = Vec::with_capacity(captures.len());
+        for capture in captures {
+            let tablet = self.get_tablet(capture.tablet_id).ok_or_else(|| {
+                TiSqlError::Storage(format!(
+                    "tablet {:?} missing while truncating tablet ilog",
+                    capture.tablet_id
+                ))
+            })?;
+            let stats = tablet.truncate_ilog_before(capture.checkpoint_lsn).await?;
+            truncates.push(TabletIlogTruncateCapture {
+                tablet_id: capture.tablet_id,
+                checkpoint_lsn: capture.checkpoint_lsn,
+                stats,
+            });
+        }
+        truncates.sort_by_key(|entry| entry.tablet_id);
+        Ok(truncates)
+    }
+
     /// Global min flushed_lsn across mounted tablets.
     pub fn min_flushed_lsn(&self) -> Option<Lsn> {
         self.tablets
@@ -656,6 +757,199 @@ mod tests {
         let expected = system.min_in_flight_lsn();
         let manager = TabletManager::new(dir.path(), new_lsn_provider(), system).unwrap();
         assert_eq!(manager.min_in_flight_lsn(), expected);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn test_phase5_gc_boundary_min_across_two_tablets() {
+        let dir = TempDir::new().unwrap();
+        let lsn_provider = new_lsn_provider();
+
+        let system_dir = dir.path().join("tablets").join("system");
+        std::fs::create_dir_all(&system_dir).unwrap();
+        let system = open_durable_tablet(&system_dir, Arc::clone(&lsn_provider));
+        let manager = TabletManager::new(dir.path(), Arc::clone(&lsn_provider), system).unwrap();
+
+        let tablet_a = TabletId::Table {
+            table_id: USER_TABLE_ID_START + 500,
+        };
+        let tablet_b = TabletId::Table {
+            table_id: USER_TABLE_ID_START + 501,
+        };
+        let engine_a =
+            open_durable_tablet(&manager.tablet_dir(tablet_a), Arc::clone(&lsn_provider));
+        let engine_b =
+            open_durable_tablet(&manager.tablet_dir(tablet_b), Arc::clone(&lsn_provider));
+        manager
+            .insert_tablet(tablet_a, Arc::clone(&engine_a))
+            .unwrap();
+        manager
+            .insert_tablet(tablet_b, Arc::clone(&engine_b))
+            .unwrap();
+
+        let mut wb_a = WriteBatch::new();
+        wb_a.set_commit_ts(11);
+        wb_a.set_clog_lsn(11);
+        wb_a.put(b"a".to_vec(), b"va".to_vec());
+        engine_a.write_batch(wb_a).unwrap();
+        engine_a.flush_all_with_active().unwrap();
+
+        let mut wb_b = WriteBatch::new();
+        wb_b.set_commit_ts(21);
+        wb_b.set_clog_lsn(21);
+        wb_b.put(b"b".to_vec(), b"vb".to_vec());
+        engine_b.write_batch(wb_b).unwrap();
+
+        let captures = manager.checkpoint_and_capture_all_tablets().await.unwrap();
+        let boundary = manager
+            .compute_global_log_gc_boundary_with_caps(&captures)
+            .unwrap();
+
+        let slow_cap = engine_b.min_unflushed_lsn().unwrap().saturating_sub(1);
+        assert!(
+            boundary.safe_lsn <= slow_cap,
+            "safe_lsn={} must be <= slow tablet cap={slow_cap}",
+            boundary.safe_lsn
+        );
+        assert!(
+            boundary.safe_lsn <= boundary.checkpoint_flushed_cap,
+            "safe_lsn={} must be <= checkpoint cap={}",
+            boundary.safe_lsn,
+            boundary.checkpoint_flushed_cap
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn test_phase5_gc_boundary_reservation_cap_global() {
+        let dir = TempDir::new().unwrap();
+        let lsn_provider = new_lsn_provider();
+
+        let system_dir = dir.path().join("tablets").join("system");
+        std::fs::create_dir_all(&system_dir).unwrap();
+        let system = open_durable_tablet(&system_dir, Arc::clone(&lsn_provider));
+        let manager = TabletManager::new(dir.path(), Arc::clone(&lsn_provider), system).unwrap();
+
+        let lsn = manager.alloc_and_reserve_commit_lsn(123);
+        let captures = manager.checkpoint_and_capture_all_tablets().await.unwrap();
+        let boundary = manager
+            .compute_global_log_gc_boundary_with_caps(&captures)
+            .unwrap();
+
+        assert_eq!(boundary.reservation_cap, Some(lsn.saturating_sub(1)));
+        assert!(
+            boundary.safe_lsn <= lsn.saturating_sub(1),
+            "safe_lsn={} must respect reservation cap {}",
+            boundary.safe_lsn,
+            lsn.saturating_sub(1)
+        );
+        assert_eq!(manager.release_commit_lsn(123), Some(lsn));
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn test_phase5_gc_boundary_all_caps_combined() {
+        let dir = TempDir::new().unwrap();
+        let lsn_provider = new_lsn_provider();
+
+        let system_dir = dir.path().join("tablets").join("system");
+        std::fs::create_dir_all(&system_dir).unwrap();
+        let system = open_durable_tablet(&system_dir, Arc::clone(&lsn_provider));
+        let manager = TabletManager::new(dir.path(), Arc::clone(&lsn_provider), system).unwrap();
+
+        let tablet = TabletId::Table {
+            table_id: USER_TABLE_ID_START + 510,
+        };
+        let engine = open_durable_tablet(&manager.tablet_dir(tablet), Arc::clone(&lsn_provider));
+        manager.insert_tablet(tablet, Arc::clone(&engine)).unwrap();
+
+        let mut wb = WriteBatch::new();
+        wb.set_commit_ts(41);
+        wb.set_clog_lsn(41);
+        wb.put(b"k".to_vec(), b"v".to_vec());
+        engine.write_batch(wb).unwrap();
+
+        let reserved = manager.alloc_and_reserve_commit_lsn(404);
+        let captures = manager.checkpoint_and_capture_all_tablets().await.unwrap();
+        let boundary = manager
+            .compute_global_log_gc_boundary_with_caps(&captures)
+            .unwrap();
+        let unflushed_cap = engine.min_unflushed_lsn().unwrap().saturating_sub(1);
+        let reservation_cap = reserved.saturating_sub(1);
+        let expected_upper = unflushed_cap.min(reservation_cap);
+        assert!(
+            boundary.safe_lsn <= expected_upper,
+            "safe_lsn={} must be <= min(unflushed_cap={unflushed_cap}, reservation_cap={reservation_cap})",
+            boundary.safe_lsn
+        );
+        assert_eq!(manager.release_commit_lsn(404), Some(reserved));
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn test_phase5_truncate_tablet_ilogs_before_all_tablets() {
+        let dir = TempDir::new().unwrap();
+        let lsn_provider = new_lsn_provider();
+
+        let system_dir = dir.path().join("tablets").join("system");
+        std::fs::create_dir_all(&system_dir).unwrap();
+        let system = open_durable_tablet(&system_dir, Arc::clone(&lsn_provider));
+        let manager = TabletManager::new(dir.path(), Arc::clone(&lsn_provider), system).unwrap();
+
+        let tablet_a = TabletId::Table {
+            table_id: USER_TABLE_ID_START + 520,
+        };
+        let tablet_b = TabletId::Table {
+            table_id: USER_TABLE_ID_START + 521,
+        };
+        manager
+            .insert_tablet(
+                tablet_a,
+                open_durable_tablet(&manager.tablet_dir(tablet_a), Arc::clone(&lsn_provider)),
+            )
+            .unwrap();
+        manager
+            .insert_tablet(
+                tablet_b,
+                open_durable_tablet(&manager.tablet_dir(tablet_b), Arc::clone(&lsn_provider)),
+            )
+            .unwrap();
+
+        for (tablet_id, ts, lsn) in [
+            (TabletId::System, 31, 31),
+            (tablet_a, 32, 32),
+            (tablet_b, 33, 33),
+        ] {
+            let tablet = manager.get_tablet(tablet_id).unwrap();
+            let mut wb = WriteBatch::new();
+            wb.set_commit_ts(ts);
+            wb.set_clog_lsn(lsn);
+            wb.put(
+                format!("k_{ts}").into_bytes(),
+                format!("v_{ts}").into_bytes(),
+            );
+            tablet.write_batch(wb).unwrap();
+        }
+
+        let captures = manager.checkpoint_and_capture_all_tablets().await.unwrap();
+        let truncates = manager
+            .truncate_tablet_ilogs_before(&captures)
+            .await
+            .unwrap();
+
+        assert_eq!(
+            truncates.len(),
+            captures.len(),
+            "every captured tablet should truncate its ilog once"
+        );
+        assert!(
+            truncates.iter().any(|t| t.tablet_id == TabletId::System),
+            "system tablet truncate stats must be present"
+        );
+        assert!(
+            truncates.iter().any(|t| t.tablet_id == tablet_a),
+            "tablet A truncate stats must be present"
+        );
+        assert!(
+            truncates.iter().any(|t| t.tablet_id == tablet_b),
+            "tablet B truncate stats must be present"
+        );
     }
 
     #[test]
