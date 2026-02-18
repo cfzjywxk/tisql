@@ -4,6 +4,7 @@
 
 UNIT_TEST_TIMEOUT_SECS ?= 1200
 STORE_TEST_TIMEOUT_SECS ?= 1200
+PESSIMISTIC_TXN_TEST_TIMEOUT_SECS ?= 300
 STORAGE_TEST_TIMEOUT_SECS ?= 1200
 COMPACTION_BATCH_TIMEOUT_SECS ?= 300
 COMPACTION_CASE_TIMEOUT_SECS ?= 240
@@ -39,6 +40,7 @@ unit-test:
 # Run store tests (internal integration tests)
 store-test:
 	./scripts/run_with_timeout.sh $(STORE_TEST_TIMEOUT_SECS) cargo test --test store_test $(STORE_TEST_THREAD_ARGS)
+	./scripts/run_with_timeout.sh $(PESSIMISTIC_TXN_TEST_TIMEOUT_SECS) cargo test --test pessimistic_txn_ported_test
 
 # Run storage regression tests (ported RocksDB-style suites)
 storage-test:

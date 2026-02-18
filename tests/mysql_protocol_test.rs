@@ -127,6 +127,20 @@ async fn query_one(conn: &mut Conn, sql: &str) -> String {
         .unwrap_or_else(|| "NULL".to_string())
 }
 
+/// Execute SQL and assert it fails with a lock-conflict style error.
+async fn expect_lock_conflict(conn: &mut Conn, sql: &str) {
+    let result = conn.query_drop(sql).await;
+    assert!(
+        result.is_err(),
+        "Expected lock conflict, SQL succeeded: {sql}"
+    );
+    let err_msg = format!("{:?}", result.unwrap_err()).to_lowercase();
+    assert!(
+        err_msg.contains("locked") || err_msg.contains("conflict"),
+        "Expected lock conflict, got: {err_msg}, SQL: {sql}"
+    );
+}
+
 // ============================================================================
 // Explicit Transaction Tests (BEGIN/COMMIT/ROLLBACK)
 // ============================================================================
@@ -1068,6 +1082,73 @@ async fn test_lock_conflict_keeps_explicit_txn_context() {
     // After both rollbacks, table stays empty.
     let rows = query_all(&mut conn1, "SELECT a, b FROM lock_ctx").await;
     assert!(rows.is_empty(), "table should be empty after rollbacks");
+}
+
+/// E2E pessimistic-transaction flow with mixed autocommit/explicit sessions.
+///
+/// Covers:
+/// - multiple sessions
+/// - write conflict and non-conflict writes
+/// - rollback + retry + commit
+/// - uncommitted visibility checks via protocol path
+#[tokio::test]
+async fn test_mixed_sessions_conflict_non_conflict_commit_rollback() {
+    let ctx = TestContext::new().await;
+    let mut conn1 = ctx.conn().await;
+    let mut conn2 = ctx.conn().await;
+    let mut conn3 = ctx.conn().await;
+
+    exec(
+        &mut conn1,
+        "CREATE TABLE mixed_lock_flow (id INT PRIMARY KEY, v INT)",
+    )
+    .await;
+    exec(
+        &mut conn1,
+        "INSERT INTO mixed_lock_flow VALUES (1, 10), (2, 20)",
+    )
+    .await;
+
+    // conn1 explicit txn locks key=1.
+    exec(&mut conn1, "BEGIN").await;
+    exec(&mut conn1, "UPDATE mixed_lock_flow SET v = 11 WHERE id = 1").await;
+
+    // conn2 autocommit write on disjoint key succeeds.
+    exec(
+        &mut conn2,
+        "UPDATE mixed_lock_flow SET v = 200 WHERE id = 2",
+    )
+    .await;
+
+    // conn3 explicit txn hits conflict on key=1, but must remain active.
+    exec(&mut conn3, "BEGIN").await;
+    expect_lock_conflict(&mut conn3, "UPDATE mixed_lock_flow SET v = 30 WHERE id = 1").await;
+
+    // conn3 keeps txn alive and can write another key.
+    exec(
+        &mut conn3,
+        "UPDATE mixed_lock_flow SET v = 220 WHERE id = 2",
+    )
+    .await;
+
+    // While conn3 is uncommitted, autocommit reads still see committed value.
+    let v2_before_commit =
+        query_one(&mut conn2, "SELECT v FROM mixed_lock_flow WHERE id = 2").await;
+    assert_eq!(v2_before_commit, "200");
+    expect_lock_conflict(
+        &mut conn2,
+        "UPDATE mixed_lock_flow SET v = 201 WHERE id = 2",
+    )
+    .await;
+
+    // Release key=1 lock, then conn3 retry succeeds and commits.
+    exec(&mut conn1, "ROLLBACK").await;
+    exec(&mut conn3, "UPDATE mixed_lock_flow SET v = 30 WHERE id = 1").await;
+    exec(&mut conn3, "COMMIT").await;
+
+    let rows = query_all(&mut conn2, "SELECT id, v FROM mixed_lock_flow ORDER BY id").await;
+    assert_eq!(rows[0], vec!["1", "30"]);
+    assert_eq!(rows[1], vec!["2", "220"]);
 }
 
 /// Test that concurrent UPDATE to the same key results in lock conflict.
