@@ -110,6 +110,12 @@ impl<T: TxnService + 'static> GcWorkerInner<T> {
         while !self.shutdown.load(Ordering::Relaxed) {
             self.process_gc_tasks().await;
 
+            // If shutdown is requested while processing tasks, exit promptly
+            // instead of entering the periodic sleep branch.
+            if self.shutdown.load(Ordering::Relaxed) {
+                break;
+            }
+
             tokio::select! {
                 _ = self.notify.notified() => {}
                 _ = tokio::time::sleep(Duration::from_secs(30)) => {}
@@ -168,6 +174,10 @@ impl<T: TxnService + 'static> GcWorkerInner<T> {
                     task.task_id
                 );
                 continue;
+            }
+
+            if self.shutdown.load(Ordering::Relaxed) {
+                return;
             }
 
             // No overlap — mark task done

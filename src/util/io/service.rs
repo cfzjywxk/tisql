@@ -278,7 +278,8 @@ fn io_thread_main(rx: crossbeam_channel::Receiver<IoOp>, ring_size: u32) -> Resu
             batch.push(op);
         }
 
-        // Submit each operation to io_uring
+        // Submit each operation to io_uring.
+        let mut remaining = 0usize;
         for op in batch {
             let id = next_id;
             next_id += 1;
@@ -327,6 +328,7 @@ fn io_thread_main(rx: crossbeam_channel::Receiver<IoOp>, ring_size: u32) -> Resu
                             .push(&sqe)
                             .map_err(|e| format!("SQ full: {e}"))?;
                     }
+                    remaining += 1;
                 }
                 IoOp::WriteAt {
                     fd,
@@ -359,6 +361,7 @@ fn io_thread_main(rx: crossbeam_channel::Receiver<IoOp>, ring_size: u32) -> Resu
                             .push(&sqe)
                             .map_err(|e| format!("SQ full: {e}"))?;
                     }
+                    remaining += 1;
                 }
                 IoOp::Fsync { fd, reply } => {
                     let sqe = io_uring::opcode::Fsync::new(io_uring::types::Fd(fd))
@@ -375,71 +378,76 @@ fn io_thread_main(rx: crossbeam_channel::Receiver<IoOp>, ring_size: u32) -> Resu
                             .push(&sqe)
                             .map_err(|e| format!("SQ full: {e}"))?;
                     }
+                    remaining += 1;
                 }
             }
         }
 
-        // Submit all and wait for at least 1 completion
-        ring.submit_and_wait(1)
-            .map_err(|e| format!("submit_and_wait failed: {e}"))?;
+        // Drain all completions for this submission batch before blocking on
+        // new channel work; otherwise trailing CQEs can remain unreaped and
+        // their reply futures never resolve.
+        while remaining > 0 {
+            ring.submit_and_wait(1)
+                .map_err(|e| format!("submit_and_wait failed: {e}"))?;
 
-        // Reap all available completions
-        for cqe in ring.completion() {
-            let id = cqe.user_data() as usize;
-            let result = cqe.result();
+            for cqe in ring.completion() {
+                let id = cqe.user_data() as usize;
+                let result = cqe.result();
 
-            if let Some(op) = pending.get_mut(id).and_then(|slot| slot.take()) {
-                match op {
-                    PendingOp::Read {
-                        buf,
-                        requested_offset,
-                        aligned_offset,
-                        requested_len,
-                        reply,
-                    } => {
-                        if result < 0 {
-                            let _ = reply.send(Err(format!(
-                                "io_uring read failed: {}",
-                                std::io::Error::from_raw_os_error(-result)
-                            )));
-                        } else {
-                            // Extract the exact range the caller requested
-                            let skip = (requested_offset - aligned_offset) as usize;
-                            let end = skip + requested_len;
-                            if end <= buf.len() {
-                                let result_buf =
-                                    AlignedBuf::from_slice(&buf[skip..end], DMA_ALIGNMENT);
-                                let _ = reply.send(Ok(result_buf));
+                if let Some(op) = pending.get_mut(id).and_then(|slot| slot.take()) {
+                    remaining -= 1;
+                    match op {
+                        PendingOp::Read {
+                            buf,
+                            requested_offset,
+                            aligned_offset,
+                            requested_len,
+                            reply,
+                        } => {
+                            if result < 0 {
+                                let _ = reply.send(Err(format!(
+                                    "io_uring read failed: {}",
+                                    std::io::Error::from_raw_os_error(-result)
+                                )));
                             } else {
-                                // Short read — return what we got
-                                let available = buf.len().saturating_sub(skip);
-                                let actual_len = requested_len.min(available);
-                                let result_buf = AlignedBuf::from_slice(
-                                    &buf[skip..skip + actual_len],
-                                    DMA_ALIGNMENT,
-                                );
-                                let _ = reply.send(Ok(result_buf));
+                                // Extract the exact range the caller requested.
+                                let skip = (requested_offset - aligned_offset) as usize;
+                                let end = skip + requested_len;
+                                if end <= buf.len() {
+                                    let result_buf =
+                                        AlignedBuf::from_slice(&buf[skip..end], DMA_ALIGNMENT);
+                                    let _ = reply.send(Ok(result_buf));
+                                } else {
+                                    // Short read — return what we got.
+                                    let available = buf.len().saturating_sub(skip);
+                                    let actual_len = requested_len.min(available);
+                                    let result_buf = AlignedBuf::from_slice(
+                                        &buf[skip..skip + actual_len],
+                                        DMA_ALIGNMENT,
+                                    );
+                                    let _ = reply.send(Ok(result_buf));
+                                }
                             }
                         }
-                    }
-                    PendingOp::Write { _buf, reply } => {
-                        if result < 0 {
-                            let _ = reply.send(Err(format!(
-                                "io_uring write failed: {}",
-                                std::io::Error::from_raw_os_error(-result)
-                            )));
-                        } else {
-                            let _ = reply.send(Ok(result as usize));
+                        PendingOp::Write { _buf, reply } => {
+                            if result < 0 {
+                                let _ = reply.send(Err(format!(
+                                    "io_uring write failed: {}",
+                                    std::io::Error::from_raw_os_error(-result)
+                                )));
+                            } else {
+                                let _ = reply.send(Ok(result as usize));
+                            }
                         }
-                    }
-                    PendingOp::Fsync { reply } => {
-                        if result < 0 {
-                            let _ = reply.send(Err(format!(
-                                "io_uring fsync failed: {}",
-                                std::io::Error::from_raw_os_error(-result)
-                            )));
-                        } else {
-                            let _ = reply.send(Ok(()));
+                        PendingOp::Fsync { reply } => {
+                            if result < 0 {
+                                let _ = reply.send(Err(format!(
+                                    "io_uring fsync failed: {}",
+                                    std::io::Error::from_raw_os_error(-result)
+                                )));
+                            } else {
+                                let _ = reply.send(Ok(()));
+                            }
                         }
                     }
                 }

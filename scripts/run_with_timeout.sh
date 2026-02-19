@@ -14,8 +14,8 @@ if [[ ! "$timeout_secs" =~ ^[1-9][0-9]*$ ]]; then
     exit 2
 fi
 
-# Keep timeout guards strict and aligned with CLAUDE.md policy.
-max_timeout_secs="${TISQL_MAX_TIMEOUT_SECS:-300}"
+# Keep timeout guards strict and fast-fail by default (< 1 minute).
+max_timeout_secs="${TISQL_MAX_TIMEOUT_SECS:-55}"
 if [[ ! "$max_timeout_secs" =~ ^[1-9][0-9]*$ ]]; then
     echo "TISQL_MAX_TIMEOUT_SECS must be a positive integer, got: $max_timeout_secs" >&2
     exit 2
@@ -25,9 +25,15 @@ if (( timeout_secs > max_timeout_secs )); then
     exit 2
 fi
 
+kill_after_secs="${TISQL_TIMEOUT_KILL_AFTER_SECS:-5}"
+if [[ ! "$kill_after_secs" =~ ^[1-9][0-9]*$ ]]; then
+    echo "TISQL_TIMEOUT_KILL_AFTER_SECS must be a positive integer, got: $kill_after_secs" >&2
+    exit 2
+fi
+
 if command -v timeout >/dev/null 2>&1; then
     set +e
-    timeout --signal=TERM --kill-after=30s "${timeout_secs}s" "$@"
+    timeout --signal=TERM --kill-after="${kill_after_secs}s" "${timeout_secs}s" "$@"
     status=$?
     set -e
 

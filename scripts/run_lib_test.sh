@@ -27,8 +27,8 @@ if [[ ! "$job_count" =~ ^[1-9][0-9]*$ ]]; then
 fi
 
 discover_timeout_secs="$timeout_secs"
-if (( discover_timeout_secs > 120 )); then
-    discover_timeout_secs=120
+if (( discover_timeout_secs > 55 )); then
+    discover_timeout_secs=55
 fi
 
 list_output="$(

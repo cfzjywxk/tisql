@@ -52,8 +52,8 @@ fi
 
 # Pre-build once so parallel case runs avoid serializing on cargo build locks.
 discover_timeout_secs="$case_timeout_secs"
-if (( discover_timeout_secs > 120 )); then
-    discover_timeout_secs=120
+if (( discover_timeout_secs > 55 )); then
+    discover_timeout_secs=55
 fi
 ./scripts/run_with_timeout.sh "$discover_timeout_secs" cargo build --bin mysqltest-runner
 runner_bin="target/debug/mysqltest-runner"
