@@ -30,6 +30,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use tisql::util::error::TiSqlError;
+use tisql::util::{init_logger_from_env, LogLevel};
 use tisql::{Database, DatabaseConfig, QueryResult, Session};
 
 /// Test runner configuration
@@ -67,6 +68,10 @@ struct TestResult {
 
 #[tokio::main]
 async fn main() {
+    // Avoid TRACE-level fallback logging (logger uninitialized) during mysqltest
+    // runs; excessive stderr output can dominate statement wall time.
+    init_logger_from_env(LogLevel::Warn);
+
     let args: Vec<String> = std::env::args().collect();
 
     let base_dir = PathBuf::from(env!("CARGO_MANIFEST_DIR"))

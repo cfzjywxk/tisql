@@ -178,8 +178,8 @@ impl FileClogService {
 
             // Find max LSN from existing entries and track valid data length
             let (entries, valid_bytes) = Self::read_entries_with_valid_length(&mut reader)?;
-            if let Some(last) = entries.last() {
-                max_lsn = last.lsn;
+            if let Some(max_seen) = entries.iter().map(|entry| entry.lsn).max() {
+                max_lsn = max_seen;
             }
 
             // Calculate the total valid length: header + valid record bytes
@@ -321,7 +321,7 @@ impl FileClogService {
     /// Returns 0 if the clog is empty.
     pub fn max_lsn(&self) -> Result<Lsn> {
         let entries = self.read_all()?;
-        Ok(entries.last().map(|e| e.lsn).unwrap_or(0))
+        Ok(entries.iter().map(|entry| entry.lsn).max().unwrap_or(0))
     }
 
     /// Write file header

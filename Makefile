@@ -10,6 +10,7 @@ COMPACTION_BATCH_TIMEOUT_SECS ?= 300
 COMPACTION_CASE_TIMEOUT_SECS ?= 240
 E2E_TEST_TIMEOUT_SECS ?= 900
 E2E_STMT_TIMEOUT_SECS ?= 15
+E2E_CASE_TIMEOUT_SECS ?= 180
 
 UNAME_S := $(shell uname -s)
 
@@ -63,8 +64,15 @@ failpoint-test:
 
 # Run E2E tests (MySQL-test format)
 e2e-test:
-	./scripts/run_with_timeout.sh $(E2E_TEST_TIMEOUT_SECS) \
-		cargo run --bin mysqltest-runner -- --all --statement-timeout-secs $(E2E_STMT_TIMEOUT_SECS)
+	@set -e; \
+	for test_file in $$(find tests/integrationtest/t -type f \( -name '*.test' -o -name '*.t' \) | sort); do \
+		test_name=$${test_file#tests/integrationtest/t/}; \
+		test_name=$${test_name%.test}; \
+		test_name=$${test_name%.t}; \
+		echo "Running e2e case: $$test_name"; \
+		./scripts/run_with_timeout.sh $(E2E_CASE_TIMEOUT_SECS) \
+			cargo run --bin mysqltest-runner -- --test $$test_name --statement-timeout-secs $(E2E_STMT_TIMEOUT_SECS); \
+	done
 
 # Record E2E test results (use when adding new tests)
 e2e-record:
