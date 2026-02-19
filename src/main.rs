@@ -98,13 +98,10 @@ fn main() {
         .parse()
         .expect("Invalid address");
 
-    let encoded_result_batch = if args.enable_encoded_result_batch {
-        true
-    } else if args.disable_encoded_result_batch {
-        false
-    } else {
-        DatabaseConfig::default().enable_encoded_result_batch
-    };
+    let encoded_result_batch = resolve_encoded_result_batch_setting(
+        args.enable_encoded_result_batch,
+        args.disable_encoded_result_batch,
+    );
 
     // Open database with persistence
     let db_config = DatabaseConfig::with_data_dir(&args.data_dir)
@@ -160,4 +157,59 @@ fn main() {
             eprintln!("Server error: {e}");
         }
     });
+}
+
+fn resolve_encoded_result_batch_setting(enable: bool, disable: bool) -> bool {
+    if enable {
+        true
+    } else if disable {
+        false
+    } else {
+        DatabaseConfig::default().enable_encoded_result_batch
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_encoded_result_batch_defaults_to_config() {
+        let args = Args::try_parse_from(["tisql"]).unwrap();
+        assert_eq!(
+            resolve_encoded_result_batch_setting(
+                args.enable_encoded_result_batch,
+                args.disable_encoded_result_batch
+            ),
+            DatabaseConfig::default().enable_encoded_result_batch
+        );
+    }
+
+    #[test]
+    fn test_encoded_result_batch_enable_flag() {
+        let args = Args::try_parse_from(["tisql", "--enable-encoded-result-batch"]).unwrap();
+        assert!(resolve_encoded_result_batch_setting(
+            args.enable_encoded_result_batch,
+            args.disable_encoded_result_batch
+        ));
+    }
+
+    #[test]
+    fn test_encoded_result_batch_disable_flag() {
+        let args = Args::try_parse_from(["tisql", "--disable-encoded-result-batch"]).unwrap();
+        assert!(!resolve_encoded_result_batch_setting(
+            args.enable_encoded_result_batch,
+            args.disable_encoded_result_batch
+        ));
+    }
+
+    #[test]
+    fn test_encoded_result_batch_flags_conflict() {
+        let parsed = Args::try_parse_from([
+            "tisql",
+            "--enable-encoded-result-batch",
+            "--disable-encoded-result-batch",
+        ]);
+        assert!(parsed.is_err());
+    }
 }

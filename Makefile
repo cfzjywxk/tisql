@@ -6,6 +6,7 @@ UNIT_TEST_TIMEOUT_SECS ?= 300
 UNIT_TEST_THREAD_ARGS ?= -- --test-threads=8
 STORE_TEST_CASE_TIMEOUT_SECS ?= 180
 STORE_TEST_LOG_LEVEL ?= warn
+STORE_TEST_FILTER ?=
 PESSIMISTIC_TXN_TEST_TIMEOUT_SECS ?= 300
 STORAGE_TEST_TIMEOUT_SECS ?= 300
 COMPACTION_BATCH_TIMEOUT_SECS ?= 300
@@ -49,40 +50,11 @@ unit-test:
 
 # Run store tests (internal integration tests)
 store-test:
-	./scripts/run_with_timeout.sh $(STORE_TEST_CASE_TIMEOUT_SECS) \
-		env RUST_LOG=$(STORE_TEST_LOG_LEVEL) cargo test --test store_test crud:: -- --test-threads=$(STORE_TEST_THREAD_COUNT)
-	./scripts/run_with_timeout.sh $(STORE_TEST_CASE_TIMEOUT_SECS) \
-		env RUST_LOG=$(STORE_TEST_LOG_LEVEL) cargo test --test store_test data_types:: -- --test-threads=$(STORE_TEST_THREAD_COUNT)
-	./scripts/run_with_timeout.sh $(STORE_TEST_CASE_TIMEOUT_SECS) \
-		env RUST_LOG=$(STORE_TEST_LOG_LEVEL) cargo test --test store_test ddl:: -- --test-threads=$(STORE_TEST_THREAD_COUNT)
-	./scripts/run_with_timeout.sh $(STORE_TEST_CASE_TIMEOUT_SECS) \
-		env RUST_LOG=$(STORE_TEST_LOG_LEVEL) cargo test --test store_test duplicate_key:: -- --test-threads=$(STORE_TEST_THREAD_COUNT)
-	./scripts/run_with_timeout.sh $(STORE_TEST_CASE_TIMEOUT_SECS) \
-		env RUST_LOG=$(STORE_TEST_LOG_LEVEL) cargo test --test store_test errors:: -- --test-threads=$(STORE_TEST_THREAD_COUNT)
-	./scripts/run_with_timeout.sh $(STORE_TEST_CASE_TIMEOUT_SECS) \
-		env RUST_LOG=$(STORE_TEST_LOG_LEVEL) cargo test --test store_test expressions:: -- --test-threads=$(STORE_TEST_THREAD_COUNT)
-	./scripts/run_with_timeout.sh $(STORE_TEST_CASE_TIMEOUT_SECS) \
-		env RUST_LOG=$(STORE_TEST_LOG_LEVEL) cargo test --test store_test filter:: -- --test-threads=$(STORE_TEST_THREAD_COUNT)
-	./scripts/run_with_timeout.sh $(STORE_TEST_CASE_TIMEOUT_SECS) \
-		env RUST_LOG=$(STORE_TEST_LOG_LEVEL) cargo test --test store_test select:: -- --test-threads=$(STORE_TEST_THREAD_COUNT)
-	./scripts/run_with_timeout.sh $(STORE_TEST_CASE_TIMEOUT_SECS) \
-		env RUST_LOG=$(STORE_TEST_LOG_LEVEL) cargo test --test store_test testkit::tests:: -- --test-threads=$(STORE_TEST_THREAD_COUNT)
-	./scripts/run_with_timeout.sh $(STORE_TEST_CASE_TIMEOUT_SECS) \
-		env RUST_LOG=$(STORE_TEST_LOG_LEVEL) cargo test --test store_test persistence::test_catalog_survives_restart -- --test-threads=$(STORE_TEST_THREAD_COUNT) --nocapture
-	./scripts/run_with_timeout.sh $(STORE_TEST_CASE_TIMEOUT_SECS) \
-		env RUST_LOG=$(STORE_TEST_LOG_LEVEL) cargo test --test store_test persistence::test_multiple_tables_survive_restart -- --test-threads=$(STORE_TEST_THREAD_COUNT) --nocapture
-	./scripts/run_with_timeout.sh $(STORE_TEST_CASE_TIMEOUT_SECS) \
-		env RUST_LOG=$(STORE_TEST_LOG_LEVEL) cargo test --test store_test persistence::test_drop_table_persists -- --test-threads=$(STORE_TEST_THREAD_COUNT) --nocapture
-	./scripts/run_with_timeout.sh $(STORE_TEST_CASE_TIMEOUT_SECS) \
-		env RUST_LOG=$(STORE_TEST_LOG_LEVEL) cargo test --test store_test persistence::test_table_id_persists -- --test-threads=$(STORE_TEST_THREAD_COUNT) --nocapture
-	./scripts/run_with_timeout.sh $(STORE_TEST_CASE_TIMEOUT_SECS) \
-		env RUST_LOG=$(STORE_TEST_LOG_LEVEL) cargo test --test store_test persistence::test_crash_recovery_no_close -- --test-threads=$(STORE_TEST_THREAD_COUNT) --nocapture
-	./scripts/run_with_timeout.sh $(STORE_TEST_CASE_TIMEOUT_SECS) \
-		env RUST_LOG=$(STORE_TEST_LOG_LEVEL) cargo test --test store_test persistence::test_crash_recovery_with_updates_deletes -- --test-threads=$(STORE_TEST_THREAD_COUNT) --nocapture
-	./scripts/run_with_timeout.sh $(STORE_TEST_CASE_TIMEOUT_SECS) \
-		env RUST_LOG=$(STORE_TEST_LOG_LEVEL) cargo test --test store_test persistence::test_multiple_crash_recovery_cycles -- --test-threads=$(STORE_TEST_THREAD_COUNT) --nocapture
-	./scripts/run_with_timeout.sh $(STORE_TEST_CASE_TIMEOUT_SECS) \
-		env RUST_LOG=$(STORE_TEST_LOG_LEVEL) cargo test --test store_test persistence::test_crash_recovery_ddl_drop_table -- --test-threads=$(STORE_TEST_THREAD_COUNT) --nocapture
+	./scripts/run_store_test.sh \
+		$(STORE_TEST_CASE_TIMEOUT_SECS) \
+		$(STORE_TEST_LOG_LEVEL) \
+		$(STORE_TEST_THREAD_COUNT) \
+		"$(STORE_TEST_FILTER)"
 	./scripts/run_with_timeout.sh $(PESSIMISTIC_TXN_TEST_TIMEOUT_SECS) cargo test --test pessimistic_txn_ported_test
 
 # Run storage regression tests (ported RocksDB-style suites)

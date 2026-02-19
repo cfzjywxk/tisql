@@ -534,11 +534,7 @@ async fn flush_typed_batch(
     }
 
     let est_bytes = (*batch_est_bytes).max(1);
-    let permits = u32::try_from(est_bytes).map_err(|_| {
-        TiSqlError::Internal(format!(
-            "Batch estimated bytes {est_bytes} exceed semaphore permit range"
-        ))
-    })?;
+    let permits = permits_for_batch_bytes(est_bytes, "Typed")?;
     let permit = Arc::clone(result_budget)
         .acquire_many_owned(permits)
         .await
@@ -576,11 +572,7 @@ async fn flush_encoded_batch(
 
     let payload = std::mem::take(bytes);
     let est_bytes = payload.len().max(1);
-    let permits = u32::try_from(est_bytes).map_err(|_| {
-        TiSqlError::Internal(format!(
-            "Encoded batch bytes {est_bytes} exceed semaphore permit range"
-        ))
-    })?;
+    let permits = permits_for_batch_bytes(est_bytes, "Encoded")?;
     let permit = Arc::clone(result_budget)
         .acquire_many_owned(permits)
         .await
@@ -606,6 +598,19 @@ async fn flush_encoded_batch(
     }
 
     Ok(true)
+}
+
+fn permits_for_batch_bytes(est_bytes: usize, batch_kind: &str) -> Result<u32, TiSqlError> {
+    if est_bytes > RESULT_BUDGET_BYTES {
+        return Err(TiSqlError::Internal(format!(
+            "{batch_kind} batch bytes {est_bytes} exceeds result budget {RESULT_BUDGET_BYTES}"
+        )));
+    }
+    u32::try_from(est_bytes).map_err(|_| {
+        TiSqlError::Internal(format!(
+            "{batch_kind} batch bytes {est_bytes} exceed semaphore permit range"
+        ))
+    })
 }
 
 fn encode_row_canonical(
@@ -981,6 +986,18 @@ mod tests {
         s.push_str("abc");
         let row = Row::new(vec![Value::String(s)]);
         assert!(estimate_row_heap_bytes(&row) >= 128);
+    }
+
+    #[test]
+    fn test_permits_for_batch_bytes_accepts_budget_boundary() {
+        let permits = permits_for_batch_bytes(RESULT_BUDGET_BYTES, "Typed").unwrap();
+        assert_eq!(permits as usize, RESULT_BUDGET_BYTES);
+    }
+
+    #[test]
+    fn test_permits_for_batch_bytes_rejects_oversized_batch() {
+        let err = permits_for_batch_bytes(RESULT_BUDGET_BYTES + 1, "Encoded").unwrap_err();
+        assert!(err.to_string().contains("exceeds result budget"));
     }
 
     #[test]
