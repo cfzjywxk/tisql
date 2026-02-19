@@ -85,7 +85,8 @@ impl<T: TxnService + 'static> GcWorker<T> {
         let handle = self.worker_handle.lock().take();
         if let Some(jh) = handle {
             // Drain the worker task to avoid leaving an in-flight tablet retire
-            // operation detached during Database::close/drop.
+            // operation detached during Database::close/drop. This is a
+            // shutdown-only blocking wait by design.
             let _ = crate::io::block_on_sync(jh);
         }
     }

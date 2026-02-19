@@ -536,7 +536,9 @@ impl Database {
             Arc::new(move || -> u64 {
                 match registry.min_start_ts() {
                     Some(min_ts) if min_ts > 0 => min_ts - 1,
-                    _ => txn_svc.tso().get_ts(),
+                    // Read current TSO without advancing it; GC safe-point polling
+                    // runs frequently (compaction + background worker loops).
+                    _ => txn_svc.last_ts(),
                 }
             })
         };
