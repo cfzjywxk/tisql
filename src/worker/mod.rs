@@ -25,23 +25,43 @@
 
 use std::sync::Arc;
 
-use tokio::sync::{mpsc, oneshot};
+use tokio::sync::{mpsc, oneshot, OwnedSemaphorePermit, Semaphore};
 
-use crate::catalog::types::Row;
+use crate::catalog::types::{Row, Value};
 use crate::executor::ExecutionOutput;
 use crate::session::ExecutionCtx;
 use crate::transaction::TxnCtx;
 use crate::util::error::TiSqlError;
 use crate::Database;
 
-/// A batch of rows streamed from worker to protocol task.
-pub type RowBatch = Vec<Row>;
+/// A typed row batch plus its byte-budget permit.
+pub struct TypedBatch {
+    pub rows: Vec<Row>,
+    pub est_bytes: usize,
+    _budget_permit: OwnedSemaphorePermit,
+}
 
-/// Number of rows per batch sent through the mpsc channel.
-const BATCH_SIZE: usize = 1024;
+/// Target rows per emitted batch.
+const TARGET_BATCH_ROWS: usize = 256;
+/// Soft byte threshold per emitted batch.
+const TARGET_BATCH_BYTES: usize = 256 * 1024;
+/// Hard byte threshold per emitted batch.
+const MAX_BATCH_BYTES: usize = 1024 * 1024;
+/// Per-query result-memory budget.
+const RESULT_BUDGET_BYTES: usize = 8 * 1024 * 1024;
+/// Lower/upper bound for channel capacity derived from byte budget.
+const MIN_CHANNEL_CAPACITY: usize = 4;
+const MAX_CHANNEL_CAPACITY: usize = 64;
+const CHANNEL_CAPACITY_FROM_BUDGET: usize = RESULT_BUDGET_BYTES.div_ceil(TARGET_BATCH_BYTES);
 
 /// Bounded channel capacity (number of batches in flight).
-const CHANNEL_CAPACITY: usize = 4;
+const CHANNEL_CAPACITY: usize = if CHANNEL_CAPACITY_FROM_BUDGET < MIN_CHANNEL_CAPACITY {
+    MIN_CHANNEL_CAPACITY
+} else if CHANNEL_CAPACITY_FROM_BUDGET > MAX_CHANNEL_CAPACITY {
+    MAX_CHANNEL_CAPACITY
+} else {
+    CHANNEL_CAPACITY_FROM_BUDGET
+};
 
 /// Response from query dispatch.
 ///
@@ -51,7 +71,7 @@ pub enum QueryResponse {
     /// Read query — receive row batches from the channel.
     Rows {
         columns: Vec<String>,
-        batch_rx: mpsc::Receiver<Result<RowBatch, TiSqlError>>,
+        batch_rx: mpsc::Receiver<Result<TypedBatch, TiSqlError>>,
         txn_ctx: Option<TxnCtx>,
     },
     /// Write operation (INSERT/UPDATE/DELETE).
@@ -164,29 +184,60 @@ pub async fn dispatch_full_query(
 
 /// Pull rows from the Execution handle and send batches through the channel.
 ///
-/// Accumulates up to BATCH_SIZE rows per batch. On error, sends the error
+/// Accumulates rows into row+byte bounded batches. On error, sends the error
 /// through the channel and returns. On EOF, drops the sender (receiver gets None).
 async fn stream_rows(
     mut exec: crate::executor::Execution,
-    batch_tx: mpsc::Sender<Result<RowBatch, TiSqlError>>,
+    batch_tx: mpsc::Sender<Result<TypedBatch, TiSqlError>>,
 ) {
-    let mut batch = Vec::with_capacity(BATCH_SIZE);
+    let result_budget = Arc::new(Semaphore::new(RESULT_BUDGET_BYTES));
+    let mut batch = Vec::with_capacity(TARGET_BATCH_ROWS);
+    let mut batch_est_bytes = 0usize;
 
     loop {
         match exec.next().await {
             Ok(Some(row)) => {
+                batch_est_bytes = batch_est_bytes.saturating_add(estimate_row_text_bytes(&row));
                 batch.push(row);
-                if batch.len() >= BATCH_SIZE {
-                    let full_batch = std::mem::replace(&mut batch, Vec::with_capacity(BATCH_SIZE));
-                    if batch_tx.send(Ok(full_batch)).await.is_err() {
-                        return; // Receiver dropped (client disconnected)
+                if batch.len() >= TARGET_BATCH_ROWS
+                    || batch_est_bytes >= TARGET_BATCH_BYTES
+                    || batch_est_bytes >= MAX_BATCH_BYTES
+                {
+                    match flush_typed_batch(
+                        &batch_tx,
+                        &result_budget,
+                        &mut batch,
+                        &mut batch_est_bytes,
+                    )
+                    .await
+                    {
+                        Ok(true) => {}
+                        Ok(false) => return, // Receiver dropped (client disconnected)
+                        Err(e) => {
+                            let _ = batch_tx.send(Err(e)).await;
+                            return;
+                        }
                     }
                 }
             }
             Ok(None) => {
                 // Send remaining rows
                 if !batch.is_empty() {
-                    let _ = batch_tx.send(Ok(batch)).await;
+                    match flush_typed_batch(
+                        &batch_tx,
+                        &result_budget,
+                        &mut batch,
+                        &mut batch_est_bytes,
+                    )
+                    .await
+                    {
+                        Ok(true) => {}
+                        Ok(false) => return,
+                        Err(e) => {
+                            let _ = batch_tx.send(Err(e)).await;
+                            return;
+                        }
+                    }
                 }
                 return; // EOF — drop sender, receiver gets None
             }
@@ -196,6 +247,131 @@ async fn stream_rows(
                 return;
             }
         }
+    }
+}
+
+async fn flush_typed_batch(
+    batch_tx: &mpsc::Sender<Result<TypedBatch, TiSqlError>>,
+    result_budget: &Arc<Semaphore>,
+    batch: &mut Vec<Row>,
+    batch_est_bytes: &mut usize,
+) -> Result<bool, TiSqlError> {
+    if batch.is_empty() {
+        return Ok(true);
+    }
+
+    let est_bytes = (*batch_est_bytes).max(1);
+    let permits = u32::try_from(est_bytes).map_err(|_| {
+        TiSqlError::Internal(format!(
+            "Batch estimated bytes {est_bytes} exceed semaphore permit range"
+        ))
+    })?;
+    let permit = Arc::clone(result_budget)
+        .acquire_many_owned(permits)
+        .await
+        .map_err(|_| TiSqlError::Internal("Result budget semaphore unexpectedly closed".into()))?;
+
+    let rows = std::mem::replace(batch, Vec::with_capacity(TARGET_BATCH_ROWS));
+    *batch_est_bytes = 0;
+    let typed_batch = TypedBatch {
+        rows,
+        est_bytes,
+        _budget_permit: permit,
+    };
+
+    if batch_tx.send(Ok(typed_batch)).await.is_err() {
+        return Ok(false);
+    }
+
+    Ok(true)
+}
+
+fn estimate_row_text_bytes(row: &Row) -> usize {
+    row.iter().fold(0usize, |acc, val| {
+        acc.saturating_add(estimate_value_text_bytes(val))
+    })
+}
+
+fn estimate_value_text_bytes(val: &Value) -> usize {
+    match val {
+        Value::Null => 1, // 0xFB
+        Value::Boolean(b) => {
+            let len = if *b { 4 } else { 5 }; // true/false
+            lenenc_prefix_len(len).saturating_add(len)
+        }
+        Value::TinyInt(v) => {
+            let mut buf = itoa::Buffer::new();
+            let len = buf.format(*v).len();
+            lenenc_prefix_len(len).saturating_add(len)
+        }
+        Value::SmallInt(v) => {
+            let mut buf = itoa::Buffer::new();
+            let len = buf.format(*v).len();
+            lenenc_prefix_len(len).saturating_add(len)
+        }
+        Value::Int(v) => {
+            let mut buf = itoa::Buffer::new();
+            let len = buf.format(*v).len();
+            lenenc_prefix_len(len).saturating_add(len)
+        }
+        Value::BigInt(v) => {
+            let mut buf = itoa::Buffer::new();
+            let len = buf.format(*v).len();
+            lenenc_prefix_len(len).saturating_add(len)
+        }
+        Value::Float(v) => {
+            let mut buf = ryu::Buffer::new();
+            let len = buf.format(*v).len();
+            lenenc_prefix_len(len).saturating_add(len)
+        }
+        Value::Double(v) => {
+            let mut buf = ryu::Buffer::new();
+            let len = buf.format(*v).len();
+            lenenc_prefix_len(len).saturating_add(len)
+        }
+        Value::Decimal(v) | Value::String(v) => lenenc_prefix_len(v.len()).saturating_add(v.len()),
+        Value::Bytes(v) => lenenc_prefix_len(v.len()).saturating_add(v.len()),
+        Value::Date(_) => lenenc_prefix_len(10).saturating_add(10),
+        Value::Time(v) => {
+            let len = estimate_time_text_len(*v);
+            lenenc_prefix_len(len).saturating_add(len)
+        }
+        Value::DateTime(v) | Value::Timestamp(v) => {
+            let frac = v.rem_euclid(1_000_000);
+            let len = if frac == 0 { 19 } else { 26 };
+            lenenc_prefix_len(len).saturating_add(len)
+        }
+    }
+}
+
+fn estimate_time_text_len(micros: i64) -> usize {
+    let abs = micros.saturating_abs() as u64;
+    let total_secs = abs / 1_000_000;
+    let hours = total_secs / 3600;
+    let mut len = decimal_len_u64(hours).max(2) + 6; // HH:MM:SS
+    if micros < 0 {
+        len += 1; // '-'
+    }
+    if abs % 1_000_000 != 0 {
+        len += 7; // ".ffffff"
+    }
+    len
+}
+
+fn decimal_len_u64(v: u64) -> usize {
+    let mut buf = itoa::Buffer::new();
+    buf.format(v).len()
+}
+
+fn lenenc_prefix_len(len: usize) -> usize {
+    if len < 251 {
+        1
+    } else if len < (1 << 16) {
+        3
+    } else if len < (1 << 24) {
+        4
+    } else {
+        9
     }
 }
 
@@ -258,7 +434,7 @@ fn make_show_response(columns: Vec<String>, rows: Vec<Row>) -> QueryResponse {
     let (batch_tx, batch_rx) = mpsc::channel(1);
     if !rows.is_empty() {
         // Send all rows as one batch (SHOW results are always small)
-        let _ = batch_tx.try_send(Ok(rows));
+        let _ = batch_tx.try_send(make_typed_batch(rows));
     }
     // Drop sender immediately — receiver will get the batch then None
     drop(batch_tx);
@@ -266,5 +442,55 @@ fn make_show_response(columns: Vec<String>, rows: Vec<Row>) -> QueryResponse {
         columns,
         batch_rx,
         txn_ctx: None,
+    }
+}
+
+fn make_typed_batch(rows: Vec<Row>) -> Result<TypedBatch, TiSqlError> {
+    let est_bytes = rows
+        .iter()
+        .map(estimate_row_text_bytes)
+        .fold(0usize, |acc, n| acc.saturating_add(n))
+        .max(1);
+
+    let permits = u32::try_from(est_bytes).map_err(|_| {
+        TiSqlError::Internal(format!(
+            "SHOW batch estimated bytes {est_bytes} exceed semaphore permit range"
+        ))
+    })?;
+    let sem = Arc::new(Semaphore::new(est_bytes));
+    let permit = Arc::clone(&sem)
+        .try_acquire_many_owned(permits)
+        .map_err(|_| TiSqlError::Internal("Failed to acquire SHOW batch result budget".into()))?;
+
+    Ok(TypedBatch {
+        rows,
+        est_bytes,
+        _budget_permit: permit,
+    })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::catalog::types::Value;
+
+    #[test]
+    fn test_channel_capacity_from_budget_defaults() {
+        assert_eq!(CHANNEL_CAPACITY, 32);
+    }
+
+    #[test]
+    fn test_estimate_value_text_bytes_numeric_nonzero() {
+        let int_len = estimate_value_text_bytes(&Value::Int(12345));
+        let float_len = estimate_value_text_bytes(&Value::Double(std::f64::consts::PI));
+        assert!(int_len > 0);
+        assert!(float_len > 0);
+    }
+
+    #[test]
+    fn test_estimate_time_text_len_fraction_and_sign() {
+        assert_eq!(estimate_time_text_len(0), 8); // 00:00:00
+        assert_eq!(estimate_time_text_len(-1_000_000), 9); // -00:00:01
+        assert_eq!(estimate_time_text_len(1_234_567), 15); // 00:00:01.234567
     }
 }

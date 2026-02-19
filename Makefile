@@ -1,6 +1,6 @@
 # TiSQL Makefile
 
-.PHONY: all build test unit-test store-test storage-test failpoint-test e2e-test fmt clippy clean run help prepare
+.PHONY: all build test unit-test store-test storage-test failpoint-test e2e-test fmt clippy clean run help prepare quick-prepare
 
 UNIT_TEST_TIMEOUT_SECS ?= 1200
 STORE_TEST_TIMEOUT_SECS ?= 1200
@@ -11,6 +11,16 @@ COMPACTION_CASE_TIMEOUT_SECS ?= 240
 E2E_TEST_TIMEOUT_SECS ?= 900
 E2E_STMT_TIMEOUT_SECS ?= 15
 E2E_CASE_TIMEOUT_SECS ?= 180
+
+# Faster local-iteration profile (smaller timeout guards, same segmented flow)
+QUICK_UNIT_TEST_TIMEOUT_SECS ?= 600
+QUICK_STORE_TEST_TIMEOUT_SECS ?= 600
+QUICK_PESSIMISTIC_TXN_TEST_TIMEOUT_SECS ?= 180
+QUICK_STORAGE_TEST_TIMEOUT_SECS ?= 600
+QUICK_COMPACTION_BATCH_TIMEOUT_SECS ?= 240
+QUICK_COMPACTION_CASE_TIMEOUT_SECS ?= 180
+QUICK_E2E_STMT_TIMEOUT_SECS ?= 15
+QUICK_E2E_CASE_TIMEOUT_SECS ?= 90
 
 UNAME_S := $(shell uname -s)
 
@@ -94,6 +104,20 @@ clippy:
 # Format, lint, and run all tests - run before pushing to pass CI
 prepare: fmt clippy test
 
+# Fast local gate: same segmented pipeline with tighter timeout guards.
+quick-prepare: fmt clippy
+	$(MAKE) unit-test UNIT_TEST_TIMEOUT_SECS=$(QUICK_UNIT_TEST_TIMEOUT_SECS)
+	$(MAKE) store-test \
+		STORE_TEST_TIMEOUT_SECS=$(QUICK_STORE_TEST_TIMEOUT_SECS) \
+		PESSIMISTIC_TXN_TEST_TIMEOUT_SECS=$(QUICK_PESSIMISTIC_TXN_TEST_TIMEOUT_SECS)
+	$(MAKE) storage-test \
+		STORAGE_TEST_TIMEOUT_SECS=$(QUICK_STORAGE_TEST_TIMEOUT_SECS) \
+		COMPACTION_BATCH_TIMEOUT_SECS=$(QUICK_COMPACTION_BATCH_TIMEOUT_SECS) \
+		COMPACTION_CASE_TIMEOUT_SECS=$(QUICK_COMPACTION_CASE_TIMEOUT_SECS)
+	$(MAKE) e2e-test \
+		E2E_STMT_TIMEOUT_SECS=$(QUICK_E2E_STMT_TIMEOUT_SECS) \
+		E2E_CASE_TIMEOUT_SECS=$(QUICK_E2E_CASE_TIMEOUT_SECS)
+
 # Run all CI checks locally (same as prepare but with format check instead of format)
 ci: fmt-check clippy test
 
@@ -129,6 +153,7 @@ help:
 	@echo "  fmt-check    Check code formatting"
 	@echo "  clippy       Run clippy linter"
 	@echo "  prepare      Format, lint, and run all tests (run before push)"
+	@echo "  quick-prepare Fast local gate with tighter timeout guards"
 	@echo "  ci           Run all CI checks (format check, lint, all tests)"
 	@echo "  clean        Clean build artifacts"
 	@echo "  run          Run the server (debug)"

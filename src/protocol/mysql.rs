@@ -192,9 +192,9 @@ impl MySqlBackend {
                 while let Some(batch_result) = batch_rx.recv().await {
                     match batch_result {
                         Ok(batch) => {
-                            for row in &batch {
+                            for row in &batch.rows {
                                 for val in row.iter() {
-                                    write_value_col(&mut rw, val)?;
+                                    write_value_fast(&mut rw, val)?;
                                 }
                                 rw.end_row().await?;
                             }
@@ -325,25 +325,239 @@ impl Drop for MySqlBackend {
 // Typed Value Writing
 // ============================================================================
 
-fn write_value_col<W: AsyncWrite + Unpin>(
+fn write_value_fast<W: AsyncWrite + Unpin>(
     rw: &mut opensrv_mysql::RowWriter<'_, W>,
     val: &Value,
 ) -> io::Result<()> {
     match val {
         Value::Null => rw.write_col(None::<i32>),
         Value::Boolean(b) => rw.write_col(if *b { "true" } else { "false" }),
-        Value::TinyInt(v) => rw.write_col(v.to_string().as_str()),
-        Value::SmallInt(v) => rw.write_col(v.to_string().as_str()),
-        Value::Int(v) => rw.write_col(v.to_string().as_str()),
-        Value::BigInt(v) => rw.write_col(v.to_string().as_str()),
-        Value::Float(v) => rw.write_col(v.to_string().as_str()),
-        Value::Double(v) => rw.write_col(v.to_string().as_str()),
+        Value::TinyInt(v) => {
+            let mut buf = itoa::Buffer::new();
+            rw.write_col(buf.format(*v))
+        }
+        Value::SmallInt(v) => {
+            let mut buf = itoa::Buffer::new();
+            rw.write_col(buf.format(*v))
+        }
+        Value::Int(v) => {
+            let mut buf = itoa::Buffer::new();
+            rw.write_col(buf.format(*v))
+        }
+        Value::BigInt(v) => {
+            let mut buf = itoa::Buffer::new();
+            rw.write_col(buf.format(*v))
+        }
+        Value::Float(v) => {
+            let mut buf = ryu::Buffer::new();
+            rw.write_col(buf.format(*v))
+        }
+        Value::Double(v) => {
+            let mut buf = ryu::Buffer::new();
+            rw.write_col(buf.format(*v))
+        }
         Value::Decimal(v) => rw.write_col(v.as_str()),
         Value::String(v) => rw.write_col(v.as_str()),
-        Value::Bytes(v) => rw.write_col(format!("{v:?}").as_str()),
-        Value::Date(v) => rw.write_col(format!("DATE({v})").as_str()),
-        Value::Time(v) => rw.write_col(format!("TIME({v})").as_str()),
-        Value::DateTime(v) => rw.write_col(format!("DATETIME({v})").as_str()),
-        Value::Timestamp(v) => rw.write_col(format!("TIMESTAMP({v})").as_str()),
+        Value::Bytes(v) => rw.write_col(v.as_slice()),
+        Value::Date(v) => {
+            let mut scratch = [0u8; 32];
+            let n = format_date_canonical(*v, &mut scratch)?;
+            rw.write_col(&scratch[..n])
+        }
+        Value::Time(v) => {
+            let mut scratch = [0u8; 32];
+            let n = format_time_canonical(*v, &mut scratch)?;
+            rw.write_col(&scratch[..n])
+        }
+        Value::DateTime(v) => {
+            let mut scratch = [0u8; 32];
+            let n = format_datetime_canonical(*v, &mut scratch)?;
+            rw.write_col(&scratch[..n])
+        }
+        Value::Timestamp(v) => {
+            let mut scratch = [0u8; 32];
+            let n = format_datetime_canonical(*v, &mut scratch)?;
+            rw.write_col(&scratch[..n])
+        }
+    }
+}
+
+fn format_date_canonical(days_since_epoch: i32, out: &mut [u8; 32]) -> io::Result<usize> {
+    let (year, month, day) = civil_from_days(days_since_epoch as i64);
+    let mut len = 0usize;
+    append_year(out, &mut len, year)?;
+    append_byte(out, &mut len, b'-')?;
+    append_u32_padded(out, &mut len, month, 2)?;
+    append_byte(out, &mut len, b'-')?;
+    append_u32_padded(out, &mut len, day, 2)?;
+    Ok(len)
+}
+
+fn format_time_canonical(micros: i64, out: &mut [u8; 32]) -> io::Result<usize> {
+    let mut len = 0usize;
+    let abs = micros.unsigned_abs();
+    let total_secs = abs / 1_000_000;
+    let frac = (abs % 1_000_000) as u32;
+    let hours = total_secs / 3_600;
+    let minutes = ((total_secs % 3_600) / 60) as u32;
+    let seconds = (total_secs % 60) as u32;
+
+    if micros < 0 {
+        append_byte(out, &mut len, b'-')?;
+    }
+
+    if hours < 100 {
+        append_u32_padded(out, &mut len, hours as u32, 2)?;
+    } else {
+        append_u64(out, &mut len, hours)?;
+    }
+    append_byte(out, &mut len, b':')?;
+    append_u32_padded(out, &mut len, minutes, 2)?;
+    append_byte(out, &mut len, b':')?;
+    append_u32_padded(out, &mut len, seconds, 2)?;
+    if frac != 0 {
+        append_byte(out, &mut len, b'.')?;
+        append_u32_padded(out, &mut len, frac, 6)?;
+    }
+    Ok(len)
+}
+
+fn format_datetime_canonical(micros_since_epoch: i64, out: &mut [u8; 32]) -> io::Result<usize> {
+    let secs = micros_since_epoch.div_euclid(1_000_000);
+    let frac = micros_since_epoch.rem_euclid(1_000_000) as u32;
+    let days = secs.div_euclid(86_400);
+    let sec_of_day = secs.rem_euclid(86_400) as u32;
+
+    let (year, month, day) = civil_from_days(days);
+    let hour = sec_of_day / 3_600;
+    let minute = (sec_of_day % 3_600) / 60;
+    let second = sec_of_day % 60;
+
+    let mut len = 0usize;
+    append_year(out, &mut len, year)?;
+    append_byte(out, &mut len, b'-')?;
+    append_u32_padded(out, &mut len, month, 2)?;
+    append_byte(out, &mut len, b'-')?;
+    append_u32_padded(out, &mut len, day, 2)?;
+    append_byte(out, &mut len, b' ')?;
+    append_u32_padded(out, &mut len, hour, 2)?;
+    append_byte(out, &mut len, b':')?;
+    append_u32_padded(out, &mut len, minute, 2)?;
+    append_byte(out, &mut len, b':')?;
+    append_u32_padded(out, &mut len, second, 2)?;
+    if frac != 0 {
+        append_byte(out, &mut len, b'.')?;
+        append_u32_padded(out, &mut len, frac, 6)?;
+    }
+    Ok(len)
+}
+
+// Convert days since Unix epoch (1970-01-01) to civil date.
+fn civil_from_days(days_since_epoch: i64) -> (i32, u32, u32) {
+    let z = days_since_epoch + 719_468;
+    let era = if z >= 0 { z } else { z - 146_096 } / 146_097;
+    let doe = z - era * 146_097;
+    let yoe = (doe - doe / 1_460 + doe / 36_524 - doe / 146_096) / 365;
+    let y = yoe + era * 400;
+    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
+    let mp = (5 * doy + 2) / 153;
+    let d = doy - (153 * mp + 2) / 5 + 1;
+    let m = mp + if mp < 10 { 3 } else { -9 };
+    let year = y + if m <= 2 { 1 } else { 0 };
+    (year as i32, m as u32, d as u32)
+}
+
+fn append_year(out: &mut [u8], len: &mut usize, year: i32) -> io::Result<()> {
+    if (0..=9_999).contains(&year) {
+        append_u32_padded(out, len, year as u32, 4)
+    } else {
+        let mut buf = itoa::Buffer::new();
+        append_bytes(out, len, buf.format(year).as_bytes())
+    }
+}
+
+fn append_u64(out: &mut [u8], len: &mut usize, value: u64) -> io::Result<()> {
+    let mut buf = itoa::Buffer::new();
+    append_bytes(out, len, buf.format(value).as_bytes())
+}
+
+fn append_u32_padded(
+    out: &mut [u8],
+    len: &mut usize,
+    mut value: u32,
+    width: usize,
+) -> io::Result<()> {
+    let mut tmp = [b'0'; 10];
+    let start = tmp.len().checked_sub(width).ok_or_else(|| {
+        io::Error::new(
+            io::ErrorKind::InvalidData,
+            "Invalid width for zero-padded integer",
+        )
+    })?;
+
+    for idx in (start..tmp.len()).rev() {
+        tmp[idx] = b'0' + (value % 10) as u8;
+        value /= 10;
+    }
+    if value != 0 {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "Zero-padded integer width overflow",
+        ));
+    }
+    append_bytes(out, len, &tmp[start..])
+}
+
+fn append_byte(out: &mut [u8], len: &mut usize, b: u8) -> io::Result<()> {
+    append_bytes(out, len, &[b])
+}
+
+fn append_bytes(out: &mut [u8], len: &mut usize, bytes: &[u8]) -> io::Result<()> {
+    let remaining = out.len().saturating_sub(*len);
+    if remaining < bytes.len() {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "Temporal formatting exceeded scratch buffer",
+        ));
+    }
+    out[*len..*len + bytes.len()].copy_from_slice(bytes);
+    *len += bytes.len();
+    Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_format_date_canonical_epoch() {
+        let mut scratch = [0u8; 32];
+        let n = format_date_canonical(0, &mut scratch).unwrap();
+        assert_eq!(&scratch[..n], b"1970-01-01");
+    }
+
+    #[test]
+    fn test_format_time_canonical_with_fraction() {
+        let mut scratch = [0u8; 32];
+        let n = format_time_canonical(
+            12 * 3_600_000_000 + 34 * 60_000_000 + 56_789_000,
+            &mut scratch,
+        )
+        .unwrap();
+        assert_eq!(&scratch[..n], b"12:34:56.789000");
+    }
+
+    #[test]
+    fn test_format_time_canonical_negative() {
+        let mut scratch = [0u8; 32];
+        let n = format_time_canonical(-3_600_000_000, &mut scratch).unwrap();
+        assert_eq!(&scratch[..n], b"-01:00:00");
+    }
+
+    #[test]
+    fn test_format_datetime_canonical_epoch() {
+        let mut scratch = [0u8; 32];
+        let n = format_datetime_canonical(0, &mut scratch).unwrap();
+        assert_eq!(&scratch[..n], b"1970-01-01 00:00:00");
     }
 }

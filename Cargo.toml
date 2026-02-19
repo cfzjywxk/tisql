@@ -28,6 +28,8 @@ tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 
 # Bytes handling
 bytes = "1"
+itoa = "1"
+ryu = "1"
 
 # Regex for LIKE matching
 regex = "1"
