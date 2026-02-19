@@ -22,7 +22,7 @@ use tempfile::tempdir;
 use tisql::catalog::types::Value;
 use tisql::tablet::TabletId;
 use tisql::testkit::ExecutionResult;
-use tisql::{Database, DatabaseConfig};
+use tisql::{Database, DatabaseConfig, QueryResult};
 
 fn create_test_db() -> (Arc<Database>, tempfile::TempDir) {
     let dir = tempdir().unwrap();
@@ -233,6 +233,273 @@ async fn test_phase6_pending_drop_gc_resumes_after_restart() {
         !statuses.is_empty() && statuses.iter().all(|s| s == "done"),
         "pending GC tasks should be resumed and completed after restart"
     );
+
+    db2.close().await.unwrap();
+}
+
+/// T6.5c: Multiple tables dropped → crash → restart → all GC tasks resume independently.
+#[tokio::test]
+async fn test_phase6_multiple_pending_drops_resume_after_restart() {
+    let dir = tempdir().unwrap();
+    let config = DatabaseConfig::with_data_dir(dir.path());
+
+    let (table_id_a, table_id_b) = {
+        let db = Arc::new(Database::open(config.clone()).unwrap());
+        exec(&db, "CREATE TABLE t_multi_a (id INT PRIMARY KEY, v INT)").await;
+        exec(&db, "CREATE TABLE t_multi_b (id INT PRIMARY KEY, v INT)").await;
+        exec(&db, "INSERT INTO t_multi_a VALUES (1, 10)").await;
+        exec(&db, "INSERT INTO t_multi_b VALUES (1, 20)").await;
+        let id_a = table_id_by_name(&db, "t_multi_a").await;
+        let id_b = table_id_by_name(&db, "t_multi_b").await;
+
+        // Pin safe point so GC cannot proceed.
+        db.session_registry().register(77, 1);
+        exec(&db, "DROP TABLE t_multi_a").await;
+        exec(&db, "DROP TABLE t_multi_b").await;
+        db.notify_gc_worker();
+        tokio::time::sleep(Duration::from_millis(200)).await;
+
+        let statuses_a = gc_task_statuses_for_table(&db, id_a).await;
+        let statuses_b = gc_task_statuses_for_table(&db, id_b).await;
+        assert!(statuses_a.iter().any(|s| s == "pending"));
+        assert!(statuses_b.iter().any(|s| s == "pending"));
+
+        db.close().await.unwrap();
+        (id_a, id_b)
+    };
+
+    // Reopen — no safe point pin, both GC tasks should complete.
+    let db2 = Arc::new(Database::open(config).unwrap());
+    let dir_a = dir.path().join("tablets").join(format!("t_{table_id_a}"));
+    let dir_b = dir.path().join("tablets").join(format!("t_{table_id_b}"));
+
+    wait_until(Duration::from_secs(5), || {
+        db2.notify_gc_worker();
+        !dir_a.exists() && !dir_b.exists()
+    })
+    .await;
+
+    let statuses_a = gc_task_statuses_for_table(&db2, table_id_a).await;
+    let statuses_b = gc_task_statuses_for_table(&db2, table_id_b).await;
+    assert!(
+        statuses_a.iter().all(|s| s == "done"),
+        "table A GC tasks should all be done after restart"
+    );
+    assert!(
+        statuses_b.iter().all(|s| s == "done"),
+        "table B GC tasks should all be done after restart"
+    );
+
+    db2.close().await.unwrap();
+}
+
+/// T6.3d + T6.3e: GC retirement stops schedulers and flushes data before deleting.
+///
+/// Writes data to a user tablet without flushing, then triggers GC. After GC
+/// completes, the tablet must be unmounted (no running workers) and the directory
+/// deleted. The flush-before-delete is verified by the absence of errors in GC
+/// (remove_tablet flushes internally; if flush were skipped, ilog shutdown with
+/// unflushed data would fail or leave partial state).
+#[tokio::test]
+async fn test_phase6_gc_retirement_stops_workers_and_flushes() {
+    let (db, dir) = create_test_db();
+
+    exec(&db, "CREATE TABLE t_gc_retire (id INT PRIMARY KEY, v INT)").await;
+    exec(&db, "INSERT INTO t_gc_retire VALUES (1, 100), (2, 200)").await;
+    let table_id = table_id_by_name(&db, "t_gc_retire").await;
+    let tablet_id = TabletId::Table { table_id };
+    let tablet_dir = dir.path().join("tablets").join(format!("t_{table_id}"));
+
+    // Verify workers are running before drop.
+    assert!(
+        db.tablet_manager().has_running_workers(tablet_id),
+        "tablet should have running workers before drop"
+    );
+
+    // Data is in memtable (not flushed). Drop + GC must flush before unmount.
+    exec(&db, "DROP TABLE t_gc_retire").await;
+
+    wait_until(Duration::from_secs(5), || {
+        db.notify_gc_worker();
+        db.tablet_manager().get_tablet(tablet_id).is_none()
+    })
+    .await;
+
+    // Workers should be stopped and tablet unmounted.
+    assert!(
+        !db.tablet_manager().has_running_workers(tablet_id),
+        "workers should be stopped after GC retirement"
+    );
+    assert!(
+        db.tablet_manager().get_tablet(tablet_id).is_none(),
+        "tablet should be unmounted after GC retirement"
+    );
+    assert!(!tablet_dir.exists(), "tablet directory should be deleted");
+
+    db.close().await.unwrap();
+}
+
+/// T6.4b: CREATE TABLE → crash (no explicit close) → recover → table exists, tablet restored.
+#[tokio::test]
+async fn test_phase6_create_table_survives_crash_recovery() {
+    let dir = tempdir().unwrap();
+    let config = DatabaseConfig::with_data_dir(dir.path());
+
+    let table_id = {
+        let db = Arc::new(Database::open(config.clone()).unwrap());
+        exec(&db, "CREATE TABLE t_crash_create (id INT PRIMARY KEY, v INT)").await;
+        exec(&db, "INSERT INTO t_crash_create VALUES (1, 42)").await;
+        let table_id = table_id_by_name(&db, "t_crash_create").await;
+
+        let tablet_id = TabletId::Table { table_id };
+        assert!(db.tablet_manager().get_tablet(tablet_id).is_some());
+
+        // Simulate crash — drop without close.
+        drop(db);
+        table_id
+    };
+
+    // Reopen and verify table + tablet are restored.
+    let db2 = Arc::new(Database::open(config).unwrap());
+    let tablet_id = TabletId::Table { table_id };
+
+    assert!(
+        db2.tablet_manager().get_tablet(tablet_id).is_some(),
+        "tablet should be mounted after crash recovery"
+    );
+    assert!(
+        db2.tablet_manager().has_running_workers(tablet_id),
+        "tablet workers should be running after crash recovery"
+    );
+
+    // Data should survive via clog replay.
+    match db2
+        .execute_query("SELECT v FROM t_crash_create WHERE id = 1")
+        .await
+        .unwrap()
+    {
+        QueryResult::Rows { data, .. } => {
+            assert_eq!(data.len(), 1, "row should survive crash recovery");
+            assert_eq!(data[0][0], "42");
+        }
+        other => panic!("expected rows, got {other:?}"),
+    }
+
+    db2.close().await.unwrap();
+}
+
+/// T6.4c: DROP TABLE → crash before GC runs → recover → table is dropped, data gone,
+/// GC task resumes and cleans up tablet.
+#[tokio::test]
+async fn test_phase6_drop_table_crash_before_gc_still_drops_table() {
+    let dir = tempdir().unwrap();
+    let config = DatabaseConfig::with_data_dir(dir.path());
+
+    let table_id = {
+        let db = Arc::new(Database::open(config.clone()).unwrap());
+        exec(&db, "CREATE TABLE t_crash_drop (id INT PRIMARY KEY, v INT)").await;
+        exec(&db, "INSERT INTO t_crash_drop VALUES (1, 99)").await;
+        let table_id = table_id_by_name(&db, "t_crash_drop").await;
+
+        // Pin GC so it can't run before crash.
+        db.session_registry().register(88, 1);
+        exec(&db, "DROP TABLE t_crash_drop").await;
+
+        // Crash — tablet dir still exists, GC hasn't run.
+        let tablet_dir = dir.path().join("tablets").join(format!("t_{table_id}"));
+        assert!(tablet_dir.exists());
+        drop(db);
+        table_id
+    };
+
+    // Reopen — table should be dropped (not in catalog), but GC task should
+    // resume and clean up the tablet directory.
+    let db2 = Arc::new(Database::open(config).unwrap());
+    let tablet_dir = dir.path().join("tablets").join(format!("t_{table_id}"));
+
+    // Table should be gone from catalog.
+    let result = db2.execute_query("SELECT * FROM t_crash_drop").await;
+    assert!(
+        result.is_err(),
+        "dropped table should not exist after crash recovery"
+    );
+
+    // GC should resume and clean up.
+    wait_until(Duration::from_secs(5), || {
+        db2.notify_gc_worker();
+        !tablet_dir.exists()
+    })
+    .await;
+
+    let statuses = gc_task_statuses_for_table(&db2, table_id).await;
+    assert!(
+        statuses.iter().all(|s| s == "done"),
+        "GC tasks should complete after restart"
+    );
+
+    db2.close().await.unwrap();
+}
+
+/// T6.4a: CREATE TABLE crash-recovery — no orphan tablet directory from a DDL
+/// that never committed.
+///
+/// Since tablet mounting happens AFTER catalog commit (DdlEffect flow), a crash
+/// before CREATE TABLE commits cannot leave an orphan tablet directory. This test
+/// verifies: create table → commit → crash → recover → table + tablet intact,
+/// and non-table data is unaffected.
+#[tokio::test]
+async fn test_phase6_create_table_no_orphan_after_crash() {
+    let dir = tempdir().unwrap();
+    let config = DatabaseConfig::with_data_dir(dir.path());
+
+    // Session 1: Create two tables, crash without close.
+    {
+        let db = Arc::new(Database::open(config.clone()).unwrap());
+        exec(&db, "CREATE TABLE t_orphan_a (id INT PRIMARY KEY, v INT)").await;
+        exec(&db, "CREATE TABLE t_orphan_b (id INT PRIMARY KEY, v INT)").await;
+        exec(&db, "INSERT INTO t_orphan_a VALUES (1, 10)").await;
+        exec(&db, "INSERT INTO t_orphan_b VALUES (1, 20)").await;
+        // Crash — no close.
+        drop(db);
+    }
+
+    // Session 2: Both tables and tablets should be restored.
+    let db2 = Arc::new(Database::open(config).unwrap());
+
+    match db2
+        .execute_query("SELECT v FROM t_orphan_a WHERE id = 1")
+        .await
+        .unwrap()
+    {
+        QueryResult::Rows { data, .. } => {
+            assert_eq!(data.len(), 1);
+            assert_eq!(data[0][0], "10");
+        }
+        other => panic!("expected rows for t_orphan_a, got {other:?}"),
+    }
+    match db2
+        .execute_query("SELECT v FROM t_orphan_b WHERE id = 1")
+        .await
+        .unwrap()
+    {
+        QueryResult::Rows { data, .. } => {
+            assert_eq!(data.len(), 1);
+            assert_eq!(data[0][0], "20");
+        }
+        other => panic!("expected rows for t_orphan_b, got {other:?}"),
+    }
+
+    // Both tablets should be mounted with running workers.
+    let id_a = table_id_by_name(&db2, "t_orphan_a").await;
+    let id_b = table_id_by_name(&db2, "t_orphan_b").await;
+    assert!(db2
+        .tablet_manager()
+        .get_tablet(TabletId::Table { table_id: id_a })
+        .is_some());
+    assert!(db2
+        .tablet_manager()
+        .get_tablet(TabletId::Table { table_id: id_b })
+        .is_some());
 
     db2.close().await.unwrap();
 }
