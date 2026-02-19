@@ -1,14 +1,15 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-if [[ $# -lt 2 || $# -gt 3 ]]; then
-    echo "usage: run_lib_test.sh <timeout-seconds> <thread-count> [name-filter]" >&2
+if [[ $# -lt 2 || $# -gt 4 ]]; then
+    echo "usage: run_lib_test.sh <timeout-seconds> <thread-count> [name-filter] [job-count]" >&2
     exit 2
 fi
 
 timeout_secs="$1"
 thread_count="$2"
 name_filter="${3:-}"
+job_count="${4:-1}"
 
 if [[ ! "$timeout_secs" =~ ^[1-9][0-9]*$ ]]; then
     echo "timeout-seconds must be a positive integer, got: $timeout_secs" >&2
@@ -20,20 +21,33 @@ if [[ ! "$thread_count" =~ ^[1-9][0-9]*$ ]]; then
     exit 2
 fi
 
+if [[ ! "$job_count" =~ ^[1-9][0-9]*$ ]]; then
+    echo "job-count must be a positive integer, got: $job_count" >&2
+    exit 2
+fi
+
 discover_timeout_secs="$timeout_secs"
 if (( discover_timeout_secs > 120 )); then
     discover_timeout_secs=120
 fi
 
 list_output="$(
-    ./scripts/run_with_timeout.sh "$discover_timeout_secs" cargo test --lib -- --list
+    ./scripts/run_with_timeout.sh "$discover_timeout_secs" cargo test --lib -- --list 2>&1
 )"
+
+lib_test_bin="$(
+    printf '%s\n' "$list_output" | sed -n 's/^.*Running unittests .* (\(.*\))$/\1/p' | tail -n 1
+)"
+if [[ -z "$lib_test_bin" || ! -x "$lib_test_bin" ]]; then
+    echo "failed to locate lib test binary from cargo --list output" >&2
+    exit 1
+fi
 
 mapfile -t test_groups < <(
     TEST_LIST_OUTPUT="$list_output" python3 - "$name_filter" <<'PY'
+import os
 import re
 import sys
-import os
 
 name_filter = sys.argv[1]
 prefix_groups = set()
@@ -57,8 +71,7 @@ for raw in os.environ.get("TEST_LIST_OUTPUT", "").splitlines():
             # filter. Keep these as exact test-name runs.
             exact_groups.add(test_name)
             continue
-        else:
-            group = "::".join(parts[: idx + 1])
+        group = "::".join(parts[: idx + 1])
     elif len(parts) >= 2:
         group = "::".join(parts[:2])
     else:
@@ -82,17 +95,60 @@ if [[ ${#test_groups[@]} -eq 0 ]]; then
     exit 1
 fi
 
+run_group() {
+    local mode="$1"
+    local name="$2"
+    if [[ "$mode" == "exact" ]]; then
+        echo "Running lib test case: $name"
+        ./scripts/run_with_timeout.sh "$timeout_secs" \
+            "$lib_test_bin" "$name" --exact --test-threads="$thread_count"
+    else
+        echo "Running lib test group: $name"
+        ./scripts/run_with_timeout.sh "$timeout_secs" \
+            "$lib_test_bin" "$name" --test-threads="$thread_count"
+    fi
+}
+
+count_active_jobs() {
+    local pids=()
+    mapfile -t pids < <(jobs -pr || true)
+    echo "${#pids[@]}"
+}
+
+kill_active_jobs() {
+    local pids=()
+    mapfile -t pids < <(jobs -pr || true)
+    if [[ ${#pids[@]} -gt 0 ]]; then
+        kill "${pids[@]}" 2>/dev/null || true
+        wait || true
+    fi
+}
+
+failed=0
 for group_line in "${test_groups[@]}"; do
     group_mode="${group_line%%$'\t'*}"
     group_name="${group_line#*$'\t'}"
 
-    if [[ "$group_mode" == "exact" ]]; then
-        echo "Running lib test case: $group_name"
-        ./scripts/run_with_timeout.sh "$timeout_secs" \
-            cargo test --lib "$group_name" -- --exact --test-threads="$thread_count"
-    else
-        echo "Running lib test group: $group_name"
-        ./scripts/run_with_timeout.sh "$timeout_secs" \
-            cargo test --lib "$group_name" -- --test-threads="$thread_count"
-    fi
+    while (( $(count_active_jobs) >= job_count )); do
+        if ! wait -n; then
+            failed=1
+            break 2
+        fi
+    done
+
+    run_group "$group_mode" "$group_name" &
 done
+
+if (( failed == 0 )); then
+    while (( $(count_active_jobs) > 0 )); do
+        if ! wait -n; then
+            failed=1
+            break
+        fi
+    done
+fi
+
+if (( failed != 0 )); then
+    kill_active_jobs
+    exit 1
+fi

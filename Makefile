@@ -2,29 +2,50 @@
 
 .PHONY: all build test unit-test store-test storage-test failpoint-test e2e-test fmt clippy clean run help prepare quick-prepare
 
+CPU_CORES ?= $(shell getconf _NPROCESSORS_ONLN 2>/dev/null || nproc 2>/dev/null || echo 4)
+# Process-level test parallelism tuned by machine size. Keep integration/e2e
+# more conservative than unit tests for deterministic runtime and lower
+# contention under CI.
+DEFAULT_CASE_JOB_COUNT ?= $(shell cores=$(CPU_CORES); jobs=$$((cores / 4)); if [ $$jobs -lt 1 ]; then jobs=1; fi; if [ $$jobs -gt 8 ]; then jobs=8; fi; echo $$jobs)
+MEDIUM_CASE_JOB_COUNT ?= $(shell cores=$(CPU_CORES); jobs=$$((cores / 8)); if [ $$jobs -lt 1 ]; then jobs=1; fi; if [ $$jobs -gt 4 ]; then jobs=4; fi; echo $$jobs)
+HEAVY_CASE_JOB_COUNT ?= $(shell cores=$(CPU_CORES); jobs=$$((cores / 16)); if [ $$jobs -lt 1 ]; then jobs=1; fi; if [ $$jobs -gt 2 ]; then jobs=2; fi; echo $$jobs)
+
 UNIT_TEST_TIMEOUT_SECS ?= 180
-UNIT_TEST_THREAD_COUNT ?= 8
+UNIT_TEST_THREAD_COUNT ?= 2
+UNIT_TEST_JOB_COUNT ?= $(DEFAULT_CASE_JOB_COUNT)
 UNIT_TEST_FILTER ?=
 STORE_TEST_CASE_TIMEOUT_SECS ?= 180
 STORE_TEST_LOG_LEVEL ?= warn
+STORE_TEST_JOB_COUNT ?= $(MEDIUM_CASE_JOB_COUNT)
 STORE_TEST_FILTER ?=
 PESSIMISTIC_TXN_TEST_TIMEOUT_SECS ?= 180
+PESSIMISTIC_TXN_TEST_JOB_COUNT ?= $(HEAVY_CASE_JOB_COUNT)
 PESSIMISTIC_TXN_TEST_FILTER ?=
 STORAGE_TEST_TIMEOUT_SECS ?= 180
+STORAGE_TEST_JOB_COUNT ?= $(MEDIUM_CASE_JOB_COUNT)
 COMPACTION_BATCH_TIMEOUT_SECS ?= 180
+COMPACTION_BATCH_JOB_COUNT ?= $(HEAVY_CASE_JOB_COUNT)
 COMPACTION_CASE_TIMEOUT_SECS ?= 240
 E2E_TEST_TIMEOUT_SECS ?= 300
+E2E_TEST_CASE_JOB_COUNT ?= $(MEDIUM_CASE_JOB_COUNT)
+E2E_TEST_FILTER ?=
 E2E_STMT_TIMEOUT_SECS ?= 15
 E2E_CASE_TIMEOUT_SECS ?= 180
 
 # Faster local-iteration profile (smaller timeout guards, same segmented flow)
 QUICK_UNIT_TEST_TIMEOUT_SECS ?= 120
+QUICK_UNIT_TEST_JOB_COUNT ?= $(DEFAULT_CASE_JOB_COUNT)
 QUICK_STORE_TEST_CASE_TIMEOUT_SECS ?= 120
 QUICK_STORE_TEST_LOG_LEVEL ?= warn
+QUICK_STORE_TEST_JOB_COUNT ?= $(MEDIUM_CASE_JOB_COUNT)
 QUICK_PESSIMISTIC_TXN_TEST_TIMEOUT_SECS ?= 120
+QUICK_PESSIMISTIC_TXN_TEST_JOB_COUNT ?= $(HEAVY_CASE_JOB_COUNT)
 QUICK_STORAGE_TEST_TIMEOUT_SECS ?= 180
+QUICK_STORAGE_TEST_JOB_COUNT ?= $(MEDIUM_CASE_JOB_COUNT)
 QUICK_COMPACTION_BATCH_TIMEOUT_SECS ?= 120
+QUICK_COMPACTION_BATCH_JOB_COUNT ?= $(HEAVY_CASE_JOB_COUNT)
 QUICK_COMPACTION_CASE_TIMEOUT_SECS ?= 180
+QUICK_E2E_TEST_CASE_JOB_COUNT ?= $(MEDIUM_CASE_JOB_COUNT)
 QUICK_E2E_STMT_TIMEOUT_SECS ?= 15
 QUICK_E2E_CASE_TIMEOUT_SECS ?= 90
 
@@ -53,7 +74,8 @@ unit-test:
 	./scripts/run_lib_test.sh \
 		$(UNIT_TEST_TIMEOUT_SECS) \
 		$(UNIT_TEST_THREAD_COUNT) \
-		"$(UNIT_TEST_FILTER)"
+		"$(UNIT_TEST_FILTER)" \
+		$(UNIT_TEST_JOB_COUNT)
 
 # Run store tests (internal integration tests)
 store-test:
@@ -61,25 +83,32 @@ store-test:
 		$(STORE_TEST_CASE_TIMEOUT_SECS) \
 		$(STORE_TEST_LOG_LEVEL) \
 		$(STORE_TEST_THREAD_COUNT) \
-		"$(STORE_TEST_FILTER)"
+		"$(STORE_TEST_FILTER)" \
+		$(STORE_TEST_JOB_COUNT)
 	./scripts/run_integration_test_cases.sh \
 		$(PESSIMISTIC_TXN_TEST_TIMEOUT_SECS) \
 		pessimistic_txn_ported_test \
 		$(PESSIMISTIC_TXN_TEST_THREAD_COUNT) \
-		"$(PESSIMISTIC_TXN_TEST_FILTER)"
+		"$(PESSIMISTIC_TXN_TEST_FILTER)" \
+		"" \
+		$(PESSIMISTIC_TXN_TEST_JOB_COUNT)
 
 # Run storage regression tests (ported RocksDB-style suites)
 storage-test:
 	./scripts/run_integration_test_cases.sh \
 		$(STORAGE_TEST_TIMEOUT_SECS) \
 		rocksdb_ported_tests \
-		$(STORAGE_TEST_THREAD_COUNT)
+		$(STORAGE_TEST_THREAD_COUNT) \
+		"" \
+		"" \
+		$(STORAGE_TEST_JOB_COUNT)
 	./scripts/run_integration_test_cases.sh \
 		$(COMPACTION_BATCH_TIMEOUT_SECS) \
 		rocksdb_ported_compaction_tests \
 		$(STORAGE_TEST_THREAD_COUNT) \
 		"" \
-		"test_compaction_scheduler_automatic,test_multi_level_cascading,test_multi_level_delete_reinsert_compaction_correctness"
+		"test_compaction_scheduler_automatic,test_multi_level_cascading,test_multi_level_delete_reinsert_compaction_correctness" \
+		$(COMPACTION_BATCH_JOB_COUNT)
 	./scripts/run_with_timeout.sh $(COMPACTION_CASE_TIMEOUT_SECS) \
 		cargo test --test rocksdb_ported_compaction_tests test_compaction_scheduler_automatic -- --exact --test-threads=$(STORAGE_TEST_THREAD_COUNT)
 	./scripts/run_with_timeout.sh $(COMPACTION_CASE_TIMEOUT_SECS) \
@@ -93,15 +122,11 @@ failpoint-test:
 
 # Run E2E tests (MySQL-test format)
 e2e-test:
-	@set -e; \
-	for test_file in $$(find tests/integrationtest/t -type f \( -name '*.test' -o -name '*.t' \) | sort); do \
-		test_name=$${test_file#tests/integrationtest/t/}; \
-		test_name=$${test_name%.test}; \
-		test_name=$${test_name%.t}; \
-		echo "Running e2e case: $$test_name"; \
-		./scripts/run_with_timeout.sh $(E2E_CASE_TIMEOUT_SECS) \
-			cargo run --bin mysqltest-runner -- --test $$test_name --statement-timeout-secs $(E2E_STMT_TIMEOUT_SECS); \
-	done
+	./scripts/run_mysqltest_cases.sh \
+		$(E2E_CASE_TIMEOUT_SECS) \
+		$(E2E_STMT_TIMEOUT_SECS) \
+		$(E2E_TEST_CASE_JOB_COUNT) \
+		"$(E2E_TEST_FILTER)"
 
 # Record E2E test results (use when adding new tests)
 e2e-record:
@@ -125,16 +150,23 @@ prepare: fmt clippy test
 
 # Fast local gate: same segmented pipeline with tighter timeout guards.
 quick-prepare: fmt clippy
-	$(MAKE) unit-test UNIT_TEST_TIMEOUT_SECS=$(QUICK_UNIT_TEST_TIMEOUT_SECS)
+	$(MAKE) unit-test \
+		UNIT_TEST_TIMEOUT_SECS=$(QUICK_UNIT_TEST_TIMEOUT_SECS) \
+		UNIT_TEST_JOB_COUNT=$(QUICK_UNIT_TEST_JOB_COUNT)
 	$(MAKE) store-test \
 		STORE_TEST_CASE_TIMEOUT_SECS=$(QUICK_STORE_TEST_CASE_TIMEOUT_SECS) \
 		STORE_TEST_LOG_LEVEL=$(QUICK_STORE_TEST_LOG_LEVEL) \
-		PESSIMISTIC_TXN_TEST_TIMEOUT_SECS=$(QUICK_PESSIMISTIC_TXN_TEST_TIMEOUT_SECS)
+		STORE_TEST_JOB_COUNT=$(QUICK_STORE_TEST_JOB_COUNT) \
+		PESSIMISTIC_TXN_TEST_TIMEOUT_SECS=$(QUICK_PESSIMISTIC_TXN_TEST_TIMEOUT_SECS) \
+		PESSIMISTIC_TXN_TEST_JOB_COUNT=$(QUICK_PESSIMISTIC_TXN_TEST_JOB_COUNT)
 	$(MAKE) storage-test \
 		STORAGE_TEST_TIMEOUT_SECS=$(QUICK_STORAGE_TEST_TIMEOUT_SECS) \
 		COMPACTION_BATCH_TIMEOUT_SECS=$(QUICK_COMPACTION_BATCH_TIMEOUT_SECS) \
+		STORAGE_TEST_JOB_COUNT=$(QUICK_STORAGE_TEST_JOB_COUNT) \
+		COMPACTION_BATCH_JOB_COUNT=$(QUICK_COMPACTION_BATCH_JOB_COUNT) \
 		COMPACTION_CASE_TIMEOUT_SECS=$(QUICK_COMPACTION_CASE_TIMEOUT_SECS)
 	$(MAKE) e2e-test \
+		E2E_TEST_CASE_JOB_COUNT=$(QUICK_E2E_TEST_CASE_JOB_COUNT) \
 		E2E_STMT_TIMEOUT_SECS=$(QUICK_E2E_STMT_TIMEOUT_SECS) \
 		E2E_CASE_TIMEOUT_SECS=$(QUICK_E2E_CASE_TIMEOUT_SECS)
 
