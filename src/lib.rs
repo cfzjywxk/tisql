@@ -173,8 +173,8 @@ use clog::{FileClogService, TruncateStats};
 use executor::{ExecutionOutput, ExecutionResult, Executor, SimpleExecutor};
 use sql::Parser;
 use tablet::{
-    route_index_to_tablet, route_table_to_tablet, GlobalLogGcBoundary, IlogService,
-    IlogTruncateStats, LsmEngine, LsmRecovery, RoutedTabletStorage, TabletId, TabletManager,
+    route_table_to_tablet, GlobalLogGcBoundary, IlogService, IlogTruncateStats, LsmEngine,
+    LsmRecovery, RoutedTabletStorage, TabletId, TabletManager,
 };
 use transaction::{ConcurrencyManager, TransactionService};
 use tso::LocalTso;
@@ -402,9 +402,6 @@ impl Database {
         let recovered_dirs = tablet_manager.discover_existing_tablet_dirs_for_recovery()?;
         for tablet_id in recovered_dirs {
             if tablet_id == TabletId::System {
-                continue;
-            }
-            if !tablet_manager.has_persisted_tablet_state(tablet_id)? {
                 continue;
             }
             let recovered = LsmRecovery::recover_tablet(
@@ -666,10 +663,6 @@ impl Database {
         self.mount_tablet_if_needed(route_table_to_tablet(table_id))
     }
 
-    fn mount_index_tablet_if_needed(&self, table_id: u64, index_id: u64) -> Result<()> {
-        self.mount_tablet_if_needed(route_index_to_tablet(table_id, index_id))
-    }
-
     // ========================================================================
     // Test / Convenience Query Execution
     // ========================================================================
@@ -921,10 +914,7 @@ impl Database {
                 executor::DdlEffect::TableCreated { table_id } => {
                     self.mount_table_tablet_if_needed(*table_id)
                 }
-                executor::DdlEffect::IndexCreated { table_id, index_id } => {
-                    self.mount_index_tablet_if_needed(*table_id, *index_id)
-                }
-                executor::DdlEffect::TableDropped | executor::DdlEffect::IndexDropped => {
+                executor::DdlEffect::TableDropped => {
                     self.gc_worker.notify();
                     Ok(())
                 }
@@ -1531,8 +1521,14 @@ mod tests {
             table_id: USER_TABLE_ID_START + 77,
             index_id: 9001,
         };
-        std::fs::create_dir_all(dir.path().join("tablets").join(table_tablet.dir_name())).unwrap();
-        std::fs::create_dir_all(dir.path().join("tablets").join(index_tablet.dir_name())).unwrap();
+        let table_dir = dir.path().join("tablets").join(table_tablet.dir_name());
+        let index_dir = dir.path().join("tablets").join(index_tablet.dir_name());
+        let table_ilog =
+            IlogService::open_with_thread(IlogConfig::new(&table_dir), new_lsn_provider()).unwrap();
+        table_ilog.close().unwrap();
+        let index_ilog =
+            IlogService::open_with_thread(IlogConfig::new(&index_dir), new_lsn_provider()).unwrap();
+        index_ilog.close().unwrap();
 
         let db = Database::open(config).unwrap();
         let desired = db.tablet_manager.desired_tablets();

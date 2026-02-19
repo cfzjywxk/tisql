@@ -277,7 +277,7 @@ impl TabletManager {
     /// Derive desired inventory from catalog and ensure corresponding dirs.
     pub fn register_catalog_inventory(&self, cache: &CatalogCache) -> Result<Vec<TabletId>> {
         let mut inventory = derive_tablet_inventory(cache);
-        inventory.extend(self.discover_existing_tablet_dirs()?);
+        inventory.extend(self.discover_existing_tablet_dirs_for_recovery()?);
         self.register_desired_tablets(inventory.iter().copied())?;
         Ok(inventory.into_iter().collect())
     }
@@ -564,7 +564,19 @@ impl TabletManager {
 
     /// Discover tablet directories currently present on disk.
     pub fn discover_existing_tablet_dirs_for_recovery(&self) -> Result<BTreeSet<TabletId>> {
-        self.discover_existing_tablet_dirs()
+        let mut discovered = BTreeSet::new();
+        for tablet_id in self.discover_existing_tablet_dirs()? {
+            if self.has_persisted_tablet_state(tablet_id)? {
+                discovered.insert(tablet_id);
+            } else if tablet_id != TabletId::System {
+                // Fresh system dir without ilog/SST state is expected before first durability write.
+                log_warn!(
+                    "Ignoring empty/orphan tablet dir {:?}: no ilog or SST state",
+                    self.tablet_dir(tablet_id)
+                );
+            }
+        }
+        Ok(discovered)
     }
 
     fn discover_existing_tablet_dirs(&self) -> Result<BTreeSet<TabletId>> {
@@ -1052,6 +1064,24 @@ mod tests {
         };
         manager.ensure_tablet_dir(user_tablet).unwrap();
         manager.ensure_tablet_dir(user_index_tablet).unwrap();
+        std::fs::create_dir_all(manager.tablet_dir(user_tablet).join("ilog")).unwrap();
+        std::fs::create_dir_all(manager.tablet_dir(user_index_tablet).join("ilog")).unwrap();
+        std::fs::write(
+            manager
+                .tablet_dir(user_tablet)
+                .join("ilog")
+                .join("tisql.ilog"),
+            b"stub",
+        )
+        .unwrap();
+        std::fs::write(
+            manager
+                .tablet_dir(user_index_tablet)
+                .join("ilog")
+                .join("tisql.ilog"),
+            b"stub",
+        )
+        .unwrap();
 
         let inventory = manager.register_catalog_inventory(&empty_cache()).unwrap();
         let inventory: BTreeSet<_> = inventory.into_iter().collect();
@@ -1078,6 +1108,9 @@ mod tests {
         std::fs::create_dir_all(tablets_root.join("garbage")).unwrap();
         std::fs::create_dir_all(tablets_root.join(format!("t_{ALL_TABLE_TABLE_ID}"))).unwrap();
         std::fs::create_dir_all(tablets_root.join(format!("i_{ALL_TABLE_TABLE_ID}_9"))).unwrap();
+        // Empty user tablet dir should be ignored unless it has persisted state.
+        std::fs::create_dir_all(tablets_root.join(format!("t_{}", USER_TABLE_ID_START + 55)))
+            .unwrap();
 
         let inventory = manager.register_catalog_inventory(&empty_cache()).unwrap();
         let inventory: BTreeSet<_> = inventory.into_iter().collect();
@@ -1386,6 +1419,15 @@ mod tests {
             table_id: USER_TABLE_ID_START + 99,
         };
         std::fs::create_dir_all(tablets_root.join(valid_tid.dir_name())).unwrap();
+        std::fs::create_dir_all(tablets_root.join(valid_tid.dir_name()).join("ilog")).unwrap();
+        std::fs::write(
+            tablets_root
+                .join(valid_tid.dir_name())
+                .join("ilog")
+                .join("tisql.ilog"),
+            b"stub",
+        )
+        .unwrap();
 
         let inventory = manager.register_catalog_inventory(&empty_cache()).unwrap();
         let inventory: BTreeSet<_> = inventory.into_iter().collect();

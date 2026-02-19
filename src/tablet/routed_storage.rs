@@ -25,11 +25,11 @@ use std::sync::Arc;
 use fail::fail_point;
 
 use crate::catalog::types::{Key, RawValue, Timestamp};
-use crate::util::codec::key::{decode_index_key, decode_table_id, is_index_key};
+use crate::util::codec::key::{decode_index_key, decode_table_id, is_index_key, is_record_key};
 use crate::util::error::Result;
 
 use super::mvcc::MvccKey;
-use super::router::{route_index_to_tablet, route_key_to_tablet, route_table_to_tablet, TabletId};
+use super::router::{is_system_table_id, route_index_to_tablet, route_table_to_tablet, TabletId};
 use super::{
     PessimisticStorage, PessimisticWriteError, StorageEngine, TabletEngine, TabletManager,
     TieredMergeIterator, WriteBatch, WriteOp,
@@ -65,7 +65,7 @@ impl RoutedTabletStorage {
 
     fn resolve_key_tablet(&self, key: &[u8]) -> (TabletId, Arc<TabletEngine>) {
         // Legacy/internal key-only fallback path.
-        let logical = route_key_to_tablet(key);
+        let logical = infer_logical_tablet_from_encoded_key(key);
         self.resolve_mounted_tablet(logical)
     }
 
@@ -88,7 +88,7 @@ impl RoutedTabletStorage {
                     route_table_to_tablet(table_id)
                 }
             }
-            Err(_) => route_key_to_tablet(start_key),
+            Err(_) => infer_logical_tablet_from_encoded_key(start_key),
         };
         self.resolve_mounted_tablet(logical)
     }
@@ -130,6 +130,37 @@ impl RoutedTabletStorage {
         }
         grouped
     }
+}
+
+fn infer_logical_tablet_from_encoded_key(key: &[u8]) -> TabletId {
+    let table_id = match decode_table_id(key) {
+        Ok(id) => id,
+        Err(_) => return TabletId::System,
+    };
+
+    if is_system_table_id(table_id) {
+        return TabletId::System;
+    }
+
+    if is_record_key(key) || has_record_prefix(key) {
+        return route_table_to_tablet(table_id);
+    }
+
+    if is_index_key(key) {
+        return match decode_index_key(key) {
+            Ok((decoded_table_id, index_id, _)) if decoded_table_id == table_id => {
+                route_index_to_tablet(table_id, index_id)
+            }
+            _ => TabletId::System,
+        };
+    }
+
+    TabletId::System
+}
+
+#[inline]
+fn has_record_prefix(key: &[u8]) -> bool {
+    key.len() >= 11 && &key[9..11] == b"_r"
 }
 
 impl StorageEngine for RoutedTabletStorage {

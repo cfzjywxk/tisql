@@ -20,7 +20,7 @@ pub(crate) use simple::SimpleExecutor;
 use std::future::Future;
 use std::pin::Pin;
 
-use crate::catalog::types::{IndexId, Row, Schema, TableId};
+use crate::catalog::types::{Row, Schema, TableId};
 use crate::catalog::Catalog;
 use crate::session::ExecutionCtx;
 use crate::sql::LogicalPlan;
@@ -31,15 +31,8 @@ use crate::util::error::Result;
 pub enum DdlEffect {
     /// A table was created and should have a dedicated tablet mounted.
     TableCreated { table_id: TableId },
-    /// A local index was created and should have a dedicated tablet mounted.
-    IndexCreated {
-        table_id: TableId,
-        index_id: IndexId,
-    },
     /// A table drop committed and GC worker should process pending retire tasks.
     TableDropped,
-    /// An index drop committed and GC worker should process pending retire tasks.
-    IndexDropped,
 }
 
 /// Query execution result (materialized — all rows in memory).

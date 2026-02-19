@@ -347,7 +347,11 @@ async fn test_phase6_create_table_survives_crash_recovery() {
 
     let table_id = {
         let db = Arc::new(Database::open(config.clone()).unwrap());
-        exec(&db, "CREATE TABLE t_crash_create (id INT PRIMARY KEY, v INT)").await;
+        exec(
+            &db,
+            "CREATE TABLE t_crash_create (id INT PRIMARY KEY, v INT)",
+        )
+        .await;
         exec(&db, "INSERT INTO t_crash_create VALUES (1, 42)").await;
         let table_id = table_id_by_name(&db, "t_crash_create").await;
 

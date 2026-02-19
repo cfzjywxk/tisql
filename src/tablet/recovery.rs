@@ -50,11 +50,12 @@ use crate::catalog::types::{Lsn, Timestamp, TxnId};
 use crate::clog::{ClogEntry, ClogOp, FileClogConfig, FileClogService};
 use crate::lsn::{new_lsn_provider, SharedLsnProvider};
 use crate::tablet::{LsmConfig, LsmEngine, StorageEngine, TabletId, TabletManager, WriteBatch};
+use crate::util::codec::key::{decode_index_key, decode_table_id, is_index_key, is_record_key};
 use crate::util::error::Result;
 use crate::{log_info, log_warn};
 
 use super::ilog::{IlogConfig, IlogService};
-use super::router::route_key_to_tablet;
+use super::router::{is_system_table_id, route_index_to_tablet, route_table_to_tablet};
 
 /// Recovery state for a transaction during clog replay.
 #[derive(Default)]
@@ -398,7 +399,7 @@ impl LsmRecovery {
 
             let mut per_tablet: BTreeMap<TabletId, WriteBatch> = BTreeMap::new();
             for (key, value) in state.writes {
-                let logical = route_key_to_tablet(&key);
+                let logical = infer_logical_tablet_from_encoded_key(&key);
                 let tablet_id = if manager.get_tablet(logical).is_some() {
                     logical
                 } else {
@@ -574,9 +575,40 @@ fn max_commit_ts_from_entries(entries: &[ClogEntry]) -> Timestamp {
 fn touched_logical_tablets(writes: &[(Vec<u8>, Option<Vec<u8>>)]) -> BTreeSet<TabletId> {
     let mut tablets = BTreeSet::new();
     for (key, _) in writes {
-        tablets.insert(route_key_to_tablet(key));
+        tablets.insert(infer_logical_tablet_from_encoded_key(key));
     }
     tablets
+}
+
+fn infer_logical_tablet_from_encoded_key(key: &[u8]) -> TabletId {
+    let table_id = match decode_table_id(key) {
+        Ok(id) => id,
+        Err(_) => return TabletId::System,
+    };
+
+    if is_system_table_id(table_id) {
+        return TabletId::System;
+    }
+
+    if is_record_key(key) || has_record_prefix(key) {
+        return route_table_to_tablet(table_id);
+    }
+
+    if is_index_key(key) {
+        return match decode_index_key(key) {
+            Ok((decoded_table_id, index_id, _)) if decoded_table_id == table_id => {
+                route_index_to_tablet(table_id, index_id)
+            }
+            _ => TabletId::System,
+        };
+    }
+
+    TabletId::System
+}
+
+#[inline]
+fn has_record_prefix(key: &[u8]) -> bool {
+    key.len() >= 11 && &key[9..11] == b"_r"
 }
 
 #[cfg(test)]

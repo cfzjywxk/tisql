@@ -20,9 +20,11 @@
 
 use crate::catalog::types::{IndexId, TableId};
 use crate::inner_table::core_tables::USER_TABLE_ID_START;
-use crate::util::codec::key::{decode_index_key, decode_table_id, is_index_key, is_record_key};
 use crate::util::error::{Result, TiSqlError};
 use std::fmt;
+
+#[cfg(test)]
+use crate::util::codec::key::{decode_index_key, decode_table_id, is_index_key, is_record_key};
 
 /// Stable tablet identifier used by routing and disk layout.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
@@ -119,18 +121,11 @@ pub fn route_index_to_tablet(table_id: TableId, index_id: IndexId) -> TabletId {
     }
 }
 
-/// Route a raw encoded key to one logical tablet.
+/// Test-only key decoding helper for routing compatibility checks.
 ///
-/// This is crate-internal for recovery/defensive fallback only. Upper layers
-/// should prefer
-/// `route_table_to_tablet` / `route_index_to_tablet`.
-///
-/// Routing priority (locked by review):
-/// 1) decode table id; non-table/malformed keys -> system
-/// 2) inner/system table id range (`USER_TABLE_ID_START`) -> system
-/// 3) user `_r` keys -> table tablet
-/// 4) user `_i` keys -> index tablet
-/// 5) anything else -> system (conservative fallback)
+/// Production paths should route by planner metadata via `route_table_to_tablet`
+/// / `route_index_to_tablet`.
+#[cfg(test)]
 pub(crate) fn route_key_to_tablet(key: &[u8]) -> TabletId {
     let table_id = match decode_table_id(key) {
         Ok(id) => id,
@@ -160,6 +155,7 @@ pub(crate) fn route_key_to_tablet(key: &[u8]) -> TabletId {
     TabletId::System
 }
 
+#[cfg(test)]
 #[inline]
 fn has_record_prefix(key: &[u8]) -> bool {
     // 't' (1 byte) + table_id (8 bytes) + "_r" (2 bytes)
