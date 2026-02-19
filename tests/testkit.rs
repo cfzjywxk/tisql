@@ -25,7 +25,7 @@
 use std::sync::Arc;
 use std::time::Duration;
 use tempfile::TempDir;
-use tisql::{Database, DatabaseConfig, QueryResult};
+use tisql::{Database, DatabaseConfig, QueryResult, RuntimeThreadOverrides};
 
 const DEFAULT_QUERY_TIMEOUT_SECS: u64 = 15;
 const QUERY_TIMEOUT_ENV: &str = "TISQL_TESTKIT_QUERY_TIMEOUT_SECS";
@@ -42,7 +42,16 @@ impl TestKit {
     /// Create a new TestKit with a fresh database
     pub fn new() -> Self {
         let temp_dir = tempfile::tempdir().expect("Failed to create temp directory");
-        let config = DatabaseConfig::with_data_dir(temp_dir.path());
+        // Keep runtime footprint small so store tests can run in parallel without
+        // spawning hundreds of worker threads per case.
+        let config = DatabaseConfig::with_data_dir(temp_dir.path()).with_runtime_threads(
+            RuntimeThreadOverrides {
+                protocol: Some(1),
+                worker: Some(1),
+                background: Some(1),
+                io: Some(1),
+            },
+        );
         let db = Database::open(config).expect("Failed to open database");
 
         Self {

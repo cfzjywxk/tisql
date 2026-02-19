@@ -31,7 +31,7 @@ use std::time::Duration;
 
 use tisql::util::error::TiSqlError;
 use tisql::util::{init_logger_from_env, LogLevel};
-use tisql::{Database, DatabaseConfig, QueryResult, Session};
+use tisql::{Database, DatabaseConfig, QueryResult, RuntimeThreadOverrides, Session};
 
 /// Test runner configuration
 struct Config {
@@ -267,7 +267,15 @@ async fn run_test(config: &Config, test_case: &TestCase) -> TestResult {
     // Create database with temp directory
     let temp_dir = std::env::temp_dir().join(format!("tisql-test-{}", std::process::id()));
     std::fs::create_dir_all(&temp_dir).expect("Failed to create temp directory");
-    let db_config = DatabaseConfig::with_data_dir(&temp_dir);
+    // Keep per-test runtime footprint small to avoid thread churn across many
+    // mysqltest cases in a single runner process.
+    let db_config =
+        DatabaseConfig::with_data_dir(&temp_dir).with_runtime_threads(RuntimeThreadOverrides {
+            protocol: Some(1),
+            worker: Some(1),
+            background: Some(1),
+            io: Some(1),
+        });
     let db = Arc::new(Database::open(db_config).expect("Failed to open database"));
     // Clean up temp dir at the end using a guard
     struct TempDirGuard(std::path::PathBuf);

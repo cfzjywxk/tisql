@@ -24,7 +24,10 @@ use std::sync::Arc;
 use clap::Parser as ClapParser;
 use tisql::util::LogLevel;
 use tisql::{log_error, log_info};
-use tisql::{Database, DatabaseConfig, MySqlServer, MYSQL_DEFAULT_PORT};
+use tisql::{
+    Database, DatabaseConfig, MySqlServer, RuntimeThreadOverrides, RuntimeThreads,
+    MYSQL_DEFAULT_PORT,
+};
 
 #[derive(ClapParser, Debug)]
 #[command(name = "tisql")]
@@ -46,17 +49,47 @@ struct Args {
     /// Log level (trace, debug, info, warn, error)
     #[arg(short = 'L', long, default_value = "info")]
     log_level: String,
+
+    /// Protocol runtime worker threads
+    #[arg(long)]
+    protocol_threads: Option<usize>,
+
+    /// Query worker runtime threads
+    #[arg(long)]
+    worker_threads: Option<usize>,
+
+    /// Background runtime threads
+    #[arg(long)]
+    bg_threads: Option<usize>,
+
+    /// I/O runtime threads
+    #[arg(long)]
+    io_threads: Option<usize>,
+
+    /// Disable adaptive encoded result batches (phase 3 optimization)
+    #[arg(long, default_value_t = false)]
+    disable_encoded_result_batch: bool,
 }
 
 fn main() {
     let args = Args::parse();
+
+    let runtime_overrides = RuntimeThreadOverrides {
+        protocol: args.protocol_threads,
+        worker: args.worker_threads,
+        background: args.bg_threads,
+        io: args.io_threads,
+    };
+    let runtime_threads = runtime_overrides.apply(RuntimeThreads::detect());
 
     let addr: SocketAddr = format!("{}:{}", args.host, args.port)
         .parse()
         .expect("Invalid address");
 
     // Open database with persistence
-    let db_config = DatabaseConfig::with_data_dir(&args.data_dir);
+    let db_config = DatabaseConfig::with_data_dir(&args.data_dir)
+        .with_runtime_threads(runtime_overrides)
+        .with_encoded_result_batch(!args.disable_encoded_result_batch);
     let db = match Database::open(db_config) {
         Ok(db) => Arc::new(db),
         Err(e) => {
@@ -71,11 +104,22 @@ fn main() {
     println!("Data directory: {}", args.data_dir);
     println!("Listening on {}:{}", args.host, args.port);
     println!(
+        "Runtime threads: protocol={}, worker={}, bg={}, io={}",
+        runtime_threads.protocol,
+        runtime_threads.worker,
+        runtime_threads.background,
+        runtime_threads.io
+    );
+    println!(
         "Connect with: mysql -h{} -P{} -uroot test",
         args.host, args.port
     );
 
-    let rt = tokio::runtime::Runtime::new().expect("Failed to create Tokio runtime");
+    let rt = tokio::runtime::Builder::new_multi_thread()
+        .worker_threads(runtime_threads.protocol)
+        .enable_all()
+        .build()
+        .expect("Failed to create protocol runtime");
     rt.block_on(async {
         // Initialize async logger within tokio runtime
         let log_level = LogLevel::parse(&args.log_level).unwrap_or(LogLevel::Info);

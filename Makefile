@@ -3,6 +3,7 @@
 .PHONY: all build test unit-test store-test storage-test failpoint-test e2e-test fmt clippy clean run help prepare quick-prepare
 
 UNIT_TEST_TIMEOUT_SECS ?= 1200
+UNIT_TEST_THREAD_ARGS ?= -- --test-threads=8
 STORE_TEST_TIMEOUT_SECS ?= 1200
 PESSIMISTIC_TXN_TEST_TIMEOUT_SECS ?= 300
 STORAGE_TEST_TIMEOUT_SECS ?= 1200
@@ -22,13 +23,9 @@ QUICK_COMPACTION_CASE_TIMEOUT_SECS ?= 180
 QUICK_E2E_STMT_TIMEOUT_SECS ?= 15
 QUICK_E2E_CASE_TIMEOUT_SECS ?= 90
 
-UNAME_S := $(shell uname -s)
-
-# macOS has a lower default file descriptor limit; running store_test in
-# parallel can exhaust descriptors because each test creates multiple runtimes.
-ifeq ($(UNAME_S),Darwin)
+# Keep store_test deterministic and avoid runtime/thread explosion when the
+# harness executes many tokio::test cases concurrently.
 STORE_TEST_THREAD_ARGS := -- --test-threads=1
-endif
 
 # Default target
 all: build
@@ -46,7 +43,7 @@ test: unit-test store-test storage-test e2e-test
 
 # Run unit tests only
 unit-test:
-	./scripts/run_with_timeout.sh $(UNIT_TEST_TIMEOUT_SECS) cargo test --lib
+	./scripts/run_with_timeout.sh $(UNIT_TEST_TIMEOUT_SECS) cargo test --lib $(UNIT_TEST_THREAD_ARGS)
 
 # Run store tests (internal integration tests)
 store-test:

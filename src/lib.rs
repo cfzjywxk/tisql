@@ -34,6 +34,7 @@
 // Public modules - common types and server infrastructure
 pub mod log;
 pub mod protocol;
+pub mod runtime;
 pub mod session;
 pub mod tablet;
 pub mod util;
@@ -58,6 +59,7 @@ pub use catalog::Catalog;
 pub use clog::{ClogFsyncFuture, ClogService};
 pub use lsn::{new_lsn_provider, LsnProvider, SharedLsnProvider};
 pub use protocol::{MySqlServer, MYSQL_DEFAULT_PORT};
+pub use runtime::{RuntimeThreadOverrides, RuntimeThreads};
 pub use session::{ExecutionCtx, Priority, QueryCtx, Session, SessionRegistry, SessionVars};
 pub use tablet::{PessimisticStorage, StorageEngine, V26BoundaryMode};
 pub use transaction::{CommitInfo, TxnCtx, TxnService, TxnState};
@@ -195,12 +197,18 @@ use fail::fail_point;
 pub struct DatabaseConfig {
     /// Data directory for persistence
     pub data_dir: PathBuf,
+    /// Runtime thread-count overrides.
+    pub runtime_threads: RuntimeThreadOverrides,
+    /// Enable adaptive encoded result batches (phase 3).
+    pub enable_encoded_result_batch: bool,
 }
 
 impl Default for DatabaseConfig {
     fn default() -> Self {
         Self {
             data_dir: PathBuf::from("data"),
+            runtime_threads: RuntimeThreadOverrides::default(),
+            enable_encoded_result_batch: true,
         }
     }
 }
@@ -210,7 +218,20 @@ impl DatabaseConfig {
     pub fn with_data_dir(dir: impl Into<PathBuf>) -> Self {
         Self {
             data_dir: dir.into(),
+            ..Self::default()
         }
+    }
+
+    /// Set runtime thread-count overrides.
+    pub fn with_runtime_threads(mut self, overrides: RuntimeThreadOverrides) -> Self {
+        self.runtime_threads = overrides;
+        self
+    }
+
+    /// Enable/disable adaptive encoded result batches.
+    pub fn with_encoded_result_batch(mut self, enabled: bool) -> Self {
+        self.enable_encoded_result_batch = enabled;
+        self
     }
 }
 
@@ -270,6 +291,8 @@ pub struct Database {
     io_runtime: Option<tokio::runtime::Runtime>,
     /// Registry of active explicit transactions for GC safe point computation.
     session_registry: Arc<session::SessionRegistry>,
+    /// Result-path mode toggle for adaptive encoded batches.
+    enable_encoded_result_batch: bool,
 }
 
 fn drop_runtime_safely(runtime: tokio::runtime::Runtime) {
@@ -367,10 +390,42 @@ impl Database {
     pub fn open(config: DatabaseConfig) -> Result<Self> {
         log_info!("Opening TiSQL database at {:?}", config.data_dir);
 
+        let cpu_count = std::thread::available_parallelism()
+            .map(|n| n.get())
+            .unwrap_or(4);
+        let planned_threads = config
+            .runtime_threads
+            .apply(RuntimeThreads::plan(cpu_count));
+        let total_threads = planned_threads.protocol
+            + planned_threads.worker
+            + planned_threads.background
+            + planned_threads.io;
+        log_info!(
+            "Runtime thread plan (cpu={}): protocol={}, worker={}, bg={}, io={}, total={}",
+            cpu_count,
+            planned_threads.protocol,
+            planned_threads.worker,
+            planned_threads.background,
+            planned_threads.io,
+            total_threads
+        );
+        if cpu_count <= 2 {
+            log_warn!(
+                "Detected low CPU count ({}). Throughput may be limited; consider explicit runtime thread overrides.",
+                cpu_count
+            );
+        } else if total_threads > cpu_count {
+            log_warn!(
+                "Runtime split oversubscribes CPUs (cpu={}, total_threads={}). This is acceptable for role isolation in fast-dev mode.",
+                cpu_count,
+                total_threads
+            );
+        }
+
         // 1. Create I/O runtime FIRST — recovery needs it for GroupCommitWriter + IoService
         let io_runtime = OpenRuntimeGuard::new(
             tokio::runtime::Builder::new_multi_thread()
-                .worker_threads(2)
+                .worker_threads(planned_threads.io)
                 .thread_name("tisql-io")
                 .enable_all()
                 .build()
@@ -381,7 +436,7 @@ impl Database {
                 })?,
         );
 
-        log_info!("I/O runtime created with 2 threads");
+        log_info!("I/O runtime created with {} threads", planned_threads.io);
 
         // 2. Staged recovery bootstrap (system ilog + raw clog, no replay yet).
         let mut recovery =
@@ -511,7 +566,7 @@ impl Database {
         // 3. Create background runtime for per-tablet flush/compaction/GC.
         let bg_runtime = OpenRuntimeGuard::new(
             tokio::runtime::Builder::new_multi_thread()
-                .worker_threads(2)
+                .worker_threads(planned_threads.background)
                 .thread_name("tisql-bg")
                 .enable_all()
                 .build()
@@ -522,7 +577,10 @@ impl Database {
                 })?,
         );
 
-        log_info!("Background runtime created with 2 threads");
+        log_info!(
+            "Background runtime created with {} threads",
+            planned_threads.background
+        );
         tablet_manager.bind_background_runtime(bg_runtime.handle())?;
 
         // Create session registry and wire GC safe point.
@@ -569,14 +627,9 @@ impl Database {
         );
         gc_worker.start(bg_runtime.handle());
 
-        // Create dedicated worker runtime for query execution.
-        // Sized to available parallelism (defaults to CPU count).
-        let worker_threads = std::thread::available_parallelism()
-            .map(|n| n.get())
-            .unwrap_or(4);
         let worker_runtime = OpenRuntimeGuard::new(
             tokio::runtime::Builder::new_multi_thread()
-                .worker_threads(worker_threads)
+                .worker_threads(planned_threads.worker)
                 .thread_name("tisql-worker")
                 .enable_all()
                 .build()
@@ -587,7 +640,10 @@ impl Database {
                 })?,
         );
 
-        log_info!("Worker runtime created with {} threads", worker_threads);
+        log_info!(
+            "Worker runtime created with {} threads",
+            planned_threads.worker
+        );
 
         Ok(Self {
             parser: Parser::new(),
@@ -602,6 +658,7 @@ impl Database {
             bg_runtime: Some(bg_runtime.into_inner()),
             io_runtime: Some(io_runtime.into_inner()),
             session_registry,
+            enable_encoded_result_batch: config.enable_encoded_result_batch,
         })
     }
 
@@ -621,6 +678,11 @@ impl Database {
     /// Get a handle to the I/O runtime, if available.
     pub fn io_handle(&self) -> Option<&tokio::runtime::Handle> {
         self.io_runtime.as_ref().map(|rt| rt.handle())
+    }
+
+    /// Whether adaptive encoded result batches are enabled.
+    pub fn encoded_result_batch_enabled(&self) -> bool {
+        self.enable_encoded_result_batch
     }
 
     /// Get the tablet manager.

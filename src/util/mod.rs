@@ -20,6 +20,7 @@ pub mod error;
 pub mod fs;
 pub mod io;
 pub mod log;
+pub mod mysql_text;
 pub mod timing;
 
 // Re-export commonly used items

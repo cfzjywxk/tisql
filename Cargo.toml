@@ -98,22 +98,44 @@ name = "mysql_protocol_test"
 path = "tests/mysql_protocol_test.rs"
 
 # ============================================================================
-# Profile settings for debugging
+# Profile settings
 # ============================================================================
 
 [profile.dev]
-# Full debug info (level 2) - includes all symbols, line numbers, variable names
 debug = 2
-# No optimization - makes debugging much easier (variables won't be optimized out)
 opt-level = 0
-# Disable LTO for faster builds and better debugging
 lto = false
-# Include debug assertions
 debug-assertions = true
-# Overflow checks
 overflow-checks = true
 
-# Release profile with debug info (useful for profiling)
+# Production release: max optimization (slower compile, fastest binary).
+# References TiKV's release + dist_release profiles.
+[profile.release]
+opt-level = 3
+# Thin LTO: cross-crate inlining with ~2x compile cost (fat LTO is ~4x for marginal gain).
+lto = "thin"
+# Single codegen unit: lets LLVM optimize across the whole crate.
+codegen-units = 1
+# No debug symbols in release binary (use release-with-debug for profiling).
+debug = false
+# Disable incremental: full rebuild ensures maximum optimization.
+incremental = false
+# Keep overflow checks: correctness-first policy — arithmetic bugs must not go silent.
+overflow-checks = true
+# Keep debug assertions: TiSQL is in fast-dev, invariant checks are worth the cost.
+debug-assertions = true
+
+# Profiling release: same optimizations + full debug symbols for perf/pprof.
 [profile.release-with-debug]
 inherits = "release"
 debug = 2
+
+# Benchmark profile: match release settings so bench numbers reflect production.
+[profile.bench]
+opt-level = 3
+lto = "thin"
+codegen-units = 1
+debug = false
+incremental = false
+overflow-checks = false
+debug-assertions = false

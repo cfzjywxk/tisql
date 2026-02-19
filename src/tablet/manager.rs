@@ -1645,9 +1645,8 @@ mod tests {
         let system_tablet = open_durable_tablet(&system_tablet_dir, Arc::clone(&lsn_provider));
         let manager =
             TabletManager::new(dir.path(), Arc::clone(&lsn_provider), system_tablet).unwrap();
-        manager
-            .bind_background_runtime(&tokio::runtime::Handle::current())
-            .unwrap();
+        // Do not bind background workers in this test. We want deterministic
+        // explicit concurrent flushes without scheduler races.
 
         let tablet_a = TabletId::Table {
             table_id: USER_TABLE_ID_START + 11,

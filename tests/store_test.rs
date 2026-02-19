@@ -462,12 +462,21 @@ mod errors {
 /// Persistence tests - verify data and catalog survive restart
 mod persistence {
     use tempfile::tempdir;
-    use tisql::{Database, DatabaseConfig, QueryResult};
+    use tisql::{Database, DatabaseConfig, QueryResult, RuntimeThreadOverrides};
+
+    fn persistence_config(path: &std::path::Path) -> DatabaseConfig {
+        DatabaseConfig::with_data_dir(path).with_runtime_threads(RuntimeThreadOverrides {
+            protocol: Some(1),
+            worker: Some(1),
+            background: Some(1),
+            io: Some(1),
+        })
+    }
 
     #[tokio::test]
     async fn test_catalog_survives_restart() {
         let dir = tempdir().unwrap();
-        let config = DatabaseConfig::with_data_dir(dir.path());
+        let config = persistence_config(dir.path());
 
         // First session: create table and insert data
         {
@@ -510,7 +519,7 @@ mod persistence {
     #[tokio::test]
     async fn test_multiple_tables_survive_restart() {
         let dir = tempdir().unwrap();
-        let config = DatabaseConfig::with_data_dir(dir.path());
+        let config = persistence_config(dir.path());
 
         // First session: create multiple tables
         {
@@ -561,7 +570,7 @@ mod persistence {
     #[tokio::test]
     async fn test_drop_table_persists() {
         let dir = tempdir().unwrap();
-        let config = DatabaseConfig::with_data_dir(dir.path());
+        let config = persistence_config(dir.path());
 
         // First session: create and drop a table
         {
@@ -607,7 +616,7 @@ mod persistence {
     #[tokio::test]
     async fn test_table_id_persists() {
         let dir = tempdir().unwrap();
-        let config = DatabaseConfig::with_data_dir(dir.path());
+        let config = persistence_config(dir.path());
 
         // First session: create tables
         {
@@ -649,7 +658,7 @@ mod persistence {
     #[tokio::test]
     async fn test_crash_recovery_no_close() {
         let dir = tempdir().unwrap();
-        let config = DatabaseConfig::with_data_dir(dir.path());
+        let config = persistence_config(dir.path());
 
         // First session: write data and "crash" (no close)
         {
@@ -699,7 +708,7 @@ mod persistence {
     #[tokio::test]
     async fn test_crash_recovery_with_updates_deletes() {
         let dir = tempdir().unwrap();
-        let config = DatabaseConfig::with_data_dir(dir.path());
+        let config = persistence_config(dir.path());
 
         // First session: create, insert, update, delete, then crash
         {
@@ -758,7 +767,7 @@ mod persistence {
     #[tokio::test]
     async fn test_multiple_crash_recovery_cycles() {
         let dir = tempdir().unwrap();
-        let config = DatabaseConfig::with_data_dir(dir.path());
+        let config = persistence_config(dir.path());
 
         // Cycle 1: create and insert
         {
@@ -849,7 +858,7 @@ mod persistence {
     #[tokio::test]
     async fn test_crash_recovery_ddl_drop_table() {
         let dir = tempdir().unwrap();
-        let config = DatabaseConfig::with_data_dir(dir.path());
+        let config = persistence_config(dir.path());
 
         // Create two tables
         {

@@ -31,7 +31,10 @@ use tokio::io::AsyncWrite;
 
 use crate::catalog::types::Value;
 use crate::session::{ExecutionCtx, Session};
-use crate::worker::{self, QueryResponse};
+use crate::util::mysql_text::{
+    format_date_canonical, format_datetime_canonical, format_time_canonical,
+};
+use crate::worker::{self, EncodedBatch, QueryResponse, ResultBatch};
 use crate::{log_debug, log_info, Database};
 
 /// MySQL protocol backend for a single client connection.
@@ -191,14 +194,27 @@ impl MySqlBackend {
                 // Receive row batches from the worker
                 while let Some(batch_result) = batch_rx.recv().await {
                     match batch_result {
-                        Ok(batch) => {
-                            for row in &batch.rows {
-                                for val in row.iter() {
-                                    write_value_fast(&mut rw, val)?;
+                        Ok(batch) => match batch {
+                            ResultBatch::Typed(batch) => {
+                                for row in &batch.rows {
+                                    for val in row.iter() {
+                                        write_value_fast(&mut rw, val)?;
+                                    }
+                                    rw.end_row().await?;
                                 }
-                                rw.end_row().await?;
                             }
-                        }
+                            ResultBatch::Encoded(batch) => {
+                                if let Err(e) = write_encoded_batch(&mut rw, &batch).await {
+                                    self.update_session_registry();
+                                    return rw
+                                        .finish_error(
+                                            ErrorKind::ER_UNKNOWN_ERROR,
+                                            &e.to_string().into_bytes(),
+                                        )
+                                        .await;
+                                }
+                            }
+                        },
                         Err(e) => {
                             // Update registry before early return on error
                             self.update_session_registry();
@@ -382,147 +398,203 @@ fn write_value_fast<W: AsyncWrite + Unpin>(
     }
 }
 
-fn format_date_canonical(days_since_epoch: i32, out: &mut [u8; 32]) -> io::Result<usize> {
-    let (year, month, day) = civil_from_days(days_since_epoch as i64);
-    let mut len = 0usize;
-    append_year(out, &mut len, year)?;
-    append_byte(out, &mut len, b'-')?;
-    append_u32_padded(out, &mut len, month, 2)?;
-    append_byte(out, &mut len, b'-')?;
-    append_u32_padded(out, &mut len, day, 2)?;
-    Ok(len)
-}
-
-fn format_time_canonical(micros: i64, out: &mut [u8; 32]) -> io::Result<usize> {
-    let mut len = 0usize;
-    let abs = micros.unsigned_abs();
-    let total_secs = abs / 1_000_000;
-    let frac = (abs % 1_000_000) as u32;
-    let hours = total_secs / 3_600;
-    let minutes = ((total_secs % 3_600) / 60) as u32;
-    let seconds = (total_secs % 60) as u32;
-
-    if micros < 0 {
-        append_byte(out, &mut len, b'-')?;
-    }
-
-    if hours < 100 {
-        append_u32_padded(out, &mut len, hours as u32, 2)?;
-    } else {
-        append_u64(out, &mut len, hours)?;
-    }
-    append_byte(out, &mut len, b':')?;
-    append_u32_padded(out, &mut len, minutes, 2)?;
-    append_byte(out, &mut len, b':')?;
-    append_u32_padded(out, &mut len, seconds, 2)?;
-    if frac != 0 {
-        append_byte(out, &mut len, b'.')?;
-        append_u32_padded(out, &mut len, frac, 6)?;
-    }
-    Ok(len)
-}
-
-fn format_datetime_canonical(micros_since_epoch: i64, out: &mut [u8; 32]) -> io::Result<usize> {
-    let secs = micros_since_epoch.div_euclid(1_000_000);
-    let frac = micros_since_epoch.rem_euclid(1_000_000) as u32;
-    let days = secs.div_euclid(86_400);
-    let sec_of_day = secs.rem_euclid(86_400) as u32;
-
-    let (year, month, day) = civil_from_days(days);
-    let hour = sec_of_day / 3_600;
-    let minute = (sec_of_day % 3_600) / 60;
-    let second = sec_of_day % 60;
-
-    let mut len = 0usize;
-    append_year(out, &mut len, year)?;
-    append_byte(out, &mut len, b'-')?;
-    append_u32_padded(out, &mut len, month, 2)?;
-    append_byte(out, &mut len, b'-')?;
-    append_u32_padded(out, &mut len, day, 2)?;
-    append_byte(out, &mut len, b' ')?;
-    append_u32_padded(out, &mut len, hour, 2)?;
-    append_byte(out, &mut len, b':')?;
-    append_u32_padded(out, &mut len, minute, 2)?;
-    append_byte(out, &mut len, b':')?;
-    append_u32_padded(out, &mut len, second, 2)?;
-    if frac != 0 {
-        append_byte(out, &mut len, b'.')?;
-        append_u32_padded(out, &mut len, frac, 6)?;
-    }
-    Ok(len)
-}
-
-// Convert days since Unix epoch (1970-01-01) to civil date.
-fn civil_from_days(days_since_epoch: i64) -> (i32, u32, u32) {
-    let z = days_since_epoch + 719_468;
-    let era = if z >= 0 { z } else { z - 146_096 } / 146_097;
-    let doe = z - era * 146_097;
-    let yoe = (doe - doe / 1_460 + doe / 36_524 - doe / 146_096) / 365;
-    let y = yoe + era * 400;
-    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
-    let mp = (5 * doy + 2) / 153;
-    let d = doy - (153 * mp + 2) / 5 + 1;
-    let m = mp + if mp < 10 { 3 } else { -9 };
-    let year = y + if m <= 2 { 1 } else { 0 };
-    (year as i32, m as u32, d as u32)
-}
-
-fn append_year(out: &mut [u8], len: &mut usize, year: i32) -> io::Result<()> {
-    if (0..=9_999).contains(&year) {
-        append_u32_padded(out, len, year as u32, 4)
-    } else {
-        let mut buf = itoa::Buffer::new();
-        append_bytes(out, len, buf.format(year).as_bytes())
-    }
-}
-
-fn append_u64(out: &mut [u8], len: &mut usize, value: u64) -> io::Result<()> {
-    let mut buf = itoa::Buffer::new();
-    append_bytes(out, len, buf.format(value).as_bytes())
-}
-
-fn append_u32_padded(
-    out: &mut [u8],
-    len: &mut usize,
-    mut value: u32,
-    width: usize,
+async fn write_encoded_batch<W: AsyncWrite + Unpin>(
+    rw: &mut opensrv_mysql::RowWriter<'_, W>,
+    batch: &EncodedBatch,
 ) -> io::Result<()> {
-    let mut tmp = [b'0'; 10];
-    let start = tmp.len().checked_sub(width).ok_or_else(|| {
-        io::Error::new(
-            io::ErrorKind::InvalidData,
-            "Invalid width for zero-padded integer",
-        )
-    })?;
-
-    for idx in (start..tmp.len()).rev() {
-        tmp[idx] = b'0' + (value % 10) as u8;
-        value /= 10;
+    let mut reader = BatchReader::new(&batch.bytes, batch.num_columns);
+    let mut rows = 0usize;
+    while let Some(mut row_reader) = reader.next_row()? {
+        for _ in 0..batch.num_columns {
+            match row_reader.next_col()? {
+                Some(RawCol::Null) => rw.write_col(None::<i32>)?,
+                Some(RawCol::Bytes(bytes)) => rw.write_col(bytes)?,
+                None => {
+                    return Err(io::Error::new(
+                        io::ErrorKind::InvalidData,
+                        "Encoded row has fewer columns than expected",
+                    ));
+                }
+            }
+        }
+        if row_reader.next_col()?.is_some() {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "Encoded row has more columns than expected",
+            ));
+        }
+        rw.end_row().await?;
+        rows += 1;
     }
-    if value != 0 {
+    if rows != batch.num_rows {
         return Err(io::Error::new(
             io::ErrorKind::InvalidData,
-            "Zero-padded integer width overflow",
+            format!(
+                "Encoded batch row count mismatch: expected {}, decoded {}",
+                batch.num_rows, rows
+            ),
         ));
     }
-    append_bytes(out, len, &tmp[start..])
-}
-
-fn append_byte(out: &mut [u8], len: &mut usize, b: u8) -> io::Result<()> {
-    append_bytes(out, len, &[b])
-}
-
-fn append_bytes(out: &mut [u8], len: &mut usize, bytes: &[u8]) -> io::Result<()> {
-    let remaining = out.len().saturating_sub(*len);
-    if remaining < bytes.len() {
-        return Err(io::Error::new(
-            io::ErrorKind::InvalidData,
-            "Temporal formatting exceeded scratch buffer",
-        ));
-    }
-    out[*len..*len + bytes.len()].copy_from_slice(bytes);
-    *len += bytes.len();
     Ok(())
+}
+
+enum RawCol<'a> {
+    Null,
+    Bytes(&'a [u8]),
+}
+
+struct BatchReader<'a> {
+    buf: &'a [u8],
+    offset: usize,
+    num_columns: usize,
+}
+
+impl<'a> BatchReader<'a> {
+    fn new(buf: &'a [u8], num_columns: usize) -> Self {
+        Self {
+            buf,
+            offset: 0,
+            num_columns,
+        }
+    }
+
+    fn next_row(&mut self) -> io::Result<Option<RowReader<'a>>> {
+        if self.offset == self.buf.len() {
+            return Ok(None);
+        }
+        if self.offset + 4 > self.buf.len() {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "Truncated encoded row header",
+            ));
+        }
+        let row_len = u32::from_le_bytes([
+            self.buf[self.offset],
+            self.buf[self.offset + 1],
+            self.buf[self.offset + 2],
+            self.buf[self.offset + 3],
+        ]) as usize;
+        self.offset += 4;
+        if self.offset + row_len > self.buf.len() {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "Truncated encoded row payload",
+            ));
+        }
+        let row_payload = &self.buf[self.offset..self.offset + row_len];
+        self.offset += row_len;
+        Ok(Some(RowReader::new(row_payload, self.num_columns)))
+    }
+}
+
+struct RowReader<'a> {
+    row: &'a [u8],
+    offset: usize,
+    num_columns: usize,
+    decoded_columns: usize,
+}
+
+impl<'a> RowReader<'a> {
+    fn new(row: &'a [u8], num_columns: usize) -> Self {
+        Self {
+            row,
+            offset: 0,
+            num_columns,
+            decoded_columns: 0,
+        }
+    }
+
+    fn next_col(&mut self) -> io::Result<Option<RawCol<'a>>> {
+        if self.offset == self.row.len() {
+            return Ok(None);
+        }
+        if self.decoded_columns >= self.num_columns {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "Encoded row has more columns than declared",
+            ));
+        }
+
+        let first = self.row[self.offset];
+        if first == 0xFB {
+            self.offset += 1;
+            self.decoded_columns += 1;
+            return Ok(Some(RawCol::Null));
+        }
+
+        let (len, used) = decode_lenenc_int(&self.row[self.offset..])?;
+        self.offset += used;
+        let len = usize::try_from(len).map_err(|_| {
+            io::Error::new(
+                io::ErrorKind::InvalidData,
+                "Length-encoded integer overflow",
+            )
+        })?;
+        if self.offset + len > self.row.len() {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "Truncated encoded column payload",
+            ));
+        }
+        let bytes = &self.row[self.offset..self.offset + len];
+        self.offset += len;
+        self.decoded_columns += 1;
+        Ok(Some(RawCol::Bytes(bytes)))
+    }
+}
+
+fn decode_lenenc_int(buf: &[u8]) -> io::Result<(u64, usize)> {
+    if buf.is_empty() {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "Empty buffer for length-encoded integer",
+        ));
+    }
+
+    match buf[0] {
+        x if x < 0xFB => Ok((x as u64, 1)),
+        0xFC => {
+            if buf.len() < 3 {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    "Truncated lenenc u16",
+                ));
+            }
+            Ok((u16::from_le_bytes([buf[1], buf[2]]) as u64, 3))
+        }
+        0xFD => {
+            if buf.len() < 4 {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    "Truncated lenenc u24",
+                ));
+            }
+            let v = u32::from(buf[1]) | (u32::from(buf[2]) << 8) | (u32::from(buf[3]) << 16);
+            Ok((v as u64, 4))
+        }
+        0xFE => {
+            if buf.len() < 9 {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    "Truncated lenenc u64",
+                ));
+            }
+            Ok((
+                u64::from_le_bytes([
+                    buf[1], buf[2], buf[3], buf[4], buf[5], buf[6], buf[7], buf[8],
+                ]),
+                9,
+            ))
+        }
+        0xFB => Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "NULL marker is not valid lenenc integer",
+        )),
+        _ => Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "Invalid length-encoded integer marker",
+        )),
+    }
 }
 
 #[cfg(test)]
@@ -559,5 +631,41 @@ mod tests {
         let mut scratch = [0u8; 32];
         let n = format_datetime_canonical(0, &mut scratch).unwrap();
         assert_eq!(&scratch[..n], b"1970-01-01 00:00:00");
+    }
+
+    #[test]
+    fn test_decode_lenenc_u24() {
+        let (v, n) = decode_lenenc_int(&[0xFD, 0x56, 0x34, 0x12]).unwrap();
+        assert_eq!(v, 0x12_34_56);
+        assert_eq!(n, 4);
+    }
+
+    #[test]
+    fn test_batch_reader_single_row() {
+        let mut bytes = Vec::new();
+        bytes.extend_from_slice(&4u32.to_le_bytes());
+        bytes.extend_from_slice(&[2, b'4', b'2', 0xFB]);
+
+        let mut reader = BatchReader::new(&bytes, 2);
+        let mut row = reader.next_row().unwrap().unwrap();
+        match row.next_col().unwrap().unwrap() {
+            RawCol::Bytes(v) => assert_eq!(v, b"42"),
+            RawCol::Null => panic!("expected bytes column"),
+        }
+        assert!(matches!(row.next_col().unwrap().unwrap(), RawCol::Null));
+        assert!(row.next_col().unwrap().is_none());
+        assert!(reader.next_row().unwrap().is_none());
+    }
+
+    #[test]
+    fn test_batch_reader_extra_column_rejected() {
+        let mut bytes = Vec::new();
+        bytes.extend_from_slice(&4u32.to_le_bytes());
+        bytes.extend_from_slice(&[1, b'a', 1, b'b']);
+
+        let mut reader = BatchReader::new(&bytes, 1);
+        let mut row = reader.next_row().unwrap().unwrap();
+        assert!(row.next_col().unwrap().is_some());
+        assert!(row.next_col().is_err());
     }
 }
