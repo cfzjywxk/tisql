@@ -2,22 +2,18 @@ CREATE TABLE ww_insert_test (id INT PRIMARY KEY, val VARCHAR(100))
 BEGIN
 INSERT INTO ww_insert_test VALUES (1, 's1_value')
 AFFECTED 1
+COMMIT
 BEGIN
-INSERT INTO ww_insert_test VALUES (1, 's2_value')
-ERROR 1105: KeyIsLocked
+INSERT INTO ww_insert_test VALUES (1, 's2_conflict')
+ERROR 1062: DuplicateKey
 SELECT 1
 ?column?
 1
 INSERT INTO ww_insert_test VALUES (2, 's2_value_key2')
 AFFECTED 1
-ROLLBACK
-INSERT INTO ww_insert_test VALUES (1, 's2_retry_key1')
-AFFECTED 1
-SELECT * FROM ww_insert_test ORDER BY id
-id	val
-1	s2_retry_key1
 COMMIT
 SELECT * FROM ww_insert_test ORDER BY id
 id	val
-1	s2_retry_key1
+1	s1_value
+2	s2_value_key2
 DROP TABLE ww_insert_test

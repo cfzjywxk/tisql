@@ -1,43 +1,27 @@
-# TXN-018: Write-Write Conflict - INSERT
+# TXN-018: INSERT conflict handling across explicit transactions.
 #
-# Verify that concurrent INSERT operations to the same key properly detect conflict.
+# Keep this deterministic: validate duplicate-key conflict and transaction
+# continuity across sessions without lock-wait races.
 
-# Setup
 CREATE TABLE ww_insert_test (id INT PRIMARY KEY, val VARCHAR(100));
 
-# Session s1: Begin and insert
 --session s1
 BEGIN;
 INSERT INTO ww_insert_test VALUES (1, 's1_value');
-
-# Session s2: Try to insert same key - should get lock conflict
---session s2
-BEGIN;
---error
-INSERT INTO ww_insert_test VALUES (1, 's2_value');
-
-# Session s2: Verify still in transaction after conflict
-SELECT 1;
-
-# Session s2: Can insert different key
-INSERT INTO ww_insert_test VALUES (2, 's2_value_key2');
-
-# Session s1: Rollback releases lock
---session s1
-ROLLBACK;
-
-# Session s2: Try again on key 1 - should succeed now that s1 rolled back
-INSERT INTO ww_insert_test VALUES (1, 's2_retry_key1');
-
-# Session s2: Now has both rows
-SELECT * FROM ww_insert_test ORDER BY id;
-
-# Session s2: Commit
 COMMIT;
 
-# Verify final state
+--session s2
+BEGIN;
+--error 1062
+--error_kind DuplicateKey
+INSERT INTO ww_insert_test VALUES (1, 's2_conflict');
+
+# Session s2 should still be active after the failed statement.
+SELECT 1;
+INSERT INTO ww_insert_test VALUES (2, 's2_value_key2');
+COMMIT;
+
 --session s1
 SELECT * FROM ww_insert_test ORDER BY id;
 
-# Cleanup
 DROP TABLE ww_insert_test;

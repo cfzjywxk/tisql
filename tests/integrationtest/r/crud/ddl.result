@@ -11,7 +11,3 @@ SELECT id, char_val, varchar_val, text_val FROM t_ddl
 id	char_val	varchar_val	text_val
 1	hello	world	long text here
 DROP TABLE t_ddl
-CREATE TABLE t_test (id INT PRIMARY KEY)
-CREATE TABLE IF NOT EXISTS t_test (id INT PRIMARY KEY)
-DROP TABLE t_test
-DROP TABLE IF EXISTS t_test

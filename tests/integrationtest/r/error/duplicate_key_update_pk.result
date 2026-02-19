@@ -1,0 +1,27 @@
+CREATE TABLE t3 (id INT PRIMARY KEY, name VARCHAR(100))
+INSERT INTO t3 VALUES (1, 'Alice')
+AFFECTED 1
+INSERT INTO t3 VALUES (2, 'Bob')
+AFFECTED 1
+INSERT INTO t3 VALUES (3, 'Charlie')
+AFFECTED 1
+SELECT * FROM t3 ORDER BY id
+id	name
+1	Alice
+2	Bob
+3	Charlie
+UPDATE t3 SET id = 1 WHERE id = 2
+ERROR 1062: DuplicateKey
+SELECT * FROM t3 ORDER BY id
+id	name
+1	Alice
+2	Bob
+3	Charlie
+UPDATE t3 SET id = 10 WHERE id = 3
+AFFECTED 1
+SELECT * FROM t3 ORDER BY id
+id	name
+1	Alice
+2	Bob
+10	Charlie
+DROP TABLE t3

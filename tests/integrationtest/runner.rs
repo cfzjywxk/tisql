@@ -282,6 +282,14 @@ async fn run_test(config: &Config, test_case: &TestCase) -> TestResult {
     // multiple runner processes execute concurrently.
     let temp_dir = unique_mysqltest_temp_dir();
     std::fs::create_dir_all(&temp_dir).expect("Failed to create temp directory");
+    // Clean up temp dir at the end using a guard.
+    struct TempDirGuard(std::path::PathBuf);
+    impl Drop for TempDirGuard {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.0);
+        }
+    }
+    let _temp_guard = TempDirGuard(temp_dir.clone());
     // Keep per-test runtime footprint small to avoid thread churn across many
     // mysqltest cases in a single runner process.
     let db_config =
@@ -292,14 +300,6 @@ async fn run_test(config: &Config, test_case: &TestCase) -> TestResult {
             io: Some(1),
         });
     let db = Arc::new(Database::open(db_config).expect("Failed to open database"));
-    // Clean up temp dir at the end using a guard.
-    struct TempDirGuard(std::path::PathBuf);
-    impl Drop for TempDirGuard {
-        fn drop(&mut self) {
-            let _ = std::fs::remove_dir_all(&self.0);
-        }
-    }
-    let _temp_guard = TempDirGuard(temp_dir.clone());
 
     // Execute statements and collect output
     let mut sessions: HashMap<String, Session> = HashMap::new();

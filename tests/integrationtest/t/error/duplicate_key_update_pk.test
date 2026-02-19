@@ -1,0 +1,21 @@
+# Duplicate key errors when UPDATE rewrites primary keys.
+
+CREATE TABLE t3 (id INT PRIMARY KEY, name VARCHAR(100));
+
+INSERT INTO t3 VALUES (1, 'Alice');
+INSERT INTO t3 VALUES (2, 'Bob');
+INSERT INTO t3 VALUES (3, 'Charlie');
+
+SELECT * FROM t3 ORDER BY id;
+
+--error 1062
+--error_kind DuplicateKey
+UPDATE t3 SET id = 1 WHERE id = 2;
+
+SELECT * FROM t3 ORDER BY id;
+
+UPDATE t3 SET id = 10 WHERE id = 3;
+
+SELECT * FROM t3 ORDER BY id;
+
+DROP TABLE t3;
