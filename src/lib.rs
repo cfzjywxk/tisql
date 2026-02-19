@@ -199,7 +199,7 @@ pub struct DatabaseConfig {
     pub data_dir: PathBuf,
     /// Runtime thread-count overrides.
     pub runtime_threads: RuntimeThreadOverrides,
-    /// Enable adaptive encoded result batches (phase 3).
+    /// Enable adaptive encoded result batches (phase 3, experimental).
     pub enable_encoded_result_batch: bool,
 }
 
@@ -208,7 +208,7 @@ impl Default for DatabaseConfig {
         Self {
             data_dir: PathBuf::from("data"),
             runtime_threads: RuntimeThreadOverrides::default(),
-            enable_encoded_result_batch: true,
+            enable_encoded_result_batch: false,
         }
     }
 }

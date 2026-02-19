@@ -48,6 +48,7 @@ pub enum ResultBatch {
 /// A typed row batch plus its byte-budget permit.
 pub struct TypedBatch {
     pub rows: Vec<Row>,
+    /// Estimated heap footprint of rows buffered in this batch.
     pub est_bytes: usize,
     _budget_permit: OwnedSemaphorePermit,
 }
@@ -57,6 +58,7 @@ pub struct EncodedBatch {
     pub bytes: Vec<u8>,
     pub num_columns: usize,
     pub num_rows: usize,
+    /// Encoded payload bytes retained in this batch.
     pub est_bytes: usize,
     _budget_permit: OwnedSemaphorePermit,
 }
@@ -236,14 +238,13 @@ async fn stream_rows(
     let mut typed_est_bytes = 0usize;
     let mut encoded_bytes = Vec::with_capacity(TARGET_BATCH_BYTES);
     let mut encoded_rows = 0usize;
-    let mut encoded_est_bytes = 0usize;
 
     loop {
         match exec.next().await {
             Ok(Some(row)) => {
-                let row_est_bytes = estimate_row_text_bytes(&row);
                 match &mut state {
                     StreamState::Sampling(sample) => {
+                        let row_est_bytes = estimate_row_text_bytes(&row);
                         sample.observe(&row, row_est_bytes);
                         sample.rows.push(row);
                         if sample.rows.len() >= SAMPLE_ROWS {
@@ -252,11 +253,9 @@ async fn stream_rows(
                             let sampled_rows = std::mem::take(&mut sample.rows);
                             state = StreamState::Active(mode);
                             for sampled in sampled_rows {
-                                let sampled_est = estimate_row_text_bytes(&sampled);
                                 let pushed = push_row_to_active_mode(
                                     mode,
                                     sampled,
-                                    sampled_est,
                                     num_columns,
                                     &batch_tx,
                                     &result_budget,
@@ -264,7 +263,6 @@ async fn stream_rows(
                                     &mut typed_est_bytes,
                                     &mut encoded_bytes,
                                     &mut encoded_rows,
-                                    &mut encoded_est_bytes,
                                 )
                                 .await;
                                 match pushed {
@@ -282,7 +280,6 @@ async fn stream_rows(
                         let pushed = push_row_to_active_mode(
                             *mode,
                             row,
-                            row_est_bytes,
                             num_columns,
                             &batch_tx,
                             &result_budget,
@@ -290,7 +287,6 @@ async fn stream_rows(
                             &mut typed_est_bytes,
                             &mut encoded_bytes,
                             &mut encoded_rows,
-                            &mut encoded_est_bytes,
                         )
                         .await;
                         match pushed {
@@ -315,11 +311,9 @@ async fn stream_rows(
                     );
                     let sampled_rows = std::mem::take(&mut sample.rows);
                     for sampled in sampled_rows {
-                        let sampled_est = estimate_row_text_bytes(&sampled);
                         let pushed = push_row_to_active_mode(
                             StreamMode::Typed,
                             sampled,
-                            sampled_est,
                             num_columns,
                             &batch_tx,
                             &result_budget,
@@ -327,7 +321,6 @@ async fn stream_rows(
                             &mut typed_est_bytes,
                             &mut encoded_bytes,
                             &mut encoded_rows,
-                            &mut encoded_est_bytes,
                         )
                         .await;
                         match pushed {
@@ -367,7 +360,6 @@ async fn stream_rows(
                             &result_budget,
                             &mut encoded_bytes,
                             &mut encoded_rows,
-                            &mut encoded_est_bytes,
                             num_columns,
                         )
                         .await
@@ -488,7 +480,6 @@ fn decide_stream_mode(
 async fn push_row_to_active_mode(
     mode: StreamMode,
     row: Row,
-    row_est_bytes: usize,
     num_columns: usize,
     batch_tx: &mpsc::Sender<Result<ResultBatch, TiSqlError>>,
     result_budget: &Arc<Semaphore>,
@@ -496,11 +487,10 @@ async fn push_row_to_active_mode(
     typed_est_bytes: &mut usize,
     encoded_bytes: &mut Vec<u8>,
     encoded_rows: &mut usize,
-    encoded_est_bytes: &mut usize,
 ) -> Result<bool, TiSqlError> {
     match mode {
         StreamMode::Typed => {
-            *typed_est_bytes = typed_est_bytes.saturating_add(row_est_bytes);
+            *typed_est_bytes = typed_est_bytes.saturating_add(estimate_row_heap_bytes(&row));
             typed_batch.push(row);
             if typed_batch.len() >= TARGET_BATCH_ROWS
                 || *typed_est_bytes >= TARGET_BATCH_BYTES
@@ -514,7 +504,6 @@ async fn push_row_to_active_mode(
         StreamMode::Encoded => {
             encode_row_canonical(encoded_bytes, &row, num_columns)?;
             *encoded_rows = encoded_rows.saturating_add(1);
-            *encoded_est_bytes = encoded_est_bytes.saturating_add(row_est_bytes);
             if *encoded_rows >= TARGET_BATCH_ROWS
                 || encoded_bytes.len() >= TARGET_BATCH_BYTES
                 || encoded_bytes.len() >= MAX_BATCH_BYTES
@@ -524,7 +513,6 @@ async fn push_row_to_active_mode(
                     result_budget,
                     encoded_bytes,
                     encoded_rows,
-                    encoded_est_bytes,
                     num_columns,
                 )
                 .await
@@ -580,7 +568,6 @@ async fn flush_encoded_batch(
     result_budget: &Arc<Semaphore>,
     bytes: &mut Vec<u8>,
     num_rows: &mut usize,
-    est_bytes_acc: &mut usize,
     num_columns: usize,
 ) -> Result<bool, TiSqlError> {
     if *num_rows == 0 {
@@ -608,7 +595,6 @@ async fn flush_encoded_batch(
     };
 
     *num_rows = 0;
-    *est_bytes_acc = 0;
     bytes.reserve(TARGET_BATCH_BYTES);
 
     if batch_tx
@@ -776,30 +762,12 @@ fn estimate_value_payload_bytes(val: &Value) -> usize {
                 5
             }
         }
-        Value::TinyInt(v) => {
-            let mut buf = itoa::Buffer::new();
-            buf.format(*v).len()
-        }
-        Value::SmallInt(v) => {
-            let mut buf = itoa::Buffer::new();
-            buf.format(*v).len()
-        }
-        Value::Int(v) => {
-            let mut buf = itoa::Buffer::new();
-            buf.format(*v).len()
-        }
-        Value::BigInt(v) => {
-            let mut buf = itoa::Buffer::new();
-            buf.format(*v).len()
-        }
-        Value::Float(v) => {
-            let mut buf = ryu::Buffer::new();
-            buf.format(*v).len()
-        }
-        Value::Double(v) => {
-            let mut buf = ryu::Buffer::new();
-            buf.format(*v).len()
-        }
+        Value::TinyInt(_) => 4,
+        Value::SmallInt(_) => 6,
+        Value::Int(_) => 11,
+        Value::BigInt(_) => 20,
+        Value::Float(_) => 15,
+        Value::Double(_) => 24,
         Value::Decimal(v) | Value::String(v) => v.len(),
         Value::Bytes(v) => v.len(),
         Value::Date(_) => 10,
@@ -821,6 +789,21 @@ fn estimate_row_text_bytes(row: &Row) -> usize {
     })
 }
 
+// Approximate retained heap bytes when this row is buffered in TypedBatch.
+// Includes row/value container storage plus backing allocations for varlen values.
+fn estimate_row_heap_bytes(row: &Row) -> usize {
+    let mut est = std::mem::size_of::<Row>();
+    est = est.saturating_add(row.len().saturating_mul(std::mem::size_of::<Value>()));
+    for val in row.iter() {
+        est = est.saturating_add(match val {
+            Value::Decimal(v) | Value::String(v) => v.capacity(),
+            Value::Bytes(v) => v.capacity(),
+            _ => 0,
+        });
+    }
+    est
+}
+
 fn estimate_value_text_bytes(val: &Value) -> usize {
     match val {
         Value::Null => 1, // 0xFB
@@ -828,36 +811,12 @@ fn estimate_value_text_bytes(val: &Value) -> usize {
             let len = if *b { 4 } else { 5 }; // true/false
             lenenc_prefix_len(len).saturating_add(len)
         }
-        Value::TinyInt(v) => {
-            let mut buf = itoa::Buffer::new();
-            let len = buf.format(*v).len();
-            lenenc_prefix_len(len).saturating_add(len)
-        }
-        Value::SmallInt(v) => {
-            let mut buf = itoa::Buffer::new();
-            let len = buf.format(*v).len();
-            lenenc_prefix_len(len).saturating_add(len)
-        }
-        Value::Int(v) => {
-            let mut buf = itoa::Buffer::new();
-            let len = buf.format(*v).len();
-            lenenc_prefix_len(len).saturating_add(len)
-        }
-        Value::BigInt(v) => {
-            let mut buf = itoa::Buffer::new();
-            let len = buf.format(*v).len();
-            lenenc_prefix_len(len).saturating_add(len)
-        }
-        Value::Float(v) => {
-            let mut buf = ryu::Buffer::new();
-            let len = buf.format(*v).len();
-            lenenc_prefix_len(len).saturating_add(len)
-        }
-        Value::Double(v) => {
-            let mut buf = ryu::Buffer::new();
-            let len = buf.format(*v).len();
-            lenenc_prefix_len(len).saturating_add(len)
-        }
+        Value::TinyInt(_) => lenenc_prefix_len(4).saturating_add(4),
+        Value::SmallInt(_) => lenenc_prefix_len(6).saturating_add(6),
+        Value::Int(_) => lenenc_prefix_len(11).saturating_add(11),
+        Value::BigInt(_) => lenenc_prefix_len(20).saturating_add(20),
+        Value::Float(_) => lenenc_prefix_len(15).saturating_add(15),
+        Value::Double(_) => lenenc_prefix_len(24).saturating_add(24),
         Value::Decimal(v) | Value::String(v) => lenenc_prefix_len(v.len()).saturating_add(v.len()),
         Value::Bytes(v) => lenenc_prefix_len(v.len()).saturating_add(v.len()),
         Value::Date(_) => lenenc_prefix_len(10).saturating_add(10),
@@ -977,7 +936,7 @@ fn make_show_response(columns: Vec<String>, rows: Vec<Row>) -> QueryResponse {
 fn make_typed_batch(rows: Vec<Row>) -> Result<ResultBatch, TiSqlError> {
     let est_bytes = rows
         .iter()
-        .map(estimate_row_text_bytes)
+        .map(estimate_row_heap_bytes)
         .fold(0usize, |acc, n| acc.saturating_add(n))
         .max(1);
 
@@ -1014,6 +973,14 @@ mod tests {
         let float_len = estimate_value_text_bytes(&Value::Double(std::f64::consts::PI));
         assert!(int_len > 0);
         assert!(float_len > 0);
+    }
+
+    #[test]
+    fn test_estimate_row_heap_bytes_accounts_for_varlen_capacity() {
+        let mut s = String::with_capacity(128);
+        s.push_str("abc");
+        let row = Row::new(vec![Value::String(s)]);
+        assert!(estimate_row_heap_bytes(&row) >= 128);
     }
 
     #[test]

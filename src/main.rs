@@ -66,8 +66,20 @@ struct Args {
     #[arg(long)]
     io_threads: Option<usize>,
 
-    /// Disable adaptive encoded result batches (phase 3 optimization)
-    #[arg(long, default_value_t = false)]
+    /// Enable adaptive encoded result batches (phase 3 optimization, experimental)
+    #[arg(
+        long,
+        default_value_t = false,
+        conflicts_with = "disable_encoded_result_batch"
+    )]
+    enable_encoded_result_batch: bool,
+
+    /// Disable adaptive encoded result batches
+    #[arg(
+        long,
+        default_value_t = false,
+        conflicts_with = "enable_encoded_result_batch"
+    )]
     disable_encoded_result_batch: bool,
 }
 
@@ -86,10 +98,18 @@ fn main() {
         .parse()
         .expect("Invalid address");
 
+    let encoded_result_batch = if args.enable_encoded_result_batch {
+        true
+    } else if args.disable_encoded_result_batch {
+        false
+    } else {
+        DatabaseConfig::default().enable_encoded_result_batch
+    };
+
     // Open database with persistence
     let db_config = DatabaseConfig::with_data_dir(&args.data_dir)
         .with_runtime_threads(runtime_overrides)
-        .with_encoded_result_batch(!args.disable_encoded_result_batch);
+        .with_encoded_result_batch(encoded_result_batch);
     let db = match Database::open(db_config) {
         Ok(db) => Arc::new(db),
         Err(e) => {
@@ -109,6 +129,14 @@ fn main() {
         runtime_threads.worker,
         runtime_threads.background,
         runtime_threads.io
+    );
+    println!(
+        "Encoded result batches: {}",
+        if encoded_result_batch {
+            "enabled"
+        } else {
+            "disabled"
+        }
     );
     println!(
         "Connect with: mysql -h{} -P{} -uroot test",
