@@ -26,8 +26,9 @@ use std::collections::HashMap;
 use std::fs;
 use std::io::{BufRead, BufReader};
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use tisql::util::error::TiSqlError;
 use tisql::util::{init_logger_from_env, LogLevel};
@@ -43,6 +44,7 @@ struct Config {
 
 const DEFAULT_STATEMENT_TIMEOUT_SECS: u64 = 15;
 const STATEMENT_TIMEOUT_ENV: &str = "TISQL_E2E_STMT_TIMEOUT_SECS";
+static MYSQLTEST_TMP_DIR_SEQ: AtomicU64 = AtomicU64::new(0);
 
 /// Test case
 struct TestCase {
@@ -161,6 +163,18 @@ fn parse_statement_timeout(args: &[String]) -> Duration {
     Duration::from_secs(secs)
 }
 
+fn unique_mysqltest_temp_dir() -> PathBuf {
+    let now_nanos = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_nanos();
+    let seq = MYSQLTEST_TMP_DIR_SEQ.fetch_add(1, Ordering::Relaxed);
+    std::env::temp_dir().join(format!(
+        "tisql-test-{}-{now_nanos}-{seq}",
+        std::process::id()
+    ))
+}
+
 /// Expected behavior for a statement.
 #[derive(Debug, Clone, Default)]
 struct Expectations {
@@ -264,8 +278,9 @@ async fn run_test(config: &Config, test_case: &TestCase) -> TestResult {
         }
     };
 
-    // Create database with temp directory
-    let temp_dir = std::env::temp_dir().join(format!("tisql-test-{}", std::process::id()));
+    // Use a unique temp dir per case so mysqltest runs stay isolated even when
+    // multiple runner processes execute concurrently.
+    let temp_dir = unique_mysqltest_temp_dir();
     std::fs::create_dir_all(&temp_dir).expect("Failed to create temp directory");
     // Keep per-test runtime footprint small to avoid thread churn across many
     // mysqltest cases in a single runner process.
@@ -277,14 +292,14 @@ async fn run_test(config: &Config, test_case: &TestCase) -> TestResult {
             io: Some(1),
         });
     let db = Arc::new(Database::open(db_config).expect("Failed to open database"));
-    // Clean up temp dir at the end using a guard
+    // Clean up temp dir at the end using a guard.
     struct TempDirGuard(std::path::PathBuf);
     impl Drop for TempDirGuard {
         fn drop(&mut self) {
             let _ = std::fs::remove_dir_all(&self.0);
         }
     }
-    let _temp_guard = TempDirGuard(temp_dir);
+    let _temp_guard = TempDirGuard(temp_dir.clone());
 
     // Execute statements and collect output
     let mut sessions: HashMap<String, Session> = HashMap::new();

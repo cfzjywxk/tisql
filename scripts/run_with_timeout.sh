@@ -14,6 +14,17 @@ if [[ ! "$timeout_secs" =~ ^[1-9][0-9]*$ ]]; then
     exit 2
 fi
 
+# Keep timeout guards strict and aligned with CLAUDE.md policy.
+max_timeout_secs="${TISQL_MAX_TIMEOUT_SECS:-300}"
+if [[ ! "$max_timeout_secs" =~ ^[1-9][0-9]*$ ]]; then
+    echo "TISQL_MAX_TIMEOUT_SECS must be a positive integer, got: $max_timeout_secs" >&2
+    exit 2
+fi
+if (( timeout_secs > max_timeout_secs )); then
+    echo "timeout-seconds must be <= ${max_timeout_secs}, got: $timeout_secs" >&2
+    exit 2
+fi
+
 if command -v timeout >/dev/null 2>&1; then
     set +e
     timeout --signal=TERM --kill-after=30s "${timeout_secs}s" "$@"

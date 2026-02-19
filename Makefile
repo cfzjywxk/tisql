@@ -2,26 +2,28 @@
 
 .PHONY: all build test unit-test store-test storage-test failpoint-test e2e-test fmt clippy clean run help prepare quick-prepare
 
-UNIT_TEST_TIMEOUT_SECS ?= 300
-UNIT_TEST_THREAD_ARGS ?= -- --test-threads=8
+UNIT_TEST_TIMEOUT_SECS ?= 180
+UNIT_TEST_THREAD_COUNT ?= 8
+UNIT_TEST_FILTER ?=
 STORE_TEST_CASE_TIMEOUT_SECS ?= 180
 STORE_TEST_LOG_LEVEL ?= warn
 STORE_TEST_FILTER ?=
-PESSIMISTIC_TXN_TEST_TIMEOUT_SECS ?= 300
-STORAGE_TEST_TIMEOUT_SECS ?= 300
-COMPACTION_BATCH_TIMEOUT_SECS ?= 300
+PESSIMISTIC_TXN_TEST_TIMEOUT_SECS ?= 180
+PESSIMISTIC_TXN_TEST_FILTER ?=
+STORAGE_TEST_TIMEOUT_SECS ?= 180
+COMPACTION_BATCH_TIMEOUT_SECS ?= 180
 COMPACTION_CASE_TIMEOUT_SECS ?= 240
 E2E_TEST_TIMEOUT_SECS ?= 300
 E2E_STMT_TIMEOUT_SECS ?= 15
 E2E_CASE_TIMEOUT_SECS ?= 180
 
 # Faster local-iteration profile (smaller timeout guards, same segmented flow)
-QUICK_UNIT_TEST_TIMEOUT_SECS ?= 240
+QUICK_UNIT_TEST_TIMEOUT_SECS ?= 120
 QUICK_STORE_TEST_CASE_TIMEOUT_SECS ?= 120
 QUICK_STORE_TEST_LOG_LEVEL ?= warn
-QUICK_PESSIMISTIC_TXN_TEST_TIMEOUT_SECS ?= 180
-QUICK_STORAGE_TEST_TIMEOUT_SECS ?= 300
-QUICK_COMPACTION_BATCH_TIMEOUT_SECS ?= 240
+QUICK_PESSIMISTIC_TXN_TEST_TIMEOUT_SECS ?= 120
+QUICK_STORAGE_TEST_TIMEOUT_SECS ?= 180
+QUICK_COMPACTION_BATCH_TIMEOUT_SECS ?= 120
 QUICK_COMPACTION_CASE_TIMEOUT_SECS ?= 180
 QUICK_E2E_STMT_TIMEOUT_SECS ?= 15
 QUICK_E2E_CASE_TIMEOUT_SECS ?= 90
@@ -29,6 +31,8 @@ QUICK_E2E_CASE_TIMEOUT_SECS ?= 90
 # Keep store_test deterministic and avoid runtime/thread explosion when the
 # harness executes many tokio::test cases concurrently.
 STORE_TEST_THREAD_COUNT ?= 1
+PESSIMISTIC_TXN_TEST_THREAD_COUNT ?= 1
+STORAGE_TEST_THREAD_COUNT ?= 1
 
 # Default target
 all: build
@@ -46,7 +50,10 @@ test: unit-test store-test storage-test e2e-test
 
 # Run unit tests only
 unit-test:
-	./scripts/run_with_timeout.sh $(UNIT_TEST_TIMEOUT_SECS) cargo test --lib $(UNIT_TEST_THREAD_ARGS)
+	./scripts/run_lib_test.sh \
+		$(UNIT_TEST_TIMEOUT_SECS) \
+		$(UNIT_TEST_THREAD_COUNT) \
+		"$(UNIT_TEST_FILTER)"
 
 # Run store tests (internal integration tests)
 store-test:
@@ -55,22 +62,30 @@ store-test:
 		$(STORE_TEST_LOG_LEVEL) \
 		$(STORE_TEST_THREAD_COUNT) \
 		"$(STORE_TEST_FILTER)"
-	./scripts/run_with_timeout.sh $(PESSIMISTIC_TXN_TEST_TIMEOUT_SECS) cargo test --test pessimistic_txn_ported_test
+	./scripts/run_integration_test_cases.sh \
+		$(PESSIMISTIC_TXN_TEST_TIMEOUT_SECS) \
+		pessimistic_txn_ported_test \
+		$(PESSIMISTIC_TXN_TEST_THREAD_COUNT) \
+		"$(PESSIMISTIC_TXN_TEST_FILTER)"
 
 # Run storage regression tests (ported RocksDB-style suites)
 storage-test:
-	./scripts/run_with_timeout.sh $(STORAGE_TEST_TIMEOUT_SECS) cargo test --test rocksdb_ported_tests
-	./scripts/run_with_timeout.sh $(COMPACTION_BATCH_TIMEOUT_SECS) \
-		cargo test --test rocksdb_ported_compaction_tests -- --test-threads=1 \
-		--skip test_compaction_scheduler_automatic \
-		--skip test_multi_level_cascading \
-		--skip test_multi_level_delete_reinsert_compaction_correctness
+	./scripts/run_integration_test_cases.sh \
+		$(STORAGE_TEST_TIMEOUT_SECS) \
+		rocksdb_ported_tests \
+		$(STORAGE_TEST_THREAD_COUNT)
+	./scripts/run_integration_test_cases.sh \
+		$(COMPACTION_BATCH_TIMEOUT_SECS) \
+		rocksdb_ported_compaction_tests \
+		$(STORAGE_TEST_THREAD_COUNT) \
+		"" \
+		"test_compaction_scheduler_automatic,test_multi_level_cascading,test_multi_level_delete_reinsert_compaction_correctness"
 	./scripts/run_with_timeout.sh $(COMPACTION_CASE_TIMEOUT_SECS) \
-		cargo test --test rocksdb_ported_compaction_tests test_compaction_scheduler_automatic -- --test-threads=1
+		cargo test --test rocksdb_ported_compaction_tests test_compaction_scheduler_automatic -- --exact --test-threads=$(STORAGE_TEST_THREAD_COUNT)
 	./scripts/run_with_timeout.sh $(COMPACTION_CASE_TIMEOUT_SECS) \
-		cargo test --test rocksdb_ported_compaction_tests test_multi_level_cascading -- --test-threads=1
+		cargo test --test rocksdb_ported_compaction_tests test_multi_level_cascading -- --exact --test-threads=$(STORAGE_TEST_THREAD_COUNT)
 	./scripts/run_with_timeout.sh $(COMPACTION_CASE_TIMEOUT_SECS) \
-		cargo test --test rocksdb_ported_compaction_tests test_multi_level_delete_reinsert_compaction_correctness -- --test-threads=1
+		cargo test --test rocksdb_ported_compaction_tests test_multi_level_delete_reinsert_compaction_correctness -- --exact --test-threads=$(STORAGE_TEST_THREAD_COUNT)
 
 # Run failpoint crash-recovery tests (opt-in; requires feature flag)
 failpoint-test:

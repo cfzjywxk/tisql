@@ -21,7 +21,14 @@ if [[ ! "$thread_count" =~ ^[1-9][0-9]*$ ]]; then
     exit 2
 fi
 
-list_output="$(cargo test --test store_test -- --list)"
+discover_timeout_secs="$timeout_secs"
+if (( discover_timeout_secs > 120 )); then
+    discover_timeout_secs=120
+fi
+
+list_output="$(
+    ./scripts/run_with_timeout.sh "$discover_timeout_secs" cargo test --test store_test -- --list
+)"
 mapfile -t test_names < <(printf '%s\n' "$list_output" | sed -n 's/^\(.*\): test$/\1/p')
 
 if [[ ${#test_names[@]} -eq 0 ]]; then
@@ -70,5 +77,5 @@ for case_name in "${sorted_persistence[@]}"; do
     echo "Running store_test persistence case: $case_name"
     ./scripts/run_with_timeout.sh "$timeout_secs" \
         env RUST_LOG="$log_level" cargo test --test store_test "$case_name" -- \
-        --test-threads="$thread_count" --nocapture
+        --exact --test-threads="$thread_count" --nocapture
 done
