@@ -360,6 +360,30 @@ impl MemTable {
         Ok(())
     }
 
+    /// Borrowed-value variant of `put_pending`.
+    pub fn put_pending_ref(
+        &self,
+        key: &[u8],
+        value: &[u8],
+        owner_start_ts: crate::catalog::types::Timestamp,
+    ) -> std::result::Result<(), PessimisticWriteError> {
+        if self.is_frozen() {
+            // Frozen memtables cannot accept new writes
+            return Err(PessimisticWriteError::WriteStall { delay: None });
+        }
+        let value_len = value.len();
+        let created = self
+            .inner
+            .put_pending_counted_ref(key, value, owner_start_ts)
+            .map_err(PessimisticWriteError::LockConflict)?;
+        if created {
+            self.pending_count.fetch_add(1, Ordering::AcqRel);
+            self.approximate_size
+                .fetch_add(estimate_entry_size(key.len(), value_len), Ordering::Relaxed);
+        }
+        Ok(())
+    }
+
     fn dec_pending_count(&self, resolved: usize) {
         if resolved == 0 {
             return;

@@ -894,7 +894,7 @@ async fn lock_key_if_explicit<T: TxnService>(
     txn_service: &T,
     ctx: &mut TxnCtx,
     table_id: TableId,
-    key: Key,
+    key: &[u8],
 ) -> Result<()> {
     if ctx.is_explicit() {
         txn_service.lock_key(ctx, table_id, key).await?;
@@ -1542,7 +1542,7 @@ impl SimpleExecutor {
                     // Check for duplicate primary key
                     if txn_service.get(ctx, table.id(), &key).await?.is_some() {
                         if ignore {
-                            txn_service.lock_key(ctx, table.id(), key).await?;
+                            txn_service.lock_key(ctx, table.id(), &key).await?;
                             continue;
                         }
                         let pk_desc = if pk_indices.is_empty() {
@@ -1563,7 +1563,7 @@ impl SimpleExecutor {
                     let value = encode_row(&col_ids, &row_values);
 
                     // Buffer write in transaction
-                    txn_service.put(ctx, table.id(), key, value).await?;
+                    txn_service.put(ctx, table.id(), &key, value).await?;
                     count += 1;
                 }
 
@@ -1586,10 +1586,10 @@ impl SimpleExecutor {
                             let values = decode_row_to_values(&value, &col_ids, &data_types)?;
                             let row = Row::new(values);
                             if row_matches_filter(filter.as_ref(), &row)? {
-                                txn_service.delete(ctx, table_id, key).await?;
+                                txn_service.delete(ctx, table_id, &key).await?;
                                 count += 1;
                             } else {
-                                txn_service.lock_key(ctx, table_id, key).await?;
+                                txn_service.lock_key(ctx, table_id, &key).await?;
                             }
                         }
                     }
@@ -1607,10 +1607,10 @@ impl SimpleExecutor {
                             for (key, values) in scanned_rows {
                                 let row = Row::new(values);
                                 if row_matches_filter(filter.as_ref(), &row)? {
-                                    txn_service.delete(ctx, table_id, key).await?;
+                                    txn_service.delete(ctx, table_id, &key).await?;
                                     count += 1;
                                 } else {
-                                    txn_service.lock_key(ctx, table_id, key).await?;
+                                    txn_service.lock_key(ctx, table_id, &key).await?;
                                 }
                             }
                         } else {
@@ -1622,13 +1622,12 @@ impl SimpleExecutor {
                                     decode_row_to_values(iter.value(), &col_ids, &data_types)?;
                                 let row = Row::new(values);
                                 if row_matches_filter(filter.as_ref(), &row)? {
-                                    txn_service.delete(ctx, table_id, key.to_vec()).await?;
+                                    txn_service.delete(ctx, table_id, key).await?;
                                     count += 1;
                                 } else {
                                     // In implicit autocommit this is a no-op; keep the helper
                                     // for defensive consistency with explicit paths.
-                                    lock_key_if_explicit(txn_service, ctx, table_id, key.to_vec())
-                                        .await?;
+                                    lock_key_if_explicit(txn_service, ctx, table_id, key).await?;
                                 }
                                 iter.advance().await?;
                             }
@@ -1680,25 +1679,30 @@ impl SimpleExecutor {
                                     row.set(col_idx, new_value);
                                 }
 
-                                let new_key = if pk_indices.is_empty() || !pk_assigned {
-                                    key.clone()
+                                let maybe_new_key = if pk_indices.is_empty() || !pk_assigned {
+                                    None
                                 } else {
                                     let pk_values: Vec<_> = pk_indices
                                         .iter()
                                         .map(|&i| row.get(i).cloned().unwrap_or(Value::Null))
                                         .collect();
-                                    encode_key(table_id, &encode_pk(&pk_values))
+                                    Some(encode_key(table_id, &encode_pk(&pk_values)))
                                 };
+                                let target_key = maybe_new_key.as_deref().unwrap_or(&key);
+                                let key_changed = maybe_new_key
+                                    .as_ref()
+                                    .is_some_and(|new_key| new_key.as_slice() != key.as_slice());
 
                                 let row_unchanged =
-                                    new_key == key && row.values() == original_values.as_slice();
+                                    !key_changed && row.values() == original_values.as_slice();
                                 if row_unchanged {
-                                    txn_service.lock_key(ctx, table_id, key.clone()).await?;
+                                    txn_service.lock_key(ctx, table_id, &key).await?;
                                 } else {
-                                    if pk_assigned
-                                        && !pk_indices.is_empty()
-                                        && new_key != key
-                                        && txn_service.get(ctx, table_id, &new_key).await?.is_some()
+                                    if key_changed
+                                        && txn_service
+                                            .get(ctx, table_id, target_key)
+                                            .await?
+                                            .is_some()
                                     {
                                         let pk_values: Vec<_> = pk_indices
                                             .iter()
@@ -1710,15 +1714,17 @@ impl SimpleExecutor {
                                         )));
                                     }
 
-                                    if pk_assigned && !pk_indices.is_empty() && new_key != key {
-                                        txn_service.delete(ctx, table_id, key.clone()).await?;
+                                    if key_changed {
+                                        txn_service.delete(ctx, table_id, &key).await?;
                                     }
                                     let new_value = encode_row(&col_ids, row.values());
-                                    txn_service.put(ctx, table_id, new_key, new_value).await?;
+                                    txn_service
+                                        .put(ctx, table_id, target_key, new_value)
+                                        .await?;
                                 }
                                 count += 1;
                             } else {
-                                txn_service.lock_key(ctx, table_id, key).await?;
+                                txn_service.lock_key(ctx, table_id, &key).await?;
                             }
                         }
                     }
@@ -1749,34 +1755,33 @@ impl SimpleExecutor {
                                         row.set(col_idx, new_value);
                                     }
 
-                                    let new_key = if pk_indices.is_empty() || !pk_assigned {
-                                        old_key.clone()
+                                    let maybe_new_key = if pk_indices.is_empty() || !pk_assigned {
+                                        None
                                     } else {
                                         let pk_values: Vec<_> = pk_indices
                                             .iter()
                                             .map(|&i| row.get(i).cloned().unwrap_or(Value::Null))
                                             .collect();
-                                        encode_key(table_id, &encode_pk(&pk_values))
+                                        Some(encode_key(table_id, &encode_pk(&pk_values)))
                                     };
+                                    let target_key =
+                                        maybe_new_key.as_deref().unwrap_or(old_key.as_slice());
+                                    let key_changed =
+                                        maybe_new_key.as_ref().is_some_and(|new_key| {
+                                            new_key.as_slice() != old_key.as_slice()
+                                        });
 
-                                    let row_unchanged = new_key == old_key
-                                        && row.values() == original_values.as_slice();
+                                    let row_unchanged =
+                                        !key_changed && row.values() == original_values.as_slice();
                                     if row_unchanged {
                                         // In implicit autocommit this is a no-op; keep the helper
                                         // for defensive consistency with explicit paths.
-                                        lock_key_if_explicit(
-                                            txn_service,
-                                            ctx,
-                                            table_id,
-                                            old_key.clone(),
-                                        )
-                                        .await?;
+                                        lock_key_if_explicit(txn_service, ctx, table_id, &old_key)
+                                            .await?;
                                     } else {
-                                        if pk_assigned
-                                            && !pk_indices.is_empty()
-                                            && new_key != old_key
+                                        if key_changed
                                             && txn_service
-                                                .get(ctx, table_id, &new_key)
+                                                .get(ctx, table_id, target_key)
                                                 .await?
                                                 .is_some()
                                         {
@@ -1792,21 +1797,18 @@ impl SimpleExecutor {
                                             )));
                                         }
 
-                                        if pk_assigned
-                                            && !pk_indices.is_empty()
-                                            && new_key != old_key
-                                        {
-                                            txn_service
-                                                .delete(ctx, table_id, old_key.clone())
-                                                .await?;
+                                        if key_changed {
+                                            txn_service.delete(ctx, table_id, &old_key).await?;
                                         }
 
                                         let new_value = encode_row(&col_ids, row.values());
-                                        txn_service.put(ctx, table_id, new_key, new_value).await?;
+                                        txn_service
+                                            .put(ctx, table_id, target_key, new_value)
+                                            .await?;
                                     }
                                     count += 1;
                                 } else {
-                                    txn_service.lock_key(ctx, table_id, old_key).await?;
+                                    txn_service.lock_key(ctx, table_id, &old_key).await?;
                                 }
                             }
                         } else {
@@ -1831,29 +1833,28 @@ impl SimpleExecutor {
                                         row.set(col_idx, new_value);
                                     }
 
-                                    let old_key = key_ref.to_vec();
-                                    let new_key = if pk_indices.is_empty() || !pk_assigned {
-                                        old_key.clone()
+                                    let maybe_new_key = if pk_indices.is_empty() || !pk_assigned {
+                                        None
                                     } else {
                                         let pk_values: Vec<_> = pk_indices
                                             .iter()
                                             .map(|&i| row.get(i).cloned().unwrap_or(Value::Null))
                                             .collect();
-                                        encode_key(table_id, &encode_pk(&pk_values))
+                                        Some(encode_key(table_id, &encode_pk(&pk_values)))
                                     };
+                                    let target_key = maybe_new_key.as_deref().unwrap_or(key_ref);
+                                    let key_changed = maybe_new_key
+                                        .as_ref()
+                                        .is_some_and(|new_key| new_key.as_slice() != key_ref);
 
-                                    let row_unchanged = new_key == old_key
-                                        && row.values() == original_values.as_slice();
+                                    let row_unchanged =
+                                        !key_changed && row.values() == original_values.as_slice();
                                     if row_unchanged {
-                                        txn_service
-                                            .lock_key(ctx, table_id, old_key.clone())
-                                            .await?;
+                                        txn_service.lock_key(ctx, table_id, key_ref).await?;
                                     } else {
-                                        if pk_assigned
-                                            && !pk_indices.is_empty()
-                                            && new_key != old_key
+                                        if key_changed
                                             && txn_service
-                                                .get(ctx, table_id, &new_key)
+                                                .get(ctx, table_id, target_key)
                                                 .await?
                                                 .is_some()
                                         {
@@ -1869,29 +1870,21 @@ impl SimpleExecutor {
                                             )));
                                         }
 
-                                        if pk_assigned
-                                            && !pk_indices.is_empty()
-                                            && new_key != old_key
-                                        {
-                                            txn_service
-                                                .delete(ctx, table_id, old_key.clone())
-                                                .await?;
+                                        if key_changed {
+                                            txn_service.delete(ctx, table_id, key_ref).await?;
                                         }
 
                                         let new_value = encode_row(&col_ids, row.values());
-                                        txn_service.put(ctx, table_id, new_key, new_value).await?;
+                                        txn_service
+                                            .put(ctx, table_id, target_key, new_value)
+                                            .await?;
                                     }
                                     count += 1;
                                 } else {
                                     // In implicit autocommit this is a no-op; keep the helper
                                     // for defensive consistency with explicit paths.
-                                    lock_key_if_explicit(
-                                        txn_service,
-                                        ctx,
-                                        table_id,
-                                        key_ref.to_vec(),
-                                    )
-                                    .await?;
+                                    lock_key_if_explicit(txn_service, ctx, table_id, key_ref)
+                                        .await?;
                                 }
                                 iter.advance().await?;
                             }
@@ -2008,7 +2001,7 @@ mod tests {
             &'a self,
             _ctx: &'a mut TxnCtx,
             table_id: TableId,
-            _key: Vec<u8>,
+            _key: &'a [u8],
             _value: RawValue,
         ) -> Result<()> {
             assert_eq!(table_id, self.table_id);
@@ -2020,7 +2013,7 @@ mod tests {
             &'a self,
             _ctx: &'a mut TxnCtx,
             table_id: TableId,
-            _key: Vec<u8>,
+            _key: &'a [u8],
         ) -> Result<()> {
             assert_eq!(table_id, self.table_id);
             self.delete_calls.fetch_add(1, Ordering::SeqCst);
@@ -2031,7 +2024,7 @@ mod tests {
             &'a self,
             _ctx: &'a mut TxnCtx,
             table_id: TableId,
-            _key: Vec<u8>,
+            _key: &'a [u8],
         ) -> Result<()> {
             assert_eq!(table_id, self.table_id);
             self.lock_calls.fetch_add(1, Ordering::SeqCst);
@@ -2149,7 +2142,7 @@ mod tests {
             &'a self,
             _ctx: &'a mut TxnCtx,
             table_id: TableId,
-            _key: Vec<u8>,
+            _key: &'a [u8],
             _value: RawValue,
         ) -> Result<()> {
             assert_eq!(table_id, self.table_id);
@@ -2161,7 +2154,7 @@ mod tests {
             &'a self,
             _ctx: &'a mut TxnCtx,
             table_id: TableId,
-            _key: Vec<u8>,
+            _key: &'a [u8],
         ) -> Result<()> {
             assert_eq!(table_id, self.table_id);
             self.delete_calls.fetch_add(1, Ordering::SeqCst);
@@ -2172,7 +2165,7 @@ mod tests {
             &'a self,
             _ctx: &'a mut TxnCtx,
             table_id: TableId,
-            _key: Vec<u8>,
+            _key: &'a [u8],
         ) -> Result<()> {
             assert_eq!(table_id, self.table_id);
             self.lock_calls.fetch_add(1, Ordering::SeqCst);
@@ -2938,7 +2931,7 @@ mod tests {
         };
 
         let mut ctx = TxnCtx::new(61, 600, false);
-        lock_key_if_explicit(&service, &mut ctx, 606, b"k".to_vec())
+        lock_key_if_explicit(&service, &mut ctx, 606, b"k")
             .await
             .unwrap();
 
@@ -2960,7 +2953,7 @@ mod tests {
         };
 
         let mut ctx = TxnCtx::new_explicit(62, 601, false);
-        lock_key_if_explicit(&service, &mut ctx, 607, b"k".to_vec())
+        lock_key_if_explicit(&service, &mut ctx, 607, b"k")
             .await
             .unwrap();
 

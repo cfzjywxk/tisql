@@ -206,6 +206,16 @@ impl PessimisticStorage for RoutedTabletStorage {
         tablet.put_pending(key, value, owner_start_ts)
     }
 
+    fn put_pending_ref(
+        &self,
+        key: &[u8],
+        value: &[u8],
+        owner_start_ts: Timestamp,
+    ) -> std::result::Result<(), PessimisticWriteError> {
+        let (_, tablet) = self.resolve_key_tablet(key);
+        tablet.put_pending_ref(key, value, owner_start_ts)
+    }
+
     fn put_pending_on_tablet(
         &self,
         tablet_id: TabletId,
@@ -215,6 +225,17 @@ impl PessimisticStorage for RoutedTabletStorage {
     ) -> std::result::Result<(), PessimisticWriteError> {
         let (_, tablet) = self.resolve_mounted_tablet(tablet_id);
         tablet.put_pending(key, value, owner_start_ts)
+    }
+
+    fn put_pending_on_tablet_ref(
+        &self,
+        tablet_id: TabletId,
+        key: &[u8],
+        value: &[u8],
+        owner_start_ts: Timestamp,
+    ) -> std::result::Result<(), PessimisticWriteError> {
+        let (_, tablet) = self.resolve_mounted_tablet(tablet_id);
+        tablet.put_pending_ref(key, value, owner_start_ts)
     }
 
     fn get_lock_owner(&self, key: &[u8]) -> Option<Timestamp> {

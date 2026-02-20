@@ -61,6 +61,15 @@ pub(crate) enum MutationType {
     Lock,
 }
 
+/// Per-key mutation metadata tracked inside a transaction context.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct MutationMeta {
+    /// Logical mutation type for commit/rollback handling.
+    pub(crate) mutation_type: MutationType,
+    /// Tablet routing captured when the mutation was recorded.
+    pub(crate) tablet_id: TabletId,
+}
+
 /// Transaction state machine for OceanBase-style pessimistic locking.
 ///
 /// State transitions:
@@ -129,16 +138,12 @@ pub struct TxnCtx {
     /// Whether this is an explicit transaction (started with BEGIN).
     /// Explicit transactions use pessimistic locking.
     pub(crate) explicit: bool,
-    /// Keys mutated by this transaction, mapped to their mutation type.
-    /// Write keys have real data changes; Lock keys are pessimistic locks
-    /// on non-existent keys (skipped during clog persist).
-    /// BTreeMap ensures O(log n) insert/lookup and deterministic iteration order.
-    pub(crate) mutations: BTreeMap<Key, MutationType>,
-    /// Metadata-first routing map for mutated keys.
+    /// Keys mutated by this transaction with combined mutation metadata.
     ///
-    /// Upper layers may record route using table/index metadata so commit/abort
-    /// does not rely on key-prefix decode on the hot path.
-    pub(crate) mutation_tablets: BTreeMap<Key, TabletId>,
+    /// Write keys have real data changes; Lock keys are pessimistic locks on
+    /// non-existent keys (skipped during clog persist). Tablet routing is stored
+    /// in the same map to avoid duplicate key allocations.
+    pub(crate) mutations: BTreeMap<Key, MutationMeta>,
     /// Whether this transaction has been registered in the state cache.
     /// Registration happens on first write (put/delete) for implicit txns,
     /// or at begin_explicit() for explicit txns.
@@ -162,7 +167,6 @@ impl TxnCtx {
             read_only,
             explicit: false,
             mutations: BTreeMap::new(),
-            mutation_tablets: BTreeMap::new(),
             registered: false,
             schema_version: None,
             reserved_lsn: None,
@@ -181,7 +185,6 @@ impl TxnCtx {
             read_only,
             explicit: true,
             mutations: BTreeMap::new(),
-            mutation_tablets: BTreeMap::new(),
             registered: false,
             schema_version: None,
             reserved_lsn: None,
@@ -206,7 +209,6 @@ impl TxnCtx {
             read_only,
             explicit,
             mutations: BTreeMap::new(),
-            mutation_tablets: BTreeMap::new(),
             registered: false,
             schema_version: None,
             reserved_lsn: None,
@@ -381,7 +383,7 @@ pub trait TxnService: Send + Sync {
         &'a self,
         ctx: &'a mut TxnCtx,
         table_id: TableId,
-        key: Key,
+        key: &'a [u8],
         value: RawValue,
     ) -> impl Future<Output = Result<()>> + Send + 'a;
 
@@ -399,7 +401,7 @@ pub trait TxnService: Send + Sync {
         &'a self,
         ctx: &'a mut TxnCtx,
         table_id: TableId,
-        key: Key,
+        key: &'a [u8],
     ) -> impl Future<Output = Result<()>> + Send + 'a;
 
     /// Acquire a pessimistic lock marker on a key without changing user data.
@@ -410,7 +412,7 @@ pub trait TxnService: Send + Sync {
         &'a self,
         ctx: &'a mut TxnCtx,
         table_id: TableId,
-        key: Key,
+        key: &'a [u8],
     ) -> impl Future<Output = Result<()>> + Send + 'a;
 
     // === Finalization ===

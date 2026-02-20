@@ -514,6 +514,71 @@ impl MvccRow {
         }
     }
 
+    /// Borrowed-value variant of `prepend_pending`.
+    ///
+    /// Allocates only when we actually need to install/update a pending value.
+    /// Lock conflicts return before any value allocation.
+    fn prepend_pending_ref(
+        &self,
+        my_start_ts: Timestamp,
+        value: &[u8],
+    ) -> std::result::Result<bool, Timestamp> {
+        let mut owned_value: Option<RawValue> = None;
+        loop {
+            let current_head = self.head.load(Ordering::Acquire);
+
+            // Check for conflicts with existing pending writes
+            if !current_head.is_null() {
+                let head_node = unsafe { &*current_head };
+
+                // Skip aborted nodes - they don't conflict
+                if !head_node.is_aborted() {
+                    let owner = head_node.get_owner();
+                    if owner > 0 && owner != my_start_ts {
+                        // Key is locked by another transaction
+                        return Err(owner);
+                    }
+
+                    if owner == my_start_ts {
+                        // Same transaction writing again - update value in place
+                        let mut replacement = owned_value.take().unwrap_or_else(|| value.to_vec());
+                        let value_ptr = &head_node.value as *const RawValue as *mut RawValue;
+                        unsafe {
+                            std::ptr::swap(value_ptr, &mut replacement);
+                        }
+                        return Ok(false); // Updated in place, no new node
+                    }
+                }
+            }
+
+            // Create pending node lazily - allocate value bytes only when needed.
+            let mut new_node = VersionNode::new_pending(
+                my_start_ts,
+                owned_value.take().unwrap_or_else(|| value.to_vec()),
+            );
+            new_node.next = current_head;
+
+            let new_ptr = Box::into_raw(new_node);
+
+            match self.head.compare_exchange_weak(
+                current_head,
+                new_ptr,
+                Ordering::Release,
+                Ordering::Relaxed,
+            ) {
+                Ok(_) => {
+                    self.version_count.fetch_add(1, Ordering::Relaxed);
+                    return Ok(true); // New node created
+                }
+                Err(_) => {
+                    // CAS failed, retry with updated head and recovered value.
+                    let recovered_node = unsafe { Box::from_raw(new_ptr) };
+                    owned_value = Some(recovered_node.value);
+                }
+            }
+        }
+    }
+
     /// Delete for pessimistic transactions.
     ///
     /// Behavior:
@@ -778,23 +843,34 @@ impl VersionedMemTableEngine {
         Arc::clone(&self.lsn_provider)
     }
 
-    /// Internal put implementation.
+    /// Internal put implementation for borrowed keys.
     ///
-    /// Uses get_or_insert + prepend pattern for race-free concurrent insertion:
-    /// 1. get_or_insert atomically inserts an empty row if key doesn't exist
-    /// 2. prepend adds the version to whatever row we get (existing or new)
-    ///
-    /// This ensures no versions are lost even with concurrent inserts to same key.
+    /// Fast path probes first so existing keys avoid allocating a temporary
+    /// `Vec<u8>` on hot update paths.
+    #[cfg(test)]
     fn put_internal(&self, key: &[u8], value: RawValue, ts: Timestamp) {
-        // get_or_insert is atomic: returns existing entry or inserts new empty row
-        let entry = self
-            .inner
-            .index
-            .get_or_insert(key.to_vec(), MvccRow::new_empty());
-
-        // Prepend version to the row (works for both new and existing rows)
+        let entry = if let Some(entry) = self.inner.index.get(key) {
+            entry
+        } else {
+            self.inner
+                .index
+                .get_or_insert(key.to_vec(), MvccRow::new_empty())
+        };
         entry.value().prepend(ts, value);
+        self.inner.entry_count.fetch_add(1, Ordering::Relaxed);
+    }
 
+    /// Internal put implementation for owned keys.
+    ///
+    /// Used by `WriteBatch` so we can move keys straight into the skiplist
+    /// without a second key allocation in the write path.
+    fn put_internal_owned(&self, key: Key, value: RawValue, ts: Timestamp) {
+        let entry = if let Some(entry) = self.inner.index.get(key.as_slice()) {
+            entry
+        } else {
+            self.inner.index.get_or_insert(key, MvccRow::new_empty())
+        };
+        entry.value().prepend(ts, value);
         self.inner.entry_count.fetch_add(1, Ordering::Relaxed);
     }
 
@@ -815,12 +891,44 @@ impl VersionedMemTableEngine {
         value: RawValue,
         owner_start_ts: Timestamp,
     ) -> std::result::Result<bool, Timestamp> {
-        let entry = self
-            .inner
-            .index
-            .get_or_insert(key.to_vec(), MvccRow::new_empty());
+        let entry = if let Some(entry) = self.inner.index.get(key) {
+            entry
+        } else {
+            self.inner
+                .index
+                .get_or_insert(key.to_vec(), MvccRow::new_empty())
+        };
 
         match entry.value().prepend_pending(owner_start_ts, value) {
+            Ok(new_node_created) => {
+                if new_node_created {
+                    self.inner.entry_count.fetch_add(1, Ordering::Relaxed);
+                }
+                Ok(new_node_created)
+            }
+            Err(lock_owner) => Err(lock_owner),
+        }
+    }
+
+    /// Borrowed-value pending write path.
+    ///
+    /// This avoids caller-side clones in retry loops and only allocates value
+    /// bytes when the row can actually be updated/inserted.
+    pub fn put_pending_counted_ref(
+        &self,
+        key: &[u8],
+        value: &[u8],
+        owner_start_ts: Timestamp,
+    ) -> std::result::Result<bool, Timestamp> {
+        let entry = if let Some(entry) = self.inner.index.get(key) {
+            entry
+        } else {
+            self.inner
+                .index
+                .get_or_insert(key.to_vec(), MvccRow::new_empty())
+        };
+
+        match entry.value().prepend_pending_ref(owner_start_ts, value) {
             Ok(new_node_created) => {
                 if new_node_created {
                     self.inner.entry_count.fetch_add(1, Ordering::Relaxed);
@@ -839,6 +947,17 @@ impl VersionedMemTableEngine {
         owner_start_ts: Timestamp,
     ) -> std::result::Result<(), Timestamp> {
         self.put_pending_counted(key, value, owner_start_ts)
+            .map(|_| ())
+    }
+
+    /// Borrowed-value variant of `put_pending`.
+    pub fn put_pending_ref(
+        &self,
+        key: &[u8],
+        value: &[u8],
+        owner_start_ts: Timestamp,
+    ) -> std::result::Result<(), Timestamp> {
+        self.put_pending_counted_ref(key, value, owner_start_ts)
             .map(|_| ())
     }
 
@@ -1072,6 +1191,16 @@ impl PessimisticStorage for VersionedMemTableEngine {
             .map_err(PessimisticWriteError::LockConflict)
     }
 
+    fn put_pending_ref(
+        &self,
+        key: &[u8],
+        value: &[u8],
+        owner_start_ts: Timestamp,
+    ) -> std::result::Result<(), PessimisticWriteError> {
+        VersionedMemTableEngine::put_pending_ref(self, key, value, owner_start_ts)
+            .map_err(PessimisticWriteError::LockConflict)
+    }
+
     fn get_lock_owner(&self, key: &[u8]) -> Option<Timestamp> {
         // Delegate to the inherent method
         VersionedMemTableEngine::get_lock_owner(self, key)
@@ -1134,10 +1263,10 @@ impl VersionedMemTableEngine {
         for (key, op) in batch.into_iter() {
             match op {
                 WriteOp::Put { value } => {
-                    self.put_internal(&key, value, commit_ts);
+                    self.put_internal_owned(key, value, commit_ts);
                 }
                 WriteOp::Delete => {
-                    self.put_internal(&key, TOMBSTONE.to_vec(), commit_ts);
+                    self.put_internal_owned(key, TOMBSTONE.to_vec(), commit_ts);
                 }
             }
         }

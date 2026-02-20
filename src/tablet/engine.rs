@@ -3448,6 +3448,29 @@ impl PessimisticStorage for LsmEngine {
         }
     }
 
+    fn put_pending_ref(
+        &self,
+        key: &[u8],
+        value: &[u8],
+        owner_start_ts: Timestamp,
+    ) -> std::result::Result<(), PessimisticWriteError> {
+        self.pending_write_pressure_status()?;
+
+        // Keep the read lock scope minimal and drop it before maybe_rotate().
+        let write_result = {
+            let state = self.state.read();
+            state.active.put_pending_ref(key, value, owner_start_ts)
+        };
+
+        match write_result {
+            Ok(()) => {
+                let _ = self.maybe_rotate();
+                Ok(())
+            }
+            Err(err) => Err(err),
+        }
+    }
+
     fn get_lock_owner(&self, key: &[u8]) -> Option<Timestamp> {
         // Check active memtable first
         let state = self.state.read();

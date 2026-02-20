@@ -471,15 +471,15 @@ async fn test_implicit_multiple_puts_same_key() {
     // Start a transaction and put the same key multiple times
     let mut ctx = txn_service.begin(false).unwrap();
     txn_service
-        .put(&mut ctx, SYS_TABLE_ID, key.to_vec(), value1.to_vec())
+        .put(&mut ctx, SYS_TABLE_ID, key, value1.to_vec())
         .await
         .unwrap();
     txn_service
-        .put(&mut ctx, SYS_TABLE_ID, key.to_vec(), value2.to_vec())
+        .put(&mut ctx, SYS_TABLE_ID, key, value2.to_vec())
         .await
         .unwrap();
     txn_service
-        .put(&mut ctx, SYS_TABLE_ID, key.to_vec(), value3.to_vec())
+        .put(&mut ctx, SYS_TABLE_ID, key, value3.to_vec())
         .await
         .unwrap();
 
@@ -511,11 +511,11 @@ async fn test_implicit_put_then_delete() {
     // Start a transaction, put then delete
     let mut ctx = txn_service.begin(false).unwrap();
     txn_service
-        .put(&mut ctx, SYS_TABLE_ID, key.to_vec(), value.to_vec())
+        .put(&mut ctx, SYS_TABLE_ID, key, value.to_vec())
         .await
         .unwrap();
     txn_service
-        .delete(&mut ctx, SYS_TABLE_ID, key.to_vec())
+        .delete(&mut ctx, SYS_TABLE_ID, key)
         .await
         .unwrap();
 
@@ -543,12 +543,7 @@ async fn test_implicit_delete_then_put() {
     // First, insert an initial value
     let mut setup_ctx = txn_service.begin(false).unwrap();
     txn_service
-        .put(
-            &mut setup_ctx,
-            SYS_TABLE_ID,
-            key.to_vec(),
-            b"initial".to_vec(),
-        )
+        .put(&mut setup_ctx, SYS_TABLE_ID, key, b"initial".to_vec())
         .await
         .unwrap();
     txn_service.commit(setup_ctx).await.unwrap();
@@ -556,11 +551,11 @@ async fn test_implicit_delete_then_put() {
     // Start a new transaction, delete then put
     let mut ctx = txn_service.begin(false).unwrap();
     txn_service
-        .delete(&mut ctx, SYS_TABLE_ID, key.to_vec())
+        .delete(&mut ctx, SYS_TABLE_ID, key)
         .await
         .unwrap();
     txn_service
-        .put(&mut ctx, SYS_TABLE_ID, key.to_vec(), value.to_vec())
+        .put(&mut ctx, SYS_TABLE_ID, key, value.to_vec())
         .await
         .unwrap();
 
@@ -589,27 +584,27 @@ async fn test_implicit_dedup_commit() {
 
     // Key "a" - multiple puts, last should win
     txn_service
-        .put(&mut ctx, SYS_TABLE_ID, b"a".to_vec(), b"a1".to_vec())
+        .put(&mut ctx, SYS_TABLE_ID, b"a", b"a1".to_vec())
         .await
         .unwrap();
     txn_service
-        .put(&mut ctx, SYS_TABLE_ID, b"a".to_vec(), b"a2".to_vec())
+        .put(&mut ctx, SYS_TABLE_ID, b"a", b"a2".to_vec())
         .await
         .unwrap();
 
     // Key "b" - put then delete, should be absent
     txn_service
-        .put(&mut ctx, SYS_TABLE_ID, b"b".to_vec(), b"b1".to_vec())
+        .put(&mut ctx, SYS_TABLE_ID, b"b", b"b1".to_vec())
         .await
         .unwrap();
     txn_service
-        .delete(&mut ctx, SYS_TABLE_ID, b"b".to_vec())
+        .delete(&mut ctx, SYS_TABLE_ID, b"b")
         .await
         .unwrap();
 
     // Key "c" - single put
     txn_service
-        .put(&mut ctx, SYS_TABLE_ID, b"c".to_vec(), b"c1".to_vec())
+        .put(&mut ctx, SYS_TABLE_ID, b"c", b"c1".to_vec())
         .await
         .unwrap();
 

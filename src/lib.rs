@@ -144,7 +144,7 @@ pub mod testkit {
         async fn autocommit_put(&self, key: &[u8], value: &[u8]) -> Result<CommitInfo> {
             let mut ctx = self.begin(false)?;
             match self
-                .put(&mut ctx, ALL_META_TABLE_ID, key.to_vec(), value.to_vec())
+                .put(&mut ctx, ALL_META_TABLE_ID, key, value.to_vec())
                 .await
             {
                 Ok(()) => self.commit(ctx).await,
@@ -157,7 +157,7 @@ pub mod testkit {
 
         async fn autocommit_delete(&self, key: &[u8]) -> Result<CommitInfo> {
             let mut ctx = self.begin(false)?;
-            match self.delete(&mut ctx, ALL_META_TABLE_ID, key.to_vec()).await {
+            match self.delete(&mut ctx, ALL_META_TABLE_ID, key).await {
                 Ok(()) => self.commit(ctx).await,
                 Err(e) => {
                     let _ = self.rollback(ctx);
@@ -2168,11 +2168,11 @@ mod tests {
 
         let mut writer = db.txn_service.begin_explicit(false).unwrap();
         db.txn_service
-            .put(&mut writer, table1, key1.clone(), b"v1".to_vec())
+            .put(&mut writer, table1, &key1, b"v1".to_vec())
             .await
             .unwrap();
         db.txn_service
-            .put(&mut writer, table2, key2.clone(), b"v2".to_vec())
+            .put(&mut writer, table2, &key2, b"v2".to_vec())
             .await
             .unwrap();
 
@@ -2233,20 +2233,20 @@ mod tests {
 
         let mut txn1 = db.txn_service.begin_explicit(false).unwrap();
         db.txn_service
-            .put(&mut txn1, table1, key1.clone(), b"owner1".to_vec())
+            .put(&mut txn1, table1, &key1, b"owner1".to_vec())
             .await
             .unwrap();
 
         let mut txn2 = db.txn_service.begin_explicit(false).unwrap();
         db.txn_service
-            .put(&mut txn2, table2, key2.clone(), b"owner2".to_vec())
+            .put(&mut txn2, table2, &key2, b"owner2".to_vec())
             .await
             .unwrap();
 
         let mut txn3 = db.txn_service.begin_explicit(false).unwrap();
         let conflict = db
             .txn_service
-            .put(&mut txn3, table1, key1.clone(), b"conflict".to_vec())
+            .put(&mut txn3, table1, &key1, b"conflict".to_vec())
             .await;
         assert!(matches!(
             conflict,
@@ -2284,11 +2284,11 @@ mod tests {
 
         let mut ctx = db.txn_service.begin_explicit(false).unwrap();
         db.txn_service
-            .put(&mut ctx, table1, key1.clone(), b"t1_val".to_vec())
+            .put(&mut ctx, table1, &key1, b"t1_val".to_vec())
             .await
             .unwrap();
         db.txn_service
-            .put(&mut ctx, table2, key2.clone(), b"t2_val".to_vec())
+            .put(&mut ctx, table2, &key2, b"t2_val".to_vec())
             .await
             .unwrap();
         db.txn_service.commit(ctx).await.unwrap();
@@ -2344,11 +2344,11 @@ mod tests {
 
         let mut ctx = db.txn_service.begin_explicit(false).unwrap();
         db.txn_service
-            .put(&mut ctx, table1, key1.clone(), b"rb_v1".to_vec())
+            .put(&mut ctx, table1, &key1, b"rb_v1".to_vec())
             .await
             .unwrap();
         db.txn_service
-            .put(&mut ctx, table2, key2.clone(), b"rb_v2".to_vec())
+            .put(&mut ctx, table2, &key2, b"rb_v2".to_vec())
             .await
             .unwrap();
         db.txn_service.rollback(ctx).unwrap();
@@ -2403,11 +2403,11 @@ mod tests {
 
         let mut ctx = db.txn_service.begin_explicit(false).unwrap();
         db.txn_service
-            .put(&mut ctx, table1, key1.clone(), b"ryw_v1".to_vec())
+            .put(&mut ctx, table1, &key1, b"ryw_v1".to_vec())
             .await
             .unwrap();
         db.txn_service
-            .put(&mut ctx, table2, key2.clone(), b"ryw_v2".to_vec())
+            .put(&mut ctx, table2, &key2, b"ryw_v2".to_vec())
             .await
             .unwrap();
 
@@ -2454,11 +2454,11 @@ mod tests {
         // Writer txn
         let mut writer = db.txn_service.begin_explicit(false).unwrap();
         db.txn_service
-            .put(&mut writer, table1, key1.clone(), b"si_v1".to_vec())
+            .put(&mut writer, table1, &key1, b"si_v1".to_vec())
             .await
             .unwrap();
         db.txn_service
-            .put(&mut writer, table2, key2.clone(), b"si_v2".to_vec())
+            .put(&mut writer, table2, &key2, b"si_v2".to_vec())
             .await
             .unwrap();
 
@@ -2527,11 +2527,11 @@ mod tests {
 
         let mut ctx = db.txn_service.begin_explicit(false).unwrap();
         db.txn_service
-            .put(&mut ctx, table1, key1.clone(), b"lsn_v1".to_vec())
+            .put(&mut ctx, table1, &key1, b"lsn_v1".to_vec())
             .await
             .unwrap();
         db.txn_service
-            .put(&mut ctx, table2, key2.clone(), b"lsn_v2".to_vec())
+            .put(&mut ctx, table2, &key2, b"lsn_v2".to_vec())
             .await
             .unwrap();
         let info = db.txn_service.commit(ctx).await.unwrap();
@@ -2596,11 +2596,11 @@ mod tests {
 
         let mut ctx = db.txn_service.begin_explicit(false).unwrap();
         db.txn_service
-            .put(&mut ctx, table1, key1, b"r_v1".to_vec())
+            .put(&mut ctx, table1, &key1, b"r_v1".to_vec())
             .await
             .unwrap();
         db.txn_service
-            .put(&mut ctx, table2, key2, b"r_v2".to_vec())
+            .put(&mut ctx, table2, &key2, b"r_v2".to_vec())
             .await
             .unwrap();
         db.txn_service.commit(ctx).await.unwrap();
@@ -2622,7 +2622,7 @@ mod tests {
         );
     }
 
-    /// T3.5 (QA): mutation_tablets properly records tablet routing from metadata-first put.
+    /// T3.5 (QA): mutation metadata properly records tablet routing from metadata-first put.
     /// After writes via put, the commit path should use grouped operations.
     #[tokio::test]
     async fn test_qa_phase3_mutation_tablets_recording() {
@@ -2649,30 +2649,30 @@ mod tests {
 
         let mut ctx = db.txn_service.begin_explicit(false).unwrap();
         db.txn_service
-            .put(&mut ctx, table1, key1.clone(), b"mv1".to_vec())
+            .put(&mut ctx, table1, &key1, b"mv1".to_vec())
             .await
             .unwrap();
         db.txn_service
-            .put(&mut ctx, table1, key1b.clone(), b"mv1b".to_vec())
+            .put(&mut ctx, table1, &key1b, b"mv1b".to_vec())
             .await
             .unwrap();
         db.txn_service
-            .put(&mut ctx, table2, key2.clone(), b"mv2".to_vec())
+            .put(&mut ctx, table2, &key2, b"mv2".to_vec())
             .await
             .unwrap();
 
-        // Verify mutation_tablets has entries for all keys
-        assert_eq!(ctx.mutation_tablets.len(), 3);
+        // Verify mutation metadata has entries for all keys
+        assert_eq!(ctx.mutations.len(), 3);
         assert_eq!(
-            ctx.mutation_tablets.get(&key1).copied(),
+            ctx.mutations.get(&key1).map(|meta| meta.tablet_id),
             Some(TabletId::Table { table_id: table1 })
         );
         assert_eq!(
-            ctx.mutation_tablets.get(&key1b).copied(),
+            ctx.mutations.get(&key1b).map(|meta| meta.tablet_id),
             Some(TabletId::Table { table_id: table1 })
         );
         assert_eq!(
-            ctx.mutation_tablets.get(&key2).copied(),
+            ctx.mutations.get(&key2).map(|meta| meta.tablet_id),
             Some(TabletId::Table { table_id: table2 })
         );
 

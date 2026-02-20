@@ -515,6 +515,19 @@ pub trait PessimisticStorage: StorageEngine {
         owner_start_ts: Timestamp,
     ) -> std::result::Result<(), PessimisticWriteError>;
 
+    /// Borrowed-value pending write path.
+    ///
+    /// This avoids caller-side cloning on retry loops. Implementations can
+    /// allocate only when a write actually proceeds.
+    fn put_pending_ref(
+        &self,
+        key: &[u8],
+        value: &[u8],
+        owner_start_ts: Timestamp,
+    ) -> std::result::Result<(), PessimisticWriteError> {
+        self.put_pending(key, value.to_vec(), owner_start_ts)
+    }
+
     /// Metadata-first pending write path for callers that already know target tablet.
     fn put_pending_on_tablet(
         &self,
@@ -524,6 +537,17 @@ pub trait PessimisticStorage: StorageEngine {
         owner_start_ts: Timestamp,
     ) -> std::result::Result<(), PessimisticWriteError> {
         self.put_pending(key, value, owner_start_ts)
+    }
+
+    /// Metadata-first borrowed-value pending write path.
+    fn put_pending_on_tablet_ref(
+        &self,
+        _tablet_id: router::TabletId,
+        key: &[u8],
+        value: &[u8],
+        owner_start_ts: Timestamp,
+    ) -> std::result::Result<(), PessimisticWriteError> {
+        self.put_pending_ref(key, value, owner_start_ts)
     }
 
     /// Check if a key is locked by a pending write.

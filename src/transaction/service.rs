@@ -28,7 +28,7 @@ use crate::clog::{ClogEntry, ClogOp, ClogOpRef, ClogService};
 use crate::tso::TsoService;
 use crate::util::error::{Result, TiSqlError};
 
-use super::api::{CommitInfo, MutationType, TxnCtx, TxnService, TxnState};
+use super::api::{CommitInfo, MutationMeta, MutationType, TxnCtx, TxnService, TxnState};
 use super::concurrency::ConcurrencyManager;
 use crate::catalog::types::{Key, RawValue, TableId, Timestamp, TxnId};
 use crate::inner_table::core_tables::USER_TABLE_ID_START;
@@ -137,12 +137,13 @@ impl<S: StorageEngine, L: ClogService, T: TsoService> TransactionService<S, L, T
     /// Write a pending value and retry when storage requests slowdown delay.
     ///
     /// This keeps storage trait methods synchronous while ensuring async callers
-    /// can apply `tokio::time::sleep` for backpressure hints.
+    /// can apply `tokio::time::sleep` for backpressure hints, and uses a borrowed
+    /// value slice so retry loops do not force caller-side cloning.
     async fn put_pending_with_retry(
         &self,
         tablet_id: TabletId,
         key: &[u8],
-        value: RawValue,
+        value: &[u8],
         owner_start_ts: Timestamp,
     ) -> std::result::Result<(), PessimisticWriteError>
     where
@@ -155,7 +156,7 @@ impl<S: StorageEngine, L: ClogService, T: TsoService> TransactionService<S, L, T
         loop {
             let result =
                 self.storage
-                    .put_pending_on_tablet(tablet_id, key, value.clone(), owner_start_ts);
+                    .put_pending_on_tablet_ref(tablet_id, key, value, owner_start_ts);
 
             match result {
                 Ok(()) => return Ok(()),
@@ -296,48 +297,40 @@ impl<S: StorageEngine, L: ClogService, T: TsoService> TransactionService<S, L, T
         Ok(())
     }
 
-    fn group_mutation_keys_by_tablet(
-        mutations: &BTreeMap<Key, MutationType>,
-        mutation_tablets: &BTreeMap<Key, TabletId>,
-    ) -> Result<GroupedTabletKeys> {
+    fn group_owned_mutation_keys_by_tablet(
+        mutations: BTreeMap<Key, MutationMeta>,
+    ) -> GroupedTabletKeys {
         let mut grouped: BTreeMap<TabletId, Vec<Key>> = BTreeMap::new();
-        for key in mutations.keys() {
-            let tablet_id = mutation_tablets.get(key).copied().ok_or_else(|| {
-                TiSqlError::Internal(format!(
-                    "Missing tablet routing metadata for mutation key (len={}): use metadata-first write APIs",
-                    key.len()
-                ))
-            })?;
-            grouped.entry(tablet_id).or_default().push(key.clone());
+        for (key, mutation_meta) in mutations {
+            grouped
+                .entry(mutation_meta.tablet_id)
+                .or_default()
+                .push(key);
         }
-        Ok(grouped.into_iter().collect())
+        grouped.into_iter().collect()
     }
 
-    fn group_mutation_keys_by_tablet_and_type(
-        mutations: &BTreeMap<Key, MutationType>,
-        mutation_tablets: &BTreeMap<Key, TabletId>,
-    ) -> Result<(GroupedTabletKeys, GroupedTabletKeys)> {
+    fn group_owned_mutation_keys_by_tablet_and_type(
+        mutations: BTreeMap<Key, MutationMeta>,
+    ) -> (GroupedTabletKeys, GroupedTabletKeys) {
         let mut write_grouped: BTreeMap<TabletId, Vec<Key>> = BTreeMap::new();
         let mut lock_grouped: BTreeMap<TabletId, Vec<Key>> = BTreeMap::new();
-        for (key, mutation_type) in mutations {
-            let tablet_id = mutation_tablets.get(key).copied().ok_or_else(|| {
-                TiSqlError::Internal(format!(
-                    "Missing tablet routing metadata for mutation key (len={}): use metadata-first write APIs",
-                    key.len()
-                ))
-            })?;
-            match mutation_type {
+        for (key, mutation_meta) in mutations {
+            match mutation_meta.mutation_type {
                 MutationType::Write => write_grouped
-                    .entry(tablet_id)
+                    .entry(mutation_meta.tablet_id)
                     .or_default()
-                    .push(key.clone()),
-                MutationType::Lock => lock_grouped.entry(tablet_id).or_default().push(key.clone()),
+                    .push(key),
+                MutationType::Lock => lock_grouped
+                    .entry(mutation_meta.tablet_id)
+                    .or_default()
+                    .push(key),
             }
         }
-        Ok((
+        (
             write_grouped.into_iter().collect(),
             lock_grouped.into_iter().collect(),
-        ))
+        )
     }
 }
 
@@ -422,7 +415,7 @@ impl<S: PessimisticStorage + 'static, L: ClogService + 'static, T: TsoService> T
         &self,
         ctx: &mut TxnCtx,
         table_id: TableId,
-        key: Key,
+        key: &[u8],
         value: RawValue,
     ) -> Result<()> {
         if ctx.state != TxnState::Running {
@@ -431,7 +424,7 @@ impl<S: PessimisticStorage + 'static, L: ClogService + 'static, T: TsoService> T
         if ctx.read_only {
             return Err(TiSqlError::ReadOnlyTransaction);
         }
-        Self::validate_table_target_key(table_id, &key, "TxnService::put")?;
+        Self::validate_table_target_key(table_id, key, "TxnService::put")?;
 
         // Register in state cache BEFORE writing pending node so concurrent readers
         // can always resolve our pending writes via TxnStateCache.
@@ -442,18 +435,24 @@ impl<S: PessimisticStorage + 'static, L: ClogService + 'static, T: TsoService> T
 
         let tablet_id = route_table_to_tablet(table_id);
         match self
-            .put_pending_with_retry(tablet_id, &key, value, ctx.start_ts)
+            .put_pending_with_retry(tablet_id, key, &value, ctx.start_ts)
             .await
         {
             Ok(()) => {
+                let key = key.to_vec();
                 // Single insert handles both: adding a new Write entry AND
                 // upgrading Lock→Write (overwrite) if key had a prior LOCK.
-                ctx.mutation_tablets.insert(key.clone(), tablet_id);
-                ctx.mutations.insert(key, MutationType::Write);
+                ctx.mutations.insert(
+                    key,
+                    MutationMeta {
+                        mutation_type: MutationType::Write,
+                        tablet_id,
+                    },
+                );
                 Ok(())
             }
             Err(PessimisticWriteError::LockConflict(lock_owner)) => Err(TiSqlError::KeyIsLocked {
-                key,
+                key: key.to_vec(),
                 lock_ts: lock_owner,
                 primary: vec![],
             }),
@@ -466,14 +465,14 @@ impl<S: PessimisticStorage + 'static, L: ClogService + 'static, T: TsoService> T
         }
     }
 
-    async fn delete(&self, ctx: &mut TxnCtx, table_id: TableId, key: Key) -> Result<()> {
+    async fn delete(&self, ctx: &mut TxnCtx, table_id: TableId, key: &[u8]) -> Result<()> {
         if ctx.state != TxnState::Running {
             return Err(TiSqlError::TransactionNotActive(format!("{:?}", ctx.state)));
         }
         if ctx.read_only {
             return Err(TiSqlError::ReadOnlyTransaction);
         }
-        Self::validate_table_target_key(table_id, &key, "TxnService::delete")?;
+        Self::validate_table_target_key(table_id, key, "TxnService::delete")?;
 
         // Register before writing pending (same reason as put()).
         if !ctx.registered {
@@ -487,24 +486,30 @@ impl<S: PessimisticStorage + 'static, L: ClogService + 'static, T: TsoService> T
         // This fixes put(k)+delete(k) on non-existing key: sees own pending put → TOMBSTONE.
         let value_exists = self
             .storage
-            .get_with_owner_on_tablet(tablet_id, &key, ctx.start_ts, ctx.start_ts)
+            .get_with_owner_on_tablet(tablet_id, key, ctx.start_ts, ctx.start_ts)
             .await
             .is_some();
 
         if value_exists {
             // Value exists (committed or own pending) → TOMBSTONE
             match self
-                .put_pending_with_retry(tablet_id, &key, TOMBSTONE.to_vec(), ctx.start_ts)
+                .put_pending_with_retry(tablet_id, key, TOMBSTONE, ctx.start_ts)
                 .await
             {
                 Ok(()) => {
-                    ctx.mutation_tablets.insert(key.clone(), tablet_id);
-                    ctx.mutations.insert(key, MutationType::Write);
+                    let key = key.to_vec();
+                    ctx.mutations.insert(
+                        key,
+                        MutationMeta {
+                            mutation_type: MutationType::Write,
+                            tablet_id,
+                        },
+                    );
                     Ok(())
                 }
                 Err(PessimisticWriteError::LockConflict(lock_owner)) => {
                     Err(TiSqlError::KeyIsLocked {
-                        key,
+                        key: key.to_vec(),
                         lock_ts: lock_owner,
                         primary: vec![],
                     })
@@ -519,19 +524,22 @@ impl<S: PessimisticStorage + 'static, L: ClogService + 'static, T: TsoService> T
         } else {
             // No value exists → LOCK (pessimistic lock only, not persisted to clog)
             match self
-                .put_pending_with_retry(tablet_id, &key, LOCK.to_vec(), ctx.start_ts)
+                .put_pending_with_retry(tablet_id, key, LOCK, ctx.start_ts)
                 .await
             {
                 Ok(()) => {
-                    ctx.mutation_tablets.insert(key.clone(), tablet_id);
+                    let key = key.to_vec();
                     // or_insert preserves existing Write if key was previously put
                     // (won't downgrade Write→Lock).
-                    ctx.mutations.entry(key).or_insert(MutationType::Lock);
+                    ctx.mutations.entry(key).or_insert(MutationMeta {
+                        mutation_type: MutationType::Lock,
+                        tablet_id,
+                    });
                     Ok(())
                 }
                 Err(PessimisticWriteError::LockConflict(lock_owner)) => {
                     Err(TiSqlError::KeyIsLocked {
-                        key,
+                        key: key.to_vec(),
                         lock_ts: lock_owner,
                         primary: vec![],
                     })
@@ -546,21 +554,27 @@ impl<S: PessimisticStorage + 'static, L: ClogService + 'static, T: TsoService> T
         }
     }
 
-    async fn lock_key(&self, ctx: &mut TxnCtx, table_id: TableId, key: Key) -> Result<()> {
+    async fn lock_key(&self, ctx: &mut TxnCtx, table_id: TableId, key: &[u8]) -> Result<()> {
         if ctx.state != TxnState::Running {
             return Err(TiSqlError::TransactionNotActive(format!("{:?}", ctx.state)));
         }
         if ctx.read_only {
             return Err(TiSqlError::ReadOnlyTransaction);
         }
-        Self::validate_table_target_key(table_id, &key, "TxnService::lock_key")?;
+        Self::validate_table_target_key(table_id, key, "TxnService::lock_key")?;
 
         // Existing write mutation already protects this key; don't downgrade.
-        if matches!(ctx.mutations.get(&key), Some(MutationType::Write)) {
+        if matches!(
+            ctx.mutations.get(key).map(|meta| meta.mutation_type),
+            Some(MutationType::Write)
+        ) {
             return Ok(());
         }
         // Existing lock mutation is already in place.
-        if matches!(ctx.mutations.get(&key), Some(MutationType::Lock)) {
+        if matches!(
+            ctx.mutations.get(key).map(|meta| meta.mutation_type),
+            Some(MutationType::Lock)
+        ) {
             return Ok(());
         }
 
@@ -571,16 +585,19 @@ impl<S: PessimisticStorage + 'static, L: ClogService + 'static, T: TsoService> T
 
         let tablet_id = route_table_to_tablet(table_id);
         match self
-            .put_pending_with_retry(tablet_id, &key, LOCK.to_vec(), ctx.start_ts)
+            .put_pending_with_retry(tablet_id, key, LOCK, ctx.start_ts)
             .await
         {
             Ok(()) => {
-                ctx.mutation_tablets.insert(key.clone(), tablet_id);
-                ctx.mutations.entry(key).or_insert(MutationType::Lock);
+                let key = key.to_vec();
+                ctx.mutations.entry(key).or_insert(MutationMeta {
+                    mutation_type: MutationType::Lock,
+                    tablet_id,
+                });
                 Ok(())
             }
             Err(PessimisticWriteError::LockConflict(lock_owner)) => Err(TiSqlError::KeyIsLocked {
-                key,
+                key: key.to_vec(),
                 lock_ts: lock_owner,
                 primary: vec![],
             }),
@@ -600,7 +617,6 @@ impl<S: PessimisticStorage + 'static, L: ClogService + 'static, T: TsoService> T
         let start_ts = ctx.start_ts;
 
         let mutations = std::mem::take(&mut ctx.mutations);
-        let mutation_tablets = std::mem::take(&mut ctx.mutation_tablets);
 
         // No-write transaction: clean up and return
         if mutations.is_empty() {
@@ -621,16 +637,11 @@ impl<S: PessimisticStorage + 'static, L: ClogService + 'static, T: TsoService> T
         // the mutations BTreeMap; values are owned (read from storage).
         // Lock keys are skipped — they have no data to persist.
         let mut read_values: Vec<(&[u8], Option<RawValue>)> = Vec::new();
-        for (key, mt) in &mutations {
-            if *mt == MutationType::Lock {
+        for (key, mutation_meta) in &mutations {
+            if mutation_meta.mutation_type == MutationType::Lock {
                 continue;
             }
-            let tablet_id = mutation_tablets.get(key).copied().ok_or_else(|| {
-                TiSqlError::Internal(format!(
-                    "Missing tablet routing metadata for committed key (len={})",
-                    key.len()
-                ))
-            })?;
+            let tablet_id = mutation_meta.tablet_id;
             // TOMBSTONE: MemTableEngine returns Some(TOMBSTONE),
             // LsmEngine returns None. Both handled as Delete in clog.
             match self
@@ -704,6 +715,7 @@ impl<S: PessimisticStorage + 'static, L: ClogService + 'static, T: TsoService> T
         // Release borrows on mutations (ops → read_values → mutations).
         drop(ops);
         drop(read_values);
+        let mut grouped_mutations = Some(mutations);
 
         match clog_result {
             Ok(fsync_future) => match fsync_future.await {
@@ -719,8 +731,11 @@ impl<S: PessimisticStorage + 'static, L: ClogService + 'static, T: TsoService> T
                     }
                     let commit_lsn = txn_lsn;
                     let (write_grouped_keys, lock_grouped_keys) =
-                        Self::group_mutation_keys_by_tablet_and_type(&mutations, &mutation_tablets)
-                            .expect("mutation tablet routing must be recorded before commit");
+                        Self::group_owned_mutation_keys_by_tablet_and_type(
+                            grouped_mutations
+                                .take()
+                                .expect("commit mutation set should be available exactly once"),
+                        );
 
                     // Step 6: Finalize write keys and abort lock-only keys so LOCK
                     // sentinels never become committed user-visible versions.
@@ -763,9 +778,11 @@ impl<S: PessimisticStorage + 'static, L: ClogService + 'static, T: TsoService> T
                         let _ = guard.release();
                     }
                     ctx.reserved_lsn = None;
-                    let grouped_keys =
-                        Self::group_mutation_keys_by_tablet(&mutations, &mutation_tablets)
-                            .expect("mutation tablet routing must be recorded before abort");
+                    let grouped_keys = Self::group_owned_mutation_keys_by_tablet(
+                        grouped_mutations
+                            .take()
+                            .expect("commit mutation set should be available exactly once"),
+                    );
                     self.storage.abort_pending_grouped(&grouped_keys, start_ts);
                     self.concurrency_manager.abort_txn(start_ts).ok();
                     self.concurrency_manager.remove_txn(start_ts);
@@ -777,9 +794,11 @@ impl<S: PessimisticStorage + 'static, L: ClogService + 'static, T: TsoService> T
                     let _ = guard.release();
                 }
                 ctx.reserved_lsn = None;
-                let grouped_keys =
-                    Self::group_mutation_keys_by_tablet(&mutations, &mutation_tablets)
-                        .expect("mutation tablet routing must be recorded before abort");
+                let grouped_keys = Self::group_owned_mutation_keys_by_tablet(
+                    grouped_mutations
+                        .take()
+                        .expect("commit mutation set should be available exactly once"),
+                );
                 self.storage.abort_pending_grouped(&grouped_keys, start_ts);
                 self.concurrency_manager.abort_txn(start_ts).ok();
                 self.concurrency_manager.remove_txn(start_ts);
@@ -792,12 +811,10 @@ impl<S: PessimisticStorage + 'static, L: ClogService + 'static, T: TsoService> T
         Self::check_active(&ctx)?;
 
         let mutations = std::mem::take(&mut ctx.mutations);
-        let mutation_tablets = std::mem::take(&mut ctx.mutation_tablets);
 
         // Abort all pending nodes in storage
         if !mutations.is_empty() {
-            let grouped_keys = Self::group_mutation_keys_by_tablet(&mutations, &mutation_tablets)
-                .expect("mutation tablet routing must be recorded before rollback");
+            let grouped_keys = Self::group_owned_mutation_keys_by_tablet(mutations);
             self.storage
                 .abort_pending_grouped(&grouped_keys, ctx.start_ts);
         }
@@ -1371,12 +1388,7 @@ mod tests {
 
         // Put via transaction — writes pending node directly to storage
         txn_service
-            .put(
-                &mut ctx,
-                ALL_META_TABLE_ID,
-                b"key1".to_vec(),
-                b"value1".to_vec(),
-            )
+            .put(&mut ctx, ALL_META_TABLE_ID, b"key1", b"value1".to_vec())
             .await
             .unwrap();
 
@@ -1407,7 +1419,7 @@ mod tests {
         // Delete via transaction
         let mut ctx = txn_service.begin(false).unwrap();
         txn_service
-            .delete(&mut ctx, ALL_META_TABLE_ID, b"key1".to_vec())
+            .delete(&mut ctx, ALL_META_TABLE_ID, b"key1")
             .await
             .unwrap();
         txn_service.commit(ctx).await.unwrap();
@@ -1423,12 +1435,7 @@ mod tests {
         let mut ctx = txn_service.begin(false).unwrap();
 
         txn_service
-            .put(
-                &mut ctx,
-                ALL_META_TABLE_ID,
-                b"key1".to_vec(),
-                b"value1".to_vec(),
-            )
+            .put(&mut ctx, ALL_META_TABLE_ID, b"key1", b"value1".to_vec())
             .await
             .unwrap();
 
@@ -1480,12 +1487,7 @@ mod tests {
 
         // Put should error for read-only transaction
         let result = txn_service
-            .put(
-                &mut ctx,
-                ALL_META_TABLE_ID,
-                b"key1".to_vec(),
-                b"value1".to_vec(),
-            )
+            .put(&mut ctx, ALL_META_TABLE_ID, b"key1", b"value1".to_vec())
             .await;
         assert!(result.is_err());
         assert!(matches!(
@@ -1495,7 +1497,7 @@ mod tests {
 
         // Delete should also error
         let result = txn_service
-            .delete(&mut ctx, ALL_META_TABLE_ID, b"key1".to_vec())
+            .delete(&mut ctx, ALL_META_TABLE_ID, b"key1")
             .await;
         assert!(result.is_err());
         assert!(matches!(
@@ -1892,12 +1894,7 @@ mod tests {
 
         // Put via explicit transaction (pessimistic: writes go to storage immediately)
         txn_service
-            .put(
-                &mut ctx,
-                ALL_META_TABLE_ID,
-                b"key1".to_vec(),
-                b"value1".to_vec(),
-            )
+            .put(&mut ctx, ALL_META_TABLE_ID, b"key1", b"value1".to_vec())
             .await
             .unwrap();
 
@@ -1923,12 +1920,7 @@ mod tests {
 
         // Put via explicit transaction
         txn_service
-            .put(
-                &mut ctx,
-                ALL_META_TABLE_ID,
-                b"key1".to_vec(),
-                b"value1".to_vec(),
-            )
+            .put(&mut ctx, ALL_META_TABLE_ID, b"key1", b"value1".to_vec())
             .await
             .unwrap();
 
@@ -1959,7 +1951,7 @@ mod tests {
 
         // Delete via explicit transaction
         txn_service
-            .delete(&mut ctx, ALL_META_TABLE_ID, b"key1".to_vec())
+            .delete(&mut ctx, ALL_META_TABLE_ID, b"key1")
             .await
             .unwrap();
 
@@ -1980,30 +1972,15 @@ mod tests {
 
         // Multiple puts
         txn_service
-            .put(
-                &mut ctx,
-                ALL_META_TABLE_ID,
-                b"key1".to_vec(),
-                b"value1".to_vec(),
-            )
+            .put(&mut ctx, ALL_META_TABLE_ID, b"key1", b"value1".to_vec())
             .await
             .unwrap();
         txn_service
-            .put(
-                &mut ctx,
-                ALL_META_TABLE_ID,
-                b"key2".to_vec(),
-                b"value2".to_vec(),
-            )
+            .put(&mut ctx, ALL_META_TABLE_ID, b"key2", b"value2".to_vec())
             .await
             .unwrap();
         txn_service
-            .put(
-                &mut ctx,
-                ALL_META_TABLE_ID,
-                b"key3".to_vec(),
-                b"value3".to_vec(),
-            )
+            .put(&mut ctx, ALL_META_TABLE_ID, b"key3", b"value3".to_vec())
             .await
             .unwrap();
 
@@ -2037,21 +2014,11 @@ mod tests {
 
         // Write key twice within same transaction
         txn_service
-            .put(
-                &mut ctx,
-                ALL_META_TABLE_ID,
-                b"key1".to_vec(),
-                b"v1".to_vec(),
-            )
+            .put(&mut ctx, ALL_META_TABLE_ID, b"key1", b"v1".to_vec())
             .await
             .unwrap();
         txn_service
-            .put(
-                &mut ctx,
-                ALL_META_TABLE_ID,
-                b"key1".to_vec(),
-                b"v2".to_vec(),
-            )
+            .put(&mut ctx, ALL_META_TABLE_ID, b"key1", b"v2".to_vec())
             .await
             .unwrap();
 
@@ -2074,12 +2041,7 @@ mod tests {
 
         // Put should error for read-only explicit transaction
         let result = txn_service
-            .put(
-                &mut ctx,
-                ALL_META_TABLE_ID,
-                b"key1".to_vec(),
-                b"value1".to_vec(),
-            )
+            .put(&mut ctx, ALL_META_TABLE_ID, b"key1", b"value1".to_vec())
             .await;
         assert!(result.is_err());
         assert!(matches!(
@@ -2130,12 +2092,7 @@ mod tests {
 
         // Write a value
         txn_service
-            .put(
-                &mut ctx,
-                ALL_META_TABLE_ID,
-                b"key1".to_vec(),
-                b"value1".to_vec(),
-            )
+            .put(&mut ctx, ALL_META_TABLE_ID, b"key1", b"value1".to_vec())
             .await
             .unwrap();
 
@@ -2159,23 +2116,13 @@ mod tests {
 
         // Write initial value
         txn_service
-            .put(
-                &mut ctx,
-                ALL_META_TABLE_ID,
-                b"key1".to_vec(),
-                b"v1".to_vec(),
-            )
+            .put(&mut ctx, ALL_META_TABLE_ID, b"key1", b"v1".to_vec())
             .await
             .unwrap();
 
         // Update it
         txn_service
-            .put(
-                &mut ctx,
-                ALL_META_TABLE_ID,
-                b"key1".to_vec(),
-                b"v2".to_vec(),
-            )
+            .put(&mut ctx, ALL_META_TABLE_ID, b"key1", b"v2".to_vec())
             .await
             .unwrap();
 
@@ -2200,7 +2147,7 @@ mod tests {
             .put(
                 &mut setup_ctx,
                 ALL_META_TABLE_ID,
-                b"key1".to_vec(),
+                b"key1",
                 b"initial".to_vec(),
             )
             .await
@@ -2212,7 +2159,7 @@ mod tests {
 
         // Delete the key
         txn_service
-            .delete(&mut ctx, ALL_META_TABLE_ID, b"key1".to_vec())
+            .delete(&mut ctx, ALL_META_TABLE_ID, b"key1")
             .await
             .unwrap();
 
@@ -2236,30 +2183,15 @@ mod tests {
 
         // Write multiple values
         txn_service
-            .put(
-                &mut ctx,
-                ALL_META_TABLE_ID,
-                b"key1".to_vec(),
-                b"value1".to_vec(),
-            )
+            .put(&mut ctx, ALL_META_TABLE_ID, b"key1", b"value1".to_vec())
             .await
             .unwrap();
         txn_service
-            .put(
-                &mut ctx,
-                ALL_META_TABLE_ID,
-                b"key2".to_vec(),
-                b"value2".to_vec(),
-            )
+            .put(&mut ctx, ALL_META_TABLE_ID, b"key2", b"value2".to_vec())
             .await
             .unwrap();
         txn_service
-            .put(
-                &mut ctx,
-                ALL_META_TABLE_ID,
-                b"key3".to_vec(),
-                b"value3".to_vec(),
-            )
+            .put(&mut ctx, ALL_META_TABLE_ID, b"key3", b"value3".to_vec())
             .await
             .unwrap();
 
@@ -2295,12 +2227,7 @@ mod tests {
 
         // Txn1 writes a value
         txn_service
-            .put(
-                &mut ctx1,
-                ALL_META_TABLE_ID,
-                b"key1".to_vec(),
-                b"from_txn1".to_vec(),
-            )
+            .put(&mut ctx1, ALL_META_TABLE_ID, b"key1", b"from_txn1".to_vec())
             .await
             .unwrap();
 
@@ -2333,7 +2260,7 @@ mod tests {
             .put(
                 &mut setup_ctx,
                 ALL_META_TABLE_ID,
-                b"key1".to_vec(),
+                b"key1",
                 b"committed".to_vec(),
             )
             .await
@@ -2345,12 +2272,7 @@ mod tests {
 
         // Update the key
         txn_service
-            .put(
-                &mut ctx,
-                ALL_META_TABLE_ID,
-                b"key1".to_vec(),
-                b"pending".to_vec(),
-            )
+            .put(&mut ctx, ALL_META_TABLE_ID, b"key1", b"pending".to_vec())
             .await
             .unwrap();
 
@@ -2375,7 +2297,7 @@ mod tests {
             .put(
                 &mut setup_ctx,
                 ALL_META_TABLE_ID,
-                b"key1".to_vec(),
+                b"key1",
                 b"original".to_vec(),
             )
             .await
@@ -2387,7 +2309,7 @@ mod tests {
 
         // Delete
         txn_service
-            .delete(&mut ctx, ALL_META_TABLE_ID, b"key1".to_vec())
+            .delete(&mut ctx, ALL_META_TABLE_ID, b"key1")
             .await
             .unwrap();
 
@@ -2400,12 +2322,7 @@ mod tests {
 
         // Re-insert with new value
         txn_service
-            .put(
-                &mut ctx,
-                ALL_META_TABLE_ID,
-                b"key1".to_vec(),
-                b"reinserted".to_vec(),
-            )
+            .put(&mut ctx, ALL_META_TABLE_ID, b"key1", b"reinserted".to_vec())
             .await
             .unwrap();
 
@@ -2458,12 +2375,7 @@ mod tests {
         // Begin and commit a transaction
         let mut ctx = txn_service.begin(false).unwrap();
         txn_service
-            .put(
-                &mut ctx,
-                ALL_META_TABLE_ID,
-                b"key1".to_vec(),
-                b"value1".to_vec(),
-            )
+            .put(&mut ctx, ALL_META_TABLE_ID, b"key1", b"value1".to_vec())
             .await
             .unwrap();
         let commit_info = txn_service.commit(ctx).await.unwrap();
@@ -2480,7 +2392,7 @@ mod tests {
             .put(
                 &mut committed_ctx,
                 ALL_META_TABLE_ID,
-                b"key2".to_vec(),
+                b"key2",
                 b"value2".to_vec(),
             )
             .await;
@@ -2507,7 +2419,7 @@ mod tests {
 
         // Try to delete on committed transaction - should fail
         let result = txn_service
-            .delete(&mut committed_ctx, ALL_META_TABLE_ID, b"key1".to_vec())
+            .delete(&mut committed_ctx, ALL_META_TABLE_ID, b"key1")
             .await;
         assert!(result.is_err());
         assert!(matches!(
@@ -2529,7 +2441,7 @@ mod tests {
             .put(
                 &mut aborted_ctx,
                 ALL_META_TABLE_ID,
-                b"key1".to_vec(),
+                b"key1",
                 b"value1".to_vec(),
             )
             .await;
@@ -2550,7 +2462,7 @@ mod tests {
 
         // Try to delete on aborted transaction - should fail
         let result = txn_service
-            .delete(&mut aborted_ctx, ALL_META_TABLE_ID, b"key1".to_vec())
+            .delete(&mut aborted_ctx, ALL_META_TABLE_ID, b"key1")
             .await;
         assert!(result.is_err());
         assert!(matches!(
@@ -2776,7 +2688,7 @@ mod tests {
             .put(
                 &mut ctx1,
                 ALL_META_TABLE_ID,
-                b"conflict_key".to_vec(),
+                b"conflict_key",
                 b"value1".to_vec(),
             )
             .await
@@ -2788,7 +2700,7 @@ mod tests {
             .put(
                 &mut ctx2,
                 ALL_META_TABLE_ID,
-                b"conflict_key".to_vec(),
+                b"conflict_key",
                 b"value2".to_vec(),
             )
             .await;
@@ -2820,14 +2732,14 @@ mod tests {
         // Transaction 1: Lock key with delete
         let mut ctx1 = txn_service.begin_explicit(false).unwrap();
         txn_service
-            .delete(&mut ctx1, ALL_META_TABLE_ID, b"delete_key".to_vec())
+            .delete(&mut ctx1, ALL_META_TABLE_ID, b"delete_key")
             .await
             .unwrap();
 
         // Transaction 2: Try to delete same key - should fail
         let mut ctx2 = txn_service.begin_explicit(false).unwrap();
         let result = txn_service
-            .delete(&mut ctx2, ALL_META_TABLE_ID, b"delete_key".to_vec())
+            .delete(&mut ctx2, ALL_META_TABLE_ID, b"delete_key")
             .await;
 
         assert!(result.is_err());
@@ -3005,12 +2917,7 @@ mod tests {
         let mut ctx = txn_service.begin_explicit(false).unwrap();
         let txn_id = ctx.txn_id();
         txn_service
-            .put(
-                &mut ctx,
-                ALL_META_TABLE_ID,
-                b"key1".to_vec(),
-                b"value1".to_vec(),
-            )
+            .put(&mut ctx, ALL_META_TABLE_ID, b"key1", b"value1".to_vec())
             .await
             .unwrap();
         let info = txn_service.commit(ctx).await.unwrap();
@@ -3044,7 +2951,7 @@ mod tests {
         let mut ctx = txn_service.begin_explicit(false).unwrap();
         let txn_id = ctx.txn_id();
         txn_service
-            .delete(&mut ctx, ALL_META_TABLE_ID, b"key1".to_vec())
+            .delete(&mut ctx, ALL_META_TABLE_ID, b"key1")
             .await
             .unwrap();
         let info = txn_service.commit(ctx).await.unwrap();
@@ -3068,30 +2975,15 @@ mod tests {
         let mut ctx = txn_service.begin_explicit(false).unwrap();
         let txn_id = ctx.txn_id();
         txn_service
-            .put(
-                &mut ctx,
-                ALL_META_TABLE_ID,
-                b"key1".to_vec(),
-                b"v1".to_vec(),
-            )
+            .put(&mut ctx, ALL_META_TABLE_ID, b"key1", b"v1".to_vec())
             .await
             .unwrap();
         txn_service
-            .put(
-                &mut ctx,
-                ALL_META_TABLE_ID,
-                b"key2".to_vec(),
-                b"v2".to_vec(),
-            )
+            .put(&mut ctx, ALL_META_TABLE_ID, b"key2", b"v2".to_vec())
             .await
             .unwrap();
         txn_service
-            .put(
-                &mut ctx,
-                ALL_META_TABLE_ID,
-                b"key3".to_vec(),
-                b"v3".to_vec(),
-            )
+            .put(&mut ctx, ALL_META_TABLE_ID, b"key3", b"v3".to_vec())
             .await
             .unwrap();
         txn_service.commit(ctx).await.unwrap();
@@ -3115,7 +3007,7 @@ mod tests {
         let mut ctx = txn_service.begin_explicit(false).unwrap();
         let txn_id = ctx.txn_id();
         txn_service
-            .delete(&mut ctx, ALL_META_TABLE_ID, b"nonexistent".to_vec())
+            .delete(&mut ctx, ALL_META_TABLE_ID, b"nonexistent")
             .await
             .unwrap();
         txn_service.commit(ctx).await.unwrap();
@@ -3144,13 +3036,13 @@ mod tests {
             .put(
                 &mut ctx,
                 ALL_META_TABLE_ID,
-                b"write_key".to_vec(),
+                b"write_key",
                 b"write_value".to_vec(),
             )
             .await
             .unwrap();
         txn_service
-            .lock_key(&mut ctx, ALL_META_TABLE_ID, b"locked_key".to_vec())
+            .lock_key(&mut ctx, ALL_META_TABLE_ID, b"locked_key")
             .await
             .unwrap();
         let info = txn_service.commit(ctx).await.unwrap();
@@ -3230,16 +3122,11 @@ mod tests {
         let mut ctx = txn_service.begin_explicit(false).unwrap();
         let txn_id = ctx.txn_id();
         txn_service
-            .put(
-                &mut ctx,
-                ALL_META_TABLE_ID,
-                b"key1".to_vec(),
-                b"value1".to_vec(),
-            )
+            .put(&mut ctx, ALL_META_TABLE_ID, b"key1", b"value1".to_vec())
             .await
             .unwrap();
         txn_service
-            .delete(&mut ctx, ALL_META_TABLE_ID, b"key1".to_vec())
+            .delete(&mut ctx, ALL_META_TABLE_ID, b"key1")
             .await
             .unwrap();
         txn_service.commit(ctx).await.unwrap();
@@ -3267,25 +3154,15 @@ mod tests {
         let mut ctx = txn_service.begin_explicit(false).unwrap();
         let txn_id = ctx.txn_id();
         txn_service
-            .put(
-                &mut ctx,
-                ALL_META_TABLE_ID,
-                b"key1".to_vec(),
-                b"v1".to_vec(),
-            )
+            .put(&mut ctx, ALL_META_TABLE_ID, b"key1", b"v1".to_vec())
             .await
             .unwrap();
         txn_service
-            .delete(&mut ctx, ALL_META_TABLE_ID, b"key1".to_vec())
+            .delete(&mut ctx, ALL_META_TABLE_ID, b"key1")
             .await
             .unwrap();
         txn_service
-            .put(
-                &mut ctx,
-                ALL_META_TABLE_ID,
-                b"key1".to_vec(),
-                b"v2".to_vec(),
-            )
+            .put(&mut ctx, ALL_META_TABLE_ID, b"key1", b"v2".to_vec())
             .await
             .unwrap();
         txn_service.commit(ctx).await.unwrap();
@@ -3318,12 +3195,7 @@ mod tests {
         // Start an explicit txn and write a pending value
         let mut writer = txn_service.begin_explicit(false).unwrap();
         txn_service
-            .put(
-                &mut writer,
-                ALL_META_TABLE_ID,
-                b"key1".to_vec(),
-                b"v2".to_vec(),
-            )
+            .put(&mut writer, ALL_META_TABLE_ID, b"key1", b"v2".to_vec())
             .await
             .unwrap();
 
@@ -3358,12 +3230,7 @@ mod tests {
         // Start an explicit txn, write, then rollback (abort)
         let mut writer = txn_service.begin_explicit(false).unwrap();
         txn_service
-            .put(
-                &mut writer,
-                ALL_META_TABLE_ID,
-                b"key1".to_vec(),
-                b"v2".to_vec(),
-            )
+            .put(&mut writer, ALL_META_TABLE_ID, b"key1", b"v2".to_vec())
             .await
             .unwrap();
         txn_service.rollback(writer).unwrap();
@@ -3410,12 +3277,7 @@ mod tests {
         let mut writer = txn_service.begin_explicit(false).unwrap();
         let start_ts = writer.start_ts;
         txn_service
-            .put(
-                &mut writer,
-                ALL_META_TABLE_ID,
-                b"key1".to_vec(),
-                b"v1".to_vec(),
-            )
+            .put(&mut writer, ALL_META_TABLE_ID, b"key1", b"v1".to_vec())
             .await
             .unwrap();
 
@@ -3449,12 +3311,7 @@ mod tests {
         // Writer: explicit txn, write v2, commit
         let mut writer = txn_service.begin_explicit(false).unwrap();
         txn_service
-            .put(
-                &mut writer,
-                ALL_META_TABLE_ID,
-                b"key1".to_vec(),
-                b"v2".to_vec(),
-            )
+            .put(&mut writer, ALL_META_TABLE_ID, b"key1", b"v2".to_vec())
             .await
             .unwrap();
         let commit_info = txn_service.commit(writer).await.unwrap();
@@ -3481,12 +3338,7 @@ mod tests {
         // Start explicit txn and write to key "b"
         let mut writer = txn_service.begin_explicit(false).unwrap();
         txn_service
-            .put(
-                &mut writer,
-                ALL_META_TABLE_ID,
-                b"b".to_vec(),
-                b"pending".to_vec(),
-            )
+            .put(&mut writer, ALL_META_TABLE_ID, b"b", b"pending".to_vec())
             .await
             .unwrap();
 
@@ -3524,12 +3376,7 @@ mod tests {
         // Start explicit txn (Running) and write a pending update
         let mut writer = txn_service.begin_explicit(false).unwrap();
         txn_service
-            .put(
-                &mut writer,
-                ALL_META_TABLE_ID,
-                b"key1".to_vec(),
-                b"v2".to_vec(),
-            )
+            .put(&mut writer, ALL_META_TABLE_ID, b"key1", b"v2".to_vec())
             .await
             .unwrap();
 
@@ -3557,12 +3404,7 @@ mod tests {
         // Writer commits v2
         let mut writer = txn_service.begin_explicit(false).unwrap();
         txn_service
-            .put(
-                &mut writer,
-                ALL_META_TABLE_ID,
-                b"key1".to_vec(),
-                b"v2".to_vec(),
-            )
+            .put(&mut writer, ALL_META_TABLE_ID, b"key1", b"v2".to_vec())
             .await
             .unwrap();
         let commit_info = txn_service.commit(writer).await.unwrap();
