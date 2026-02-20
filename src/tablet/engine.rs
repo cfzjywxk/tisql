@@ -1753,7 +1753,7 @@ impl LsmEngine {
     ///
     /// Two tiers:
     /// 1. **L0 slowdown**: If L0 file count is in `[slowdown_trigger, stop_trigger)`,
-    ///    returns `Ok(Some(delay))` with a linearly increasing delay (1ms → 100ms).
+    ///    returns `Ok(Some(delay))` with a linearly increasing delay (1ms → 20ms).
     /// 2. **Frozen memtable stall**: If the active memtable is full AND frozen list
     ///    is at capacity, return error immediately (caller should retry after flush).
     fn check_write_stall(&self) -> Result<Option<Duration>> {
@@ -1784,17 +1784,20 @@ impl LsmEngine {
         Ok(delay)
     }
 
-    /// Compute write delay for L0 slowdown. Linearly interpolates from 1ms to 100ms
+    /// Compute write delay for L0 slowdown. Linearly interpolates from 1ms to 20ms
     /// across the range `[slowdown_trigger, stop_trigger)`.
     fn compute_write_delay(&self, l0_count: usize) -> Duration {
+        const MIN_DELAY_MS: u64 = 1;
+        const MAX_DELAY_MS: u64 = 20;
         let slowdown = self.config.l0_slowdown_trigger;
         let stop = self.config.l0_stop_trigger;
         if stop <= slowdown {
-            return Duration::from_millis(1);
+            return Duration::from_millis(MIN_DELAY_MS);
         }
         let range = (stop - slowdown) as u64;
         let excess = (l0_count.saturating_sub(slowdown).min(stop - slowdown)) as u64;
-        let delay_ms = 1 + 99 * excess / range;
+        let span = MAX_DELAY_MS - MIN_DELAY_MS;
+        let delay_ms = MIN_DELAY_MS + span * excess / range;
         Duration::from_millis(delay_ms)
     }
 
@@ -9153,17 +9156,17 @@ mod tests {
         let delay = engine.compute_write_delay(8);
         assert_eq!(delay, Duration::from_millis(1));
 
-        // At stop trigger - 1: excess=3, range=4, delay = 1 + 99*3/4 = 75ms
+        // At stop trigger - 1: excess=3, range=4, delay = 1 + 19*3/4 = 15ms
         let delay = engine.compute_write_delay(11);
-        assert_eq!(delay, Duration::from_millis(75));
+        assert_eq!(delay, Duration::from_millis(15));
 
-        // At stop trigger: capped at max excess=4, delay = 1 + 99*4/4 = 100ms
+        // At stop trigger: capped at max excess=4, delay = 1 + 19*4/4 = 20ms
         let delay = engine.compute_write_delay(12);
-        assert_eq!(delay, Duration::from_millis(100));
+        assert_eq!(delay, Duration::from_millis(20));
 
         // Beyond stop trigger: same cap
         let delay = engine.compute_write_delay(20);
-        assert_eq!(delay, Duration::from_millis(100));
+        assert_eq!(delay, Duration::from_millis(20));
 
         // Below slowdown: excess=0 (saturating_sub), delay=1ms
         let delay = engine.compute_write_delay(5);

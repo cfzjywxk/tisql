@@ -24,7 +24,7 @@
 //! | Parameter | Default | Description |
 //! |-----------|---------|-------------|
 //! | memtable_size | 64 MB | Size threshold for memtable flush |
-//! | max_frozen_memtables | 4 | Max frozen memtables before stalling |
+//! | max_frozen_memtables | 16 | Max frozen memtables before stalling |
 //! | block_size | 4 KB | Target data block size |
 //! | l0_compaction_trigger | 8 | L0 file count to trigger compaction |
 //! | level_size_multiplier | 10 | Size ratio between adjacent levels |
@@ -48,7 +48,7 @@ use crate::tablet::sstable::CompressionType;
 pub const DEFAULT_MEMTABLE_SIZE: usize = 64 * 1024 * 1024;
 
 /// Default maximum frozen memtables.
-pub const DEFAULT_MAX_FROZEN_MEMTABLES: usize = 4;
+pub const DEFAULT_MAX_FROZEN_MEMTABLES: usize = 16;
 
 /// Default data block size (4 KB).
 pub const DEFAULT_BLOCK_SIZE: usize = 4 * 1024;
@@ -57,10 +57,10 @@ pub const DEFAULT_BLOCK_SIZE: usize = 4 * 1024;
 pub const DEFAULT_L0_COMPACTION_TRIGGER: usize = 8;
 
 /// Default L0 slowdown trigger (file count).
-pub const DEFAULT_L0_SLOWDOWN_TRIGGER: usize = DEFAULT_L0_COMPACTION_TRIGGER * 3;
+pub const DEFAULT_L0_SLOWDOWN_TRIGGER: usize = DEFAULT_L0_COMPACTION_TRIGGER * 8;
 
 /// Default L0 stop trigger (file count).
-pub const DEFAULT_L0_STOP_TRIGGER: usize = DEFAULT_L0_COMPACTION_TRIGGER * 4;
+pub const DEFAULT_L0_STOP_TRIGGER: usize = DEFAULT_L0_COMPACTION_TRIGGER * 12;
 
 /// Default level size multiplier (10x between levels).
 pub const DEFAULT_LEVEL_SIZE_MULTIPLIER: usize = 10;
@@ -86,8 +86,11 @@ pub const DEFAULT_BLOOM_BITS_PER_KEY: u32 = 12;
 /// Shared block cache is enabled by default.
 pub const DEFAULT_SHARED_BLOCK_CACHE_ENABLED: bool = true;
 
-/// Reader cache is disabled by default (rollout gate).
-pub const DEFAULT_READER_CACHE_ENABLED: bool = false;
+/// Reader cache is enabled by default.
+///
+/// This keeps SST point-lookups from repeatedly reopening readers on hot paths
+/// such as INSERT duplicate checks.
+pub const DEFAULT_READER_CACHE_ENABLED: bool = true;
 
 /// Row cache is disabled by default (rollout gate).
 pub const DEFAULT_ROW_CACHE_ENABLED: bool = false;

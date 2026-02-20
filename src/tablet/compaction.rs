@@ -205,9 +205,15 @@ impl CompactionPicker {
             return None;
         }
 
-        // Compact a bounded oldest slice of L0 to avoid huge all-L0 rewrites.
+        // Compact an adaptive oldest slice of L0:
+        // - at/near trigger: compact `trigger` files (bounded rewrite cost),
+        // - under sustained backlog: expand up to 4x trigger to catch up.
+        //
         // Keep selected inputs ordered newest -> oldest for merge tie-breaking.
-        let max_l0_inputs = self.config.l0_compaction_trigger.max(1);
+        let trigger = self.config.l0_compaction_trigger.max(1);
+        let backlog = l0_files.len().saturating_sub(trigger);
+        let extra = backlog.min(trigger.saturating_mul(3));
+        let max_l0_inputs = trigger.saturating_add(extra);
         let selected_count = max_l0_inputs.min(l0_files.len());
         let start = l0_files.len() - selected_count;
         let selected_l0: Vec<Arc<SstMeta>> = l0_files[start..].to_vec();
@@ -726,7 +732,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_picker_l0_compaction_caps_inputs_to_trigger() {
+    async fn test_picker_l0_compaction_preserves_oldest_slice_order() {
         let tmp = TempDir::new().unwrap();
         let config = Arc::new(
             LsmConfig::builder(tmp.path())
@@ -737,8 +743,8 @@ mod tests {
         let picker = CompactionPicker::new(config);
 
         // L0 is sorted newest-first by id: [6, 5, 4, 3, 2, 1].
-        // Picker should compact only the oldest trigger-sized slice, while
-        // preserving newest->oldest order within that slice: [4, 3, 2, 1].
+        // With trigger=4 and small backlog, adaptive selection includes all 6.
+        // Preserve newest->oldest order within the selected oldest slice.
         let version = Version::builder()
             .add_sst(make_sst(1, 0, b"a", b"b"))
             .add_sst(make_sst(2, 0, b"c", b"d"))
@@ -755,7 +761,38 @@ mod tests {
             .filter_map(|(level, id)| (*level == 0).then_some(*id))
             .collect();
 
-        assert_eq!(l0_inputs, vec![4, 3, 2, 1]);
+        assert_eq!(l0_inputs, vec![6, 5, 4, 3, 2, 1]);
+    }
+
+    #[tokio::test]
+    async fn test_picker_l0_compaction_expands_under_backlog() {
+        let tmp = TempDir::new().unwrap();
+        let config = Arc::new(
+            LsmConfig::builder(tmp.path())
+                .l0_compaction_trigger(4)
+                .build()
+                .unwrap(),
+        );
+        let picker = CompactionPicker::new(config);
+
+        // L0 newest-first by id: [20..1]. With trigger=4 and adaptive cap=4x,
+        // picker should select the oldest 16 files and preserve newest->oldest
+        // order within that slice.
+        let mut builder = Version::builder();
+        for id in 1..=20 {
+            builder = builder.add_sst(make_sst(id, 0, b"a", b"z"));
+        }
+        let version = builder.build();
+
+        let task = picker.pick(&version).unwrap();
+        let l0_inputs: Vec<u64> = task
+            .inputs
+            .iter()
+            .filter_map(|(level, id)| (*level == 0).then_some(*id))
+            .collect();
+
+        let expected: Vec<u64> = (1..=16).rev().collect();
+        assert_eq!(l0_inputs, expected);
     }
 
     #[tokio::test]
