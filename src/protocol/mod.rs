@@ -47,6 +47,10 @@ impl MySqlServer {
 
         loop {
             let (stream, peer_addr) = listener.accept().await?;
+            // Disable Nagle's algorithm — the MySQL protocol sends many small
+            // packets (column defs, row data, EOF markers).  Without this,
+            // Nagle + delayed-ACK interaction adds ~40 ms per round-trip.
+            stream.set_nodelay(true)?;
             let db = Arc::clone(&self.db);
 
             log_info!("New connection from {}", peer_addr);
