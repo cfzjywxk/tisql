@@ -29,7 +29,7 @@ use crate::tablet::cache::{
     tablet_namespace_from_dir, BlockCacheKey, BlockKind, CachePriority, SharedBlockCache,
 };
 use crate::util::error::{Result, TiSqlError};
-use tokio::sync::Mutex;
+use tokio::sync::OnceCell;
 
 use super::block::{DataBlock, IndexBlock, IndexEntry};
 use super::bloom::BloomFilter;
@@ -55,12 +55,6 @@ impl std::fmt::Debug for SstReadOptions {
             .field("block_cache", &self.block_cache.is_some())
             .finish()
     }
-}
-
-#[derive(Debug)]
-enum BloomState {
-    Uninitialized,
-    Ready(Option<BloomFilter>),
 }
 
 // ============================================================================
@@ -92,8 +86,8 @@ pub struct SstReader {
     options: SstReadOptions,
     /// Optional bloom block location (offset, size).
     bloom_span: Option<(u64, u32)>,
-    /// Lazy bloom decode state.
-    bloom_state: Mutex<BloomState>,
+    /// Lazily loaded bloom filter (None = unavailable/corrupt/disabled).
+    bloom_state: OnceCell<Option<BloomFilter>>,
 }
 
 impl SstReader {
@@ -236,7 +230,7 @@ impl SstReader {
             index,
             options,
             bloom_span,
-            bloom_state: Mutex::new(BloomState::Uninitialized),
+            bloom_state: OnceCell::new(),
         })
     }
 
@@ -374,6 +368,38 @@ impl SstReader {
         self.bloom_span
     }
 
+    async fn load_bloom_filter(&self) -> Option<BloomFilter> {
+        let (offset, size) = self.bloom_span()?;
+        let raw = match self.read_raw_block(offset, size, BlockKind::Bloom).await {
+            Ok(raw) => raw,
+            Err(e) => {
+                crate::log_warn!(
+                    "Failed to load bloom block from {} (id={}): {}",
+                    self.path.display(),
+                    self.options.sst_id,
+                    e
+                );
+                return None;
+            }
+        };
+        if raw.is_empty() {
+            return None;
+        }
+
+        match BloomFilter::decode(&raw) {
+            Ok(filter) => Some(filter),
+            Err(e) => {
+                crate::log_warn!(
+                    "Failed to decode bloom block from {} (id={}): {}. Falling back to full lookup.",
+                    self.path.display(),
+                    self.options.sst_id,
+                    e
+                );
+                None
+            }
+        }
+    }
+
     /// Bloom check for one user key.
     ///
     /// Returns `Ok(true)` when bloom is unavailable/disabled (fail-open).
@@ -382,53 +408,19 @@ impl SstReader {
             return Ok(true);
         }
 
-        let mut state = self.bloom_state.lock().await;
-        match &mut *state {
-            BloomState::Ready(Some(filter)) => return Ok(filter.may_contain(user_key)),
-            BloomState::Ready(None) => return Ok(true),
-            BloomState::Uninitialized => {}
+        if let Some(maybe_filter) = self.bloom_state.get() {
+            return Ok(maybe_filter
+                .as_ref()
+                .is_none_or(|filter| filter.may_contain(user_key)));
         }
 
-        let maybe_filter = match self.bloom_span() {
-            Some((offset, size)) => {
-                let raw = match self.read_raw_block(offset, size, BlockKind::Bloom).await {
-                    Ok(raw) => raw,
-                    Err(e) => {
-                        crate::log_warn!(
-                            "Failed to load bloom block from {} (id={}): {}",
-                            self.path.display(),
-                            self.options.sst_id,
-                            e
-                        );
-                        Vec::new()
-                    }
-                };
-                if raw.is_empty() {
-                    None
-                } else {
-                    match BloomFilter::decode(&raw) {
-                        Ok(filter) => Some(filter),
-                        Err(e) => {
-                            crate::log_warn!(
-                                "Failed to decode bloom block from {} (id={}): {}. Falling back to full lookup.",
-                                self.path.display(),
-                                self.options.sst_id,
-                                e
-                            );
-                            None
-                        }
-                    }
-                }
-            }
-            None => None,
-        };
-
-        *state = BloomState::Ready(maybe_filter);
-        match &*state {
-            BloomState::Ready(Some(filter)) => Ok(filter.may_contain(user_key)),
-            BloomState::Ready(None) => Ok(true),
-            BloomState::Uninitialized => Ok(true),
-        }
+        let maybe_filter = self
+            .bloom_state
+            .get_or_init(|| async { self.load_bloom_filter().await })
+            .await;
+        Ok(maybe_filter
+            .as_ref()
+            .is_none_or(|filter| filter.may_contain(user_key)))
     }
 
     /// Find the block that may contain the given key using binary search.

@@ -1010,6 +1010,7 @@ impl Drop for AsyncSstBuilder {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::io::IoService;
     use tempfile::tempdir;
 
     // Helper to create MVCC key
@@ -1113,6 +1114,39 @@ mod tests {
     }
 
     #[test]
+    fn test_builder_skips_bloom_trailer_when_filter_is_empty() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("bloom_empty.sst");
+        let builder = SstBuilder::new(
+            &path,
+            SstBuilderOptions {
+                bloom_enabled: true,
+                bloom_bits_per_key: 12,
+                ..SstBuilderOptions::default()
+            },
+        )
+        .unwrap();
+        builder.finish(7, 0).unwrap();
+
+        let bytes = std::fs::read(&path).unwrap();
+        let footer_start = bytes.len() - FOOTER_SIZE;
+        let footer_raw: [u8; FOOTER_SIZE] = bytes[footer_start..].try_into().unwrap();
+        let footer = Footer::decode(&footer_raw).unwrap();
+
+        assert_eq!(
+            footer.index_offset + footer.index_size as u64,
+            footer_start as u64
+        );
+        if footer_start >= BLOOM_META_TRAILER_SIZE {
+            let trailer_raw: [u8; BLOOM_META_TRAILER_SIZE] = bytes
+                [footer_start - BLOOM_META_TRAILER_SIZE..footer_start]
+                .try_into()
+                .unwrap();
+            assert!(BloomMetaTrailer::decode_optional(&trailer_raw).is_none());
+        }
+    }
+
+    #[test]
     fn test_builder_bloom_deduplicates_adjacent_mvcc_versions() {
         let dir = tempdir().unwrap();
         let path = dir.path().join("bloom_dedup.sst");
@@ -1158,6 +1192,43 @@ mod tests {
                 .unwrap();
         assert!(bloom.may_contain(b"dup-key"));
         assert!(bloom.may_contain(b"uniq-key"));
+        assert_eq!(
+            trailer.bloom_offset + trailer.bloom_size as u64,
+            footer.index_offset
+        );
+    }
+
+    #[tokio::test]
+    async fn test_async_builder_writes_bloom_meta_trailer_when_enabled() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("async_bloom_trailer.sst");
+        let io = IoService::new_for_test(32).unwrap();
+        let mut builder = AsyncSstBuilder::new(
+            &path,
+            SstBuilderOptions {
+                bloom_enabled: true,
+                bloom_bits_per_key: 12,
+                ..SstBuilderOptions::default()
+            },
+            io,
+        )
+        .unwrap();
+
+        builder.add(&mvcc_key(b"k1", 9), b"v1").await.unwrap();
+        builder.add(&mvcc_key(b"k2", 8), b"v2").await.unwrap();
+        let meta = builder.finish(11, 0).await.unwrap();
+
+        let bytes = std::fs::read(&path).unwrap();
+        assert_eq!(bytes.len(), meta.file_size as usize);
+        let footer_start = bytes.len() - FOOTER_SIZE;
+        let footer_raw: [u8; FOOTER_SIZE] = bytes[footer_start..].try_into().unwrap();
+        let footer = Footer::decode(&footer_raw).unwrap();
+
+        let trailer_start = footer_start - BLOOM_META_TRAILER_SIZE;
+        let trailer_raw: [u8; BLOOM_META_TRAILER_SIZE] =
+            bytes[trailer_start..footer_start].try_into().unwrap();
+        let trailer = BloomMetaTrailer::decode_optional(&trailer_raw).unwrap();
+        assert!(trailer.bloom_size > 0);
         assert_eq!(
             trailer.bloom_offset + trailer.bloom_size as u64,
             footer.index_offset

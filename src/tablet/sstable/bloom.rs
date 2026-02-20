@@ -13,6 +13,7 @@
 // limitations under the License.
 
 use crate::util::error::{Result, TiSqlError};
+use crate::util::stable_hash64;
 
 const BLOOM_MAGIC: u32 = 0x464D4C42; // "BLMF"
 const BLOOM_VERSION: u8 = 1;
@@ -32,30 +33,6 @@ fn crc32(data: &[u8]) -> u32 {
         }
     }
     !crc
-}
-
-fn stable_hash64(seed: u64, key: &[u8]) -> u64 {
-    // Use a deterministic hash for persisted bloom filters.
-    // `DefaultHasher` is not stable across toolchains and can cause
-    // false negatives when old SSTs are read by a newer binary.
-    const FNV_OFFSET_BASIS: u64 = 0xcbf2_9ce4_8422_2325;
-    const FNV_PRIME: u64 = 0x0000_0100_0000_01b3;
-    const MIX1: u64 = 0xff51_afd7_ed55_8ccd;
-    const MIX2: u64 = 0xc4ce_b9fe_1a85_ec53;
-
-    let mut h = FNV_OFFSET_BASIS ^ seed;
-    for byte in key {
-        h ^= *byte as u64;
-        h = h.wrapping_mul(FNV_PRIME);
-    }
-
-    // Murmur-style finalization to improve bit dispersion.
-    h ^= h >> 33;
-    h = h.wrapping_mul(MIX1);
-    h ^= h >> 33;
-    h = h.wrapping_mul(MIX2);
-    h ^= h >> 33;
-    h
 }
 
 #[inline]
@@ -341,5 +318,28 @@ mod tests {
         builder2.add(b"k1");
         builder2.add(b"k2");
         assert_eq!(builder2.estimated_encoded_size(), expected);
+    }
+
+    #[test]
+    fn test_bloom_false_positive_rate_stays_reasonable() {
+        let mut builder = BloomBuilder::new(12);
+        for i in 0..10_000 {
+            builder.add(format!("present-{i:05}").as_bytes());
+        }
+        let filter = builder.finish();
+
+        let mut false_positives = 0usize;
+        let probes = 10_000usize;
+        for i in 0..probes {
+            if filter.may_contain(format!("absent-{i:05}").as_bytes()) {
+                false_positives += 1;
+            }
+        }
+
+        let rate = false_positives as f64 / probes as f64;
+        assert!(
+            rate <= 0.02,
+            "false-positive rate too high: {rate:.4} ({false_positives}/{probes})"
+        );
     }
 }

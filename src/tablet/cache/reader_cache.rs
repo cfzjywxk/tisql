@@ -13,10 +13,10 @@
 // limitations under the License.
 
 use std::any::Any;
-use std::collections::{HashMap, VecDeque};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 
+use hashlink::LinkedHashMap;
 use parking_lot::Mutex;
 
 use super::key::ReaderCacheKey;
@@ -30,8 +30,7 @@ pub struct ReaderCacheStats {
 }
 
 struct ReaderCacheInner {
-    map: HashMap<ReaderCacheKey, Arc<dyn Any + Send + Sync>>,
-    lru: VecDeque<ReaderCacheKey>,
+    map: LinkedHashMap<ReaderCacheKey, Arc<dyn Any + Send + Sync>>,
     max_entries: usize,
 }
 
@@ -48,8 +47,7 @@ impl ReaderCache {
     pub fn new(max_entries: usize) -> Self {
         Self {
             inner: Mutex::new(ReaderCacheInner {
-                map: HashMap::new(),
-                lru: VecDeque::new(),
+                map: LinkedHashMap::new(),
                 max_entries,
             }),
             hits: AtomicU64::new(0),
@@ -61,22 +59,18 @@ impl ReaderCache {
 
     pub fn get_typed<T: Any + Send + Sync>(&self, key: &ReaderCacheKey) -> Option<Arc<T>> {
         let mut inner = self.inner.lock();
-        let value = inner.map.get(key).cloned();
+        let value = inner.map.to_back(key).cloned();
         match value {
-            Some(value) => {
-                inner.lru.retain(|k| k != key);
-                inner.lru.push_back(*key);
-                match Arc::downcast::<T>(value) {
-                    Ok(typed) => {
-                        self.hits.fetch_add(1, Ordering::Relaxed);
-                        Some(typed)
-                    }
-                    Err(_) => {
-                        self.misses.fetch_add(1, Ordering::Relaxed);
-                        None
-                    }
+            Some(value) => match Arc::downcast::<T>(value) {
+                Ok(typed) => {
+                    self.hits.fetch_add(1, Ordering::Relaxed);
+                    Some(typed)
                 }
-            }
+                Err(_) => {
+                    self.misses.fetch_add(1, Ordering::Relaxed);
+                    None
+                }
+            },
             None => {
                 self.misses.fetch_add(1, Ordering::Relaxed);
                 None
@@ -90,27 +84,21 @@ impl ReaderCache {
             return;
         }
 
-        if inner.map.contains_key(&key) {
-            inner.lru.retain(|k| *k != key);
-        }
+        inner.map.remove(&key);
         inner.map.insert(key, value as Arc<dyn Any + Send + Sync>);
-        inner.lru.push_back(key);
         self.inserts.fetch_add(1, Ordering::Relaxed);
 
         while inner.map.len() > inner.max_entries {
-            let Some(victim) = inner.lru.pop_front() else {
+            let Some((_, _)) = inner.map.pop_front() else {
                 break;
             };
-            if inner.map.remove(&victim).is_some() {
-                self.evictions.fetch_add(1, Ordering::Relaxed);
-            }
+            self.evictions.fetch_add(1, Ordering::Relaxed);
         }
     }
 
     pub fn remove(&self, key: &ReaderCacheKey) {
         let mut inner = self.inner.lock();
         inner.map.remove(key);
-        inner.lru.retain(|k| k != key);
     }
 
     pub fn remove_sst(&self, ns: u128, sst_id: u64) {
@@ -182,5 +170,18 @@ mod tests {
 
         cache.remove_sst(1, 3);
         assert!(cache.get_typed::<u64>(&k3).is_none());
+    }
+
+    #[test]
+    fn test_reader_cache_remove_sst_keeps_inflight_arc_alive() {
+        let cache = ReaderCache::new(8);
+        let key = ReaderCacheKey { ns: 9, sst_id: 99 };
+        cache.insert_typed(key, Arc::new(String::from("reader")));
+
+        let inflight = cache.get_typed::<String>(&key).unwrap();
+        cache.remove_sst(9, 99);
+
+        assert!(cache.get_typed::<String>(&key).is_none());
+        assert_eq!(inflight.as_str(), "reader");
     }
 }

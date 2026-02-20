@@ -189,4 +189,21 @@ mod tests {
         assert_eq!(suite_cfg.scan_fill_cache_threshold_blocks, 12);
         assert_eq!(suite_cfg.reader_cache_max_entries, 321);
     }
+
+    #[test]
+    fn test_cache_suite_enables_all_cache_layers() {
+        let suite = CacheSuite::new(CacheSuiteConfig {
+            shared_block_cache_enabled: true,
+            reader_cache_enabled: true,
+            row_cache_enabled: true,
+            scan_fill_cache: true,
+            scan_fill_cache_threshold_blocks: 16,
+            cache_total_ratio: 0.50,
+            reader_cache_max_entries: 64,
+        });
+
+        assert!(suite.block_cache().is_some());
+        assert!(suite.reader_cache().is_some());
+        assert!(suite.row_cache().is_some());
+    }
 }

@@ -12,9 +12,10 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-use std::collections::{HashMap, VecDeque};
+use std::collections::{HashMap, HashSet};
 use std::sync::atomic::{AtomicU64, Ordering};
 
+use hashlink::LinkedHashMap;
 use parking_lot::Mutex;
 
 use super::key::RowCacheKey;
@@ -34,8 +35,10 @@ struct RowEntry {
 }
 
 struct RowCacheInner {
-    map: HashMap<RowCacheKey, RowEntry>,
-    lru: VecDeque<RowCacheKey>,
+    map: LinkedHashMap<RowCacheKey, RowEntry>,
+    // Secondary index: ns -> user_key -> cached snapshot read_ts set.
+    // This avoids O(n) full-cache scans on committed-write invalidation.
+    by_user_key: HashMap<u128, HashMap<Vec<u8>, HashSet<u64>>>,
     usage_bytes: usize,
     capacity_bytes: usize,
 }
@@ -54,8 +57,8 @@ impl RowCache {
     pub fn new(capacity_bytes: usize) -> Self {
         Self {
             inner: Mutex::new(RowCacheInner {
-                map: HashMap::new(),
-                lru: VecDeque::new(),
+                map: LinkedHashMap::new(),
+                by_user_key: HashMap::new(),
                 usage_bytes: 0,
                 capacity_bytes,
             }),
@@ -72,13 +75,55 @@ impl RowCache {
         base + value.as_ref().map_or(0, |v| v.len())
     }
 
+    fn index_insert(inner: &mut RowCacheInner, key: &RowCacheKey) {
+        inner
+            .by_user_key
+            .entry(key.ns)
+            .or_default()
+            .entry(key.user_key.clone())
+            .or_default()
+            .insert(key.read_ts);
+    }
+
+    fn index_remove(inner: &mut RowCacheInner, key: &RowCacheKey) {
+        let mut remove_ns = false;
+        if let Some(by_key) = inner.by_user_key.get_mut(&key.ns) {
+            let mut remove_user_key = false;
+            if let Some(read_ts_set) = by_key.get_mut(key.user_key.as_slice()) {
+                read_ts_set.remove(&key.read_ts);
+                remove_user_key = read_ts_set.is_empty();
+            }
+            if remove_user_key {
+                by_key.remove(key.user_key.as_slice());
+            }
+            remove_ns = by_key.is_empty();
+        }
+        if remove_ns {
+            inner.by_user_key.remove(&key.ns);
+        }
+    }
+
+    fn take_index_entry_for_user_key(
+        inner: &mut RowCacheInner,
+        ns: u128,
+        user_key: &[u8],
+    ) -> Option<HashSet<u64>> {
+        let (read_ts_set, remove_ns) = {
+            let by_key = inner.by_user_key.get_mut(&ns)?;
+            let read_ts_set = by_key.remove(user_key)?;
+            (read_ts_set, by_key.is_empty())
+        };
+        if remove_ns {
+            inner.by_user_key.remove(&ns);
+        }
+        Some(read_ts_set)
+    }
+
     pub fn get(&self, key: &RowCacheKey) -> Option<Option<Vec<u8>>> {
         let mut inner = self.inner.lock();
-        let value = inner.map.get(key).map(|entry| entry.value.clone());
+        let value = inner.map.to_back(key).map(|entry| entry.value.clone());
         match value {
             Some(value) => {
-                inner.lru.retain(|k| k != key);
-                inner.lru.push_back(key.clone());
                 self.hits.fetch_add(1, Ordering::Relaxed);
                 Some(value)
             }
@@ -98,21 +143,20 @@ impl RowCache {
 
         if let Some(old) = inner.map.remove(&key) {
             inner.usage_bytes = inner.usage_bytes.saturating_sub(old.charge);
-            inner.lru.retain(|k| *k != key);
+            Self::index_remove(&mut inner, &key);
         }
 
         while inner.usage_bytes + charge > inner.capacity_bytes {
-            let Some(victim) = inner.lru.pop_front() else {
+            let Some((victim, old)) = inner.map.pop_front() else {
                 return false;
             };
-            if let Some(old) = inner.map.remove(&victim) {
-                inner.usage_bytes = inner.usage_bytes.saturating_sub(old.charge);
-                self.evictions.fetch_add(1, Ordering::Relaxed);
-            }
+            inner.usage_bytes = inner.usage_bytes.saturating_sub(old.charge);
+            Self::index_remove(&mut inner, &victim);
+            self.evictions.fetch_add(1, Ordering::Relaxed);
         }
 
-        inner.map.insert(key.clone(), RowEntry { value, charge });
-        inner.lru.push_back(key);
+        Self::index_insert(&mut inner, &key);
+        inner.map.insert(key, RowEntry { value, charge });
         inner.usage_bytes += charge;
         self.inserts.fetch_add(1, Ordering::Relaxed);
         true
@@ -121,19 +165,22 @@ impl RowCache {
     /// Invalidate all snapshot cache entries for one logical user key.
     pub fn invalidate_key(&self, ns: u128, user_key: &[u8]) {
         let mut inner = self.inner.lock();
-        let victims: Vec<RowCacheKey> = inner
-            .map
-            .keys()
-            .filter(|k| k.ns == ns && k.user_key.as_slice() == user_key)
-            .cloned()
-            .collect();
+        let Some(read_ts_set) = Self::take_index_entry_for_user_key(&mut inner, ns, user_key)
+        else {
+            return;
+        };
 
-        for key in victims {
-            if let Some(old) = inner.map.remove(&key) {
+        let mut victim = RowCacheKey {
+            ns,
+            user_key: user_key.to_vec(),
+            read_ts: 0,
+        };
+        for read_ts in read_ts_set {
+            victim.read_ts = read_ts;
+            if let Some(old) = inner.map.remove(&victim) {
                 inner.usage_bytes = inner.usage_bytes.saturating_sub(old.charge);
                 self.invalidations.fetch_add(1, Ordering::Relaxed);
             }
-            inner.lru.retain(|k| k != &key);
         }
     }
 
@@ -214,5 +261,25 @@ mod tests {
         assert!(cache.get(&k2).is_none());
         assert!(cache.get(&k3).is_some());
         assert!(cache.stats().evictions >= 1);
+    }
+
+    #[test]
+    fn test_row_cache_invalidate_key_after_eviction_keeps_index_consistent() {
+        let cache = RowCache::new(128);
+        let victim = key(9, b"user", 10);
+        let survivor = key(9, b"user", 20);
+        let other = key(9, b"other", 30);
+
+        assert!(cache.insert(victim.clone(), Some(vec![1u8; 16])));
+        assert!(cache.insert(survivor.clone(), Some(vec![2u8; 16])));
+
+        // Trigger one eviction (oldest = victim).
+        assert!(cache.insert(other.clone(), Some(vec![3u8; 16])));
+        assert!(cache.get(&victim).is_none());
+
+        cache.invalidate_key(9, b"user");
+        assert!(cache.get(&survivor).is_none());
+        assert_eq!(cache.get(&other), Some(Some(vec![3u8; 16])));
+        assert_eq!(cache.stats().invalidations, 1);
     }
 }

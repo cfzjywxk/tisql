@@ -12,11 +12,11 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-use std::collections::{HashMap, VecDeque};
 use std::hash::Hasher;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 
+use hashlink::LinkedHashMap;
 use parking_lot::Mutex;
 
 use super::key::{BlockCacheKey, CachePriority};
@@ -36,12 +36,11 @@ pub struct BlockCacheStats {
 struct BlockEntry {
     value: BlockCacheValue,
     charge: usize,
-    priority: CachePriority,
 }
 
 struct BlockShard {
-    map: HashMap<BlockCacheKey, BlockEntry>,
-    lru: VecDeque<BlockCacheKey>,
+    normal: LinkedHashMap<BlockCacheKey, BlockEntry>,
+    high: LinkedHashMap<BlockCacheKey, BlockEntry>,
     usage: usize,
     capacity: usize,
 }
@@ -49,41 +48,32 @@ struct BlockShard {
 impl BlockShard {
     fn with_capacity(capacity: usize) -> Self {
         Self {
-            map: HashMap::new(),
-            lru: VecDeque::new(),
+            normal: LinkedHashMap::new(),
+            high: LinkedHashMap::new(),
             usage: 0,
             capacity,
         }
     }
 
-    fn touch(&mut self, key: BlockCacheKey) {
-        self.lru.retain(|k| *k != key);
-        self.lru.push_back(key);
+    fn remove_existing(&mut self, key: &BlockCacheKey) {
+        if let Some(old) = self.normal.remove(key).or_else(|| self.high.remove(key)) {
+            self.usage = self.usage.saturating_sub(old.charge);
+        }
     }
 
     fn get(&mut self, key: &BlockCacheKey) -> Option<BlockCacheValue> {
-        let value = self.map.get(key).map(|entry| Arc::clone(&entry.value))?;
-        self.touch(*key);
-        Some(value)
+        if let Some(entry) = self.normal.to_back(key) {
+            return Some(Arc::clone(&entry.value));
+        }
+        self.high.to_back(key).map(|entry| Arc::clone(&entry.value))
     }
 
     fn evict_one_normal_first(&mut self) -> bool {
-        if self.map.is_empty() {
-            return false;
+        if let Some((_, entry)) = self.normal.pop_front() {
+            self.usage = self.usage.saturating_sub(entry.charge);
+            return true;
         }
-
-        let normal_victim = self.lru.iter().copied().find(|k| {
-            self.map
-                .get(k)
-                .is_some_and(|entry| entry.priority == CachePriority::Normal)
-        });
-        let victim = normal_victim.or_else(|| self.lru.front().copied());
-        let Some(victim) = victim else {
-            return false;
-        };
-
-        self.lru.retain(|k| *k != victim);
-        if let Some(entry) = self.map.remove(&victim) {
+        if let Some((_, entry)) = self.high.pop_front() {
             self.usage = self.usage.saturating_sub(entry.charge);
             return true;
         }
@@ -101,10 +91,7 @@ impl BlockShard {
             return (false, 0);
         }
 
-        if let Some(old) = self.map.remove(&key) {
-            self.usage = self.usage.saturating_sub(old.charge);
-            self.lru.retain(|k| *k != key);
-        }
+        self.remove_existing(&key);
 
         let mut evicted = 0;
         while self.usage + charge > self.capacity {
@@ -114,31 +101,42 @@ impl BlockShard {
             evicted += 1;
         }
 
-        self.map.insert(
-            key,
-            BlockEntry {
-                value,
-                charge,
-                priority,
-            },
-        );
-        self.touch(key);
+        let entry = BlockEntry { value, charge };
+        match priority {
+            CachePriority::Normal => {
+                self.normal.insert(key, entry);
+            }
+            CachePriority::High => {
+                self.high.insert(key, entry);
+            }
+        }
         self.usage += charge;
         (true, evicted)
     }
 
     fn remove_by_sst(&mut self, ns: u128, sst_id: u64) {
-        let victims: Vec<BlockCacheKey> = self
-            .map
+        let normal_victims: Vec<BlockCacheKey> = self
+            .normal
             .keys()
             .copied()
             .filter(|k| k.ns == ns && k.sst_id == sst_id)
             .collect();
-        for key in victims {
-            if let Some(entry) = self.map.remove(&key) {
+        for key in normal_victims {
+            if let Some(entry) = self.normal.remove(&key) {
                 self.usage = self.usage.saturating_sub(entry.charge);
             }
-            self.lru.retain(|k| *k != key);
+        }
+
+        let high_victims: Vec<BlockCacheKey> = self
+            .high
+            .keys()
+            .copied()
+            .filter(|k| k.ns == ns && k.sst_id == sst_id)
+            .collect();
+        for key in high_victims {
+            if let Some(entry) = self.high.remove(&key) {
+                self.usage = self.usage.saturating_sub(entry.charge);
+            }
         }
     }
 }
@@ -234,6 +232,8 @@ impl SharedBlockCache {
 mod tests {
     use super::*;
     use crate::tablet::cache::{BlockCacheKey, BlockKind, CachePriority};
+    use std::sync::{Arc, Barrier};
+    use std::thread;
 
     fn key(ns: u128, sst_id: u64, offset: u64, kind: BlockKind) -> BlockCacheKey {
         BlockCacheKey {
@@ -355,5 +355,56 @@ mod tests {
         assert!(cache.get(&keep).is_some());
         assert!(cache.get(&drop1).is_none());
         assert!(cache.get(&drop2).is_none());
+    }
+
+    #[test]
+    fn test_block_cache_concurrent_get_insert_and_remove_sst() {
+        let cache = Arc::new(SharedBlockCache::new(16 * 1024));
+        let keep = key(3, 200, 0, BlockKind::Data);
+        let drop = key(4, 300, 0, BlockKind::Data);
+        assert!(cache.insert(
+            keep,
+            Arc::<[u8]>::from(vec![9u8; 32]),
+            32,
+            CachePriority::High
+        ));
+        assert!(cache.insert(
+            drop,
+            Arc::<[u8]>::from(vec![8u8; 32]),
+            32,
+            CachePriority::Normal
+        ));
+
+        let workers = 6usize;
+        let start = Arc::new(Barrier::new(workers + 1));
+        let mut handles = Vec::with_capacity(workers);
+        for worker in 0..workers {
+            let cache = Arc::clone(&cache);
+            let start = Arc::clone(&start);
+            handles.push(thread::spawn(move || {
+                start.wait();
+                for i in 0..500 {
+                    let _ = cache.get(&keep);
+                    let _ = cache.get(&drop);
+                    let k = key(3, 200 + worker as u64 + 1, i as u64, BlockKind::Data);
+                    let _ = cache.insert(
+                        k,
+                        Arc::<[u8]>::from(vec![worker as u8; 24]),
+                        24,
+                        CachePriority::Normal,
+                    );
+                }
+            }));
+        }
+
+        start.wait();
+        cache.remove_sst(4, 300);
+
+        for handle in handles {
+            handle.join().unwrap();
+        }
+
+        assert!(cache.get(&keep).is_some());
+        assert!(cache.get(&drop).is_none());
     }
 }

@@ -12,8 +12,9 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-use std::hash::{Hash, Hasher};
 use std::path::Path;
+
+use crate::util::stable_hash64;
 
 /// Tablet namespace used by cache keys.
 pub type TabletCacheNs = u128;
@@ -59,18 +60,13 @@ pub struct RowCacheKey {
 
 /// Stable namespace derived from a tablet's data directory.
 pub fn tablet_namespace_from_dir(dir: &Path) -> TabletCacheNs {
-    // Build 128-bit tag from two independent 64-bit hashes.
+    const NS_SEED_HI: u64 = 0x5449_5351_4c2d_4e31; // "TISQL-N1"
+    const NS_SEED_LO: u64 = 0x5449_5351_4c2d_4e32; // "TISQL-N2"
+
     let dir = dir.to_string_lossy();
-
-    let mut h1 = std::collections::hash_map::DefaultHasher::new();
-    "tisql-cache-ns-v1".hash(&mut h1);
-    dir.hash(&mut h1);
-
-    let mut h2 = std::collections::hash_map::DefaultHasher::new();
-    "tisql-cache-ns-v2".hash(&mut h2);
-    dir.hash(&mut h2);
-
-    ((h1.finish() as u128) << 64) | h2.finish() as u128
+    let h1 = stable_hash64(NS_SEED_HI, dir.as_bytes());
+    let h2 = stable_hash64(NS_SEED_LO, dir.as_bytes());
+    ((h1 as u128) << 64) | h2 as u128
 }
 
 #[cfg(test)]
@@ -82,6 +78,14 @@ mod tests {
         let a = tablet_namespace_from_dir(Path::new("/tmp/tisql/tablet-1"));
         let b = tablet_namespace_from_dir(Path::new("/tmp/tisql/tablet-1"));
         assert_eq!(a, b);
+    }
+
+    #[test]
+    fn test_tablet_namespace_from_dir_known_vector() {
+        assert_eq!(
+            tablet_namespace_from_dir(Path::new("/tmp/tisql/tablet-1")),
+            0x0238_e363_4248_fde9_bce2_2145_81e4_15cb
+        );
     }
 
     #[test]

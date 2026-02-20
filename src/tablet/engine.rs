@@ -1484,35 +1484,44 @@ impl LsmEngine {
         }
     }
 
-    async fn open_point_reader(&self, sst_path: &Path, sst_id: u64) -> Result<SstReaderRef> {
+    async fn open_point_reader(
+        &self,
+        sst_path: &Path,
+        sst_id: u64,
+        fill_cache: bool,
+    ) -> Result<SstReaderRef> {
         let cache_suite = self.cache_suite();
-        if let Some(reader_cache) = cache_suite.as_ref().and_then(|suite| suite.reader_cache()) {
-            let key = ReaderCacheKey {
-                ns: self.tablet_cache_ns,
-                sst_id,
-            };
-            if let Some(reader) = reader_cache.get_typed::<SstReaderRef>(&key) {
-                return Ok((*reader).clone());
-            }
+        if fill_cache {
+            if let Some(reader_cache) = cache_suite.as_ref().and_then(|suite| suite.reader_cache())
+            {
+                let key = ReaderCacheKey {
+                    ns: self.tablet_cache_ns,
+                    sst_id,
+                };
+                if let Some(reader) = reader_cache.get_typed::<SstReaderRef>(&key) {
+                    return Ok((*reader).clone());
+                }
 
-            let options = SstReadOptions {
-                tablet_tag: self.tablet_cache_ns,
-                sst_id,
-                bloom_enabled: self.config.bloom_enabled,
-                fill_cache: true,
-                block_cache: cache_suite.as_ref().and_then(|suite| suite.block_cache()),
-            };
-            let reader =
-                SstReaderRef::open_with_options(sst_path, Arc::clone(&self.io), options).await?;
-            reader_cache.insert_typed(key, Arc::new(reader.clone()));
-            return Ok(reader);
+                let options = SstReadOptions {
+                    tablet_tag: self.tablet_cache_ns,
+                    sst_id,
+                    bloom_enabled: self.config.bloom_enabled,
+                    fill_cache,
+                    block_cache: cache_suite.as_ref().and_then(|suite| suite.block_cache()),
+                };
+                let reader =
+                    SstReaderRef::open_with_options(sst_path, Arc::clone(&self.io), options)
+                        .await?;
+                reader_cache.insert_typed(key, Arc::new(reader.clone()));
+                return Ok(reader);
+            }
         }
 
         let options = SstReadOptions {
             tablet_tag: self.tablet_cache_ns,
             sst_id,
             bloom_enabled: self.config.bloom_enabled,
-            fill_cache: true,
+            fill_cache,
             block_cache: cache_suite.and_then(|suite| suite.block_cache()),
         };
         SstReaderRef::open_with_options(sst_path, Arc::clone(&self.io), options).await
@@ -1554,7 +1563,7 @@ impl LsmEngine {
 
             // SST now contains MVCC keys - iterate to find matching key with ts visibility
             // Propagate errors instead of silently ignoring (risks wrong reads)
-            let reader = self.open_point_reader(&sst_path, sst_meta.id).await?;
+            let reader = self.open_point_reader(&sst_path, sst_meta.id, true).await?;
             if self.config.bloom_enabled && !reader.may_contain_user_key(key).await? {
                 continue;
             }
