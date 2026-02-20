@@ -26,12 +26,13 @@
 use std::future::Future;
 use std::pin::Pin;
 
-use crate::catalog::types::{ColumnId, ColumnInfo, DataType, Row, Schema, Value};
-use crate::catalog::Catalog;
+use crate::catalog::types::{ColumnId, ColumnInfo, DataType, Key, Row, Schema, TableId, Value};
+use crate::catalog::{Catalog, TableDef};
 use crate::session::ExecutionCtx;
 use crate::sql::{AggFunc, BinaryOp, Expr, LogicalPlan, OrderByExpr, UnaryOp};
 use crate::tablet::{
-    decode_row_to_values, encode_int_key, encode_key, encode_pk, encode_row, MvccIterator,
+    decode_row_to_values, encode_int_key, encode_key, encode_pk, encode_row, next_key_bound,
+    MvccIterator,
 };
 use crate::transaction::{TxnCtx, TxnService};
 use crate::util::error::{Result, TiSqlError};
@@ -699,7 +700,18 @@ async fn build_read_operator<T: TxnService>(
                     .collect(),
             );
 
-            let iter = txn_service.scan_iter(ctx, table_id, start_key..end_key)?;
+            let scan_range = match filter
+                .as_ref()
+                .and_then(|predicate| extract_pk_scan_range(&table, predicate))
+            {
+                Some(PkScanRange::Empty) => {
+                    return Ok(Operator::Empty(EmptyOp { schema }));
+                }
+                Some(PkScanRange::Bounded(range)) => range,
+                None => start_key..end_key,
+            };
+
+            let iter = txn_service.scan_iter(ctx, table_id, scan_range)?;
 
             Ok(Operator::Scan(ScanOp {
                 iter,
@@ -833,6 +845,334 @@ async fn build_read_operator<T: TxnService>(
             "Unsupported read plan: {:?}",
             std::mem::discriminant(&other)
         ))),
+    }
+}
+
+enum DmlReadPlan {
+    Empty,
+    PointGet {
+        key: Key,
+        filter: Option<Expr>,
+    },
+    Scan {
+        range: std::ops::Range<Key>,
+        filter: Option<Expr>,
+    },
+}
+
+enum PkScanRange {
+    Empty,
+    Bounded(std::ops::Range<Key>),
+}
+
+#[derive(Clone)]
+struct PkBound {
+    encoded: Vec<u8>,
+    inclusive: bool,
+}
+
+fn conjoin_predicate(existing: Option<Expr>, predicate: Expr) -> Option<Expr> {
+    match existing {
+        Some(prev) => Some(Expr::BinaryOp {
+            left: Box::new(prev),
+            op: BinaryOp::And,
+            right: Box::new(predicate),
+        }),
+        None => Some(predicate),
+    }
+}
+
+fn row_matches_filter(filter: Option<&Expr>, row: &Row) -> Result<bool> {
+    let Some(predicate) = filter else {
+        return Ok(true);
+    };
+    let result = eval_expr(predicate, row)?;
+    value_to_bool(&result)
+}
+
+async fn collect_scan_rows<T: TxnService>(
+    txn_service: &T,
+    ctx: &TxnCtx,
+    table_id: TableId,
+    range: std::ops::Range<Key>,
+    col_ids: &[ColumnId],
+    data_types: &[DataType],
+) -> Result<Vec<(Key, Vec<Value>)>> {
+    let mut iter = txn_service.scan_iter(ctx, table_id, range)?;
+    iter.advance().await?;
+
+    let mut rows = Vec::new();
+    while iter.valid() {
+        let key = iter.user_key().to_vec();
+        let values = decode_row_to_values(iter.value(), col_ids, data_types)?;
+        rows.push((key, values));
+        iter.advance().await?;
+    }
+    Ok(rows)
+}
+
+fn collect_conjuncts<'a>(expr: &'a Expr, out: &mut Vec<&'a Expr>) {
+    match expr {
+        Expr::BinaryOp {
+            left,
+            op: BinaryOp::And,
+            right,
+        } => {
+            collect_conjuncts(left, out);
+            collect_conjuncts(right, out);
+        }
+        _ => out.push(expr),
+    }
+}
+
+fn point_get_literal_matches_pk(pk_type: &DataType, literal: &Value) -> bool {
+    match (pk_type, literal) {
+        (_, Value::Null) => false,
+        (DataType::Boolean, Value::Boolean(_)) => true,
+        (
+            DataType::TinyInt | DataType::SmallInt | DataType::Int | DataType::BigInt,
+            Value::TinyInt(_) | Value::SmallInt(_) | Value::Int(_) | Value::BigInt(_),
+        ) => true,
+        (DataType::Float | DataType::Double, Value::Float(_) | Value::Double(_)) => true,
+        (DataType::Decimal { .. }, Value::Decimal(_)) => true,
+        (DataType::Char(_) | DataType::Varchar(_) | DataType::Text, Value::String(_)) => true,
+        (DataType::Blob, Value::Bytes(_)) => true,
+        (DataType::Date, Value::Date(_)) => true,
+        (DataType::Time, Value::Time(_)) => true,
+        (DataType::DateTime, Value::DateTime(_)) => true,
+        (DataType::Timestamp, Value::Timestamp(_)) => true,
+        _ => false,
+    }
+}
+
+fn normalize_pk_comparison(expr: &Expr, pk_column_idx: usize) -> Option<(BinaryOp, &Value)> {
+    let Expr::BinaryOp { left, op, right } = expr else {
+        return None;
+    };
+
+    match (left.as_ref(), right.as_ref()) {
+        (Expr::Column { column_idx, .. }, Expr::Literal(literal))
+            if *column_idx == pk_column_idx =>
+        {
+            Some((*op, literal))
+        }
+        (Expr::Literal(literal), Expr::Column { column_idx, .. })
+            if *column_idx == pk_column_idx =>
+        {
+            let normalized = match op {
+                BinaryOp::Eq => BinaryOp::Eq,
+                BinaryOp::Lt => BinaryOp::Gt,
+                BinaryOp::Le => BinaryOp::Ge,
+                BinaryOp::Gt => BinaryOp::Lt,
+                BinaryOp::Ge => BinaryOp::Le,
+                _ => return None,
+            };
+            Some((normalized, literal))
+        }
+        _ => None,
+    }
+}
+
+fn combine_lower(existing: Option<PkBound>, candidate: PkBound) -> Option<PkBound> {
+    match existing {
+        None => Some(candidate),
+        Some(current) => match current.encoded.cmp(&candidate.encoded) {
+            std::cmp::Ordering::Less => Some(candidate),
+            std::cmp::Ordering::Greater => Some(current),
+            std::cmp::Ordering::Equal => Some(PkBound {
+                encoded: current.encoded,
+                inclusive: current.inclusive && candidate.inclusive,
+            }),
+        },
+    }
+}
+
+fn combine_upper(existing: Option<PkBound>, candidate: PkBound) -> Option<PkBound> {
+    match existing {
+        None => Some(candidate),
+        Some(current) => match current.encoded.cmp(&candidate.encoded) {
+            std::cmp::Ordering::Less => Some(current),
+            std::cmp::Ordering::Greater => Some(candidate),
+            std::cmp::Ordering::Equal => Some(PkBound {
+                encoded: current.encoded,
+                inclusive: current.inclusive && candidate.inclusive,
+            }),
+        },
+    }
+}
+
+fn extract_pk_scan_range(table: &TableDef, filter: &Expr) -> Option<PkScanRange> {
+    let pk_indices = table.pk_column_indices();
+    if pk_indices.len() != 1 {
+        return None;
+    }
+    let pk_column_idx = pk_indices[0];
+    let pk_column = table.columns().get(pk_column_idx)?;
+
+    let mut lower: Option<PkBound> = None;
+    let mut upper: Option<PkBound> = None;
+
+    let mut conjuncts = Vec::new();
+    collect_conjuncts(filter, &mut conjuncts);
+    let mut found_pk_predicate = false;
+
+    for conjunct in conjuncts {
+        let Some((op, literal)) = normalize_pk_comparison(conjunct, pk_column_idx) else {
+            continue;
+        };
+        if !point_get_literal_matches_pk(pk_column.data_type(), literal) {
+            continue;
+        }
+
+        let encoded = encode_pk(std::slice::from_ref(literal));
+        found_pk_predicate = true;
+
+        match op {
+            BinaryOp::Eq => {
+                let bound = PkBound {
+                    encoded,
+                    inclusive: true,
+                };
+                lower = combine_lower(lower, bound.clone());
+                upper = combine_upper(upper, bound);
+            }
+            BinaryOp::Gt => {
+                lower = combine_lower(
+                    lower,
+                    PkBound {
+                        encoded,
+                        inclusive: false,
+                    },
+                );
+            }
+            BinaryOp::Ge => {
+                lower = combine_lower(
+                    lower,
+                    PkBound {
+                        encoded,
+                        inclusive: true,
+                    },
+                );
+            }
+            BinaryOp::Lt => {
+                upper = combine_upper(
+                    upper,
+                    PkBound {
+                        encoded,
+                        inclusive: false,
+                    },
+                );
+            }
+            BinaryOp::Le => {
+                upper = combine_upper(
+                    upper,
+                    PkBound {
+                        encoded,
+                        inclusive: true,
+                    },
+                );
+            }
+            _ => {}
+        }
+    }
+
+    if !found_pk_predicate {
+        return None;
+    }
+
+    if let (Some(l), Some(u)) = (&lower, &upper) {
+        match l.encoded.cmp(&u.encoded) {
+            std::cmp::Ordering::Greater => return Some(PkScanRange::Empty),
+            std::cmp::Ordering::Equal if !l.inclusive || !u.inclusive => {
+                return Some(PkScanRange::Empty);
+            }
+            _ => {}
+        }
+    }
+
+    let table_start = encode_key(table.id(), &[]);
+    let table_end = encode_key(table.id() + 1, &[]);
+
+    let mut range_start = table_start;
+    if let Some(l) = lower {
+        range_start = encode_key(table.id(), &l.encoded);
+        if !l.inclusive && !next_key_bound(&mut range_start) {
+            return Some(PkScanRange::Empty);
+        }
+    }
+
+    let mut range_end = table_end.clone();
+    if let Some(u) = upper {
+        range_end = encode_key(table.id(), &u.encoded);
+        if u.inclusive && !next_key_bound(&mut range_end) {
+            range_end = table_end;
+        }
+    }
+
+    if range_start >= range_end {
+        return Some(PkScanRange::Empty);
+    }
+
+    Some(PkScanRange::Bounded(range_start..range_end))
+}
+
+fn build_dml_read_plan(input: LogicalPlan, table: &TableDef) -> Result<DmlReadPlan> {
+    let mut filter = None;
+    let mut current = input;
+
+    loop {
+        match current {
+            LogicalPlan::Filter { input, predicate } => {
+                filter = conjoin_predicate(filter, predicate);
+                current = *input;
+            }
+            LogicalPlan::Scan {
+                table: scan_table,
+                filter: scan_filter,
+                ..
+            } => {
+                if scan_table.id() != table.id() {
+                    return Err(TiSqlError::Execution(
+                        "DML input scan table does not match target table".into(),
+                    ));
+                }
+
+                if let Some(scan_filter) = scan_filter {
+                    filter = conjoin_predicate(filter, scan_filter);
+                }
+
+                let table_start = encode_key(table.id(), &[]);
+                let table_end = encode_key(table.id() + 1, &[]);
+                let range = match filter
+                    .as_ref()
+                    .and_then(|predicate| extract_pk_scan_range(table, predicate))
+                {
+                    Some(PkScanRange::Empty) => return Ok(DmlReadPlan::Empty),
+                    Some(PkScanRange::Bounded(range)) => range,
+                    None => table_start..table_end,
+                };
+
+                return Ok(DmlReadPlan::Scan { range, filter });
+            }
+            LogicalPlan::PointGet {
+                table: point_get_table,
+                key,
+            } => {
+                if point_get_table.id() != table.id() {
+                    return Err(TiSqlError::Execution(
+                        "DML input point-get table does not match target table".into(),
+                    ));
+                }
+                return Ok(DmlReadPlan::PointGet { key, filter });
+            }
+            LogicalPlan::Empty { .. } => return Ok(DmlReadPlan::Empty),
+            other => {
+                return Err(TiSqlError::Execution(format!(
+                    "Unsupported DML input plan: {:?}",
+                    std::mem::discriminant(&other)
+                )));
+            }
+        }
     }
 }
 
@@ -1135,6 +1475,7 @@ impl SimpleExecutor {
                 table,
                 columns,
                 values,
+                ignore,
             } => {
                 let pk_indices = table.pk_column_indices();
                 let mut count = 0u64;
@@ -1188,6 +1529,10 @@ impl SimpleExecutor {
 
                     // Check for duplicate primary key
                     if txn_service.get(ctx, table.id(), &key).await?.is_some() {
+                        if ignore {
+                            txn_service.lock_key(ctx, table.id(), key).await?;
+                            continue;
+                        }
                         let pk_desc = if pk_indices.is_empty() {
                             format!("row_id={}", row_id_for_key.unwrap_or(0))
                         } else {
@@ -1213,136 +1558,318 @@ impl SimpleExecutor {
                 Ok(ExecutionOutput::Affected { count })
             }
 
-            LogicalPlan::Delete { table, filter } => {
+            LogicalPlan::Delete { table, input } => {
                 let table_id = table.id();
-                let start_key = encode_key(table_id, &[]);
-                let end_key = encode_key(table_id + 1, &[]);
-
                 let col_ids: Vec<ColumnId> = table.columns().iter().map(|c| c.id()).collect();
                 let data_types: Vec<DataType> = table
                     .columns()
                     .iter()
                     .map(|c| c.data_type().clone())
                     .collect();
-
                 let mut count = 0u64;
-
-                // Scan using transaction's snapshot (reads at start_ts)
-                // Use zero-copy streaming iteration - process one row at a time
-                let mut iter = txn_service.scan_iter(ctx, table_id, start_key..end_key)?;
-
-                iter.advance().await?; // Position on first entry
-                while iter.valid() {
-                    // Zero-copy: references to underlying storage
-                    let key = iter.user_key();
-                    let value = iter.value();
-                    let values = decode_row_to_values(value, &col_ids, &data_types)?;
-                    let row = Row::new(values);
-
-                    // Apply filter
-                    if let Some(ref filter_expr) = filter {
-                        let result = eval_expr(filter_expr, &row)?;
-                        if !value_to_bool(&result)? {
-                            iter.advance().await?;
-                            continue;
+                match build_dml_read_plan(*input, &table)? {
+                    DmlReadPlan::Empty => {}
+                    DmlReadPlan::PointGet { key, filter } => {
+                        if let Some(value) = txn_service.get(ctx, table_id, &key).await? {
+                            let values = decode_row_to_values(&value, &col_ids, &data_types)?;
+                            let row = Row::new(values);
+                            if row_matches_filter(filter.as_ref(), &row)? {
+                                txn_service.delete(ctx, table_id, key).await?;
+                                count += 1;
+                            } else {
+                                txn_service.lock_key(ctx, table_id, key).await?;
+                            }
                         }
                     }
-
-                    // Buffer delete in transaction (need to clone key for ownership)
-                    txn_service.delete(ctx, table_id, key.to_vec()).await?;
-                    count += 1;
-                    iter.advance().await?;
+                    DmlReadPlan::Scan { range, filter } => {
+                        if ctx.is_explicit() {
+                            let scanned_rows = collect_scan_rows(
+                                txn_service,
+                                &*ctx,
+                                table_id,
+                                range,
+                                &col_ids,
+                                &data_types,
+                            )
+                            .await?;
+                            for (key, values) in scanned_rows {
+                                let row = Row::new(values);
+                                if row_matches_filter(filter.as_ref(), &row)? {
+                                    txn_service.delete(ctx, table_id, key).await?;
+                                    count += 1;
+                                } else {
+                                    txn_service.lock_key(ctx, table_id, key).await?;
+                                }
+                            }
+                        } else {
+                            let mut iter = txn_service.scan_iter(ctx, table_id, range)?;
+                            iter.advance().await?;
+                            while iter.valid() {
+                                let key = iter.user_key();
+                                let values =
+                                    decode_row_to_values(iter.value(), &col_ids, &data_types)?;
+                                let row = Row::new(values);
+                                if row_matches_filter(filter.as_ref(), &row)? {
+                                    txn_service.delete(ctx, table_id, key.to_vec()).await?;
+                                    count += 1;
+                                } else {
+                                    txn_service.lock_key(ctx, table_id, key.to_vec()).await?;
+                                }
+                                iter.advance().await?;
+                            }
+                        }
+                    }
                 }
-
                 Ok(ExecutionOutput::Affected { count })
             }
 
             LogicalPlan::Update {
                 table,
                 assignments,
-                filter,
+                input,
             } => {
                 let table_id = table.id();
                 let pk_indices = table.pk_column_indices();
-                let start_key = encode_key(table_id, &[]);
-                let end_key = encode_key(table_id + 1, &[]);
-
+                let pk_column_ids: Vec<ColumnId> = pk_indices
+                    .iter()
+                    .map(|&idx| table.columns()[idx].id())
+                    .collect();
+                let pk_assigned = assignments
+                    .iter()
+                    .any(|(col_id, _)| pk_column_ids.contains(col_id));
                 let col_ids: Vec<ColumnId> = table.columns().iter().map(|c| c.id()).collect();
                 let data_types: Vec<DataType> = table
                     .columns()
                     .iter()
                     .map(|c| c.data_type().clone())
                     .collect();
-
                 let mut count = 0u64;
 
-                // Scan using transaction's snapshot
-                // Use zero-copy streaming iteration - process one row at a time
-                let mut iter = txn_service.scan_iter(ctx, table_id, start_key..end_key)?;
+                match build_dml_read_plan(*input, &table)? {
+                    DmlReadPlan::Empty => {}
+                    DmlReadPlan::PointGet { key, filter } => {
+                        if let Some(value) = txn_service.get(ctx, table_id, &key).await? {
+                            let original_values =
+                                decode_row_to_values(&value, &col_ids, &data_types)?;
+                            let mut row = Row::new(original_values.clone());
+                            if row_matches_filter(filter.as_ref(), &row)? {
+                                for (col_id, expr) in &assignments {
+                                    let col_idx = table
+                                        .columns()
+                                        .iter()
+                                        .position(|c| c.id() == *col_id)
+                                        .ok_or_else(|| {
+                                            TiSqlError::ColumnNotFound(format!("id={col_id}"))
+                                        })?;
+                                    let new_value = eval_expr(expr, &row)?;
+                                    row.set(col_idx, new_value);
+                                }
 
-                iter.advance().await?; // Position on first entry
-                while iter.valid() {
-                    // Zero-copy: references to underlying storage
-                    let key_ref = iter.user_key();
-                    let value = iter.value();
-                    let values = decode_row_to_values(value, &col_ids, &data_types)?;
-                    let mut row = Row::new(values);
+                                let new_key = if pk_indices.is_empty() || !pk_assigned {
+                                    key.clone()
+                                } else {
+                                    let pk_values: Vec<_> = pk_indices
+                                        .iter()
+                                        .map(|&i| row.get(i).cloned().unwrap_or(Value::Null))
+                                        .collect();
+                                    encode_key(table_id, &encode_pk(&pk_values))
+                                };
 
-                    // Apply filter
-                    if let Some(ref filter_expr) = filter {
-                        let result = eval_expr(filter_expr, &row)?;
-                        if !value_to_bool(&result)? {
+                                let row_unchanged =
+                                    new_key == key && row.values() == original_values.as_slice();
+                                if row_unchanged {
+                                    txn_service.lock_key(ctx, table_id, key.clone()).await?;
+                                } else {
+                                    if pk_assigned
+                                        && !pk_indices.is_empty()
+                                        && new_key != key
+                                        && txn_service.get(ctx, table_id, &new_key).await?.is_some()
+                                    {
+                                        let pk_values: Vec<_> = pk_indices
+                                            .iter()
+                                            .map(|&i| row.get(i).cloned().unwrap_or(Value::Null))
+                                            .collect();
+                                        return Err(TiSqlError::DuplicateKey(format!(
+                                            "Duplicate entry '{pk_values:?}' for key '{}.PRIMARY'",
+                                            table.name()
+                                        )));
+                                    }
+
+                                    if pk_assigned && !pk_indices.is_empty() && new_key != key {
+                                        txn_service.delete(ctx, table_id, key.clone()).await?;
+                                    }
+                                    let new_value = encode_row(&col_ids, row.values());
+                                    txn_service.put(ctx, table_id, new_key, new_value).await?;
+                                }
+                                count += 1;
+                            } else {
+                                txn_service.lock_key(ctx, table_id, key).await?;
+                            }
+                        }
+                    }
+                    DmlReadPlan::Scan { range, filter } => {
+                        if ctx.is_explicit() {
+                            let scanned_rows = collect_scan_rows(
+                                txn_service,
+                                &*ctx,
+                                table_id,
+                                range,
+                                &col_ids,
+                                &data_types,
+                            )
+                            .await?;
+                            for (old_key, original_values) in scanned_rows {
+                                let mut row = Row::new(original_values.clone());
+
+                                if row_matches_filter(filter.as_ref(), &row)? {
+                                    for (col_id, expr) in &assignments {
+                                        let col_idx = table
+                                            .columns()
+                                            .iter()
+                                            .position(|c| c.id() == *col_id)
+                                            .ok_or_else(|| {
+                                                TiSqlError::ColumnNotFound(format!("id={col_id}"))
+                                            })?;
+                                        let new_value = eval_expr(expr, &row)?;
+                                        row.set(col_idx, new_value);
+                                    }
+
+                                    let new_key = if pk_indices.is_empty() || !pk_assigned {
+                                        old_key.clone()
+                                    } else {
+                                        let pk_values: Vec<_> = pk_indices
+                                            .iter()
+                                            .map(|&i| row.get(i).cloned().unwrap_or(Value::Null))
+                                            .collect();
+                                        encode_key(table_id, &encode_pk(&pk_values))
+                                    };
+
+                                    let row_unchanged = new_key == old_key
+                                        && row.values() == original_values.as_slice();
+                                    if row_unchanged {
+                                        txn_service
+                                            .lock_key(ctx, table_id, old_key.clone())
+                                            .await?;
+                                    } else {
+                                        if pk_assigned
+                                            && !pk_indices.is_empty()
+                                            && new_key != old_key
+                                            && txn_service
+                                                .get(ctx, table_id, &new_key)
+                                                .await?
+                                                .is_some()
+                                        {
+                                            let pk_values: Vec<_> = pk_indices
+                                                .iter()
+                                                .map(|&i| {
+                                                    row.get(i).cloned().unwrap_or(Value::Null)
+                                                })
+                                                .collect();
+                                            return Err(TiSqlError::DuplicateKey(format!(
+                                                "Duplicate entry '{pk_values:?}' for key '{}.PRIMARY'",
+                                                table.name()
+                                            )));
+                                        }
+
+                                        if pk_assigned
+                                            && !pk_indices.is_empty()
+                                            && new_key != old_key
+                                        {
+                                            txn_service
+                                                .delete(ctx, table_id, old_key.clone())
+                                                .await?;
+                                        }
+
+                                        let new_value = encode_row(&col_ids, row.values());
+                                        txn_service.put(ctx, table_id, new_key, new_value).await?;
+                                    }
+                                    count += 1;
+                                } else {
+                                    txn_service.lock_key(ctx, table_id, old_key).await?;
+                                }
+                            }
+                        } else {
+                            let mut iter = txn_service.scan_iter(ctx, table_id, range)?;
                             iter.advance().await?;
-                            continue;
+                            while iter.valid() {
+                                let key_ref = iter.user_key();
+                                let original_values =
+                                    decode_row_to_values(iter.value(), &col_ids, &data_types)?;
+                                let mut row = Row::new(original_values.clone());
+
+                                if row_matches_filter(filter.as_ref(), &row)? {
+                                    for (col_id, expr) in &assignments {
+                                        let col_idx = table
+                                            .columns()
+                                            .iter()
+                                            .position(|c| c.id() == *col_id)
+                                            .ok_or_else(|| {
+                                                TiSqlError::ColumnNotFound(format!("id={col_id}"))
+                                            })?;
+                                        let new_value = eval_expr(expr, &row)?;
+                                        row.set(col_idx, new_value);
+                                    }
+
+                                    let old_key = key_ref.to_vec();
+                                    let new_key = if pk_indices.is_empty() || !pk_assigned {
+                                        old_key.clone()
+                                    } else {
+                                        let pk_values: Vec<_> = pk_indices
+                                            .iter()
+                                            .map(|&i| row.get(i).cloned().unwrap_or(Value::Null))
+                                            .collect();
+                                        encode_key(table_id, &encode_pk(&pk_values))
+                                    };
+
+                                    let row_unchanged = new_key == old_key
+                                        && row.values() == original_values.as_slice();
+                                    if row_unchanged {
+                                        txn_service
+                                            .lock_key(ctx, table_id, old_key.clone())
+                                            .await?;
+                                    } else {
+                                        if pk_assigned
+                                            && !pk_indices.is_empty()
+                                            && new_key != old_key
+                                            && txn_service
+                                                .get(ctx, table_id, &new_key)
+                                                .await?
+                                                .is_some()
+                                        {
+                                            let pk_values: Vec<_> = pk_indices
+                                                .iter()
+                                                .map(|&i| {
+                                                    row.get(i).cloned().unwrap_or(Value::Null)
+                                                })
+                                                .collect();
+                                            return Err(TiSqlError::DuplicateKey(format!(
+                                                "Duplicate entry '{pk_values:?}' for key '{}.PRIMARY'",
+                                                table.name()
+                                            )));
+                                        }
+
+                                        if pk_assigned
+                                            && !pk_indices.is_empty()
+                                            && new_key != old_key
+                                        {
+                                            txn_service
+                                                .delete(ctx, table_id, old_key.clone())
+                                                .await?;
+                                        }
+
+                                        let new_value = encode_row(&col_ids, row.values());
+                                        txn_service.put(ctx, table_id, new_key, new_value).await?;
+                                    }
+                                    count += 1;
+                                } else {
+                                    txn_service
+                                        .lock_key(ctx, table_id, key_ref.to_vec())
+                                        .await?;
+                                }
+                                iter.advance().await?;
+                            }
                         }
                     }
-
-                    // Apply assignments
-                    for (col_id, expr) in &assignments {
-                        let col_idx = table
-                            .columns()
-                            .iter()
-                            .position(|c| c.id() == *col_id)
-                            .ok_or_else(|| TiSqlError::ColumnNotFound(format!("id={col_id}")))?;
-
-                        let new_value = eval_expr(expr, &row)?;
-                        row.set(col_idx, new_value);
-                    }
-
-                    // Compute new key if PK changed
-                    let new_key = if pk_indices.is_empty() {
-                        key_ref.to_vec() // Clone only when needed
-                    } else {
-                        let pk_values: Vec<_> = pk_indices
-                            .iter()
-                            .map(|&i| row.get(i).cloned().unwrap_or(Value::Null))
-                            .collect();
-                        let pk_bytes = encode_pk(&pk_values);
-                        encode_key(table_id, &pk_bytes)
-                    };
-
-                    // Check for duplicate key when PK changed
-                    if !pk_indices.is_empty() && new_key.as_slice() != key_ref {
-                        // Check if new key already exists (would conflict with another row)
-                        if txn_service.get(ctx, table_id, &new_key).await?.is_some() {
-                            let pk_values: Vec<_> = pk_indices
-                                .iter()
-                                .map(|&i| row.get(i).cloned().unwrap_or(Value::Null))
-                                .collect();
-                            return Err(TiSqlError::DuplicateKey(format!(
-                                "Duplicate entry '{pk_values:?}' for key '{}.PRIMARY'",
-                                table.name()
-                            )));
-                        }
-                        // Delete old key (need to clone for ownership)
-                        txn_service.delete(ctx, table_id, key_ref.to_vec()).await?;
-                    }
-
-                    // Write new row
-                    let new_value = encode_row(&col_ids, row.values());
-                    txn_service.put(ctx, table_id, new_key, new_value).await?;
-                    count += 1;
-                    iter.advance().await?;
                 }
 
                 Ok(ExecutionOutput::Affected { count })
@@ -1361,9 +1888,11 @@ mod tests {
     use std::ops::Range;
     use std::sync::atomic::{AtomicUsize, Ordering};
 
+    use parking_lot::Mutex;
+
     use super::*;
     use crate::catalog::types::{Lsn, RawValue, TableId, Timestamp, TxnId};
-    use crate::catalog::{ColumnDef, TableDef};
+    use crate::catalog::{ColumnDef, MemoryCatalog, TableDef};
     use crate::tablet::MvccKey;
     use crate::transaction::{CommitInfo, TxnState};
 
@@ -1397,9 +1926,14 @@ mod tests {
 
     struct MockPointGetTxnService {
         table_id: TableId,
-        expected_key: Vec<u8>,
+        expected_key: Option<Vec<u8>>,
         row_value: Option<RawValue>,
         get_calls: AtomicUsize,
+        scan_calls: AtomicUsize,
+        put_calls: AtomicUsize,
+        delete_calls: AtomicUsize,
+        lock_calls: AtomicUsize,
+        last_scan_range: Mutex<Option<Range<Vec<u8>>>>,
     }
 
     impl TxnService for MockPointGetTxnService {
@@ -1425,36 +1959,56 @@ mod tests {
         ) -> Result<Option<RawValue>> {
             self.get_calls.fetch_add(1, Ordering::SeqCst);
             assert_eq!(table_id, self.table_id);
-            assert_eq!(key, self.expected_key.as_slice());
+            if let Some(expected_key) = &self.expected_key {
+                assert_eq!(key, expected_key.as_slice());
+            }
             Ok(self.row_value.clone())
         }
 
         fn scan_iter(
             &self,
             _ctx: &TxnCtx,
-            _table_id: TableId,
-            _range: Range<Vec<u8>>,
+            table_id: TableId,
+            range: Range<Vec<u8>>,
         ) -> Result<Self::ScanIter> {
-            panic!("scan_iter should not be called for point-get plan")
+            assert_eq!(table_id, self.table_id);
+            self.scan_calls.fetch_add(1, Ordering::SeqCst);
+            *self.last_scan_range.lock() = Some(range);
+            Ok(DummyIter)
         }
 
         async fn put<'a>(
             &'a self,
             _ctx: &'a mut TxnCtx,
-            _table_id: TableId,
+            table_id: TableId,
             _key: Vec<u8>,
             _value: RawValue,
         ) -> Result<()> {
-            panic!("put should not be called in point-get read test")
+            assert_eq!(table_id, self.table_id);
+            self.put_calls.fetch_add(1, Ordering::SeqCst);
+            Ok(())
         }
 
         async fn delete<'a>(
             &'a self,
             _ctx: &'a mut TxnCtx,
-            _table_id: TableId,
+            table_id: TableId,
             _key: Vec<u8>,
         ) -> Result<()> {
-            panic!("delete should not be called in point-get read test")
+            assert_eq!(table_id, self.table_id);
+            self.delete_calls.fetch_add(1, Ordering::SeqCst);
+            Ok(())
+        }
+
+        async fn lock_key<'a>(
+            &'a self,
+            _ctx: &'a mut TxnCtx,
+            table_id: TableId,
+            _key: Vec<u8>,
+        ) -> Result<()> {
+            assert_eq!(table_id, self.table_id);
+            self.lock_calls.fetch_add(1, Ordering::SeqCst);
+            Ok(())
         }
 
         async fn commit(&self, _ctx: TxnCtx) -> Result<CommitInfo> {
@@ -1488,9 +2042,14 @@ mod tests {
 
         let service = MockPointGetTxnService {
             table_id: table.id(),
-            expected_key: key.clone(),
+            expected_key: Some(key.clone()),
             row_value: Some(row),
             get_calls: AtomicUsize::new(0),
+            scan_calls: AtomicUsize::new(0),
+            put_calls: AtomicUsize::new(0),
+            delete_calls: AtomicUsize::new(0),
+            lock_calls: AtomicUsize::new(0),
+            last_scan_range: Mutex::new(None),
         };
         let ctx = TxnCtx::new(11, 100, true);
 
@@ -1515,6 +2074,7 @@ mod tests {
         assert_eq!(first.get(1), Some(&Value::String("alice".into())));
         assert!(op.next().await.unwrap().is_none());
         assert_eq!(service.get_calls.load(Ordering::SeqCst), 1);
+        assert_eq!(service.scan_calls.load(Ordering::SeqCst), 0);
     }
 
     #[tokio::test]
@@ -1533,9 +2093,14 @@ mod tests {
 
         let service = MockPointGetTxnService {
             table_id: table.id(),
-            expected_key: key.clone(),
+            expected_key: Some(key.clone()),
             row_value: None,
             get_calls: AtomicUsize::new(0),
+            scan_calls: AtomicUsize::new(0),
+            put_calls: AtomicUsize::new(0),
+            delete_calls: AtomicUsize::new(0),
+            lock_calls: AtomicUsize::new(0),
+            last_scan_range: Mutex::new(None),
         };
         let ctx = TxnCtx::new(12, 101, true);
 
@@ -1546,5 +2111,539 @@ mod tests {
         op.open().await.unwrap();
         assert!(op.next().await.unwrap().is_none());
         assert_eq!(service.get_calls.load(Ordering::SeqCst), 1);
+        assert_eq!(service.scan_calls.load(Ordering::SeqCst), 0);
+    }
+
+    #[test]
+    fn test_extract_pk_scan_range_for_closed_interval() {
+        let table = TableDef::new(
+            202,
+            "t".to_string(),
+            "default".to_string(),
+            vec![
+                ColumnDef::new(1, "id".into(), DataType::BigInt, false, None, false),
+                ColumnDef::new(2, "name".into(), DataType::Varchar(32), true, None, false),
+            ],
+            vec![1],
+        );
+
+        let id_col = Expr::Column {
+            table_idx: None,
+            column_idx: 0,
+            name: "id".into(),
+            data_type: DataType::BigInt,
+        };
+        let predicate = Expr::BinaryOp {
+            left: Box::new(Expr::BinaryOp {
+                left: Box::new(id_col.clone()),
+                op: BinaryOp::Ge,
+                right: Box::new(Expr::Literal(Value::BigInt(1))),
+            }),
+            op: BinaryOp::And,
+            right: Box::new(Expr::BinaryOp {
+                left: Box::new(id_col),
+                op: BinaryOp::Le,
+                right: Box::new(Expr::Literal(Value::BigInt(5))),
+            }),
+        };
+
+        match extract_pk_scan_range(&table, &predicate) {
+            Some(PkScanRange::Bounded(range)) => {
+                let expected_start = encode_key(table.id(), &encode_pk(&[Value::BigInt(1)]));
+                let mut expected_end = encode_key(table.id(), &encode_pk(&[Value::BigInt(5)]));
+                assert!(next_key_bound(&mut expected_end));
+                assert_eq!(range.start, expected_start);
+                assert_eq!(range.end, expected_end);
+            }
+            _ => panic!("expected bounded pk range"),
+        }
+    }
+
+    #[test]
+    fn test_extract_pk_scan_range_accepts_integer_literal_type_mismatch() {
+        let table = TableDef::new(
+            203,
+            "t".to_string(),
+            "default".to_string(),
+            vec![
+                ColumnDef::new(1, "id".into(), DataType::Int, false, None, false),
+                ColumnDef::new(2, "name".into(), DataType::Varchar(32), true, None, false),
+            ],
+            vec![1],
+        );
+
+        let predicate = Expr::BinaryOp {
+            left: Box::new(Expr::Column {
+                table_idx: None,
+                column_idx: 0,
+                name: "id".into(),
+                data_type: DataType::Int,
+            }),
+            op: BinaryOp::Eq,
+            right: Box::new(Expr::Literal(Value::BigInt(7))),
+        };
+
+        match extract_pk_scan_range(&table, &predicate) {
+            Some(PkScanRange::Bounded(range)) => {
+                let expected_start = encode_key(table.id(), &encode_pk(&[Value::BigInt(7)]));
+                let mut expected_end = encode_key(table.id(), &encode_pk(&[Value::BigInt(7)]));
+                assert!(next_key_bound(&mut expected_end));
+                assert_eq!(range.start, expected_start);
+                assert_eq!(range.end, expected_end);
+            }
+            _ => panic!("expected bounded pk range"),
+        }
+    }
+
+    #[tokio::test]
+    async fn test_scan_operator_uses_pk_range_from_filter() {
+        let table = TableDef::new(
+            210,
+            "t".to_string(),
+            "default".to_string(),
+            vec![
+                ColumnDef::new(1, "id".into(), DataType::BigInt, false, None, false),
+                ColumnDef::new(2, "name".into(), DataType::Varchar(32), true, None, false),
+            ],
+            vec![1],
+        );
+
+        let id_col = Expr::Column {
+            table_idx: None,
+            column_idx: 0,
+            name: "id".into(),
+            data_type: DataType::BigInt,
+        };
+        let filter = Expr::BinaryOp {
+            left: Box::new(Expr::BinaryOp {
+                left: Box::new(id_col.clone()),
+                op: BinaryOp::Ge,
+                right: Box::new(Expr::Literal(Value::BigInt(1))),
+            }),
+            op: BinaryOp::And,
+            right: Box::new(Expr::BinaryOp {
+                left: Box::new(id_col),
+                op: BinaryOp::Le,
+                right: Box::new(Expr::Literal(Value::BigInt(5))),
+            }),
+        };
+
+        let service = MockPointGetTxnService {
+            table_id: table.id(),
+            expected_key: None,
+            row_value: None,
+            get_calls: AtomicUsize::new(0),
+            scan_calls: AtomicUsize::new(0),
+            put_calls: AtomicUsize::new(0),
+            delete_calls: AtomicUsize::new(0),
+            lock_calls: AtomicUsize::new(0),
+            last_scan_range: Mutex::new(None),
+        };
+        let ctx = TxnCtx::new(15, 150, true);
+
+        let mut op = build_read_operator(
+            LogicalPlan::Scan {
+                table: table.clone(),
+                projection: None,
+                filter: Some(filter),
+            },
+            &service,
+            &ctx,
+        )
+        .await
+        .unwrap();
+
+        op.open().await.unwrap();
+        assert!(op.next().await.unwrap().is_none());
+        assert_eq!(service.scan_calls.load(Ordering::SeqCst), 1);
+
+        let observed = service
+            .last_scan_range
+            .lock()
+            .clone()
+            .expect("scan range should be captured");
+        let expected_start = encode_key(table.id(), &encode_pk(&[Value::BigInt(1)]));
+        let mut expected_end = encode_key(table.id(), &encode_pk(&[Value::BigInt(5)]));
+        assert!(next_key_bound(&mut expected_end));
+        assert_eq!(observed.start, expected_start);
+        assert_eq!(observed.end, expected_end);
+    }
+
+    #[tokio::test]
+    async fn test_delete_point_get_non_matching_filter_locks_key() {
+        let table = TableDef::new(
+            220,
+            "t".to_string(),
+            "default".to_string(),
+            vec![
+                ColumnDef::new(1, "id".into(), DataType::BigInt, false, None, false),
+                ColumnDef::new(2, "name".into(), DataType::Varchar(32), true, None, false),
+            ],
+            vec![1],
+        );
+        let key = encode_key(table.id(), &encode_pk(&[Value::BigInt(7)]));
+        let row = encode_row(&[1, 2], &[Value::BigInt(7), Value::String("alice".into())]);
+
+        let service = MockPointGetTxnService {
+            table_id: table.id(),
+            expected_key: Some(key.clone()),
+            row_value: Some(row),
+            get_calls: AtomicUsize::new(0),
+            scan_calls: AtomicUsize::new(0),
+            put_calls: AtomicUsize::new(0),
+            delete_calls: AtomicUsize::new(0),
+            lock_calls: AtomicUsize::new(0),
+            last_scan_range: Mutex::new(None),
+        };
+
+        let mut ctx = TxnCtx::new(16, 160, false);
+        let plan = LogicalPlan::Delete {
+            table: table.clone(),
+            input: Box::new(LogicalPlan::Filter {
+                input: Box::new(LogicalPlan::PointGet {
+                    table,
+                    key: key.clone(),
+                }),
+                predicate: Expr::BinaryOp {
+                    left: Box::new(Expr::Column {
+                        table_idx: None,
+                        column_idx: 1,
+                        name: "name".into(),
+                        data_type: DataType::Varchar(32),
+                    }),
+                    op: BinaryOp::Eq,
+                    right: Box::new(Expr::Literal(Value::String("bob".into()))),
+                },
+            }),
+        };
+
+        let output = SimpleExecutor::new()
+            .execute_write_with_ctx(plan, &mut ctx, &service, &MemoryCatalog::new())
+            .await
+            .unwrap();
+
+        assert!(matches!(output, ExecutionOutput::Affected { count } if count == 0));
+        assert_eq!(service.get_calls.load(Ordering::SeqCst), 1);
+        assert_eq!(service.lock_calls.load(Ordering::SeqCst), 1);
+        assert_eq!(service.delete_calls.load(Ordering::SeqCst), 0);
+        assert_eq!(service.scan_calls.load(Ordering::SeqCst), 0);
+    }
+
+    #[tokio::test]
+    async fn test_update_noop_uses_lock_key_with_point_get_input() {
+        let table = TableDef::new(
+            303,
+            "t".to_string(),
+            "default".to_string(),
+            vec![
+                ColumnDef::new(1, "id".into(), DataType::BigInt, false, None, false),
+                ColumnDef::new(2, "name".into(), DataType::Varchar(32), true, None, false),
+            ],
+            vec![1],
+        );
+        let key = encode_key(table.id(), &encode_pk(&[Value::BigInt(7)]));
+        let row = encode_row(&[1, 2], &[Value::BigInt(7), Value::String("alice".into())]);
+
+        let service = MockPointGetTxnService {
+            table_id: table.id(),
+            expected_key: Some(key.clone()),
+            row_value: Some(row),
+            get_calls: AtomicUsize::new(0),
+            scan_calls: AtomicUsize::new(0),
+            put_calls: AtomicUsize::new(0),
+            delete_calls: AtomicUsize::new(0),
+            lock_calls: AtomicUsize::new(0),
+            last_scan_range: Mutex::new(None),
+        };
+
+        let mut ctx = TxnCtx::new(31, 300, false);
+        let plan = LogicalPlan::Update {
+            table: table.clone(),
+            assignments: vec![(
+                2,
+                Expr::Column {
+                    table_idx: None,
+                    column_idx: 1,
+                    name: "name".into(),
+                    data_type: DataType::Varchar(32),
+                },
+            )],
+            input: Box::new(LogicalPlan::PointGet {
+                table,
+                key: key.clone(),
+            }),
+        };
+
+        let output = SimpleExecutor::new()
+            .execute_write_with_ctx(plan, &mut ctx, &service, &MemoryCatalog::new())
+            .await
+            .unwrap();
+
+        assert!(matches!(output, ExecutionOutput::Affected { count } if count == 1));
+        assert_eq!(service.get_calls.load(Ordering::SeqCst), 1);
+        assert_eq!(service.lock_calls.load(Ordering::SeqCst), 1);
+        assert_eq!(service.put_calls.load(Ordering::SeqCst), 0);
+        assert_eq!(service.delete_calls.load(Ordering::SeqCst), 0);
+        assert_eq!(service.scan_calls.load(Ordering::SeqCst), 0);
+    }
+
+    #[tokio::test]
+    async fn test_update_point_get_non_matching_filter_locks_key() {
+        let table = TableDef::new(
+            304,
+            "t".to_string(),
+            "default".to_string(),
+            vec![
+                ColumnDef::new(1, "id".into(), DataType::BigInt, false, None, false),
+                ColumnDef::new(2, "name".into(), DataType::Varchar(32), true, None, false),
+            ],
+            vec![1],
+        );
+        let key = encode_key(table.id(), &encode_pk(&[Value::BigInt(7)]));
+        let row = encode_row(&[1, 2], &[Value::BigInt(7), Value::String("alice".into())]);
+
+        let service = MockPointGetTxnService {
+            table_id: table.id(),
+            expected_key: Some(key.clone()),
+            row_value: Some(row),
+            get_calls: AtomicUsize::new(0),
+            scan_calls: AtomicUsize::new(0),
+            put_calls: AtomicUsize::new(0),
+            delete_calls: AtomicUsize::new(0),
+            lock_calls: AtomicUsize::new(0),
+            last_scan_range: Mutex::new(None),
+        };
+
+        let mut ctx = TxnCtx::new(32, 301, false);
+        let plan = LogicalPlan::Update {
+            table: table.clone(),
+            assignments: vec![(2, Expr::Literal(Value::String("bob".into())))],
+            input: Box::new(LogicalPlan::Filter {
+                input: Box::new(LogicalPlan::PointGet {
+                    table,
+                    key: key.clone(),
+                }),
+                predicate: Expr::BinaryOp {
+                    left: Box::new(Expr::Column {
+                        table_idx: None,
+                        column_idx: 1,
+                        name: "name".into(),
+                        data_type: DataType::Varchar(32),
+                    }),
+                    op: BinaryOp::Eq,
+                    right: Box::new(Expr::Literal(Value::String("carol".into()))),
+                },
+            }),
+        };
+
+        let output = SimpleExecutor::new()
+            .execute_write_with_ctx(plan, &mut ctx, &service, &MemoryCatalog::new())
+            .await
+            .unwrap();
+
+        assert!(matches!(output, ExecutionOutput::Affected { count } if count == 0));
+        assert_eq!(service.get_calls.load(Ordering::SeqCst), 1);
+        assert_eq!(service.lock_calls.load(Ordering::SeqCst), 1);
+        assert_eq!(service.put_calls.load(Ordering::SeqCst), 0);
+        assert_eq!(service.delete_calls.load(Ordering::SeqCst), 0);
+        assert_eq!(service.scan_calls.load(Ordering::SeqCst), 0);
+    }
+
+    #[tokio::test]
+    async fn test_update_scan_uses_pk_range_from_filter() {
+        let table = TableDef::new(
+            404,
+            "t".to_string(),
+            "default".to_string(),
+            vec![
+                ColumnDef::new(1, "id".into(), DataType::BigInt, false, None, false),
+                ColumnDef::new(2, "name".into(), DataType::Varchar(32), true, None, false),
+            ],
+            vec![1],
+        );
+
+        let id_col = Expr::Column {
+            table_idx: None,
+            column_idx: 0,
+            name: "id".into(),
+            data_type: DataType::BigInt,
+        };
+        let filter = Expr::BinaryOp {
+            left: Box::new(Expr::BinaryOp {
+                left: Box::new(id_col.clone()),
+                op: BinaryOp::Ge,
+                right: Box::new(Expr::Literal(Value::BigInt(1))),
+            }),
+            op: BinaryOp::And,
+            right: Box::new(Expr::BinaryOp {
+                left: Box::new(id_col),
+                op: BinaryOp::Le,
+                right: Box::new(Expr::Literal(Value::BigInt(5))),
+            }),
+        };
+
+        let service = MockPointGetTxnService {
+            table_id: table.id(),
+            expected_key: None,
+            row_value: None,
+            get_calls: AtomicUsize::new(0),
+            scan_calls: AtomicUsize::new(0),
+            put_calls: AtomicUsize::new(0),
+            delete_calls: AtomicUsize::new(0),
+            lock_calls: AtomicUsize::new(0),
+            last_scan_range: Mutex::new(None),
+        };
+
+        let mut ctx = TxnCtx::new(41, 400, false);
+        let plan = LogicalPlan::Update {
+            table: table.clone(),
+            assignments: vec![(2, Expr::Literal(Value::String("new_name".into())))],
+            input: Box::new(LogicalPlan::Scan {
+                table: table.clone(),
+                projection: None,
+                filter: Some(filter),
+            }),
+        };
+
+        let output = SimpleExecutor::new()
+            .execute_write_with_ctx(plan, &mut ctx, &service, &MemoryCatalog::new())
+            .await
+            .unwrap();
+
+        assert!(matches!(output, ExecutionOutput::Affected { count } if count == 0));
+        assert_eq!(service.scan_calls.load(Ordering::SeqCst), 1);
+        let observed = service
+            .last_scan_range
+            .lock()
+            .clone()
+            .expect("scan range should be captured");
+        let expected_start = encode_key(table.id(), &encode_pk(&[Value::BigInt(1)]));
+        let mut expected_end = encode_key(table.id(), &encode_pk(&[Value::BigInt(5)]));
+        assert!(next_key_bound(&mut expected_end));
+        assert_eq!(observed.start, expected_start);
+        assert_eq!(observed.end, expected_end);
+    }
+
+    #[tokio::test]
+    async fn test_delete_scan_uses_pk_range_from_filter() {
+        let table = TableDef::new(
+            405,
+            "t".to_string(),
+            "default".to_string(),
+            vec![
+                ColumnDef::new(1, "id".into(), DataType::BigInt, false, None, false),
+                ColumnDef::new(2, "name".into(), DataType::Varchar(32), true, None, false),
+            ],
+            vec![1],
+        );
+
+        let id_col = Expr::Column {
+            table_idx: None,
+            column_idx: 0,
+            name: "id".into(),
+            data_type: DataType::BigInt,
+        };
+        let filter = Expr::BinaryOp {
+            left: Box::new(Expr::BinaryOp {
+                left: Box::new(id_col.clone()),
+                op: BinaryOp::Ge,
+                right: Box::new(Expr::Literal(Value::BigInt(1))),
+            }),
+            op: BinaryOp::And,
+            right: Box::new(Expr::BinaryOp {
+                left: Box::new(id_col),
+                op: BinaryOp::Le,
+                right: Box::new(Expr::Literal(Value::BigInt(5))),
+            }),
+        };
+
+        let service = MockPointGetTxnService {
+            table_id: table.id(),
+            expected_key: None,
+            row_value: None,
+            get_calls: AtomicUsize::new(0),
+            scan_calls: AtomicUsize::new(0),
+            put_calls: AtomicUsize::new(0),
+            delete_calls: AtomicUsize::new(0),
+            lock_calls: AtomicUsize::new(0),
+            last_scan_range: Mutex::new(None),
+        };
+
+        let mut ctx = TxnCtx::new(42, 401, false);
+        let plan = LogicalPlan::Delete {
+            table: table.clone(),
+            input: Box::new(LogicalPlan::Scan {
+                table: table.clone(),
+                projection: None,
+                filter: Some(filter),
+            }),
+        };
+
+        let output = SimpleExecutor::new()
+            .execute_write_with_ctx(plan, &mut ctx, &service, &MemoryCatalog::new())
+            .await
+            .unwrap();
+
+        assert!(matches!(output, ExecutionOutput::Affected { count } if count == 0));
+        assert_eq!(service.scan_calls.load(Ordering::SeqCst), 1);
+        let observed = service
+            .last_scan_range
+            .lock()
+            .clone()
+            .expect("scan range should be captured");
+        let expected_start = encode_key(table.id(), &encode_pk(&[Value::BigInt(1)]));
+        let mut expected_end = encode_key(table.id(), &encode_pk(&[Value::BigInt(5)]));
+        assert!(next_key_bound(&mut expected_end));
+        assert_eq!(observed.start, expected_start);
+        assert_eq!(observed.end, expected_end);
+    }
+
+    #[tokio::test]
+    async fn test_insert_ignore_duplicate_locks_existing_key() {
+        let table = TableDef::new(
+            505,
+            "t".to_string(),
+            "default".to_string(),
+            vec![
+                ColumnDef::new(1, "id".into(), DataType::BigInt, false, None, false),
+                ColumnDef::new(2, "name".into(), DataType::Varchar(32), true, None, false),
+            ],
+            vec![1],
+        );
+        let key = encode_key(table.id(), &encode_pk(&[Value::BigInt(7)]));
+
+        let service = MockPointGetTxnService {
+            table_id: table.id(),
+            expected_key: Some(key),
+            row_value: Some(b"existing".to_vec()),
+            get_calls: AtomicUsize::new(0),
+            scan_calls: AtomicUsize::new(0),
+            put_calls: AtomicUsize::new(0),
+            delete_calls: AtomicUsize::new(0),
+            lock_calls: AtomicUsize::new(0),
+            last_scan_range: Mutex::new(None),
+        };
+
+        let plan = LogicalPlan::Insert {
+            table,
+            columns: vec![1, 2],
+            values: vec![vec![
+                Expr::Literal(Value::BigInt(7)),
+                Expr::Literal(Value::String("alice".into())),
+            ]],
+            ignore: true,
+        };
+
+        let mut ctx = TxnCtx::new(51, 500, false);
+        let output = SimpleExecutor::new()
+            .execute_write_with_ctx(plan, &mut ctx, &service, &MemoryCatalog::new())
+            .await
+            .unwrap();
+
+        assert!(matches!(output, ExecutionOutput::Affected { count } if count == 0));
+        assert_eq!(service.get_calls.load(Ordering::SeqCst), 1);
+        assert_eq!(service.lock_calls.load(Ordering::SeqCst), 1);
+        assert_eq!(service.put_calls.load(Ordering::SeqCst), 0);
+        assert_eq!(service.scan_calls.load(Ordering::SeqCst), 0);
     }
 }

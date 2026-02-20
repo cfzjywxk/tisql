@@ -1890,6 +1890,142 @@ mod explicit_transaction_tests {
         db.close().await.unwrap();
     }
 
+    /// INSERT IGNORE on an existing PK should acquire a lock until transaction end.
+    #[tokio::test]
+    async fn test_insert_ignore_duplicate_holds_lock_until_commit() {
+        let dir = tempdir().unwrap();
+        let config = DatabaseConfig::with_data_dir(dir.path());
+        let db = Database::open(config).unwrap();
+        let mut s1 = Session::new();
+        let mut s2 = Session::new();
+
+        db.execute_query("CREATE TABLE insert_ignore_lock_t (id INT PRIMARY KEY, v INT)")
+            .await
+            .unwrap();
+        db.execute_query("INSERT INTO insert_ignore_lock_t VALUES (1, 10)")
+            .await
+            .unwrap();
+
+        db.execute_query_with_session("BEGIN", &mut s1)
+            .await
+            .unwrap();
+        match db
+            .execute_query_with_session(
+                "INSERT IGNORE INTO insert_ignore_lock_t VALUES (1, 99)",
+                &mut s1,
+            )
+            .await
+            .unwrap()
+        {
+            QueryResult::Affected(rows) => assert_eq!(rows, 0, "duplicate row should be ignored"),
+            other => panic!("Expected affected rows result, got: {other:?}"),
+        }
+
+        db.execute_query_with_session("BEGIN", &mut s2)
+            .await
+            .unwrap();
+        let err = db
+            .execute_query_with_session(
+                "UPDATE insert_ignore_lock_t SET v = 20 WHERE id = 1",
+                &mut s2,
+            )
+            .await
+            .unwrap_err();
+        assert!(
+            err.to_string().to_lowercase().contains("locked"),
+            "expected lock conflict before s1 commit, got: {err}"
+        );
+        assert!(
+            s2.has_active_txn(),
+            "explicit txn should remain active after lock conflict"
+        );
+
+        db.execute_query_with_session("COMMIT", &mut s1)
+            .await
+            .unwrap();
+        db.execute_query_with_session(
+            "UPDATE insert_ignore_lock_t SET v = 20 WHERE id = 1",
+            &mut s2,
+        )
+        .await
+        .unwrap();
+        db.execute_query_with_session("COMMIT", &mut s2)
+            .await
+            .unwrap();
+
+        match db
+            .execute_query("SELECT id, v FROM insert_ignore_lock_t ORDER BY id")
+            .await
+            .unwrap()
+        {
+            QueryResult::Rows { data, .. } => {
+                assert_eq!(data, vec![vec!["1".to_string(), "20".to_string()]]);
+            }
+            other => panic!("Expected rows, got: {other:?}"),
+        }
+
+        db.close().await.unwrap();
+    }
+
+    /// UPDATE that changes PK during explicit txn should process each original row once.
+    #[tokio::test]
+    async fn test_update_pk_shift_in_explicit_txn_no_halloween_loop() {
+        let dir = tempdir().unwrap();
+        let config = DatabaseConfig::with_data_dir(dir.path());
+        let db = Database::open(config).unwrap();
+        let mut session = Session::new();
+
+        db.execute_query("CREATE TABLE update_pk_shift_t (id INT PRIMARY KEY, v INT)")
+            .await
+            .unwrap();
+        db.execute_query("INSERT INTO update_pk_shift_t VALUES (1, 10), (2, 20)")
+            .await
+            .unwrap();
+
+        db.execute_query_with_session("BEGIN", &mut session)
+            .await
+            .unwrap();
+        let update_result = tokio::time::timeout(
+            std::time::Duration::from_secs(5),
+            db.execute_query_with_session(
+                "UPDATE update_pk_shift_t SET id = id + 10",
+                &mut session,
+            ),
+        )
+        .await
+        .expect("UPDATE should finish without Halloween-style reprocessing")
+        .unwrap();
+        match update_result {
+            QueryResult::Affected(rows) => assert_eq!(rows, 2),
+            other => panic!("Expected affected rows result, got: {other:?}"),
+        }
+
+        match db
+            .execute_query_with_session(
+                "SELECT id, v FROM update_pk_shift_t ORDER BY id",
+                &mut session,
+            )
+            .await
+            .unwrap()
+        {
+            QueryResult::Rows { data, .. } => {
+                assert_eq!(
+                    data,
+                    vec![
+                        vec!["11".to_string(), "10".to_string()],
+                        vec!["12".to_string(), "20".to_string()],
+                    ]
+                );
+            }
+            other => panic!("Expected rows, got: {other:?}"),
+        }
+
+        db.execute_query_with_session("COMMIT", &mut session)
+            .await
+            .unwrap();
+        db.close().await.unwrap();
+    }
+
     /// Test multiple INSERT statements within a transaction.
     ///
     /// Note: Read-your-writes is not yet supported, so UPDATE/DELETE within the same

@@ -81,19 +81,22 @@ pub enum LogicalPlan {
         table: TableDef,
         columns: Vec<ColumnId>,
         values: Vec<Vec<Expr>>, // Each inner vec is a row
+        ignore: bool,
     },
 
     /// Update
     Update {
         table: TableDef,
         assignments: Vec<(ColumnId, Expr)>,
-        filter: Option<Expr>,
+        /// Child read plan used to find rows to update.
+        input: Box<LogicalPlan>,
     },
 
     /// Delete
     Delete {
         table: TableDef,
-        filter: Option<Expr>,
+        /// Child read plan used to find rows to delete.
+        input: Box<LogicalPlan>,
     },
 
     /// Create table

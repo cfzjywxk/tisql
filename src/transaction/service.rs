@@ -517,6 +517,53 @@ impl<S: PessimisticStorage + 'static, L: ClogService + 'static, T: TsoService> T
         }
     }
 
+    async fn lock_key(&self, ctx: &mut TxnCtx, table_id: TableId, key: Key) -> Result<()> {
+        if ctx.state != TxnState::Running {
+            return Err(TiSqlError::TransactionNotActive(format!("{:?}", ctx.state)));
+        }
+        if ctx.read_only {
+            return Err(TiSqlError::ReadOnlyTransaction);
+        }
+        Self::validate_table_target_key(table_id, &key, "TxnService::lock_key")?;
+
+        // Existing write mutation already protects this key; don't downgrade.
+        if matches!(ctx.mutations.get(&key), Some(MutationType::Write)) {
+            return Ok(());
+        }
+        // Existing lock mutation is already in place.
+        if matches!(ctx.mutations.get(&key), Some(MutationType::Lock)) {
+            return Ok(());
+        }
+
+        if !ctx.registered {
+            self.concurrency_manager.register_txn(ctx.start_ts);
+            ctx.registered = true;
+        }
+
+        let tablet_id = route_table_to_tablet(table_id);
+        match self
+            .put_pending_with_retry(tablet_id, &key, LOCK.to_vec(), ctx.start_ts)
+            .await
+        {
+            Ok(()) => {
+                ctx.mutation_tablets.insert(key.clone(), tablet_id);
+                ctx.mutations.entry(key).or_insert(MutationType::Lock);
+                Ok(())
+            }
+            Err(PessimisticWriteError::LockConflict(lock_owner)) => Err(TiSqlError::KeyIsLocked {
+                key,
+                lock_ts: lock_owner,
+                primary: vec![],
+            }),
+            Err(PessimisticWriteError::WriteStall { delay: None }) => Err(TiSqlError::Storage(
+                "Write stalled: storage backpressure, retry later".into(),
+            )),
+            Err(PessimisticWriteError::WriteStall { delay: Some(_) }) => {
+                unreachable!("put_pending_with_retry returns only LockConflict or hard WriteStall")
+            }
+        }
+    }
+
     async fn commit(&self, mut ctx: TxnCtx) -> Result<CommitInfo> {
         Self::check_active(&ctx)?;
 

@@ -402,6 +402,17 @@ pub trait TxnService: Send + Sync {
         key: Key,
     ) -> impl Future<Output = Result<()>> + Send + 'a;
 
+    /// Acquire a pessimistic lock marker on a key without changing user data.
+    ///
+    /// This is used by no-op current reads (for example, UPDATE that matches a row
+    /// but produces the same values) so commit still protects the read set.
+    fn lock_key<'a>(
+        &'a self,
+        ctx: &'a mut TxnCtx,
+        table_id: TableId,
+        key: Key,
+    ) -> impl Future<Output = Result<()>> + Send + 'a;
+
     // === Finalization ===
 
     /// Commit the transaction.

@@ -938,6 +938,26 @@ mod duplicate_key {
     }
 
     #[tokio::test]
+    async fn test_insert_ignore_duplicate_primary_key() {
+        let tk = TestKit::new();
+
+        tk.must_exec("CREATE TABLE t (id INT PRIMARY KEY, val INT)")
+            .await;
+        tk.must_exec("INSERT INTO t VALUES (1, 100)")
+            .await
+            .check_affected(1);
+
+        // Duplicate row should be ignored, non-duplicate row should be inserted.
+        tk.must_exec("INSERT IGNORE INTO t VALUES (1, 999), (2, 200)")
+            .await
+            .check_affected(1);
+
+        tk.must_query("SELECT id, val FROM t ORDER BY id")
+            .await
+            .check(rows![["1", "100"], ["2", "200"]]);
+    }
+
+    #[tokio::test]
     async fn test_insert_duplicate_composite_key() {
         let tk = TestKit::new();
 

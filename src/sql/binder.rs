@@ -54,11 +54,12 @@ impl<'a, C: Catalog> Binder<'a, C> {
         match stmt {
             SqlStatement::Query(query) => self.bind_query(*query),
             SqlStatement::Insert {
+                ignore,
                 table_name,
                 columns,
                 source,
                 ..
-            } => self.bind_insert(table_name, columns, source),
+            } => self.bind_insert(ignore, table_name, columns, source),
             SqlStatement::Update {
                 table,
                 assignments,
@@ -596,6 +597,7 @@ impl<'a, C: Catalog> Binder<'a, C> {
 
     fn bind_insert(
         &self,
+        ignore: bool,
         table_name: ast::ObjectName,
         columns: Vec<ast::Ident>,
         source: Option<Box<Query>>,
@@ -640,6 +642,7 @@ impl<'a, C: Catalog> Binder<'a, C> {
             table,
             columns: col_ids,
             values,
+            ignore,
         })
     }
 
@@ -673,11 +676,12 @@ impl<'a, C: Catalog> Binder<'a, C> {
             .collect::<Result<Vec<_>>>()?;
 
         let filter = selection.map(|s| self.bind_expr(&s, &tables)).transpose()?;
+        let input = self.build_dml_input_plan(&table, filter);
 
         Ok(LogicalPlan::Update {
             table,
             assignments: assigns,
-            filter,
+            input: Box::new(input),
         })
     }
 
@@ -699,8 +703,12 @@ impl<'a, C: Catalog> Binder<'a, C> {
         let tables = vec![&table];
 
         let filter = selection.map(|s| self.bind_expr(&s, &tables)).transpose()?;
+        let input = self.build_dml_input_plan(&table, filter);
 
-        Ok(LogicalPlan::Delete { table, filter })
+        Ok(LogicalPlan::Delete {
+            table,
+            input: Box::new(input),
+        })
     }
 
     fn bind_create_table(
@@ -963,6 +971,35 @@ impl<'a, C: Catalog> Binder<'a, C> {
             },
             residual_predicate,
         })
+    }
+
+    fn build_dml_input_plan(&self, table: &TableDef, predicate: Option<Expr>) -> LogicalPlan {
+        let base_scan = LogicalPlan::Scan {
+            table: table.clone(),
+            projection: None,
+            filter: None,
+        };
+
+        let Some(predicate) = predicate else {
+            return base_scan;
+        };
+
+        if let Some(rewrite) = self.try_build_point_get(&base_scan, &predicate) {
+            if let Some(residual) = rewrite.residual_predicate {
+                LogicalPlan::Filter {
+                    input: Box::new(rewrite.plan),
+                    predicate: residual,
+                }
+            } else {
+                rewrite.plan
+            }
+        } else {
+            LogicalPlan::Scan {
+                table: table.clone(),
+                projection: None,
+                filter: Some(predicate),
+            }
+        }
     }
 
     fn conjoin_exprs(exprs: Vec<Expr>) -> Option<Expr> {
@@ -1346,6 +1383,46 @@ mod tests {
                 assert!(matches!(*input, LogicalPlan::Empty { .. }));
             }
             _ => panic!("expected Project plan root"),
+        }
+    }
+
+    #[test]
+    fn test_bind_update_pk_eq_generates_point_get_child() {
+        let catalog = setup_table();
+        let plan = bind_sql(&catalog, "UPDATE t SET name = 'bob' WHERE id = 1");
+        match plan {
+            LogicalPlan::Update { input, .. } => {
+                assert!(matches!(*input, LogicalPlan::PointGet { .. }));
+            }
+            _ => panic!("expected Update root"),
+        }
+    }
+
+    #[test]
+    fn test_bind_delete_pk_eq_with_residual_generates_filter_over_point_get_child() {
+        let catalog = setup_table();
+        let plan = bind_sql(&catalog, "DELETE FROM t WHERE id = 1 AND name = 'alice'");
+        match plan {
+            LogicalPlan::Delete { input, .. } => match *input {
+                LogicalPlan::Filter { input, .. } => {
+                    assert!(matches!(*input, LogicalPlan::PointGet { .. }));
+                }
+                _ => panic!("expected Filter over PointGet"),
+            },
+            _ => panic!("expected Delete root"),
+        }
+    }
+
+    #[test]
+    fn test_bind_insert_ignore_sets_plan_flag() {
+        let catalog = setup_table();
+        let plan = bind_sql(
+            &catalog,
+            "INSERT IGNORE INTO t(id, name) VALUES (1, 'alice')",
+        );
+        match plan {
+            LogicalPlan::Insert { ignore, .. } => assert!(ignore),
+            _ => panic!("expected Insert root"),
         }
     }
 }
