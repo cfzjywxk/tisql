@@ -629,11 +629,11 @@ async fn test_flush_and_compaction_e2e() {
             let mut batch = new_batch_with_lsn(ts, ts);
             let key = format!("key_{i:03}");
             batch.put(key.into_bytes(), format!("batch_{batch_num}").into_bytes());
-            engine.write_batch(batch).unwrap();
+            engine.write_batch_async(batch).await.unwrap();
         }
 
         // Flush after each batch
-        engine.flush_all_with_active().unwrap();
+        engine.flush_all_with_active_async().await.unwrap();
     }
 
     // Verify stats show L0 files

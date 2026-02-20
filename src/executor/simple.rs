@@ -665,9 +665,9 @@ impl<I: MvccIterator> AggregateOp<I> {
 
 /// Build an operator tree from a logical plan.
 ///
-/// Only `Scan` touches `txn_service` (calls `scan_iter()`). All other nodes
-/// just wrap their child operator in `Box`.
-fn build_read_operator<T: TxnService>(
+/// `Scan` and `PointGet` touch `txn_service`; all other nodes just wrap
+/// their child operator in `Box`.
+async fn build_read_operator<T: TxnService>(
     plan: LogicalPlan,
     txn_service: &T,
     ctx: &TxnCtx,
@@ -712,6 +712,35 @@ fn build_read_operator<T: TxnService>(
             }))
         }
 
+        LogicalPlan::PointGet { table, key } => {
+            let col_ids: Vec<ColumnId> = table.columns().iter().map(|c| c.id()).collect();
+            let data_types: Vec<DataType> = table
+                .columns()
+                .iter()
+                .map(|c| c.data_type().clone())
+                .collect();
+            let schema = Schema::new(
+                table
+                    .columns()
+                    .iter()
+                    .map(|c| {
+                        ColumnInfo::new(c.name().to_string(), c.data_type().clone(), c.nullable())
+                    })
+                    .collect(),
+            );
+
+            let mut rows = Vec::new();
+            if let Some(value) = txn_service.get(ctx, table.id(), &key).await? {
+                let decoded = decode_row_to_values(&value, &col_ids, &data_types)?;
+                rows.push(Row::new(decoded));
+            }
+
+            Ok(Operator::Values(ValuesOp {
+                rows: rows.into_iter(),
+                schema,
+            }))
+        }
+
         LogicalPlan::Values { rows, schema } => {
             let result_rows = rows
                 .into_iter()
@@ -733,7 +762,7 @@ fn build_read_operator<T: TxnService>(
         LogicalPlan::Empty { schema } => Ok(Operator::Empty(EmptyOp { schema })),
 
         LogicalPlan::Project { input, exprs } => {
-            let child = build_read_operator(*input, txn_service, ctx)?;
+            let child = Box::pin(build_read_operator(*input, txn_service, ctx)).await?;
             let schema = Schema::new(
                 exprs
                     .iter()
@@ -748,7 +777,7 @@ fn build_read_operator<T: TxnService>(
         }
 
         LogicalPlan::Filter { input, predicate } => {
-            let child = build_read_operator(*input, txn_service, ctx)?;
+            let child = Box::pin(build_read_operator(*input, txn_service, ctx)).await?;
             Ok(Operator::Filter(FilterOp {
                 child: Box::new(child),
                 predicate,
@@ -760,7 +789,7 @@ fn build_read_operator<T: TxnService>(
             limit,
             offset,
         } => {
-            let child = build_read_operator(*input, txn_service, ctx)?;
+            let child = Box::pin(build_read_operator(*input, txn_service, ctx)).await?;
             Ok(Operator::Limit(LimitOp {
                 child: Box::new(child),
                 limit,
@@ -771,7 +800,7 @@ fn build_read_operator<T: TxnService>(
         }
 
         LogicalPlan::Sort { input, order_by } => {
-            let child = build_read_operator(*input, txn_service, ctx)?;
+            let child = Box::pin(build_read_operator(*input, txn_service, ctx)).await?;
             Ok(Operator::Sort(SortOp {
                 child: Box::new(child),
                 order_by,
@@ -784,7 +813,7 @@ fn build_read_operator<T: TxnService>(
             group_by,
             agg_exprs,
         } => {
-            let child = build_read_operator(*input, txn_service, ctx)?;
+            let child = Box::pin(build_read_operator(*input, txn_service, ctx)).await?;
             let schema = Schema::new(
                 agg_exprs
                     .iter()
@@ -1084,7 +1113,7 @@ impl SimpleExecutor {
         txn_service: &T,
         _catalog: &C,
     ) -> Result<ExecutionOutput> {
-        let mut op = build_read_operator(plan, txn_service, ctx)?;
+        let mut op = build_read_operator(plan, txn_service, ctx).await?;
         op.open().await?;
         let schema = op.schema().clone();
         Ok(ExecutionOutput::Rows {
@@ -1324,5 +1353,198 @@ impl SimpleExecutor {
                 std::mem::discriminant(&plan)
             ))),
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::ops::Range;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    use super::*;
+    use crate::catalog::types::{Lsn, RawValue, TableId, Timestamp, TxnId};
+    use crate::catalog::{ColumnDef, TableDef};
+    use crate::tablet::MvccKey;
+    use crate::transaction::{CommitInfo, TxnState};
+
+    struct DummyIter;
+
+    impl MvccIterator for DummyIter {
+        async fn seek(&mut self, _target: &MvccKey) -> Result<()> {
+            Ok(())
+        }
+
+        async fn advance(&mut self) -> Result<()> {
+            Ok(())
+        }
+
+        fn valid(&self) -> bool {
+            false
+        }
+
+        fn user_key(&self) -> &[u8] {
+            panic!("dummy iterator should never be used")
+        }
+
+        fn timestamp(&self) -> Timestamp {
+            panic!("dummy iterator should never be used")
+        }
+
+        fn value(&self) -> &[u8] {
+            panic!("dummy iterator should never be used")
+        }
+    }
+
+    struct MockPointGetTxnService {
+        table_id: TableId,
+        expected_key: Vec<u8>,
+        row_value: Option<RawValue>,
+        get_calls: AtomicUsize,
+    }
+
+    impl TxnService for MockPointGetTxnService {
+        type ScanIter = DummyIter;
+
+        fn begin(&self, read_only: bool) -> Result<TxnCtx> {
+            Ok(TxnCtx::new(1, 1, read_only))
+        }
+
+        fn begin_explicit(&self, read_only: bool) -> Result<TxnCtx> {
+            Ok(TxnCtx::new_explicit(1, 1, read_only))
+        }
+
+        fn get_txn_state(&self, _start_ts: Timestamp) -> Option<TxnState> {
+            Some(TxnState::Running)
+        }
+
+        async fn get<'a>(
+            &'a self,
+            _ctx: &'a TxnCtx,
+            table_id: TableId,
+            key: &'a [u8],
+        ) -> Result<Option<RawValue>> {
+            self.get_calls.fetch_add(1, Ordering::SeqCst);
+            assert_eq!(table_id, self.table_id);
+            assert_eq!(key, self.expected_key.as_slice());
+            Ok(self.row_value.clone())
+        }
+
+        fn scan_iter(
+            &self,
+            _ctx: &TxnCtx,
+            _table_id: TableId,
+            _range: Range<Vec<u8>>,
+        ) -> Result<Self::ScanIter> {
+            panic!("scan_iter should not be called for point-get plan")
+        }
+
+        async fn put<'a>(
+            &'a self,
+            _ctx: &'a mut TxnCtx,
+            _table_id: TableId,
+            _key: Vec<u8>,
+            _value: RawValue,
+        ) -> Result<()> {
+            panic!("put should not be called in point-get read test")
+        }
+
+        async fn delete<'a>(
+            &'a self,
+            _ctx: &'a mut TxnCtx,
+            _table_id: TableId,
+            _key: Vec<u8>,
+        ) -> Result<()> {
+            panic!("delete should not be called in point-get read test")
+        }
+
+        async fn commit(&self, _ctx: TxnCtx) -> Result<CommitInfo> {
+            Ok(CommitInfo {
+                txn_id: 1 as TxnId,
+                commit_ts: 2,
+                lsn: 3 as Lsn,
+            })
+        }
+
+        fn rollback(&self, _ctx: TxnCtx) -> Result<()> {
+            Ok(())
+        }
+    }
+
+    #[tokio::test]
+    async fn test_point_get_plan_uses_txn_get_instead_of_scan_iter() {
+        let table = TableDef::new(
+            101,
+            "t".to_string(),
+            "default".to_string(),
+            vec![
+                ColumnDef::new(1, "id".into(), DataType::BigInt, false, None, false),
+                ColumnDef::new(2, "name".into(), DataType::Varchar(32), true, None, false),
+            ],
+            vec![1],
+        );
+        let pk = vec![Value::BigInt(7)];
+        let key = encode_key(table.id(), &encode_pk(&pk));
+        let row = encode_row(&[1, 2], &[Value::BigInt(7), Value::String("alice".into())]);
+
+        let service = MockPointGetTxnService {
+            table_id: table.id(),
+            expected_key: key.clone(),
+            row_value: Some(row),
+            get_calls: AtomicUsize::new(0),
+        };
+        let ctx = TxnCtx::new(11, 100, true);
+
+        let mut op = build_read_operator(
+            LogicalPlan::PointGet {
+                table,
+                key: key.clone(),
+            },
+            &service,
+            &ctx,
+        )
+        .await
+        .unwrap();
+
+        op.open().await.unwrap();
+        let first = op
+            .next()
+            .await
+            .unwrap()
+            .expect("point-get should return one row");
+        assert_eq!(first.get(0), Some(&Value::BigInt(7)));
+        assert_eq!(first.get(1), Some(&Value::String("alice".into())));
+        assert!(op.next().await.unwrap().is_none());
+        assert_eq!(service.get_calls.load(Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test]
+    async fn test_point_get_plan_not_found_returns_empty() {
+        let table = TableDef::new(
+            101,
+            "t".to_string(),
+            "default".to_string(),
+            vec![
+                ColumnDef::new(1, "id".into(), DataType::BigInt, false, None, false),
+                ColumnDef::new(2, "name".into(), DataType::Varchar(32), true, None, false),
+            ],
+            vec![1],
+        );
+        let key = encode_key(table.id(), &encode_pk(&[Value::BigInt(8)]));
+
+        let service = MockPointGetTxnService {
+            table_id: table.id(),
+            expected_key: key.clone(),
+            row_value: None,
+            get_calls: AtomicUsize::new(0),
+        };
+        let ctx = TxnCtx::new(12, 101, true);
+
+        let mut op = build_read_operator(LogicalPlan::PointGet { table, key }, &service, &ctx)
+            .await
+            .unwrap();
+
+        op.open().await.unwrap();
+        assert!(op.next().await.unwrap().is_none());
+        assert_eq!(service.get_calls.load(Ordering::SeqCst), 1);
     }
 }

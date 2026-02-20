@@ -12,6 +12,8 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+use std::collections::BTreeMap;
+
 use sqlparser::ast::{
     self, Expr as SqlExpr, GroupByExpr, Query, Select, SelectItem, SetExpr,
     Statement as SqlStatement, TableFactor, TableWithJoins, Value as SqlValue,
@@ -19,6 +21,7 @@ use sqlparser::ast::{
 
 use crate::catalog::types::{ColumnInfo, DataType, Schema, Timestamp, Value};
 use crate::catalog::{Catalog, ColumnDef, TableDef};
+use crate::tablet::{encode_key, encode_pk};
 use crate::util::error::{Result, TiSqlError};
 
 use super::plan::{AggFunc, BinaryOp, Expr, JoinType, LogicalPlan, OrderByExpr, UnaryOp};
@@ -29,6 +32,11 @@ pub struct Binder<'a, C: Catalog> {
     current_schema: String,
     /// Timestamp for MVCC schema reads. If None, uses latest schema.
     snapshot_ts: Option<Timestamp>,
+}
+
+struct PointGetRewrite {
+    plan: LogicalPlan,
+    residual_predicate: Option<Expr>,
 }
 
 impl<'a, C: Catalog> Binder<'a, C> {
@@ -167,7 +175,7 @@ impl<'a, C: Catalog> Binder<'a, C> {
         let table_refs: Vec<&TableDef> = tables.iter().collect();
 
         // Bind all expressions first, before modifying plan
-        let where_predicate = select
+        let mut where_predicate = select
             .selection
             .as_ref()
             .map(|s| self.bind_expr(s, &table_refs))
@@ -188,6 +196,16 @@ impl<'a, C: Catalog> Binder<'a, C> {
             .as_ref()
             .map(|h| self.bind_expr(h, &table_refs))
             .transpose()?;
+
+        // Point-get optimization:
+        // If WHERE provides equality bindings for all PK columns, replace
+        // table scan with a direct point-get plan.
+        if let Some(predicate) = where_predicate.as_ref() {
+            if let Some(rewrite) = self.try_build_point_get(&plan, predicate) {
+                plan = rewrite.plan;
+                where_predicate = rewrite.residual_predicate;
+            }
+        }
 
         // Now build the plan tree
         // WHERE clause
@@ -875,10 +893,154 @@ impl<'a, C: Catalog> Binder<'a, C> {
         }
     }
 
+    fn try_build_point_get(&self, plan: &LogicalPlan, predicate: &Expr) -> Option<PointGetRewrite> {
+        let table = match plan {
+            LogicalPlan::Scan {
+                table,
+                filter: None,
+                projection: None,
+            } => table,
+            _ => return None,
+        };
+
+        let pk_indices = table.pk_column_indices();
+        if pk_indices.is_empty() {
+            return None;
+        }
+
+        let mut conjuncts = Vec::new();
+        Self::collect_conjuncts(predicate, &mut conjuncts);
+        let mut consumed = vec![false; conjuncts.len()];
+
+        let mut pk_eq_values: BTreeMap<usize, Value> = BTreeMap::new();
+        for (idx, conjunct) in conjuncts.iter().enumerate() {
+            let Some((column_idx, literal)) = Self::extract_column_eq_literal(conjunct) else {
+                continue;
+            };
+            if !pk_indices.contains(&column_idx) {
+                continue;
+            }
+
+            let column = table.columns().get(column_idx)?;
+            if !Self::point_get_literal_matches_pk(column.data_type(), literal) {
+                return None;
+            }
+
+            match pk_eq_values.get(&column_idx) {
+                Some(existing) if existing != literal => {
+                    return Some(PointGetRewrite {
+                        plan: LogicalPlan::Empty {
+                            schema: Self::table_to_schema(table),
+                        },
+                        residual_predicate: None,
+                    });
+                }
+                Some(_) => {}
+                None => {
+                    pk_eq_values.insert(column_idx, literal.clone());
+                }
+            }
+            consumed[idx] = true;
+        }
+
+        let mut pk_values = Vec::with_capacity(pk_indices.len());
+        for idx in &pk_indices {
+            pk_values.push(pk_eq_values.get(idx)?.clone());
+        }
+
+        let residual_predicate = Self::conjoin_exprs(
+            conjuncts
+                .into_iter()
+                .zip(consumed)
+                .filter_map(|(expr, is_consumed)| (!is_consumed).then_some(expr.clone()))
+                .collect(),
+        );
+        let key = encode_key(table.id(), &encode_pk(&pk_values));
+        Some(PointGetRewrite {
+            plan: LogicalPlan::PointGet {
+                table: table.clone(),
+                key,
+            },
+            residual_predicate,
+        })
+    }
+
+    fn conjoin_exprs(exprs: Vec<Expr>) -> Option<Expr> {
+        let mut iter = exprs.into_iter();
+        let first = iter.next()?;
+        Some(iter.fold(first, |acc, expr| Expr::BinaryOp {
+            left: Box::new(acc),
+            op: BinaryOp::And,
+            right: Box::new(expr),
+        }))
+    }
+
+    fn collect_conjuncts<'b>(expr: &'b Expr, out: &mut Vec<&'b Expr>) {
+        match expr {
+            Expr::BinaryOp {
+                left,
+                op: BinaryOp::And,
+                right,
+            } => {
+                Self::collect_conjuncts(left, out);
+                Self::collect_conjuncts(right, out);
+            }
+            _ => out.push(expr),
+        }
+    }
+
+    fn extract_column_eq_literal(expr: &Expr) -> Option<(usize, &Value)> {
+        let Expr::BinaryOp {
+            left,
+            op: BinaryOp::Eq,
+            right,
+        } = expr
+        else {
+            return None;
+        };
+
+        match (left.as_ref(), right.as_ref()) {
+            (Expr::Column { column_idx, .. }, Expr::Literal(v)) => Some((*column_idx, v)),
+            (Expr::Literal(v), Expr::Column { column_idx, .. }) => Some((*column_idx, v)),
+            _ => None,
+        }
+    }
+
+    fn point_get_literal_matches_pk(pk_type: &DataType, literal: &Value) -> bool {
+        match (pk_type, literal) {
+            (_, Value::Null) => false,
+            (DataType::Boolean, Value::Boolean(_)) => true,
+            (DataType::TinyInt, Value::TinyInt(_)) => true,
+            (DataType::SmallInt, Value::SmallInt(_)) => true,
+            (DataType::Int, Value::Int(_)) => true,
+            (DataType::BigInt, Value::BigInt(_)) => true,
+            (DataType::Float, Value::Float(_)) => true,
+            (DataType::Double, Value::Double(_)) => true,
+            (DataType::Decimal { .. }, Value::Decimal(_)) => true,
+            (DataType::Char(_) | DataType::Varchar(_) | DataType::Text, Value::String(_)) => true,
+            (DataType::Blob, Value::Bytes(_)) => true,
+            (DataType::Date, Value::Date(_)) => true,
+            (DataType::Time, Value::Time(_)) => true,
+            (DataType::DateTime, Value::DateTime(_)) => true,
+            (DataType::Timestamp, Value::Timestamp(_)) => true,
+            _ => false,
+        }
+    }
+
+    fn table_to_schema(table: &TableDef) -> Schema {
+        Schema::new(
+            table
+                .columns()
+                .iter()
+                .map(|c| ColumnInfo::new(c.name().to_string(), c.data_type().clone(), c.nullable()))
+                .collect(),
+        )
+    }
+
     #[allow(clippy::only_used_in_recursion)]
     fn collect_tables<'b>(&'b self, plan: &'b LogicalPlan) -> Vec<&'b TableDef> {
         match plan {
-            LogicalPlan::Scan { table, .. } => vec![table],
+            LogicalPlan::Scan { table, .. } | LogicalPlan::PointGet { table, .. } => vec![table],
             LogicalPlan::Project { input, .. } => self.collect_tables(input),
             LogicalPlan::Filter { input, .. } => self.collect_tables(input),
             LogicalPlan::Join { left, right, .. } => {
@@ -896,7 +1058,9 @@ impl<'a, C: Catalog> Binder<'a, C> {
     #[allow(clippy::only_used_in_recursion)]
     fn collect_tables_owned(&self, plan: &LogicalPlan) -> Vec<TableDef> {
         match plan {
-            LogicalPlan::Scan { table, .. } => vec![table.clone()],
+            LogicalPlan::Scan { table, .. } | LogicalPlan::PointGet { table, .. } => {
+                vec![table.clone()]
+            }
             LogicalPlan::Project { input, .. } => self.collect_tables_owned(input),
             LogicalPlan::Filter { input, .. } => self.collect_tables_owned(input),
             LogicalPlan::Join { left, right, .. } => {
@@ -941,6 +1105,247 @@ impl<'a, C: Catalog> Binder<'a, C> {
                 .parse()
                 .map_err(|_| TiSqlError::Bind("Invalid LIMIT/OFFSET value".into())),
             _ => Err(TiSqlError::Bind("LIMIT/OFFSET must be a number".into())),
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use sqlparser::dialect::MySqlDialect;
+    use sqlparser::parser::Parser as SqlParser;
+
+    use super::*;
+    use crate::catalog::MemoryCatalog;
+    use crate::tablet::{encode_key, encode_pk};
+
+    fn bind_sql(catalog: &MemoryCatalog, sql: &str) -> LogicalPlan {
+        let mut stmts = SqlParser::parse_sql(&MySqlDialect {}, sql).unwrap();
+        let stmt = stmts.remove(0);
+        Binder::new(catalog, "default").bind(stmt).unwrap()
+    }
+
+    fn setup_table() -> MemoryCatalog {
+        let catalog = MemoryCatalog::new();
+        let table = TableDef::new(
+            42,
+            "t".to_string(),
+            "default".to_string(),
+            vec![
+                ColumnDef::new(1, "id".into(), DataType::BigInt, false, None, false),
+                ColumnDef::new(2, "name".into(), DataType::Varchar(64), true, None, false),
+            ],
+            vec![1],
+        );
+        crate::io::block_on_sync(catalog.create_table(table)).unwrap();
+        catalog
+    }
+
+    fn setup_table_with_composite_pk() -> MemoryCatalog {
+        let catalog = setup_table();
+        let table = TableDef::new(
+            43,
+            "t2".to_string(),
+            "default".to_string(),
+            vec![
+                ColumnDef::new(1, "id".into(), DataType::BigInt, false, None, false),
+                ColumnDef::new(
+                    2,
+                    "region".into(),
+                    DataType::Varchar(16),
+                    false,
+                    None,
+                    false,
+                ),
+                ColumnDef::new(3, "name".into(), DataType::Varchar(64), true, None, false),
+            ],
+            vec![1, 2],
+        );
+        crate::io::block_on_sync(catalog.create_table(table)).unwrap();
+        catalog
+    }
+
+    fn setup_table_with_int_pk() -> MemoryCatalog {
+        let catalog = MemoryCatalog::new();
+        let table = TableDef::new(
+            44,
+            "t_int".to_string(),
+            "default".to_string(),
+            vec![
+                ColumnDef::new(1, "id".into(), DataType::Int, false, None, false),
+                ColumnDef::new(2, "name".into(), DataType::Varchar(64), true, None, false),
+            ],
+            vec![1],
+        );
+        crate::io::block_on_sync(catalog.create_table(table)).unwrap();
+        catalog
+    }
+
+    #[test]
+    fn test_bind_select_pk_eq_with_residual_filter_generates_point_get() {
+        let catalog = setup_table();
+        let plan = bind_sql(&catalog, "SELECT * FROM t WHERE id = 1 AND name = 'alice'");
+        match plan {
+            LogicalPlan::Project { input, .. } => match *input {
+                LogicalPlan::Filter { input, .. } => {
+                    assert!(matches!(*input, LogicalPlan::PointGet { .. }));
+                }
+                _ => panic!("expected Filter over PointGet"),
+            },
+            _ => panic!("expected Project plan root"),
+        }
+    }
+
+    #[test]
+    fn test_bind_select_pk_only_eq_generates_bare_point_get() {
+        let catalog = setup_table();
+        let plan = bind_sql(&catalog, "SELECT * FROM t WHERE id = 1");
+        match plan {
+            LogicalPlan::Project { input, .. } => {
+                assert!(matches!(*input, LogicalPlan::PointGet { .. }));
+            }
+            _ => panic!("expected Project plan root"),
+        }
+    }
+
+    #[test]
+    fn test_bind_select_non_pk_filter_keeps_scan() {
+        let catalog = setup_table();
+        let plan = bind_sql(&catalog, "SELECT * FROM t WHERE name = 'alice'");
+        match plan {
+            LogicalPlan::Project { input, .. } => match *input {
+                LogicalPlan::Filter { input, .. } => {
+                    assert!(matches!(*input, LogicalPlan::Scan { .. }));
+                }
+                _ => panic!("expected Filter over Scan"),
+            },
+            _ => panic!("expected Project plan root"),
+        }
+    }
+
+    #[test]
+    fn test_bind_select_pk_eq_with_string_literal_keeps_scan() {
+        let catalog = setup_table();
+        let plan = bind_sql(&catalog, "SELECT * FROM t WHERE id = '1'");
+        match plan {
+            LogicalPlan::Project { input, .. } => match *input {
+                LogicalPlan::Filter { input, .. } => {
+                    assert!(matches!(*input, LogicalPlan::Scan { .. }));
+                }
+                _ => panic!("expected Filter over Scan"),
+            },
+            _ => panic!("expected Project plan root"),
+        }
+    }
+
+    #[test]
+    fn test_bind_select_int_pk_literal_keeps_scan() {
+        let catalog = setup_table_with_int_pk();
+        let plan = bind_sql(&catalog, "SELECT * FROM t_int WHERE id = 1");
+        match plan {
+            LogicalPlan::Project { input, .. } => match *input {
+                LogicalPlan::Filter { input, .. } => {
+                    assert!(matches!(*input, LogicalPlan::Scan { .. }));
+                }
+                _ => panic!("expected Filter over Scan"),
+            },
+            _ => panic!("expected Project plan root"),
+        }
+    }
+
+    #[test]
+    fn test_bind_select_pk_eq_null_keeps_scan() {
+        let catalog = setup_table();
+        let plan = bind_sql(&catalog, "SELECT * FROM t WHERE id = NULL");
+        match plan {
+            LogicalPlan::Project { input, .. } => match *input {
+                LogicalPlan::Filter { input, .. } => {
+                    assert!(matches!(*input, LogicalPlan::Scan { .. }));
+                }
+                _ => panic!("expected Filter over Scan"),
+            },
+            _ => panic!("expected Project plan root"),
+        }
+    }
+
+    #[test]
+    fn test_bind_select_composite_pk_eq_generates_point_get() {
+        let catalog = setup_table_with_composite_pk();
+        let plan = bind_sql(&catalog, "SELECT * FROM t2 WHERE id = 7 AND region = 'us'");
+        match plan {
+            LogicalPlan::Project { input, .. } => match *input {
+                LogicalPlan::PointGet { key, .. } => {
+                    let expected = encode_key(
+                        43,
+                        &encode_pk(&[Value::BigInt(7), Value::String("us".into())]),
+                    );
+                    assert_eq!(key, expected);
+                }
+                _ => panic!("expected bare PointGet"),
+            },
+            _ => panic!("expected Project plan root"),
+        }
+    }
+
+    #[test]
+    fn test_bind_select_composite_pk_missing_component_keeps_scan() {
+        let catalog = setup_table_with_composite_pk();
+        let plan = bind_sql(&catalog, "SELECT * FROM t2 WHERE id = 7");
+        match plan {
+            LogicalPlan::Project { input, .. } => match *input {
+                LogicalPlan::Filter { input, .. } => {
+                    assert!(matches!(*input, LogicalPlan::Scan { .. }));
+                }
+                _ => panic!("expected Filter over Scan"),
+            },
+            _ => panic!("expected Project plan root"),
+        }
+    }
+
+    #[test]
+    fn test_bind_select_or_predicate_keeps_scan() {
+        let catalog = setup_table();
+        let plan = bind_sql(&catalog, "SELECT * FROM t WHERE id = 1 OR name = 'alice'");
+        match plan {
+            LogicalPlan::Project { input, .. } => match *input {
+                LogicalPlan::Filter { input, .. } => {
+                    assert!(matches!(*input, LogicalPlan::Scan { .. }));
+                }
+                _ => panic!("expected Filter over Scan"),
+            },
+            _ => panic!("expected Project plan root"),
+        }
+    }
+
+    #[test]
+    fn test_bind_select_point_get_with_order_by_and_limit() {
+        let catalog = setup_table();
+        let plan = bind_sql(
+            &catalog,
+            "SELECT * FROM t WHERE id = 1 ORDER BY name LIMIT 1",
+        );
+        match plan {
+            LogicalPlan::Limit { input, .. } => match *input {
+                LogicalPlan::Sort { input, .. } => match *input {
+                    LogicalPlan::Project { input, .. } => {
+                        assert!(matches!(*input, LogicalPlan::PointGet { .. }));
+                    }
+                    _ => panic!("expected Project under Sort"),
+                },
+                _ => panic!("expected Sort under Limit"),
+            },
+            _ => panic!("expected Limit plan root"),
+        }
+    }
+
+    #[test]
+    fn test_bind_select_contradictory_pk_eq_generates_empty() {
+        let catalog = setup_table();
+        let plan = bind_sql(&catalog, "SELECT * FROM t WHERE id = 1 AND id = 2");
+        match plan {
+            LogicalPlan::Project { input, .. } => {
+                assert!(matches!(*input, LogicalPlan::Empty { .. }));
+            }
+            _ => panic!("expected Project plan root"),
         }
     }
 }

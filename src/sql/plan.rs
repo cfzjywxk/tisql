@@ -20,7 +20,7 @@
 // Allow dead code for future features that are defined but not yet implemented
 #![allow(dead_code)]
 
-use crate::catalog::types::{ColumnId, DataType, Schema, Value};
+use crate::catalog::types::{ColumnId, DataType, Key, Schema, Value};
 use crate::catalog::TableDef;
 
 /// Logical plan tree
@@ -32,6 +32,9 @@ pub enum LogicalPlan {
         projection: Option<Vec<usize>>, // Column indices to project
         filter: Option<Expr>,
     },
+
+    /// Point get by primary key.
+    PointGet { table: TableDef, key: Key },
 
     /// Projection (SELECT expressions)
     Project {
@@ -188,6 +191,7 @@ impl LogicalPlan {
         matches!(
             self,
             LogicalPlan::Scan { .. }
+                | LogicalPlan::PointGet { .. }
                 | LogicalPlan::Project { .. }
                 | LogicalPlan::Filter { .. }
                 | LogicalPlan::Sort { .. }
@@ -225,6 +229,11 @@ impl LogicalPlan {
                         .collect()
                 }
             }
+            LogicalPlan::PointGet { table, .. } => table
+                .columns()
+                .iter()
+                .map(|c| c.name().to_string())
+                .collect(),
             LogicalPlan::Values { schema, .. } | LogicalPlan::Empty { schema } => schema
                 .columns()
                 .iter()
