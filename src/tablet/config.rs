@@ -68,14 +68,14 @@ pub const DEFAULT_TARGET_FILE_SIZE: usize = 64 * 1024 * 1024;
 /// Default number of LSM levels (L0 + L1).
 pub const DEFAULT_MAX_LEVELS: usize = 2;
 
-/// Bloom filter is disabled by default (rollout gate).
-pub const DEFAULT_BLOOM_ENABLED: bool = false;
+/// Bloom filter is enabled by default.
+pub const DEFAULT_BLOOM_ENABLED: bool = true;
 
 /// Default bloom filter bits per key.
 pub const DEFAULT_BLOOM_BITS_PER_KEY: u32 = 12;
 
-/// Shared block cache is disabled by default (rollout gate).
-pub const DEFAULT_SHARED_BLOCK_CACHE_ENABLED: bool = false;
+/// Shared block cache is enabled by default.
+pub const DEFAULT_SHARED_BLOCK_CACHE_ENABLED: bool = true;
 
 /// Reader cache is disabled by default (rollout gate).
 pub const DEFAULT_READER_CACHE_ENABLED: bool = false;
