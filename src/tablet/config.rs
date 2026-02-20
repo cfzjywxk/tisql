@@ -26,9 +26,9 @@
 //! | memtable_size | 64 MB | Size threshold for memtable flush |
 //! | max_frozen_memtables | 4 | Max frozen memtables before stalling |
 //! | block_size | 4 KB | Target data block size |
-//! | l0_compaction_trigger | 4 | L0 file count to trigger compaction |
+//! | l0_compaction_trigger | 8 | L0 file count to trigger compaction |
 //! | level_size_multiplier | 10 | Size ratio between adjacent levels |
-//! | max_levels | 2 | Number of levels (L0 + L1 by default) |
+//! | max_levels | 3 | Number of levels (L0 + L1 + L2 by default) |
 //!
 //! ## Example
 //!
@@ -54,7 +54,13 @@ pub const DEFAULT_MAX_FROZEN_MEMTABLES: usize = 4;
 pub const DEFAULT_BLOCK_SIZE: usize = 4 * 1024;
 
 /// Default L0 compaction trigger (file count).
-pub const DEFAULT_L0_COMPACTION_TRIGGER: usize = 4;
+pub const DEFAULT_L0_COMPACTION_TRIGGER: usize = 8;
+
+/// Default L0 slowdown trigger (file count).
+pub const DEFAULT_L0_SLOWDOWN_TRIGGER: usize = DEFAULT_L0_COMPACTION_TRIGGER * 3;
+
+/// Default L0 stop trigger (file count).
+pub const DEFAULT_L0_STOP_TRIGGER: usize = DEFAULT_L0_COMPACTION_TRIGGER * 4;
 
 /// Default level size multiplier (10x between levels).
 pub const DEFAULT_LEVEL_SIZE_MULTIPLIER: usize = 10;
@@ -65,8 +71,11 @@ pub const DEFAULT_L1_MAX_SIZE: usize = 256 * 1024 * 1024;
 /// Default target file size (64 MB).
 pub const DEFAULT_TARGET_FILE_SIZE: usize = 64 * 1024 * 1024;
 
-/// Default number of LSM levels (L0 + L1).
-pub const DEFAULT_MAX_LEVELS: usize = 2;
+/// Default number of LSM levels (L0 + L1 + L2).
+///
+/// TiSQL shards data by tablet, so we keep a small number of levels to control
+/// compaction rewrite cost without adopting RocksDB-like deep level stacks.
+pub const DEFAULT_MAX_LEVELS: usize = 3;
 
 /// Bloom filter is enabled by default.
 pub const DEFAULT_BLOOM_ENABLED: bool = true;
@@ -278,8 +287,8 @@ impl LsmConfig {
             reader_cache_max_entries: DEFAULT_READER_CACHE_MAX_ENTRIES,
             target_file_size: DEFAULT_TARGET_FILE_SIZE,
             l0_compaction_trigger: DEFAULT_L0_COMPACTION_TRIGGER,
-            l0_slowdown_trigger: DEFAULT_L0_COMPACTION_TRIGGER * 2,
-            l0_stop_trigger: DEFAULT_L0_COMPACTION_TRIGGER * 3,
+            l0_slowdown_trigger: DEFAULT_L0_SLOWDOWN_TRIGGER,
+            l0_stop_trigger: DEFAULT_L0_STOP_TRIGGER,
             level_size_multiplier: DEFAULT_LEVEL_SIZE_MULTIPLIER,
             l1_max_size: DEFAULT_L1_MAX_SIZE,
             max_levels: DEFAULT_MAX_LEVELS,
@@ -574,6 +583,8 @@ mod tests {
         assert_eq!(config.max_frozen_memtables, DEFAULT_MAX_FROZEN_MEMTABLES);
         assert_eq!(config.block_size, DEFAULT_BLOCK_SIZE);
         assert_eq!(config.l0_compaction_trigger, DEFAULT_L0_COMPACTION_TRIGGER);
+        assert_eq!(config.l0_slowdown_trigger, DEFAULT_L0_SLOWDOWN_TRIGGER);
+        assert_eq!(config.l0_stop_trigger, DEFAULT_L0_STOP_TRIGGER);
         assert_eq!(config.max_levels, DEFAULT_MAX_LEVELS);
         assert_eq!(config.bloom_enabled, DEFAULT_BLOOM_ENABLED);
         assert_eq!(config.bloom_bits_per_key, DEFAULT_BLOOM_BITS_PER_KEY);
@@ -621,6 +632,8 @@ mod tests {
         assert_eq!(config.memtable_size, 128 * 1024 * 1024);
         assert_eq!(config.max_frozen_memtables, 8);
         assert_eq!(config.l0_compaction_trigger, 8);
+        assert_eq!(config.l0_slowdown_trigger, 16);
+        assert_eq!(config.l0_stop_trigger, 24);
         assert!(config.bloom_enabled);
         assert_eq!(config.bloom_bits_per_key, 16);
         assert!(config.shared_block_cache_enabled);

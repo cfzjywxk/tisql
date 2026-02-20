@@ -1038,10 +1038,10 @@ async fn test_do_compaction_deletes_old_ssts() {
     // Total count may differ but old input files should not exist.
     // The version should reflect the new state.
     let version = engine.current_version();
-    assert_eq!(
-        version.level_size(0),
-        0,
-        "L0 should be empty after L0→L1 compaction"
+    assert!(
+        version.level_size(0) < count_before,
+        "L0 should shrink after bounded L0→L1 compaction (before={count_before}, after={})",
+        version.level_size(0)
     );
     assert!(
         version.level_size(1) > 0,
@@ -2068,7 +2068,9 @@ async fn test_multi_level_cascading() {
     }
 
     // Run compaction with deterministic bounds to avoid hanging CI.
-    let total_compactions = compact_until_idle(&engine, 24, Duration::from_secs(5)).await;
+    // Bounded L0 picking compacts incrementally, so deep-level convergence can
+    // require more rounds than "all-L0-at-once" behavior.
+    let total_compactions = compact_until_idle(&engine, 96, Duration::from_secs(5)).await;
     assert!(
         total_compactions >= 1,
         "Should have compacted at least once"
@@ -2298,7 +2300,9 @@ async fn test_multi_level_delete_reinsert_compaction_correctness() {
         engine.flush_all_with_active_async().await.unwrap();
     }
 
-    let compact_rounds = compact_until_idle(&engine, 24, Duration::from_secs(5)).await;
+    // Bounded L0 picking compacts incrementally, so deep-level convergence can
+    // require more rounds than "all-L0-at-once" behavior.
+    let compact_rounds = compact_until_idle(&engine, 96, Duration::from_secs(5)).await;
     assert!(compact_rounds > 0, "expected compaction to run");
 
     let version = engine.current_version();

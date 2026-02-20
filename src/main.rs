@@ -23,8 +23,9 @@ use std::sync::Arc;
 
 use clap::Parser as ClapParser;
 use tisql::tablet::{
-    DEFAULT_BLOOM_BITS_PER_KEY, DEFAULT_CACHE_TOTAL_RATIO, DEFAULT_READER_CACHE_MAX_ENTRIES,
-    DEFAULT_SCAN_FILL_CACHE_THRESHOLD_BLOCKS,
+    DEFAULT_BLOOM_BITS_PER_KEY, DEFAULT_CACHE_TOTAL_RATIO, DEFAULT_L0_COMPACTION_TRIGGER,
+    DEFAULT_L0_SLOWDOWN_TRIGGER, DEFAULT_L0_STOP_TRIGGER, DEFAULT_MAX_LEVELS,
+    DEFAULT_READER_CACHE_MAX_ENTRIES, DEFAULT_SCAN_FILL_CACHE_THRESHOLD_BLOCKS,
 };
 use tisql::util::LogLevel;
 use tisql::{log_error, log_info};
@@ -167,6 +168,38 @@ struct Args {
         default_value_t = DEFAULT_READER_CACHE_MAX_ENTRIES
     )]
     reader_cache_max_entries: usize,
+
+    /// L0 file count that triggers compaction.
+    #[arg(
+        long,
+        default_value_t = DEFAULT_L0_COMPACTION_TRIGGER as u32,
+        value_parser = clap::value_parser!(u32).range(1..)
+    )]
+    l0_compaction_trigger: u32,
+
+    /// L0 file count that starts write slowdown.
+    #[arg(
+        long,
+        default_value_t = DEFAULT_L0_SLOWDOWN_TRIGGER as u32,
+        value_parser = clap::value_parser!(u32).range(1..)
+    )]
+    l0_slowdown_trigger: u32,
+
+    /// L0 file count that hard-stops writes.
+    #[arg(
+        long,
+        default_value_t = DEFAULT_L0_STOP_TRIGGER as u32,
+        value_parser = clap::value_parser!(u32).range(1..)
+    )]
+    l0_stop_trigger: u32,
+
+    /// Number of LSM levels (kept intentionally small for per-tablet LSMs).
+    #[arg(
+        long,
+        default_value_t = DEFAULT_MAX_LEVELS as u32,
+        value_parser = clap::value_parser!(u32).range(2..)
+    )]
+    max_levels: u32,
 }
 
 fn main() {
@@ -222,7 +255,11 @@ fn main() {
         .with_scan_fill_cache(scan_fill_cache)
         .with_scan_fill_cache_threshold_blocks(args.scan_fill_cache_threshold_blocks)
         .with_cache_total_ratio(args.cache_total_ratio)
-        .with_reader_cache_max_entries(args.reader_cache_max_entries);
+        .with_reader_cache_max_entries(args.reader_cache_max_entries)
+        .with_l0_compaction_trigger(args.l0_compaction_trigger as usize)
+        .with_l0_slowdown_trigger(args.l0_slowdown_trigger as usize)
+        .with_l0_stop_trigger(args.l0_stop_trigger as usize)
+        .with_max_levels(args.max_levels as usize);
     let db = match Database::open(db_config) {
         Ok(db) => Arc::new(db),
         Err(e) => {
@@ -281,6 +318,10 @@ fn main() {
         args.scan_fill_cache_threshold_blocks,
         args.cache_total_ratio,
         args.reader_cache_max_entries
+    );
+    println!(
+        "LSM flow control: levels={} l0(compact/slowdown/stop)=({}/{}/{})",
+        args.max_levels, args.l0_compaction_trigger, args.l0_slowdown_trigger, args.l0_stop_trigger
     );
     println!(
         "Connect with: mysql -h{} -P{} -uroot test",
@@ -459,6 +500,13 @@ mod tests {
             args.reader_cache_max_entries,
             DEFAULT_READER_CACHE_MAX_ENTRIES
         );
+        assert_eq!(
+            args.l0_compaction_trigger,
+            DEFAULT_L0_COMPACTION_TRIGGER as u32
+        );
+        assert_eq!(args.l0_slowdown_trigger, DEFAULT_L0_SLOWDOWN_TRIGGER as u32);
+        assert_eq!(args.l0_stop_trigger, DEFAULT_L0_STOP_TRIGGER as u32);
+        assert_eq!(args.max_levels, DEFAULT_MAX_LEVELS as u32);
     }
 
     #[test]
@@ -501,5 +549,25 @@ mod tests {
             "--disable-shared-block-cache",
         ]);
         assert!(parsed.is_err());
+    }
+
+    #[test]
+    fn test_lsm_flow_control_flags_parse() {
+        let args = Args::try_parse_from([
+            "tisql",
+            "--l0-compaction-trigger",
+            "12",
+            "--l0-slowdown-trigger",
+            "24",
+            "--l0-stop-trigger",
+            "36",
+            "--max-levels",
+            "4",
+        ])
+        .unwrap();
+        assert_eq!(args.l0_compaction_trigger, 12);
+        assert_eq!(args.l0_slowdown_trigger, 24);
+        assert_eq!(args.l0_stop_trigger, 36);
+        assert_eq!(args.max_levels, 4);
     }
 }

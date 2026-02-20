@@ -29,7 +29,8 @@
 //! ## Compaction Types
 //!
 //! 1. **L0 -> L1**: Triggered when L0 file count exceeds threshold.
-//!    Picks all L0 files and overlapping L1 files, merges into new L1 files.
+//!    Picks a bounded oldest slice of L0 files (up to trigger count) and
+//!    overlapping L1 files, merges into new L1 files.
 //!
 //! 2. **Ln -> Ln+1**: Triggered when level size exceeds threshold.
 //!    Picks one file from Ln, finds overlapping Ln+1 files, merges.
@@ -204,11 +205,16 @@ impl CompactionPicker {
             return None;
         }
 
-        // Collect all L0 files
-        let mut inputs: Vec<(u32, u64)> = l0_files.iter().map(|sst| (0, sst.id)).collect();
+        // Compact a bounded oldest slice of L0 to avoid huge all-L0 rewrites.
+        // Keep selected inputs ordered newest -> oldest for merge tie-breaking.
+        let max_l0_inputs = self.config.l0_compaction_trigger.max(1);
+        let selected_count = max_l0_inputs.min(l0_files.len());
+        let start = l0_files.len() - selected_count;
+        let selected_l0: Vec<Arc<SstMeta>> = l0_files[start..].to_vec();
+        let mut inputs: Vec<(u32, u64)> = selected_l0.iter().map(|sst| (0, sst.id)).collect();
 
         // Find MVCC key range covered by L0 files
-        let (min_mvcc_key, max_mvcc_key) = self.get_key_range(l0_files)?;
+        let (min_mvcc_key, max_mvcc_key) = self.get_key_range(&selected_l0)?;
 
         // Find overlapping L1 files using MVCC key ranges directly.
         // Each MVCC key is an independent key in the storage engine.
@@ -717,6 +723,39 @@ mod tests {
         assert_eq!(task.output_level, 1);
         assert!(!task.is_trivial_move);
         assert_eq!(task.inputs.len(), 4); // All 4 L0 files
+    }
+
+    #[tokio::test]
+    async fn test_picker_l0_compaction_caps_inputs_to_trigger() {
+        let tmp = TempDir::new().unwrap();
+        let config = Arc::new(
+            LsmConfig::builder(tmp.path())
+                .l0_compaction_trigger(4)
+                .build()
+                .unwrap(),
+        );
+        let picker = CompactionPicker::new(config);
+
+        // L0 is sorted newest-first by id: [6, 5, 4, 3, 2, 1].
+        // Picker should compact only the oldest trigger-sized slice, while
+        // preserving newest->oldest order within that slice: [4, 3, 2, 1].
+        let version = Version::builder()
+            .add_sst(make_sst(1, 0, b"a", b"b"))
+            .add_sst(make_sst(2, 0, b"c", b"d"))
+            .add_sst(make_sst(3, 0, b"e", b"f"))
+            .add_sst(make_sst(4, 0, b"g", b"h"))
+            .add_sst(make_sst(5, 0, b"i", b"j"))
+            .add_sst(make_sst(6, 0, b"k", b"z"))
+            .build();
+
+        let task = picker.pick(&version).unwrap();
+        let l0_inputs: Vec<u64> = task
+            .inputs
+            .iter()
+            .filter_map(|(level, id)| (*level == 0).then_some(*id))
+            .collect();
+
+        assert_eq!(l0_inputs, vec![4, 3, 2, 1]);
     }
 
     #[tokio::test]

@@ -9111,6 +9111,33 @@ mod tests {
     // ==================== Write Flow Control Tests ====================
 
     #[test]
+    fn test_default_flow_control_has_tablet_headroom() {
+        let tmp = TempDir::new().unwrap();
+        let config = LsmConfig::new(tmp.path());
+        let engine = LsmEngine::open(config).unwrap();
+        let cfg = engine.config();
+
+        // Tablets keep LSM trees smaller than monolithic engines, so defaults
+        // should stay shallow (not deep RocksDB-style trees) while preserving
+        // enough L0 headroom before write slowdown kicks in.
+        assert_eq!(cfg.max_levels, 3);
+        assert!(cfg.l0_slowdown_trigger > cfg.l0_compaction_trigger);
+        assert!(cfg.l0_stop_trigger > cfg.l0_slowdown_trigger);
+
+        let mild_pressure_l0 = cfg.l0_compaction_trigger + 2;
+        let stall = engine
+            .check_write_stall_with_l0(mild_pressure_l0)
+            .expect("frozen memtable stall should not trigger in an idle engine");
+        assert!(
+            stall.is_none(),
+            "mild L0 pressure (l0_count={mild_pressure_l0}) should not slowdown writes with defaults: compact={} slowdown={} stop={}",
+            cfg.l0_compaction_trigger,
+            cfg.l0_slowdown_trigger,
+            cfg.l0_stop_trigger,
+        );
+    }
+
+    #[test]
     fn test_compute_write_delay() {
         let tmp = TempDir::new().unwrap();
         let config = LsmConfig::builder(tmp.path())

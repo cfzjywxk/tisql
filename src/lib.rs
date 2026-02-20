@@ -178,9 +178,10 @@ use tablet::{
     route_table_to_tablet, CacheSuite, CacheSuiteConfig, GlobalLogGcBoundary, IlogConfig,
     IlogService, IlogTruncateStats, LsmConfig, LsmEngine, LsmRecovery, RoutedTabletStorage,
     TabletId, TabletManager, DEFAULT_BLOOM_BITS_PER_KEY, DEFAULT_BLOOM_ENABLED,
-    DEFAULT_CACHE_TOTAL_RATIO, DEFAULT_READER_CACHE_ENABLED, DEFAULT_READER_CACHE_MAX_ENTRIES,
-    DEFAULT_ROW_CACHE_ENABLED, DEFAULT_SCAN_FILL_CACHE, DEFAULT_SCAN_FILL_CACHE_THRESHOLD_BLOCKS,
-    DEFAULT_SHARED_BLOCK_CACHE_ENABLED,
+    DEFAULT_CACHE_TOTAL_RATIO, DEFAULT_L0_COMPACTION_TRIGGER, DEFAULT_L0_SLOWDOWN_TRIGGER,
+    DEFAULT_L0_STOP_TRIGGER, DEFAULT_MAX_LEVELS, DEFAULT_READER_CACHE_ENABLED,
+    DEFAULT_READER_CACHE_MAX_ENTRIES, DEFAULT_ROW_CACHE_ENABLED, DEFAULT_SCAN_FILL_CACHE,
+    DEFAULT_SCAN_FILL_CACHE_THRESHOLD_BLOCKS, DEFAULT_SHARED_BLOCK_CACHE_ENABLED,
 };
 use transaction::{ConcurrencyManager, TransactionService};
 use tso::LocalTso;
@@ -223,6 +224,14 @@ pub struct DatabaseConfig {
     pub cache_total_ratio: f64,
     /// Reader cache entry cap.
     pub reader_cache_max_entries: usize,
+    /// L0 file count that triggers compaction.
+    pub l0_compaction_trigger: usize,
+    /// L0 file count that starts write slowdown.
+    pub l0_slowdown_trigger: usize,
+    /// L0 file count that hard-stops writes.
+    pub l0_stop_trigger: usize,
+    /// Number of LSM levels.
+    pub max_levels: usize,
 }
 
 impl Default for DatabaseConfig {
@@ -240,6 +249,10 @@ impl Default for DatabaseConfig {
             scan_fill_cache_threshold_blocks: DEFAULT_SCAN_FILL_CACHE_THRESHOLD_BLOCKS,
             cache_total_ratio: DEFAULT_CACHE_TOTAL_RATIO,
             reader_cache_max_entries: DEFAULT_READER_CACHE_MAX_ENTRIES,
+            l0_compaction_trigger: DEFAULT_L0_COMPACTION_TRIGGER,
+            l0_slowdown_trigger: DEFAULT_L0_SLOWDOWN_TRIGGER,
+            l0_stop_trigger: DEFAULT_L0_STOP_TRIGGER,
+            max_levels: DEFAULT_MAX_LEVELS,
         }
     }
 }
@@ -312,6 +325,30 @@ impl DatabaseConfig {
         self
     }
 
+    /// Set L0 compaction trigger.
+    pub fn with_l0_compaction_trigger(mut self, count: usize) -> Self {
+        self.l0_compaction_trigger = count;
+        self
+    }
+
+    /// Set L0 write-slowdown trigger.
+    pub fn with_l0_slowdown_trigger(mut self, count: usize) -> Self {
+        self.l0_slowdown_trigger = count;
+        self
+    }
+
+    /// Set L0 write-stop trigger.
+    pub fn with_l0_stop_trigger(mut self, count: usize) -> Self {
+        self.l0_stop_trigger = count;
+        self
+    }
+
+    /// Set the number of LSM levels.
+    pub fn with_max_levels(mut self, levels: usize) -> Self {
+        self.max_levels = levels;
+        self
+    }
+
     fn lsm_config_for_dir(&self, data_dir: impl Into<PathBuf>) -> Result<LsmConfig> {
         LsmConfig::builder(data_dir)
             .bloom_enabled(self.bloom_enabled)
@@ -323,6 +360,10 @@ impl DatabaseConfig {
             .scan_fill_cache_threshold_blocks(self.scan_fill_cache_threshold_blocks)
             .cache_total_ratio(self.cache_total_ratio)
             .reader_cache_max_entries(self.reader_cache_max_entries)
+            .l0_compaction_trigger(self.l0_compaction_trigger)
+            .l0_slowdown_trigger(self.l0_slowdown_trigger)
+            .l0_stop_trigger(self.l0_stop_trigger)
+            .max_levels(self.max_levels)
             .build()
             .map_err(util::error::TiSqlError::Storage)
     }
@@ -350,6 +391,10 @@ mod database_config_tests {
             config.reader_cache_max_entries,
             DEFAULT_READER_CACHE_MAX_ENTRIES
         );
+        assert_eq!(config.l0_compaction_trigger, DEFAULT_L0_COMPACTION_TRIGGER);
+        assert_eq!(config.l0_slowdown_trigger, DEFAULT_L0_SLOWDOWN_TRIGGER);
+        assert_eq!(config.l0_stop_trigger, DEFAULT_L0_STOP_TRIGGER);
+        assert_eq!(config.max_levels, DEFAULT_MAX_LEVELS);
     }
 
     #[test]
@@ -363,7 +408,11 @@ mod database_config_tests {
             .with_scan_fill_cache(true)
             .with_scan_fill_cache_threshold_blocks(16)
             .with_cache_total_ratio(0.6)
-            .with_reader_cache_max_entries(2048);
+            .with_reader_cache_max_entries(2048)
+            .with_l0_compaction_trigger(10)
+            .with_l0_slowdown_trigger(20)
+            .with_l0_stop_trigger(30)
+            .with_max_levels(4);
         assert!(config.bloom_enabled);
         assert_eq!(config.bloom_bits_per_key, 16);
         assert!(config.shared_block_cache_enabled);
@@ -373,6 +422,10 @@ mod database_config_tests {
         assert_eq!(config.scan_fill_cache_threshold_blocks, 16);
         assert_eq!(config.cache_total_ratio, 0.6);
         assert_eq!(config.reader_cache_max_entries, 2048);
+        assert_eq!(config.l0_compaction_trigger, 10);
+        assert_eq!(config.l0_slowdown_trigger, 20);
+        assert_eq!(config.l0_stop_trigger, 30);
+        assert_eq!(config.max_levels, 4);
     }
 
     #[test]
@@ -380,6 +433,16 @@ mod database_config_tests {
         let config = DatabaseConfig::with_data_dir("data").with_bloom_bits_per_key(0);
         let err = config.lsm_config_for_dir("data").unwrap_err().to_string();
         assert!(err.contains("bloom_bits_per_key"));
+    }
+
+    #[test]
+    fn test_database_config_l0_threshold_validation() {
+        let config = DatabaseConfig::with_data_dir("data")
+            .with_l0_compaction_trigger(8)
+            .with_l0_slowdown_trigger(7)
+            .with_l0_stop_trigger(9);
+        let err = config.lsm_config_for_dir("data").unwrap_err().to_string();
+        assert!(err.contains("l0_slowdown_trigger"));
     }
 }
 

@@ -18,6 +18,7 @@ bench_cases=(
     "tablet::engine::tests::test_point_get_from_sst_reads_few_blocks"
     "tablet::engine::tests::test_point_get_from_sst_bloom_path_hits_block_cache"
     "tablet::engine::tests::test_point_get_from_sst_scale_regression_guard"
+    "tablet::engine::tests::test_default_flow_control_has_tablet_headroom"
 )
 
 selected_cases=()
