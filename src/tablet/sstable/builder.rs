@@ -41,6 +41,8 @@
 //! +-------------------------------------------------------------------+
 //! | Index Block                                                        |
 //! +-------------------------------------------------------------------+
+//! | Bloom Meta Trailer (optional, fixed size)                          |
+//! +-------------------------------------------------------------------+
 //! | Footer (fixed size)                                                |
 //! +-------------------------------------------------------------------+
 //! ```
@@ -58,6 +60,7 @@ use crate::util::fs::sync_dir;
 use serde::{Deserialize, Serialize};
 
 use super::block::{DataBlockBuilder, IndexBlockBuilder, DEFAULT_BLOCK_SIZE};
+use super::bloom::BloomBuilder;
 
 // ============================================================================
 // Constants
@@ -71,6 +74,11 @@ pub const SST_VERSION: u32 = 1;
 
 /// Footer size in bytes (fixed)
 pub const FOOTER_SIZE: usize = 48;
+
+/// Optional bloom metadata trailer size in bytes.
+pub const BLOOM_META_TRAILER_SIZE: usize = 24;
+
+const BLOOM_META_MAGIC: u64 = 0x4154_454d_4d4f_4f42; // "BOOMMETA" (LE)
 
 /// Compression type: None (reserved for future)
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
@@ -187,6 +195,10 @@ pub struct SstBuilderOptions {
     pub block_size: usize,
     /// Compression type (default: None)
     pub compression: CompressionType,
+    /// Whether bloom filter is enabled for this SST.
+    pub bloom_enabled: bool,
+    /// Bloom filter bits per key.
+    pub bloom_bits_per_key: u32,
 }
 
 impl Default for SstBuilderOptions {
@@ -194,6 +206,8 @@ impl Default for SstBuilderOptions {
         Self {
             block_size: DEFAULT_BLOCK_SIZE,
             compression: CompressionType::None,
+            bloom_enabled: false,
+            bloom_bits_per_key: 12,
         }
     }
 }
@@ -353,6 +367,40 @@ impl Footer {
     }
 }
 
+/// Optional bloom metadata trailer, placed right before the footer.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct BloomMetaTrailer {
+    pub bloom_offset: u64,
+    pub bloom_size: u32,
+}
+
+impl BloomMetaTrailer {
+    pub fn encode(&self) -> [u8; BLOOM_META_TRAILER_SIZE] {
+        let mut buf = [0u8; BLOOM_META_TRAILER_SIZE];
+        buf[0..8].copy_from_slice(&BLOOM_META_MAGIC.to_le_bytes());
+        buf[8..16].copy_from_slice(&self.bloom_offset.to_le_bytes());
+        buf[16..20].copy_from_slice(&self.bloom_size.to_le_bytes());
+        // [20..24] reserved for future use
+        buf
+    }
+
+    pub fn decode_optional(data: &[u8; BLOOM_META_TRAILER_SIZE]) -> Option<Self> {
+        let magic = u64::from_le_bytes(data[0..8].try_into().ok()?);
+        if magic != BLOOM_META_MAGIC {
+            return None;
+        }
+        let bloom_offset = u64::from_le_bytes(data[8..16].try_into().ok()?);
+        let bloom_size = u32::from_le_bytes(data[16..20].try_into().ok()?);
+        if bloom_size == 0 {
+            return None;
+        }
+        Some(Self {
+            bloom_offset,
+            bloom_size,
+        })
+    }
+}
+
 // ============================================================================
 // SstBuilder
 // ============================================================================
@@ -387,6 +435,10 @@ pub struct SstBuilder {
     max_ts: Timestamp,
     /// Whether the builder has been finished
     finished: bool,
+    /// Optional bloom builder for per-SST full filter.
+    bloom_builder: Option<BloomBuilder>,
+    /// Last user key admitted into bloom (dedupe adjacent MVCC versions).
+    last_bloom_user_key: Option<Vec<u8>>,
 }
 
 impl SstBuilder {
@@ -395,6 +447,11 @@ impl SstBuilder {
         let path = path.as_ref().to_path_buf();
         let file = File::create(&path)?;
         let writer = BufWriter::new(file);
+        let bloom_builder = if options.bloom_enabled {
+            Some(BloomBuilder::new(options.bloom_bits_per_key))
+        } else {
+            None
+        };
 
         Ok(Self {
             path,
@@ -410,6 +467,8 @@ impl SstBuilder {
             min_ts: Timestamp::MAX,
             max_ts: 0,
             finished: false,
+            bloom_builder,
+            last_bloom_user_key: None,
         })
     }
 
@@ -435,6 +494,18 @@ impl SstBuilder {
             let ts = !u64::from_be_bytes(ts_bytes);
             self.min_ts = self.min_ts.min(ts);
             self.max_ts = self.max_ts.max(ts);
+        }
+
+        if let Some(ref mut bloom) = self.bloom_builder {
+            let user_key = extract_key(key);
+            let should_add = self
+                .last_bloom_user_key
+                .as_ref()
+                .is_none_or(|last| last.as_slice() != user_key);
+            if should_add {
+                bloom.add(user_key);
+                self.last_bloom_user_key = Some(user_key.to_vec());
+            }
         }
 
         self.entry_count += 1;
@@ -492,9 +563,20 @@ impl SstBuilder {
 
     /// Get the estimated file size.
     pub fn estimated_size(&self) -> u64 {
+        let bloom_meta_size = if self.options.bloom_enabled {
+            BLOOM_META_TRAILER_SIZE as u64
+        } else {
+            0
+        };
+        let bloom_payload_size = self
+            .bloom_builder
+            .as_ref()
+            .map_or(0, BloomBuilder::estimated_encoded_size);
         self.current_offset
             + self.data_block.estimated_size() as u64
             + self.index_block.estimated_size() as u64
+            + bloom_payload_size
+            + bloom_meta_size
             + FOOTER_SIZE as u64
     }
 
@@ -521,6 +603,19 @@ impl SstBuilder {
         // Flush remaining data block
         self.flush_data_block()?;
 
+        let mut bloom_span: Option<(u64, u32)> = None;
+
+        // Write optional bloom block right before index block.
+        if let Some(bloom_builder) = self.bloom_builder.take() {
+            if !bloom_builder.is_empty() {
+                let bloom_offset = self.current_offset;
+                let bloom_data = bloom_builder.finish().encode();
+                self.writer.write_all(&bloom_data)?;
+                self.current_offset += bloom_data.len() as u64;
+                bloom_span = Some((bloom_offset, bloom_data.len() as u32));
+            }
+        }
+
         // Write index block
         let index_offset = self.current_offset;
         let index_data = std::mem::take(&mut self.index_block).finish();
@@ -528,6 +623,15 @@ impl SstBuilder {
 
         self.writer.write_all(&index_data)?;
         self.current_offset += index_data.len() as u64;
+
+        if let Some((bloom_offset, bloom_size)) = bloom_span {
+            let trailer = BloomMetaTrailer {
+                bloom_offset,
+                bloom_size,
+            };
+            self.writer.write_all(&trailer.encode())?;
+            self.current_offset += BLOOM_META_TRAILER_SIZE as u64;
+        }
 
         // Build and write footer
         let footer = Footer {
@@ -638,6 +742,10 @@ pub struct AsyncSstBuilder {
     max_ts: Timestamp,
     /// Whether the builder has been finished
     finished: bool,
+    /// Optional bloom builder for per-SST full filter.
+    bloom_builder: Option<BloomBuilder>,
+    /// Last user key admitted into bloom.
+    last_bloom_user_key: Option<Vec<u8>>,
 }
 
 impl AsyncSstBuilder {
@@ -654,6 +762,11 @@ impl AsyncSstBuilder {
                 path.display()
             ))
         })?;
+        let bloom_builder = if options.bloom_enabled {
+            Some(BloomBuilder::new(options.bloom_bits_per_key))
+        } else {
+            None
+        };
 
         Ok(Self {
             path,
@@ -670,6 +783,8 @@ impl AsyncSstBuilder {
             min_ts: Timestamp::MAX,
             max_ts: 0,
             finished: false,
+            bloom_builder,
+            last_bloom_user_key: None,
         })
     }
 
@@ -695,6 +810,18 @@ impl AsyncSstBuilder {
             let ts = !u64::from_be_bytes(ts_bytes);
             self.min_ts = self.min_ts.min(ts);
             self.max_ts = self.max_ts.max(ts);
+        }
+
+        if let Some(ref mut bloom) = self.bloom_builder {
+            let user_key = extract_key(key);
+            let should_add = self
+                .last_bloom_user_key
+                .as_ref()
+                .is_none_or(|last| last.as_slice() != user_key);
+            if should_add {
+                bloom.add(user_key);
+                self.last_bloom_user_key = Some(user_key.to_vec());
+            }
         }
 
         self.entry_count += 1;
@@ -778,11 +905,31 @@ impl AsyncSstBuilder {
         // Flush remaining data block
         self.flush_data_block().await?;
 
+        let mut bloom_span: Option<(u64, u32)> = None;
+
+        // Write optional bloom block right before index block.
+        if let Some(bloom_builder) = self.bloom_builder.take() {
+            if !bloom_builder.is_empty() {
+                let bloom_offset = self.current_offset;
+                let bloom_data = bloom_builder.finish().encode();
+                self.write_all(&bloom_data).await?;
+                bloom_span = Some((bloom_offset, bloom_data.len() as u32));
+            }
+        }
+
         // Write index block
         let index_offset = self.current_offset;
         let index_data = std::mem::take(&mut self.index_block).finish();
         let index_size = index_data.len() as u32;
         self.write_all(&index_data).await?;
+
+        if let Some((bloom_offset, bloom_size)) = bloom_span {
+            let trailer = BloomMetaTrailer {
+                bloom_offset,
+                bloom_size,
+            };
+            self.write_all(&trailer.encode()).await?;
+        }
 
         // Build and write footer
         let footer = Footer {
@@ -910,6 +1057,111 @@ mod tests {
         let result = Footer::decode(&data);
         assert!(result.is_err());
         assert!(result.unwrap_err().to_string().contains("magic"));
+    }
+
+    #[test]
+    fn test_bloom_meta_trailer_encode_decode() {
+        let trailer = BloomMetaTrailer {
+            bloom_offset: 1234,
+            bloom_size: 567,
+        };
+        let encoded = trailer.encode();
+        let decoded = BloomMetaTrailer::decode_optional(&encoded).unwrap();
+        assert_eq!(decoded, trailer);
+    }
+
+    #[test]
+    fn test_bloom_meta_trailer_absent_when_magic_mismatch() {
+        let trailer = [0u8; BLOOM_META_TRAILER_SIZE];
+        assert!(BloomMetaTrailer::decode_optional(&trailer).is_none());
+    }
+
+    #[test]
+    fn test_builder_writes_bloom_meta_trailer_when_bloom_enabled() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("bloom_trailer.sst");
+        let mut builder = SstBuilder::new(
+            &path,
+            SstBuilderOptions {
+                bloom_enabled: true,
+                bloom_bits_per_key: 12,
+                ..SstBuilderOptions::default()
+            },
+        )
+        .unwrap();
+        builder.add(&mvcc_key(b"k1", 10), b"v1").unwrap();
+        let meta = builder.finish(1, 0).unwrap();
+
+        let bytes = std::fs::read(&path).unwrap();
+        assert_eq!(bytes.len(), meta.file_size as usize);
+
+        let footer_start = bytes.len() - FOOTER_SIZE;
+        let footer_raw: [u8; FOOTER_SIZE] = bytes[footer_start..].try_into().unwrap();
+        let footer = Footer::decode(&footer_raw).unwrap();
+
+        let trailer_start = footer_start - BLOOM_META_TRAILER_SIZE;
+        let trailer_raw: [u8; BLOOM_META_TRAILER_SIZE] =
+            bytes[trailer_start..footer_start].try_into().unwrap();
+        let trailer = BloomMetaTrailer::decode_optional(&trailer_raw).unwrap();
+
+        assert!(trailer.bloom_offset < footer.index_offset);
+        assert!(trailer.bloom_size > 0);
+        assert_eq!(
+            trailer.bloom_offset + trailer.bloom_size as u64,
+            footer.index_offset
+        );
+    }
+
+    #[test]
+    fn test_builder_bloom_deduplicates_adjacent_mvcc_versions() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("bloom_dedup.sst");
+        let mut builder = SstBuilder::new(
+            &path,
+            SstBuilderOptions {
+                bloom_enabled: true,
+                bloom_bits_per_key: 12,
+                ..SstBuilderOptions::default()
+            },
+        )
+        .unwrap();
+
+        // Same logical key across many MVCC versions (descending ts = sorted MVCC order).
+        for ts in (100..=200u64).rev() {
+            builder
+                .add(&mvcc_key(b"dup-key", ts), format!("v{ts}").as_bytes())
+                .unwrap();
+        }
+        builder.add(&mvcc_key(b"uniq-key", 88), b"u88").unwrap();
+        builder.finish(2, 0).unwrap();
+
+        let bytes = std::fs::read(&path).unwrap();
+        let footer_start = bytes.len() - FOOTER_SIZE;
+        let footer_raw: [u8; FOOTER_SIZE] = bytes[footer_start..].try_into().unwrap();
+        let footer = Footer::decode(&footer_raw).unwrap();
+
+        let trailer_start = footer_start - BLOOM_META_TRAILER_SIZE;
+        let trailer_raw: [u8; BLOOM_META_TRAILER_SIZE] =
+            bytes[trailer_start..footer_start].try_into().unwrap();
+        let trailer = BloomMetaTrailer::decode_optional(&trailer_raw).unwrap();
+
+        let mut expected = BloomBuilder::new(12);
+        expected.add(b"dup-key");
+        expected.add(b"uniq-key");
+        let expected_size = expected.finish().encode().len() as u32;
+        assert_eq!(trailer.bloom_size, expected_size);
+
+        let bloom_start = trailer.bloom_offset as usize;
+        let bloom_end = bloom_start + trailer.bloom_size as usize;
+        let bloom =
+            crate::tablet::sstable::bloom::BloomFilter::decode(&bytes[bloom_start..bloom_end])
+                .unwrap();
+        assert!(bloom.may_contain(b"dup-key"));
+        assert!(bloom.may_contain(b"uniq-key"));
+        assert_eq!(
+            trailer.bloom_offset + trailer.bloom_size as u64,
+            footer.index_offset
+        );
     }
 
     // ------------------------------------------------------------------------

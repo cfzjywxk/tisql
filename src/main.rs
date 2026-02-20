@@ -22,6 +22,10 @@ use std::net::SocketAddr;
 use std::sync::Arc;
 
 use clap::Parser as ClapParser;
+use tisql::tablet::{
+    DEFAULT_BLOOM_BITS_PER_KEY, DEFAULT_CACHE_TOTAL_RATIO, DEFAULT_READER_CACHE_MAX_ENTRIES,
+    DEFAULT_SCAN_FILL_CACHE_THRESHOLD_BLOCKS,
+};
 use tisql::util::LogLevel;
 use tisql::{log_error, log_info};
 use tisql::{
@@ -81,6 +85,88 @@ struct Args {
         conflicts_with = "enable_encoded_result_batch"
     )]
     disable_encoded_result_batch: bool,
+
+    /// Enable bloom filter for SST point-lookups.
+    #[arg(long, default_value_t = false, conflicts_with = "disable_bloom")]
+    enable_bloom: bool,
+
+    /// Disable bloom filter for SST point-lookups.
+    #[arg(long, default_value_t = false, conflicts_with = "enable_bloom")]
+    disable_bloom: bool,
+
+    /// Bloom filter bits per key.
+    #[arg(
+        long,
+        default_value_t = DEFAULT_BLOOM_BITS_PER_KEY,
+        value_parser = clap::value_parser!(u32).range(1..)
+    )]
+    bloom_bits_per_key: u32,
+
+    /// Enable shared block cache.
+    #[arg(
+        long,
+        default_value_t = false,
+        conflicts_with = "disable_shared_block_cache"
+    )]
+    enable_shared_block_cache: bool,
+
+    /// Disable shared block cache.
+    #[arg(
+        long,
+        default_value_t = false,
+        conflicts_with = "enable_shared_block_cache"
+    )]
+    disable_shared_block_cache: bool,
+
+    /// Enable reader cache.
+    #[arg(long, default_value_t = false, conflicts_with = "disable_reader_cache")]
+    enable_reader_cache: bool,
+
+    /// Disable reader cache.
+    #[arg(long, default_value_t = false, conflicts_with = "enable_reader_cache")]
+    disable_reader_cache: bool,
+
+    /// Enable row cache.
+    #[arg(long, default_value_t = false, conflicts_with = "disable_row_cache")]
+    enable_row_cache: bool,
+
+    /// Disable row cache.
+    #[arg(long, default_value_t = false, conflicts_with = "enable_row_cache")]
+    disable_row_cache: bool,
+
+    /// Enable cache-fill for short foreground scans.
+    #[arg(
+        long,
+        default_value_t = false,
+        conflicts_with = "disable_scan_fill_cache"
+    )]
+    enable_scan_fill_cache: bool,
+
+    /// Disable cache-fill for foreground scans.
+    #[arg(
+        long,
+        default_value_t = false,
+        conflicts_with = "enable_scan_fill_cache"
+    )]
+    disable_scan_fill_cache: bool,
+
+    /// Short-scan cache-fill threshold in estimated blocks.
+    #[arg(
+        long,
+        default_value_t = DEFAULT_SCAN_FILL_CACHE_THRESHOLD_BLOCKS
+    )]
+    scan_fill_cache_threshold_blocks: usize,
+
+    /// Fraction of machine RAM used as total cache budget.
+    #[arg(long, default_value_t = DEFAULT_CACHE_TOTAL_RATIO)]
+    cache_total_ratio: f64,
+
+    /// Reader-cache entry cap.
+    #[arg(
+        long,
+        default_value_t = DEFAULT_READER_CACHE_MAX_ENTRIES
+    )]
+    reader_cache_max_entries: usize,
 }
 
 fn main() {
@@ -102,11 +188,41 @@ fn main() {
         args.enable_encoded_result_batch,
         args.disable_encoded_result_batch,
     );
+    let bloom_enabled = resolve_bloom_enabled_setting(args.enable_bloom, args.disable_bloom);
+    let shared_block_cache_enabled = resolve_flag_setting(
+        args.enable_shared_block_cache,
+        args.disable_shared_block_cache,
+        DatabaseConfig::default().shared_block_cache_enabled,
+    );
+    let reader_cache_enabled = resolve_flag_setting(
+        args.enable_reader_cache,
+        args.disable_reader_cache,
+        DatabaseConfig::default().reader_cache_enabled,
+    );
+    let row_cache_enabled = resolve_flag_setting(
+        args.enable_row_cache,
+        args.disable_row_cache,
+        DatabaseConfig::default().row_cache_enabled,
+    );
+    let scan_fill_cache = resolve_flag_setting(
+        args.enable_scan_fill_cache,
+        args.disable_scan_fill_cache,
+        DatabaseConfig::default().scan_fill_cache,
+    );
 
     // Open database with persistence
     let db_config = DatabaseConfig::with_data_dir(&args.data_dir)
         .with_runtime_threads(runtime_overrides)
-        .with_encoded_result_batch(encoded_result_batch);
+        .with_encoded_result_batch(encoded_result_batch)
+        .with_bloom_enabled(bloom_enabled)
+        .with_bloom_bits_per_key(args.bloom_bits_per_key)
+        .with_shared_block_cache_enabled(shared_block_cache_enabled)
+        .with_reader_cache_enabled(reader_cache_enabled)
+        .with_row_cache_enabled(row_cache_enabled)
+        .with_scan_fill_cache(scan_fill_cache)
+        .with_scan_fill_cache_threshold_blocks(args.scan_fill_cache_threshold_blocks)
+        .with_cache_total_ratio(args.cache_total_ratio)
+        .with_reader_cache_max_entries(args.reader_cache_max_entries);
     let db = match Database::open(db_config) {
         Ok(db) => Arc::new(db),
         Err(e) => {
@@ -134,6 +250,37 @@ fn main() {
         } else {
             "disabled"
         }
+    );
+    println!(
+        "Bloom filter: {} (bits/key={})",
+        if bloom_enabled { "enabled" } else { "disabled" },
+        args.bloom_bits_per_key
+    );
+    println!(
+        "Cache suite: block={}, reader={}, row={}, scan_fill={} (threshold_blocks={}, ratio={}, reader_cap={})",
+        if shared_block_cache_enabled {
+            "enabled"
+        } else {
+            "disabled"
+        },
+        if reader_cache_enabled {
+            "enabled"
+        } else {
+            "disabled"
+        },
+        if row_cache_enabled {
+            "enabled"
+        } else {
+            "disabled"
+        },
+        if scan_fill_cache {
+            "enabled"
+        } else {
+            "disabled"
+        },
+        args.scan_fill_cache_threshold_blocks,
+        args.cache_total_ratio,
+        args.reader_cache_max_entries
     );
     println!(
         "Connect with: mysql -h{} -P{} -uroot test",
@@ -166,6 +313,20 @@ fn resolve_encoded_result_batch_setting(enable: bool, disable: bool) -> bool {
         false
     } else {
         DatabaseConfig::default().enable_encoded_result_batch
+    }
+}
+
+fn resolve_bloom_enabled_setting(enable: bool, disable: bool) -> bool {
+    resolve_flag_setting(enable, disable, DatabaseConfig::default().bloom_enabled)
+}
+
+fn resolve_flag_setting(enable: bool, disable: bool, default_value: bool) -> bool {
+    if enable {
+        true
+    } else if disable {
+        false
+    } else {
+        default_value
     }
 }
 
@@ -209,6 +370,135 @@ mod tests {
             "tisql",
             "--enable-encoded-result-batch",
             "--disable-encoded-result-batch",
+        ]);
+        assert!(parsed.is_err());
+    }
+
+    #[test]
+    fn test_bloom_defaults_to_config() {
+        let args = Args::try_parse_from(["tisql"]).unwrap();
+        assert_eq!(
+            resolve_bloom_enabled_setting(args.enable_bloom, args.disable_bloom),
+            DatabaseConfig::default().bloom_enabled
+        );
+        assert_eq!(args.bloom_bits_per_key, DEFAULT_BLOOM_BITS_PER_KEY);
+    }
+
+    #[test]
+    fn test_bloom_enable_flag() {
+        let args = Args::try_parse_from(["tisql", "--enable-bloom"]).unwrap();
+        assert!(resolve_bloom_enabled_setting(
+            args.enable_bloom,
+            args.disable_bloom
+        ));
+    }
+
+    #[test]
+    fn test_bloom_disable_flag() {
+        let args = Args::try_parse_from(["tisql", "--disable-bloom"]).unwrap();
+        assert!(!resolve_bloom_enabled_setting(
+            args.enable_bloom,
+            args.disable_bloom
+        ));
+    }
+
+    #[test]
+    fn test_bloom_flags_conflict() {
+        let parsed = Args::try_parse_from(["tisql", "--enable-bloom", "--disable-bloom"]);
+        assert!(parsed.is_err());
+    }
+
+    #[test]
+    fn test_bloom_bits_per_key_must_be_positive() {
+        let parsed = Args::try_parse_from(["tisql", "--bloom-bits-per-key", "0"]);
+        assert!(parsed.is_err());
+    }
+
+    #[test]
+    fn test_cache_flags_defaults_to_config() {
+        let args = Args::try_parse_from(["tisql"]).unwrap();
+        let defaults = DatabaseConfig::default();
+        assert_eq!(
+            resolve_flag_setting(
+                args.enable_shared_block_cache,
+                args.disable_shared_block_cache,
+                defaults.shared_block_cache_enabled
+            ),
+            defaults.shared_block_cache_enabled
+        );
+        assert_eq!(
+            resolve_flag_setting(
+                args.enable_reader_cache,
+                args.disable_reader_cache,
+                defaults.reader_cache_enabled
+            ),
+            defaults.reader_cache_enabled
+        );
+        assert_eq!(
+            resolve_flag_setting(
+                args.enable_row_cache,
+                args.disable_row_cache,
+                defaults.row_cache_enabled
+            ),
+            defaults.row_cache_enabled
+        );
+        assert_eq!(
+            resolve_flag_setting(
+                args.enable_scan_fill_cache,
+                args.disable_scan_fill_cache,
+                defaults.scan_fill_cache
+            ),
+            defaults.scan_fill_cache
+        );
+        assert_eq!(
+            args.scan_fill_cache_threshold_blocks,
+            DEFAULT_SCAN_FILL_CACHE_THRESHOLD_BLOCKS
+        );
+        assert_eq!(args.cache_total_ratio, DEFAULT_CACHE_TOTAL_RATIO);
+        assert_eq!(
+            args.reader_cache_max_entries,
+            DEFAULT_READER_CACHE_MAX_ENTRIES
+        );
+    }
+
+    #[test]
+    fn test_cache_enable_disable_flags() {
+        let args = Args::try_parse_from([
+            "tisql",
+            "--enable-shared-block-cache",
+            "--enable-reader-cache",
+            "--enable-row-cache",
+            "--enable-scan-fill-cache",
+        ])
+        .unwrap();
+        assert!(resolve_flag_setting(
+            args.enable_shared_block_cache,
+            args.disable_shared_block_cache,
+            false
+        ));
+        assert!(resolve_flag_setting(
+            args.enable_reader_cache,
+            args.disable_reader_cache,
+            false
+        ));
+        assert!(resolve_flag_setting(
+            args.enable_row_cache,
+            args.disable_row_cache,
+            false
+        ));
+        assert!(resolve_flag_setting(
+            args.enable_scan_fill_cache,
+            args.disable_scan_fill_cache,
+            false
+        ));
+    }
+
+    #[test]
+    fn test_shared_block_cache_flags_conflict() {
+        let parsed = Args::try_parse_from([
+            "tisql",
+            "--enable-shared-block-cache",
+            "--disable-shared-block-cache",
         ]);
         assert!(parsed.is_err());
     }

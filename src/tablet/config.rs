@@ -68,6 +68,33 @@ pub const DEFAULT_TARGET_FILE_SIZE: usize = 64 * 1024 * 1024;
 /// Default number of LSM levels (L0 + L1).
 pub const DEFAULT_MAX_LEVELS: usize = 2;
 
+/// Bloom filter is disabled by default (rollout gate).
+pub const DEFAULT_BLOOM_ENABLED: bool = false;
+
+/// Default bloom filter bits per key.
+pub const DEFAULT_BLOOM_BITS_PER_KEY: u32 = 12;
+
+/// Shared block cache is disabled by default (rollout gate).
+pub const DEFAULT_SHARED_BLOCK_CACHE_ENABLED: bool = false;
+
+/// Reader cache is disabled by default (rollout gate).
+pub const DEFAULT_READER_CACHE_ENABLED: bool = false;
+
+/// Row cache is disabled by default (rollout gate).
+pub const DEFAULT_ROW_CACHE_ENABLED: bool = false;
+
+/// Foreground scan cache-fill policy gate (off by default in v1 rollout).
+pub const DEFAULT_SCAN_FILL_CACHE: bool = false;
+
+/// Foreground scan threshold (in estimated blocks) for cache fill.
+pub const DEFAULT_SCAN_FILL_CACHE_THRESHOLD_BLOCKS: usize = 8;
+
+/// Total cache memory ratio (fraction of machine RAM).
+pub const DEFAULT_CACHE_TOTAL_RATIO: f64 = 0.50;
+
+/// Reader-cache entry cap.
+pub const DEFAULT_READER_CACHE_MAX_ENTRIES: usize = 100_000;
+
 /// Rollout mode for V2.6 reservation/in-flight boundaries.
 ///
 /// Note: Phase 5 normalizes runtime behavior to `On` inside `LsmEngine`.
@@ -136,6 +163,36 @@ pub struct LsmConfig {
 
     /// Compression type for data blocks.
     pub compression: CompressionType,
+
+    /// Whether bloom filter support is enabled.
+    ///
+    /// Phase-B0 gate: this is a pure configuration toggle. Later phases wire
+    /// writer/reader behavior behind this flag.
+    pub bloom_enabled: bool,
+
+    /// Bloom filter density (bits per inserted key).
+    pub bloom_bits_per_key: u32,
+
+    /// Shared block cache gate.
+    pub shared_block_cache_enabled: bool,
+
+    /// Reader cache gate.
+    pub reader_cache_enabled: bool,
+
+    /// Row cache gate.
+    pub row_cache_enabled: bool,
+
+    /// Whether scan paths may fill cache.
+    pub scan_fill_cache: bool,
+
+    /// Foreground scan cache-fill threshold.
+    pub scan_fill_cache_threshold_blocks: usize,
+
+    /// Fraction of machine memory to reserve for total cache budget.
+    pub cache_total_ratio: f64,
+
+    /// Reader cache max entry count.
+    pub reader_cache_max_entries: usize,
 
     /// Target SST file size (bytes).
     ///
@@ -210,6 +267,15 @@ impl LsmConfig {
             min_memtable_age: None,
             block_size: DEFAULT_BLOCK_SIZE,
             compression: CompressionType::None,
+            bloom_enabled: DEFAULT_BLOOM_ENABLED,
+            bloom_bits_per_key: DEFAULT_BLOOM_BITS_PER_KEY,
+            shared_block_cache_enabled: DEFAULT_SHARED_BLOCK_CACHE_ENABLED,
+            reader_cache_enabled: DEFAULT_READER_CACHE_ENABLED,
+            row_cache_enabled: DEFAULT_ROW_CACHE_ENABLED,
+            scan_fill_cache: DEFAULT_SCAN_FILL_CACHE,
+            scan_fill_cache_threshold_blocks: DEFAULT_SCAN_FILL_CACHE_THRESHOLD_BLOCKS,
+            cache_total_ratio: DEFAULT_CACHE_TOTAL_RATIO,
+            reader_cache_max_entries: DEFAULT_READER_CACHE_MAX_ENTRIES,
             target_file_size: DEFAULT_TARGET_FILE_SIZE,
             l0_compaction_trigger: DEFAULT_L0_COMPACTION_TRIGGER,
             l0_slowdown_trigger: DEFAULT_L0_COMPACTION_TRIGGER * 2,
@@ -290,6 +356,20 @@ impl LsmConfig {
         if self.max_levels < 2 {
             return Err("max_levels must be >= 2 (L0 + L1)".to_string());
         }
+        if self.bloom_bits_per_key == 0 {
+            return Err("bloom_bits_per_key must be > 0".to_string());
+        }
+        if !(0.0..=0.95).contains(&self.cache_total_ratio) {
+            return Err("cache_total_ratio must be in [0.0, 0.95]".to_string());
+        }
+        if self.scan_fill_cache_threshold_blocks == 0 {
+            return Err("scan_fill_cache_threshold_blocks must be > 0".to_string());
+        }
+        if self.reader_cache_max_entries == 0 && self.reader_cache_enabled {
+            return Err(
+                "reader_cache_max_entries must be > 0 when reader cache is enabled".to_string(),
+            );
+        }
         Ok(())
     }
 }
@@ -340,6 +420,60 @@ impl LsmConfigBuilder {
     /// Set the compression type.
     pub fn compression(mut self, compression: CompressionType) -> Self {
         self.config.compression = compression;
+        self
+    }
+
+    /// Enable/disable bloom filter usage.
+    pub fn bloom_enabled(mut self, enabled: bool) -> Self {
+        self.config.bloom_enabled = enabled;
+        self
+    }
+
+    /// Set bloom filter bits per key.
+    pub fn bloom_bits_per_key(mut self, bits: u32) -> Self {
+        self.config.bloom_bits_per_key = bits;
+        self
+    }
+
+    /// Enable/disable shared block cache.
+    pub fn shared_block_cache_enabled(mut self, enabled: bool) -> Self {
+        self.config.shared_block_cache_enabled = enabled;
+        self
+    }
+
+    /// Enable/disable reader cache.
+    pub fn reader_cache_enabled(mut self, enabled: bool) -> Self {
+        self.config.reader_cache_enabled = enabled;
+        self
+    }
+
+    /// Enable/disable row cache.
+    pub fn row_cache_enabled(mut self, enabled: bool) -> Self {
+        self.config.row_cache_enabled = enabled;
+        self
+    }
+
+    /// Enable/disable scan cache fill.
+    pub fn scan_fill_cache(mut self, enabled: bool) -> Self {
+        self.config.scan_fill_cache = enabled;
+        self
+    }
+
+    /// Set scan cache-fill threshold in estimated block count.
+    pub fn scan_fill_cache_threshold_blocks(mut self, threshold: usize) -> Self {
+        self.config.scan_fill_cache_threshold_blocks = threshold;
+        self
+    }
+
+    /// Set total cache memory ratio.
+    pub fn cache_total_ratio(mut self, ratio: f64) -> Self {
+        self.config.cache_total_ratio = ratio;
+        self
+    }
+
+    /// Set reader cache max entry count.
+    pub fn reader_cache_max_entries(mut self, max_entries: usize) -> Self {
+        self.config.reader_cache_max_entries = max_entries;
         self
     }
 
@@ -441,6 +575,24 @@ mod tests {
         assert_eq!(config.block_size, DEFAULT_BLOCK_SIZE);
         assert_eq!(config.l0_compaction_trigger, DEFAULT_L0_COMPACTION_TRIGGER);
         assert_eq!(config.max_levels, DEFAULT_MAX_LEVELS);
+        assert_eq!(config.bloom_enabled, DEFAULT_BLOOM_ENABLED);
+        assert_eq!(config.bloom_bits_per_key, DEFAULT_BLOOM_BITS_PER_KEY);
+        assert_eq!(
+            config.shared_block_cache_enabled,
+            DEFAULT_SHARED_BLOCK_CACHE_ENABLED
+        );
+        assert_eq!(config.reader_cache_enabled, DEFAULT_READER_CACHE_ENABLED);
+        assert_eq!(config.row_cache_enabled, DEFAULT_ROW_CACHE_ENABLED);
+        assert_eq!(config.scan_fill_cache, DEFAULT_SCAN_FILL_CACHE);
+        assert_eq!(
+            config.scan_fill_cache_threshold_blocks,
+            DEFAULT_SCAN_FILL_CACHE_THRESHOLD_BLOCKS
+        );
+        assert_eq!(config.cache_total_ratio, DEFAULT_CACHE_TOTAL_RATIO);
+        assert_eq!(
+            config.reader_cache_max_entries,
+            DEFAULT_READER_CACHE_MAX_ENTRIES
+        );
         assert_eq!(config.v26_boundary_mode, V26BoundaryMode::On);
         assert!(config.validate().is_ok());
     }
@@ -453,6 +605,15 @@ mod tests {
             .l0_compaction_trigger(8)
             .l0_slowdown_trigger(16)
             .l0_stop_trigger(24)
+            .bloom_enabled(true)
+            .bloom_bits_per_key(16)
+            .shared_block_cache_enabled(true)
+            .reader_cache_enabled(true)
+            .row_cache_enabled(true)
+            .scan_fill_cache(true)
+            .scan_fill_cache_threshold_blocks(16)
+            .cache_total_ratio(0.6)
+            .reader_cache_max_entries(2048)
             .v26_boundary_mode(V26BoundaryMode::On)
             .build()
             .unwrap();
@@ -460,6 +621,15 @@ mod tests {
         assert_eq!(config.memtable_size, 128 * 1024 * 1024);
         assert_eq!(config.max_frozen_memtables, 8);
         assert_eq!(config.l0_compaction_trigger, 8);
+        assert!(config.bloom_enabled);
+        assert_eq!(config.bloom_bits_per_key, 16);
+        assert!(config.shared_block_cache_enabled);
+        assert!(config.reader_cache_enabled);
+        assert!(config.row_cache_enabled);
+        assert!(config.scan_fill_cache);
+        assert_eq!(config.scan_fill_cache_threshold_blocks, 16);
+        assert_eq!(config.cache_total_ratio, 0.6);
+        assert_eq!(config.reader_cache_max_entries, 2048);
         assert_eq!(config.v26_boundary_mode, V26BoundaryMode::On);
     }
 
@@ -611,6 +781,52 @@ mod tests {
         let config = LsmConfig::builder("./test").max_levels(5).build().unwrap();
 
         assert_eq!(config.max_levels, 5);
+    }
+
+    #[test]
+    fn test_config_validation_bloom_bits_per_key_zero() {
+        let config = LsmConfig::builder("./test")
+            .bloom_bits_per_key(0)
+            .build_unchecked();
+        let result = config.validate();
+        assert!(result.is_err());
+        assert!(result.unwrap_err().contains("bloom_bits_per_key"));
+    }
+
+    #[test]
+    fn test_config_validation_cache_total_ratio_bounds() {
+        let low = LsmConfig::builder("./test")
+            .cache_total_ratio(-0.1)
+            .build_unchecked();
+        assert!(low.validate().is_err());
+
+        let high = LsmConfig::builder("./test")
+            .cache_total_ratio(1.2)
+            .build_unchecked();
+        assert!(high.validate().is_err());
+    }
+
+    #[test]
+    fn test_config_validation_scan_fill_cache_threshold_zero() {
+        let config = LsmConfig::builder("./test")
+            .scan_fill_cache_threshold_blocks(0)
+            .build_unchecked();
+        let result = config.validate();
+        assert!(result.is_err());
+        assert!(result
+            .unwrap_err()
+            .contains("scan_fill_cache_threshold_blocks"));
+    }
+
+    #[test]
+    fn test_config_validation_reader_cache_entry_cap_when_enabled() {
+        let config = LsmConfig::builder("./test")
+            .reader_cache_enabled(true)
+            .reader_cache_max_entries(0)
+            .build_unchecked();
+        let result = config.validate();
+        assert!(result.is_err());
+        assert!(result.unwrap_err().contains("reader_cache_max_entries"));
     }
 
     #[test]

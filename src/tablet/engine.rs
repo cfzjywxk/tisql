@@ -44,6 +44,7 @@
 
 use std::collections::VecDeque;
 use std::ops::Range;
+use std::path::Path;
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicU8, AtomicUsize, Ordering as AtomicOrdering};
 use std::sync::Arc;
 
@@ -61,12 +62,15 @@ use crate::tablet::mvcc::{decode_mvcc_key, is_tombstone, MvccIterator, MvccKey, 
 use crate::tablet::{PessimisticStorage, PessimisticWriteError, StorageEngine, WriteBatch};
 use crate::util::error::{Result, TiSqlError};
 
+use super::cache::key::{tablet_namespace_from_dir, ReaderCacheKey, RowCacheKey};
+use super::cache::CacheSuite;
 use super::commit_reservations::{CommitLsnReservations, CommitReservationStats};
 use super::config::{LsmConfig, V26BoundaryMode};
 use super::ilog::{IlogService, IlogTruncateStats};
 use super::memtable::{FlushState, MemTable};
 use super::sstable::{
-    AsyncSstBuilder, SstBuilderOptions, SstIterator, SstMeta, SstMvccIterator, SstReaderRef,
+    AsyncSstBuilder, SstBuilderOptions, SstIterator, SstMeta, SstMvccIterator, SstReadOptions,
+    SstReaderRef,
 };
 use super::version::{ManifestDelta, Version, MAX_LEVELS};
 use super::version_set::{SuperVersion, VersionSet};
@@ -497,6 +501,18 @@ pub struct LsmEngine {
     /// Configuration.
     config: Arc<LsmConfig>,
 
+    /// Stable cache namespace for this tablet engine.
+    tablet_cache_ns: u128,
+
+    /// Optional process-wide cache suite.
+    cache_suite: RwLock<Option<Arc<CacheSuite>>>,
+
+    /// Row-cache sequence counter (seqlock-style).
+    ///
+    /// Even values mean no row-cache-affecting write is in progress.
+    /// Odd values mean a write is mutating visibility + cache state.
+    row_cache_epoch: AtomicU64,
+
     /// Engine state (active/frozen memtables).
     state: RwLock<LsmState>,
 
@@ -573,6 +589,21 @@ pub struct LsmEngine {
     manifest_error: Arc<AtomicBool>,
 }
 
+struct RowCacheEpochGuard<'a> {
+    engine: &'a LsmEngine,
+    enabled: bool,
+}
+
+impl Drop for RowCacheEpochGuard<'_> {
+    fn drop(&mut self) {
+        if self.enabled {
+            self.engine
+                .row_cache_epoch
+                .fetch_add(1, AtomicOrdering::AcqRel);
+        }
+    }
+}
+
 impl LsmEngine {
     /// Open with recovery from ilog.
     ///
@@ -595,6 +626,7 @@ impl LsmEngine {
 
         // Initialize next_sst_id from recovered version's max SST ID + 1
         let recovered_max_sst_id = version.next_sst_id();
+        let tablet_cache_ns = tablet_namespace_from_dir(&config.data_dir);
 
         // Create initial state and version_set
         let initial_state = LsmState::new(1);
@@ -610,6 +642,9 @@ impl LsmEngine {
 
         Ok(Self {
             config: Arc::new(config),
+            tablet_cache_ns,
+            cache_suite: RwLock::new(None),
+            row_cache_epoch: AtomicU64::new(0),
             state: RwLock::new(initial_state),
             version_set,
             next_memtable_id: AtomicU64::new(2),
@@ -723,6 +758,15 @@ impl LsmEngine {
     /// Get the current configuration.
     pub fn config(&self) -> &LsmConfig {
         &self.config
+    }
+
+    /// Bind one process-wide cache suite to this tablet engine.
+    pub fn set_cache_suite(&self, cache_suite: Arc<CacheSuite>) {
+        *self.cache_suite.write() = Some(cache_suite);
+    }
+
+    fn cache_suite(&self) -> Option<Arc<CacheSuite>> {
+        self.cache_suite.read().as_ref().cloned()
     }
 
     /// Check if this engine has durable ilog.
@@ -1267,6 +1311,8 @@ impl LsmEngine {
         let options = SstBuilderOptions {
             block_size: self.config.block_size,
             compression: self.config.compression,
+            bloom_enabled: self.config.bloom_enabled,
+            bloom_bits_per_key: self.config.bloom_bits_per_key,
         };
         let build_result: Result<SstMeta> = async {
             let mut builder = AsyncSstBuilder::new(&sst_path, options, Arc::clone(&self.io))?;
@@ -1377,6 +1423,101 @@ impl LsmEngine {
         crate::io::block_on_sync(self.flush_memtable_async(memtable))
     }
 
+    fn row_cache_get(&self, key: &[u8], ts: Timestamp) -> Option<Option<RawValue>> {
+        let cache_suite = self.cache_suite()?;
+        let row_cache = cache_suite.row_cache()?;
+        row_cache.get(&RowCacheKey {
+            ns: self.tablet_cache_ns,
+            user_key: key.to_vec(),
+            read_ts: ts,
+        })
+    }
+
+    fn row_cache_insert(&self, key: &[u8], ts: Timestamp, value: Option<RawValue>) {
+        let Some(cache_suite) = self.cache_suite() else {
+            return;
+        };
+        let Some(row_cache) = cache_suite.row_cache() else {
+            return;
+        };
+        let _ = row_cache.insert(
+            RowCacheKey {
+                ns: self.tablet_cache_ns,
+                user_key: key.to_vec(),
+                read_ts: ts,
+            },
+            value,
+        );
+    }
+
+    fn begin_row_cache_write_epoch(&self) -> RowCacheEpochGuard<'_> {
+        let enabled = self
+            .cache_suite()
+            .and_then(|suite| suite.row_cache())
+            .is_some();
+        if enabled {
+            self.row_cache_epoch.fetch_add(1, AtomicOrdering::AcqRel);
+        }
+        RowCacheEpochGuard {
+            engine: self,
+            enabled,
+        }
+    }
+
+    #[inline]
+    fn row_cache_epoch(&self) -> u64 {
+        self.row_cache_epoch.load(AtomicOrdering::Acquire)
+    }
+
+    fn row_cache_invalidate_keys<'a, I>(&self, keys: I)
+    where
+        I: IntoIterator<Item = &'a [u8]>,
+    {
+        let Some(cache_suite) = self.cache_suite() else {
+            return;
+        };
+        let Some(row_cache) = cache_suite.row_cache() else {
+            return;
+        };
+        for key in keys {
+            row_cache.invalidate_key(self.tablet_cache_ns, key);
+        }
+    }
+
+    async fn open_point_reader(&self, sst_path: &Path, sst_id: u64) -> Result<SstReaderRef> {
+        let cache_suite = self.cache_suite();
+        if let Some(reader_cache) = cache_suite.as_ref().and_then(|suite| suite.reader_cache()) {
+            let key = ReaderCacheKey {
+                ns: self.tablet_cache_ns,
+                sst_id,
+            };
+            if let Some(reader) = reader_cache.get_typed::<SstReaderRef>(&key) {
+                return Ok((*reader).clone());
+            }
+
+            let options = SstReadOptions {
+                tablet_tag: self.tablet_cache_ns,
+                sst_id,
+                bloom_enabled: self.config.bloom_enabled,
+                fill_cache: true,
+                block_cache: cache_suite.as_ref().and_then(|suite| suite.block_cache()),
+            };
+            let reader =
+                SstReaderRef::open_with_options(sst_path, Arc::clone(&self.io), options).await?;
+            reader_cache.insert_typed(key, Arc::new(reader.clone()));
+            return Ok(reader);
+        }
+
+        let options = SstReadOptions {
+            tablet_tag: self.tablet_cache_ns,
+            sst_id,
+            bloom_enabled: self.config.bloom_enabled,
+            fill_cache: true,
+            block_cache: cache_suite.and_then(|suite| suite.block_cache()),
+        };
+        SstReaderRef::open_with_options(sst_path, Arc::clone(&self.io), options).await
+    }
+
     /// Read a key from SST files with MVCC timestamp filtering.
     ///
     /// Searches L0 first (newest to oldest), then L1, L2, etc.
@@ -1413,7 +1554,10 @@ impl LsmEngine {
 
             // SST now contains MVCC keys - iterate to find matching key with ts visibility
             // Propagate errors instead of silently ignoring (risks wrong reads)
-            let reader = SstReaderRef::open(&sst_path, Arc::clone(&self.io)).await?;
+            let reader = self.open_point_reader(&sst_path, sst_meta.id).await?;
+            if self.config.bloom_enabled && !reader.may_contain_user_key(key).await? {
+                continue;
+            }
             let mut iter = SstIterator::new(reader)?;
             iter.seek_to_first().await?; // Position at first entry
 
@@ -1667,6 +1811,9 @@ impl LsmEngine {
 
     /// Shared write logic: allocate LSN, write to memtable, maybe rotate.
     fn write_batch_inner(&self, batch: WriteBatch) -> Result<()> {
+        let touched_keys: Vec<Vec<u8>> = batch.keys().cloned().collect();
+        let _row_cache_epoch_guard = self.begin_row_cache_write_epoch();
+
         // Use CLOG LSN if provided, otherwise allocate locally.
         // Using the CLOG LSN ensures proper recovery ordering: when we flush
         // the memtable to SST, the flushed_lsn in SST metadata matches the
@@ -1692,6 +1839,10 @@ impl LsmEngine {
             state.active.write_batch_with_lsn(batch, lsn)?;
         }
         // _guard drops here, clearing the in-flight slot.
+
+        // Invalidate after the memtable mutation commits so cache entries
+        // cannot be repopulated with pre-write data and survive this write.
+        self.row_cache_invalidate_keys(touched_keys.iter().map(Vec::as_slice));
 
         // Check if rotation is needed (non-blocking check)
         // Actual rotation happens asynchronously or on next write
@@ -1848,6 +1999,14 @@ impl LsmEngine {
             if path.exists() {
                 std::fs::remove_file(&path)?;
             }
+            if let Some(cache_suite) = self.cache_suite() {
+                if let Some(reader_cache) = cache_suite.reader_cache() {
+                    reader_cache.remove_sst(self.tablet_cache_ns, *sst_id);
+                }
+                if let Some(block_cache) = cache_suite.block_cache() {
+                    block_cache.remove_sst(self.tablet_cache_ns, *sst_id);
+                }
+            }
         }
         Ok(())
     }
@@ -1921,34 +2080,53 @@ impl LsmEngine {
     ///
     /// Returns `Ok(Some(value))` if found, `Ok(None)` if not found or deleted.
     pub async fn get_at(&self, key: &[u8], ts: Timestamp) -> Result<Option<RawValue>> {
-        // Scope the lock so it's dropped before the async SST read.
-        {
-            let state = self.state.read();
-
-            // Check active memtable first
-            // owner_start_ts = 0 means don't see pending writes from any transaction
-            if let Some(value) = state.active.get_with_owner(key, ts, 0) {
-                return if is_tombstone(&value) {
-                    Ok(None)
-                } else {
-                    Ok(Some(value))
-                };
+        loop {
+            let epoch_start = self.row_cache_epoch();
+            if epoch_start & 1 == 1 {
+                tokio::task::yield_now().await;
+                continue;
             }
 
-            // Check frozen memtables (newest first = iterate from back)
-            for frozen in state.frozen.iter().rev() {
-                if let Some(value) = frozen.get_with_owner(key, ts, 0) {
+            // Scope the lock so it's dropped before the async SST read.
+            {
+                let state = self.state.read();
+
+                // Check active memtable first
+                // owner_start_ts = 0 means don't see pending writes from any transaction
+                if let Some(value) = state.active.get_with_owner(key, ts, 0) {
                     return if is_tombstone(&value) {
                         Ok(None)
                     } else {
                         Ok(Some(value))
                     };
                 }
+
+                // Check frozen memtables (newest first = iterate from back)
+                for frozen in state.frozen.iter().rev() {
+                    if let Some(value) = frozen.get_with_owner(key, ts, 0) {
+                        return if is_tombstone(&value) {
+                            Ok(None)
+                        } else {
+                            Ok(Some(value))
+                        };
+                    }
+                }
+            }
+
+            if let Some(cached) = self.row_cache_get(key, ts) {
+                if self.row_cache_epoch() == epoch_start {
+                    return Ok(cached);
+                }
+                continue;
+            }
+
+            // Check SSTs
+            let result = self.get_from_sst(key, ts).await?;
+            if self.row_cache_epoch() == epoch_start {
+                self.row_cache_insert(key, ts, result.clone());
+                return Ok(result);
             }
         }
-
-        // Check SSTs
-        self.get_from_sst(key, ts).await
     }
 }
 
@@ -2298,6 +2476,8 @@ struct L0SstIterator {
     pending_error: Option<TiSqlError>,
     /// io_uring I/O service
     io: Arc<crate::io::IoService>,
+    /// Scan read options (cache policy and namespace).
+    read_options: SstReadOptions,
 }
 
 impl L0SstIterator {
@@ -2307,6 +2487,7 @@ impl L0SstIterator {
         sst_dir: PathBuf,
         range: SharedMvccRange,
         io: Arc<crate::io::IoService>,
+        read_options: SstReadOptions,
     ) -> Self {
         Self {
             meta,
@@ -2315,6 +2496,7 @@ impl L0SstIterator {
             inner: None,
             io,
             pending_error: None,
+            read_options,
         }
     }
 
@@ -2339,7 +2521,9 @@ impl L0SstIterator {
             )));
         }
 
-        let reader = SstReaderRef::open(&path, Arc::clone(&self.io)).await?;
+        let mut options = self.read_options.clone();
+        options.sst_id = self.meta.id;
+        let reader = SstReaderRef::open_with_options(&path, Arc::clone(&self.io), options).await?;
         let iter = SstMvccIterator::new(reader, Arc::clone(&self.range))?;
         self.inner = Some(iter);
         Ok(())
@@ -2430,6 +2614,8 @@ struct LevelIterator {
     pending_error: Option<TiSqlError>,
     /// io_uring I/O service
     io: Arc<crate::io::IoService>,
+    /// Scan read options (cache policy and namespace).
+    read_options: SstReadOptions,
 }
 
 impl LevelIterator {
@@ -2441,6 +2627,7 @@ impl LevelIterator {
         sst_dir: PathBuf,
         range: SharedMvccRange,
         io: Arc<crate::io::IoService>,
+        read_options: SstReadOptions,
     ) -> Self {
         Self {
             io,
@@ -2450,6 +2637,7 @@ impl LevelIterator {
             current_file_idx: None,
             current_iter: None,
             pending_error: None,
+            read_options,
         }
     }
 
@@ -2478,7 +2666,9 @@ impl LevelIterator {
             )));
         }
 
-        let reader = SstReaderRef::open(&path, Arc::clone(&self.io)).await?;
+        let mut options = self.read_options.clone();
+        options.sst_id = sst.id;
+        let reader = SstReaderRef::open_with_options(&path, Arc::clone(&self.io), options).await?;
         let iter = SstMvccIterator::new(reader, Arc::clone(&self.range))?;
         self.current_file_idx = Some(idx);
         self.current_iter = Some(iter);
@@ -2748,9 +2938,10 @@ impl TieredMergeIterator {
         range: SharedMvccRange,
         index: usize,
         io: Arc<crate::io::IoService>,
+        read_options: SstReadOptions,
     ) {
         self.children.push(ChildHandle {
-            iter: ChildIterator::L0Sst(L0SstIterator::new(meta, sst_dir, range, io)),
+            iter: ChildIterator::L0Sst(L0SstIterator::new(meta, sst_dir, range, io, read_options)),
             priority: PRIORITY_L0_BASE + index as u32,
         });
     }
@@ -3130,6 +3321,52 @@ impl StorageEngine for LsmEngine {
             .collect();
         l0_ssts.sort_by(|a, b| b.id.cmp(&a.id)); // Newest first
 
+        // 4. Collect L1+ level iterators (internally lazy for file opening)
+        let mut level_inputs: Vec<(usize, Vec<Arc<SstMeta>>)> = Vec::new();
+        for level in 1..MAX_LEVELS {
+            let ssts: Vec<Arc<SstMeta>> = version
+                .ssts_at_level(level as u32)
+                .iter()
+                .filter(|sst| sst.overlaps_mvcc(range.start.as_bytes(), range.end.as_bytes()))
+                .cloned()
+                .collect();
+            if !ssts.is_empty() {
+                level_inputs.push((level, ssts));
+            }
+        }
+
+        // Foreground scan cache policy:
+        // - disabled by default
+        // - when enabled, only short scans (by estimated block count) fill cache
+        let estimated_scan_blocks = l0_ssts
+            .iter()
+            .map(|sst| sst.block_count as usize)
+            .sum::<usize>()
+            .saturating_add(
+                level_inputs
+                    .iter()
+                    .map(|(_, ssts)| {
+                        ssts.iter()
+                            .map(|sst| sst.block_count as usize)
+                            .sum::<usize>()
+                    })
+                    .sum::<usize>(),
+            );
+        let should_fill_scan_cache = self.config.scan_fill_cache
+            && estimated_scan_blocks <= self.config.scan_fill_cache_threshold_blocks;
+        let scan_block_cache = if should_fill_scan_cache {
+            self.cache_suite().and_then(|suite| suite.block_cache())
+        } else {
+            None
+        };
+        let scan_read_options = SstReadOptions {
+            tablet_tag: self.tablet_cache_ns,
+            sst_id: 0,
+            bloom_enabled: false,
+            fill_cache: should_fill_scan_cache,
+            block_cache: scan_block_cache,
+        };
+
         for (idx, sst_meta) in l0_ssts.into_iter().enumerate() {
             // LAZY: L0SstIterator opens file on first seek
             merge_iter.add_l0_sst(
@@ -3138,28 +3375,20 @@ impl StorageEngine for LsmEngine {
                 Arc::clone(&range),
                 idx,
                 Arc::clone(&self.io),
+                scan_read_options.clone(),
             );
         }
 
-        // 4. Add L1+ level iterators (internally lazy for file opening)
-        for level in 1..MAX_LEVELS {
-            let ssts: Vec<Arc<SstMeta>> = version
-                .ssts_at_level(level as u32)
-                .iter()
-                .filter(|sst| sst.overlaps_mvcc(range.start.as_bytes(), range.end.as_bytes()))
-                .cloned()
-                .collect();
-
-            if !ssts.is_empty() {
-                // LevelIterator is already lazy internally
-                let level_iter = LevelIterator::new(
-                    ssts,
-                    sst_dir.clone(),
-                    Arc::clone(&range),
-                    Arc::clone(&self.io),
-                );
-                merge_iter.add_level(level_iter, level);
-            }
+        for (level, ssts) in level_inputs {
+            // LevelIterator is already lazy internally
+            let level_iter = LevelIterator::new(
+                ssts,
+                sst_dir.clone(),
+                Arc::clone(&range),
+                Arc::clone(&self.io),
+                scan_read_options.clone(),
+            );
+            merge_iter.add_level(level_iter, level);
         }
 
         // Return the iterator (no I/O done yet!)
@@ -3248,37 +3477,48 @@ impl PessimisticStorage for LsmEngine {
         commit_ts: Timestamp,
         clog_lsn: u64,
     ) {
-        let state = self.state.read();
+        let _row_cache_epoch_guard = self.begin_row_cache_write_epoch();
+        let mut committed_any = false;
 
-        let active_stats = state
-            .active
-            .finalize_pending(keys, owner_start_ts, commit_ts);
-        if active_stats.committed > 0 {
-            if clog_lsn > 0 {
-                state.active.track_lsn(clog_lsn);
+        {
+            let state = self.state.read();
+
+            let active_stats = state
+                .active
+                .finalize_pending(keys, owner_start_ts, commit_ts);
+            if active_stats.committed > 0 {
+                committed_any = true;
+                if clog_lsn > 0 {
+                    state.active.track_lsn(clog_lsn);
+                }
+                if matches!(
+                    state.active.flush_state(),
+                    FlushState::Flushing | FlushState::FlushedClean
+                ) {
+                    state.active.set_flush_state(FlushState::FlushedDirty);
+                }
             }
-            if matches!(
-                state.active.flush_state(),
-                FlushState::Flushing | FlushState::FlushedClean
-            ) {
-                state.active.set_flush_state(FlushState::FlushedDirty);
+
+            // Also finalize in frozen memtables in case writes happened before rotation.
+            for frozen in &state.frozen {
+                let stats = frozen.finalize_pending(keys, owner_start_ts, commit_ts);
+                if stats.committed > 0 {
+                    committed_any = true;
+                    if clog_lsn > 0 {
+                        frozen.track_lsn(clog_lsn);
+                    }
+                    if matches!(
+                        frozen.flush_state(),
+                        FlushState::Flushing | FlushState::FlushedClean
+                    ) {
+                        frozen.set_flush_state(FlushState::FlushedDirty);
+                    }
+                }
             }
         }
 
-        // Also finalize in frozen memtables in case writes happened before rotation.
-        for frozen in &state.frozen {
-            let stats = frozen.finalize_pending(keys, owner_start_ts, commit_ts);
-            if stats.committed > 0 {
-                if clog_lsn > 0 {
-                    frozen.track_lsn(clog_lsn);
-                }
-                if matches!(
-                    frozen.flush_state(),
-                    FlushState::Flushing | FlushState::FlushedClean
-                ) {
-                    frozen.set_flush_state(FlushState::FlushedDirty);
-                }
-            }
+        if committed_any {
+            self.row_cache_invalidate_keys(keys.iter().map(|k| k.as_slice()));
         }
     }
 
@@ -3334,42 +3574,91 @@ impl PessimisticStorage for LsmEngine {
         read_ts: Timestamp,
         owner_start_ts: Timestamp,
     ) -> Option<RawValue> {
-        // Check memtables under lock, then release before async SST I/O.
-        // Scoped block ensures RwLockReadGuard (not Send) is dropped before .await.
-        let memtable_result = {
-            let state = self.state.read();
-
-            // Check active memtable first
-            if let Some(value) = state.active.get_with_owner(key, read_ts, owner_start_ts) {
-                if is_tombstone(&value) {
-                    Some(None) // Found tombstone
-                } else {
-                    Some(Some(value))
-                }
-            } else {
-                // Check frozen memtables (newest to oldest = iterate from back)
-                let mut found = None;
-                for frozen in state.frozen.iter().rev() {
-                    if let Some(value) = frozen.get_with_owner(key, read_ts, owner_start_ts) {
-                        if is_tombstone(&value) {
-                            found = Some(None);
-                        } else {
-                            found = Some(Some(value));
-                        }
-                        break;
+        if owner_start_ts != 0 {
+            // Owner-visible reads skip row cache to preserve pending-write semantics.
+            let memtable_result = {
+                let state = self.state.read();
+                if let Some(value) = state.active.get_with_owner(key, read_ts, owner_start_ts) {
+                    if is_tombstone(&value) {
+                        Some(None)
+                    } else {
+                        Some(Some(value))
                     }
+                } else {
+                    let mut found = None;
+                    for frozen in state.frozen.iter().rev() {
+                        if let Some(value) = frozen.get_with_owner(key, read_ts, owner_start_ts) {
+                            found = if is_tombstone(&value) {
+                                Some(None)
+                            } else {
+                                Some(Some(value))
+                            };
+                            break;
+                        }
+                    }
+                    found
                 }
-                found
+            };
+            if let Some(result) = memtable_result {
+                return result;
             }
-            // state (RwLockReadGuard) dropped here
-        };
-
-        if let Some(result) = memtable_result {
-            return result;
+            return self.get_from_sst(key, read_ts).await.ok().flatten();
         }
 
-        // Check SST files via async point lookup
-        self.get_from_sst(key, read_ts).await.ok().flatten()
+        loop {
+            let epoch_start = self.row_cache_epoch();
+            if epoch_start & 1 == 1 {
+                tokio::task::yield_now().await;
+                continue;
+            }
+
+            // Check memtables under lock, then release before async SST I/O.
+            // Scoped block ensures RwLockReadGuard (not Send) is dropped before .await.
+            let memtable_result = {
+                let state = self.state.read();
+
+                // Check active memtable first
+                if let Some(value) = state.active.get_with_owner(key, read_ts, 0) {
+                    if is_tombstone(&value) {
+                        Some(None) // Found tombstone
+                    } else {
+                        Some(Some(value))
+                    }
+                } else {
+                    // Check frozen memtables (newest to oldest = iterate from back)
+                    let mut found = None;
+                    for frozen in state.frozen.iter().rev() {
+                        if let Some(value) = frozen.get_with_owner(key, read_ts, 0) {
+                            if is_tombstone(&value) {
+                                found = Some(None);
+                            } else {
+                                found = Some(Some(value));
+                            }
+                            break;
+                        }
+                    }
+                    found
+                }
+            };
+
+            if let Some(result) = memtable_result {
+                return result;
+            }
+
+            if let Some(cached) = self.row_cache_get(key, read_ts) {
+                if self.row_cache_epoch() == epoch_start {
+                    return cached;
+                }
+                continue;
+            }
+
+            // Check SST files via async point lookup
+            let sst_result = self.get_from_sst(key, read_ts).await.ok().flatten();
+            if self.row_cache_epoch() == epoch_start {
+                self.row_cache_insert(key, read_ts, sst_result.clone());
+                return sst_result;
+            }
+        }
     }
 }
 
@@ -3447,6 +3736,7 @@ mod tests {
             // Create initial state and version_set
             let initial_state = LsmState::new(1);
             let version_set = Arc::new(VersionSet::new(Version::new()));
+            let tablet_cache_ns = tablet_namespace_from_dir(&config.data_dir);
 
             // Create initial SuperVersion
             let initial_sv = Arc::new(SuperVersion::new(
@@ -3458,6 +3748,9 @@ mod tests {
 
             Ok(Self {
                 config: Arc::new(config),
+                tablet_cache_ns,
+                cache_suite: RwLock::new(None),
+                row_cache_epoch: AtomicU64::new(0),
                 state: RwLock::new(initial_state),
                 version_set,
                 next_memtable_id: AtomicU64::new(2),
@@ -3490,6 +3783,12 @@ mod tests {
             .max_frozen_memtables(16)
             .build()
             .unwrap()
+    }
+
+    fn bind_test_cache_suite(engine: &LsmEngine, config: &LsmConfig) {
+        engine.set_cache_suite(Arc::new(CacheSuite::new(
+            crate::tablet::cache::CacheSuiteConfig::from_lsm_config(config),
+        )));
     }
 
     fn new_batch(commit_ts: Timestamp) -> WriteBatch {
@@ -9759,6 +10058,232 @@ mod tests {
         };
         engine.flush_memtable_async(&f3).await.unwrap();
         assert_eq!(engine.current_version().flushed_lsn(), 4);
+    }
+
+    #[tokio::test]
+    async fn test_flush_outputs_bloom_when_enabled() {
+        let dir = TempDir::new().unwrap();
+        let config = LsmConfig::builder(dir.path())
+            .bloom_enabled(true)
+            .bloom_bits_per_key(16)
+            .build()
+            .unwrap();
+        let engine = LsmEngine::open(config.clone()).unwrap();
+
+        for i in 0..32u64 {
+            let mut batch = WriteBatch::new();
+            batch.set_commit_ts(i + 1);
+            batch.put(format!("bf-key-{i:03}").into_bytes(), b"value".to_vec());
+            engine.write_batch(batch).unwrap();
+        }
+        engine.flush_all_with_active_async().await.unwrap();
+
+        let sst = engine
+            .current_version()
+            .ssts_at_level(0)
+            .first()
+            .cloned()
+            .expect("expected flushed SST");
+        let path = config.sst_dir().join(format!("{:08}.sst", sst.id));
+        let reader = SstReaderRef::open_with_options(
+            &path,
+            make_test_io(),
+            SstReadOptions {
+                bloom_enabled: true,
+                ..SstReadOptions::default()
+            },
+        )
+        .await
+        .unwrap();
+
+        assert!(reader.may_contain_user_key(b"bf-key-000").await.unwrap());
+        let mut negatives = 0usize;
+        for i in 0..128 {
+            let key = format!("bf-miss-{i:03}");
+            if !reader.may_contain_user_key(key.as_bytes()).await.unwrap() {
+                negatives += 1;
+            }
+        }
+        assert!(negatives > 0);
+    }
+
+    #[tokio::test]
+    async fn test_row_cache_invalidation_on_committed_writes() {
+        let dir = TempDir::new().unwrap();
+        let config = LsmConfig::builder(dir.path())
+            .row_cache_enabled(true)
+            .build()
+            .unwrap();
+        let engine = LsmEngine::open(config.clone()).unwrap();
+        bind_test_cache_suite(&engine, &config);
+
+        let key = b"rk".to_vec();
+        let mut b1 = WriteBatch::new();
+        b1.set_commit_ts(10);
+        b1.put(key.clone(), b"v1".to_vec());
+        engine.write_batch(b1).unwrap();
+        engine.flush_all_with_active_async().await.unwrap();
+
+        assert_eq!(engine.get_at(&key, 20).await.unwrap(), Some(b"v1".to_vec()));
+        let row_cache = engine
+            .cache_suite()
+            .and_then(|suite| suite.row_cache())
+            .unwrap();
+        let invalid_before = row_cache.stats().invalidations;
+
+        let mut b2 = WriteBatch::new();
+        b2.set_commit_ts(30);
+        b2.put(key.clone(), b"v2".to_vec());
+        engine.write_batch(b2).unwrap();
+
+        // Snapshot reads must stay correct across invalidation.
+        assert_eq!(engine.get_at(&key, 20).await.unwrap(), Some(b"v1".to_vec()));
+        assert_eq!(engine.get_at(&key, 40).await.unwrap(), Some(b"v2".to_vec()));
+        assert!(row_cache.stats().invalidations > invalid_before);
+    }
+
+    #[cfg(feature = "failpoints")]
+    #[tokio::test]
+    async fn test_row_cache_does_not_keep_stale_value_when_write_pauses_before_memtable_commit() {
+        struct FailpointGuard;
+        impl Drop for FailpointGuard {
+            fn drop(&mut self) {
+                let _ = fail::cfg("write_batch_after_inflight_register", "off");
+            }
+        }
+
+        let scenario = fail::FailScenario::setup();
+        let dir = TempDir::new().unwrap();
+        let config = LsmConfig::builder(dir.path())
+            .row_cache_enabled(true)
+            .build()
+            .unwrap();
+        let engine = Arc::new(LsmEngine::open(config.clone()).unwrap());
+        bind_test_cache_suite(engine.as_ref(), &config);
+
+        let key = b"row-cache-race".to_vec();
+        let mut b1 = WriteBatch::new();
+        b1.set_commit_ts(10);
+        b1.put(key.clone(), b"v1".to_vec());
+        engine.write_batch(b1).unwrap();
+
+        // Warm cache with v1 at a high read timestamp.
+        assert_eq!(engine.get_at(&key, 40).await.unwrap(), Some(b"v1".to_vec()));
+
+        fail::cfg("write_batch_after_inflight_register", "pause").unwrap();
+        let _failpoint_guard = FailpointGuard;
+
+        let writer_engine = Arc::clone(&engine);
+        let writer_key = key.clone();
+        let writer = tokio::task::spawn_blocking(move || {
+            let mut b2 = WriteBatch::new();
+            b2.set_commit_ts(30);
+            b2.put(writer_key, b"v2".to_vec());
+            writer_engine.write_batch(b2).unwrap();
+        });
+
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        while engine.in_flight_tracker.min_in_flight().is_none() {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "writer did not reach failpoint in time"
+            );
+            tokio::task::yield_now().await;
+        }
+
+        fail::cfg("write_batch_after_inflight_register", "off").unwrap();
+        writer.await.unwrap();
+
+        assert_eq!(engine.get_at(&key, 40).await.unwrap(), Some(b"v2".to_vec()));
+        scenario.teardown();
+    }
+
+    #[tokio::test]
+    async fn test_scan_short_range_can_fill_block_cache() {
+        let dir = TempDir::new().unwrap();
+        let config = LsmConfig::builder(dir.path())
+            .block_size(64)
+            .shared_block_cache_enabled(true)
+            .scan_fill_cache(true)
+            .scan_fill_cache_threshold_blocks(1024)
+            .build()
+            .unwrap();
+        let engine = LsmEngine::open(config.clone()).unwrap();
+        bind_test_cache_suite(&engine, &config);
+
+        for i in 0..128u64 {
+            let mut batch = WriteBatch::new();
+            batch.set_commit_ts(i + 1);
+            batch.put(format!("scan-key-{i:03}").into_bytes(), vec![b'v'; 24]);
+            engine.write_batch(batch).unwrap();
+        }
+        engine.flush_all_with_active_async().await.unwrap();
+
+        let block_cache = engine
+            .cache_suite()
+            .and_then(|suite| suite.block_cache())
+            .unwrap();
+        let before = block_cache.stats();
+
+        let mut iter = engine
+            .scan_iter(MvccKey::unbounded()..MvccKey::unbounded(), 0)
+            .unwrap();
+        iter.advance().await.unwrap();
+        while iter.valid() {
+            iter.advance().await.unwrap();
+        }
+        let after_first = block_cache.stats();
+
+        let mut iter2 = engine
+            .scan_iter(MvccKey::unbounded()..MvccKey::unbounded(), 0)
+            .unwrap();
+        iter2.advance().await.unwrap();
+        while iter2.valid() {
+            iter2.advance().await.unwrap();
+        }
+        let after_second = block_cache.stats();
+
+        assert!(after_first.inserts > before.inserts);
+        assert!(after_second.hits > after_first.hits);
+    }
+
+    #[tokio::test]
+    async fn test_scan_long_range_does_not_fill_block_cache() {
+        let dir = TempDir::new().unwrap();
+        let config = LsmConfig::builder(dir.path())
+            .block_size(64)
+            .shared_block_cache_enabled(true)
+            .scan_fill_cache(true)
+            .scan_fill_cache_threshold_blocks(1)
+            .build()
+            .unwrap();
+        let engine = LsmEngine::open(config.clone()).unwrap();
+        bind_test_cache_suite(&engine, &config);
+
+        for i in 0..128u64 {
+            let mut batch = WriteBatch::new();
+            batch.set_commit_ts(i + 1);
+            batch.put(format!("noscan-key-{i:03}").into_bytes(), vec![b'v'; 24]);
+            engine.write_batch(batch).unwrap();
+        }
+        engine.flush_all_with_active_async().await.unwrap();
+
+        let block_cache = engine
+            .cache_suite()
+            .and_then(|suite| suite.block_cache())
+            .unwrap();
+
+        let mut iter = engine
+            .scan_iter(MvccKey::unbounded()..MvccKey::unbounded(), 0)
+            .unwrap();
+        iter.advance().await.unwrap();
+        while iter.valid() {
+            iter.advance().await.unwrap();
+        }
+        let stats = block_cache.stats();
+        assert_eq!(stats.hits, 0);
+        assert_eq!(stats.misses, 0);
+        assert_eq!(stats.inserts, 0);
     }
 
     /// Failpoint test: verify safe_flushed_lsn accounts for in-flight LSNs

@@ -50,6 +50,7 @@
 //! Keys are encoded using TiDB-compatible format via the codec module.
 //! The storage layer is agnostic to key structure - it just stores bytes.
 
+pub mod cache;
 pub mod commit_reservations;
 pub mod compaction;
 pub mod compaction_scheduler;
@@ -93,9 +94,13 @@ pub use memtable::MemTable;
 // Re-export LSM configuration
 pub use config::{LsmConfig, LsmConfigBuilder, V26BoundaryMode};
 pub use config::{
-    DEFAULT_BLOCK_SIZE as LSM_DEFAULT_BLOCK_SIZE, DEFAULT_L0_COMPACTION_TRIGGER,
+    DEFAULT_BLOCK_SIZE as LSM_DEFAULT_BLOCK_SIZE, DEFAULT_BLOOM_BITS_PER_KEY,
+    DEFAULT_BLOOM_ENABLED, DEFAULT_CACHE_TOTAL_RATIO, DEFAULT_L0_COMPACTION_TRIGGER,
     DEFAULT_L1_MAX_SIZE, DEFAULT_LEVEL_SIZE_MULTIPLIER, DEFAULT_MAX_FROZEN_MEMTABLES,
-    DEFAULT_MAX_LEVELS, DEFAULT_MEMTABLE_SIZE, DEFAULT_TARGET_FILE_SIZE,
+    DEFAULT_MAX_LEVELS, DEFAULT_MEMTABLE_SIZE, DEFAULT_READER_CACHE_ENABLED,
+    DEFAULT_READER_CACHE_MAX_ENTRIES, DEFAULT_ROW_CACHE_ENABLED, DEFAULT_SCAN_FILL_CACHE,
+    DEFAULT_SCAN_FILL_CACHE_THRESHOLD_BLOCKS, DEFAULT_SHARED_BLOCK_CACHE_ENABLED,
+    DEFAULT_TARGET_FILE_SIZE,
 };
 
 // Re-export version management
@@ -103,6 +108,10 @@ pub use version::{ManifestDelta, Version, VersionBuilder, MAX_LEVELS};
 pub use version_set::{SuperVersion, VersionSet};
 
 // Re-export LSM engine
+pub use cache::{
+    tablet_namespace_from_dir, BlockCacheKey, BlockKind, CachePriority, CacheSuite,
+    CacheSuiteConfig, ReaderCacheKey, RowCacheKey, SharedBlockCache,
+};
 pub use commit_reservations::{
     CommitLsnReservations, CommitReservation, CommitReservationStats, ReservationGuard,
 };
@@ -155,6 +164,7 @@ pub use sstable::{
     SstMeta,
     // MvccIterator wrapper for SST
     SstMvccIterator,
+    SstReadOptions,
     // Reader types
     SstReader,
     SstReaderRef,

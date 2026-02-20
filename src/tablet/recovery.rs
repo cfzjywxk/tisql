@@ -262,14 +262,38 @@ impl LsmRecovery {
     }
 
     /// Recover one non-system tablet from its tablet-scoped ilog.
+    ///
+    /// Uses default `LsmConfig::new(tablet_dir)` settings.
     pub fn recover_tablet(
         tablet_dir: &Path,
         lsn_provider: SharedLsnProvider,
         io_service: Arc<crate::io::IoService>,
         io_handle: &tokio::runtime::Handle,
     ) -> Result<RecoveredTablet> {
+        let template = LsmConfig::new(tablet_dir);
+        Self::recover_tablet_with_template(
+            tablet_dir,
+            lsn_provider,
+            io_service,
+            io_handle,
+            &template,
+        )
+    }
+
+    /// Recover one non-system tablet from its tablet-scoped ilog using a
+    /// template configuration.
+    ///
+    /// `template.data_dir` is ignored; `tablet_dir` is always authoritative.
+    pub fn recover_tablet_with_template(
+        tablet_dir: &Path,
+        lsn_provider: SharedLsnProvider,
+        io_service: Arc<crate::io::IoService>,
+        io_handle: &tokio::runtime::Handle,
+        template: &LsmConfig,
+    ) -> Result<RecoveredTablet> {
         let ilog_config = IlogConfig::new(tablet_dir);
-        let lsm_config = LsmConfig::new(tablet_dir);
+        let mut lsm_config = template.clone();
+        lsm_config.data_dir = tablet_dir.to_path_buf();
 
         let (ilog, version, orphan_ssts) = IlogService::recover(
             ilog_config,

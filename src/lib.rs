@@ -171,12 +171,16 @@ pub mod testkit {
 // Internal imports (not re-exported)
 use catalog::types::{Lsn, Value};
 use catalog::MvccCatalog;
-use clog::{FileClogService, TruncateStats};
+use clog::{FileClogConfig, FileClogService, TruncateStats};
 use executor::{ExecutionOutput, ExecutionResult, Executor, SimpleExecutor};
 use sql::Parser;
 use tablet::{
-    route_table_to_tablet, GlobalLogGcBoundary, IlogService, IlogTruncateStats, LsmEngine,
-    LsmRecovery, RoutedTabletStorage, TabletId, TabletManager,
+    route_table_to_tablet, CacheSuite, CacheSuiteConfig, GlobalLogGcBoundary, IlogConfig,
+    IlogService, IlogTruncateStats, LsmConfig, LsmEngine, LsmRecovery, RoutedTabletStorage,
+    TabletId, TabletManager, DEFAULT_BLOOM_BITS_PER_KEY, DEFAULT_BLOOM_ENABLED,
+    DEFAULT_CACHE_TOTAL_RATIO, DEFAULT_READER_CACHE_ENABLED, DEFAULT_READER_CACHE_MAX_ENTRIES,
+    DEFAULT_ROW_CACHE_ENABLED, DEFAULT_SCAN_FILL_CACHE, DEFAULT_SCAN_FILL_CACHE_THRESHOLD_BLOCKS,
+    DEFAULT_SHARED_BLOCK_CACHE_ENABLED,
 };
 use transaction::{ConcurrencyManager, TransactionService};
 use tso::LocalTso;
@@ -201,6 +205,24 @@ pub struct DatabaseConfig {
     pub runtime_threads: RuntimeThreadOverrides,
     /// Enable adaptive encoded result batches (phase 3, experimental).
     pub enable_encoded_result_batch: bool,
+    /// Enable bloom filter usage in SST paths.
+    pub bloom_enabled: bool,
+    /// Bloom filter bits-per-key setting.
+    pub bloom_bits_per_key: u32,
+    /// Shared block cache gate.
+    pub shared_block_cache_enabled: bool,
+    /// Reader cache gate.
+    pub reader_cache_enabled: bool,
+    /// Row cache gate.
+    pub row_cache_enabled: bool,
+    /// Foreground scan fill-cache gate.
+    pub scan_fill_cache: bool,
+    /// Scan fill-cache threshold in estimated blocks.
+    pub scan_fill_cache_threshold_blocks: usize,
+    /// Total cache memory ratio.
+    pub cache_total_ratio: f64,
+    /// Reader cache entry cap.
+    pub reader_cache_max_entries: usize,
 }
 
 impl Default for DatabaseConfig {
@@ -209,6 +231,15 @@ impl Default for DatabaseConfig {
             data_dir: PathBuf::from("data"),
             runtime_threads: RuntimeThreadOverrides::default(),
             enable_encoded_result_batch: false,
+            bloom_enabled: DEFAULT_BLOOM_ENABLED,
+            bloom_bits_per_key: DEFAULT_BLOOM_BITS_PER_KEY,
+            shared_block_cache_enabled: DEFAULT_SHARED_BLOCK_CACHE_ENABLED,
+            reader_cache_enabled: DEFAULT_READER_CACHE_ENABLED,
+            row_cache_enabled: DEFAULT_ROW_CACHE_ENABLED,
+            scan_fill_cache: DEFAULT_SCAN_FILL_CACHE,
+            scan_fill_cache_threshold_blocks: DEFAULT_SCAN_FILL_CACHE_THRESHOLD_BLOCKS,
+            cache_total_ratio: DEFAULT_CACHE_TOTAL_RATIO,
+            reader_cache_max_entries: DEFAULT_READER_CACHE_MAX_ENTRIES,
         }
     }
 }
@@ -232,6 +263,123 @@ impl DatabaseConfig {
     pub fn with_encoded_result_batch(mut self, enabled: bool) -> Self {
         self.enable_encoded_result_batch = enabled;
         self
+    }
+
+    /// Enable/disable bloom filter usage for SST paths.
+    pub fn with_bloom_enabled(mut self, enabled: bool) -> Self {
+        self.bloom_enabled = enabled;
+        self
+    }
+
+    /// Set bloom filter bits-per-key.
+    pub fn with_bloom_bits_per_key(mut self, bits: u32) -> Self {
+        self.bloom_bits_per_key = bits;
+        self
+    }
+
+    pub fn with_shared_block_cache_enabled(mut self, enabled: bool) -> Self {
+        self.shared_block_cache_enabled = enabled;
+        self
+    }
+
+    pub fn with_reader_cache_enabled(mut self, enabled: bool) -> Self {
+        self.reader_cache_enabled = enabled;
+        self
+    }
+
+    pub fn with_row_cache_enabled(mut self, enabled: bool) -> Self {
+        self.row_cache_enabled = enabled;
+        self
+    }
+
+    pub fn with_scan_fill_cache(mut self, enabled: bool) -> Self {
+        self.scan_fill_cache = enabled;
+        self
+    }
+
+    pub fn with_scan_fill_cache_threshold_blocks(mut self, threshold: usize) -> Self {
+        self.scan_fill_cache_threshold_blocks = threshold;
+        self
+    }
+
+    pub fn with_cache_total_ratio(mut self, ratio: f64) -> Self {
+        self.cache_total_ratio = ratio;
+        self
+    }
+
+    pub fn with_reader_cache_max_entries(mut self, max_entries: usize) -> Self {
+        self.reader_cache_max_entries = max_entries;
+        self
+    }
+
+    fn lsm_config_for_dir(&self, data_dir: impl Into<PathBuf>) -> Result<LsmConfig> {
+        LsmConfig::builder(data_dir)
+            .bloom_enabled(self.bloom_enabled)
+            .bloom_bits_per_key(self.bloom_bits_per_key)
+            .shared_block_cache_enabled(self.shared_block_cache_enabled)
+            .reader_cache_enabled(self.reader_cache_enabled)
+            .row_cache_enabled(self.row_cache_enabled)
+            .scan_fill_cache(self.scan_fill_cache)
+            .scan_fill_cache_threshold_blocks(self.scan_fill_cache_threshold_blocks)
+            .cache_total_ratio(self.cache_total_ratio)
+            .reader_cache_max_entries(self.reader_cache_max_entries)
+            .build()
+            .map_err(util::error::TiSqlError::Storage)
+    }
+}
+
+#[cfg(test)]
+mod database_config_tests {
+    use super::*;
+
+    #[test]
+    fn test_database_config_bloom_defaults() {
+        let config = DatabaseConfig::default();
+        assert!(!config.bloom_enabled);
+        assert_eq!(config.bloom_bits_per_key, DEFAULT_BLOOM_BITS_PER_KEY);
+        assert!(!config.shared_block_cache_enabled);
+        assert!(!config.reader_cache_enabled);
+        assert!(!config.row_cache_enabled);
+        assert!(!config.scan_fill_cache);
+        assert_eq!(
+            config.scan_fill_cache_threshold_blocks,
+            DEFAULT_SCAN_FILL_CACHE_THRESHOLD_BLOCKS
+        );
+        assert_eq!(config.cache_total_ratio, DEFAULT_CACHE_TOTAL_RATIO);
+        assert_eq!(
+            config.reader_cache_max_entries,
+            DEFAULT_READER_CACHE_MAX_ENTRIES
+        );
+    }
+
+    #[test]
+    fn test_database_config_with_bloom_overrides() {
+        let config = DatabaseConfig::with_data_dir("data")
+            .with_bloom_enabled(true)
+            .with_bloom_bits_per_key(16)
+            .with_shared_block_cache_enabled(true)
+            .with_reader_cache_enabled(true)
+            .with_row_cache_enabled(true)
+            .with_scan_fill_cache(true)
+            .with_scan_fill_cache_threshold_blocks(16)
+            .with_cache_total_ratio(0.6)
+            .with_reader_cache_max_entries(2048);
+        assert!(config.bloom_enabled);
+        assert_eq!(config.bloom_bits_per_key, 16);
+        assert!(config.shared_block_cache_enabled);
+        assert!(config.reader_cache_enabled);
+        assert!(config.row_cache_enabled);
+        assert!(config.scan_fill_cache);
+        assert_eq!(config.scan_fill_cache_threshold_blocks, 16);
+        assert_eq!(config.cache_total_ratio, 0.6);
+        assert_eq!(config.reader_cache_max_entries, 2048);
+    }
+
+    #[test]
+    fn test_database_config_lsm_projection_validates() {
+        let config = DatabaseConfig::with_data_dir("data").with_bloom_bits_per_key(0);
+        let err = config.lsm_config_for_dir("data").unwrap_err().to_string();
+        assert!(err.contains("bloom_bits_per_key"));
     }
 }
 
@@ -438,9 +586,20 @@ impl Database {
 
         log_info!("I/O runtime created with {} threads", planned_threads.io);
 
+        let lsm_config = config.lsm_config_for_dir(&config.data_dir)?;
+        log_info!(
+            "Bloom config: enabled={}, bits_per_key={}",
+            lsm_config.bloom_enabled,
+            lsm_config.bloom_bits_per_key
+        );
+
         // 2. Staged recovery bootstrap (system ilog + raw clog, no replay yet).
-        let mut recovery =
-            LsmRecovery::new(&config.data_dir).recover_bootstrap(io_runtime.handle())?;
+        let mut recovery = LsmRecovery::with_configs(
+            lsm_config.clone(),
+            FileClogConfig::with_dir(&config.data_dir),
+            IlogConfig::new(&config.data_dir),
+        )
+        .recover_bootstrap(io_runtime.handle())?;
 
         // Wrap recovered system tablet in manager first.
         let storage = Arc::new(recovery.engine);
@@ -449,6 +608,20 @@ impl Database {
             Arc::clone(&recovery.lsn_provider),
             Arc::clone(&storage),
         )?);
+        let cache_suite = Arc::new(CacheSuite::new(CacheSuiteConfig::from_lsm_config(
+            &lsm_config,
+        )));
+        tablet_manager.bind_cache_suite(Arc::clone(&cache_suite));
+        log_info!(
+            "Cache config: block_cache={}, reader_cache={}, row_cache={}, scan_fill_cache={}, scan_threshold_blocks={}, cache_ratio={}, reader_cache_max_entries={}",
+            lsm_config.shared_block_cache_enabled,
+            lsm_config.reader_cache_enabled,
+            lsm_config.row_cache_enabled,
+            lsm_config.scan_fill_cache,
+            lsm_config.scan_fill_cache_threshold_blocks,
+            lsm_config.cache_total_ratio,
+            lsm_config.reader_cache_max_entries
+        );
 
         // Recover previously-mounted non-system tablets from disk before TSO init,
         // so startup max_commit_ts accounts for their SST metadata too.
@@ -459,11 +632,12 @@ impl Database {
             if tablet_id == TabletId::System {
                 continue;
             }
-            let recovered = LsmRecovery::recover_tablet(
+            let recovered = LsmRecovery::recover_tablet_with_template(
                 &tablet_manager.tablet_dir(tablet_id),
                 Arc::clone(&recovery.lsn_provider),
                 Arc::clone(&recovery.io_service),
                 io_runtime.handle(),
+                &lsm_config,
             )?;
             max_commit_ts = max_commit_ts.max(recovered.max_ts_from_ssts);
             recovery.stats.orphan_ssts_cleaned += recovered.orphan_ssts_cleaned;
@@ -516,11 +690,12 @@ impl Database {
                 if tablet_id == TabletId::System || tablet_manager.get_tablet(tablet_id).is_some() {
                     continue;
                 }
-                let recovered = LsmRecovery::recover_tablet(
+                let recovered = LsmRecovery::recover_tablet_with_template(
                     &tablet_manager.tablet_dir(tablet_id),
                     Arc::clone(&recovery.lsn_provider),
                     Arc::clone(&recovery.io_service),
                     io_runtime.handle(),
+                    &lsm_config,
                 )?;
                 max_commit_ts = max_commit_ts.max(recovered.max_ts_from_ssts);
                 recovery.stats.orphan_ssts_cleaned += recovered.orphan_ssts_cleaned;
@@ -710,11 +885,12 @@ impl Database {
                 "I/O runtime not available while mounting tablet".to_string(),
             )
         })?;
-        let recovered = LsmRecovery::recover_tablet(
+        let recovered = LsmRecovery::recover_tablet_with_template(
             &self.tablet_manager.tablet_dir(tablet_id),
             self.tablet_manager.shared_lsn_provider(),
             Arc::clone(self.storage.io_service()),
             io_rt.handle(),
+            self.storage.config(),
         )?;
         self.tablet_manager
             .insert_tablet(tablet_id, Arc::new(recovered.engine))?;

@@ -41,6 +41,7 @@
 //! ```
 
 pub mod block;
+pub mod bloom;
 pub mod builder;
 pub mod iterator;
 pub mod reader;
@@ -50,12 +51,13 @@ pub use block::{
     DataBlock, DataBlockBuilder, DataBlockIterator, IndexBlock, IndexBlockBuilder, IndexEntry,
     DEFAULT_BLOCK_SIZE,
 };
+pub use bloom::{BloomBuilder, BloomFilter};
 
 pub use builder::{
     AsyncSstBuilder, CompressionType, Footer, SstBuilder, SstBuilderOptions, SstMeta, FOOTER_SIZE,
     SST_MAGIC, SST_VERSION,
 };
 
-pub use reader::{SstReader, SstReaderRef};
+pub use reader::{SstReadOptions, SstReader, SstReaderRef};
 
 pub use iterator::{ConcatIterator, SstIterator, SstMvccIterator};

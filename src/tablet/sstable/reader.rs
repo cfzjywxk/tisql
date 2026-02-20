@@ -25,10 +25,43 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use crate::io::{DmaFile, IoService};
+use crate::tablet::cache::{
+    tablet_namespace_from_dir, BlockCacheKey, BlockKind, CachePriority, SharedBlockCache,
+};
 use crate::util::error::{Result, TiSqlError};
+use tokio::sync::Mutex;
 
 use super::block::{DataBlock, IndexBlock, IndexEntry};
-use super::builder::{Footer, FOOTER_SIZE};
+use super::bloom::BloomFilter;
+use super::builder::{BloomMetaTrailer, Footer, BLOOM_META_TRAILER_SIZE, FOOTER_SIZE};
+
+/// Open/read options for SST readers.
+#[derive(Clone, Default)]
+pub struct SstReadOptions {
+    pub tablet_tag: u128,
+    pub sst_id: u64,
+    pub bloom_enabled: bool,
+    pub fill_cache: bool,
+    pub block_cache: Option<Arc<SharedBlockCache>>,
+}
+
+impl std::fmt::Debug for SstReadOptions {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("SstReadOptions")
+            .field("tablet_tag", &self.tablet_tag)
+            .field("sst_id", &self.sst_id)
+            .field("bloom_enabled", &self.bloom_enabled)
+            .field("fill_cache", &self.fill_cache)
+            .field("block_cache", &self.block_cache.is_some())
+            .finish()
+    }
+}
+
+#[derive(Debug)]
+enum BloomState {
+    Uninitialized,
+    Ready(Option<BloomFilter>),
+}
 
 // ============================================================================
 // SstReader
@@ -55,12 +88,41 @@ pub struct SstReader {
     footer: Footer,
     /// Index block (loaded on open)
     index: IndexBlock,
+    /// Read/cache options.
+    options: SstReadOptions,
+    /// Optional bloom block location (offset, size).
+    bloom_span: Option<(u64, u32)>,
+    /// Lazy bloom decode state.
+    bloom_state: Mutex<BloomState>,
 }
 
 impl SstReader {
     /// Open an SST file for reading.
     pub async fn open<P: AsRef<Path>>(path: P, io: Arc<IoService>) -> Result<Self> {
+        Self::open_with_options(path, io, SstReadOptions::default()).await
+    }
+
+    /// Open an SST file for reading with explicit options.
+    pub async fn open_with_options<P: AsRef<Path>>(
+        path: P,
+        io: Arc<IoService>,
+        mut options: SstReadOptions,
+    ) -> Result<Self> {
         let path = path.as_ref().to_path_buf();
+        if options.tablet_tag == 0 {
+            options.tablet_tag = path.parent().and_then(|p| p.parent()).map_or_else(
+                || tablet_namespace_from_dir(Path::new(".")),
+                tablet_namespace_from_dir,
+            );
+        }
+        if options.sst_id == 0 {
+            options.sst_id = path
+                .file_stem()
+                .and_then(|s| s.to_str())
+                .and_then(|s| s.parse::<u64>().ok())
+                .unwrap_or(0);
+        }
+
         let file = DmaFile::open_read(&path).map_err(|e| {
             TiSqlError::Storage(format!("Failed to open SST {}: {e}", path.display()))
         })?;
@@ -83,15 +145,86 @@ impl SstReader {
             .map_err(|_| TiSqlError::Storage("Footer read returned wrong size".into()))?;
         let footer = Footer::decode(&footer_buf)?;
 
-        // Validate index block bounds
         let data_end = file_size - FOOTER_SIZE as u64;
-        Self::validate_index_bounds(&footer, data_end)?;
+        let mut index_data_end = data_end;
+        let mut bloom_span = None;
 
-        // Read index block via io_uring
-        let index_buf = io
-            .read_at(&file, footer.index_offset, footer.index_size as usize)
-            .await
-            .map_err(|e| TiSqlError::Storage(format!("Failed to read SST index: {e}")))?;
+        if data_end >= BLOOM_META_TRAILER_SIZE as u64 {
+            let trailer_offset = data_end - BLOOM_META_TRAILER_SIZE as u64;
+            let trailer_buf = io
+                .read_at(&file, trailer_offset, BLOOM_META_TRAILER_SIZE)
+                .await
+                .map_err(|e| {
+                    TiSqlError::Storage(format!("Failed to read bloom trailer candidate: {e}"))
+                })?;
+            let trailer_arr: [u8; BLOOM_META_TRAILER_SIZE] = trailer_buf[..BLOOM_META_TRAILER_SIZE]
+                .try_into()
+                .map_err(|_| {
+                    TiSqlError::Storage("Bloom trailer read returned wrong size".into())
+                })?;
+
+            if let Some(meta) = BloomMetaTrailer::decode_optional(&trailer_arr) {
+                let bloom_end = meta
+                    .bloom_offset
+                    .checked_add(meta.bloom_size as u64)
+                    .ok_or_else(|| {
+                        TiSqlError::Storage("Bloom trailer offset + size overflows".into())
+                    })?;
+                if bloom_end > footer.index_offset {
+                    crate::log_warn!(
+                        "Ignoring invalid bloom trailer in {}: bloom_end={} > index_offset={}",
+                        path.display(),
+                        bloom_end,
+                        footer.index_offset
+                    );
+                } else {
+                    index_data_end = trailer_offset;
+                    bloom_span = Some((meta.bloom_offset, meta.bloom_size));
+                }
+            }
+        }
+
+        // Validate index block bounds
+        Self::validate_index_bounds(&footer, index_data_end)?;
+
+        let index_cache_key = BlockCacheKey {
+            ns: options.tablet_tag,
+            sst_id: options.sst_id,
+            block_offset: footer.index_offset,
+            block_kind: BlockKind::Index,
+        };
+        let index_buf = if options.fill_cache {
+            if let Some(cache) = options.block_cache.as_ref() {
+                if let Some(hit) = cache.get(&index_cache_key) {
+                    hit.as_ref().to_vec()
+                } else {
+                    let miss = io
+                        .read_at(&file, footer.index_offset, footer.index_size as usize)
+                        .await
+                        .map_err(|e| {
+                            TiSqlError::Storage(format!("Failed to read SST index: {e}"))
+                        })?;
+                    let miss_vec = miss.to_vec();
+                    let _ = cache.insert(
+                        index_cache_key,
+                        Arc::<[u8]>::from(miss_vec.as_slice()),
+                        miss_vec.len(),
+                        CachePriority::High,
+                    );
+                    miss_vec
+                }
+            } else {
+                io.read_at(&file, footer.index_offset, footer.index_size as usize)
+                    .await
+                    .map_err(|e| TiSqlError::Storage(format!("Failed to read SST index: {e}")))?
+                    .to_vec()
+            }
+        } else {
+            io.read_at(&file, footer.index_offset, footer.index_size as usize)
+                .await
+                .map_err(|e| TiSqlError::Storage(format!("Failed to read SST index: {e}")))?
+                .to_vec()
+        };
         let index = IndexBlock::decode(&index_buf)?;
 
         Ok(Self {
@@ -101,6 +234,9 @@ impl SstReader {
             file_size,
             footer,
             index,
+            options,
+            bloom_span,
+            bloom_state: Mutex::new(BloomState::Uninitialized),
         })
     }
 
@@ -185,18 +321,114 @@ impl SstReader {
             ))
         })?;
 
-        self.read_block_at(entry.block_offset, entry.block_size)
+        self.read_block_at(entry.block_offset, entry.block_size, BlockKind::Data)
             .await
     }
 
-    /// Read a data block at the given offset and size.
-    async fn read_block_at(&self, offset: u64, size: u32) -> Result<DataBlock> {
-        let buf = self
-            .io
+    async fn read_raw_block(&self, offset: u64, size: u32, kind: BlockKind) -> Result<Vec<u8>> {
+        let cache_key = BlockCacheKey {
+            ns: self.options.tablet_tag,
+            sst_id: self.options.sst_id,
+            block_offset: offset,
+            block_kind: kind,
+        };
+        if self.options.fill_cache {
+            if let Some(cache) = self.options.block_cache.as_ref() {
+                if let Some(hit) = cache.get(&cache_key) {
+                    return Ok(hit.as_ref().to_vec());
+                }
+                let miss = self
+                    .io
+                    .read_at(&self.file, offset, size as usize)
+                    .await
+                    .map_err(|e| TiSqlError::Storage(format!("io_uring read_block failed: {e}")))?;
+                let miss_vec = miss.to_vec();
+                let priority = match kind {
+                    BlockKind::Data => CachePriority::Normal,
+                    BlockKind::Index | BlockKind::Bloom => CachePriority::High,
+                };
+                let _ = cache.insert(
+                    cache_key,
+                    Arc::<[u8]>::from(miss_vec.as_slice()),
+                    miss_vec.len(),
+                    priority,
+                );
+                return Ok(miss_vec);
+            }
+        }
+
+        self.io
             .read_at(&self.file, offset, size as usize)
             .await
-            .map_err(|e| TiSqlError::Storage(format!("io_uring read_block failed: {e}")))?;
+            .map(|buf| buf.to_vec())
+            .map_err(|e| TiSqlError::Storage(format!("io_uring read_block failed: {e}")))
+    }
+
+    /// Read a data block at the given offset and size.
+    async fn read_block_at(&self, offset: u64, size: u32, kind: BlockKind) -> Result<DataBlock> {
+        let buf = self.read_raw_block(offset, size, kind).await?;
         DataBlock::decode(&buf)
+    }
+
+    fn bloom_span(&self) -> Option<(u64, u32)> {
+        self.bloom_span
+    }
+
+    /// Bloom check for one user key.
+    ///
+    /// Returns `Ok(true)` when bloom is unavailable/disabled (fail-open).
+    pub async fn may_contain_user_key(&self, user_key: &[u8]) -> Result<bool> {
+        if !self.options.bloom_enabled {
+            return Ok(true);
+        }
+
+        let mut state = self.bloom_state.lock().await;
+        match &mut *state {
+            BloomState::Ready(Some(filter)) => return Ok(filter.may_contain(user_key)),
+            BloomState::Ready(None) => return Ok(true),
+            BloomState::Uninitialized => {}
+        }
+
+        let maybe_filter = match self.bloom_span() {
+            Some((offset, size)) => {
+                let raw = match self.read_raw_block(offset, size, BlockKind::Bloom).await {
+                    Ok(raw) => raw,
+                    Err(e) => {
+                        crate::log_warn!(
+                            "Failed to load bloom block from {} (id={}): {}",
+                            self.path.display(),
+                            self.options.sst_id,
+                            e
+                        );
+                        Vec::new()
+                    }
+                };
+                if raw.is_empty() {
+                    None
+                } else {
+                    match BloomFilter::decode(&raw) {
+                        Ok(filter) => Some(filter),
+                        Err(e) => {
+                            crate::log_warn!(
+                                "Failed to decode bloom block from {} (id={}): {}. Falling back to full lookup.",
+                                self.path.display(),
+                                self.options.sst_id,
+                                e
+                            );
+                            None
+                        }
+                    }
+                }
+            }
+            None => None,
+        };
+
+        *state = BloomState::Ready(maybe_filter);
+        match &*state {
+            BloomState::Ready(Some(filter)) => Ok(filter.may_contain(user_key)),
+            BloomState::Ready(None) => Ok(true),
+            BloomState::Uninitialized => Ok(true),
+        }
     }
 
     /// Find the block that may contain the given key using binary search.
@@ -260,6 +492,16 @@ impl SstReaderRef {
         Ok(Self::new(reader))
     }
 
+    /// Open an SST file and create a shared reader with explicit read options.
+    pub async fn open_with_options<P: AsRef<Path>>(
+        path: P,
+        io: Arc<IoService>,
+        options: SstReadOptions,
+    ) -> Result<Self> {
+        let reader = SstReader::open_with_options(path, io, options).await?;
+        Ok(Self::new(reader))
+    }
+
     /// Read a data block by index.
     pub async fn read_block(&self, block_idx: usize) -> Result<DataBlock> {
         self.inner.read_block(block_idx).await
@@ -268,6 +510,11 @@ impl SstReaderRef {
     /// Point lookup for a key.
     pub async fn get(&self, key: &[u8]) -> Result<Option<Vec<u8>>> {
         self.inner.get(key).await
+    }
+
+    /// Bloom check for one user key.
+    pub async fn may_contain_user_key(&self, user_key: &[u8]) -> Result<bool> {
+        self.inner.may_contain_user_key(user_key).await
     }
 
     /// Get the number of blocks.
@@ -634,6 +881,265 @@ mod tests {
         // Both should work
         assert_eq!(reader1.get(b"key").await.unwrap(), Some(b"value".to_vec()));
         assert_eq!(reader2.get(b"key").await.unwrap(), Some(b"value".to_vec()));
+    }
+
+    // ------------------------------------------------------------------------
+    // Bloom + Block Cache Tests
+    // ------------------------------------------------------------------------
+
+    #[tokio::test]
+    async fn test_reader_bloom_filter_enabled_and_optional() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("bloom_on.sst");
+        let io = test_io();
+
+        let mut builder = SstBuilder::new(
+            &path,
+            SstBuilderOptions {
+                bloom_enabled: true,
+                bloom_bits_per_key: 20,
+                ..SstBuilderOptions::default()
+            },
+        )
+        .unwrap();
+        builder.add(&mvcc_key(b"k1", 200), b"v1").unwrap();
+        builder.add(&mvcc_key(b"k2", 100), b"v2").unwrap();
+        builder.finish(1, 0).unwrap();
+
+        let reader = SstReader::open_with_options(
+            &path,
+            Arc::clone(&io),
+            SstReadOptions {
+                bloom_enabled: true,
+                ..SstReadOptions::default()
+            },
+        )
+        .await
+        .unwrap();
+        assert!(reader.may_contain_user_key(b"k1").await.unwrap());
+
+        let mut negatives = 0;
+        for probe in 0..128 {
+            let key = format!("not-present-{probe:03}");
+            if !reader.may_contain_user_key(key.as_bytes()).await.unwrap() {
+                negatives += 1;
+            }
+        }
+        assert!(
+            negatives > 0,
+            "expected bloom to prune at least one absent key"
+        );
+
+        let path_no_bloom = dir.path().join("bloom_off.sst");
+        let mut no_bloom_builder =
+            SstBuilder::new(&path_no_bloom, SstBuilderOptions::default()).unwrap();
+        no_bloom_builder.add(&mvcc_key(b"k1", 200), b"v1").unwrap();
+        no_bloom_builder.finish(2, 0).unwrap();
+
+        let no_bloom_reader = SstReader::open_with_options(
+            &path_no_bloom,
+            io,
+            SstReadOptions {
+                bloom_enabled: true,
+                ..SstReadOptions::default()
+            },
+        )
+        .await
+        .unwrap();
+        // No bloom block should fail-open.
+        assert!(no_bloom_reader
+            .may_contain_user_key(b"definitely-missing")
+            .await
+            .unwrap());
+    }
+
+    #[tokio::test]
+    async fn test_reader_bloom_decode_failure_is_fail_open() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("bloom_corrupt.sst");
+        let io = test_io();
+
+        let mut builder = SstBuilder::new(
+            &path,
+            SstBuilderOptions {
+                bloom_enabled: true,
+                bloom_bits_per_key: 16,
+                ..SstBuilderOptions::default()
+            },
+        )
+        .unwrap();
+        let mvcc = mvcc_key(b"k1", 100);
+        builder.add(&mvcc, b"v1").unwrap();
+        builder.finish(3, 0).unwrap();
+
+        let reader = SstReader::open(&path, Arc::clone(&io)).await.unwrap();
+        let data_end = reader
+            .index_entries()
+            .iter()
+            .map(|e| e.block_offset + e.block_size as u64)
+            .max()
+            .unwrap_or(0);
+        let bloom_size = reader.footer().index_offset.saturating_sub(data_end);
+        assert!(bloom_size > 0, "expected bloom block to exist");
+        drop(reader);
+
+        let mut bytes = std::fs::read(&path).unwrap();
+        bytes[data_end as usize] ^= 0x5A; // Corrupt bloom payload checksum.
+        std::fs::write(&path, bytes).unwrap();
+
+        let corrupted_reader = SstReader::open_with_options(
+            &path,
+            Arc::clone(&io),
+            SstReadOptions {
+                bloom_enabled: true,
+                ..SstReadOptions::default()
+            },
+        )
+        .await
+        .unwrap();
+
+        // Decode failure must fail-open for correctness.
+        assert!(corrupted_reader
+            .may_contain_user_key(b"missing-key")
+            .await
+            .unwrap());
+        assert_eq!(
+            corrupted_reader.get(&mvcc).await.unwrap(),
+            Some(b"v1".to_vec())
+        );
+    }
+
+    #[tokio::test]
+    async fn test_reader_block_cache_hits_on_repeated_reads() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("cache_hits.sst");
+        let io = test_io();
+
+        let mut builder = SstBuilder::new(
+            &path,
+            SstBuilderOptions {
+                block_size: 128,
+                ..SstBuilderOptions::default()
+            },
+        )
+        .unwrap();
+        for i in 0..16 {
+            builder
+                .add(&mvcc_key(format!("k{i:03}").as_bytes(), 100), b"value")
+                .unwrap();
+        }
+        builder.finish(4, 0).unwrap();
+
+        let cache = Arc::new(SharedBlockCache::new(1 << 20));
+        let reader = SstReader::open_with_options(
+            &path,
+            io,
+            SstReadOptions {
+                tablet_tag: 111,
+                sst_id: 4,
+                fill_cache: true,
+                block_cache: Some(Arc::clone(&cache)),
+                ..SstReadOptions::default()
+            },
+        )
+        .await
+        .unwrap();
+
+        reader.read_block(0).await.unwrap();
+        let after_first = cache.stats();
+        reader.read_block(0).await.unwrap();
+        let after_second = cache.stats();
+
+        assert!(after_first.misses >= 1);
+        assert!(after_second.hits > after_first.hits);
+    }
+
+    #[tokio::test]
+    async fn test_reader_fill_cache_false_does_not_populate_cache() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("cache_fill_false.sst");
+        let io = test_io();
+
+        let mut builder = SstBuilder::new(
+            &path,
+            SstBuilderOptions {
+                block_size: 128,
+                ..SstBuilderOptions::default()
+            },
+        )
+        .unwrap();
+        for i in 0..16 {
+            builder
+                .add(&mvcc_key(format!("k{i:03}").as_bytes(), 100), b"value")
+                .unwrap();
+        }
+        builder.finish(5, 0).unwrap();
+
+        let cache = Arc::new(SharedBlockCache::new(1 << 20));
+        let reader = SstReader::open_with_options(
+            &path,
+            io,
+            SstReadOptions {
+                tablet_tag: 222,
+                sst_id: 5,
+                fill_cache: false,
+                block_cache: Some(Arc::clone(&cache)),
+                ..SstReadOptions::default()
+            },
+        )
+        .await
+        .unwrap();
+
+        reader.read_block(0).await.unwrap();
+        reader.read_block(0).await.unwrap();
+
+        let stats = cache.stats();
+        assert_eq!(stats.hits, 0);
+        assert_eq!(stats.misses, 0);
+        assert_eq!(stats.inserts, 0);
+    }
+
+    #[tokio::test]
+    async fn test_reader_open_caches_index_block() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("cache_index_open.sst");
+        let io = test_io();
+
+        let mut builder = SstBuilder::new(
+            &path,
+            SstBuilderOptions {
+                block_size: 128,
+                ..SstBuilderOptions::default()
+            },
+        )
+        .unwrap();
+        for i in 0..16 {
+            builder
+                .add(&mvcc_key(format!("k{i:03}").as_bytes(), 100), b"value")
+                .unwrap();
+        }
+        builder.finish(6, 0).unwrap();
+
+        let cache = Arc::new(SharedBlockCache::new(1 << 20));
+        let options = SstReadOptions {
+            tablet_tag: 333,
+            sst_id: 6,
+            fill_cache: true,
+            block_cache: Some(Arc::clone(&cache)),
+            ..SstReadOptions::default()
+        };
+
+        let _reader1 = SstReader::open_with_options(&path, Arc::clone(&io), options.clone())
+            .await
+            .unwrap();
+        let after_open1 = cache.stats();
+        assert!(after_open1.inserts >= 1);
+
+        let _reader2 = SstReader::open_with_options(&path, io, options)
+            .await
+            .unwrap();
+        let after_open2 = cache.stats();
+        assert!(after_open2.hits > after_open1.hits);
     }
 
     // ------------------------------------------------------------------------

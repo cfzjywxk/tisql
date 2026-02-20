@@ -513,6 +513,8 @@ impl CompactionExecutor {
         let options = SstBuilderOptions {
             block_size: self.config.block_size,
             compression: self.config.compression,
+            bloom_enabled: self.config.bloom_enabled,
+            bloom_bits_per_key: self.config.bloom_bits_per_key,
         };
         let mut builder = AsyncSstBuilder::new(&output_path, options.clone(), Arc::clone(&io))?;
 
@@ -969,6 +971,81 @@ mod tests {
         assert!(!delta.new_ssts.is_empty());
         assert_eq!(delta.deleted_ssts.len(), 2);
         assert!(delta.new_ssts.iter().all(|sst| sst.level == 1));
+    }
+
+    #[tokio::test]
+    async fn test_compaction_executor_writes_bloom_when_enabled() {
+        let tmp = TempDir::new().unwrap();
+        let config = Arc::new(
+            LsmConfig::builder(tmp.path())
+                .memtable_size(1024)
+                .target_file_size(1024)
+                .bloom_enabled(true)
+                .bloom_bits_per_key(16)
+                .build()
+                .unwrap(),
+        );
+        let executor = CompactionExecutor::new(Arc::clone(&config));
+
+        std::fs::create_dir_all(config.sst_dir()).unwrap();
+
+        let sst1_path = config.sst_dir().join("00000001.sst");
+        let mut builder = SstBuilder::new(&sst1_path, SstBuilderOptions::default()).unwrap();
+        builder.add(b"a", b"v1").unwrap();
+        builder.add(b"c", b"v1").unwrap();
+        let meta1 = builder.finish(1, 0).unwrap();
+
+        let sst2_path = config.sst_dir().join("00000002.sst");
+        let mut builder = SstBuilder::new(&sst2_path, SstBuilderOptions::default()).unwrap();
+        builder.add(b"b", b"v2").unwrap();
+        builder.add(b"d", b"v2").unwrap();
+        let meta2 = builder.finish(2, 0).unwrap();
+
+        let version = Version::builder()
+            .add_sst(meta1)
+            .add_sst(meta2)
+            .next_sst_id(3)
+            .build();
+        let task = CompactionTask {
+            inputs: vec![(0, 1), (0, 2)],
+            output_level: 1,
+            is_trivial_move: false,
+        };
+
+        let delta = executor
+            .execute(
+                &task,
+                &version,
+                &config.sst_dir(),
+                &[3, 4],
+                test_io(),
+                0,
+                false,
+            )
+            .await
+            .unwrap();
+        let output = delta.new_ssts.first().unwrap();
+        let output_path = config.sst_dir().join(format!("{:08}.sst", output.id));
+        let reader = SstReaderRef::open_with_options(
+            &output_path,
+            test_io(),
+            crate::tablet::sstable::SstReadOptions {
+                bloom_enabled: true,
+                ..crate::tablet::sstable::SstReadOptions::default()
+            },
+        )
+        .await
+        .unwrap();
+
+        assert!(reader.may_contain_user_key(b"a").await.unwrap());
+        let mut negatives = 0;
+        for i in 0..64 {
+            let probe = format!("miss-{i:03}");
+            if !reader.may_contain_user_key(probe.as_bytes()).await.unwrap() {
+                negatives += 1;
+            }
+        }
+        assert!(negatives > 0);
     }
 
     // ==================== MergeIterator Additional Coverage Tests ====================

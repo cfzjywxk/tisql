@@ -29,6 +29,7 @@ use crate::log_info;
 use crate::log_warn;
 use crate::lsn::SharedLsnProvider;
 use crate::tablet::commit_reservations::{CommitLsnReservations, CommitReservationStats};
+use crate::tablet::CacheSuite;
 use crate::util::error::{Result, TiSqlError};
 
 use super::router::{route_index_to_tablet, route_table_to_tablet, TabletId};
@@ -102,6 +103,7 @@ pub struct TabletManager {
     desired_tablets: RwLock<BTreeSet<TabletId>>,
     background_runtime: RwLock<Option<tokio::runtime::Handle>>,
     tablet_workers: RwLock<BTreeMap<TabletId, TabletWorkerSet>>,
+    cache_suite: RwLock<Option<Arc<CacheSuite>>>,
     lsn_provider: SharedLsnProvider,
     commit_reservations: CommitLsnReservations,
 }
@@ -123,6 +125,7 @@ impl TabletManager {
             desired_tablets: RwLock::new(BTreeSet::from([TabletId::System])),
             background_runtime: RwLock::new(None),
             tablet_workers: RwLock::new(BTreeMap::new()),
+            cache_suite: RwLock::new(None),
             lsn_provider,
             commit_reservations: CommitLsnReservations::new(),
         };
@@ -317,10 +320,21 @@ impl TabletManager {
     /// Insert one mounted tablet engine (future phases).
     pub fn insert_tablet(&self, tablet_id: TabletId, tablet: Arc<TabletEngine>) -> Result<()> {
         self.ensure_tablet_dir(tablet_id)?;
+        if let Some(cache_suite) = self.cache_suite.read().as_ref() {
+            tablet.set_cache_suite(Arc::clone(cache_suite));
+        }
         self.desired_tablets.write().insert(tablet_id);
         self.tablets.write().insert(tablet_id, Arc::clone(&tablet));
         self.start_tablet_workers(tablet_id, tablet)?;
         Ok(())
+    }
+
+    /// Bind one shared cache suite and apply to all currently mounted tablets.
+    pub fn bind_cache_suite(&self, suite: Arc<CacheSuite>) {
+        *self.cache_suite.write() = Some(Arc::clone(&suite));
+        for (_, tablet) in self.all_tablets() {
+            tablet.set_cache_suite(Arc::clone(&suite));
+        }
     }
 
     /// Remove a mounted tablet and stop its per-tablet workers.
