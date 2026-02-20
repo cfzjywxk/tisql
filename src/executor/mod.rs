@@ -59,19 +59,6 @@ pub(crate) trait RowPuller: Send {
     fn next(&mut self) -> Pin<Box<dyn Future<Output = Result<Option<Row>>> + Send + '_>>;
 }
 
-/// Backward-compat row puller wrapping a materialized `Vec<Row>`.
-///
-/// Used for `From<ExecutionResult>` conversion (write results). In production,
-/// write results are always `Affected`/`Ok`, so this is effectively dead code
-/// in the hot path.
-struct VecPuller(std::vec::IntoIter<Row>);
-
-impl RowPuller for VecPuller {
-    fn next(&mut self) -> Pin<Box<dyn Future<Output = Result<Option<Row>>> + Send + '_>> {
-        Box::pin(std::future::ready(Ok(self.0.next())))
-    }
-}
-
 /// Lazy row-producing execution handle (volcano-style, async).
 ///
 /// Wraps a `RowPuller` that yields rows one at a time via async `next()`.
@@ -85,13 +72,6 @@ impl Execution {
     /// Create from a type-erased row puller (production path — streaming).
     pub(crate) fn from_puller(puller: Box<dyn RowPuller>) -> Self {
         Self { puller }
-    }
-
-    /// Create from a materialized row vec (backward-compat / test path).
-    pub(crate) fn from_rows(rows: Vec<Row>) -> Self {
-        Self {
-            puller: Box::new(VecPuller(rows.into_iter())),
-        }
     }
 
     /// Pull the next row (volcano-style, async).
@@ -116,7 +96,7 @@ pub enum ExecutionOutput {
 }
 
 impl ExecutionOutput {
-    /// Materialize into an `ExecutionResult` (test / legacy paths only).
+    /// Materialize into an `ExecutionResult` (test/convenience paths only).
     pub(crate) async fn into_result(self) -> Result<ExecutionResult> {
         match self {
             ExecutionOutput::Rows { schema, mut exec } => {
@@ -129,20 +109,6 @@ impl ExecutionOutput {
             ExecutionOutput::Affected { count } => Ok(ExecutionResult::Affected { count }),
             ExecutionOutput::Ok => Ok(ExecutionResult::Ok),
             ExecutionOutput::OkWithEffect(effect) => Ok(ExecutionResult::OkWithEffect(effect)),
-        }
-    }
-}
-
-impl From<ExecutionResult> for ExecutionOutput {
-    fn from(result: ExecutionResult) -> Self {
-        match result {
-            ExecutionResult::Rows { schema, rows } => ExecutionOutput::Rows {
-                schema,
-                exec: Execution::from_rows(rows),
-            },
-            ExecutionResult::Affected { count } => ExecutionOutput::Affected { count },
-            ExecutionResult::Ok => ExecutionOutput::Ok,
-            ExecutionResult::OkWithEffect(effect) => ExecutionOutput::OkWithEffect(effect),
         }
     }
 }

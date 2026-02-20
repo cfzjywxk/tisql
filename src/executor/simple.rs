@@ -36,7 +36,7 @@ use crate::tablet::{
 use crate::transaction::{TxnCtx, TxnService};
 use crate::util::error::{Result, TiSqlError};
 
-use super::{DdlEffect, Execution, ExecutionOutput, ExecutionResult, Executor, RowPuller};
+use super::{DdlEffect, Execution, ExecutionOutput, Executor, RowPuller};
 
 // ============================================================================
 // Expression Evaluation (free functions)
@@ -905,7 +905,7 @@ impl Executor for SimpleExecutor {
                         .execute_write_with_ctx(plan, &mut ctx, txn_service, catalog)
                         .await
                     {
-                        Ok(result) => (Ok(result.into()), Some(ctx)),
+                        Ok(result) => (Ok(result), Some(ctx)),
                         Err(e) => (Err(e), Some(ctx)),
                     }
                 } else {
@@ -922,7 +922,7 @@ impl Executor for SimpleExecutor {
             None => {
                 if plan.is_write() {
                     match self.execute_write(plan, txn_service, catalog).await {
-                        Ok(result) => (Ok(result.into()), None),
+                        Ok(result) => (Ok(result), None),
                         Err(e) => (Err(e), None),
                     }
                 } else {
@@ -977,7 +977,7 @@ impl SimpleExecutor {
         plan: LogicalPlan,
         txn_service: &T,
         catalog: &C,
-    ) -> Result<ExecutionResult> {
+    ) -> Result<ExecutionOutput> {
         // DDL operations don't need transaction (catalog operations)
         match &plan {
             LogicalPlan::CreateTable { .. } | LogicalPlan::DropTable { .. } => {
@@ -1023,7 +1023,7 @@ impl SimpleExecutor {
         &self,
         plan: LogicalPlan,
         catalog: &C,
-    ) -> Result<ExecutionResult> {
+    ) -> Result<ExecutionOutput> {
         match plan {
             LogicalPlan::CreateTable {
                 table,
@@ -1039,7 +1039,7 @@ impl SimpleExecutor {
 
                 if catalog.get_table(table.schema(), table.name())?.is_some() {
                     if if_not_exists {
-                        return Ok(ExecutionResult::Ok);
+                        return Ok(ExecutionOutput::Ok);
                     }
                     return Err(TiSqlError::Catalog(format!(
                         "Table '{}' already exists",
@@ -1048,7 +1048,7 @@ impl SimpleExecutor {
                 }
 
                 let table_id = catalog.create_table(table).await?;
-                Ok(ExecutionResult::OkWithEffect(DdlEffect::TableCreated {
+                Ok(ExecutionOutput::OkWithEffect(DdlEffect::TableCreated {
                     table_id,
                 }))
             }
@@ -1060,13 +1060,13 @@ impl SimpleExecutor {
             } => {
                 if catalog.get_table(&schema, &table)?.is_none() {
                     if if_exists {
-                        return Ok(ExecutionResult::Ok);
+                        return Ok(ExecutionOutput::Ok);
                     }
                     return Err(TiSqlError::TableNotFound(format!("{schema}.{table}")));
                 }
 
                 let _info = catalog.drop_table(&schema, &table).await?;
-                Ok(ExecutionResult::OkWithEffect(DdlEffect::TableDropped))
+                Ok(ExecutionOutput::OkWithEffect(DdlEffect::TableDropped))
             }
 
             _ => Err(TiSqlError::Execution("Not a DDL operation".into())),
@@ -1100,7 +1100,7 @@ impl SimpleExecutor {
         ctx: &mut TxnCtx,
         txn_service: &T,
         catalog: &C,
-    ) -> Result<ExecutionResult> {
+    ) -> Result<ExecutionOutput> {
         match plan {
             LogicalPlan::Insert {
                 table,
@@ -1181,7 +1181,7 @@ impl SimpleExecutor {
                     count += 1;
                 }
 
-                Ok(ExecutionResult::Affected { count })
+                Ok(ExecutionOutput::Affected { count })
             }
 
             LogicalPlan::Delete { table, filter } => {
@@ -1225,7 +1225,7 @@ impl SimpleExecutor {
                     iter.advance().await?;
                 }
 
-                Ok(ExecutionResult::Affected { count })
+                Ok(ExecutionOutput::Affected { count })
             }
 
             LogicalPlan::Update {
@@ -1316,7 +1316,7 @@ impl SimpleExecutor {
                     iter.advance().await?;
                 }
 
-                Ok(ExecutionResult::Affected { count })
+                Ok(ExecutionOutput::Affected { count })
             }
 
             _ => Err(TiSqlError::Execution(format!(
