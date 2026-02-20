@@ -1,6 +1,6 @@
 # TiSQL Makefile
 
-.PHONY: all build test unit-test store-test storage-test failpoint-test e2e-test fmt clippy clean run help prepare quick-prepare
+.PHONY: all build test unit-test store-test storage-test failpoint-test e2e-test bench fmt clippy clean run help prepare quick-prepare
 
 CPU_CORES ?= $(shell getconf _NPROCESSORS_ONLN 2>/dev/null || nproc 2>/dev/null || echo 4)
 # Process-level test parallelism tuned by machine size. Keep integration/e2e
@@ -31,6 +31,8 @@ E2E_TEST_CASE_JOB_COUNT ?= $(MEDIUM_CASE_JOB_COUNT)
 E2E_TEST_FILTER ?=
 E2E_STMT_TIMEOUT_SECS ?= 15
 E2E_CASE_TIMEOUT_SECS ?= 55
+BENCH_TIMEOUT_SECS ?= 55
+BENCH_FILTER ?=
 
 # Keep all timeout guards below one minute for fast fail detection.
 # Faster local-iteration profile (smaller timeout guards, same segmented flow)
@@ -49,6 +51,7 @@ QUICK_COMPACTION_CASE_TIMEOUT_SECS ?= 45
 QUICK_E2E_TEST_CASE_JOB_COUNT ?= $(MEDIUM_CASE_JOB_COUNT)
 QUICK_E2E_STMT_TIMEOUT_SECS ?= 15
 QUICK_E2E_CASE_TIMEOUT_SECS ?= 45
+QUICK_BENCH_TIMEOUT_SECS ?= 45
 
 # Keep store_test deterministic and avoid runtime/thread explosion when the
 # harness executes many tokio::test cases concurrently.
@@ -129,6 +132,12 @@ e2e-test:
 		$(E2E_TEST_CASE_JOB_COUNT) \
 		"$(E2E_TEST_FILTER)"
 
+# Run deterministic performance-regression bench cases
+bench:
+	./scripts/run_bench.sh \
+		$(BENCH_TIMEOUT_SECS) \
+		"$(BENCH_FILTER)"
+
 # Record E2E test results (use when adding new tests)
 e2e-record:
 	./scripts/run_with_timeout.sh $(E2E_TEST_TIMEOUT_SECS) \
@@ -146,8 +155,8 @@ fmt-check:
 clippy:
 	cargo clippy --all-targets -- -D warnings
 
-# Format, lint, and run all tests - run before pushing to pass CI
-prepare: fmt clippy test
+# Format, lint, run all tests, and run perf-regression benches.
+prepare: fmt clippy test bench
 
 # Fast local gate: same segmented pipeline with tighter timeout guards.
 quick-prepare: fmt clippy
@@ -170,6 +179,8 @@ quick-prepare: fmt clippy
 		E2E_TEST_CASE_JOB_COUNT=$(QUICK_E2E_TEST_CASE_JOB_COUNT) \
 		E2E_STMT_TIMEOUT_SECS=$(QUICK_E2E_STMT_TIMEOUT_SECS) \
 		E2E_CASE_TIMEOUT_SECS=$(QUICK_E2E_CASE_TIMEOUT_SECS)
+	$(MAKE) bench \
+		BENCH_TIMEOUT_SECS=$(QUICK_BENCH_TIMEOUT_SECS)
 
 # Run all CI checks locally (same as prepare but with format check instead of format)
 ci: fmt-check clippy test
@@ -202,10 +213,11 @@ help:
 	@echo "  failpoint-test Run failpoint crash-recovery tests"
 	@echo "  e2e-test     Run E2E tests only"
 	@echo "  e2e-record   Record E2E test results"
+	@echo "  bench        Run deterministic performance-regression bench cases"
 	@echo "  fmt          Format code"
 	@echo "  fmt-check    Check code formatting"
 	@echo "  clippy       Run clippy linter"
-	@echo "  prepare      Format, lint, and run all tests (run before push)"
+	@echo "  prepare      Format, lint, run all tests, and run perf-regression benches"
 	@echo "  quick-prepare Fast local gate with tighter timeout guards"
 	@echo "  ci           Run all CI checks (format check, lint, all tests)"
 	@echo "  clean        Clean build artifacts"

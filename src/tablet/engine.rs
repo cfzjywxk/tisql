@@ -58,7 +58,9 @@ use fail::fail_point;
 use crate::catalog::types::{Key, Lsn, RawValue, Timestamp};
 use crate::log_error;
 use crate::lsn::SharedLsnProvider;
-use crate::tablet::mvcc::{decode_mvcc_key, is_tombstone, MvccIterator, MvccKey, SharedMvccRange};
+use crate::tablet::mvcc::{
+    extract_key, extract_timestamp, is_tombstone, MvccIterator, MvccKey, SharedMvccRange,
+};
 use crate::tablet::{PessimisticStorage, PessimisticWriteError, StorageEngine, WriteBatch};
 use crate::util::error::{Result, TiSqlError};
 
@@ -74,6 +76,9 @@ use super::sstable::{
 };
 use super::version::{ManifestDelta, Version, MAX_LEVELS};
 use super::version_set::{SuperVersion, VersionSet};
+
+#[cfg(test)]
+use crate::tablet::mvcc::decode_mvcc_key;
 
 // ---------------------------------------------------------------------------
 // In-flight LSN tracker (OceanBase-inspired per-thread tracking)
@@ -1530,70 +1535,61 @@ impl LsmEngine {
     /// Read a key from SST files with MVCC timestamp filtering.
     ///
     /// Searches L0 first (newest to oldest), then L1, L2, etc.
-    /// SSTs contain MVCC keys (key || !commit_ts), so we need to:
-    /// 1. Scan for entries matching the key
-    /// 2. Find the latest version with entry_ts <= ts
-    /// 3. Return None if that version is a tombstone
+    /// SSTs contain MVCC keys (key || !commit_ts), so for each candidate SST:
+    /// 1. Seek to `(key, read_ts)` using MVCC ordering
+    /// 2. Check whether the positioned entry still belongs to `key`
+    /// 3. Merge best visible version across candidate SSTs
     async fn get_from_sst(&self, key: &[u8], ts: Timestamp) -> Result<Option<RawValue>> {
         let version = self.current_version();
 
         // Find SSTs that may contain this key
-        // Note: find_ssts_for_key now receives user key, but SST metadata stores MVCC key ranges
-        // We need to update this to work with MVCC keys, but for now iterate all SSTs
         let candidates = version.find_ssts_for_key(key);
+        let seek_target = MvccKey::seek_for_read(key, ts);
 
         // Track best match: (entry_ts, value) where entry_ts <= ts
         let mut best_match: Option<(Timestamp, RawValue)> = None;
 
         for sst_meta in candidates {
+            // Quick reject: this SST only has versions newer than our snapshot.
+            if sst_meta.min_ts > ts {
+                continue;
+            }
+
             let sst_path = self
                 .config
                 .sst_dir()
                 .join(format!("{:08}.sst", sst_meta.id));
 
-            // SST referenced by Version must exist - missing file indicates data corruption
-            if !sst_path.exists() {
-                return Err(TiSqlError::Storage(format!(
-                    "SST file missing: {} (id={}, level={}). This indicates data corruption or incomplete recovery.",
-                    sst_path.display(),
-                    sst_meta.id,
-                    sst_meta.level
-                )));
-            }
-
-            // SST now contains MVCC keys - iterate to find matching key with ts visibility
-            // Propagate errors instead of silently ignoring (risks wrong reads)
+            // Point-seek the best visible MVCC version for this user key in this SST.
+            // Propagate errors instead of silently ignoring (risks wrong reads).
             let reader = self.open_point_reader(&sst_path, sst_meta.id, true).await?;
             if self.config.bloom_enabled && !reader.may_contain_user_key(key).await? {
                 continue;
             }
             let mut iter = SstIterator::new(reader)?;
-            iter.seek_to_first().await?; // Position at first entry
+            iter.seek(seek_target.as_bytes()).await?;
+            if !iter.valid() {
+                continue;
+            }
 
-            while iter.valid() {
-                let mvcc_key = iter.key();
-                let value = iter.value();
+            let mvcc_key = iter.key();
+            if extract_key(mvcc_key) != key {
+                continue;
+            }
+            let Some(entry_ts) = extract_timestamp(mvcc_key) else {
+                continue;
+            };
+            debug_assert!(
+                entry_ts <= ts,
+                "seek_for_read returned a newer version: key={key:?}, entry_ts={entry_ts}, read_ts={ts}"
+            );
 
-                if let Some((decoded_key, entry_ts)) = decode_mvcc_key(mvcc_key) {
-                    // Check if this is our key and visible at ts
-                    if decoded_key == key && entry_ts <= ts {
-                        // Check if this is better than current best match
-                        // (higher entry_ts but still <= ts)
-                        let dominated = best_match
-                            .as_ref()
-                            .is_some_and(|(best_ts, _)| entry_ts <= *best_ts);
-                        if !dominated {
-                            best_match = Some((entry_ts, value.to_vec()));
-                        }
-                    }
-                    // Optimization: if decoded_key > key, we've passed our key
-                    // (due to MVCC key ordering: same key groups together)
-                    if decoded_key.as_slice() > key {
-                        break;
-                    }
-                }
-
-                iter.advance().await?;
+            // Keep the latest visible version across candidate SSTs.
+            let dominated = best_match
+                .as_ref()
+                .is_some_and(|(best_ts, _)| entry_ts <= *best_ts);
+            if !dominated {
+                best_match = Some((entry_ts, iter.value().to_vec()));
             }
         }
 
@@ -10277,6 +10273,176 @@ mod tests {
 
         assert!(after_first.inserts > before.inserts);
         assert!(after_second.hits > after_first.hits);
+    }
+
+    #[tokio::test]
+    async fn test_point_get_from_sst_reads_few_blocks() {
+        let dir = TempDir::new().unwrap();
+        let config = LsmConfig::builder(dir.path())
+            .block_size(64)
+            .shared_block_cache_enabled(true)
+            .bloom_enabled(false)
+            .build()
+            .unwrap();
+        let engine = LsmEngine::open(config.clone()).unwrap();
+        bind_test_cache_suite(&engine, &config);
+
+        for i in 0..512u64 {
+            let mut batch = WriteBatch::new();
+            batch.set_commit_ts(i + 1);
+            batch.put(format!("point-key-{i:04}").into_bytes(), vec![b'v'; 64]);
+            engine.write_batch(batch).unwrap();
+        }
+        engine.flush_all_with_active_async().await.unwrap();
+
+        let block_cache = engine
+            .cache_suite()
+            .and_then(|suite| suite.block_cache())
+            .unwrap();
+        let before = block_cache.stats();
+
+        let target = b"point-key-0511".to_vec();
+        assert_eq!(
+            engine.get_at(&target, Timestamp::MAX).await.unwrap(),
+            Some(vec![b'v'; 64])
+        );
+
+        let after = block_cache.stats();
+        let miss_delta = after.misses.saturating_sub(before.misses);
+        assert!(
+            miss_delta > 0 && miss_delta <= 3,
+            "point get should touch only a few blocks via seek path, miss_delta={miss_delta}"
+        );
+
+        // Re-read should hit block cache for the data block.
+        let before_second = block_cache.stats();
+        assert_eq!(
+            engine.get_at(&target, Timestamp::MAX).await.unwrap(),
+            Some(vec![b'v'; 64])
+        );
+        let after_second = block_cache.stats();
+        let second_miss_delta = after_second.misses.saturating_sub(before_second.misses);
+        let second_hit_delta = after_second.hits.saturating_sub(before_second.hits);
+        assert_eq!(
+            second_miss_delta, 0,
+            "second point get should be served from block cache"
+        );
+        assert!(
+            second_hit_delta > 0,
+            "second point get should produce block-cache hits"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_point_get_from_sst_bloom_path_hits_block_cache() {
+        let dir = TempDir::new().unwrap();
+        let config = LsmConfig::builder(dir.path())
+            .block_size(64)
+            .shared_block_cache_enabled(true)
+            .bloom_enabled(true)
+            .build()
+            .unwrap();
+        let engine = LsmEngine::open(config.clone()).unwrap();
+        bind_test_cache_suite(&engine, &config);
+
+        for i in 0..512u64 {
+            let mut batch = WriteBatch::new();
+            batch.set_commit_ts(i + 1);
+            batch.put(format!("bloom-key-{i:04}").into_bytes(), vec![b'v'; 64]);
+            engine.write_batch(batch).unwrap();
+        }
+        engine.flush_all_with_active_async().await.unwrap();
+
+        let block_cache = engine
+            .cache_suite()
+            .and_then(|suite| suite.block_cache())
+            .unwrap();
+
+        let target = b"bloom-key-0511".to_vec();
+        let before_first = block_cache.stats();
+        assert_eq!(
+            engine.get_at(&target, Timestamp::MAX).await.unwrap(),
+            Some(vec![b'v'; 64])
+        );
+        let after_first = block_cache.stats();
+        let first_miss_delta = after_first.misses.saturating_sub(before_first.misses);
+        assert!(
+            first_miss_delta > 0 && first_miss_delta <= 4,
+            "first bloom-enabled point get should load a few blocks, miss_delta={first_miss_delta}"
+        );
+
+        let before_second = block_cache.stats();
+        assert_eq!(
+            engine.get_at(&target, Timestamp::MAX).await.unwrap(),
+            Some(vec![b'v'; 64])
+        );
+        let after_second = block_cache.stats();
+        let second_miss_delta = after_second.misses.saturating_sub(before_second.misses);
+        let second_hit_delta = after_second.hits.saturating_sub(before_second.hits);
+        assert_eq!(
+            second_miss_delta, 0,
+            "second bloom-enabled point get should avoid block-cache misses"
+        );
+        assert!(
+            second_hit_delta > 0,
+            "second bloom-enabled point get should produce block-cache hits"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_point_get_from_sst_scale_regression_guard() {
+        let dir = TempDir::new().unwrap();
+        let config = LsmConfig::builder(dir.path())
+            .block_size(64)
+            .shared_block_cache_enabled(true)
+            .bloom_enabled(false)
+            .build()
+            .unwrap();
+        let engine = LsmEngine::open(config.clone()).unwrap();
+        bind_test_cache_suite(&engine, &config);
+
+        for i in 0..4096u64 {
+            let mut batch = WriteBatch::new();
+            batch.set_commit_ts(i + 1);
+            batch.put(format!("scale-key-{i:05}").into_bytes(), vec![b'v'; 64]);
+            engine.write_batch(batch).unwrap();
+        }
+        engine.flush_all_with_active_async().await.unwrap();
+
+        let block_cache = engine
+            .cache_suite()
+            .and_then(|suite| suite.block_cache())
+            .unwrap();
+
+        let target = b"scale-key-04095".to_vec();
+        let before_first = block_cache.stats();
+        assert_eq!(
+            engine.get_at(&target, Timestamp::MAX).await.unwrap(),
+            Some(vec![b'v'; 64])
+        );
+        let after_first = block_cache.stats();
+        let first_miss_delta = after_first.misses.saturating_sub(before_first.misses);
+        assert!(
+            first_miss_delta > 0 && first_miss_delta <= 3,
+            "point seek should stay near O(log n): miss_delta={first_miss_delta}"
+        );
+
+        let before_second = block_cache.stats();
+        assert_eq!(
+            engine.get_at(&target, Timestamp::MAX).await.unwrap(),
+            Some(vec![b'v'; 64])
+        );
+        let after_second = block_cache.stats();
+        let second_miss_delta = after_second.misses.saturating_sub(before_second.misses);
+        let second_hit_delta = after_second.hits.saturating_sub(before_second.hits);
+        assert_eq!(
+            second_miss_delta, 0,
+            "second read should avoid extra block misses"
+        );
+        assert!(
+            second_hit_delta > 0,
+            "second read should be served from block cache"
+        );
     }
 
     #[tokio::test]

@@ -586,6 +586,21 @@ pub fn decode_mvcc_key(mvcc_key: &[u8]) -> Option<(Key, Timestamp)> {
     Some((key, ts))
 }
 
+/// Extract only the timestamp portion from an MVCC key.
+///
+/// This avoids allocating the user key when only timestamp visibility
+/// checks are needed.
+#[inline]
+pub fn extract_timestamp(mvcc_key: &[u8]) -> Option<Timestamp> {
+    if mvcc_key.len() < TIMESTAMP_SIZE {
+        return None;
+    }
+    let ts_bytes: [u8; TIMESTAMP_SIZE] = mvcc_key[mvcc_key.len() - TIMESTAMP_SIZE..]
+        .try_into()
+        .ok()?;
+    Some(!u64::from_be_bytes(ts_bytes))
+}
+
 /// Extract the key portion from an MVCC key (without timestamp).
 ///
 /// This is more efficient than full decode when the timestamp is not needed.
@@ -968,6 +983,28 @@ mod tests {
         let short = b"short";
         let extracted = extract_key(short);
         assert_eq!(extracted, short);
+    }
+
+    #[test]
+    fn test_extract_timestamp() {
+        let key = b"test_key";
+        let ts: Timestamp = 12345;
+        let mvcc_key = encode_mvcc_key(key, ts);
+        assert_eq!(extract_timestamp(&mvcc_key), Some(ts));
+    }
+
+    #[test]
+    fn test_extract_timestamp_short_key() {
+        assert_eq!(extract_timestamp(b"short"), None);
+    }
+
+    #[test]
+    fn test_extract_timestamp_boundaries() {
+        let key = b"boundary";
+        let min_mvcc = encode_mvcc_key(key, 0);
+        let max_mvcc = encode_mvcc_key(key, Timestamp::MAX);
+        assert_eq!(extract_timestamp(&min_mvcc), Some(0));
+        assert_eq!(extract_timestamp(&max_mvcc), Some(Timestamp::MAX));
     }
 
     #[test]
