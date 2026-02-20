@@ -890,6 +890,18 @@ fn row_matches_filter(filter: Option<&Expr>, row: &Row) -> Result<bool> {
     value_to_bool(&result)
 }
 
+async fn lock_key_if_explicit<T: TxnService>(
+    txn_service: &T,
+    ctx: &mut TxnCtx,
+    table_id: TableId,
+    key: Key,
+) -> Result<()> {
+    if ctx.is_explicit() {
+        txn_service.lock_key(ctx, table_id, key).await?;
+    }
+    Ok(())
+}
+
 async fn collect_scan_rows<T: TxnService>(
     txn_service: &T,
     ctx: &TxnCtx,
@@ -1613,7 +1625,10 @@ impl SimpleExecutor {
                                     txn_service.delete(ctx, table_id, key.to_vec()).await?;
                                     count += 1;
                                 } else {
-                                    txn_service.lock_key(ctx, table_id, key.to_vec()).await?;
+                                    // In implicit autocommit this is a no-op; keep the helper
+                                    // for defensive consistency with explicit paths.
+                                    lock_key_if_explicit(txn_service, ctx, table_id, key.to_vec())
+                                        .await?;
                                 }
                                 iter.advance().await?;
                             }
@@ -1747,9 +1762,15 @@ impl SimpleExecutor {
                                     let row_unchanged = new_key == old_key
                                         && row.values() == original_values.as_slice();
                                     if row_unchanged {
-                                        txn_service
-                                            .lock_key(ctx, table_id, old_key.clone())
-                                            .await?;
+                                        // In implicit autocommit this is a no-op; keep the helper
+                                        // for defensive consistency with explicit paths.
+                                        lock_key_if_explicit(
+                                            txn_service,
+                                            ctx,
+                                            table_id,
+                                            old_key.clone(),
+                                        )
+                                        .await?;
                                     } else {
                                         if pk_assigned
                                             && !pk_indices.is_empty()
@@ -1862,9 +1883,15 @@ impl SimpleExecutor {
                                     }
                                     count += 1;
                                 } else {
-                                    txn_service
-                                        .lock_key(ctx, table_id, key_ref.to_vec())
-                                        .await?;
+                                    // In implicit autocommit this is a no-op; keep the helper
+                                    // for defensive consistency with explicit paths.
+                                    lock_key_if_explicit(
+                                        txn_service,
+                                        ctx,
+                                        table_id,
+                                        key_ref.to_vec(),
+                                    )
+                                    .await?;
                                 }
                                 iter.advance().await?;
                             }
@@ -1975,6 +2002,147 @@ mod tests {
             self.scan_calls.fetch_add(1, Ordering::SeqCst);
             *self.last_scan_range.lock() = Some(range);
             Ok(DummyIter)
+        }
+
+        async fn put<'a>(
+            &'a self,
+            _ctx: &'a mut TxnCtx,
+            table_id: TableId,
+            _key: Vec<u8>,
+            _value: RawValue,
+        ) -> Result<()> {
+            assert_eq!(table_id, self.table_id);
+            self.put_calls.fetch_add(1, Ordering::SeqCst);
+            Ok(())
+        }
+
+        async fn delete<'a>(
+            &'a self,
+            _ctx: &'a mut TxnCtx,
+            table_id: TableId,
+            _key: Vec<u8>,
+        ) -> Result<()> {
+            assert_eq!(table_id, self.table_id);
+            self.delete_calls.fetch_add(1, Ordering::SeqCst);
+            Ok(())
+        }
+
+        async fn lock_key<'a>(
+            &'a self,
+            _ctx: &'a mut TxnCtx,
+            table_id: TableId,
+            _key: Vec<u8>,
+        ) -> Result<()> {
+            assert_eq!(table_id, self.table_id);
+            self.lock_calls.fetch_add(1, Ordering::SeqCst);
+            Ok(())
+        }
+
+        async fn commit(&self, _ctx: TxnCtx) -> Result<CommitInfo> {
+            Ok(CommitInfo {
+                txn_id: 1 as TxnId,
+                commit_ts: 2,
+                lsn: 3 as Lsn,
+            })
+        }
+
+        fn rollback(&self, _ctx: TxnCtx) -> Result<()> {
+            Ok(())
+        }
+    }
+
+    struct MockRowsIter {
+        rows: Vec<(Key, RawValue)>,
+        index: usize,
+        started: bool,
+    }
+
+    impl MockRowsIter {
+        fn new(rows: Vec<(Key, RawValue)>) -> Self {
+            Self {
+                rows,
+                index: 0,
+                started: false,
+            }
+        }
+    }
+
+    impl MvccIterator for MockRowsIter {
+        async fn seek(&mut self, _target: &MvccKey) -> Result<()> {
+            self.started = true;
+            self.index = 0;
+            Ok(())
+        }
+
+        async fn advance(&mut self) -> Result<()> {
+            if !self.started {
+                self.started = true;
+            } else {
+                self.index += 1;
+            }
+            Ok(())
+        }
+
+        fn valid(&self) -> bool {
+            self.started && self.index < self.rows.len()
+        }
+
+        fn user_key(&self) -> &[u8] {
+            &self.rows[self.index].0
+        }
+
+        fn timestamp(&self) -> Timestamp {
+            0
+        }
+
+        fn value(&self) -> &[u8] {
+            &self.rows[self.index].1
+        }
+    }
+
+    struct MockScanRowsTxnService {
+        table_id: TableId,
+        rows: Vec<(Key, RawValue)>,
+        scan_calls: AtomicUsize,
+        put_calls: AtomicUsize,
+        delete_calls: AtomicUsize,
+        lock_calls: AtomicUsize,
+    }
+
+    impl TxnService for MockScanRowsTxnService {
+        type ScanIter = MockRowsIter;
+
+        fn begin(&self, read_only: bool) -> Result<TxnCtx> {
+            Ok(TxnCtx::new(1, 1, read_only))
+        }
+
+        fn begin_explicit(&self, read_only: bool) -> Result<TxnCtx> {
+            Ok(TxnCtx::new_explicit(1, 1, read_only))
+        }
+
+        fn get_txn_state(&self, _start_ts: Timestamp) -> Option<TxnState> {
+            Some(TxnState::Running)
+        }
+
+        async fn get<'a>(
+            &'a self,
+            _ctx: &'a TxnCtx,
+            table_id: TableId,
+            _key: &'a [u8],
+        ) -> Result<Option<RawValue>> {
+            assert_eq!(table_id, self.table_id);
+            Ok(None)
+        }
+
+        fn scan_iter(
+            &self,
+            _ctx: &TxnCtx,
+            table_id: TableId,
+            _range: Range<Vec<u8>>,
+        ) -> Result<Self::ScanIter> {
+            assert_eq!(table_id, self.table_id);
+            self.scan_calls.fetch_add(1, Ordering::SeqCst);
+            Ok(MockRowsIter::new(self.rows.clone()))
         }
 
         async fn put<'a>(
@@ -2330,6 +2498,114 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn test_delete_scan_non_matching_filter_skips_lock_for_implicit_ctx() {
+        let table = TableDef::new(
+            221,
+            "t".to_string(),
+            "default".to_string(),
+            vec![
+                ColumnDef::new(1, "id".into(), DataType::BigInt, false, None, false),
+                ColumnDef::new(2, "name".into(), DataType::Varchar(32), true, None, false),
+            ],
+            vec![1],
+        );
+        let key = encode_key(table.id(), &encode_pk(&[Value::BigInt(7)]));
+        let row = encode_row(&[1, 2], &[Value::BigInt(7), Value::String("alice".into())]);
+
+        let service = MockScanRowsTxnService {
+            table_id: table.id(),
+            rows: vec![(key, row)],
+            scan_calls: AtomicUsize::new(0),
+            put_calls: AtomicUsize::new(0),
+            delete_calls: AtomicUsize::new(0),
+            lock_calls: AtomicUsize::new(0),
+        };
+
+        let mut ctx = TxnCtx::new(17, 161, false);
+        let plan = LogicalPlan::Delete {
+            table: table.clone(),
+            input: Box::new(LogicalPlan::Scan {
+                table,
+                projection: None,
+                filter: Some(Expr::BinaryOp {
+                    left: Box::new(Expr::Column {
+                        table_idx: None,
+                        column_idx: 1,
+                        name: "name".into(),
+                        data_type: DataType::Varchar(32),
+                    }),
+                    op: BinaryOp::Eq,
+                    right: Box::new(Expr::Literal(Value::String("bob".into()))),
+                }),
+            }),
+        };
+
+        let output = SimpleExecutor::new()
+            .execute_write_with_ctx(plan, &mut ctx, &service, &MemoryCatalog::new())
+            .await
+            .unwrap();
+
+        assert!(matches!(output, ExecutionOutput::Affected { count } if count == 0));
+        assert_eq!(service.scan_calls.load(Ordering::SeqCst), 1);
+        assert_eq!(service.delete_calls.load(Ordering::SeqCst), 0);
+        assert_eq!(service.lock_calls.load(Ordering::SeqCst), 0);
+    }
+
+    #[tokio::test]
+    async fn test_delete_scan_non_matching_filter_locks_for_explicit_ctx() {
+        let table = TableDef::new(
+            222,
+            "t".to_string(),
+            "default".to_string(),
+            vec![
+                ColumnDef::new(1, "id".into(), DataType::BigInt, false, None, false),
+                ColumnDef::new(2, "name".into(), DataType::Varchar(32), true, None, false),
+            ],
+            vec![1],
+        );
+        let key = encode_key(table.id(), &encode_pk(&[Value::BigInt(8)]));
+        let row = encode_row(&[1, 2], &[Value::BigInt(8), Value::String("alice".into())]);
+
+        let service = MockScanRowsTxnService {
+            table_id: table.id(),
+            rows: vec![(key, row)],
+            scan_calls: AtomicUsize::new(0),
+            put_calls: AtomicUsize::new(0),
+            delete_calls: AtomicUsize::new(0),
+            lock_calls: AtomicUsize::new(0),
+        };
+
+        let mut ctx = TxnCtx::new_explicit(18, 162, false);
+        let plan = LogicalPlan::Delete {
+            table: table.clone(),
+            input: Box::new(LogicalPlan::Scan {
+                table,
+                projection: None,
+                filter: Some(Expr::BinaryOp {
+                    left: Box::new(Expr::Column {
+                        table_idx: None,
+                        column_idx: 1,
+                        name: "name".into(),
+                        data_type: DataType::Varchar(32),
+                    }),
+                    op: BinaryOp::Eq,
+                    right: Box::new(Expr::Literal(Value::String("bob".into()))),
+                }),
+            }),
+        };
+
+        let output = SimpleExecutor::new()
+            .execute_write_with_ctx(plan, &mut ctx, &service, &MemoryCatalog::new())
+            .await
+            .unwrap();
+
+        assert!(matches!(output, ExecutionOutput::Affected { count } if count == 0));
+        assert_eq!(service.scan_calls.load(Ordering::SeqCst), 1);
+        assert_eq!(service.delete_calls.load(Ordering::SeqCst), 0);
+        assert_eq!(service.lock_calls.load(Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test]
     async fn test_update_noop_uses_lock_key_with_point_get_input() {
         let table = TableDef::new(
             303,
@@ -2645,5 +2921,49 @@ mod tests {
         assert_eq!(service.lock_calls.load(Ordering::SeqCst), 1);
         assert_eq!(service.put_calls.load(Ordering::SeqCst), 0);
         assert_eq!(service.scan_calls.load(Ordering::SeqCst), 0);
+    }
+
+    #[tokio::test]
+    async fn test_lock_key_if_explicit_skips_implicit_ctx() {
+        let service = MockPointGetTxnService {
+            table_id: 606,
+            expected_key: None,
+            row_value: None,
+            get_calls: AtomicUsize::new(0),
+            scan_calls: AtomicUsize::new(0),
+            put_calls: AtomicUsize::new(0),
+            delete_calls: AtomicUsize::new(0),
+            lock_calls: AtomicUsize::new(0),
+            last_scan_range: Mutex::new(None),
+        };
+
+        let mut ctx = TxnCtx::new(61, 600, false);
+        lock_key_if_explicit(&service, &mut ctx, 606, b"k".to_vec())
+            .await
+            .unwrap();
+
+        assert_eq!(service.lock_calls.load(Ordering::SeqCst), 0);
+    }
+
+    #[tokio::test]
+    async fn test_lock_key_if_explicit_locks_explicit_ctx() {
+        let service = MockPointGetTxnService {
+            table_id: 607,
+            expected_key: None,
+            row_value: None,
+            get_calls: AtomicUsize::new(0),
+            scan_calls: AtomicUsize::new(0),
+            put_calls: AtomicUsize::new(0),
+            delete_calls: AtomicUsize::new(0),
+            lock_calls: AtomicUsize::new(0),
+            last_scan_range: Mutex::new(None),
+        };
+
+        let mut ctx = TxnCtx::new_explicit(62, 601, false);
+        lock_key_if_explicit(&service, &mut ctx, 607, b"k".to_vec())
+            .await
+            .unwrap();
+
+        assert_eq!(service.lock_calls.load(Ordering::SeqCst), 1);
     }
 }

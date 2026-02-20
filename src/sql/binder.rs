@@ -1047,10 +1047,10 @@ impl<'a, C: Catalog> Binder<'a, C> {
         match (pk_type, literal) {
             (_, Value::Null) => false,
             (DataType::Boolean, Value::Boolean(_)) => true,
-            (DataType::TinyInt, Value::TinyInt(_)) => true,
-            (DataType::SmallInt, Value::SmallInt(_)) => true,
-            (DataType::Int, Value::Int(_)) => true,
-            (DataType::BigInt, Value::BigInt(_)) => true,
+            (
+                DataType::TinyInt | DataType::SmallInt | DataType::Int | DataType::BigInt,
+                Value::TinyInt(_) | Value::SmallInt(_) | Value::Int(_) | Value::BigInt(_),
+            ) => true,
             (DataType::Float, Value::Float(_)) => true,
             (DataType::Double, Value::Double(_)) => true,
             (DataType::Decimal { .. }, Value::Decimal(_)) => true,
@@ -1275,16 +1275,13 @@ mod tests {
     }
 
     #[test]
-    fn test_bind_select_int_pk_literal_keeps_scan() {
+    fn test_bind_select_int_pk_literal_uses_point_get() {
         let catalog = setup_table_with_int_pk();
         let plan = bind_sql(&catalog, "SELECT * FROM t_int WHERE id = 1");
         match plan {
-            LogicalPlan::Project { input, .. } => match *input {
-                LogicalPlan::Filter { input, .. } => {
-                    assert!(matches!(*input, LogicalPlan::Scan { .. }));
-                }
-                _ => panic!("expected Filter over Scan"),
-            },
+            LogicalPlan::Project { input, .. } => {
+                assert!(matches!(*input, LogicalPlan::PointGet { .. }));
+            }
             _ => panic!("expected Project plan root"),
         }
     }

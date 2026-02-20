@@ -32,7 +32,7 @@ use super::api::{CommitInfo, MutationType, TxnCtx, TxnService, TxnState};
 use super::concurrency::ConcurrencyManager;
 use crate::catalog::types::{Key, RawValue, TableId, Timestamp, TxnId};
 use crate::inner_table::core_tables::USER_TABLE_ID_START;
-use crate::tablet::mvcc::{is_tombstone, MvccIterator, MvccKey, LOCK, TOMBSTONE};
+use crate::tablet::mvcc::{is_lock, is_tombstone, MvccIterator, MvccKey, LOCK, TOMBSTONE};
 use crate::tablet::{
     route_table_to_tablet, PessimisticStorage, PessimisticWriteError, StorageEngine, TabletId,
     WriteBatch,
@@ -59,6 +59,8 @@ pub struct TransactionService<S: StorageEngine, L: ClogService, T: TsoService> {
     /// ConcurrencyManager for lock table and max_ts tracking
     concurrency_manager: Arc<ConcurrencyManager>,
 }
+
+type GroupedTabletKeys = Vec<(TabletId, Vec<Key>)>;
 
 /// Ensures commit reservations are released on every exit path.
 struct CommitReservationReleaseGuard<'a, S: PessimisticStorage + ?Sized> {
@@ -297,7 +299,7 @@ impl<S: StorageEngine, L: ClogService, T: TsoService> TransactionService<S, L, T
     fn group_mutation_keys_by_tablet(
         mutations: &BTreeMap<Key, MutationType>,
         mutation_tablets: &BTreeMap<Key, TabletId>,
-    ) -> Result<Vec<(TabletId, Vec<Key>)>> {
+    ) -> Result<GroupedTabletKeys> {
         let mut grouped: BTreeMap<TabletId, Vec<Key>> = BTreeMap::new();
         for key in mutations.keys() {
             let tablet_id = mutation_tablets.get(key).copied().ok_or_else(|| {
@@ -309,6 +311,33 @@ impl<S: StorageEngine, L: ClogService, T: TsoService> TransactionService<S, L, T
             grouped.entry(tablet_id).or_default().push(key.clone());
         }
         Ok(grouped.into_iter().collect())
+    }
+
+    fn group_mutation_keys_by_tablet_and_type(
+        mutations: &BTreeMap<Key, MutationType>,
+        mutation_tablets: &BTreeMap<Key, TabletId>,
+    ) -> Result<(GroupedTabletKeys, GroupedTabletKeys)> {
+        let mut write_grouped: BTreeMap<TabletId, Vec<Key>> = BTreeMap::new();
+        let mut lock_grouped: BTreeMap<TabletId, Vec<Key>> = BTreeMap::new();
+        for (key, mutation_type) in mutations {
+            let tablet_id = mutation_tablets.get(key).copied().ok_or_else(|| {
+                TiSqlError::Internal(format!(
+                    "Missing tablet routing metadata for mutation key (len={}): use metadata-first write APIs",
+                    key.len()
+                ))
+            })?;
+            match mutation_type {
+                MutationType::Write => write_grouped
+                    .entry(tablet_id)
+                    .or_default()
+                    .push(key.clone()),
+                MutationType::Lock => lock_grouped.entry(tablet_id).or_default().push(key.clone()),
+            }
+        }
+        Ok((
+            write_grouped.into_iter().collect(),
+            lock_grouped.into_iter().collect(),
+        ))
     }
 }
 
@@ -349,7 +378,7 @@ impl<S: PessimisticStorage + 'static, L: ClogService + 'static, T: TsoService> T
             .storage
             .get_with_owner_on_tablet(tablet_id, key, ctx.start_ts, ctx.start_ts)
             .await;
-        Ok(value.filter(|v| !is_tombstone(v)))
+        Ok(value.filter(|v| !is_tombstone(v) && !is_lock(v)))
     }
 
     fn scan_iter(
@@ -609,7 +638,7 @@ impl<S: PessimisticStorage + 'static, L: ClogService + 'static, T: TsoService> T
                 .get_with_owner_on_tablet(tablet_id, key, start_ts, start_ts)
                 .await
             {
-                Some(value) if !is_tombstone(&value) => {
+                Some(value) if !is_tombstone(&value) && !is_lock(&value) => {
                     read_values.push((key.as_slice(), Some(value)));
                 }
                 _ => {
@@ -689,18 +718,24 @@ impl<S: PessimisticStorage + 'static, L: ClogService + 'static, T: TsoService> T
                         );
                     }
                     let commit_lsn = txn_lsn;
-                    let grouped_keys =
-                        Self::group_mutation_keys_by_tablet(&mutations, &mutation_tablets)
+                    let (write_grouped_keys, lock_grouped_keys) =
+                        Self::group_mutation_keys_by_tablet_and_type(&mutations, &mutation_tablets)
                             .expect("mutation tablet routing must be recorded before commit");
 
-                    // Step 6: Finalize all pending nodes by setting commit_ts and
-                    // tracking the clog LSN on touched memtables.
-                    self.storage.finalize_pending_grouped_with_lsn(
-                        &grouped_keys,
-                        start_ts,
-                        commit_ts,
-                        commit_lsn,
-                    );
+                    // Step 6: Finalize write keys and abort lock-only keys so LOCK
+                    // sentinels never become committed user-visible versions.
+                    if !write_grouped_keys.is_empty() {
+                        self.storage.finalize_pending_grouped_with_lsn(
+                            &write_grouped_keys,
+                            start_ts,
+                            commit_ts,
+                            commit_lsn,
+                        );
+                    }
+                    if !lock_grouped_keys.is_empty() {
+                        self.storage
+                            .abort_pending_grouped(&lock_grouped_keys, start_ts);
+                    }
 
                     #[cfg(feature = "failpoints")]
                     fail_point!("txn_after_finalize_before_reservation_release_v26");
@@ -790,7 +825,7 @@ impl<S: PessimisticStorage + 'static, L: ClogService + 'static, T: TsoService> T
 ///
 /// This is a thin wrapper that provides MVCC visibility filtering:
 /// - Filters entries by `read_ts` (only entries with `ts <= read_ts` are visible)
-/// - Filters out tombstones (deleted keys)
+/// - Filters out tombstone/lock sentinels
 /// - Skips older versions of the same key (returns only latest visible version)
 ///
 /// ## Iterator Pattern
@@ -985,8 +1020,10 @@ impl<I: MvccIterator> MvccScanIterator<I> {
                     }
                     PendingResolution::Visible => {
                         // Committed with commit_ts <= read_ts.
-                        // Check tombstone before returning.
-                        if is_tombstone(self.storage_iter.value()) {
+                        // Skip tombstone/lock sentinels and all older versions.
+                        if is_tombstone(self.storage_iter.value())
+                            || is_lock(self.storage_iter.value())
+                        {
                             let skip_key = user_key.to_vec();
                             self.storage_iter.advance().await?;
                             while self.storage_iter.valid()
@@ -1009,10 +1046,10 @@ impl<I: MvccIterator> MvccScanIterator<I> {
                 continue;
             }
 
-            // Found a visible entry - check if tombstone
-            if is_tombstone(self.storage_iter.value()) {
-                // Tombstone: skip this key and all older versions immediately
-                // (we don't return tombstones, so no lazy skip needed)
+            // Found a visible entry - skip tombstone/lock sentinels.
+            if is_tombstone(self.storage_iter.value()) || is_lock(self.storage_iter.value()) {
+                // Sentinel: skip this key and all older versions immediately
+                // (we don't return sentinels, so no lazy skip needed).
                 let skip_key = user_key.to_vec();
                 self.storage_iter.advance().await?;
                 while self.storage_iter.valid()
@@ -1151,7 +1188,7 @@ mod tests {
             let entry_ts = iter.timestamp();
             let value = iter.value();
             if decoded_key == key && entry_ts <= ts {
-                if is_tombstone(value) {
+                if is_tombstone(value) || is_lock(value) {
                     return None;
                 }
                 return Some(value.to_vec());
@@ -1163,6 +1200,29 @@ mod tests {
 
     async fn get_for_test<S: StorageEngine>(storage: &S, key: &[u8]) -> Option<RawValue> {
         get_at_for_test(storage, key, Timestamp::MAX).await
+    }
+
+    async fn raw_versions_for_test<S: StorageEngine>(
+        storage: &S,
+        key: &[u8],
+    ) -> Vec<(Timestamp, RawValue)> {
+        let seek_key = MvccKey::encode(key, Timestamp::MAX);
+        let end_key = MvccKey::encode(key, 0)
+            .next_key()
+            .unwrap_or_else(MvccKey::unbounded);
+        let range = seek_key..end_key;
+
+        let mut iter = storage.scan_iter(range, 0).unwrap();
+        iter.advance().await.unwrap();
+        let mut versions = Vec::new();
+        while iter.valid() {
+            if iter.user_key() != key {
+                break;
+            }
+            versions.push((iter.timestamp(), iter.value().to_vec()));
+            iter.advance().await.unwrap();
+        }
+        versions
     }
 
     // Import test extension trait for autocommit helpers
@@ -3068,6 +3128,97 @@ mod tests {
             "LOCK-only delete should produce no data entries, got {} entries",
             data.len()
         );
+    }
+
+    #[tokio::test]
+    async fn test_commit_mixed_write_and_lock_aborts_lock_node() {
+        let (storage, txn_service, _dir) = create_test_service();
+
+        txn_service
+            .autocommit_put(b"locked_key", b"base")
+            .await
+            .unwrap();
+
+        let mut ctx = txn_service.begin_explicit(false).unwrap();
+        txn_service
+            .put(
+                &mut ctx,
+                ALL_META_TABLE_ID,
+                b"write_key".to_vec(),
+                b"write_value".to_vec(),
+            )
+            .await
+            .unwrap();
+        txn_service
+            .lock_key(&mut ctx, ALL_META_TABLE_ID, b"locked_key".to_vec())
+            .await
+            .unwrap();
+        let info = txn_service.commit(ctx).await.unwrap();
+
+        let locked_versions = raw_versions_for_test(&*storage, b"locked_key").await;
+        assert_eq!(
+            locked_versions.len(),
+            1,
+            "lock key should keep only base committed version after commit"
+        );
+        assert_eq!(locked_versions[0].1, b"base".to_vec());
+        assert!(
+            locked_versions[0].0 < info.commit_ts,
+            "base version should remain older than mixed txn commit_ts"
+        );
+
+        let write_versions = raw_versions_for_test(&*storage, b"write_key").await;
+        assert_eq!(write_versions.len(), 1);
+        assert_eq!(write_versions[0].0, info.commit_ts);
+        assert_eq!(write_versions[0].1, b"write_value".to_vec());
+    }
+
+    #[tokio::test]
+    async fn test_get_filters_committed_lock_sentinel() {
+        let (storage, txn_service, _dir) = create_test_service();
+
+        let mut batch = WriteBatch::new();
+        batch.put(b"key1".to_vec(), LOCK.to_vec());
+        batch.set_commit_ts(100);
+        storage.write_batch(batch).unwrap();
+
+        let reader = txn_service.begin(true).unwrap();
+        let value = txn_service
+            .get(&reader, ALL_META_TABLE_ID, b"key1")
+            .await
+            .unwrap();
+        assert!(value.is_none(), "LOCK sentinel must be hidden from get()");
+    }
+
+    #[tokio::test]
+    async fn test_scan_iter_filters_committed_lock_sentinel() {
+        let (storage, txn_service, _dir) = create_test_service();
+
+        let mut lock_batch = WriteBatch::new();
+        lock_batch.put(b"key1".to_vec(), LOCK.to_vec());
+        lock_batch.set_commit_ts(1);
+        storage.write_batch(lock_batch).unwrap();
+
+        let mut value_batch = WriteBatch::new();
+        value_batch.put(b"key2".to_vec(), b"v2".to_vec());
+        value_batch.set_commit_ts(2);
+        storage.write_batch(value_batch).unwrap();
+
+        let reader = txn_service.begin(true).unwrap();
+        let mut iter = txn_service
+            .scan_iter(
+                &reader,
+                ALL_META_TABLE_ID,
+                b"key1".to_vec()..b"key3".to_vec(),
+            )
+            .unwrap();
+        iter.advance().await.unwrap();
+
+        assert!(iter.valid(), "scan should still return non-lock rows");
+        assert_eq!(iter.user_key(), b"key2");
+        assert_eq!(iter.value(), b"v2");
+        iter.advance().await.unwrap();
+        assert!(!iter.valid());
     }
 
     #[tokio::test]
