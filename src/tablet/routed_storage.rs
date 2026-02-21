@@ -38,9 +38,9 @@ use super::{
 /// Storage facade that routes all operations through `TabletManager`.
 ///
 /// Preferred routing is metadata-first (`*_on_tablet` trait methods).
-/// Key-only trait methods still exist for legacy/internal callers and use
-/// conservative key decoding fallback. If a logical tablet is not mounted yet,
-/// operations are routed to `TabletId::System`.
+/// Internal key-decoding helpers are retained for batch splitting and tests.
+/// If a logical tablet is not mounted yet, operations are routed to
+/// `TabletId::System`.
 #[derive(Clone)]
 pub struct RoutedTabletStorage {
     manager: Arc<TabletManager>,
