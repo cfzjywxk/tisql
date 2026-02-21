@@ -340,30 +340,6 @@ impl MemTable {
     pub fn put_pending(
         &self,
         key: &[u8],
-        value: Vec<u8>,
-        owner_start_ts: crate::catalog::types::Timestamp,
-    ) -> std::result::Result<(), PessimisticWriteError> {
-        if self.is_frozen() {
-            // Frozen memtables cannot accept new writes
-            return Err(PessimisticWriteError::WriteStall { delay: None });
-        }
-        let value_len = value.len();
-        let created = self
-            .inner
-            .put_pending_counted(key, value, owner_start_ts)
-            .map_err(PessimisticWriteError::LockConflict)?;
-        if created {
-            self.pending_count.fetch_add(1, Ordering::AcqRel);
-            self.approximate_size
-                .fetch_add(estimate_entry_size(key.len(), value_len), Ordering::Relaxed);
-        }
-        Ok(())
-    }
-
-    /// Borrowed-value variant of `put_pending`.
-    pub fn put_pending_ref(
-        &self,
-        key: &[u8],
         value: &[u8],
         owner_start_ts: crate::catalog::types::Timestamp,
     ) -> std::result::Result<(), PessimisticWriteError> {
@@ -374,7 +350,7 @@ impl MemTable {
         let value_len = value.len();
         let created = self
             .inner
-            .put_pending_counted_ref(key, value, owner_start_ts)
+            .put_pending_counted(key, value, owner_start_ts)
             .map_err(PessimisticWriteError::LockConflict)?;
         if created {
             self.pending_count.fetch_add(1, Ordering::AcqRel);
@@ -913,7 +889,7 @@ mod tests {
         assert!(mt.get_lock_owner(b"key").is_none());
 
         // Add pending write
-        mt.put_pending(b"key", b"value".to_vec(), 100).unwrap();
+        mt.put_pending(b"key", b"value", 100).unwrap();
 
         // Now has lock owner
         assert_eq!(mt.get_lock_owner(b"key"), Some(100));
@@ -928,7 +904,7 @@ mod tests {
         let mt = MemTable::new(1);
 
         // Add pending write
-        mt.put_pending(b"key", b"value".to_vec(), 100).unwrap();
+        mt.put_pending(b"key", b"value", 100).unwrap();
 
         // Finalize it
         mt.finalize_pending(&[b"key".to_vec()], 100, 200);
@@ -946,7 +922,7 @@ mod tests {
         let mt = MemTable::new(1);
 
         // Add pending write
-        mt.put_pending(b"key", b"value".to_vec(), 100).unwrap();
+        mt.put_pending(b"key", b"value", 100).unwrap();
 
         // Abort it
         mt.abort_pending(&[b"key".to_vec()], 100);
@@ -991,7 +967,7 @@ mod tests {
         let mt = MemTable::new(1);
 
         // Add pending write
-        mt.put_pending(b"key", b"value".to_vec(), 100).unwrap();
+        mt.put_pending(b"key", b"value", 100).unwrap();
 
         // get_with_owner should see pending value for owner
         let result = mt.get_with_owner(b"key", Timestamp::MAX, 100);
@@ -1009,7 +985,7 @@ mod tests {
         mt.freeze();
 
         // Should return hard stall for frozen memtable
-        let result = mt.put_pending(b"key", b"value".to_vec(), 100);
+        let result = mt.put_pending(b"key", b"value", 100);
         assert_eq!(
             result,
             Err(PessimisticWriteError::WriteStall { delay: None })

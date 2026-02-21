@@ -61,7 +61,9 @@ use crate::lsn::SharedLsnProvider;
 use crate::tablet::mvcc::{
     extract_key, extract_timestamp, is_tombstone, MvccIterator, MvccKey, SharedMvccRange,
 };
-use crate::tablet::{PessimisticStorage, PessimisticWriteError, StorageEngine, WriteBatch};
+use crate::tablet::{
+    PessimisticStorage, PessimisticWriteError, StorageEngine, TabletId, WriteBatch,
+};
 use crate::util::error::{Result, TiSqlError};
 use crate::{log_error, log_info, log_warn};
 
@@ -4253,31 +4255,9 @@ impl StorageEngine for LsmEngine {
 }
 
 impl PessimisticStorage for LsmEngine {
-    fn put_pending(
+    fn put_pending_on_tablet(
         &self,
-        key: &[u8],
-        value: RawValue,
-        owner_start_ts: Timestamp,
-    ) -> std::result::Result<(), PessimisticWriteError> {
-        self.pending_write_pressure_status()?;
-
-        // Keep the read lock scope minimal and drop it before maybe_rotate().
-        let write_result = {
-            let state = self.state.read();
-            state.active.put_pending(key, value, owner_start_ts)
-        };
-
-        match write_result {
-            Ok(()) => {
-                let _ = self.maybe_rotate();
-                Ok(())
-            }
-            Err(err) => Err(err),
-        }
-    }
-
-    fn put_pending_ref(
-        &self,
+        _tablet_id: TabletId,
         key: &[u8],
         value: &[u8],
         owner_start_ts: Timestamp,
@@ -4287,7 +4267,7 @@ impl PessimisticStorage for LsmEngine {
         // Keep the read lock scope minimal and drop it before maybe_rotate().
         let write_result = {
             let state = self.state.read();
-            state.active.put_pending_ref(key, value, owner_start_ts)
+            state.active.put_pending(key, value, owner_start_ts)
         };
 
         match write_result {
@@ -4397,7 +4377,7 @@ impl PessimisticStorage for LsmEngine {
         key: &[u8],
         owner_start_ts: Timestamp,
     ) -> std::result::Result<bool, PessimisticWriteError> {
-        // TransactionService currently uses explicit put_pending(LOCK/TOMBSTONE)
+        // TransactionService currently uses explicit put_pending_on_tablet(LOCK/TOMBSTONE)
         // for delete semantics; keep this method as trait completeness and tests.
         self.pending_write_pressure_status()?;
 
@@ -4712,6 +4692,22 @@ mod tests {
                 manifest_writer_running: Arc::new(AtomicBool::new(false)),
                 manifest_error: Arc::new(AtomicBool::new(false)),
             })
+        }
+
+        /// Test-only helper that preserves key-routed call sites in legacy tests.
+        fn put_pending(
+            &self,
+            key: &[u8],
+            value: &[u8],
+            owner_start_ts: Timestamp,
+        ) -> std::result::Result<(), PessimisticWriteError> {
+            crate::tablet::PessimisticStorage::put_pending_on_tablet(
+                self,
+                TabletId::System,
+                key,
+                value,
+                owner_start_ts,
+            )
         }
     }
 
@@ -5440,7 +5436,7 @@ mod tests {
         );
 
         // PessimisticStorage::put_pending
-        let result = engine.put_pending(b"lock_key", b"pending_val".to_vec(), 100);
+        let result = engine.put_pending(b"lock_key", b"pending_val", 100);
         assert!(
             result.is_ok(),
             "put_pending should succeed via TabletEngine"
@@ -9492,9 +9488,7 @@ mod tests {
         let engine = LsmEngine::open(config).unwrap();
 
         let owner_ts: Timestamp = 100;
-        engine
-            .put_pending(b"key1", LOCK.to_vec(), owner_ts)
-            .unwrap();
+        engine.put_pending(b"key1", LOCK, owner_ts).unwrap();
 
         // Owner should see nothing useful (LOCK is skipped by iterator)
         let entries = scan_raw_for_key(&engine, b"key1", owner_ts).await;
@@ -9534,18 +9528,14 @@ mod tests {
         let owner_ts: Timestamp = 100;
 
         // PUT a value
-        engine
-            .put_pending(b"key1", b"value1".to_vec(), owner_ts)
-            .unwrap();
+        engine.put_pending(b"key1", b"value1", owner_ts).unwrap();
 
         // Owner should see the value
         let val = engine.get_with_owner(b"key1", owner_ts, owner_ts).await;
         assert_eq!(val, Some(b"value1".to_vec()));
 
         // DELETE (replaces value with LOCK since no committed base)
-        engine
-            .put_pending(b"key1", LOCK.to_vec(), owner_ts)
-            .unwrap();
+        engine.put_pending(b"key1", LOCK, owner_ts).unwrap();
 
         // Owner should now see nothing (LOCK = "undo our write")
         let val = engine.get_with_owner(b"key1", owner_ts, owner_ts).await;
@@ -9575,9 +9565,7 @@ mod tests {
 
         // Delete via pending TOMBSTONE (explicit txn pattern)
         let owner_ts: Timestamp = 100;
-        engine
-            .put_pending(b"key1", TOMBSTONE.to_vec(), owner_ts)
-            .unwrap();
+        engine.put_pending(b"key1", TOMBSTONE, owner_ts).unwrap();
 
         // Owner should see None (tombstone)
         let val = engine.get_with_owner(b"key1", owner_ts, owner_ts).await;
@@ -9611,9 +9599,7 @@ mod tests {
         let owner_ts: Timestamp = 100;
 
         // DELETE → TOMBSTONE (committed value exists)
-        engine
-            .put_pending(b"key1", TOMBSTONE.to_vec(), owner_ts)
-            .unwrap();
+        engine.put_pending(b"key1", TOMBSTONE, owner_ts).unwrap();
 
         // Owner sees None
         let val = engine.get_with_owner(b"key1", owner_ts, owner_ts).await;
@@ -9621,7 +9607,7 @@ mod tests {
 
         // PUT new value → replaces TOMBSTONE with real value
         engine
-            .put_pending(b"key1", b"reinserted".to_vec(), owner_ts)
+            .put_pending(b"key1", b"reinserted", owner_ts)
             .unwrap();
 
         // Owner sees the new value
@@ -9644,27 +9630,21 @@ mod tests {
         let owner_ts: Timestamp = 100;
 
         // INSERT
-        engine
-            .put_pending(b"key1", b"v1".to_vec(), owner_ts)
-            .unwrap();
+        engine.put_pending(b"key1", b"v1", owner_ts).unwrap();
         assert_eq!(
             engine.get_with_owner(b"key1", owner_ts, owner_ts).await,
             Some(b"v1".to_vec())
         );
 
         // UPDATE
-        engine
-            .put_pending(b"key1", b"v2".to_vec(), owner_ts)
-            .unwrap();
+        engine.put_pending(b"key1", b"v2", owner_ts).unwrap();
         assert_eq!(
             engine.get_with_owner(b"key1", owner_ts, owner_ts).await,
             Some(b"v2".to_vec())
         );
 
         // DELETE (no committed base → LOCK)
-        engine
-            .put_pending(b"key1", LOCK.to_vec(), owner_ts)
-            .unwrap();
+        engine.put_pending(b"key1", LOCK, owner_ts).unwrap();
         assert!(engine
             .get_with_owner(b"key1", owner_ts, owner_ts)
             .await
@@ -9853,9 +9833,7 @@ mod tests {
 
         // Write a LOCK node as pending (simulates explicit txn delete-nonexistent)
         let owner_ts: Timestamp = 100;
-        engine
-            .put_pending(b"key2", LOCK.to_vec(), owner_ts)
-            .unwrap();
+        engine.put_pending(b"key2", LOCK, owner_ts).unwrap();
 
         // Finalize: LOCK nodes are marked aborted (not committed)
         engine.finalize_pending(&[b"key2".to_vec()], owner_ts, 200);
@@ -9899,9 +9877,7 @@ mod tests {
         let owner_ts: Timestamp = 100;
 
         // Write a LOCK node
-        engine
-            .put_pending(b"key1", LOCK.to_vec(), owner_ts)
-            .unwrap();
+        engine.put_pending(b"key1", LOCK, owner_ts).unwrap();
 
         // Owner should NOT see the LOCK (it's invisible)
         let val = engine.get_with_owner(b"key1", owner_ts, owner_ts).await;
@@ -9945,14 +9921,10 @@ mod tests {
         let owner_ts: Timestamp = 100;
 
         // First write a pending PUT
-        engine
-            .put_pending(b"key1", b"v2".to_vec(), owner_ts)
-            .unwrap();
+        engine.put_pending(b"key1", b"v2", owner_ts).unwrap();
 
         // Then replace with LOCK (undo the PUT)
-        engine
-            .put_pending(b"key1", LOCK.to_vec(), owner_ts)
-            .unwrap();
+        engine.put_pending(b"key1", LOCK, owner_ts).unwrap();
 
         // Owner should see the committed value (LOCK skips, falls through to committed)
         let val = engine.get_with_owner(b"key1", owner_ts, owner_ts).await;
@@ -9982,11 +9954,9 @@ mod tests {
         let owner_ts: Timestamp = 100;
 
         // Write LOCK + a real value for another key
+        engine.put_pending(b"lock_key", LOCK, owner_ts).unwrap();
         engine
-            .put_pending(b"lock_key", LOCK.to_vec(), owner_ts)
-            .unwrap();
-        engine
-            .put_pending(b"real_key", b"real_value".to_vec(), owner_ts)
+            .put_pending(b"real_key", b"real_value", owner_ts)
             .unwrap();
 
         // Finalize both: LOCK → aborted, real_key → committed at ts=200
@@ -10654,7 +10624,7 @@ mod tests {
         batch.put(b"k3".to_vec(), vec![b'x'; 60]);
         let _ = engine.write_batch(batch);
 
-        let result = engine.put_pending(b"pending_stalled", b"value".to_vec(), 100);
+        let result = engine.put_pending(b"pending_stalled", b"value", 100);
         assert_eq!(
             result,
             Err(PessimisticWriteError::WriteStall { delay: None })
@@ -10667,8 +10637,8 @@ mod tests {
         let config = test_config(tmp.path());
         let engine = LsmEngine::open(config).unwrap();
 
-        engine.put_pending(b"key", b"v1".to_vec(), 100).unwrap();
-        let result = engine.put_pending(b"key", b"v2".to_vec(), 200);
+        engine.put_pending(b"key", b"v1", 100).unwrap();
+        let result = engine.put_pending(b"key", b"v2", 200);
         assert_eq!(result, Err(PessimisticWriteError::LockConflict(100)));
     }
 
@@ -10681,10 +10651,9 @@ mod tests {
             .build()
             .unwrap();
         let engine = LsmEngine::open(config).unwrap();
+        let pending_value = vec![b'x'; 128];
 
-        engine
-            .put_pending(b"rot_key", vec![b'x'; 128], 100)
-            .unwrap();
+        engine.put_pending(b"rot_key", &pending_value, 100).unwrap();
 
         let state = engine.state.read();
         assert!(

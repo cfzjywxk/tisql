@@ -29,7 +29,7 @@
 //!
 //! ```text
 //! Pessimistic Write Flow:
-//!   1. put_pending(key, value, start_ts) -> write pending node to storage
+//!   1. put_pending_on_tablet(tablet_id, key, value, start_ts) -> write pending node
 //!   2. If locked by another txn -> return KeyIsLocked error
 //!   3. On commit: finalize_pending() sets commit_ts, makes writes visible
 //!   4. On rollback: abort_pending() marks nodes as aborted

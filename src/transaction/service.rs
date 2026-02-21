@@ -154,9 +154,9 @@ impl<S: StorageEngine, L: ClogService, T: TsoService> TransactionService<S, L, T
         const MAX_SLOWDOWN_RETRIES: usize = 32;
         let mut retries = 0;
         loop {
-            let result =
-                self.storage
-                    .put_pending_on_tablet_ref(tablet_id, key, value, owner_start_ts);
+            let result = self
+                .storage
+                .put_pending_on_tablet(tablet_id, key, value, owner_start_ts);
 
             match result {
                 Ok(()) => return Ok(()),

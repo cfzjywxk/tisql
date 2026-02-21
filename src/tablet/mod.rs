@@ -468,7 +468,7 @@ pub enum PessimisticWriteError {
 /// Pessimistic storage operations for explicit transactions.
 ///
 /// This trait extends `StorageEngine` with methods for pessimistic locking:
-/// - `put_pending()`: Write a pending value with owner_start_ts
+/// - `put_pending_on_tablet()`: Metadata-first pending write
 /// - `finalize_pending()`: Convert pending writes to committed on commit
 /// - `abort_pending()`: Mark pending writes as aborted on rollback
 /// - `get_lock_owner()`: Check if a key is locked
@@ -484,7 +484,7 @@ pub enum PessimisticWriteError {
 ///
 /// ```ignore
 /// // Explicit transaction: acquire lock on write
-/// let result = storage.put_pending(key, value, txn.start_ts);
+/// let result = storage.put_pending_on_tablet(tablet_id, key, &value, txn.start_ts);
 /// match result {
 ///     Ok(()) => { /* lock acquired, value written */ },
 ///     Err(PessimisticWriteError::LockConflict(lock_owner)) => {
@@ -506,6 +506,7 @@ pub trait PessimisticStorage: StorageEngine {
     ///
     /// # Arguments
     ///
+    /// * `tablet_id` - Target tablet decided by planner/executor
     /// * `key` - The key to write
     /// * `value` - The value to write (use TOMBSTONE for deletes)
     /// * `owner_start_ts` - The transaction's start_ts (used as lock identifier)
@@ -518,47 +519,13 @@ pub trait PessimisticStorage: StorageEngine {
     ///
     /// If the key is already locked by the same transaction (owner_start_ts matches),
     /// the value is updated in place without error.
-    fn put_pending(
-        &self,
-        key: &[u8],
-        value: RawValue,
-        owner_start_ts: Timestamp,
-    ) -> std::result::Result<(), PessimisticWriteError>;
-
-    /// Borrowed-value pending write path.
-    ///
-    /// This avoids caller-side cloning on retry loops. Implementations can
-    /// allocate only when a write actually proceeds.
-    fn put_pending_ref(
-        &self,
-        key: &[u8],
-        value: &[u8],
-        owner_start_ts: Timestamp,
-    ) -> std::result::Result<(), PessimisticWriteError> {
-        self.put_pending(key, value.to_vec(), owner_start_ts)
-    }
-
-    /// Metadata-first pending write path for callers that already know target tablet.
     fn put_pending_on_tablet(
         &self,
-        _tablet_id: router::TabletId,
-        key: &[u8],
-        value: RawValue,
-        owner_start_ts: Timestamp,
-    ) -> std::result::Result<(), PessimisticWriteError> {
-        self.put_pending(key, value, owner_start_ts)
-    }
-
-    /// Metadata-first borrowed-value pending write path.
-    fn put_pending_on_tablet_ref(
-        &self,
-        _tablet_id: router::TabletId,
+        tablet_id: router::TabletId,
         key: &[u8],
         value: &[u8],
         owner_start_ts: Timestamp,
-    ) -> std::result::Result<(), PessimisticWriteError> {
-        self.put_pending_ref(key, value, owner_start_ts)
-    }
+    ) -> std::result::Result<(), PessimisticWriteError>;
 
     /// Check if a key is locked by a pending write.
     ///

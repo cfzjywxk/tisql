@@ -196,46 +196,15 @@ impl StorageEngine for RoutedTabletStorage {
 }
 
 impl PessimisticStorage for RoutedTabletStorage {
-    fn put_pending(
-        &self,
-        key: &[u8],
-        value: RawValue,
-        owner_start_ts: Timestamp,
-    ) -> std::result::Result<(), PessimisticWriteError> {
-        let (_, tablet) = self.resolve_key_tablet(key);
-        tablet.put_pending(key, value, owner_start_ts)
-    }
-
-    fn put_pending_ref(
-        &self,
-        key: &[u8],
-        value: &[u8],
-        owner_start_ts: Timestamp,
-    ) -> std::result::Result<(), PessimisticWriteError> {
-        let (_, tablet) = self.resolve_key_tablet(key);
-        tablet.put_pending_ref(key, value, owner_start_ts)
-    }
-
     fn put_pending_on_tablet(
         &self,
         tablet_id: TabletId,
         key: &[u8],
-        value: RawValue,
-        owner_start_ts: Timestamp,
-    ) -> std::result::Result<(), PessimisticWriteError> {
-        let (_, tablet) = self.resolve_mounted_tablet(tablet_id);
-        tablet.put_pending(key, value, owner_start_ts)
-    }
-
-    fn put_pending_on_tablet_ref(
-        &self,
-        tablet_id: TabletId,
-        key: &[u8],
         value: &[u8],
         owner_start_ts: Timestamp,
     ) -> std::result::Result<(), PessimisticWriteError> {
-        let (_, tablet) = self.resolve_mounted_tablet(tablet_id);
-        tablet.put_pending_ref(key, value, owner_start_ts)
+        let (resolved_tablet_id, tablet) = self.resolve_mounted_tablet(tablet_id);
+        tablet.put_pending_on_tablet(resolved_tablet_id, key, value, owner_start_ts)
     }
 
     fn get_lock_owner(&self, key: &[u8]) -> Option<Timestamp> {
@@ -397,6 +366,16 @@ mod tests {
         crate::io::block_on_sync(tablet.get_with_owner(key, read_ts, 0))
     }
 
+    fn put_pending_by_key(
+        storage: &RoutedTabletStorage,
+        key: &[u8],
+        value: &[u8],
+        owner_start_ts: Timestamp,
+    ) -> std::result::Result<(), PessimisticWriteError> {
+        let (tablet_id, _) = storage.resolve_key_tablet(key);
+        storage.put_pending_on_tablet(tablet_id, key, value, owner_start_ts)
+    }
+
     #[test]
     fn test_write_batch_routes_to_mounted_tablets() {
         let dir = TempDir::new().unwrap();
@@ -507,7 +486,7 @@ mod tests {
         let storage = RoutedTabletStorage::new(Arc::clone(&manager));
         let key = b"not_a_tidb_table_key".to_vec();
         storage
-            .put_pending_on_tablet(user_tablet_id, &key, b"pending".to_vec(), 88)
+            .put_pending_on_tablet(user_tablet_id, &key, b"pending", 88)
             .unwrap();
         storage.finalize_pending_grouped_with_lsn(
             &[(user_tablet_id, vec![key.clone()])],
@@ -550,12 +529,8 @@ mod tests {
         let record_key = encode_record_key_with_handle(USER_TABLE_ID_START, 1);
         let index_key = encode_index_seek_key(USER_TABLE_ID_START, 2001, b"idx");
 
-        storage
-            .put_pending(&record_key, b"row_v".to_vec(), 10)
-            .unwrap();
-        storage
-            .put_pending(&index_key, b"idx_v".to_vec(), 10)
-            .unwrap();
+        put_pending_by_key(&storage, &record_key, b"row_v", 10).unwrap();
+        put_pending_by_key(&storage, &index_key, b"idx_v", 10).unwrap();
 
         let commit_lsn = 9001;
         storage.finalize_pending_with_lsn(
@@ -609,12 +584,8 @@ mod tests {
         let record_key = encode_record_key_with_handle(USER_TABLE_ID_START, 11);
         let index_key = encode_index_seek_key(USER_TABLE_ID_START, 2001, b"idx_11");
 
-        storage
-            .put_pending(&record_key, b"pending_row".to_vec(), 66)
-            .unwrap();
-        storage
-            .put_pending(&index_key, b"pending_idx".to_vec(), 66)
-            .unwrap();
+        put_pending_by_key(&storage, &record_key, b"pending_row", 66).unwrap();
+        put_pending_by_key(&storage, &index_key, b"pending_idx", 66).unwrap();
 
         storage.abort_pending(&[record_key.clone(), index_key.clone()], 66);
 
@@ -891,9 +862,7 @@ mod tests {
 
         let key = encode_record_key_with_handle(USER_TABLE_ID_START, 42);
         let owner_ts = 100;
-        storage
-            .put_pending(&key, b"pending_v".to_vec(), owner_ts)
-            .unwrap();
+        put_pending_by_key(&storage, &key, b"pending_v", owner_ts).unwrap();
 
         // Lock is on user tablet, not system tablet
         assert_eq!(tablet.get_lock_owner(&key), Some(owner_ts));
@@ -959,9 +928,9 @@ mod tests {
         let storage = RoutedTabletStorage::new(Arc::clone(&manager));
 
         let key = encode_record_key_with_handle(USER_TABLE_ID_START, 1);
-        storage.put_pending(&key, b"v1".to_vec(), 100).unwrap();
+        put_pending_by_key(&storage, &key, b"v1", 100).unwrap();
 
-        let conflict = storage.put_pending(&key, b"v2".to_vec(), 200);
+        let conflict = put_pending_by_key(&storage, &key, b"v2", 200);
         assert!(
             matches!(
                 conflict,
@@ -1001,8 +970,8 @@ mod tests {
         let key_b = encode_record_key_with_handle(USER_TABLE_ID_START + 1, 1);
 
         // Different tablets → no conflict
-        storage.put_pending(&key_a, b"v_a".to_vec(), 100).unwrap();
-        storage.put_pending(&key_b, b"v_b".to_vec(), 200).unwrap();
+        put_pending_by_key(&storage, &key_a, b"v_a", 100).unwrap();
+        put_pending_by_key(&storage, &key_b, b"v_b", 200).unwrap();
 
         assert_eq!(tablet_a.get_lock_owner(&key_a), Some(100));
         assert_eq!(tablet_b.get_lock_owner(&key_b), Some(200));
@@ -1032,9 +1001,7 @@ mod tests {
 
         let key = encode_record_key_with_handle(USER_TABLE_ID_START, 7);
         let owner_ts = 300;
-        storage
-            .put_pending(&key, b"pending_val".to_vec(), owner_ts)
-            .unwrap();
+        put_pending_by_key(&storage, &key, b"pending_val", owner_ts).unwrap();
 
         // Scan with owner_ts=300 should see the pending write
         let start = encode_key(USER_TABLE_ID_START, &[]);

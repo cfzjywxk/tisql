@@ -70,7 +70,7 @@ use crate::tablet::mvcc::{
     is_lock, is_tombstone, MvccIterator, MvccKey, SharedMvccRange, LOCK, TOMBSTONE,
 };
 use crate::tablet::{
-    PessimisticStorage, PessimisticWriteError, StorageEngine, WriteBatch, WriteOp,
+    PessimisticStorage, PessimisticWriteError, StorageEngine, TabletId, WriteBatch, WriteOp,
 };
 use crate::util::error::{Result, TiSqlError};
 
@@ -452,6 +452,7 @@ impl MvccRow {
     ///
     /// If the key is already locked by the same transaction (owner == my_start_ts),
     /// the value is updated in place.
+    #[cfg(test)]
     fn prepend_pending(
         &self,
         my_start_ts: Timestamp,
@@ -518,7 +519,7 @@ impl MvccRow {
     ///
     /// Allocates only when we actually need to install/update a pending value.
     /// Lock conflicts return before any value allocation.
-    fn prepend_pending_ref(
+    fn prepend_pending_bytes(
         &self,
         my_start_ts: Timestamp,
         value: &[u8],
@@ -888,35 +889,6 @@ impl VersionedMemTableEngine {
     pub fn put_pending_counted(
         &self,
         key: &[u8],
-        value: RawValue,
-        owner_start_ts: Timestamp,
-    ) -> std::result::Result<bool, Timestamp> {
-        let entry = if let Some(entry) = self.inner.index.get(key) {
-            entry
-        } else {
-            self.inner
-                .index
-                .get_or_insert(key.to_vec(), MvccRow::new_empty())
-        };
-
-        match entry.value().prepend_pending(owner_start_ts, value) {
-            Ok(new_node_created) => {
-                if new_node_created {
-                    self.inner.entry_count.fetch_add(1, Ordering::Relaxed);
-                }
-                Ok(new_node_created)
-            }
-            Err(lock_owner) => Err(lock_owner),
-        }
-    }
-
-    /// Borrowed-value pending write path.
-    ///
-    /// This avoids caller-side clones in retry loops and only allocates value
-    /// bytes when the row can actually be updated/inserted.
-    pub fn put_pending_counted_ref(
-        &self,
-        key: &[u8],
         value: &[u8],
         owner_start_ts: Timestamp,
     ) -> std::result::Result<bool, Timestamp> {
@@ -928,7 +900,7 @@ impl VersionedMemTableEngine {
                 .get_or_insert(key.to_vec(), MvccRow::new_empty())
         };
 
-        match entry.value().prepend_pending_ref(owner_start_ts, value) {
+        match entry.value().prepend_pending_bytes(owner_start_ts, value) {
             Ok(new_node_created) => {
                 if new_node_created {
                     self.inner.entry_count.fetch_add(1, Ordering::Relaxed);
@@ -943,21 +915,10 @@ impl VersionedMemTableEngine {
     pub fn put_pending(
         &self,
         key: &[u8],
-        value: RawValue,
-        owner_start_ts: Timestamp,
-    ) -> std::result::Result<(), Timestamp> {
-        self.put_pending_counted(key, value, owner_start_ts)
-            .map(|_| ())
-    }
-
-    /// Borrowed-value variant of `put_pending`.
-    pub fn put_pending_ref(
-        &self,
-        key: &[u8],
         value: &[u8],
         owner_start_ts: Timestamp,
     ) -> std::result::Result<(), Timestamp> {
-        self.put_pending_counted_ref(key, value, owner_start_ts)
+        self.put_pending_counted(key, value, owner_start_ts)
             .map(|_| ())
     }
 
@@ -1180,24 +1141,14 @@ impl StorageEngine for VersionedMemTableEngine {
 }
 
 impl PessimisticStorage for VersionedMemTableEngine {
-    fn put_pending(
+    fn put_pending_on_tablet(
         &self,
-        key: &[u8],
-        value: RawValue,
-        owner_start_ts: Timestamp,
-    ) -> std::result::Result<(), PessimisticWriteError> {
-        // Delegate to the inherent method.
-        VersionedMemTableEngine::put_pending(self, key, value, owner_start_ts)
-            .map_err(PessimisticWriteError::LockConflict)
-    }
-
-    fn put_pending_ref(
-        &self,
+        _tablet_id: TabletId,
         key: &[u8],
         value: &[u8],
         owner_start_ts: Timestamp,
     ) -> std::result::Result<(), PessimisticWriteError> {
-        VersionedMemTableEngine::put_pending_ref(self, key, value, owner_start_ts)
+        VersionedMemTableEngine::put_pending(self, key, value, owner_start_ts)
             .map_err(PessimisticWriteError::LockConflict)
     }
 
@@ -2977,9 +2928,7 @@ mod tests {
         let engine = new_engine();
 
         // Write pending value
-        engine
-            .put_pending(b"key1", b"value1".to_vec(), 100)
-            .unwrap();
+        engine.put_pending(b"key1", b"value1", 100).unwrap();
 
         // Pending write should not be visible via normal read
         assert!(get_for_test(&engine, b"key1").is_none());
@@ -2993,10 +2942,10 @@ mod tests {
         let engine = new_engine();
 
         // First write from txn 100
-        engine.put_pending(b"key1", b"v1".to_vec(), 100).unwrap();
+        engine.put_pending(b"key1", b"v1", 100).unwrap();
 
         // Second write from txn 200 should fail (key locked)
-        let result = engine.put_pending(b"key1", b"v2".to_vec(), 200);
+        let result = engine.put_pending(b"key1", b"v2", 200);
         assert_eq!(result, Err(100)); // Returns lock owner
     }
 
@@ -3005,10 +2954,10 @@ mod tests {
         let engine = new_engine();
 
         // First write
-        engine.put_pending(b"key1", b"v1".to_vec(), 100).unwrap();
+        engine.put_pending(b"key1", b"v1", 100).unwrap();
 
         // Same txn writing again should update value in place
-        engine.put_pending(b"key1", b"v2".to_vec(), 100).unwrap();
+        engine.put_pending(b"key1", b"v2", 100).unwrap();
 
         // Should still be locked by txn 100
         assert_eq!(engine.get_lock_owner(b"key1"), Some(100));
@@ -3024,8 +2973,8 @@ mod tests {
         let engine = new_engine();
 
         // Write pending values
-        engine.put_pending(b"key1", b"v1".to_vec(), 100).unwrap();
-        engine.put_pending(b"key2", b"v2".to_vec(), 100).unwrap();
+        engine.put_pending(b"key1", b"v1", 100).unwrap();
+        engine.put_pending(b"key2", b"v2", 100).unwrap();
 
         // Neither should be visible
         assert!(get_for_test(&engine, b"key1").is_none());
@@ -3049,7 +2998,7 @@ mod tests {
         let engine = new_engine();
 
         // Write pending values
-        engine.put_pending(b"key1", b"v1".to_vec(), 100).unwrap();
+        engine.put_pending(b"key1", b"v1", 100).unwrap();
 
         // Key is locked
         assert_eq!(engine.get_lock_owner(b"key1"), Some(100));
@@ -3070,12 +3019,12 @@ mod tests {
         let engine = new_engine();
 
         // Txn 100 writes and aborts
-        engine.put_pending(b"key1", b"v1".to_vec(), 100).unwrap();
+        engine.put_pending(b"key1", b"v1", 100).unwrap();
         let keys = vec![b"key1".to_vec()];
         engine.abort_pending(&keys, 100);
 
         // Txn 200 should now be able to write
-        let result = engine.put_pending(b"key1", b"v2".to_vec(), 200);
+        let result = engine.put_pending(b"key1", b"v2", 200);
         assert!(result.is_ok());
 
         // Key locked by txn 200
@@ -3090,7 +3039,7 @@ mod tests {
         put_at(&engine, b"a", b"committed", 10);
 
         // Write pending value
-        engine.put_pending(b"b", b"pending".to_vec(), 100).unwrap();
+        engine.put_pending(b"b", b"pending", 100).unwrap();
 
         // Write another committed value
         put_at(&engine, b"c", b"committed2", 20);
@@ -3128,7 +3077,7 @@ mod tests {
         let engine = new_engine();
 
         // Write and finalize pending value
-        engine.put_pending(b"key", b"value".to_vec(), 100).unwrap();
+        engine.put_pending(b"key", b"value", 100).unwrap();
         let keys = vec![b"key".to_vec()];
         engine.finalize_pending(&keys, 100, 150);
 
@@ -3537,9 +3486,7 @@ mod tests {
         engine.put_internal(b"key1", b"committed".to_vec(), 100);
 
         // Add pending value from txn 200
-        engine
-            .put_pending(b"key1", b"pending".to_vec(), 200)
-            .unwrap();
+        engine.put_pending(b"key1", b"pending", 200).unwrap();
 
         // Non-owner iterator returns the pending node (for resolution by txn layer)
         let range = Range {
@@ -3581,9 +3528,7 @@ mod tests {
         engine.put_internal(b"key1", b"committed".to_vec(), 100);
 
         // Txn 200 writes then deletes (creates LOCK)
-        engine
-            .put_pending(b"key1", b"pending".to_vec(), 200)
-            .unwrap();
+        engine.put_pending(b"key1", b"pending", 200).unwrap();
         engine.delete_pending(b"key1", 200).unwrap();
 
         // Owner iterator should skip LOCK and see committed value
@@ -3610,14 +3555,10 @@ mod tests {
 
         // key2: committed + pending from owner
         engine.put_internal(b"key2", b"k2_committed".to_vec(), 100);
-        engine
-            .put_pending(b"key2", b"k2_pending".to_vec(), 200)
-            .unwrap();
+        engine.put_pending(b"key2", b"k2_pending", 200).unwrap();
 
         // key3: pending only from owner
-        engine
-            .put_pending(b"key3", b"k3_pending".to_vec(), 200)
-            .unwrap();
+        engine.put_pending(b"key3", b"k3_pending", 200).unwrap();
 
         // Owner iterator (txn 200) should see:
         // key1 -> committed (no pending)
@@ -3669,9 +3610,7 @@ mod tests {
         engine.put_internal(b"key1", b"committed".to_vec(), 100);
 
         // Txn 200 has pending write
-        engine
-            .put_pending(b"key1", b"txn200_pending".to_vec(), 200)
-            .unwrap();
+        engine.put_pending(b"key1", b"txn200_pending", 200).unwrap();
 
         // Txn 300 sees txn 200's pending node first (marked as pending for resolution)
         let range = Range {
@@ -3697,9 +3636,7 @@ mod tests {
         engine.put_internal(b"key1", b"committed".to_vec(), 100);
 
         // Pending from txn 200
-        engine
-            .put_pending(b"key1", b"pending".to_vec(), 200)
-            .unwrap();
+        engine.put_pending(b"key1", b"pending", 200).unwrap();
 
         // Test ArcVersionedMemTableIterator with owner
         let range = Range {
@@ -3726,7 +3663,14 @@ mod tests {
         engine.put_internal(b"key1", b"committed".to_vec(), 100);
 
         // Pending from txn 200
-        PessimisticStorage::put_pending(&engine, b"key1", b"pending".to_vec(), 200).unwrap();
+        PessimisticStorage::put_pending_on_tablet(
+            &engine,
+            crate::tablet::TabletId::System,
+            b"key1",
+            b"pending",
+            200,
+        )
+        .unwrap();
 
         // Use unified scan_iter with owner_ts for read-your-writes
         let range = Range {
@@ -3748,9 +3692,7 @@ mod tests {
         let engine = VersionedMemTableEngine::new();
 
         // Only pending, no committed
-        engine
-            .put_pending(b"key1", b"pending".to_vec(), 200)
-            .unwrap();
+        engine.put_pending(b"key1", b"pending", 200).unwrap();
 
         // Non-owner sees the pending node (marked for resolution)
         let range = Range {
@@ -3785,9 +3727,7 @@ mod tests {
         let engine = VersionedMemTableEngine::new();
 
         // Write then delete (creates LOCK)
-        engine
-            .put_pending(b"key1", b"to_delete".to_vec(), 200)
-            .unwrap();
+        engine.put_pending(b"key1", b"to_delete", 200).unwrap();
         engine.delete_pending(b"key1", 200).unwrap();
 
         // Owner should skip LOCK (no committed value to fall back to)
@@ -3855,7 +3795,7 @@ mod tests {
         let engine = VersionedMemTableEngine::new();
 
         // Pending key has lock owner
-        engine.put_pending(b"key", b"value".to_vec(), 200).unwrap();
+        engine.put_pending(b"key", b"value", 200).unwrap();
         let result = engine.get_lock_owner(b"key");
         assert_eq!(result, Some(200));
     }
@@ -3907,7 +3847,7 @@ mod tests {
         let engine = VersionedMemTableEngine::new();
 
         // Write pending with owner 100
-        engine.put_pending(b"key", b"value".to_vec(), 100).unwrap();
+        engine.put_pending(b"key", b"value", 100).unwrap();
 
         // Finalize with wrong owner - should be no-op for that key
         engine.finalize_pending(&[b"key".to_vec()], 200, 300);
@@ -3921,7 +3861,7 @@ mod tests {
         let engine = VersionedMemTableEngine::new();
 
         // Write pending with owner 100
-        engine.put_pending(b"key", b"value".to_vec(), 100).unwrap();
+        engine.put_pending(b"key", b"value", 100).unwrap();
 
         // Abort with wrong owner - should be no-op
         engine.abort_pending(&[b"key".to_vec()], 200);
@@ -3935,7 +3875,7 @@ mod tests {
         let engine = VersionedMemTableEngine::new();
 
         // Write then delete (pending tombstone)
-        engine.put_pending(b"key", b"value".to_vec(), 100).unwrap();
+        engine.put_pending(b"key", b"value", 100).unwrap();
         engine.delete_pending(b"key", 100).unwrap();
 
         // get_with_owner should see LOCK and return it
@@ -3949,7 +3889,7 @@ mod tests {
         let engine = VersionedMemTableEngine::new();
 
         // Put pending
-        engine.put_pending(b"key", b"value".to_vec(), 100).unwrap();
+        engine.put_pending(b"key", b"value", 100).unwrap();
 
         // Finalize
         engine.finalize_pending(&[b"key".to_vec()], 100, 200);
@@ -3964,7 +3904,7 @@ mod tests {
         let engine = VersionedMemTableEngine::new();
 
         // Put pending
-        engine.put_pending(b"key", b"value".to_vec(), 100).unwrap();
+        engine.put_pending(b"key", b"value", 100).unwrap();
 
         // Abort
         engine.abort_pending(&[b"key".to_vec()], 100);
@@ -3982,11 +3922,11 @@ mod tests {
         engine.put_internal(b"key", b"v1".to_vec(), 100);
 
         // Multiple pending writes that get aborted
-        engine.put_pending(b"key", b"v2".to_vec(), 200).unwrap();
+        engine.put_pending(b"key", b"v2", 200).unwrap();
         engine.abort_pending(&[b"key".to_vec()], 200);
 
         // After abort, new transaction should be able to write
-        engine.put_pending(b"key", b"v3".to_vec(), 300).unwrap();
+        engine.put_pending(b"key", b"v3", 300).unwrap();
         engine.finalize_pending(&[b"key".to_vec()], 300, 400);
 
         // Should see v3
