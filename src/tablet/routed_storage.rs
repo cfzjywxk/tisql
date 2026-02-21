@@ -207,14 +207,9 @@ impl PessimisticStorage for RoutedTabletStorage {
         tablet.put_pending_on_tablet(resolved_tablet_id, key, value, owner_start_ts)
     }
 
-    fn get_lock_owner(&self, key: &[u8]) -> Option<Timestamp> {
-        let (_, tablet) = self.resolve_key_tablet(key);
-        tablet.get_lock_owner(key)
-    }
-
     fn get_lock_owner_on_tablet(&self, tablet_id: TabletId, key: &[u8]) -> Option<Timestamp> {
-        let (_, tablet) = self.resolve_mounted_tablet(tablet_id);
-        tablet.get_lock_owner(key)
+        let (resolved_tablet_id, tablet) = self.resolve_mounted_tablet(tablet_id);
+        tablet.get_lock_owner_on_tablet(resolved_tablet_id, key)
     }
 
     fn alloc_and_reserve_commit_lsn(&self, owner_start_ts: Timestamp) -> u64 {
@@ -307,33 +302,14 @@ impl PessimisticStorage for RoutedTabletStorage {
         }
     }
 
-    fn delete_pending(
-        &self,
-        key: &[u8],
-        owner_start_ts: Timestamp,
-    ) -> std::result::Result<bool, PessimisticWriteError> {
-        let (_, tablet) = self.resolve_key_tablet(key);
-        tablet.delete_pending(key, owner_start_ts)
-    }
-
     fn delete_pending_on_tablet(
         &self,
         tablet_id: TabletId,
         key: &[u8],
         owner_start_ts: Timestamp,
     ) -> std::result::Result<bool, PessimisticWriteError> {
-        let (_, tablet) = self.resolve_mounted_tablet(tablet_id);
-        tablet.delete_pending(key, owner_start_ts)
-    }
-
-    fn get_with_owner<'a>(
-        &'a self,
-        key: &'a [u8],
-        read_ts: Timestamp,
-        owner_start_ts: Timestamp,
-    ) -> impl std::future::Future<Output = Option<RawValue>> + Send + 'a {
-        let (_, tablet) = self.resolve_key_tablet(key);
-        async move { tablet.get_with_owner(key, read_ts, owner_start_ts).await }
+        let (resolved_tablet_id, tablet) = self.resolve_mounted_tablet(tablet_id);
+        tablet.delete_pending_on_tablet(resolved_tablet_id, key, owner_start_ts)
     }
 
     fn get_with_owner_on_tablet<'a>(
@@ -343,8 +319,12 @@ impl PessimisticStorage for RoutedTabletStorage {
         read_ts: Timestamp,
         owner_start_ts: Timestamp,
     ) -> impl std::future::Future<Output = Option<RawValue>> + Send + 'a {
-        let (_, tablet) = self.resolve_mounted_tablet(tablet_id);
-        async move { tablet.get_with_owner(key, read_ts, owner_start_ts).await }
+        let (resolved_tablet_id, tablet) = self.resolve_mounted_tablet(tablet_id);
+        async move {
+            tablet
+                .get_with_owner_on_tablet(resolved_tablet_id, key, read_ts, owner_start_ts)
+                .await
+        }
     }
 }
 
@@ -363,7 +343,11 @@ mod tests {
     }
 
     fn read_value(tablet: &TabletEngine, key: &[u8], read_ts: Timestamp) -> Option<RawValue> {
-        crate::io::block_on_sync(tablet.get_with_owner(key, read_ts, 0))
+        crate::io::block_on_sync(tablet.get_with_owner_on_tablet(TabletId::System, key, read_ts, 0))
+    }
+
+    fn lock_owner(tablet: &TabletEngine, key: &[u8]) -> Option<Timestamp> {
+        tablet.get_lock_owner_on_tablet(TabletId::System, key)
     }
 
     fn put_pending_by_key(
@@ -374,6 +358,15 @@ mod tests {
     ) -> std::result::Result<(), PessimisticWriteError> {
         let (tablet_id, _) = storage.resolve_key_tablet(key);
         storage.put_pending_on_tablet(tablet_id, key, value, owner_start_ts)
+    }
+
+    fn delete_pending_by_key(
+        storage: &RoutedTabletStorage,
+        key: &[u8],
+        owner_start_ts: Timestamp,
+    ) -> std::result::Result<bool, PessimisticWriteError> {
+        let (tablet_id, _) = storage.resolve_key_tablet(key);
+        storage.delete_pending_on_tablet(tablet_id, key, owner_start_ts)
     }
 
     #[test]
@@ -589,8 +582,8 @@ mod tests {
 
         storage.abort_pending(&[record_key.clone(), index_key.clone()], 66);
 
-        assert_eq!(table_engine.get_lock_owner(&record_key), None);
-        assert_eq!(index_engine.get_lock_owner(&index_key), None);
+        assert_eq!(lock_owner(&table_engine, &record_key), None);
+        assert_eq!(lock_owner(&index_engine, &index_key), None);
     }
 
     #[test]
@@ -865,8 +858,8 @@ mod tests {
         put_pending_by_key(&storage, &key, b"pending_v", owner_ts).unwrap();
 
         // Lock is on user tablet, not system tablet
-        assert_eq!(tablet.get_lock_owner(&key), Some(owner_ts));
-        assert_eq!(system.get_lock_owner(&key), None);
+        assert_eq!(lock_owner(&tablet, &key), Some(owner_ts));
+        assert_eq!(lock_owner(&system, &key), None);
 
         // Cleanup
         tablet.abort_pending(&[key], owner_ts);
@@ -898,12 +891,12 @@ mod tests {
         tablet.write_batch(batch).unwrap();
 
         let owner_ts = 200;
-        let deleted = storage.delete_pending(&key, owner_ts).unwrap();
+        let deleted = delete_pending_by_key(&storage, &key, owner_ts).unwrap();
         assert!(deleted, "delete_pending on existing key should return true");
 
         // Lock is on user tablet
-        assert_eq!(tablet.get_lock_owner(&key), Some(owner_ts));
-        assert_eq!(system.get_lock_owner(&key), None);
+        assert_eq!(lock_owner(&tablet, &key), Some(owner_ts));
+        assert_eq!(lock_owner(&system, &key), None);
 
         // Cleanup
         tablet.abort_pending(&[key], owner_ts);
@@ -973,8 +966,8 @@ mod tests {
         put_pending_by_key(&storage, &key_a, b"v_a", 100).unwrap();
         put_pending_by_key(&storage, &key_b, b"v_b", 200).unwrap();
 
-        assert_eq!(tablet_a.get_lock_owner(&key_a), Some(100));
-        assert_eq!(tablet_b.get_lock_owner(&key_b), Some(200));
+        assert_eq!(lock_owner(&tablet_a, &key_a), Some(100));
+        assert_eq!(lock_owner(&tablet_b, &key_b), Some(200));
 
         // Cleanup
         tablet_a.abort_pending(&[key_a], 100);

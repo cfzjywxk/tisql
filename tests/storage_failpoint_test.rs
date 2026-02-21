@@ -473,11 +473,11 @@ async fn test_phase3_failpoint_partial_finalize_across_tablets() {
 
     let mut ctx = txn_service.begin_explicit(false).unwrap();
     txn_service
-        .put(&mut ctx, table1, key1.clone(), b"v1".to_vec())
+        .put(&mut ctx, table1, &key1, b"v1".to_vec())
         .await
         .unwrap();
     txn_service
-        .put(&mut ctx, table2, key2.clone(), b"v2".to_vec())
+        .put(&mut ctx, table2, &key2, b"v2".to_vec())
         .await
         .unwrap();
 
@@ -502,10 +502,17 @@ async fn test_phase3_failpoint_partial_finalize_across_tablets() {
 
     // Deterministic BTree tablet order finalizes table1 first, then failpoint trips.
     assert_eq!(
-        tablet1.get_with_owner(&key1, u64::MAX, 0).await,
+        tablet1
+            .get_with_owner_on_tablet(TabletId::System, &key1, u64::MAX, 0)
+            .await,
         Some(b"v1".to_vec())
     );
-    assert_eq!(tablet2.get_with_owner(&key2, u64::MAX, 0).await, None);
+    assert_eq!(
+        tablet2
+            .get_with_owner_on_tablet(TabletId::System, &key2, u64::MAX, 0)
+            .await,
+        None
+    );
 
     scenario.teardown();
 }
@@ -522,11 +529,11 @@ async fn test_phase3_failpoint_partial_abort_across_tablets() {
     let mut ctx = txn_service.begin_explicit(false).unwrap();
     let owner_ts = ctx.start_ts();
     txn_service
-        .put(&mut ctx, table1, key1.clone(), b"v11".to_vec())
+        .put(&mut ctx, table1, &key1, b"v11".to_vec())
         .await
         .unwrap();
     txn_service
-        .put(&mut ctx, table2, key2.clone(), b"v22".to_vec())
+        .put(&mut ctx, table2, &key2, b"v22".to_vec())
         .await
         .unwrap();
 
@@ -546,8 +553,14 @@ async fn test_phase3_failpoint_partial_abort_across_tablets() {
         .get_tablet(TabletId::Table { table_id: table2 })
         .unwrap();
 
-    assert_eq!(tablet1.get_lock_owner(&key1), None);
-    assert_eq!(tablet2.get_lock_owner(&key2), Some(owner_ts));
+    assert_eq!(
+        tablet1.get_lock_owner_on_tablet(TabletId::System, &key1),
+        None
+    );
+    assert_eq!(
+        tablet2.get_lock_owner_on_tablet(TabletId::System, &key2),
+        Some(owner_ts)
+    );
 
     // Cleanup residual pending lock on table2 so drop checks stay clean.
     tablet2.abort_pending(&[key2], owner_ts);
@@ -613,7 +626,7 @@ async fn run_v26_commit_cutpoint_panic_test(failpoint_name: &str) {
                 .put(
                     &mut ctx,
                     SYS_TABLE_ID,
-                    b"phase2_cutpoint_key".to_vec(),
+                    b"phase2_cutpoint_key",
                     b"phase2_cutpoint_value".to_vec(),
                 )
                 .await

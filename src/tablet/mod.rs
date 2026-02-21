@@ -471,7 +471,7 @@ pub enum PessimisticWriteError {
 /// - `put_pending_on_tablet()`: Metadata-first pending write
 /// - `finalize_pending()`: Convert pending writes to committed on commit
 /// - `abort_pending()`: Mark pending writes as aborted on rollback
-/// - `get_lock_owner()`: Check if a key is locked
+/// - `get_lock_owner_on_tablet()`: Check if a key is locked
 ///
 /// ## Design
 ///
@@ -527,22 +527,17 @@ pub trait PessimisticStorage: StorageEngine {
         owner_start_ts: Timestamp,
     ) -> std::result::Result<(), PessimisticWriteError>;
 
-    /// Check if a key is locked by a pending write.
+    /// Metadata-first lock-owner lookup for callers that already know target tablet.
     ///
     /// # Returns
     ///
     /// * `None` - Key is not locked
     /// * `Some(owner_start_ts)` - Key is locked by transaction with this start_ts
-    fn get_lock_owner(&self, key: &[u8]) -> Option<Timestamp>;
-
-    /// Metadata-first lock-owner lookup for callers that already know target tablet.
     fn get_lock_owner_on_tablet(
         &self,
-        _tablet_id: router::TabletId,
+        tablet_id: router::TabletId,
         key: &[u8],
-    ) -> Option<Timestamp> {
-        self.get_lock_owner(key)
-    }
+    ) -> Option<Timestamp>;
 
     /// Allocate and reserve a commit LSN for this transaction.
     fn alloc_and_reserve_commit_lsn(&self, owner_start_ts: Timestamp) -> u64;
@@ -628,21 +623,14 @@ pub trait PessimisticStorage: StorageEngine {
     /// * `Ok(false)` - Key doesn't exist or already deleted
     /// * `Err(LockConflict(lock_owner))` - Key locked by another transaction
     /// * `Err(WriteStall { .. })` - Storage backpressure/stall signal
-    fn delete_pending(
-        &self,
-        key: &[u8],
-        owner_start_ts: Timestamp,
-    ) -> std::result::Result<bool, PessimisticWriteError>;
-
+    ///
     /// Metadata-first delete path for callers that already know target tablet.
     fn delete_pending_on_tablet(
         &self,
-        _tablet_id: router::TabletId,
+        tablet_id: router::TabletId,
         key: &[u8],
         owner_start_ts: Timestamp,
-    ) -> std::result::Result<bool, PessimisticWriteError> {
-        self.delete_pending(key, owner_start_ts)
-    }
+    ) -> std::result::Result<bool, PessimisticWriteError>;
 
     /// Get a value with read-your-writes support.
     ///
@@ -659,21 +647,13 @@ pub trait PessimisticStorage: StorageEngine {
     ///
     /// * `Some(value)` - Value found (including pending value owned by this txn)
     /// * `None` - Not found, deleted, or pending LOCK
-    fn get_with_owner<'a>(
+    ///
+    /// Metadata-first read path for callers that already know target tablet.
+    fn get_with_owner_on_tablet<'a>(
         &'a self,
+        tablet_id: router::TabletId,
         key: &'a [u8],
         read_ts: Timestamp,
         owner_start_ts: Timestamp,
     ) -> impl std::future::Future<Output = Option<RawValue>> + Send + 'a;
-
-    /// Metadata-first read path for callers that already know target tablet.
-    fn get_with_owner_on_tablet<'a>(
-        &'a self,
-        _tablet_id: router::TabletId,
-        key: &'a [u8],
-        read_ts: Timestamp,
-        owner_start_ts: Timestamp,
-    ) -> impl std::future::Future<Output = Option<RawValue>> + Send + 'a {
-        self.get_with_owner(key, read_ts, owner_start_ts)
-    }
 }

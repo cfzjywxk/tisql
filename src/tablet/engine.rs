@@ -4279,7 +4279,7 @@ impl PessimisticStorage for LsmEngine {
         }
     }
 
-    fn get_lock_owner(&self, key: &[u8]) -> Option<Timestamp> {
+    fn get_lock_owner_on_tablet(&self, _tablet_id: TabletId, key: &[u8]) -> Option<Timestamp> {
         // Check active memtable first
         let state = self.state.read();
         if let Some(owner) = state.active.get_lock_owner(key) {
@@ -4372,8 +4372,9 @@ impl PessimisticStorage for LsmEngine {
         }
     }
 
-    fn delete_pending(
+    fn delete_pending_on_tablet(
         &self,
+        _tablet_id: TabletId,
         key: &[u8],
         owner_start_ts: Timestamp,
     ) -> std::result::Result<bool, PessimisticWriteError> {
@@ -4408,8 +4409,9 @@ impl PessimisticStorage for LsmEngine {
         delete_result
     }
 
-    async fn get_with_owner(
+    async fn get_with_owner_on_tablet(
         &self,
+        _tablet_id: TabletId,
         key: &[u8],
         read_ts: Timestamp,
         owner_start_ts: Timestamp,
@@ -4708,6 +4710,22 @@ mod tests {
                 value,
                 owner_start_ts,
             )
+        }
+
+        async fn get_with_owner(
+            &self,
+            key: &[u8],
+            read_ts: Timestamp,
+            owner_start_ts: Timestamp,
+        ) -> Option<RawValue> {
+            crate::tablet::PessimisticStorage::get_with_owner_on_tablet(
+                self,
+                TabletId::System,
+                key,
+                read_ts,
+                owner_start_ts,
+            )
+            .await
         }
     }
 
