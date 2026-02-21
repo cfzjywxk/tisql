@@ -206,6 +206,9 @@ pub struct DatabaseConfig {
     pub data_dir: PathBuf,
     /// Runtime thread-count overrides.
     pub runtime_threads: RuntimeThreadOverrides,
+    /// Optional per-tablet flush thread override.
+    /// If unset, TiSQL auto-sizes flush threads from CPU count.
+    pub flush_threads: Option<usize>,
     /// Enable adaptive encoded result batches (phase 3, experimental).
     pub enable_encoded_result_batch: bool,
     /// Enable bloom filter usage in SST paths.
@@ -245,6 +248,7 @@ impl Default for DatabaseConfig {
         Self {
             data_dir: PathBuf::from("data"),
             runtime_threads: RuntimeThreadOverrides::default(),
+            flush_threads: None,
             enable_encoded_result_batch: false,
             bloom_enabled: DEFAULT_BLOOM_ENABLED,
             bloom_bits_per_key: DEFAULT_BLOOM_BITS_PER_KEY,
@@ -277,6 +281,12 @@ impl DatabaseConfig {
     /// Set runtime thread-count overrides.
     pub fn with_runtime_threads(mut self, overrides: RuntimeThreadOverrides) -> Self {
         self.runtime_threads = overrides;
+        self
+    }
+
+    /// Set per-tablet flush thread override.
+    pub fn with_flush_threads(mut self, threads: usize) -> Self {
+        self.flush_threads = Some(threads);
         self
     }
 
@@ -367,7 +377,13 @@ impl DatabaseConfig {
         self
     }
 
-    fn lsm_config_for_dir(&self, data_dir: impl Into<PathBuf>) -> Result<LsmConfig> {
+    fn lsm_config_for_dir(
+        &self,
+        data_dir: impl Into<PathBuf>,
+        cpu_count: usize,
+    ) -> Result<LsmConfig> {
+        let tablet_plan = RuntimeThreads::plan_tablet_threads(cpu_count);
+        let flush_threads = self.flush_threads.unwrap_or(tablet_plan.flush_threads);
         LsmConfig::builder(data_dir)
             .bloom_enabled(self.bloom_enabled)
             .bloom_bits_per_key(self.bloom_bits_per_key)
@@ -382,6 +398,7 @@ impl DatabaseConfig {
             .l0_slowdown_trigger(self.l0_slowdown_trigger)
             .l0_stop_trigger(self.l0_stop_trigger)
             .max_levels(self.max_levels)
+            .flush_threads(flush_threads)
             .build()
             .map_err(util::error::TiSqlError::Storage)
     }
@@ -449,7 +466,10 @@ mod database_config_tests {
     #[test]
     fn test_database_config_lsm_projection_validates() {
         let config = DatabaseConfig::with_data_dir("data").with_bloom_bits_per_key(0);
-        let err = config.lsm_config_for_dir("data").unwrap_err().to_string();
+        let err = config
+            .lsm_config_for_dir("data", 32)
+            .unwrap_err()
+            .to_string();
         assert!(err.contains("bloom_bits_per_key"));
     }
 
@@ -459,8 +479,61 @@ mod database_config_tests {
             .with_l0_compaction_trigger(8)
             .with_l0_slowdown_trigger(7)
             .with_l0_stop_trigger(9);
-        let err = config.lsm_config_for_dir("data").unwrap_err().to_string();
+        let err = config
+            .lsm_config_for_dir("data", 32)
+            .unwrap_err()
+            .to_string();
         assert!(err.contains("l0_slowdown_trigger"));
+    }
+
+    #[test]
+    fn test_database_config_flush_threads_auto_sized_from_cpu() {
+        let config = DatabaseConfig::with_data_dir("data");
+        let lsm = config.lsm_config_for_dir("data", 32).unwrap();
+        assert_eq!(lsm.flush_threads, 2);
+    }
+
+    #[test]
+    fn test_database_config_flush_threads_override() {
+        let config = DatabaseConfig::with_data_dir("data").with_flush_threads(3);
+        let lsm = config.lsm_config_for_dir("data", 32).unwrap();
+        assert_eq!(lsm.flush_threads, 3);
+    }
+
+    #[test]
+    fn test_database_open_auto_flush_threads_respects_background_override() {
+        let dir = tempfile::tempdir().unwrap();
+        let config = DatabaseConfig::with_data_dir(dir.path()).with_runtime_threads(
+            RuntimeThreadOverrides {
+                protocol: Some(1),
+                worker: Some(1),
+                background: Some(1),
+                io: Some(1),
+            },
+        );
+        let db = Database::open(config);
+        assert!(
+            db.is_ok(),
+            "auto flush_threads should be capped to fit background override"
+        );
+    }
+
+    #[test]
+    fn test_database_open_explicit_flush_threads_keeps_background_guard() {
+        let dir = tempfile::tempdir().unwrap();
+        let config = DatabaseConfig::with_data_dir(dir.path())
+            .with_runtime_threads(RuntimeThreadOverrides {
+                protocol: Some(1),
+                worker: Some(1),
+                background: Some(1),
+                io: Some(1),
+            })
+            .with_flush_threads(2);
+        let err = match Database::open(config) {
+            Ok(_) => panic!("explicit invalid flush/background combination should fail"),
+            Err(err) => err.to_string(),
+        };
+        assert!(err.contains("requires background threads"));
     }
 }
 
@@ -628,7 +701,7 @@ impl Database {
         let cpu_count = std::thread::available_parallelism()
             .map(|n| n.get())
             .unwrap_or(4);
-        let mut planned_threads = config
+        let planned_threads = config
             .runtime_threads
             .apply(RuntimeThreads::plan(cpu_count));
 
@@ -648,12 +721,20 @@ impl Database {
 
         log_info!("I/O runtime created with {} threads", planned_threads.io);
 
-        let lsm_config = config.lsm_config_for_dir(&config.data_dir)?;
-        if lsm_config.flush_threads > 1
-            && config.runtime_threads.background.is_none()
-            && planned_threads.background < 4
-        {
-            planned_threads.background = 4;
+        let mut lsm_config = config.lsm_config_for_dir(&config.data_dir, cpu_count)?;
+        if config.flush_threads.is_none() {
+            // Keep auto-sized flush parallelism compatible with caller-provided
+            // runtime background overrides used by lightweight test harnesses.
+            let max_auto_flush_threads = planned_threads.background.saturating_sub(1).max(1);
+            if lsm_config.flush_threads > max_auto_flush_threads {
+                log_warn!(
+                    "Auto-sized flush_threads={} reduced to {} to fit background threads={}",
+                    lsm_config.flush_threads,
+                    max_auto_flush_threads,
+                    planned_threads.background
+                );
+                lsm_config.flush_threads = max_auto_flush_threads;
+            }
         }
         if lsm_config.flush_threads > 1
             && planned_threads.background < lsm_config.flush_threads.saturating_add(1)
@@ -670,13 +751,17 @@ impl Database {
             + planned_threads.background
             + planned_threads.io;
         log_info!(
-            "Runtime thread plan (cpu={}): protocol={}, worker={}, bg={}, io={}, total={}",
+            "Runtime thread plan (cpu={}): protocol={}, worker={}, bg={}, io={}, total={}, flush/tablet={}",
             cpu_count,
             planned_threads.protocol,
             planned_threads.worker,
             planned_threads.background,
             planned_threads.io,
-            total_threads
+            total_threads,
+            lsm_config.flush_threads
+        );
+        log_info!(
+            "Compaction scheduler currently runs single-worker semantics per tablet in this phase."
         );
         if cpu_count <= 2 {
             log_warn!(

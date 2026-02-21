@@ -487,6 +487,12 @@ impl LsmConfig {
         if self.max_levels < 2 {
             return Err("max_levels must be >= 2 (L0 + L1)".to_string());
         }
+        if self.compaction_threads == 0 {
+            return Err("compaction_threads must be > 0".to_string());
+        }
+        if self.flush_threads == 0 {
+            return Err("flush_threads must be > 0".to_string());
+        }
         if self.bloom_bits_per_key == 0 {
             return Err("bloom_bits_per_key must be > 0".to_string());
         }
@@ -974,6 +980,26 @@ mod tests {
         let result = config.validate();
         assert!(result.is_err());
         assert!(result.unwrap_err().contains("l0_compaction_trigger"));
+    }
+
+    #[test]
+    fn test_config_validation_flush_threads_zero() {
+        let config = LsmConfig::builder("./test")
+            .flush_threads(0)
+            .build_unchecked();
+        let result = config.validate();
+        assert!(result.is_err());
+        assert!(result.unwrap_err().contains("flush_threads"));
+    }
+
+    #[test]
+    fn test_config_validation_compaction_threads_zero() {
+        let config = LsmConfig::builder("./test")
+            .compaction_threads(0)
+            .build_unchecked();
+        let result = config.validate();
+        assert!(result.is_err());
+        assert!(result.unwrap_err().contains("compaction_threads"));
     }
 
     #[test]

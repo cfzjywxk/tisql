@@ -23,6 +23,12 @@ pub struct RuntimeThreads {
     pub io: usize,
 }
 
+/// CPU-sized per-tablet background worker plan.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct TabletThreadPlan {
+    pub flush_threads: usize,
+}
+
 impl RuntimeThreads {
     /// Plan thread counts using available CPU count.
     pub fn detect() -> Self {
@@ -35,8 +41,8 @@ impl RuntimeThreads {
     /// Plan thread counts from explicit CPU count.
     pub fn plan(cpu: usize) -> Self {
         let cpu = cpu.max(1);
-        let io = (cpu / 8).clamp(1, 2);
-        let background = (cpu / 8).clamp(1, 2);
+        let io = (cpu / 8).clamp(1, 4);
+        let background = (cpu / 4).clamp(2, 16);
         let protocol = (cpu / 8).clamp(1, 4);
         let reserved = io + background + protocol;
         let worker = cpu.saturating_sub(reserved).max(1);
@@ -45,6 +51,14 @@ impl RuntimeThreads {
             worker,
             background,
             io,
+        }
+    }
+
+    /// Plan per-tablet flush threads from explicit CPU count.
+    pub fn plan_tablet_threads(cpu: usize) -> TabletThreadPlan {
+        let cpu = cpu.max(1);
+        TabletThreadPlan {
+            flush_threads: (cpu / 16).clamp(1, 4),
         }
     }
 }
@@ -79,7 +93,7 @@ mod tests {
         let t = RuntimeThreads::plan(1);
         assert_eq!(t.protocol, 1);
         assert_eq!(t.worker, 1);
-        assert_eq!(t.background, 1);
+        assert_eq!(t.background, 2);
         assert_eq!(t.io, 1);
     }
 
@@ -87,9 +101,27 @@ mod tests {
     fn test_plan_large_cpu() {
         let t = RuntimeThreads::plan(32);
         assert_eq!(t.protocol, 4);
-        assert_eq!(t.background, 2);
-        assert_eq!(t.io, 2);
-        assert_eq!(t.worker, 24);
+        assert_eq!(t.background, 8);
+        assert_eq!(t.io, 4);
+        assert_eq!(t.worker, 16);
+    }
+
+    #[test]
+    fn test_plan_very_large_cpu_caps() {
+        let t = RuntimeThreads::plan(128);
+        assert_eq!(t.protocol, 4);
+        assert_eq!(t.background, 16);
+        assert_eq!(t.io, 4);
+        assert_eq!(t.worker, 104);
+    }
+
+    #[test]
+    fn test_plan_tablet_threads_reference_points() {
+        assert_eq!(RuntimeThreads::plan_tablet_threads(1).flush_threads, 1);
+        assert_eq!(RuntimeThreads::plan_tablet_threads(8).flush_threads, 1);
+        assert_eq!(RuntimeThreads::plan_tablet_threads(16).flush_threads, 1);
+        assert_eq!(RuntimeThreads::plan_tablet_threads(32).flush_threads, 2);
+        assert_eq!(RuntimeThreads::plan_tablet_threads(64).flush_threads, 4);
     }
 
     #[test]

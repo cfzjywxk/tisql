@@ -71,6 +71,10 @@ struct Args {
     #[arg(long)]
     io_threads: Option<usize>,
 
+    /// Per-tablet flush threads (auto-sized from CPU count when omitted)
+    #[arg(long, value_parser = clap::value_parser!(u32).range(1..))]
+    flush_threads: Option<u32>,
+
     /// Enable adaptive encoded result batches (phase 3 optimization, experimental)
     #[arg(
         long,
@@ -252,7 +256,7 @@ fn main() {
     );
 
     // Open database with persistence
-    let db_config = DatabaseConfig::with_data_dir(&args.data_dir)
+    let mut db_config = DatabaseConfig::with_data_dir(&args.data_dir)
         .with_runtime_threads(runtime_overrides)
         .with_encoded_result_batch(encoded_result_batch)
         .with_bloom_enabled(bloom_enabled)
@@ -270,6 +274,9 @@ fn main() {
         .with_max_levels(args.max_levels as usize)
         .with_engine_status_report_interval_secs(args.engine_status_report_interval_secs)
         .with_engine_status_top_n_tablets(args.engine_status_top_n_tablets);
+    if let Some(flush_threads) = args.flush_threads {
+        db_config = db_config.with_flush_threads(flush_threads as usize);
+    }
     let db = match Database::open(db_config) {
         Ok(db) => Arc::new(db),
         Err(e) => {
@@ -591,5 +598,17 @@ mod tests {
         assert_eq!(args.l0_slowdown_trigger, 24);
         assert_eq!(args.l0_stop_trigger, 36);
         assert_eq!(args.max_levels, 4);
+    }
+
+    #[test]
+    fn test_flush_threads_flag_parse() {
+        let args = Args::try_parse_from(["tisql", "--flush-threads", "3"]).unwrap();
+        assert_eq!(args.flush_threads, Some(3));
+    }
+
+    #[test]
+    fn test_flush_threads_flag_must_be_positive() {
+        let parsed = Args::try_parse_from(["tisql", "--flush-threads", "0"]);
+        assert!(parsed.is_err());
     }
 }
