@@ -14,11 +14,13 @@
 
 use std::collections::{HashMap, HashSet};
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::Arc;
 
+use dashmap::DashMap;
 use hashlink::LinkedHashMap;
 use parking_lot::Mutex;
 
-use super::key::RowCacheKey;
+use super::key::{RowCacheKey, TabletCacheNs};
 
 #[derive(Debug, Default, Clone, Copy)]
 pub struct RowCacheStats {
@@ -27,6 +29,14 @@ pub struct RowCacheStats {
     pub inserts: u64,
     pub evictions: u64,
     pub invalidations: u64,
+    pub insert_rejects: u64,
+}
+
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+pub struct RowCacheNamespaceUsage {
+    pub ns: TabletCacheNs,
+    pub usage_bytes: u64,
+    pub entries: u64,
 }
 
 struct RowEntry {
@@ -43,6 +53,12 @@ struct RowCacheInner {
     capacity_bytes: usize,
 }
 
+#[derive(Default)]
+struct RowNamespaceSlot {
+    usage_bytes: AtomicU64,
+    entries: AtomicU64,
+}
+
 /// Snapshot row cache keyed by `(tablet_ns, user_key, read_ts)`.
 pub struct RowCache {
     inner: Mutex<RowCacheInner>,
@@ -51,6 +67,14 @@ pub struct RowCache {
     inserts: AtomicU64,
     evictions: AtomicU64,
     invalidations: AtomicU64,
+    insert_rejects: AtomicU64,
+    hits_delta: AtomicU64,
+    misses_delta: AtomicU64,
+    inserts_delta: AtomicU64,
+    evictions_delta: AtomicU64,
+    invalidations_delta: AtomicU64,
+    insert_rejects_delta: AtomicU64,
+    namespace_slots: DashMap<TabletCacheNs, Arc<RowNamespaceSlot>>,
 }
 
 impl RowCache {
@@ -67,7 +91,53 @@ impl RowCache {
             inserts: AtomicU64::new(0),
             evictions: AtomicU64::new(0),
             invalidations: AtomicU64::new(0),
+            insert_rejects: AtomicU64::new(0),
+            hits_delta: AtomicU64::new(0),
+            misses_delta: AtomicU64::new(0),
+            inserts_delta: AtomicU64::new(0),
+            evictions_delta: AtomicU64::new(0),
+            invalidations_delta: AtomicU64::new(0),
+            insert_rejects_delta: AtomicU64::new(0),
+            namespace_slots: DashMap::new(),
         }
+    }
+
+    pub fn register_namespace(&self, ns: TabletCacheNs) {
+        let _ = self.slot_for_ns(ns);
+    }
+
+    pub fn unregister_namespace(&self, ns: TabletCacheNs) {
+        self.namespace_slots.remove(&ns);
+    }
+
+    fn slot_for_ns(&self, ns: TabletCacheNs) -> Arc<RowNamespaceSlot> {
+        if let Some(slot) = self.namespace_slots.get(&ns) {
+            return Arc::clone(slot.value());
+        }
+        let slot = Arc::new(RowNamespaceSlot::default());
+        Arc::clone(
+            self.namespace_slots
+                .entry(ns)
+                .or_insert_with(|| Arc::clone(&slot))
+                .value(),
+        )
+    }
+
+    fn account_add(&self, ns: TabletCacheNs, charge: usize) {
+        let slot = self.slot_for_ns(ns);
+        slot.entries.fetch_add(1, Ordering::Relaxed);
+        slot.usage_bytes.fetch_add(charge as u64, Ordering::Relaxed);
+    }
+
+    fn account_remove(&self, ns: TabletCacheNs, charge: usize) {
+        let slot = self.slot_for_ns(ns);
+        let dec = |counter: &AtomicU64, delta: u64| {
+            let _ = counter.fetch_update(Ordering::Relaxed, Ordering::Relaxed, |cur| {
+                Some(cur.saturating_sub(delta))
+            });
+        };
+        dec(&slot.entries, 1);
+        dec(&slot.usage_bytes, charge as u64);
     }
 
     fn charge_for_value(key: &RowCacheKey, value: &Option<Vec<u8>>) -> usize {
@@ -125,10 +195,12 @@ impl RowCache {
         match value {
             Some(value) => {
                 self.hits.fetch_add(1, Ordering::Relaxed);
+                self.hits_delta.fetch_add(1, Ordering::Relaxed);
                 Some(value)
             }
             None => {
                 self.misses.fetch_add(1, Ordering::Relaxed);
+                self.misses_delta.fetch_add(1, Ordering::Relaxed);
                 None
             }
         }
@@ -138,12 +210,15 @@ impl RowCache {
         let mut inner = self.inner.lock();
         let charge = Self::charge_for_value(&key, &value);
         if charge > inner.capacity_bytes {
+            self.insert_rejects.fetch_add(1, Ordering::Relaxed);
+            self.insert_rejects_delta.fetch_add(1, Ordering::Relaxed);
             return false;
         }
 
         if let Some(old) = inner.map.remove(&key) {
             inner.usage_bytes = inner.usage_bytes.saturating_sub(old.charge);
             Self::index_remove(&mut inner, &key);
+            self.account_remove(key.ns, old.charge);
         }
 
         while inner.usage_bytes + charge > inner.capacity_bytes {
@@ -153,12 +228,16 @@ impl RowCache {
             inner.usage_bytes = inner.usage_bytes.saturating_sub(old.charge);
             Self::index_remove(&mut inner, &victim);
             self.evictions.fetch_add(1, Ordering::Relaxed);
+            self.evictions_delta.fetch_add(1, Ordering::Relaxed);
+            self.account_remove(victim.ns, old.charge);
         }
 
         Self::index_insert(&mut inner, &key);
-        inner.map.insert(key, RowEntry { value, charge });
+        inner.map.insert(key.clone(), RowEntry { value, charge });
         inner.usage_bytes += charge;
         self.inserts.fetch_add(1, Ordering::Relaxed);
+        self.inserts_delta.fetch_add(1, Ordering::Relaxed);
+        self.account_add(key.ns, charge);
         true
     }
 
@@ -180,6 +259,8 @@ impl RowCache {
             if let Some(old) = inner.map.remove(&victim) {
                 inner.usage_bytes = inner.usage_bytes.saturating_sub(old.charge);
                 self.invalidations.fetch_add(1, Ordering::Relaxed);
+                self.invalidations_delta.fetch_add(1, Ordering::Relaxed);
+                self.account_remove(ns, old.charge);
             }
         }
     }
@@ -191,7 +272,33 @@ impl RowCache {
             inserts: self.inserts.load(Ordering::Relaxed),
             evictions: self.evictions.load(Ordering::Relaxed),
             invalidations: self.invalidations.load(Ordering::Relaxed),
+            insert_rejects: self.insert_rejects.load(Ordering::Relaxed),
         }
+    }
+
+    pub fn snapshot_and_reset_delta(&self) -> RowCacheStats {
+        RowCacheStats {
+            hits: self.hits_delta.swap(0, Ordering::Relaxed),
+            misses: self.misses_delta.swap(0, Ordering::Relaxed),
+            inserts: self.inserts_delta.swap(0, Ordering::Relaxed),
+            evictions: self.evictions_delta.swap(0, Ordering::Relaxed),
+            invalidations: self.invalidations_delta.swap(0, Ordering::Relaxed),
+            insert_rejects: self.insert_rejects_delta.swap(0, Ordering::Relaxed),
+        }
+    }
+
+    pub fn namespace_usage_snapshot(&self) -> Vec<RowCacheNamespaceUsage> {
+        let mut rows: Vec<_> = self
+            .namespace_slots
+            .iter()
+            .map(|entry| RowCacheNamespaceUsage {
+                ns: *entry.key(),
+                usage_bytes: entry.value().usage_bytes.load(Ordering::Relaxed),
+                entries: entry.value().entries.load(Ordering::Relaxed),
+            })
+            .collect();
+        rows.sort_by_key(|row| row.ns);
+        rows
     }
 }
 

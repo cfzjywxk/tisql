@@ -65,6 +65,7 @@ pub mod recovery;
 pub mod routed_storage;
 pub mod router;
 pub mod sstable;
+pub mod status_reporter;
 pub mod version;
 pub mod version_set;
 
@@ -115,19 +116,22 @@ pub use cache::{
 pub use commit_reservations::{
     CommitLsnReservations, CommitReservation, CommitReservationStats, ReservationGuard,
 };
-pub use lsm::{LevelStats, LsmEngine, LsmStats, TabletEngine, TieredMergeIterator};
+pub use lsm::{
+    BackpressureState, FrozenMemtableStateStats, LevelStats, LsmEngine, LsmStats, TabletEngine,
+    TieredMergeIterator,
+};
 pub use manager::{
     derive_tablet_inventory, GlobalLogGcBoundary, TabletCheckpointCapture,
-    TabletIlogTruncateCapture, TabletManager,
+    TabletIlogTruncateCapture, TabletManager, TabletWorkerStatus,
 };
 pub use routed_storage::RoutedTabletStorage;
 pub use router::{is_system_table_id, route_index_to_tablet, route_table_to_tablet, TabletId};
 
 // Re-export flush scheduler
-pub use flush_scheduler::FlushScheduler;
+pub use flush_scheduler::{FlushScheduler, FlushSchedulerStatus};
 
 // Re-export compaction scheduler
-pub use compaction_scheduler::CompactionScheduler;
+pub use compaction_scheduler::{CompactionScheduler, CompactionSchedulerStatus};
 
 // Re-export compaction types
 pub use compaction::{CompactionExecutor, CompactionPicker, CompactionTask, MergeIterator};
@@ -172,6 +176,12 @@ pub use sstable::{
     FOOTER_SIZE,
     SST_MAGIC,
     SST_VERSION,
+};
+pub use status_reporter::{
+    collect_snapshot, snapshot_to_metric_rows, BackpressureStatus, BlockCacheStatus,
+    CacheDeltaStatus, CacheStatus, EngineStatusMetricRow, EngineStatusReporter,
+    EngineStatusSnapshot, GlobalStatus, IoSourceStatus, IoStatus, JobCounters, JobStatus,
+    RowCacheStatus, TabletStatus,
 };
 
 use std::collections::BTreeMap;

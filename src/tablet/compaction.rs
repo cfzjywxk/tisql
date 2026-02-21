@@ -51,9 +51,12 @@ use fail::fail_point;
 use crate::catalog::types::{RawValue, Timestamp};
 use crate::util::error::Result;
 
+use super::cache::tablet_namespace_from_dir;
 use super::config::LsmConfig;
 use super::mvcc::{decode_mvcc_key, is_tombstone};
-use super::sstable::{AsyncSstBuilder, SstBuilderOptions, SstIterator, SstMeta, SstReaderRef};
+use super::sstable::{
+    AsyncSstBuilder, SstBuilderOptions, SstIterator, SstMeta, SstReadOptions, SstReaderRef,
+};
 use super::version::{ManifestDelta, Version};
 
 /// A compaction task describing which files to compact.
@@ -502,11 +505,23 @@ impl CompactionExecutor {
             ));
         }
 
+        let tablet_ns = tablet_namespace_from_dir(sst_dir.parent().unwrap_or(sst_dir));
+        let reader_options = SstReadOptions {
+            tablet_tag: tablet_ns,
+            bloom_enabled: self.config.bloom_enabled,
+            io_source: crate::io::IoSource::Compaction,
+            ..SstReadOptions::default()
+        };
+
         // Collect input SST readers
         let mut readers = Vec::new();
         for (_level, sst_id) in &task.inputs {
             let sst_path = sst_dir.join(format!("{sst_id:08}.sst"));
-            let reader = SstReaderRef::open(&sst_path, std::sync::Arc::clone(&io)).await?;
+            let mut options = reader_options.clone();
+            options.sst_id = *sst_id;
+            let reader =
+                SstReaderRef::open_with_options(&sst_path, std::sync::Arc::clone(&io), options)
+                    .await?;
             readers.push(reader);
         }
 
@@ -528,7 +543,12 @@ impl CompactionExecutor {
             bloom_enabled: self.config.bloom_enabled,
             bloom_bits_per_key: self.config.bloom_bits_per_key,
         };
-        let mut builder = AsyncSstBuilder::new(&output_path, options.clone(), Arc::clone(&io))?;
+        let mut builder = AsyncSstBuilder::new_with_trace(
+            &output_path,
+            options.clone(),
+            Arc::clone(&io),
+            crate::io::IoTraceTag::new(tablet_ns, crate::io::IoSource::Compaction),
+        )?;
 
         // Merge and write output with optional GC filtering
         let mut output_ssts = Vec::new();
@@ -602,8 +622,12 @@ impl CompactionExecutor {
                         }
                         let new_id = pre_allocated_ids[id_idx];
                         let new_path = sst_dir.join(format!("{new_id:08}.sst"));
-                        builder =
-                            AsyncSstBuilder::new(&new_path, options.clone(), Arc::clone(&io))?;
+                        builder = AsyncSstBuilder::new_with_trace(
+                            &new_path,
+                            options.clone(),
+                            Arc::clone(&io),
+                            crate::io::IoTraceTag::new(tablet_ns, crate::io::IoSource::Compaction),
+                        )?;
                         current_size = 0;
                     }
                 }

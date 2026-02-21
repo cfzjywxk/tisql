@@ -200,6 +200,14 @@ struct Args {
         value_parser = clap::value_parser!(u32).range(2..)
     )]
     max_levels: u32,
+
+    /// Engine status reporter interval in seconds (0 disables).
+    #[arg(long, default_value_t = 60)]
+    engine_status_report_interval_secs: u64,
+
+    /// Maximum tablets emitted in periodic status reports (0 = all).
+    #[arg(long, default_value_t = 20)]
+    engine_status_top_n_tablets: usize,
 }
 
 fn main() {
@@ -259,7 +267,9 @@ fn main() {
         .with_l0_compaction_trigger(args.l0_compaction_trigger as usize)
         .with_l0_slowdown_trigger(args.l0_slowdown_trigger as usize)
         .with_l0_stop_trigger(args.l0_stop_trigger as usize)
-        .with_max_levels(args.max_levels as usize);
+        .with_max_levels(args.max_levels as usize)
+        .with_engine_status_report_interval_secs(args.engine_status_report_interval_secs)
+        .with_engine_status_top_n_tablets(args.engine_status_top_n_tablets);
     let db = match Database::open(db_config) {
         Ok(db) => Arc::new(db),
         Err(e) => {
@@ -322,6 +332,10 @@ fn main() {
     println!(
         "LSM flow control: levels={} l0(compact/slowdown/stop)=({}/{}/{})",
         args.max_levels, args.l0_compaction_trigger, args.l0_slowdown_trigger, args.l0_stop_trigger
+    );
+    println!(
+        "Engine status reporter: interval={}s top_n={}",
+        args.engine_status_report_interval_secs, args.engine_status_top_n_tablets
     );
     println!(
         "Connect with: mysql -h{} -P{} -uroot test",
@@ -507,6 +521,14 @@ mod tests {
         assert_eq!(args.l0_slowdown_trigger, DEFAULT_L0_SLOWDOWN_TRIGGER as u32);
         assert_eq!(args.l0_stop_trigger, DEFAULT_L0_STOP_TRIGGER as u32);
         assert_eq!(args.max_levels, DEFAULT_MAX_LEVELS as u32);
+        assert_eq!(
+            args.engine_status_report_interval_secs,
+            defaults.engine_status_report_interval_secs
+        );
+        assert_eq!(
+            args.engine_status_top_n_tablets,
+            defaults.engine_status_top_n_tablets
+        );
     }
 
     #[test]

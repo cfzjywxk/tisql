@@ -53,7 +53,7 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use crate::catalog::types::Timestamp;
-use crate::io::{AlignedBuf, DmaFile, IoService, DMA_ALIGNMENT};
+use crate::io::{record_io, AlignedBuf, DmaFile, IoOpKind, IoService, IoTraceTag, DMA_ALIGNMENT};
 use crate::tablet::mvcc::extract_key;
 use crate::util::error::{Result, TiSqlError};
 use crate::util::fs::sync_dir;
@@ -439,11 +439,22 @@ pub struct SstBuilder {
     bloom_builder: Option<BloomBuilder>,
     /// Last user key admitted into bloom (dedupe adjacent MVCC versions).
     last_bloom_user_key: Option<Vec<u8>>,
+    /// Optional source tag for direct sync I/O attribution.
+    io_trace: IoTraceTag,
 }
 
 impl SstBuilder {
     /// Create a new SST builder.
     pub fn new<P: AsRef<Path>>(path: P, options: SstBuilderOptions) -> Result<Self> {
+        Self::new_with_trace(path, options, IoTraceTag::default())
+    }
+
+    /// Create a new SST builder with explicit I/O trace attribution.
+    pub fn new_with_trace<P: AsRef<Path>>(
+        path: P,
+        options: SstBuilderOptions,
+        io_trace: IoTraceTag,
+    ) -> Result<Self> {
         let path = path.as_ref().to_path_buf();
         let file = File::create(&path)?;
         let writer = BufWriter::new(file);
@@ -469,7 +480,15 @@ impl SstBuilder {
             finished: false,
             bloom_builder,
             last_bloom_user_key: None,
+            io_trace,
         })
+    }
+
+    #[inline]
+    fn account_write(&self, bytes: usize) {
+        if bytes > 0 {
+            record_io(self.io_trace, IoOpKind::Write, bytes as u64);
+        }
     }
 
     /// Add a key-value entry.
@@ -551,6 +570,7 @@ impl SstBuilder {
 
         // Write data block
         self.writer.write_all(&block_data)?;
+        self.account_write(block_data.len());
         self.current_offset += block_data.len() as u64;
 
         // Add index entry
@@ -611,6 +631,7 @@ impl SstBuilder {
                 let bloom_offset = self.current_offset;
                 let bloom_data = bloom_builder.finish().encode();
                 self.writer.write_all(&bloom_data)?;
+                self.account_write(bloom_data.len());
                 self.current_offset += bloom_data.len() as u64;
                 bloom_span = Some((bloom_offset, bloom_data.len() as u32));
             }
@@ -622,6 +643,7 @@ impl SstBuilder {
         let index_size = index_data.len() as u32;
 
         self.writer.write_all(&index_data)?;
+        self.account_write(index_data.len());
         self.current_offset += index_data.len() as u64;
 
         if let Some((bloom_offset, bloom_size)) = bloom_span {
@@ -630,6 +652,7 @@ impl SstBuilder {
                 bloom_size,
             };
             self.writer.write_all(&trailer.encode())?;
+            self.account_write(BLOOM_META_TRAILER_SIZE);
             self.current_offset += BLOOM_META_TRAILER_SIZE as u64;
         }
 
@@ -649,11 +672,13 @@ impl SstBuilder {
         };
 
         self.writer.write_all(&footer.encode())?;
+        self.account_write(FOOTER_SIZE);
         self.current_offset += FOOTER_SIZE as u64;
 
         // Flush and sync file
         self.writer.flush()?;
         self.writer.get_ref().sync_all()?;
+        record_io(self.io_trace, IoOpKind::Fsync, 0);
 
         // Sync parent directory to make the file's existence durable
         if let Some(parent) = self.path.parent() {
@@ -746,6 +771,8 @@ pub struct AsyncSstBuilder {
     bloom_builder: Option<BloomBuilder>,
     /// Last user key admitted into bloom.
     last_bloom_user_key: Option<Vec<u8>>,
+    /// I/O trace tag used for all file operations from this builder.
+    io_trace: IoTraceTag,
 }
 
 impl AsyncSstBuilder {
@@ -754,6 +781,16 @@ impl AsyncSstBuilder {
         path: P,
         options: SstBuilderOptions,
         io: Arc<IoService>,
+    ) -> Result<Self> {
+        Self::new_with_trace(path, options, io, IoTraceTag::default())
+    }
+
+    /// Create a new async SST builder with explicit I/O trace attribution.
+    pub fn new_with_trace<P: AsRef<Path>>(
+        path: P,
+        options: SstBuilderOptions,
+        io: Arc<IoService>,
+        io_trace: IoTraceTag,
     ) -> Result<Self> {
         let path = path.as_ref().to_path_buf();
         let file = DmaFile::open_write_buffered(&path).map_err(|e| {
@@ -785,6 +822,7 @@ impl AsyncSstBuilder {
             finished: false,
             bloom_builder,
             last_bloom_user_key: None,
+            io_trace,
         })
     }
 
@@ -874,7 +912,7 @@ impl AsyncSstBuilder {
         let buf = AlignedBuf::from_slice(data, DMA_ALIGNMENT);
         let written = self
             .io
-            .write_at(&self.file, self.current_offset, buf)
+            .write_at_with_trace(&self.file, self.current_offset, buf, self.io_trace)
             .await
             .map_err(|e| {
                 TiSqlError::Storage(format!(
@@ -949,12 +987,15 @@ impl AsyncSstBuilder {
         self.write_all(&footer.encode()).await?;
 
         // Fsync data via io_uring
-        self.io.fsync(&self.file).await.map_err(|e| {
-            TiSqlError::Storage(format!(
-                "io_uring fsync failed for {}: {e}",
-                self.path.display()
-            ))
-        })?;
+        self.io
+            .fsync_with_trace(&self.file, self.io_trace)
+            .await
+            .map_err(|e| {
+                TiSqlError::Storage(format!(
+                    "io_uring fsync failed for {}: {e}",
+                    self.path.display()
+                ))
+            })?;
 
         // Sync parent directory to make the file's existence durable
         if let Some(parent) = self.path.parent() {

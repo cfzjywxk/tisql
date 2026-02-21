@@ -18,11 +18,13 @@ pub mod reader_cache;
 pub mod row_cache;
 pub mod suite;
 
-pub use block_cache::{BlockCacheStats, BlockCacheValue, SharedBlockCache};
+pub use block_cache::{
+    BlockCacheNamespaceUsage, BlockCacheStats, BlockCacheValue, SharedBlockCache,
+};
 pub use key::{
     tablet_namespace_from_dir, BlockCacheKey, BlockKind, CachePriority, ReaderCacheKey,
     RowCacheKey, TabletCacheNs,
 };
 pub use reader_cache::{ReaderCache, ReaderCacheStats};
-pub use row_cache::{RowCache, RowCacheStats};
+pub use row_cache::{RowCache, RowCacheNamespaceUsage, RowCacheStats};
 pub use suite::{CacheSuite, CacheSuiteConfig};

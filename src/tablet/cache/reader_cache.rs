@@ -27,6 +27,7 @@ pub struct ReaderCacheStats {
     pub misses: u64,
     pub inserts: u64,
     pub evictions: u64,
+    pub invalidations: u64,
 }
 
 struct ReaderCacheInner {
@@ -41,6 +42,12 @@ pub struct ReaderCache {
     misses: AtomicU64,
     inserts: AtomicU64,
     evictions: AtomicU64,
+    invalidations: AtomicU64,
+    hits_delta: AtomicU64,
+    misses_delta: AtomicU64,
+    inserts_delta: AtomicU64,
+    evictions_delta: AtomicU64,
+    invalidations_delta: AtomicU64,
 }
 
 impl ReaderCache {
@@ -54,6 +61,12 @@ impl ReaderCache {
             misses: AtomicU64::new(0),
             inserts: AtomicU64::new(0),
             evictions: AtomicU64::new(0),
+            invalidations: AtomicU64::new(0),
+            hits_delta: AtomicU64::new(0),
+            misses_delta: AtomicU64::new(0),
+            inserts_delta: AtomicU64::new(0),
+            evictions_delta: AtomicU64::new(0),
+            invalidations_delta: AtomicU64::new(0),
         }
     }
 
@@ -64,15 +77,18 @@ impl ReaderCache {
             Some(value) => match Arc::downcast::<T>(value) {
                 Ok(typed) => {
                     self.hits.fetch_add(1, Ordering::Relaxed);
+                    self.hits_delta.fetch_add(1, Ordering::Relaxed);
                     Some(typed)
                 }
                 Err(_) => {
                     self.misses.fetch_add(1, Ordering::Relaxed);
+                    self.misses_delta.fetch_add(1, Ordering::Relaxed);
                     None
                 }
             },
             None => {
                 self.misses.fetch_add(1, Ordering::Relaxed);
+                self.misses_delta.fetch_add(1, Ordering::Relaxed);
                 None
             }
         }
@@ -87,18 +103,23 @@ impl ReaderCache {
         inner.map.remove(&key);
         inner.map.insert(key, value as Arc<dyn Any + Send + Sync>);
         self.inserts.fetch_add(1, Ordering::Relaxed);
+        self.inserts_delta.fetch_add(1, Ordering::Relaxed);
 
         while inner.map.len() > inner.max_entries {
             let Some((_, _)) = inner.map.pop_front() else {
                 break;
             };
             self.evictions.fetch_add(1, Ordering::Relaxed);
+            self.evictions_delta.fetch_add(1, Ordering::Relaxed);
         }
     }
 
     pub fn remove(&self, key: &ReaderCacheKey) {
         let mut inner = self.inner.lock();
-        inner.map.remove(key);
+        if inner.map.remove(key).is_some() {
+            self.invalidations.fetch_add(1, Ordering::Relaxed);
+            self.invalidations_delta.fetch_add(1, Ordering::Relaxed);
+        }
     }
 
     pub fn remove_sst(&self, ns: u128, sst_id: u64) {
@@ -111,6 +132,17 @@ impl ReaderCache {
             misses: self.misses.load(Ordering::Relaxed),
             inserts: self.inserts.load(Ordering::Relaxed),
             evictions: self.evictions.load(Ordering::Relaxed),
+            invalidations: self.invalidations.load(Ordering::Relaxed),
+        }
+    }
+
+    pub fn snapshot_and_reset_delta(&self) -> ReaderCacheStats {
+        ReaderCacheStats {
+            hits: self.hits_delta.swap(0, Ordering::Relaxed),
+            misses: self.misses_delta.swap(0, Ordering::Relaxed),
+            inserts: self.inserts_delta.swap(0, Ordering::Relaxed),
+            evictions: self.evictions_delta.swap(0, Ordering::Relaxed),
+            invalidations: self.invalidations_delta.swap(0, Ordering::Relaxed),
         }
     }
 }

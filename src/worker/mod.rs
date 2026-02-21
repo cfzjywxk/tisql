@@ -900,6 +900,28 @@ fn handle_show(db: &Database, sql_lower: &str, exec_ctx: &ExecutionCtx) -> Query
                 txn_ctx: None,
             },
         }
+    } else if sql_lower.contains("engine status") {
+        let rows: Vec<Row> = db
+            .engine_status_metric_rows()
+            .into_iter()
+            .map(|row| {
+                Row::new(vec![
+                    crate::catalog::types::Value::String(row.scope),
+                    crate::catalog::types::Value::String(row.tablet),
+                    crate::catalog::types::Value::String(row.metric),
+                    crate::catalog::types::Value::String(row.value),
+                ])
+            })
+            .collect();
+        make_show_response(
+            vec![
+                "scope".to_string(),
+                "tablet".to_string(),
+                "metric".to_string(),
+                "value".to_string(),
+            ],
+            rows,
+        )
     } else if sql_lower.contains("warnings") {
         make_show_response(
             vec![

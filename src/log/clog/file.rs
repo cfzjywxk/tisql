@@ -241,8 +241,12 @@ impl FileClogService {
             lsn_provider.current_lsn()
         );
 
-        let group_writer =
-            super::group_commit::GroupCommitWriter::new(dma_file, Arc::clone(&io), io_handle);
+        let group_writer = super::group_commit::GroupCommitWriter::new_with_trace(
+            dma_file,
+            Arc::clone(&io),
+            io_handle,
+            crate::io::IoTraceTag::new(0, crate::io::IoSource::Other),
+        );
 
         Ok(Self {
             config,

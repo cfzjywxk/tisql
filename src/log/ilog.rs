@@ -334,8 +334,12 @@ impl IlogService {
 
         log_info!("Opened ilog file: {:?}", ilog_path);
 
-        let group_writer =
-            crate::clog::GroupCommitWriter::new(dma_file, Arc::clone(&io), io_handle);
+        let group_writer = crate::clog::GroupCommitWriter::new_with_trace(
+            dma_file,
+            Arc::clone(&io),
+            io_handle,
+            crate::io::IoTraceTag::new(0, crate::io::IoSource::Manifest),
+        );
 
         Ok(Self {
             config,
@@ -803,8 +807,11 @@ impl IlogService {
         // Create IoService internally for test/thread paths
         let io = crate::io::IoService::new(32)
             .map_err(|e| TiSqlError::Internal(format!("Failed to create IoService: {e}")))?;
-        let group_writer =
-            crate::clog::GroupCommitWriter::new_with_thread(dma_file, Arc::clone(&io));
+        let group_writer = crate::clog::GroupCommitWriter::new_with_thread_with_trace(
+            dma_file,
+            Arc::clone(&io),
+            crate::io::IoTraceTag::new(0, crate::io::IoSource::Manifest),
+        );
 
         Ok(Self {
             config,

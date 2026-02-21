@@ -1,0 +1,742 @@
+// Copyright 2024 TiSQL Contributors
+//
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+//     http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
+
+use std::collections::{BTreeMap, HashMap};
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::Arc;
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
+
+use parking_lot::RwLock;
+use tokio::sync::Notify;
+
+use crate::io::{snapshot_io, IoCounterSnapshot, IoSnapshotEntry, IoSource};
+use crate::{log_info, log_warn};
+
+use super::cache::{
+    BlockCacheNamespaceUsage, BlockCacheStats, ReaderCacheStats, RowCacheNamespaceUsage,
+    RowCacheStats,
+};
+use super::{BackpressureState, CacheSuite, LsmStats, TabletId, TabletManager};
+
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct EngineStatusMetricRow {
+    pub scope: String,
+    pub tablet: String,
+    pub metric: String,
+    pub value: String,
+}
+
+#[derive(Debug, Clone, Default)]
+pub struct EngineStatusSnapshot {
+    pub ts_unix_ms: u64,
+    pub collection_duration_us: u64,
+    pub global: GlobalStatus,
+    pub tablets: Vec<TabletStatus>,
+}
+
+#[derive(Debug, Clone, Default)]
+pub struct GlobalStatus {
+    pub tablet_count: usize,
+    pub reported_tablets: usize,
+    pub truncated_tablets: usize,
+    pub total_active_memtable_bytes: usize,
+    pub total_frozen_memtable_bytes: usize,
+    pub total_frozen_memtable_count: usize,
+    pub total_sst_count: usize,
+    pub total_sst_bytes: u64,
+    pub cache_delta: CacheDeltaStatus,
+    pub io: IoStatus,
+    pub flush_jobs: JobCounters,
+    pub compaction_jobs: JobCounters,
+}
+
+#[derive(Debug, Clone)]
+pub struct TabletStatus {
+    pub tablet_id: TabletId,
+    pub tablet_ns: u128,
+    pub cache: CacheStatus,
+    pub io: IoStatus,
+    pub lsm: LsmStats,
+    pub jobs: JobStatus,
+    pub backpressure: BackpressureStatus,
+}
+
+#[derive(Debug, Clone, Default)]
+pub struct CacheStatus {
+    pub block: Option<BlockCacheStatus>,
+    pub row: Option<RowCacheStatus>,
+}
+
+#[derive(Debug, Clone, Default)]
+pub struct CacheDeltaStatus {
+    pub block: Option<BlockCacheStats>,
+    pub row: Option<RowCacheStats>,
+    pub reader: Option<ReaderCacheStats>,
+}
+
+#[derive(Debug, Clone, Default)]
+pub struct BlockCacheStatus {
+    pub data_usage_bytes: u64,
+    pub data_entries: u64,
+    pub index_usage_bytes: u64,
+    pub index_entries: u64,
+    pub bloom_usage_bytes: u64,
+    pub bloom_entries: u64,
+}
+
+impl BlockCacheStatus {
+    pub fn total_usage_bytes(&self) -> u64 {
+        self.data_usage_bytes + self.index_usage_bytes + self.bloom_usage_bytes
+    }
+}
+
+#[derive(Debug, Clone, Default)]
+pub struct RowCacheStatus {
+    pub usage_bytes: u64,
+    pub entries: u64,
+}
+
+#[derive(Debug, Clone, Default)]
+pub struct IoStatus {
+    pub by_source: Vec<IoSourceStatus>,
+    pub foreground_ops: u64,
+    pub foreground_bytes: u64,
+    pub background_ops: u64,
+    pub background_bytes: u64,
+}
+
+#[derive(Debug, Clone, Default)]
+pub struct IoSourceStatus {
+    pub source: IoSource,
+    pub read_ops: u64,
+    pub read_bytes: u64,
+    pub write_ops: u64,
+    pub write_bytes: u64,
+    pub fsync_ops: u64,
+}
+
+impl IoSourceStatus {
+    fn absorb(&mut self, counters: IoCounterSnapshot) {
+        self.read_ops += counters.read_ops;
+        self.read_bytes += counters.read_bytes;
+        self.write_ops += counters.write_ops;
+        self.write_bytes += counters.write_bytes;
+        self.fsync_ops += counters.fsync_ops;
+    }
+}
+
+#[derive(Debug, Clone, Default)]
+pub struct JobStatus {
+    pub flush: JobCounters,
+    pub compaction: JobCounters,
+}
+
+#[derive(Debug, Clone, Default)]
+pub struct JobCounters {
+    pub in_progress: u64,
+    pub completed: u64,
+    pub failed: u64,
+    pub pending: u64,
+    pub last_error_ts_ms: Option<u64>,
+}
+
+#[derive(Debug, Clone, Default)]
+pub struct BackpressureStatus {
+    pub state: BackpressureState,
+    pub slowdown_events: u64,
+    pub stall_events: u64,
+}
+
+pub struct EngineStatusReporter {
+    inner: Arc<EngineStatusReporterInner>,
+    worker_handle: parking_lot::Mutex<Option<tokio::task::JoinHandle<()>>>,
+}
+
+struct EngineStatusReporterInner {
+    tablet_manager: Arc<TabletManager>,
+    cache_suite: Arc<CacheSuite>,
+    interval: Duration,
+    top_n_tablets: usize,
+    shutdown: AtomicBool,
+    notify: Notify,
+    latest_snapshot: RwLock<Option<Arc<EngineStatusSnapshot>>>,
+    previous_io_totals: parking_lot::Mutex<BTreeMap<(u128, IoSource), IoCounterSnapshot>>,
+}
+
+impl EngineStatusReporter {
+    pub fn new(
+        tablet_manager: Arc<TabletManager>,
+        cache_suite: Arc<CacheSuite>,
+        interval_secs: u64,
+        top_n_tablets: usize,
+    ) -> Self {
+        Self {
+            inner: Arc::new(EngineStatusReporterInner {
+                tablet_manager,
+                cache_suite,
+                interval: Duration::from_secs(interval_secs),
+                top_n_tablets,
+                shutdown: AtomicBool::new(false),
+                notify: Notify::new(),
+                latest_snapshot: RwLock::new(None),
+                previous_io_totals: parking_lot::Mutex::new(BTreeMap::new()),
+            }),
+            worker_handle: parking_lot::Mutex::new(None),
+        }
+    }
+
+    pub fn interval(&self) -> Duration {
+        self.inner.interval
+    }
+
+    pub fn start(&self, handle: &tokio::runtime::Handle) {
+        let mut worker = self.worker_handle.lock();
+        if worker.is_some() {
+            return;
+        }
+        let inner = Arc::clone(&self.inner);
+        *worker = Some(handle.spawn(async move {
+            inner.run().await;
+        }));
+    }
+
+    pub fn stop(&self) {
+        self.inner.shutdown.store(true, Ordering::SeqCst);
+        self.inner.notify.notify_one();
+        if let Some(handle) = self.worker_handle.lock().take() {
+            handle.abort();
+        }
+    }
+
+    pub fn latest_snapshot(&self) -> Option<Arc<EngineStatusSnapshot>> {
+        self.inner.latest_snapshot.read().clone()
+    }
+
+    pub fn collect_once(&self) -> Arc<EngineStatusSnapshot> {
+        self.inner.collect_and_publish(true)
+    }
+}
+
+impl Drop for EngineStatusReporter {
+    fn drop(&mut self) {
+        self.stop();
+    }
+}
+
+impl EngineStatusReporterInner {
+    async fn run(&self) {
+        // Publish one snapshot immediately for SQL query path.
+        let _ = self.collect_and_publish(true);
+
+        while !self.shutdown.load(Ordering::Relaxed) {
+            tokio::select! {
+                _ = self.notify.notified() => {}
+                _ = tokio::time::sleep(self.interval) => {}
+            }
+            if self.shutdown.load(Ordering::Relaxed) {
+                break;
+            }
+            let _ = self.collect_and_publish(true);
+        }
+    }
+
+    fn collect_and_publish(&self, emit_log: bool) -> Arc<EngineStatusSnapshot> {
+        let io_entries = self.snapshot_io_delta();
+        let snapshot = Arc::new(collect_snapshot_with_io_entries(
+            self.tablet_manager.as_ref(),
+            self.cache_suite.as_ref(),
+            self.top_n_tablets,
+            io_entries,
+        ));
+        *self.latest_snapshot.write() = Some(Arc::clone(&snapshot));
+        if emit_log {
+            log_snapshot(snapshot.as_ref());
+        }
+        snapshot
+    }
+
+    fn snapshot_io_delta(&self) -> Vec<IoSnapshotEntry> {
+        let current_entries = snapshot_io();
+        let mut previous = self.previous_io_totals.lock();
+        let mut current_totals: BTreeMap<(u128, IoSource), IoCounterSnapshot> = BTreeMap::new();
+        let mut deltas = Vec::with_capacity(current_entries.len());
+
+        for entry in current_entries {
+            let key = (entry.tablet_ns, entry.source);
+            let previous_counters = previous.get(&key).copied().unwrap_or_default();
+            current_totals.insert(key, entry.counters);
+
+            let delta = diff_io_counters(entry.counters, previous_counters);
+            if !io_counters_is_zero(delta) {
+                deltas.push(IoSnapshotEntry {
+                    tablet_ns: entry.tablet_ns,
+                    source: entry.source,
+                    counters: delta,
+                });
+            }
+        }
+
+        *previous = current_totals;
+        deltas
+    }
+}
+
+pub fn collect_snapshot(
+    tablet_manager: &TabletManager,
+    cache_suite: &CacheSuite,
+    top_n_tablets: usize,
+) -> EngineStatusSnapshot {
+    collect_snapshot_with_io_entries(tablet_manager, cache_suite, top_n_tablets, snapshot_io())
+}
+
+fn collect_snapshot_with_io_entries(
+    tablet_manager: &TabletManager,
+    cache_suite: &CacheSuite,
+    top_n_tablets: usize,
+    io_entries: Vec<IoSnapshotEntry>,
+) -> EngineStatusSnapshot {
+    let begin = Instant::now();
+    let ts_unix_ms = now_ms();
+    let tablets = tablet_manager.all_tablets();
+    let worker_statuses = tablet_manager.worker_statuses();
+    let cache_delta = collect_cache_delta(cache_suite);
+    let block_usage = collect_block_usage(cache_suite);
+    let row_usage = collect_row_usage(cache_suite);
+    let global_io = io_from_entries(&io_entries);
+
+    let mut io_by_ns: BTreeMap<u128, Vec<IoSnapshotEntry>> = BTreeMap::new();
+    for entry in io_entries {
+        io_by_ns.entry(entry.tablet_ns).or_default().push(entry);
+    }
+
+    let mut tablet_rows: Vec<TabletStatus> = Vec::with_capacity(tablets.len());
+    for (tablet_id, tablet) in tablets {
+        let ns = tablet.tablet_cache_ns();
+        let lsm = tablet.stats();
+        let jobs = worker_statuses.get(&tablet_id).copied().unwrap_or_default();
+
+        let cache = CacheStatus {
+            block: block_usage.get(&ns).cloned().map(to_block_cache_status),
+            row: row_usage.get(&ns).cloned().map(to_row_cache_status),
+        };
+        let io = io_from_entries(io_by_ns.get(&ns).map(Vec::as_slice).unwrap_or(&[]));
+        let backpressure = BackpressureStatus {
+            state: lsm.backpressure_state,
+            slowdown_events: lsm.slowdown_events,
+            stall_events: lsm.stall_events,
+        };
+        let job_status = JobStatus {
+            flush: JobCounters {
+                in_progress: jobs.flush.in_progress,
+                completed: jobs.flush.completed,
+                failed: jobs.flush.failed,
+                pending: tablet.frozen_count() as u64,
+                last_error_ts_ms: jobs.flush.last_error_ts_ms,
+            },
+            compaction: JobCounters {
+                in_progress: jobs.compaction.in_progress,
+                completed: jobs.compaction.completed,
+                failed: jobs.compaction.failed,
+                pending: if tablet.has_pending_compaction() {
+                    1
+                } else {
+                    0
+                },
+                last_error_ts_ms: jobs.compaction.last_error_ts_ms,
+            },
+        };
+        tablet_rows.push(TabletStatus {
+            tablet_id,
+            tablet_ns: ns,
+            cache,
+            io,
+            lsm,
+            jobs: job_status,
+            backpressure,
+        });
+    }
+
+    let mut global = GlobalStatus {
+        tablet_count: tablet_rows.len(),
+        cache_delta,
+        io: global_io,
+        ..GlobalStatus::default()
+    };
+    for tablet in &tablet_rows {
+        global.total_active_memtable_bytes += tablet.lsm.active_memtable_size;
+        global.total_frozen_memtable_bytes += tablet.lsm.frozen_memtable_bytes;
+        global.total_frozen_memtable_count += tablet.lsm.frozen_memtable_count;
+        global.total_sst_count += tablet.lsm.total_sst_count;
+        global.total_sst_bytes += tablet.lsm.total_sst_bytes;
+        global.flush_jobs.in_progress += tablet.jobs.flush.in_progress;
+        global.flush_jobs.completed += tablet.jobs.flush.completed;
+        global.flush_jobs.failed += tablet.jobs.flush.failed;
+        global.flush_jobs.pending += tablet.jobs.flush.pending;
+        global.compaction_jobs.in_progress += tablet.jobs.compaction.in_progress;
+        global.compaction_jobs.completed += tablet.jobs.compaction.completed;
+        global.compaction_jobs.failed += tablet.jobs.compaction.failed;
+        global.compaction_jobs.pending += tablet.jobs.compaction.pending;
+    }
+
+    tablet_rows.sort_by(|a, b| {
+        b.lsm
+            .total_sst_bytes
+            .cmp(&a.lsm.total_sst_bytes)
+            .then(a.tablet_id.cmp(&b.tablet_id))
+    });
+    if top_n_tablets > 0 && tablet_rows.len() > top_n_tablets {
+        global.truncated_tablets = tablet_rows.len() - top_n_tablets;
+        tablet_rows.truncate(top_n_tablets);
+    }
+    global.reported_tablets = tablet_rows.len();
+
+    EngineStatusSnapshot {
+        ts_unix_ms,
+        collection_duration_us: begin.elapsed().as_micros() as u64,
+        global,
+        tablets: tablet_rows,
+    }
+}
+
+fn to_block_cache_status(usage: BlockCacheNamespaceUsage) -> BlockCacheStatus {
+    BlockCacheStatus {
+        data_usage_bytes: usage.data_usage_bytes,
+        data_entries: usage.data_entries,
+        index_usage_bytes: usage.index_usage_bytes,
+        index_entries: usage.index_entries,
+        bloom_usage_bytes: usage.bloom_usage_bytes,
+        bloom_entries: usage.bloom_entries,
+    }
+}
+
+fn to_row_cache_status(usage: RowCacheNamespaceUsage) -> RowCacheStatus {
+    RowCacheStatus {
+        usage_bytes: usage.usage_bytes,
+        entries: usage.entries,
+    }
+}
+
+fn collect_block_usage(cache_suite: &CacheSuite) -> HashMap<u128, BlockCacheNamespaceUsage> {
+    let mut map = HashMap::new();
+    if let Some(block_cache) = cache_suite.block_cache() {
+        for row in block_cache.namespace_usage_snapshot() {
+            map.insert(row.ns, row);
+        }
+    }
+    map
+}
+
+fn collect_row_usage(cache_suite: &CacheSuite) -> HashMap<u128, RowCacheNamespaceUsage> {
+    let mut map = HashMap::new();
+    if let Some(row_cache) = cache_suite.row_cache() {
+        for row in row_cache.namespace_usage_snapshot() {
+            map.insert(row.ns, row);
+        }
+    }
+    map
+}
+
+fn collect_cache_delta(cache_suite: &CacheSuite) -> CacheDeltaStatus {
+    CacheDeltaStatus {
+        block: cache_suite
+            .block_cache()
+            .map(|cache| cache.snapshot_and_reset_delta()),
+        row: cache_suite
+            .row_cache()
+            .map(|cache| cache.snapshot_and_reset_delta()),
+        reader: cache_suite
+            .reader_cache()
+            .map(|cache| cache.snapshot_and_reset_delta()),
+    }
+}
+
+fn io_from_entries(entries: &[IoSnapshotEntry]) -> IoStatus {
+    let mut by_source_map: BTreeMap<IoSource, IoSourceStatus> = BTreeMap::new();
+    let mut status = IoStatus::default();
+
+    for entry in entries {
+        let source_status = by_source_map
+            .entry(entry.source)
+            .or_insert_with(|| IoSourceStatus {
+                source: entry.source,
+                ..IoSourceStatus::default()
+            });
+        source_status.absorb(entry.counters);
+    }
+
+    status.by_source = by_source_map.into_values().collect();
+    for source in &status.by_source {
+        let ops = source.read_ops + source.write_ops;
+        let bytes = source.read_bytes + source.write_bytes;
+        if source.source.is_background() {
+            status.background_ops += ops;
+            status.background_bytes += bytes;
+        } else {
+            status.foreground_ops += ops;
+            status.foreground_bytes += bytes;
+        }
+    }
+    status
+}
+
+fn diff_io_counters(current: IoCounterSnapshot, previous: IoCounterSnapshot) -> IoCounterSnapshot {
+    IoCounterSnapshot {
+        read_ops: current.read_ops.saturating_sub(previous.read_ops),
+        read_bytes: current.read_bytes.saturating_sub(previous.read_bytes),
+        write_ops: current.write_ops.saturating_sub(previous.write_ops),
+        write_bytes: current.write_bytes.saturating_sub(previous.write_bytes),
+        fsync_ops: current.fsync_ops.saturating_sub(previous.fsync_ops),
+    }
+}
+
+fn io_counters_is_zero(counters: IoCounterSnapshot) -> bool {
+    counters.read_ops == 0
+        && counters.read_bytes == 0
+        && counters.write_ops == 0
+        && counters.write_bytes == 0
+        && counters.fsync_ops == 0
+}
+
+pub fn log_snapshot(snapshot: &EngineStatusSnapshot) {
+    let block_delta = snapshot.global.cache_delta.block.unwrap_or_default();
+    let fg_read_ops: u64 = snapshot
+        .global
+        .io
+        .by_source
+        .iter()
+        .filter(|s| !s.source.is_background())
+        .map(|s| s.read_ops)
+        .sum();
+    let fg_read_bytes: u64 = snapshot
+        .global
+        .io
+        .by_source
+        .iter()
+        .filter(|s| !s.source.is_background())
+        .map(|s| s.read_bytes)
+        .sum();
+    let bg_write_ops: u64 = snapshot
+        .global
+        .io
+        .by_source
+        .iter()
+        .filter(|s| s.source.is_background())
+        .map(|s| s.write_ops)
+        .sum();
+    let bg_write_bytes: u64 = snapshot
+        .global
+        .io
+        .by_source
+        .iter()
+        .filter(|s| s.source.is_background())
+        .map(|s| s.write_bytes)
+        .sum();
+
+    log_info!(
+        "[engine-status] ts={} collect_us={} tablets={} reported={} cache_delta:hits={} misses={} io:fg_read={}/{} bg_write={}/{}",
+        snapshot.ts_unix_ms,
+        snapshot.collection_duration_us,
+        snapshot.global.tablet_count,
+        snapshot.global.reported_tablets,
+        block_delta.hits,
+        block_delta.misses,
+        fg_read_ops,
+        fg_read_bytes,
+        bg_write_ops,
+        bg_write_bytes
+    );
+
+    for tablet in &snapshot.tablets {
+        log_info!(
+            "[engine-status][tablet={}] cache:block={} row={} lsm:mem={} frozen={}/{} L0={} total_sst={} flush:run={} pend={} compact:run={} pend={} bp={:?}",
+            tablet.tablet_id.dir_name(),
+            tablet
+                .cache
+                .block
+                .as_ref()
+                .map_or(0, BlockCacheStatus::total_usage_bytes),
+            tablet.cache.row.as_ref().map_or(0, |row| row.usage_bytes),
+            tablet.lsm.active_memtable_size,
+            tablet.lsm.frozen_memtable_count,
+            tablet.lsm.frozen_memtable_bytes,
+            tablet.lsm.l0_sst_count,
+            tablet.lsm.total_sst_bytes,
+            tablet.jobs.flush.in_progress,
+            tablet.jobs.flush.pending,
+            tablet.jobs.compaction.in_progress,
+            tablet.jobs.compaction.pending,
+            tablet.backpressure.state
+        );
+    }
+
+    if snapshot.collection_duration_us > 500_000 {
+        log_warn!(
+            "[engine-status] status collection slow: collect_us={}",
+            snapshot.collection_duration_us
+        );
+    }
+}
+
+fn push_metric(
+    rows: &mut Vec<EngineStatusMetricRow>,
+    scope: &str,
+    tablet: &str,
+    metric: &str,
+    value: impl ToString,
+) {
+    rows.push(EngineStatusMetricRow {
+        scope: scope.to_string(),
+        tablet: tablet.to_string(),
+        metric: metric.to_string(),
+        value: value.to_string(),
+    });
+}
+
+pub fn snapshot_to_metric_rows(snapshot: &EngineStatusSnapshot) -> Vec<EngineStatusMetricRow> {
+    let mut rows = Vec::new();
+    push_metric(&mut rows, "global", "", "ts_unix_ms", snapshot.ts_unix_ms);
+    push_metric(
+        &mut rows,
+        "global",
+        "",
+        "collection_duration_us",
+        snapshot.collection_duration_us,
+    );
+    push_metric(
+        &mut rows,
+        "global",
+        "",
+        "tablet_count",
+        snapshot.global.tablet_count,
+    );
+    push_metric(
+        &mut rows,
+        "global",
+        "",
+        "reported_tablets",
+        snapshot.global.reported_tablets,
+    );
+    push_metric(
+        &mut rows,
+        "global",
+        "",
+        "total_sst_bytes",
+        snapshot.global.total_sst_bytes,
+    );
+
+    for source in &snapshot.global.io.by_source {
+        let prefix = format!("io.{:?}", source.source);
+        push_metric(
+            &mut rows,
+            "global",
+            "",
+            &format!("{prefix}.read_ops"),
+            source.read_ops,
+        );
+        push_metric(
+            &mut rows,
+            "global",
+            "",
+            &format!("{prefix}.write_ops"),
+            source.write_ops,
+        );
+        push_metric(
+            &mut rows,
+            "global",
+            "",
+            &format!("{prefix}.write_bytes"),
+            source.write_bytes,
+        );
+    }
+
+    for tablet in &snapshot.tablets {
+        let name = tablet.tablet_id.dir_name();
+        push_metric(&mut rows, "tablet", &name, "tablet_ns", tablet.tablet_ns);
+        push_metric(
+            &mut rows,
+            "tablet",
+            &name,
+            "lsm.active_memtable_size",
+            tablet.lsm.active_memtable_size,
+        );
+        push_metric(
+            &mut rows,
+            "tablet",
+            &name,
+            "lsm.frozen_memtable_count",
+            tablet.lsm.frozen_memtable_count,
+        );
+        push_metric(
+            &mut rows,
+            "tablet",
+            &name,
+            "lsm.l0_sst_count",
+            tablet.lsm.l0_sst_count,
+        );
+        push_metric(
+            &mut rows,
+            "tablet",
+            &name,
+            "lsm.total_sst_bytes",
+            tablet.lsm.total_sst_bytes,
+        );
+        push_metric(
+            &mut rows,
+            "tablet",
+            &name,
+            "backpressure.state",
+            format!("{:?}", tablet.backpressure.state),
+        );
+        push_metric(
+            &mut rows,
+            "tablet",
+            &name,
+            "jobs.flush.in_progress",
+            tablet.jobs.flush.in_progress,
+        );
+        push_metric(
+            &mut rows,
+            "tablet",
+            &name,
+            "jobs.compaction.in_progress",
+            tablet.jobs.compaction.in_progress,
+        );
+        if let Some(block) = &tablet.cache.block {
+            push_metric(
+                &mut rows,
+                "tablet",
+                &name,
+                "cache.block.total_usage_bytes",
+                block.total_usage_bytes(),
+            );
+        }
+        if let Some(row) = &tablet.cache.row {
+            push_metric(
+                &mut rows,
+                "tablet",
+                &name,
+                "cache.row.usage_bytes",
+                row.usage_bytes,
+            );
+        }
+    }
+    rows
+}
+
+fn now_ms() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_millis() as u64)
+        .unwrap_or(0)
+}

@@ -40,11 +40,19 @@
 
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use tokio::sync::Notify;
 
 use super::lsm::LsmEngine;
+
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+pub struct FlushSchedulerStatus {
+    pub in_progress: u64,
+    pub completed: u64,
+    pub failed: u64,
+    pub last_error_ts_ms: Option<u64>,
+}
 
 /// Background flush scheduler for LSM storage engine.
 ///
@@ -71,6 +79,14 @@ struct FlushSchedulerInner {
 
     /// Number of flushes completed (for testing/monitoring).
     flush_count: AtomicU64,
+    /// Number of flush jobs currently running.
+    in_progress: AtomicU64,
+    /// Number of flush jobs completed.
+    completed: AtomicU64,
+    /// Number of flush jobs failed.
+    failed: AtomicU64,
+    /// Last flush error timestamp in unix millis.
+    last_error_ts_ms: AtomicU64,
 }
 
 impl FlushScheduler {
@@ -84,6 +100,10 @@ impl FlushScheduler {
                 shutdown: AtomicBool::new(false),
                 notify: Notify::new(),
                 flush_count: AtomicU64::new(0),
+                in_progress: AtomicU64::new(0),
+                completed: AtomicU64::new(0),
+                failed: AtomicU64::new(0),
+                last_error_ts_ms: AtomicU64::new(0),
             }),
             worker_handle: parking_lot::Mutex::new(None),
         }
@@ -141,6 +161,16 @@ impl FlushScheduler {
         self.inner.flush_count.load(Ordering::Relaxed)
     }
 
+    pub fn status(&self) -> FlushSchedulerStatus {
+        let last = self.inner.last_error_ts_ms.load(Ordering::Relaxed);
+        FlushSchedulerStatus {
+            in_progress: self.inner.in_progress.load(Ordering::Relaxed),
+            completed: self.inner.completed.load(Ordering::Relaxed),
+            failed: self.inner.failed.load(Ordering::Relaxed),
+            last_error_ts_ms: (last != 0).then_some(last),
+        }
+    }
+
     /// Wait for at least `count` flushes to complete.
     ///
     /// Used for testing. Returns false if timeout occurs.
@@ -163,6 +193,13 @@ impl Drop for FlushScheduler {
 }
 
 impl FlushSchedulerInner {
+    fn now_ms() -> u64 {
+        SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map(|d| d.as_millis() as u64)
+            .unwrap_or(0)
+    }
+
     /// Main loop for the flush worker (async — tokio task).
     async fn flush_worker_loop(&self) {
         tracing::info!("Flush worker started (async)");
@@ -171,11 +208,28 @@ impl FlushSchedulerInner {
             let frozen_count = self.engine.frozen_count();
 
             if frozen_count > 0 {
+                self.in_progress.fetch_add(1, Ordering::Relaxed);
+                let start = Instant::now();
+                tracing::info!(
+                    "[engine-event] op=flush phase=begin tablet_ns={} frozen={}",
+                    self.engine.tablet_cache_ns(),
+                    frozen_count
+                );
                 match self.engine.flush_all_async().await {
                     Ok(metas) => {
                         if !metas.is_empty() {
                             self.flush_count
                                 .fetch_add(metas.len() as u64, Ordering::Relaxed);
+                            self.completed.fetch_add(1, Ordering::Relaxed);
+                            let bytes: u64 = metas.iter().map(|m| m.file_size).sum();
+                            tracing::info!(
+                                "[engine-event] op=flush phase=finish tablet_ns={} memtables={} files={} bytes={} elapsed_ms={}",
+                                self.engine.tablet_cache_ns(),
+                                metas.len(),
+                                metas.len(),
+                                bytes,
+                                start.elapsed().as_millis()
+                            );
                             tracing::debug!(
                                 "Flushed {} memtables, total flushes: {}",
                                 metas.len(),
@@ -189,10 +243,20 @@ impl FlushSchedulerInner {
                         }
                     }
                     Err(e) => {
+                        self.failed.fetch_add(1, Ordering::Relaxed);
+                        self.last_error_ts_ms
+                            .store(Self::now_ms(), Ordering::Relaxed);
+                        tracing::warn!(
+                            "[engine-event] op=flush phase=abort tablet_ns={} reason=\"{}\" elapsed_ms={}",
+                            self.engine.tablet_cache_ns(),
+                            e,
+                            start.elapsed().as_millis()
+                        );
                         tracing::error!("Flush failed: {e}");
                         tokio::time::sleep(Duration::from_millis(100)).await;
                     }
                 }
+                self.in_progress.fetch_sub(1, Ordering::Relaxed);
             } else {
                 tokio::select! {
                     _ = self.notify.notified() => {}

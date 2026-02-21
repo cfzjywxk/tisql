@@ -32,10 +32,17 @@
 //!                                   send result via oneshot
 //! ```
 
+mod accounting;
 mod aligned_buf;
 mod dma_file;
 mod service;
 
+#[cfg(test)]
+pub use accounting::reset_io_accounting;
+pub use accounting::{
+    record_io, remove_io_namespace, snapshot_io, IoAccountant, IoCounterSnapshot, IoOpKind,
+    IoSnapshotEntry, IoSource, IoTraceTag,
+};
 pub use aligned_buf::{AlignedBuf, DMA_ALIGNMENT};
 pub use dma_file::DmaFile;
 pub use service::{IoFuture, IoService};

@@ -16,10 +16,11 @@ use std::hash::Hasher;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 
+use dashmap::DashMap;
 use hashlink::LinkedHashMap;
 use parking_lot::Mutex;
 
-use super::key::{BlockCacheKey, CachePriority};
+use super::key::{BlockCacheKey, BlockKind, CachePriority, TabletCacheNs};
 
 /// Cache value type for block payloads.
 pub type BlockCacheValue = Arc<[u8]>;
@@ -30,7 +31,19 @@ pub struct BlockCacheStats {
     pub misses: u64,
     pub inserts: u64,
     pub evictions: u64,
+    pub invalidations: u64,
     pub insert_rejects: u64,
+}
+
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+pub struct BlockCacheNamespaceUsage {
+    pub ns: TabletCacheNs,
+    pub data_usage_bytes: u64,
+    pub data_entries: u64,
+    pub index_usage_bytes: u64,
+    pub index_entries: u64,
+    pub bloom_usage_bytes: u64,
+    pub bloom_entries: u64,
 }
 
 struct BlockEntry {
@@ -55,9 +68,13 @@ impl BlockShard {
         }
     }
 
-    fn remove_existing(&mut self, key: &BlockCacheKey) {
+    fn remove_existing<F>(&mut self, key: &BlockCacheKey, on_remove: &mut F)
+    where
+        F: FnMut(&BlockCacheKey, usize),
+    {
         if let Some(old) = self.normal.remove(key).or_else(|| self.high.remove(key)) {
             self.usage = self.usage.saturating_sub(old.charge);
+            on_remove(key, old.charge);
         }
     }
 
@@ -68,34 +85,43 @@ impl BlockShard {
         self.high.to_back(key).map(|entry| Arc::clone(&entry.value))
     }
 
-    fn evict_one_normal_first(&mut self) -> bool {
-        if let Some((_, entry)) = self.normal.pop_front() {
+    fn evict_one_normal_first<F>(&mut self, on_remove: &mut F) -> bool
+    where
+        F: FnMut(&BlockCacheKey, usize),
+    {
+        if let Some((key, entry)) = self.normal.pop_front() {
             self.usage = self.usage.saturating_sub(entry.charge);
+            on_remove(&key, entry.charge);
             return true;
         }
-        if let Some((_, entry)) = self.high.pop_front() {
+        if let Some((key, entry)) = self.high.pop_front() {
             self.usage = self.usage.saturating_sub(entry.charge);
+            on_remove(&key, entry.charge);
             return true;
         }
         false
     }
 
-    fn insert(
+    fn insert<F>(
         &mut self,
         key: BlockCacheKey,
         value: BlockCacheValue,
         charge: usize,
         priority: CachePriority,
-    ) -> (bool, u64) {
+        mut on_remove: F,
+    ) -> (bool, u64)
+    where
+        F: FnMut(&BlockCacheKey, usize),
+    {
         if charge > self.capacity {
             return (false, 0);
         }
 
-        self.remove_existing(&key);
+        self.remove_existing(&key, &mut on_remove);
 
         let mut evicted = 0;
         while self.usage + charge > self.capacity {
-            if !self.evict_one_normal_first() {
+            if !self.evict_one_normal_first(&mut on_remove) {
                 return (false, evicted);
             }
             evicted += 1;
@@ -114,7 +140,11 @@ impl BlockShard {
         (true, evicted)
     }
 
-    fn remove_by_sst(&mut self, ns: u128, sst_id: u64) {
+    fn remove_by_sst<F>(&mut self, ns: u128, sst_id: u64, mut on_remove: F) -> u64
+    where
+        F: FnMut(&BlockCacheKey, usize),
+    {
+        let mut removed = 0u64;
         let normal_victims: Vec<BlockCacheKey> = self
             .normal
             .keys()
@@ -124,6 +154,8 @@ impl BlockShard {
         for key in normal_victims {
             if let Some(entry) = self.normal.remove(&key) {
                 self.usage = self.usage.saturating_sub(entry.charge);
+                on_remove(&key, entry.charge);
+                removed += 1;
             }
         }
 
@@ -136,9 +168,22 @@ impl BlockShard {
         for key in high_victims {
             if let Some(entry) = self.high.remove(&key) {
                 self.usage = self.usage.saturating_sub(entry.charge);
+                on_remove(&key, entry.charge);
+                removed += 1;
             }
         }
+        removed
     }
+}
+
+#[derive(Default)]
+struct BlockNamespaceSlot {
+    data_usage_bytes: AtomicU64,
+    data_entries: AtomicU64,
+    index_usage_bytes: AtomicU64,
+    index_entries: AtomicU64,
+    bloom_usage_bytes: AtomicU64,
+    bloom_entries: AtomicU64,
 }
 
 /// Process-wide shared block cache (sharded strict-cap LRU).
@@ -148,7 +193,15 @@ pub struct SharedBlockCache {
     misses: AtomicU64,
     inserts: AtomicU64,
     evictions: AtomicU64,
+    invalidations: AtomicU64,
     insert_rejects: AtomicU64,
+    hits_delta: AtomicU64,
+    misses_delta: AtomicU64,
+    inserts_delta: AtomicU64,
+    evictions_delta: AtomicU64,
+    invalidations_delta: AtomicU64,
+    insert_rejects_delta: AtomicU64,
+    namespace_slots: DashMap<TabletCacheNs, Arc<BlockNamespaceSlot>>,
 }
 
 impl SharedBlockCache {
@@ -165,7 +218,15 @@ impl SharedBlockCache {
             misses: AtomicU64::new(0),
             inserts: AtomicU64::new(0),
             evictions: AtomicU64::new(0),
+            invalidations: AtomicU64::new(0),
             insert_rejects: AtomicU64::new(0),
+            hits_delta: AtomicU64::new(0),
+            misses_delta: AtomicU64::new(0),
+            inserts_delta: AtomicU64::new(0),
+            evictions_delta: AtomicU64::new(0),
+            invalidations_delta: AtomicU64::new(0),
+            insert_rejects_delta: AtomicU64::new(0),
+            namespace_slots: DashMap::new(),
         }
     }
 
@@ -181,10 +242,12 @@ impl SharedBlockCache {
         match shard.get(key) {
             Some(v) => {
                 self.hits.fetch_add(1, Ordering::Relaxed);
+                self.hits_delta.fetch_add(1, Ordering::Relaxed);
                 Some(v)
             }
             None => {
                 self.misses.fetch_add(1, Ordering::Relaxed);
+                self.misses_delta.fetch_add(1, Ordering::Relaxed);
                 None
             }
         }
@@ -199,21 +262,100 @@ impl SharedBlockCache {
     ) -> bool {
         let idx = self.shard_index(&key);
         let mut shard = self.shards[idx].lock();
-        let (ok, evicted) = shard.insert(key, value, charge, priority);
+        let (ok, evicted) = shard.insert(key, value, charge, priority, |removed_key, removed| {
+            self.account_remove(removed_key.ns, removed_key.block_kind, removed as u64);
+        });
         if ok {
             self.inserts.fetch_add(1, Ordering::Relaxed);
+            self.inserts_delta.fetch_add(1, Ordering::Relaxed);
+            self.account_add(key.ns, key.block_kind, charge as u64);
             if evicted > 0 {
                 self.evictions.fetch_add(evicted, Ordering::Relaxed);
+                self.evictions_delta.fetch_add(evicted, Ordering::Relaxed);
             }
         } else {
             self.insert_rejects.fetch_add(1, Ordering::Relaxed);
+            self.insert_rejects_delta.fetch_add(1, Ordering::Relaxed);
         }
         ok
     }
 
+    pub fn register_namespace(&self, ns: TabletCacheNs) {
+        let _ = self.slot_for_ns(ns);
+    }
+
+    pub fn unregister_namespace(&self, ns: TabletCacheNs) {
+        self.namespace_slots.remove(&ns);
+    }
+
+    fn slot_for_ns(&self, ns: TabletCacheNs) -> Arc<BlockNamespaceSlot> {
+        if let Some(slot) = self.namespace_slots.get(&ns) {
+            return Arc::clone(slot.value());
+        }
+        let slot = Arc::new(BlockNamespaceSlot::default());
+        Arc::clone(
+            self.namespace_slots
+                .entry(ns)
+                .or_insert_with(|| Arc::clone(&slot))
+                .value(),
+        )
+    }
+
+    fn account_add(&self, ns: TabletCacheNs, kind: BlockKind, charge: u64) {
+        let slot = self.slot_for_ns(ns);
+        match kind {
+            BlockKind::Data => {
+                slot.data_entries.fetch_add(1, Ordering::Relaxed);
+                slot.data_usage_bytes.fetch_add(charge, Ordering::Relaxed);
+            }
+            BlockKind::Index => {
+                slot.index_entries.fetch_add(1, Ordering::Relaxed);
+                slot.index_usage_bytes.fetch_add(charge, Ordering::Relaxed);
+            }
+            BlockKind::Bloom => {
+                slot.bloom_entries.fetch_add(1, Ordering::Relaxed);
+                slot.bloom_usage_bytes.fetch_add(charge, Ordering::Relaxed);
+            }
+        }
+    }
+
+    fn account_remove(&self, ns: TabletCacheNs, kind: BlockKind, charge: u64) {
+        let slot = self.slot_for_ns(ns);
+        let dec = |counter: &AtomicU64, delta: u64| {
+            let _ = counter.fetch_update(Ordering::Relaxed, Ordering::Relaxed, |cur| {
+                Some(cur.saturating_sub(delta))
+            });
+        };
+        match kind {
+            BlockKind::Data => {
+                dec(&slot.data_entries, 1);
+                dec(&slot.data_usage_bytes, charge);
+            }
+            BlockKind::Index => {
+                dec(&slot.index_entries, 1);
+                dec(&slot.index_usage_bytes, charge);
+            }
+            BlockKind::Bloom => {
+                dec(&slot.bloom_entries, 1);
+                dec(&slot.bloom_usage_bytes, charge);
+            }
+        }
+    }
+
     pub fn remove_sst(&self, ns: u128, sst_id: u64) {
+        let mut removed_total = 0u64;
         for shard in &self.shards {
-            shard.lock().remove_by_sst(ns, sst_id);
+            removed_total += shard
+                .lock()
+                .remove_by_sst(ns, sst_id, |removed_key, removed| {
+                    self.account_remove(removed_key.ns, removed_key.block_kind, removed as u64);
+                });
+        }
+        if removed_total > 0 {
+            self.invalidations
+                .fetch_add(removed_total, Ordering::Relaxed);
+            self.invalidations_delta
+                .fetch_add(removed_total, Ordering::Relaxed);
         }
     }
 
@@ -223,8 +365,38 @@ impl SharedBlockCache {
             misses: self.misses.load(Ordering::Relaxed),
             inserts: self.inserts.load(Ordering::Relaxed),
             evictions: self.evictions.load(Ordering::Relaxed),
+            invalidations: self.invalidations.load(Ordering::Relaxed),
             insert_rejects: self.insert_rejects.load(Ordering::Relaxed),
         }
+    }
+
+    pub fn snapshot_and_reset_delta(&self) -> BlockCacheStats {
+        BlockCacheStats {
+            hits: self.hits_delta.swap(0, Ordering::Relaxed),
+            misses: self.misses_delta.swap(0, Ordering::Relaxed),
+            inserts: self.inserts_delta.swap(0, Ordering::Relaxed),
+            evictions: self.evictions_delta.swap(0, Ordering::Relaxed),
+            invalidations: self.invalidations_delta.swap(0, Ordering::Relaxed),
+            insert_rejects: self.insert_rejects_delta.swap(0, Ordering::Relaxed),
+        }
+    }
+
+    pub fn namespace_usage_snapshot(&self) -> Vec<BlockCacheNamespaceUsage> {
+        let mut rows: Vec<_> = self
+            .namespace_slots
+            .iter()
+            .map(|entry| BlockCacheNamespaceUsage {
+                ns: *entry.key(),
+                data_usage_bytes: entry.value().data_usage_bytes.load(Ordering::Relaxed),
+                data_entries: entry.value().data_entries.load(Ordering::Relaxed),
+                index_usage_bytes: entry.value().index_usage_bytes.load(Ordering::Relaxed),
+                index_entries: entry.value().index_entries.load(Ordering::Relaxed),
+                bloom_usage_bytes: entry.value().bloom_usage_bytes.load(Ordering::Relaxed),
+                bloom_entries: entry.value().bloom_entries.load(Ordering::Relaxed),
+            })
+            .collect();
+        rows.sort_by_key(|row| row.ns);
+        rows
     }
 }
 

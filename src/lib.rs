@@ -175,13 +175,15 @@ use clog::{FileClogConfig, FileClogService, TruncateStats};
 use executor::{ExecutionOutput, ExecutionResult, Executor, SimpleExecutor};
 use sql::Parser;
 use tablet::{
-    route_table_to_tablet, CacheSuite, CacheSuiteConfig, GlobalLogGcBoundary, IlogConfig,
-    IlogService, IlogTruncateStats, LsmConfig, LsmEngine, LsmRecovery, RoutedTabletStorage,
-    TabletId, TabletManager, DEFAULT_BLOOM_BITS_PER_KEY, DEFAULT_BLOOM_ENABLED,
-    DEFAULT_CACHE_TOTAL_RATIO, DEFAULT_L0_COMPACTION_TRIGGER, DEFAULT_L0_SLOWDOWN_TRIGGER,
-    DEFAULT_L0_STOP_TRIGGER, DEFAULT_MAX_LEVELS, DEFAULT_READER_CACHE_ENABLED,
-    DEFAULT_READER_CACHE_MAX_ENTRIES, DEFAULT_ROW_CACHE_ENABLED, DEFAULT_SCAN_FILL_CACHE,
-    DEFAULT_SCAN_FILL_CACHE_THRESHOLD_BLOCKS, DEFAULT_SHARED_BLOCK_CACHE_ENABLED,
+    collect_snapshot, route_table_to_tablet, snapshot_to_metric_rows, CacheSuite, CacheSuiteConfig,
+    EngineStatusMetricRow, EngineStatusReporter, EngineStatusSnapshot, GlobalLogGcBoundary,
+    IlogConfig, IlogService, IlogTruncateStats, LsmConfig, LsmEngine, LsmRecovery,
+    RoutedTabletStorage, TabletId, TabletManager, DEFAULT_BLOOM_BITS_PER_KEY,
+    DEFAULT_BLOOM_ENABLED, DEFAULT_CACHE_TOTAL_RATIO, DEFAULT_L0_COMPACTION_TRIGGER,
+    DEFAULT_L0_SLOWDOWN_TRIGGER, DEFAULT_L0_STOP_TRIGGER, DEFAULT_MAX_LEVELS,
+    DEFAULT_READER_CACHE_ENABLED, DEFAULT_READER_CACHE_MAX_ENTRIES, DEFAULT_ROW_CACHE_ENABLED,
+    DEFAULT_SCAN_FILL_CACHE, DEFAULT_SCAN_FILL_CACHE_THRESHOLD_BLOCKS,
+    DEFAULT_SHARED_BLOCK_CACHE_ENABLED,
 };
 use transaction::{ConcurrencyManager, TransactionService};
 use tso::LocalTso;
@@ -232,6 +234,10 @@ pub struct DatabaseConfig {
     pub l0_stop_trigger: usize,
     /// Number of LSM levels.
     pub max_levels: usize,
+    /// Background engine-status report interval in seconds (0 disables reporter).
+    pub engine_status_report_interval_secs: u64,
+    /// Max tablets emitted in one status report block (0 = all).
+    pub engine_status_top_n_tablets: usize,
 }
 
 impl Default for DatabaseConfig {
@@ -253,6 +259,8 @@ impl Default for DatabaseConfig {
             l0_slowdown_trigger: DEFAULT_L0_SLOWDOWN_TRIGGER,
             l0_stop_trigger: DEFAULT_L0_STOP_TRIGGER,
             max_levels: DEFAULT_MAX_LEVELS,
+            engine_status_report_interval_secs: 60,
+            engine_status_top_n_tablets: 20,
         }
     }
 }
@@ -346,6 +354,16 @@ impl DatabaseConfig {
     /// Set the number of LSM levels.
     pub fn with_max_levels(mut self, levels: usize) -> Self {
         self.max_levels = levels;
+        self
+    }
+
+    pub fn with_engine_status_report_interval_secs(mut self, secs: u64) -> Self {
+        self.engine_status_report_interval_secs = secs;
+        self
+    }
+
+    pub fn with_engine_status_top_n_tablets(mut self, top_n: usize) -> Self {
+        self.engine_status_top_n_tablets = top_n;
         self
     }
 
@@ -491,8 +509,14 @@ pub struct Database {
     storage: Arc<LsmEngine>,
     /// Tablet lifecycle manager (phase-4: per-tablet manifest + background workers).
     tablet_manager: Arc<TabletManager>,
+    /// Shared cache suite used by all tablets.
+    cache_suite: Arc<CacheSuite>,
     /// Background GC worker for drop-table data cleanup (Drop stops the worker)
     gc_worker: inner_table::gc_worker::GcWorker<DbTxnService>,
+    /// Periodic engine status reporter.
+    engine_status_reporter: Option<Arc<EngineStatusReporter>>,
+    /// Status row cap for periodic logs and SHOW ENGINE STATUS output.
+    engine_status_top_n_tablets: usize,
     /// Dedicated worker runtime for query execution (separate from protocol I/O).
     /// Created in `open()` for production; `None` in tests (falls back to tokio::spawn).
     worker_runtime: Option<tokio::runtime::Runtime>,
@@ -883,6 +907,25 @@ impl Database {
             planned_threads.worker
         );
 
+        let engine_status_reporter = if config.engine_status_report_interval_secs == 0 {
+            log_info!("Engine status reporter disabled (interval_secs=0)");
+            None
+        } else {
+            let reporter = Arc::new(EngineStatusReporter::new(
+                Arc::clone(&tablet_manager),
+                Arc::clone(&cache_suite),
+                config.engine_status_report_interval_secs,
+                config.engine_status_top_n_tablets,
+            ));
+            reporter.start(bg_runtime.handle());
+            log_info!(
+                "Engine status reporter enabled: interval={}s top_n_tablets={}",
+                config.engine_status_report_interval_secs,
+                config.engine_status_top_n_tablets
+            );
+            Some(reporter)
+        };
+
         Ok(Self {
             parser: Parser::new(),
             executor: SimpleExecutor::new(),
@@ -891,7 +934,10 @@ impl Database {
             ilog: recovery.ilog,
             storage,
             tablet_manager,
+            cache_suite,
             gc_worker,
+            engine_status_reporter,
+            engine_status_top_n_tablets: config.engine_status_top_n_tablets,
             worker_runtime: Some(worker_runtime.into_inner()),
             bg_runtime: Some(bg_runtime.into_inner()),
             io_runtime: Some(io_runtime.into_inner()),
@@ -936,6 +982,27 @@ impl Database {
     /// Trigger one immediate GC-worker wake-up.
     pub fn notify_gc_worker(&self) {
         self.gc_worker.notify();
+    }
+
+    /// Latest engine status snapshot (collects on-demand when needed).
+    pub fn engine_status_snapshot(&self) -> Arc<EngineStatusSnapshot> {
+        if let Some(reporter) = &self.engine_status_reporter {
+            if let Some(snapshot) = reporter.latest_snapshot() {
+                return snapshot;
+            }
+            return reporter.collect_once();
+        }
+
+        Arc::new(collect_snapshot(
+            self.tablet_manager.as_ref(),
+            self.cache_suite.as_ref(),
+            self.engine_status_top_n_tablets,
+        ))
+    }
+
+    /// Flattened metric rows used by `SHOW ENGINE STATUS`.
+    pub fn engine_status_metric_rows(&self) -> Vec<EngineStatusMetricRow> {
+        snapshot_to_metric_rows(self.engine_status_snapshot().as_ref())
     }
 
     fn mount_tablet_if_needed(&self, tablet_id: TabletId) -> Result<()> {
@@ -1230,6 +1297,9 @@ impl Database {
 
     /// Close the database (flush memtables and sync logs).
     pub async fn close(&self) -> Result<()> {
+        if let Some(reporter) = &self.engine_status_reporter {
+            reporter.stop();
+        }
         // Stop background workers first so no new manifest edits are submitted.
         self.gc_worker.stop();
         self.tablet_manager.stop_background_workers();
@@ -1256,6 +1326,9 @@ impl Database {
 
 impl Drop for Database {
     fn drop(&mut self) {
+        if let Some(reporter) = &self.engine_status_reporter {
+            reporter.stop();
+        }
         // 1. Stop background schedulers and GC worker
         self.gc_worker.stop();
         self.tablet_manager.stop_background_workers();

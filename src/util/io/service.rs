@@ -43,6 +43,7 @@ use super::aligned_buf::{align_down, align_up, AlignedBuf, DMA_ALIGNMENT};
 #[cfg(not(target_os = "linux"))]
 use super::aligned_buf::{AlignedBuf, DMA_ALIGNMENT};
 use super::dma_file::DmaFile;
+use super::{record_io, IoOpKind, IoTraceTag};
 
 /// Result type for IO operations — contains either data or an error message.
 type IoResult<T> = Result<T, String>;
@@ -96,16 +97,19 @@ enum IoOp {
         fd: RawFd,
         offset: u64,
         len: usize,
+        trace: IoTraceTag,
         reply: tokio::sync::oneshot::Sender<IoResult<AlignedBuf>>,
     },
     WriteAt {
         fd: RawFd,
         offset: u64,
         buf: AlignedBuf,
+        trace: IoTraceTag,
         reply: tokio::sync::oneshot::Sender<IoResult<usize>>,
     },
     Fsync {
         fd: RawFd,
+        trace: IoTraceTag,
         reply: tokio::sync::oneshot::Sender<IoResult<()>>,
     },
 }
@@ -187,6 +191,17 @@ impl IoService {
     ///
     /// Returns an `IoFuture` that can be `.await`ed or `.wait()`ed.
     pub fn read_at(&self, file: &DmaFile, offset: u64, len: usize) -> IoFuture<AlignedBuf> {
+        self.read_at_with_trace(file, offset, len, IoTraceTag::default())
+    }
+
+    /// Read with an explicit observability trace tag.
+    pub fn read_at_with_trace(
+        &self,
+        file: &DmaFile,
+        offset: u64,
+        len: usize,
+        trace: IoTraceTag,
+    ) -> IoFuture<AlignedBuf> {
         let (reply_tx, reply_rx) = tokio::sync::oneshot::channel();
         if self
             .tx
@@ -194,6 +209,7 @@ impl IoService {
                 fd: file.fd(),
                 offset,
                 len,
+                trace,
                 reply: reply_tx,
             })
             .is_err()
@@ -209,6 +225,17 @@ impl IoService {
     ///
     /// Returns an `IoFuture` with the number of bytes written.
     pub fn write_at(&self, file: &DmaFile, offset: u64, buf: AlignedBuf) -> IoFuture<usize> {
+        self.write_at_with_trace(file, offset, buf, IoTraceTag::default())
+    }
+
+    /// Write with an explicit observability trace tag.
+    pub fn write_at_with_trace(
+        &self,
+        file: &DmaFile,
+        offset: u64,
+        buf: AlignedBuf,
+        trace: IoTraceTag,
+    ) -> IoFuture<usize> {
         let (reply_tx, reply_rx) = tokio::sync::oneshot::channel();
         if self
             .tx
@@ -216,6 +243,7 @@ impl IoService {
                 fd: file.fd(),
                 offset,
                 buf,
+                trace,
                 reply: reply_tx,
             })
             .is_err()
@@ -231,11 +259,17 @@ impl IoService {
     ///
     /// Returns an `IoFuture` that completes when the fsync is done.
     pub fn fsync(&self, file: &DmaFile) -> IoFuture<()> {
+        self.fsync_with_trace(file, IoTraceTag::default())
+    }
+
+    /// Fsync with an explicit observability trace tag.
+    pub fn fsync_with_trace(&self, file: &DmaFile, trace: IoTraceTag) -> IoFuture<()> {
         let (reply_tx, reply_rx) = tokio::sync::oneshot::channel();
         if self
             .tx
             .send(IoOp::Fsync {
                 fd: file.fd(),
+                trace,
                 reply: reply_tx,
             })
             .is_err()
@@ -289,6 +323,7 @@ fn io_thread_main(rx: crossbeam_channel::Receiver<IoOp>, ring_size: u32) -> Resu
                     fd,
                     offset,
                     len,
+                    trace,
                     reply,
                 } => {
                     // Align offset and length for O_DIRECT
@@ -317,6 +352,7 @@ fn io_thread_main(rx: crossbeam_channel::Receiver<IoOp>, ring_size: u32) -> Resu
                         requested_offset: offset,
                         aligned_offset,
                         requested_len: len,
+                        trace,
                         reply,
                     });
 
@@ -334,6 +370,7 @@ fn io_thread_main(rx: crossbeam_channel::Receiver<IoOp>, ring_size: u32) -> Resu
                     fd,
                     offset,
                     buf,
+                    trace,
                     reply,
                 } => {
                     let buf_ptr = buf.as_ptr();
@@ -353,6 +390,7 @@ fn io_thread_main(rx: crossbeam_channel::Receiver<IoOp>, ring_size: u32) -> Resu
                     }
                     pending[id as usize] = Some(PendingOp::Write {
                         _buf: buf, // Keep alive until completion
+                        trace,
                         reply,
                     });
 
@@ -363,7 +401,7 @@ fn io_thread_main(rx: crossbeam_channel::Receiver<IoOp>, ring_size: u32) -> Resu
                     }
                     remaining += 1;
                 }
-                IoOp::Fsync { fd, reply } => {
+                IoOp::Fsync { fd, trace, reply } => {
                     let sqe = io_uring::opcode::Fsync::new(io_uring::types::Fd(fd))
                         .build()
                         .user_data(id);
@@ -371,7 +409,7 @@ fn io_thread_main(rx: crossbeam_channel::Receiver<IoOp>, ring_size: u32) -> Resu
                     while pending.len() <= id as usize {
                         pending.push(None);
                     }
-                    pending[id as usize] = Some(PendingOp::Fsync { reply });
+                    pending[id as usize] = Some(PendingOp::Fsync { trace, reply });
 
                     unsafe {
                         ring.submission()
@@ -402,6 +440,7 @@ fn io_thread_main(rx: crossbeam_channel::Receiver<IoOp>, ring_size: u32) -> Resu
                             requested_offset,
                             aligned_offset,
                             requested_len,
+                            trace,
                             reply,
                         } => {
                             if result < 0 {
@@ -416,6 +455,7 @@ fn io_thread_main(rx: crossbeam_channel::Receiver<IoOp>, ring_size: u32) -> Resu
                                 if end <= buf.len() {
                                     let result_buf =
                                         AlignedBuf::from_slice(&buf[skip..end], DMA_ALIGNMENT);
+                                    record_io(trace, IoOpKind::Read, result_buf.len() as u64);
                                     let _ = reply.send(Ok(result_buf));
                                 } else {
                                     // Short read — return what we got.
@@ -425,27 +465,30 @@ fn io_thread_main(rx: crossbeam_channel::Receiver<IoOp>, ring_size: u32) -> Resu
                                         &buf[skip..skip + actual_len],
                                         DMA_ALIGNMENT,
                                     );
+                                    record_io(trace, IoOpKind::Read, result_buf.len() as u64);
                                     let _ = reply.send(Ok(result_buf));
                                 }
                             }
                         }
-                        PendingOp::Write { _buf, reply } => {
+                        PendingOp::Write { _buf, trace, reply } => {
                             if result < 0 {
                                 let _ = reply.send(Err(format!(
                                     "io_uring write failed: {}",
                                     std::io::Error::from_raw_os_error(-result)
                                 )));
                             } else {
+                                record_io(trace, IoOpKind::Write, result as u64);
                                 let _ = reply.send(Ok(result as usize));
                             }
                         }
-                        PendingOp::Fsync { reply } => {
+                        PendingOp::Fsync { trace, reply } => {
                             if result < 0 {
                                 let _ = reply.send(Err(format!(
                                     "io_uring fsync failed: {}",
                                     std::io::Error::from_raw_os_error(-result)
                                 )));
                             } else {
+                                record_io(trace, IoOpKind::Fsync, 0);
                                 let _ = reply.send(Ok(()));
                             }
                         }
@@ -466,13 +509,16 @@ enum PendingOp {
         requested_offset: u64,
         aligned_offset: u64,
         requested_len: usize,
+        trace: IoTraceTag,
         reply: tokio::sync::oneshot::Sender<IoResult<AlignedBuf>>,
     },
     Write {
         _buf: AlignedBuf, // Keep alive until io_uring completes
+        trace: IoTraceTag,
         reply: tokio::sync::oneshot::Sender<IoResult<usize>>,
     },
     Fsync {
+        trace: IoTraceTag,
         reply: tokio::sync::oneshot::Sender<IoResult<()>>,
     },
 }
@@ -489,20 +535,36 @@ fn io_thread_main(rx: crossbeam_channel::Receiver<IoOp>, _ring_size: u32) -> Res
                 fd,
                 offset,
                 len,
+                trace,
                 reply,
             } => {
-                let _ = reply.send(read_at_sync(fd, offset, len));
+                let result = read_at_sync(fd, offset, len);
+                if let Ok(buf) = &result {
+                    record_io(trace, IoOpKind::Read, buf.len() as u64);
+                }
+                let _ = reply.send(result);
             }
             IoOp::WriteAt {
                 fd,
                 offset,
                 buf,
+                trace,
                 reply,
-            } => {
-                let _ = reply.send(write_at_sync(fd, offset, &buf));
-            }
-            IoOp::Fsync { fd, reply } => {
-                let _ = reply.send(fsync_sync(fd));
+            } => match write_at_sync(fd, offset, &buf) {
+                Ok(bytes) => {
+                    record_io(trace, IoOpKind::Write, bytes as u64);
+                    let _ = reply.send(Ok(bytes));
+                }
+                Err(e) => {
+                    let _ = reply.send(Err(e));
+                }
+            },
+            IoOp::Fsync { fd, trace, reply } => {
+                let result = fsync_sync(fd);
+                if result.is_ok() {
+                    record_io(trace, IoOpKind::Fsync, 0);
+                }
+                let _ = reply.send(result);
             }
         }
     }

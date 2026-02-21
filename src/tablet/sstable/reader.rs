@@ -24,7 +24,7 @@
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
-use crate::io::{DmaFile, IoService};
+use crate::io::{DmaFile, IoService, IoSource, IoTraceTag};
 use crate::tablet::cache::{
     tablet_namespace_from_dir, BlockCacheKey, BlockKind, CachePriority, SharedBlockCache,
 };
@@ -41,6 +41,7 @@ pub struct SstReadOptions {
     pub tablet_tag: u128,
     pub sst_id: u64,
     pub bloom_enabled: bool,
+    pub io_source: IoSource,
     pub fill_cache: bool,
     pub block_cache: Option<Arc<SharedBlockCache>>,
 }
@@ -51,6 +52,7 @@ impl std::fmt::Debug for SstReadOptions {
             .field("tablet_tag", &self.tablet_tag)
             .field("sst_id", &self.sst_id)
             .field("bloom_enabled", &self.bloom_enabled)
+            .field("io_source", &self.io_source)
             .field("fill_cache", &self.fill_cache)
             .field("block_cache", &self.block_cache.is_some())
             .finish()
@@ -116,6 +118,7 @@ impl SstReader {
                 .and_then(|s| s.parse::<u64>().ok())
                 .unwrap_or(0);
         }
+        let io_trace = IoTraceTag::new(options.tablet_tag, options.io_source);
 
         let file = DmaFile::open_read(&path).map_err(|e| {
             TiSqlError::Storage(format!("Failed to open SST {}: {e}", path.display()))
@@ -131,7 +134,7 @@ impl SstReader {
         // Read footer via io_uring
         let footer_offset = file_size - FOOTER_SIZE as u64;
         let footer_data = io
-            .read_at(&file, footer_offset, FOOTER_SIZE)
+            .read_at_with_trace(&file, footer_offset, FOOTER_SIZE, io_trace)
             .await
             .map_err(|e| TiSqlError::Storage(format!("Failed to read SST footer: {e}")))?;
         let footer_buf: [u8; FOOTER_SIZE] = footer_data[..FOOTER_SIZE]
@@ -146,7 +149,7 @@ impl SstReader {
         if data_end >= BLOOM_META_TRAILER_SIZE as u64 {
             let trailer_offset = data_end - BLOOM_META_TRAILER_SIZE as u64;
             let trailer_buf = io
-                .read_at(&file, trailer_offset, BLOOM_META_TRAILER_SIZE)
+                .read_at_with_trace(&file, trailer_offset, BLOOM_META_TRAILER_SIZE, io_trace)
                 .await
                 .map_err(|e| {
                     TiSqlError::Storage(format!("Failed to read bloom trailer candidate: {e}"))
@@ -193,7 +196,12 @@ impl SstReader {
                     hit.as_ref().to_vec()
                 } else {
                     let miss = io
-                        .read_at(&file, footer.index_offset, footer.index_size as usize)
+                        .read_at_with_trace(
+                            &file,
+                            footer.index_offset,
+                            footer.index_size as usize,
+                            io_trace,
+                        )
                         .await
                         .map_err(|e| {
                             TiSqlError::Storage(format!("Failed to read SST index: {e}"))
@@ -208,16 +216,26 @@ impl SstReader {
                     miss_vec
                 }
             } else {
-                io.read_at(&file, footer.index_offset, footer.index_size as usize)
-                    .await
-                    .map_err(|e| TiSqlError::Storage(format!("Failed to read SST index: {e}")))?
-                    .to_vec()
-            }
-        } else {
-            io.read_at(&file, footer.index_offset, footer.index_size as usize)
+                io.read_at_with_trace(
+                    &file,
+                    footer.index_offset,
+                    footer.index_size as usize,
+                    io_trace,
+                )
                 .await
                 .map_err(|e| TiSqlError::Storage(format!("Failed to read SST index: {e}")))?
                 .to_vec()
+            }
+        } else {
+            io.read_at_with_trace(
+                &file,
+                footer.index_offset,
+                footer.index_size as usize,
+                io_trace,
+            )
+            .await
+            .map_err(|e| TiSqlError::Storage(format!("Failed to read SST index: {e}")))?
+            .to_vec()
         };
         let index = IndexBlock::decode(&index_buf)?;
 
@@ -333,7 +351,7 @@ impl SstReader {
                 }
                 let miss = self
                     .io
-                    .read_at(&self.file, offset, size as usize)
+                    .read_at_with_trace(&self.file, offset, size as usize, self.io_trace())
                     .await
                     .map_err(|e| TiSqlError::Storage(format!("io_uring read_block failed: {e}")))?;
                 let miss_vec = miss.to_vec();
@@ -352,10 +370,15 @@ impl SstReader {
         }
 
         self.io
-            .read_at(&self.file, offset, size as usize)
+            .read_at_with_trace(&self.file, offset, size as usize, self.io_trace())
             .await
             .map(|buf| buf.to_vec())
             .map_err(|e| TiSqlError::Storage(format!("io_uring read_block failed: {e}")))
+    }
+
+    #[inline]
+    fn io_trace(&self) -> IoTraceTag {
+        IoTraceTag::new(self.options.tablet_tag, self.options.io_source)
     }
 
     /// Read a data block at the given offset and size.

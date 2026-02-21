@@ -41,11 +41,19 @@
 
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use tokio::sync::Notify;
 
 use super::lsm::LsmEngine;
+
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+pub struct CompactionSchedulerStatus {
+    pub in_progress: u64,
+    pub completed: u64,
+    pub failed: u64,
+    pub last_error_ts_ms: Option<u64>,
+}
 
 /// Background compaction scheduler for LSM storage engine.
 ///
@@ -72,6 +80,14 @@ struct CompactionSchedulerInner {
 
     /// Number of compactions completed (for testing/monitoring).
     compaction_count: AtomicU64,
+    /// Number of compaction jobs currently running.
+    in_progress: AtomicU64,
+    /// Number of compaction jobs completed.
+    completed: AtomicU64,
+    /// Number of compaction jobs failed.
+    failed: AtomicU64,
+    /// Last compaction error timestamp in unix millis.
+    last_error_ts_ms: AtomicU64,
 }
 
 impl CompactionScheduler {
@@ -85,6 +101,10 @@ impl CompactionScheduler {
                 shutdown: AtomicBool::new(false),
                 notify: Notify::new(),
                 compaction_count: AtomicU64::new(0),
+                in_progress: AtomicU64::new(0),
+                completed: AtomicU64::new(0),
+                failed: AtomicU64::new(0),
+                last_error_ts_ms: AtomicU64::new(0),
             }),
             worker_handle: parking_lot::Mutex::new(None),
         }
@@ -149,6 +169,16 @@ impl CompactionScheduler {
         self.inner.compaction_count.load(Ordering::Relaxed)
     }
 
+    pub fn status(&self) -> CompactionSchedulerStatus {
+        let last = self.inner.last_error_ts_ms.load(Ordering::Relaxed);
+        CompactionSchedulerStatus {
+            in_progress: self.inner.in_progress.load(Ordering::Relaxed),
+            completed: self.inner.completed.load(Ordering::Relaxed),
+            failed: self.inner.failed.load(Ordering::Relaxed),
+            last_error_ts_ms: (last != 0).then_some(last),
+        }
+    }
+
     /// Wait for at least `count` compactions to complete.
     ///
     /// Used for testing. Returns false if timeout occurs.
@@ -171,31 +201,73 @@ impl Drop for CompactionScheduler {
 }
 
 impl CompactionSchedulerInner {
+    fn now_ms() -> u64 {
+        SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map(|d| d.as_millis() as u64)
+            .unwrap_or(0)
+    }
+
     /// Main loop for the compaction worker (async — tokio task).
     async fn compaction_worker_loop(&self) {
         tracing::info!("Compaction worker started (async)");
 
         while !self.shutdown.load(Ordering::Relaxed) {
+            if !self.engine.has_pending_compaction() {
+                tokio::select! {
+                    _ = self.notify.notified() => {}
+                    _ = tokio::time::sleep(Duration::from_secs(1)) => {}
+                }
+                continue;
+            }
+
+            self.in_progress.fetch_add(1, Ordering::Relaxed);
+            let start = Instant::now();
+            tracing::info!(
+                "[engine-event] op=compact phase=begin tablet_ns={} l0_files={}",
+                self.engine.tablet_cache_ns(),
+                self.engine.current_version().level_size(0)
+            );
+
             // Advance GC safe point before each compaction attempt
             self.engine.update_gc_safe_point();
 
             match self.engine.do_compaction().await {
                 Ok(true) => {
                     self.compaction_count.fetch_add(1, Ordering::Relaxed);
+                    self.completed.fetch_add(1, Ordering::Relaxed);
+                    let stats = self.engine.stats();
+                    tracing::info!(
+                        "[engine-event] op=compact phase=finish tablet_ns={} l0_files={} total_sst={} bytes={} elapsed_ms={}",
+                        self.engine.tablet_cache_ns(),
+                        stats.l0_sst_count,
+                        stats.total_sst_count,
+                        stats.total_sst_bytes,
+                        start.elapsed().as_millis()
+                    );
                     tracing::debug!(
                         "Compaction completed, total: {}",
                         self.compaction_count.load(Ordering::Relaxed)
                     );
+                    self.in_progress.fetch_sub(1, Ordering::Relaxed);
                     continue;
                 }
                 Ok(false) => {
-                    tokio::select! {
-                        _ = self.notify.notified() => {}
-                        _ = tokio::time::sleep(Duration::from_secs(1)) => {}
-                    }
+                    self.in_progress.fetch_sub(1, Ordering::Relaxed);
+                    tokio::task::yield_now().await;
                 }
                 Err(e) => {
+                    self.failed.fetch_add(1, Ordering::Relaxed);
+                    self.last_error_ts_ms
+                        .store(Self::now_ms(), Ordering::Relaxed);
+                    tracing::warn!(
+                        "[engine-event] op=compact phase=abort tablet_ns={} reason=\"{}\" elapsed_ms={}",
+                        self.engine.tablet_cache_ns(),
+                        e,
+                        start.elapsed().as_millis()
+                    );
                     tracing::error!("Compaction failed: {e}");
+                    self.in_progress.fetch_sub(1, Ordering::Relaxed);
                     tokio::time::sleep(Duration::from_millis(500)).await;
                 }
             }

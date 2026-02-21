@@ -49,20 +49,20 @@ use std::sync::atomic::{AtomicBool, AtomicU64, AtomicU8, AtomicUsize, Ordering a
 use std::sync::Arc;
 
 use parking_lot::{RwLock, RwLockWriteGuard};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 use tokio::sync::{mpsc, oneshot};
 
 #[cfg(feature = "failpoints")]
 use fail::fail_point;
 
 use crate::catalog::types::{Key, Lsn, RawValue, Timestamp};
-use crate::log_error;
 use crate::lsn::SharedLsnProvider;
 use crate::tablet::mvcc::{
     extract_key, extract_timestamp, is_tombstone, MvccIterator, MvccKey, SharedMvccRange,
 };
 use crate::tablet::{PessimisticStorage, PessimisticWriteError, StorageEngine, WriteBatch};
 use crate::util::error::{Result, TiSqlError};
+use crate::{log_error, log_info, log_warn};
 
 use super::cache::key::{tablet_namespace_from_dir, ReaderCacheKey, RowCacheKey};
 use super::cache::CacheSuite;
@@ -216,6 +216,30 @@ pub struct BoundaryComputation {
     pub reservation_cap: Option<u64>,
     pub inflight_cap: Option<u64>,
     pub safe_lsn: u64,
+}
+
+/// Write backpressure state.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+#[repr(u8)]
+pub enum BackpressureState {
+    #[default]
+    Normal = 0,
+    Slowdown = 1,
+    Stall = 2,
+}
+
+impl BackpressureState {
+    fn from_u8(value: u8) -> Self {
+        match value {
+            1 => Self::Slowdown,
+            2 => Self::Stall,
+            _ => Self::Normal,
+        }
+    }
+
+    fn as_u8(self) -> u8 {
+        self as u8
+    }
 }
 
 /// Inner state of the LSM engine, protected by RwLock for atomic updates.
@@ -579,6 +603,19 @@ pub struct LsmEngine {
     /// Runtime-switchable V2.6 boundary mode (off/shadow/on).
     v26_mode: AtomicU8,
 
+    /// Persistent backpressure state machine (normal/slowdown/stall).
+    backpressure_state: AtomicU8,
+    /// Number of `->Slowdown` transitions.
+    slowdown_events: AtomicU64,
+    /// Number of `->Stall` transitions.
+    stall_events: AtomicU64,
+
+    /// Obsolete-SST delete accounting.
+    obsolete_delete_attempts: AtomicU64,
+    obsolete_delete_success: AtomicU64,
+    obsolete_delete_fail: AtomicU64,
+    obsolete_delete_bytes: AtomicU64,
+
     /// Single-writer manifest queue handle (durable mode only).
     manifest_writer: parking_lot::Mutex<Option<ManifestWriterHandle>>,
 
@@ -666,6 +703,13 @@ impl LsmEngine {
             in_flight_tracker: InFlightLsnTracker::new_auto(),
             commit_reservations: CommitLsnReservations::new(),
             v26_mode: AtomicU8::new(initial_v26_mode),
+            backpressure_state: AtomicU8::new(BackpressureState::Normal.as_u8()),
+            slowdown_events: AtomicU64::new(0),
+            stall_events: AtomicU64::new(0),
+            obsolete_delete_attempts: AtomicU64::new(0),
+            obsolete_delete_success: AtomicU64::new(0),
+            obsolete_delete_fail: AtomicU64::new(0),
+            obsolete_delete_bytes: AtomicU64::new(0),
             manifest_writer: parking_lot::Mutex::new(None),
             manifest_runtime: parking_lot::Mutex::new(None),
             manifest_writer_running: Arc::new(AtomicBool::new(false)),
@@ -784,6 +828,11 @@ impl LsmEngine {
         &self.io
     }
 
+    /// Stable cache namespace of this tablet.
+    pub fn tablet_cache_ns(&self) -> u128 {
+        self.tablet_cache_ns
+    }
+
     /// Get the next LSN and increment.
     fn alloc_lsn(&self) -> u64 {
         if let Some(ref provider) = self.lsn_provider {
@@ -810,6 +859,12 @@ impl LsmEngine {
     pub fn frozen_count(&self) -> usize {
         let state = self.state.read();
         state.frozen.len()
+    }
+
+    /// Whether current state has any compaction work pending.
+    pub fn has_pending_compaction(&self) -> bool {
+        let picker = super::compaction::CompactionPicker::new(Arc::clone(&self.config));
+        picker.pick(&self.current_version()).is_some()
     }
 
     /// Get the approximate size of the active memtable.
@@ -1276,6 +1331,13 @@ impl LsmEngine {
                 "Cannot flush non-frozen memtable".to_string(),
             ));
         }
+        let flush_start = Instant::now();
+        log_info!(
+            "[engine-event] op=flush phase=begin tablet_ns={} memtable_id={} frozen={}",
+            self.tablet_cache_ns,
+            memtable.id(),
+            self.frozen_count()
+        );
 
         // Step 1: mark memtable as flushing.
         match memtable.flush_state() {
@@ -1303,6 +1365,13 @@ impl LsmEngine {
         if let Some(ref ilog) = self.ilog {
             if let Err(e) = ilog.write_flush_intent_async(sst_id, memtable.id()).await {
                 Self::rollback_flushing_state(memtable);
+                log_warn!(
+                    "[engine-event] op=flush phase=abort tablet_ns={} memtable_id={} reason=\"{}\" elapsed_ms={}",
+                    self.tablet_cache_ns,
+                    memtable.id(),
+                    e,
+                    flush_start.elapsed().as_millis()
+                );
                 return Err(e);
             }
         }
@@ -1320,7 +1389,12 @@ impl LsmEngine {
             bloom_bits_per_key: self.config.bloom_bits_per_key,
         };
         let build_result: Result<SstMeta> = async {
-            let mut builder = AsyncSstBuilder::new(&sst_path, options, Arc::clone(&self.io))?;
+            let mut builder = AsyncSstBuilder::new_with_trace(
+                &sst_path,
+                options,
+                Arc::clone(&self.io),
+                crate::io::IoTraceTag::new(self.tablet_cache_ns, crate::io::IoSource::Flush),
+            )?;
 
             // Iterate memtable using streaming iterator and add all entries INCLUDING tombstones
             // as raw MVCC keys. SSTs MUST store MVCC keys (key || !commit_ts) to preserve version
@@ -1349,6 +1423,13 @@ impl LsmEngine {
             Ok(meta) => meta,
             Err(e) => {
                 Self::rollback_flushing_state(memtable);
+                log_warn!(
+                    "[engine-event] op=flush phase=abort tablet_ns={} memtable_id={} reason=\"{}\" elapsed_ms={}",
+                    self.tablet_cache_ns,
+                    memtable.id(),
+                    e,
+                    flush_start.elapsed().as_millis()
+                );
                 return Err(e);
             }
         }; // Level 0
@@ -1386,6 +1467,13 @@ impl LsmEngine {
         if let Err(e) = commit_result {
             let _ =
                 memtable.compare_exchange_flush_state(FlushState::Flushing, FlushState::NeedsFlush);
+            log_warn!(
+                "[engine-event] op=flush phase=abort tablet_ns={} memtable_id={} reason=\"{}\" elapsed_ms={}",
+                self.tablet_cache_ns,
+                memtable.id(),
+                e,
+                flush_start.elapsed().as_millis()
+            );
             return Err(e);
         }
 
@@ -1419,6 +1507,15 @@ impl LsmEngine {
         if let Some(ref notify) = *self.compaction_notify.read() {
             notify();
         }
+
+        log_info!(
+            "[engine-event] op=flush phase=finish tablet_ns={} memtable_id={} sst_id={} bytes={} elapsed_ms={}",
+            self.tablet_cache_ns,
+            memtable.id(),
+            meta.id,
+            meta.file_size,
+            flush_start.elapsed().as_millis()
+        );
 
         Ok(meta)
     }
@@ -1511,6 +1608,7 @@ impl LsmEngine {
                     tablet_tag: self.tablet_cache_ns,
                     sst_id,
                     bloom_enabled: self.config.bloom_enabled,
+                    io_source: crate::io::IoSource::ForegroundPointRead,
                     fill_cache,
                     block_cache: cache_suite.as_ref().and_then(|suite| suite.block_cache()),
                 };
@@ -1526,6 +1624,7 @@ impl LsmEngine {
             tablet_tag: self.tablet_cache_ns,
             sst_id,
             bloom_enabled: self.config.bloom_enabled,
+            io_source: crate::io::IoSource::ForegroundPointRead,
             fill_cache,
             block_cache: cache_suite.and_then(|suite| suite.block_cache()),
         };
@@ -1748,6 +1847,89 @@ impl LsmEngine {
         }
     }
 
+    fn current_backpressure_state(&self) -> BackpressureState {
+        BackpressureState::from_u8(self.backpressure_state.load(AtomicOrdering::Acquire))
+    }
+
+    pub fn backpressure_state(&self) -> BackpressureState {
+        self.current_backpressure_state()
+    }
+
+    pub fn backpressure_events(&self) -> (u64, u64) {
+        (
+            self.slowdown_events.load(AtomicOrdering::Relaxed),
+            self.stall_events.load(AtomicOrdering::Relaxed),
+        )
+    }
+
+    fn observe_backpressure_transition(&self, next_state: BackpressureState, l0_count: usize) {
+        loop {
+            let old_raw = self.backpressure_state.load(AtomicOrdering::Acquire);
+            let old_state = BackpressureState::from_u8(old_raw);
+            if old_state == next_state {
+                return;
+            }
+            match self.backpressure_state.compare_exchange(
+                old_raw,
+                next_state.as_u8(),
+                AtomicOrdering::AcqRel,
+                AtomicOrdering::Acquire,
+            ) {
+                Ok(_) => {
+                    self.on_backpressure_transition(old_state, next_state, l0_count);
+                    return;
+                }
+                Err(_) => continue,
+            }
+        }
+    }
+
+    fn on_backpressure_transition(
+        &self,
+        old_state: BackpressureState,
+        new_state: BackpressureState,
+        l0_count: usize,
+    ) {
+        match new_state {
+            BackpressureState::Slowdown => {
+                self.slowdown_events.fetch_add(1, AtomicOrdering::Relaxed);
+            }
+            BackpressureState::Stall => {
+                self.stall_events.fetch_add(1, AtomicOrdering::Relaxed);
+            }
+            BackpressureState::Normal => {}
+        }
+
+        match (old_state, new_state) {
+            (BackpressureState::Normal, BackpressureState::Slowdown) => {
+                log_warn!(
+                    "[engine-event] op=write_backpressure phase=transition state=slowdown from=normal tablet_ns={} l0_files={}",
+                    self.tablet_cache_ns,
+                    l0_count
+                );
+            }
+            (BackpressureState::Normal, BackpressureState::Stall)
+            | (BackpressureState::Slowdown, BackpressureState::Stall) => {
+                log_warn!(
+                    "[engine-event] op=write_backpressure phase=transition state=stall from={:?} tablet_ns={} l0_files={}",
+                    old_state,
+                    self.tablet_cache_ns,
+                    l0_count
+                );
+            }
+            (BackpressureState::Slowdown, BackpressureState::Normal)
+            | (BackpressureState::Stall, BackpressureState::Normal) => {
+                log_info!(
+                    "[engine-event] op=write_backpressure phase=transition state=normal from={:?} tablet_ns={} l0_files={}",
+                    old_state,
+                    self.tablet_cache_ns,
+                    l0_count
+                );
+            }
+            _ => {}
+        }
+    }
+
     /// Check write backpressure conditions. Returns the L0 slowdown delay (if any)
     /// or an error for frozen memtable stall.
     ///
@@ -1773,13 +1955,30 @@ impl LsmEngine {
 
         // Frozen memtable stall: reject immediately
         let state = self.state.read();
-        if state.active.approximate_size() >= self.config.memtable_size
-            && state.frozen.len() >= self.config.max_frozen_memtables
-        {
+        let frozen_stall = state.active.approximate_size() >= self.config.memtable_size
+            && state.frozen.len() >= self.config.max_frozen_memtables;
+        drop(state);
+
+        if self.config.should_stop_writes(l0_count) {
+            self.observe_backpressure_transition(BackpressureState::Stall, l0_count);
+            return Err(TiSqlError::Storage(
+                "Too many L0 files, writes temporarily stopped for compaction".into(),
+            ));
+        }
+
+        if frozen_stall {
+            self.observe_backpressure_transition(BackpressureState::Stall, l0_count);
             return Err(TiSqlError::Storage(
                 "Write stalled: frozen memtables at capacity, flush is not keeping up".into(),
             ));
         }
+
+        let next = if delay.is_some() {
+            BackpressureState::Slowdown
+        } else {
+            BackpressureState::Normal
+        };
+        self.observe_backpressure_transition(next, l0_count);
 
         Ok(delay)
     }
@@ -1808,6 +2007,7 @@ impl LsmEngine {
     fn pending_write_pressure_status(&self) -> std::result::Result<(), PessimisticWriteError> {
         let l0_count = self.current_version().level_size(0);
         if self.config.should_stop_writes(l0_count) {
+            self.observe_backpressure_transition(BackpressureState::Stall, l0_count);
             return Err(PessimisticWriteError::WriteStall { delay: None });
         }
         match self.check_write_stall_with_l0(l0_count) {
@@ -1866,6 +2066,7 @@ impl LsmEngine {
         // L0 write backpressure: reject writes when too many L0 files accumulate
         let l0_count = self.current_version().level_size(0);
         if self.config.should_stop_writes(l0_count) {
+            self.observe_backpressure_transition(BackpressureState::Stall, l0_count);
             return Err(TiSqlError::Storage(
                 "Too many L0 files, writes temporarily stopped for compaction".into(),
             ));
@@ -1908,6 +2109,14 @@ impl LsmEngine {
             Some(task) => task,
             None => return Ok(false),
         };
+        let compaction_start = Instant::now();
+        log_info!(
+            "[engine-event] op=compact phase=begin tablet_ns={} inputs={} output_level={} trivial={}",
+            self.tablet_cache_ns,
+            task.inputs.len(),
+            task.output_level,
+            task.is_trivial_move
+        );
 
         let is_bottommost = task.check_bottommost(&version, self.config.max_levels);
 
@@ -1915,7 +2124,7 @@ impl LsmEngine {
         if task.is_trivial_move {
             let executor = CompactionExecutor::new(Arc::clone(&self.config));
             // Trivial move doesn't use pre-allocated IDs or IO service
-            let delta = executor
+            let delta = match executor
                 .execute(
                     &task,
                     &version,
@@ -1925,11 +2134,33 @@ impl LsmEngine {
                     gc_safe_point,
                     is_bottommost,
                 )
-                .await?;
+                .await
+            {
+                Ok(delta) => delta,
+                Err(e) => {
+                    log_warn!(
+                        "[engine-event] op=compact phase=abort tablet_ns={} reason=\"{}\" elapsed_ms={}",
+                        self.tablet_cache_ns,
+                        e,
+                        compaction_start.elapsed().as_millis()
+                    );
+                    return Err(e);
+                }
+            };
+            let trivial_new = delta.new_ssts.len();
+            let trivial_deleted = delta.deleted_ssts.len();
 
             if self.ilog.is_some() {
                 let manifest = self.manifest_writer_handle()?;
-                manifest.submit(ManifestEdit::TrivialMove { delta }).await?;
+                if let Err(e) = manifest.submit(ManifestEdit::TrivialMove { delta }).await {
+                    log_warn!(
+                        "[engine-event] op=compact phase=abort tablet_ns={} reason=\"{}\" elapsed_ms={}",
+                        self.tablet_cache_ns,
+                        e,
+                        compaction_start.elapsed().as_millis()
+                    );
+                    return Err(e);
+                }
             } else {
                 self.version_set.apply_delta(&delta);
             }
@@ -1940,6 +2171,15 @@ impl LsmEngine {
                 let state = self.state.write();
                 self.install_super_version(&state);
             }
+
+            log_info!(
+                "[engine-event] op=compact phase=finish tablet_ns={} inputs={} new_ssts={} deleted_ssts={} elapsed_ms={}",
+                self.tablet_cache_ns,
+                task.inputs.len(),
+                trivial_new,
+                trivial_deleted,
+                compaction_start.elapsed().as_millis()
+            );
 
             return Ok(true);
         }
@@ -1962,7 +2202,7 @@ impl LsmEngine {
 
         // Phase 3: Execute compaction
         let executor = CompactionExecutor::new(Arc::clone(&self.config));
-        let delta = executor
+        let delta = match executor
             .execute(
                 &task,
                 &version,
@@ -1972,17 +2212,38 @@ impl LsmEngine {
                 gc_safe_point,
                 is_bottommost,
             )
-            .await?;
+            .await
+        {
+            Ok(delta) => delta,
+            Err(e) => {
+                log_warn!(
+                    "[engine-event] op=compact phase=abort tablet_ns={} reason=\"{}\" elapsed_ms={}",
+                    self.tablet_cache_ns,
+                    e,
+                    compaction_start.elapsed().as_millis()
+                );
+                return Err(e);
+            }
+        };
 
         if self.ilog.is_some() {
             let manifest = self.manifest_writer_handle()?;
             let new_ssts: Vec<SstMeta> = delta.new_ssts.iter().map(|m| (**m).clone()).collect();
-            manifest
+            if let Err(e) = manifest
                 .submit(ManifestEdit::Compact {
                     deleted_ssts: delta.deleted_ssts.clone(),
                     new_ssts,
                 })
-                .await?;
+                .await
+            {
+                log_warn!(
+                    "[engine-event] op=compact phase=abort tablet_ns={} reason=\"{}\" elapsed_ms={}",
+                    self.tablet_cache_ns,
+                    e,
+                    compaction_start.elapsed().as_millis()
+                );
+                return Err(e);
+            }
         } else {
             self.version_set.apply_delta(&delta);
         }
@@ -1997,15 +2258,58 @@ impl LsmEngine {
         // Phase 7: Delete obsolete SST files
         self.delete_obsolete_ssts(&delta)?;
 
+        log_info!(
+            "[engine-event] op=compact phase=finish tablet_ns={} inputs={} new_ssts={} deleted_ssts={} elapsed_ms={}",
+            self.tablet_cache_ns,
+            task.inputs.len(),
+            delta.new_ssts.len(),
+            delta.deleted_ssts.len(),
+            compaction_start.elapsed().as_millis()
+        );
+
         Ok(true)
     }
 
     /// Delete SST files that were removed by compaction.
     fn delete_obsolete_ssts(&self, delta: &ManifestDelta) -> Result<()> {
+        if delta.deleted_ssts.is_empty() {
+            return Ok(());
+        }
+        let start = Instant::now();
+        log_info!(
+            "[engine-event] op=gc_delete phase=begin tablet_ns={} files={}",
+            self.tablet_cache_ns,
+            delta.deleted_ssts.len()
+        );
+        let mut deleted_files = 0u64;
+        let mut deleted_bytes = 0u64;
         for (_, sst_id) in &delta.deleted_ssts {
+            self.obsolete_delete_attempts
+                .fetch_add(1, AtomicOrdering::Relaxed);
             let path = self.config.sst_dir().join(format!("{sst_id:08}.sst"));
             if path.exists() {
-                std::fs::remove_file(&path)?;
+                let file_bytes = path.metadata().map(|m| m.len()).unwrap_or(0);
+                if let Err(e) = std::fs::remove_file(&path) {
+                    self.obsolete_delete_fail
+                        .fetch_add(1, AtomicOrdering::Relaxed);
+                    log_warn!(
+                        "[engine-event] op=gc_delete phase=abort tablet_ns={} files={} reason=\"{}\" elapsed_ms={}",
+                        self.tablet_cache_ns,
+                        deleted_files,
+                        e,
+                        start.elapsed().as_millis()
+                    );
+                    return Err(e.into());
+                }
+                self.obsolete_delete_success
+                    .fetch_add(1, AtomicOrdering::Relaxed);
+                self.obsolete_delete_bytes
+                    .fetch_add(file_bytes, AtomicOrdering::Relaxed);
+                deleted_files += 1;
+                deleted_bytes += file_bytes;
+            } else {
+                self.obsolete_delete_success
+                    .fetch_add(1, AtomicOrdering::Relaxed);
             }
             if let Some(cache_suite) = self.cache_suite() {
                 if let Some(reader_cache) = cache_suite.reader_cache() {
@@ -2016,6 +2320,13 @@ impl LsmEngine {
                 }
             }
         }
+        log_info!(
+            "[engine-event] op=gc_delete phase=finish tablet_ns={} files={} bytes={} elapsed_ms={}",
+            self.tablet_cache_ns,
+            deleted_files,
+            deleted_bytes,
+            start.elapsed().as_millis()
+        );
         Ok(())
     }
 
@@ -2045,6 +2356,17 @@ impl LsmEngine {
     pub fn stats(&self) -> LsmStats {
         let state = self.state.read();
         let version = self.version_set.current();
+        let mut frozen_memtable_bytes = 0usize;
+        let mut frozen_memtable_state_counts = FrozenMemtableStateStats::default();
+        for memtable in &state.frozen {
+            frozen_memtable_bytes += memtable.approximate_size();
+            match memtable.flush_state() {
+                FlushState::NeedsFlush => frozen_memtable_state_counts.needs_flush += 1,
+                FlushState::Flushing => frozen_memtable_state_counts.flushing += 1,
+                FlushState::FlushedDirty => frozen_memtable_state_counts.flushed_dirty += 1,
+                FlushState::FlushedClean => frozen_memtable_state_counts.flushed_clean += 1,
+            }
+        }
 
         let mut level_stats = Vec::with_capacity(self.config.max_levels);
         for level in 0..self.config.max_levels {
@@ -2057,12 +2379,21 @@ impl LsmEngine {
         LsmStats {
             active_memtable_size: state.active.approximate_size(),
             frozen_memtable_count: state.frozen.len(),
+            frozen_memtable_bytes,
+            frozen_memtable_state_counts,
             l0_sst_count: version.level_size(0),
             total_sst_count: version.total_sst_count(),
             total_sst_bytes: version.total_size_bytes(),
             version_num: version.version_num(),
             flushed_lsn: version.flushed_lsn(),
             gc_safe_point: self.gc_safe_point(),
+            backpressure_state: self.current_backpressure_state(),
+            slowdown_events: self.slowdown_events.load(AtomicOrdering::Relaxed),
+            stall_events: self.stall_events.load(AtomicOrdering::Relaxed),
+            obsolete_delete_attempts: self.obsolete_delete_attempts.load(AtomicOrdering::Relaxed),
+            obsolete_delete_success: self.obsolete_delete_success.load(AtomicOrdering::Relaxed),
+            obsolete_delete_fail: self.obsolete_delete_fail.load(AtomicOrdering::Relaxed),
+            obsolete_delete_bytes: self.obsolete_delete_bytes.load(AtomicOrdering::Relaxed),
             level_stats,
         }
     }
@@ -3371,6 +3702,7 @@ impl StorageEngine for LsmEngine {
             tablet_tag: self.tablet_cache_ns,
             sst_id: 0,
             bloom_enabled: false,
+            io_source: crate::io::IoSource::ForegroundScan,
             fill_cache: should_fill_scan_cache,
             block_cache: scan_block_cache,
         };
@@ -3407,6 +3739,7 @@ impl StorageEngine for LsmEngine {
         // L0 write backpressure: reject writes when too many L0 files accumulate
         let l0_count = self.current_version().level_size(0);
         if self.config.should_stop_writes(l0_count) {
+            self.observe_backpressure_transition(BackpressureState::Stall, l0_count);
             return Err(TiSqlError::Storage(
                 "Too many L0 files, writes temporarily stopped for compaction".into(),
             ));
@@ -3702,12 +4035,27 @@ pub struct LevelStats {
     pub size_bytes: u64,
 }
 
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct FrozenMemtableStateStats {
+    pub needs_flush: usize,
+    pub flushing: usize,
+    pub flushed_dirty: usize,
+    pub flushed_clean: usize,
+}
+
+#[derive(Debug, Clone)]
 pub struct LsmStats {
     /// Size of active memtable in bytes.
     pub active_memtable_size: usize,
 
     /// Number of frozen memtables awaiting flush.
     pub frozen_memtable_count: usize,
+
+    /// Total size of frozen memtables in bytes.
+    pub frozen_memtable_bytes: usize,
+
+    /// Frozen memtable count grouped by flush state.
+    pub frozen_memtable_state_counts: FrozenMemtableStateStats,
 
     /// Number of SST files at L0.
     pub l0_sst_count: usize,
@@ -3726,6 +4074,19 @@ pub struct LsmStats {
 
     /// Current GC safe point (0 = no GC).
     pub gc_safe_point: Timestamp,
+
+    /// Current write-backpressure state.
+    pub backpressure_state: BackpressureState,
+    /// Number of transitions into slowdown.
+    pub slowdown_events: u64,
+    /// Number of transitions into stall.
+    pub stall_events: u64,
+
+    /// Obsolete-SST delete accounting.
+    pub obsolete_delete_attempts: u64,
+    pub obsolete_delete_success: u64,
+    pub obsolete_delete_fail: u64,
+    pub obsolete_delete_bytes: u64,
 
     /// Per-level statistics.
     pub level_stats: Vec<LevelStats>,
@@ -3798,6 +4159,13 @@ mod tests {
                 in_flight_tracker: InFlightLsnTracker::new_auto(),
                 commit_reservations: CommitLsnReservations::new(),
                 v26_mode: AtomicU8::new(initial_v26_mode),
+                backpressure_state: AtomicU8::new(BackpressureState::Normal.as_u8()),
+                slowdown_events: AtomicU64::new(0),
+                stall_events: AtomicU64::new(0),
+                obsolete_delete_attempts: AtomicU64::new(0),
+                obsolete_delete_success: AtomicU64::new(0),
+                obsolete_delete_fail: AtomicU64::new(0),
+                obsolete_delete_bytes: AtomicU64::new(0),
                 manifest_writer: parking_lot::Mutex::new(None),
                 manifest_runtime: parking_lot::Mutex::new(None),
                 manifest_writer_running: Arc::new(AtomicBool::new(false)),

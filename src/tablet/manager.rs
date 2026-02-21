@@ -25,6 +25,7 @@ use parking_lot::RwLock;
 
 use crate::catalog::types::{Lsn, Timestamp};
 use crate::inner_table::catalog_loader::CatalogCache;
+use crate::io::remove_io_namespace;
 use crate::log_info;
 use crate::log_warn;
 use crate::lsn::SharedLsnProvider;
@@ -33,7 +34,10 @@ use crate::tablet::CacheSuite;
 use crate::util::error::{Result, TiSqlError};
 
 use super::router::{route_index_to_tablet, route_table_to_tablet, TabletId};
-use super::{CompactionScheduler, FlushScheduler, IlogTruncateStats, TabletEngine, Version};
+use super::{
+    tablet_namespace_from_dir, CompactionScheduler, CompactionSchedulerStatus, FlushScheduler,
+    FlushSchedulerStatus, IlogTruncateStats, TabletEngine, Version,
+};
 
 /// One tablet checkpoint capture result.
 pub struct TabletCheckpointCapture {
@@ -68,6 +72,12 @@ pub struct TabletIlogTruncateCapture {
 struct TabletWorkerSet {
     flush: FlushScheduler,
     compaction: CompactionScheduler,
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct TabletWorkerStatus {
+    pub flush: FlushSchedulerStatus,
+    pub compaction: CompactionSchedulerStatus,
 }
 
 /// Derive desired tablet inventory from loaded catalog metadata.
@@ -322,6 +332,13 @@ impl TabletManager {
         self.ensure_tablet_dir(tablet_id)?;
         if let Some(cache_suite) = self.cache_suite.read().as_ref() {
             tablet.set_cache_suite(Arc::clone(cache_suite));
+            let ns = tablet_namespace_from_dir(&self.tablet_dir(tablet_id));
+            if let Some(block_cache) = cache_suite.block_cache() {
+                block_cache.register_namespace(ns);
+            }
+            if let Some(row_cache) = cache_suite.row_cache() {
+                row_cache.register_namespace(ns);
+            }
         }
         self.desired_tablets.write().insert(tablet_id);
         self.tablets.write().insert(tablet_id, Arc::clone(&tablet));
@@ -332,8 +349,15 @@ impl TabletManager {
     /// Bind one shared cache suite and apply to all currently mounted tablets.
     pub fn bind_cache_suite(&self, suite: Arc<CacheSuite>) {
         *self.cache_suite.write() = Some(Arc::clone(&suite));
-        for (_, tablet) in self.all_tablets() {
+        for (tablet_id, tablet) in self.all_tablets() {
             tablet.set_cache_suite(Arc::clone(&suite));
+            let ns = tablet_namespace_from_dir(&self.tablet_dir(tablet_id));
+            if let Some(block_cache) = suite.block_cache() {
+                block_cache.register_namespace(ns);
+            }
+            if let Some(row_cache) = suite.row_cache() {
+                row_cache.register_namespace(ns);
+            }
         }
     }
 
@@ -347,11 +371,13 @@ impl TabletManager {
         if tablet_id == TabletId::System {
             return Ok(None);
         }
+        let ns = tablet_namespace_from_dir(&self.tablet_dir(tablet_id));
 
         let tablet = match self.get_tablet(tablet_id) {
             Some(tablet) => tablet,
             None => {
                 self.desired_tablets.write().remove(&tablet_id);
+                remove_io_namespace(ns);
                 return Ok(None);
             }
         };
@@ -365,7 +391,36 @@ impl TabletManager {
 
         self.desired_tablets.write().remove(&tablet_id);
         let removed = self.tablets.write().remove(&tablet_id);
+        if let Some(cache_suite) = self.cache_suite.read().as_ref() {
+            if let Some(block_cache) = cache_suite.block_cache() {
+                block_cache.unregister_namespace(ns);
+            }
+            if let Some(row_cache) = cache_suite.row_cache() {
+                row_cache.unregister_namespace(ns);
+            }
+        }
+        remove_io_namespace(ns);
         Ok(removed)
+    }
+
+    pub fn cache_suite(&self) -> Option<Arc<CacheSuite>> {
+        self.cache_suite.read().clone()
+    }
+
+    pub fn worker_statuses(&self) -> BTreeMap<TabletId, TabletWorkerStatus> {
+        self.tablet_workers
+            .read()
+            .iter()
+            .map(|(tablet_id, workers)| {
+                (
+                    *tablet_id,
+                    TabletWorkerStatus {
+                        flush: workers.flush.status(),
+                        compaction: workers.compaction.status(),
+                    },
+                )
+            })
+            .collect()
     }
 
     /// Capture one tablet checkpoint via its manifest writer.
@@ -663,6 +718,7 @@ mod tests {
     use super::*;
     use crate::catalog::{IndexDef, TableDef};
     use crate::inner_table::core_tables::{ALL_TABLE_TABLE_ID, USER_TABLE_ID_START};
+    use crate::io::{record_io, snapshot_io, IoOpKind, IoSource, IoTraceTag};
     use crate::lsn::new_lsn_provider;
     use crate::tablet::memtable::FlushState;
     use crate::tablet::{IlogConfig, IlogService, LsmConfig, StorageEngine, Version, WriteBatch};
@@ -1569,6 +1625,52 @@ mod tests {
             "remove_tablet should flush frozen memtable after reset_aborted_flush_states"
         );
         assert!(!manager.has_running_workers(user_tablet_id));
+
+        manager.stop_background_workers();
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn test_phase4_remove_tablet_cleans_io_accounting_namespace() {
+        let dir = TempDir::new().unwrap();
+        let manager = TabletManager::new(
+            dir.path(),
+            new_lsn_provider(),
+            open_test_system_tablet(dir.path()),
+        )
+        .unwrap();
+        manager
+            .bind_background_runtime(&tokio::runtime::Handle::current())
+            .unwrap();
+
+        let user_tablet_id = TabletId::Table {
+            table_id: USER_TABLE_ID_START + 78,
+        };
+        let user_engine = Arc::new(
+            TabletEngine::open(LsmConfig::new(manager.tablet_dir(user_tablet_id))).unwrap(),
+        );
+        manager
+            .insert_tablet(user_tablet_id, Arc::clone(&user_engine))
+            .unwrap();
+
+        let ns = tablet_namespace_from_dir(&manager.tablet_dir(user_tablet_id));
+        record_io(
+            IoTraceTag::new(ns, IoSource::ForegroundPointRead),
+            IoOpKind::Read,
+            64,
+        );
+        assert!(
+            snapshot_io().iter().any(|entry| entry.tablet_ns == ns),
+            "I/O namespace should exist before tablet removal"
+        );
+
+        manager
+            .remove_tablet(user_tablet_id)
+            .unwrap()
+            .expect("tablet should be removed");
+        assert!(
+            !snapshot_io().iter().any(|entry| entry.tablet_ns == ns),
+            "remove_tablet should clean per-tablet I/O accounting namespace"
+        );
 
         manager.stop_background_workers();
     }
