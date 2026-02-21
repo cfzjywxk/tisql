@@ -50,6 +50,36 @@ pub const DEFAULT_MEMTABLE_SIZE: usize = 64 * 1024 * 1024;
 /// Default maximum frozen memtables.
 pub const DEFAULT_MAX_FROZEN_MEMTABLES: usize = 16;
 
+/// Enter frozen slowdown when frozen count reaches this percentage of max.
+pub const DEFAULT_FROZEN_SLOWDOWN_ENTER_PERCENT: u8 = 75;
+
+/// Exit frozen slowdown when frozen count falls to this percentage of max.
+pub const DEFAULT_FROZEN_SLOWDOWN_EXIT_PERCENT: u8 = 60;
+
+/// Frozen slowdown minimum write delay in milliseconds.
+pub const DEFAULT_FROZEN_SLOWDOWN_MIN_DELAY_MS: u64 = 1;
+
+/// Frozen slowdown maximum write delay in milliseconds.
+pub const DEFAULT_FROZEN_SLOWDOWN_MAX_DELAY_MS: u64 = 20;
+
+/// Async writer wait timeout for hard frozen-cap stalls in milliseconds.
+pub const DEFAULT_FROZEN_STALL_WAIT_TIMEOUT_MS: u64 = 100;
+
+/// Optional memory-pressure soft threshold in bytes (0 disables byte model).
+pub const DEFAULT_MEM_PRESSURE_SOFT_LIMIT_BYTES: usize = 0;
+
+/// Optional memory-pressure hard threshold in bytes (0 disables byte model).
+pub const DEFAULT_MEM_PRESSURE_HARD_LIMIT_BYTES: usize = 0;
+
+/// Memory-pressure slowdown minimum delay in milliseconds.
+pub const DEFAULT_MEM_PRESSURE_MIN_DELAY_MS: u64 = 1;
+
+/// Memory-pressure slowdown maximum delay in milliseconds.
+pub const DEFAULT_MEM_PRESSURE_MAX_DELAY_MS: u64 = 20;
+
+/// L0 guard band (files) for limiting concurrent flush dispatch near stop.
+pub const DEFAULT_L0_FLUSH_DISPATCH_GUARD_BAND: usize = 2;
+
 /// Default data block size (4 KB).
 pub const DEFAULT_BLOCK_SIZE: usize = 4 * 1024;
 
@@ -158,6 +188,33 @@ pub struct LsmConfig {
     /// writes will stall until a memtable is flushed.
     pub max_frozen_memtables: usize,
 
+    /// Frozen-count ratio (percentage) to enter slowdown before hard stall.
+    pub frozen_slowdown_enter_percent: u8,
+
+    /// Frozen-count ratio (percentage) to exit slowdown (hysteresis).
+    pub frozen_slowdown_exit_percent: u8,
+
+    /// Frozen slowdown minimum delay in milliseconds.
+    pub frozen_slowdown_min_delay_ms: u64,
+
+    /// Frozen slowdown maximum delay in milliseconds.
+    pub frozen_slowdown_max_delay_ms: u64,
+
+    /// Async writer wait timeout (ms) for hard frozen-cap stalls.
+    pub frozen_stall_wait_timeout_ms: u64,
+
+    /// Byte-based memory-pressure soft threshold (0 disables byte model).
+    pub mem_pressure_soft_limit_bytes: usize,
+
+    /// Byte-based memory-pressure hard threshold (0 disables byte model).
+    pub mem_pressure_hard_limit_bytes: usize,
+
+    /// Byte-based slowdown minimum delay in milliseconds.
+    pub mem_pressure_min_delay_ms: u64,
+
+    /// Byte-based slowdown maximum delay in milliseconds.
+    pub mem_pressure_max_delay_ms: u64,
+
     /// Minimum memtable age before flush (optional).
     ///
     /// If set, memtables younger than this duration won't be flushed
@@ -230,6 +287,9 @@ pub struct LsmConfig {
     /// until compaction reduces the count.
     pub l0_stop_trigger: usize,
 
+    /// Near-stop L0 guard band for limiting concurrent flush dispatch.
+    pub l0_flush_dispatch_guard_band: usize,
+
     /// Level size multiplier.
     ///
     /// Each level can hold `multiplier` times more data than
@@ -276,6 +336,15 @@ impl LsmConfig {
             data_dir: data_dir.into(),
             memtable_size: DEFAULT_MEMTABLE_SIZE,
             max_frozen_memtables: DEFAULT_MAX_FROZEN_MEMTABLES,
+            frozen_slowdown_enter_percent: DEFAULT_FROZEN_SLOWDOWN_ENTER_PERCENT,
+            frozen_slowdown_exit_percent: DEFAULT_FROZEN_SLOWDOWN_EXIT_PERCENT,
+            frozen_slowdown_min_delay_ms: DEFAULT_FROZEN_SLOWDOWN_MIN_DELAY_MS,
+            frozen_slowdown_max_delay_ms: DEFAULT_FROZEN_SLOWDOWN_MAX_DELAY_MS,
+            frozen_stall_wait_timeout_ms: DEFAULT_FROZEN_STALL_WAIT_TIMEOUT_MS,
+            mem_pressure_soft_limit_bytes: DEFAULT_MEM_PRESSURE_SOFT_LIMIT_BYTES,
+            mem_pressure_hard_limit_bytes: DEFAULT_MEM_PRESSURE_HARD_LIMIT_BYTES,
+            mem_pressure_min_delay_ms: DEFAULT_MEM_PRESSURE_MIN_DELAY_MS,
+            mem_pressure_max_delay_ms: DEFAULT_MEM_PRESSURE_MAX_DELAY_MS,
             min_memtable_age: None,
             block_size: DEFAULT_BLOCK_SIZE,
             compression: CompressionType::None,
@@ -292,6 +361,7 @@ impl LsmConfig {
             l0_compaction_trigger: DEFAULT_L0_COMPACTION_TRIGGER,
             l0_slowdown_trigger: DEFAULT_L0_SLOWDOWN_TRIGGER,
             l0_stop_trigger: DEFAULT_L0_STOP_TRIGGER,
+            l0_flush_dispatch_guard_band: DEFAULT_L0_FLUSH_DISPATCH_GUARD_BAND,
             level_size_multiplier: DEFAULT_LEVEL_SIZE_MULTIPLIER,
             l1_max_size: DEFAULT_L1_MAX_SIZE,
             max_levels: DEFAULT_MAX_LEVELS,
@@ -350,6 +420,52 @@ impl LsmConfig {
         if self.max_frozen_memtables == 0 {
             return Err("max_frozen_memtables must be > 0".to_string());
         }
+        if !(1..=100).contains(&self.frozen_slowdown_enter_percent) {
+            return Err("frozen_slowdown_enter_percent must be in [1, 100]".to_string());
+        }
+        if !(1..=100).contains(&self.frozen_slowdown_exit_percent) {
+            return Err("frozen_slowdown_exit_percent must be in [1, 100]".to_string());
+        }
+        if self.frozen_slowdown_exit_percent >= self.frozen_slowdown_enter_percent {
+            return Err(
+                "frozen_slowdown_exit_percent must be < frozen_slowdown_enter_percent".to_string(),
+            );
+        }
+        if self.frozen_slowdown_min_delay_ms == 0 {
+            return Err("frozen_slowdown_min_delay_ms must be > 0".to_string());
+        }
+        if self.frozen_slowdown_max_delay_ms < self.frozen_slowdown_min_delay_ms {
+            return Err(
+                "frozen_slowdown_max_delay_ms must be >= frozen_slowdown_min_delay_ms".to_string(),
+            );
+        }
+        if self.frozen_stall_wait_timeout_ms == 0 {
+            return Err("frozen_stall_wait_timeout_ms must be > 0".to_string());
+        }
+        let byte_model_disabled =
+            self.mem_pressure_soft_limit_bytes == 0 && self.mem_pressure_hard_limit_bytes == 0;
+        if !byte_model_disabled {
+            if self.mem_pressure_soft_limit_bytes == 0 {
+                return Err(
+                    "mem_pressure_soft_limit_bytes must be > 0 when byte model is enabled"
+                        .to_string(),
+                );
+            }
+            if self.mem_pressure_hard_limit_bytes < self.mem_pressure_soft_limit_bytes {
+                return Err(
+                    "mem_pressure_hard_limit_bytes must be >= mem_pressure_soft_limit_bytes"
+                        .to_string(),
+                );
+            }
+            if self.mem_pressure_min_delay_ms == 0 {
+                return Err("mem_pressure_min_delay_ms must be > 0".to_string());
+            }
+            if self.mem_pressure_max_delay_ms < self.mem_pressure_min_delay_ms {
+                return Err(
+                    "mem_pressure_max_delay_ms must be >= mem_pressure_min_delay_ms".to_string(),
+                );
+            }
+        }
         if self.block_size == 0 {
             return Err("block_size must be > 0".to_string());
         }
@@ -361,6 +477,9 @@ impl LsmConfig {
         }
         if self.l0_stop_trigger < self.l0_slowdown_trigger {
             return Err("l0_stop_trigger must be >= l0_slowdown_trigger".to_string());
+        }
+        if self.l0_flush_dispatch_guard_band == 0 {
+            return Err("l0_flush_dispatch_guard_band must be > 0".to_string());
         }
         if self.level_size_multiplier < 2 {
             return Err("level_size_multiplier must be >= 2".to_string());
@@ -414,6 +533,45 @@ impl LsmConfigBuilder {
     /// Set the maximum frozen memtables.
     pub fn max_frozen_memtables(mut self, count: usize) -> Self {
         self.config.max_frozen_memtables = count;
+        self
+    }
+
+    /// Set frozen slowdown enter threshold percentage.
+    pub fn frozen_slowdown_enter_percent(mut self, percent: u8) -> Self {
+        self.config.frozen_slowdown_enter_percent = percent;
+        self
+    }
+
+    /// Set frozen slowdown exit threshold percentage.
+    pub fn frozen_slowdown_exit_percent(mut self, percent: u8) -> Self {
+        self.config.frozen_slowdown_exit_percent = percent;
+        self
+    }
+
+    /// Set frozen slowdown delay range in milliseconds.
+    pub fn frozen_slowdown_delay_ms(mut self, min_ms: u64, max_ms: u64) -> Self {
+        self.config.frozen_slowdown_min_delay_ms = min_ms;
+        self.config.frozen_slowdown_max_delay_ms = max_ms;
+        self
+    }
+
+    /// Set async writer wait timeout for hard frozen-cap stalls.
+    pub fn frozen_stall_wait_timeout_ms(mut self, timeout_ms: u64) -> Self {
+        self.config.frozen_stall_wait_timeout_ms = timeout_ms;
+        self
+    }
+
+    /// Set byte-based memory-pressure limits in bytes. Set both to 0 to disable.
+    pub fn mem_pressure_limits_bytes(mut self, soft_bytes: usize, hard_bytes: usize) -> Self {
+        self.config.mem_pressure_soft_limit_bytes = soft_bytes;
+        self.config.mem_pressure_hard_limit_bytes = hard_bytes;
+        self
+    }
+
+    /// Set byte-based memory-pressure slowdown delay range in milliseconds.
+    pub fn mem_pressure_delay_ms(mut self, min_ms: u64, max_ms: u64) -> Self {
+        self.config.mem_pressure_min_delay_ms = min_ms;
+        self.config.mem_pressure_max_delay_ms = max_ms;
         self
     }
 
@@ -513,6 +671,12 @@ impl LsmConfigBuilder {
         self
     }
 
+    /// Set L0 guard band for near-stop flush dispatch limiting.
+    pub fn l0_flush_dispatch_guard_band(mut self, files: usize) -> Self {
+        self.config.l0_flush_dispatch_guard_band = files;
+        self
+    }
+
     /// Set the level size multiplier.
     pub fn level_size_multiplier(mut self, multiplier: usize) -> Self {
         self.config.level_size_multiplier = multiplier;
@@ -584,10 +748,50 @@ mod tests {
         let config = LsmConfig::default();
         assert_eq!(config.memtable_size, DEFAULT_MEMTABLE_SIZE);
         assert_eq!(config.max_frozen_memtables, DEFAULT_MAX_FROZEN_MEMTABLES);
+        assert_eq!(
+            config.frozen_slowdown_enter_percent,
+            DEFAULT_FROZEN_SLOWDOWN_ENTER_PERCENT
+        );
+        assert_eq!(
+            config.frozen_slowdown_exit_percent,
+            DEFAULT_FROZEN_SLOWDOWN_EXIT_PERCENT
+        );
+        assert_eq!(
+            config.frozen_slowdown_min_delay_ms,
+            DEFAULT_FROZEN_SLOWDOWN_MIN_DELAY_MS
+        );
+        assert_eq!(
+            config.frozen_slowdown_max_delay_ms,
+            DEFAULT_FROZEN_SLOWDOWN_MAX_DELAY_MS
+        );
+        assert_eq!(
+            config.frozen_stall_wait_timeout_ms,
+            DEFAULT_FROZEN_STALL_WAIT_TIMEOUT_MS
+        );
+        assert_eq!(
+            config.mem_pressure_soft_limit_bytes,
+            DEFAULT_MEM_PRESSURE_SOFT_LIMIT_BYTES
+        );
+        assert_eq!(
+            config.mem_pressure_hard_limit_bytes,
+            DEFAULT_MEM_PRESSURE_HARD_LIMIT_BYTES
+        );
+        assert_eq!(
+            config.mem_pressure_min_delay_ms,
+            DEFAULT_MEM_PRESSURE_MIN_DELAY_MS
+        );
+        assert_eq!(
+            config.mem_pressure_max_delay_ms,
+            DEFAULT_MEM_PRESSURE_MAX_DELAY_MS
+        );
         assert_eq!(config.block_size, DEFAULT_BLOCK_SIZE);
         assert_eq!(config.l0_compaction_trigger, DEFAULT_L0_COMPACTION_TRIGGER);
         assert_eq!(config.l0_slowdown_trigger, DEFAULT_L0_SLOWDOWN_TRIGGER);
         assert_eq!(config.l0_stop_trigger, DEFAULT_L0_STOP_TRIGGER);
+        assert_eq!(
+            config.l0_flush_dispatch_guard_band,
+            DEFAULT_L0_FLUSH_DISPATCH_GUARD_BAND
+        );
         assert_eq!(config.max_levels, DEFAULT_MAX_LEVELS);
         assert_eq!(config.bloom_enabled, DEFAULT_BLOOM_ENABLED);
         assert_eq!(config.bloom_bits_per_key, DEFAULT_BLOOM_BITS_PER_KEY);
@@ -863,6 +1067,48 @@ mod tests {
             .unwrap();
 
         assert_eq!(config.flush_threads, 4);
+    }
+
+    #[test]
+    fn test_config_validation_frozen_hysteresis_invalid() {
+        let config = LsmConfig::builder("./test")
+            .frozen_slowdown_enter_percent(60)
+            .frozen_slowdown_exit_percent(60)
+            .build_unchecked();
+        let err = config.validate().unwrap_err();
+        assert!(err.contains("frozen_slowdown_exit_percent"));
+    }
+
+    #[test]
+    fn test_config_validation_mem_pressure_limits() {
+        let invalid_soft_zero = LsmConfig::builder("./test")
+            .mem_pressure_limits_bytes(0, 1024)
+            .build_unchecked();
+        assert!(invalid_soft_zero.validate().is_err());
+
+        let invalid_hard_smaller = LsmConfig::builder("./test")
+            .mem_pressure_limits_bytes(2048, 1024)
+            .build_unchecked();
+        assert!(invalid_hard_smaller.validate().is_err());
+
+        let valid_enabled = LsmConfig::builder("./test")
+            .mem_pressure_limits_bytes(1024, 2048)
+            .build()
+            .unwrap();
+        assert_eq!(valid_enabled.mem_pressure_soft_limit_bytes, 1024);
+        assert_eq!(valid_enabled.mem_pressure_hard_limit_bytes, 2048);
+
+        let invalid_enabled_delay = LsmConfig::builder("./test")
+            .mem_pressure_limits_bytes(1024, 2048)
+            .mem_pressure_delay_ms(0, 1)
+            .build_unchecked();
+        assert!(invalid_enabled_delay.validate().is_err());
+
+        let disabled_model_allows_zero_delay = LsmConfig::builder("./test")
+            .mem_pressure_limits_bytes(0, 0)
+            .mem_pressure_delay_ms(0, 0)
+            .build_unchecked();
+        assert!(disabled_model_allows_zero_delay.validate().is_ok());
     }
 
     #[test]

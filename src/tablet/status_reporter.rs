@@ -156,6 +156,16 @@ pub struct BackpressureStatus {
     pub state: BackpressureState,
     pub slowdown_events: u64,
     pub stall_events: u64,
+    pub frozen_slowdown_events: u64,
+    pub frozen_cap_stall_events: u64,
+    pub l0_stop_stall_events: u64,
+    pub mem_pressure_soft_events: u64,
+    pub mem_pressure_hard_events: u64,
+    pub mem_pressure_soft_residency_ms: u64,
+    pub mem_pressure_hard_residency_ms: u64,
+    pub writer_wait_events: u64,
+    pub writer_wake_events: u64,
+    pub writer_wait_timeout_events: u64,
 }
 
 pub struct EngineStatusReporter {
@@ -335,6 +345,16 @@ fn collect_snapshot_with_io_entries(
             state: lsm.backpressure_state,
             slowdown_events: lsm.slowdown_events,
             stall_events: lsm.stall_events,
+            frozen_slowdown_events: lsm.frozen_slowdown_events,
+            frozen_cap_stall_events: lsm.frozen_stall_events,
+            l0_stop_stall_events: lsm.l0_stop_stall_events,
+            mem_pressure_soft_events: lsm.mem_pressure_soft_events,
+            mem_pressure_hard_events: lsm.mem_pressure_hard_events,
+            mem_pressure_soft_residency_ms: lsm.mem_pressure_soft_residency_ms,
+            mem_pressure_hard_residency_ms: lsm.mem_pressure_hard_residency_ms,
+            writer_wait_events: lsm.writer_wait_events,
+            writer_wake_events: lsm.writer_wake_events,
+            writer_wait_timeout_events: lsm.writer_wait_timeout_events,
         };
         let job_status = JobStatus {
             flush: JobCounters {
@@ -559,7 +579,7 @@ pub fn log_snapshot(snapshot: &EngineStatusSnapshot) {
 
     for tablet in &snapshot.tablets {
         log_info!(
-            "[engine-status][tablet={}] cache:block={} row={} lsm:mem={} frozen={}/{} L0={} total_sst={} flush:run={} pend={} compact:run={} pend={} bp={:?}",
+            "[engine-status][tablet={}] cache:block={} row={} lsm:mem={} frozen={}/{} waiters={} flush:active={}/{} L0={} total_sst={} flush:run={} pend={} compact:run={} pend={} bp={:?}",
             tablet.tablet_id.dir_name(),
             tablet
                 .cache
@@ -570,6 +590,9 @@ pub fn log_snapshot(snapshot: &EngineStatusSnapshot) {
             tablet.lsm.active_memtable_size,
             tablet.lsm.frozen_memtable_count,
             tablet.lsm.frozen_memtable_bytes,
+            tablet.lsm.frozen_waiters,
+            tablet.lsm.flush_workers_active,
+            tablet.lsm.flush_workers_limit,
             tablet.lsm.l0_sst_count,
             tablet.lsm.total_sst_bytes,
             tablet.jobs.flush.in_progress,
@@ -681,6 +704,27 @@ pub fn snapshot_to_metric_rows(snapshot: &EngineStatusSnapshot) -> Vec<EngineSta
             &mut rows,
             "tablet",
             &name,
+            "lsm.frozen_waiters",
+            tablet.lsm.frozen_waiters,
+        );
+        push_metric(
+            &mut rows,
+            "tablet",
+            &name,
+            "lsm.flush_workers_active",
+            tablet.lsm.flush_workers_active,
+        );
+        push_metric(
+            &mut rows,
+            "tablet",
+            &name,
+            "lsm.flush_workers_limit",
+            tablet.lsm.flush_workers_limit,
+        );
+        push_metric(
+            &mut rows,
+            "tablet",
+            &name,
             "lsm.l0_sst_count",
             tablet.lsm.l0_sst_count,
         );
@@ -697,6 +741,90 @@ pub fn snapshot_to_metric_rows(snapshot: &EngineStatusSnapshot) -> Vec<EngineSta
             &name,
             "backpressure.state",
             format!("{:?}", tablet.backpressure.state),
+        );
+        push_metric(
+            &mut rows,
+            "tablet",
+            &name,
+            "backpressure.slowdown_events",
+            tablet.backpressure.slowdown_events,
+        );
+        push_metric(
+            &mut rows,
+            "tablet",
+            &name,
+            "backpressure.stall_events",
+            tablet.backpressure.stall_events,
+        );
+        push_metric(
+            &mut rows,
+            "tablet",
+            &name,
+            "backpressure.frozen_slowdown_events",
+            tablet.backpressure.frozen_slowdown_events,
+        );
+        push_metric(
+            &mut rows,
+            "tablet",
+            &name,
+            "backpressure.frozen_cap_stall_events",
+            tablet.backpressure.frozen_cap_stall_events,
+        );
+        push_metric(
+            &mut rows,
+            "tablet",
+            &name,
+            "backpressure.l0_stop_stall_events",
+            tablet.backpressure.l0_stop_stall_events,
+        );
+        push_metric(
+            &mut rows,
+            "tablet",
+            &name,
+            "backpressure.mem_pressure_soft_events",
+            tablet.backpressure.mem_pressure_soft_events,
+        );
+        push_metric(
+            &mut rows,
+            "tablet",
+            &name,
+            "backpressure.mem_pressure_hard_events",
+            tablet.backpressure.mem_pressure_hard_events,
+        );
+        push_metric(
+            &mut rows,
+            "tablet",
+            &name,
+            "backpressure.mem_pressure_soft_residency_ms",
+            tablet.backpressure.mem_pressure_soft_residency_ms,
+        );
+        push_metric(
+            &mut rows,
+            "tablet",
+            &name,
+            "backpressure.mem_pressure_hard_residency_ms",
+            tablet.backpressure.mem_pressure_hard_residency_ms,
+        );
+        push_metric(
+            &mut rows,
+            "tablet",
+            &name,
+            "backpressure.writer_wait_events",
+            tablet.backpressure.writer_wait_events,
+        );
+        push_metric(
+            &mut rows,
+            "tablet",
+            &name,
+            "backpressure.writer_wake_events",
+            tablet.backpressure.writer_wake_events,
+        );
+        push_metric(
+            &mut rows,
+            "tablet",
+            &name,
+            "backpressure.writer_wait_timeout_events",
+            tablet.backpressure.writer_wait_timeout_events,
         );
         push_metric(
             &mut rows,

@@ -50,7 +50,8 @@ use std::sync::Arc;
 
 use parking_lot::{RwLock, RwLockWriteGuard};
 use std::time::{Duration, Instant};
-use tokio::sync::{mpsc, oneshot};
+use tokio::sync::{mpsc, oneshot, Notify};
+use tokio::task::JoinSet;
 
 #[cfg(feature = "failpoints")]
 use fail::fail_point;
@@ -240,6 +241,33 @@ impl BackpressureState {
     fn as_u8(self) -> u8 {
         self as u8
     }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum WriteStallReason {
+    L0Stop,
+    FrozenCap,
+    MemPressureHard,
+}
+
+#[derive(Debug, Clone, Copy)]
+enum WritePressureDecision {
+    Normal,
+    Slowdown(Duration),
+    Stall(WriteStallReason),
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum SlowdownCause {
+    L0,
+    Frozen,
+    MemPressure,
+}
+
+#[derive(Debug, Default)]
+struct MemPressureTracker {
+    soft_enter_at: Option<Instant>,
+    hard_enter_at: Option<Instant>,
 }
 
 /// Inner state of the LSM engine, protected by RwLock for atomic updates.
@@ -609,6 +637,39 @@ pub struct LsmEngine {
     slowdown_events: AtomicU64,
     /// Number of `->Stall` transitions.
     stall_events: AtomicU64,
+    /// Number of transitions into frozen-count slowdown.
+    frozen_slowdown_events: AtomicU64,
+    /// Number of transitions into hard frozen-cap stall.
+    frozen_stall_events: AtomicU64,
+    /// Number of transitions into hard L0-stop stall.
+    l0_stop_stall_events: AtomicU64,
+    /// Number of transitions into byte-pressure soft threshold.
+    mem_pressure_soft_events: AtomicU64,
+    /// Number of transitions into byte-pressure hard threshold.
+    mem_pressure_hard_events: AtomicU64,
+    /// Total residency time above byte-pressure soft threshold.
+    mem_pressure_soft_residency_ms: AtomicU64,
+    /// Total residency time above byte-pressure hard threshold.
+    mem_pressure_hard_residency_ms: AtomicU64,
+    /// State tracker for byte-pressure residency accounting.
+    mem_pressure_tracker: parking_lot::Mutex<MemPressureTracker>,
+    /// Current frozen-count slowdown latch (for hysteresis + transition counting).
+    frozen_slowdown_active: AtomicBool,
+    /// Current hard frozen-cap stall latch.
+    frozen_hard_stall_active: AtomicBool,
+    /// Current hard L0-stop stall latch.
+    l0_stop_stall_active: AtomicBool,
+
+    /// Number of async writers currently waiting on frozen-cap relief.
+    frozen_waiters: AtomicU64,
+    /// Number of writer wait attempts due to hard frozen-cap stalls.
+    writer_wait_events: AtomicU64,
+    /// Number of async writers woken by flush completion notifications.
+    writer_wake_events: AtomicU64,
+    /// Number of writer waits that timed out.
+    writer_wait_timeout_events: AtomicU64,
+    /// Notification channel for async writers blocked on frozen-cap pressure.
+    frozen_wait_notify: Notify,
 
     /// Obsolete-SST delete accounting.
     obsolete_delete_attempts: AtomicU64,
@@ -706,6 +767,22 @@ impl LsmEngine {
             backpressure_state: AtomicU8::new(BackpressureState::Normal.as_u8()),
             slowdown_events: AtomicU64::new(0),
             stall_events: AtomicU64::new(0),
+            frozen_slowdown_events: AtomicU64::new(0),
+            frozen_stall_events: AtomicU64::new(0),
+            l0_stop_stall_events: AtomicU64::new(0),
+            mem_pressure_soft_events: AtomicU64::new(0),
+            mem_pressure_hard_events: AtomicU64::new(0),
+            mem_pressure_soft_residency_ms: AtomicU64::new(0),
+            mem_pressure_hard_residency_ms: AtomicU64::new(0),
+            mem_pressure_tracker: parking_lot::Mutex::new(MemPressureTracker::default()),
+            frozen_slowdown_active: AtomicBool::new(false),
+            frozen_hard_stall_active: AtomicBool::new(false),
+            l0_stop_stall_active: AtomicBool::new(false),
+            frozen_waiters: AtomicU64::new(0),
+            writer_wait_events: AtomicU64::new(0),
+            writer_wake_events: AtomicU64::new(0),
+            writer_wait_timeout_events: AtomicU64::new(0),
+            frozen_wait_notify: Notify::new(),
             obsolete_delete_attempts: AtomicU64::new(0),
             obsolete_delete_success: AtomicU64::new(0),
             obsolete_delete_fail: AtomicU64::new(0),
@@ -885,6 +962,32 @@ impl LsmEngine {
                 )
             })
             .cloned()
+    }
+
+    fn try_mark_flushing(memtable: &MemTable) -> bool {
+        memtable
+            .compare_exchange_flush_state(FlushState::NeedsFlush, FlushState::Flushing)
+            .or_else(|actual| {
+                if actual == FlushState::FlushedDirty {
+                    memtable.compare_exchange_flush_state(
+                        FlushState::FlushedDirty,
+                        FlushState::Flushing,
+                    )
+                } else {
+                    Err(actual)
+                }
+            })
+            .is_ok()
+    }
+
+    fn next_claimable_frozen(&self) -> Option<Arc<MemTable>> {
+        let state = self.state.read();
+        for memtable in &state.frozen {
+            if Self::try_mark_flushing(memtable) {
+                return Some(Arc::clone(memtable));
+            }
+        }
+        None
     }
 
     fn cleanup_flushed_clean_frozen_locked(
@@ -1321,11 +1424,11 @@ impl LsmEngine {
         Some(old_active)
     }
 
-    /// Flush a frozen memtable to an SST file.
-    ///
-    /// This creates a new L0 SST and updates the version.
-    /// If ilog is configured, uses intent/commit protocol for crash safety.
-    pub async fn flush_memtable_async(&self, memtable: &MemTable) -> Result<SstMeta> {
+    async fn flush_memtable_async_inner(
+        &self,
+        memtable: &MemTable,
+        preclaimed: bool,
+    ) -> Result<SstMeta> {
         if !memtable.is_frozen() {
             return Err(TiSqlError::Storage(
                 "Cannot flush non-frozen memtable".to_string(),
@@ -1339,23 +1442,19 @@ impl LsmEngine {
             self.frozen_count()
         );
 
-        // Step 1: mark memtable as flushing.
-        match memtable.flush_state() {
-            FlushState::NeedsFlush | FlushState::FlushedDirty => {
-                memtable.set_flush_state(FlushState::Flushing);
-            }
-            FlushState::Flushing => {
+        // Step 1: atomically claim memtable for flush.
+        if preclaimed {
+            if memtable.flush_state() != FlushState::Flushing {
                 return Err(TiSqlError::Storage(format!(
-                    "Memtable {} is already flushing",
+                    "Memtable {} is not in Flushing state for claimed flush",
                     memtable.id()
                 )));
             }
-            FlushState::FlushedClean => {
-                return Err(TiSqlError::Storage(format!(
-                    "Memtable {} is already flushed clean",
-                    memtable.id()
-                )));
-            }
+        } else if !Self::try_mark_flushing(memtable) {
+            return Err(TiSqlError::Storage(format!(
+                "Memtable {} is not claimable for flushing",
+                memtable.id()
+            )));
         }
 
         // Allocate SST ID atomically to prevent races during concurrent flushes
@@ -1498,6 +1597,9 @@ impl LsmEngine {
         let mut state = self.state.write();
         let _removed = self.cleanup_flushed_clean_frozen_locked(&mut state);
         self.install_super_version(&state);
+        drop(state);
+        self.record_mem_pressure_state(self.total_memtable_bytes_for_pressure());
+        self.notify_frozen_waiters();
 
         // Failpoint: crash after version update
         #[cfg(feature = "failpoints")]
@@ -1518,6 +1620,18 @@ impl LsmEngine {
         );
 
         Ok(meta)
+    }
+
+    /// Flush a frozen memtable to an SST file.
+    ///
+    /// This creates a new L0 SST and updates the version.
+    /// If ilog is configured, uses intent/commit protocol for crash safety.
+    pub async fn flush_memtable_async(&self, memtable: &MemTable) -> Result<SstMeta> {
+        self.flush_memtable_async_inner(memtable, false).await
+    }
+
+    async fn flush_claimed_memtable_async(&self, memtable: &MemTable) -> Result<SstMeta> {
+        self.flush_memtable_async_inner(memtable, true).await
     }
 
     /// Sync wrapper for callers that cannot use async yet.
@@ -1765,6 +1879,88 @@ impl LsmEngine {
         Ok(results)
     }
 
+    /// Scheduler-only concurrent flush dispatch path.
+    ///
+    /// Keeps `flush_all_async()` sequential for shutdown/tests while enabling
+    /// bounded in-flight flushes in the background worker loop.
+    pub async fn dispatch_concurrent_flushes(
+        self: &Arc<Self>,
+        max_workers: usize,
+    ) -> Result<Vec<SstMeta>> {
+        let max_workers = max_workers.max(1);
+        if max_workers == 1 {
+            return self.flush_all_async().await;
+        }
+
+        let mut join_set: JoinSet<(u64, Result<SstMeta>)> = JoinSet::new();
+        let mut results = Vec::new();
+        let mut first_err: Option<TiSqlError> = None;
+
+        loop {
+            {
+                let mut state = self.state.write();
+                let removed = self.cleanup_flushed_clean_frozen_locked(&mut state);
+                if removed {
+                    self.install_super_version(&state);
+                }
+            }
+
+            while first_err.is_none() && join_set.len() < max_workers {
+                let Some(memtable) = self.next_claimable_frozen() else {
+                    break;
+                };
+                let engine = Arc::clone(self);
+                join_set.spawn(async move {
+                    let memtable_id = memtable.id();
+                    let result = engine.flush_claimed_memtable_async(memtable.as_ref()).await;
+                    (memtable_id, result)
+                });
+            }
+
+            if join_set.is_empty() {
+                break;
+            }
+
+            let Some(next_result) = join_set.join_next().await else {
+                break;
+            };
+            match next_result {
+                Ok((_memtable_id, Ok(meta))) => {
+                    results.push(meta);
+                }
+                Ok((memtable_id, Err(e))) => {
+                    log_warn!(
+                        "[engine-event] op=flush phase=abort tablet_ns={} memtable_id={} reason=\"{}\"",
+                        self.tablet_cache_ns,
+                        memtable_id,
+                        e
+                    );
+                    if first_err.is_none() {
+                        first_err = Some(e);
+                    }
+                }
+                Err(join_err) => {
+                    if first_err.is_none() {
+                        first_err = Some(TiSqlError::Internal(format!(
+                            "concurrent flush task join failed: {join_err}"
+                        )));
+                    }
+                }
+            }
+
+            if let Some(err) = first_err.take() {
+                while let Some(remaining) = join_set.join_next().await {
+                    if let Ok((_memtable_id, Ok(meta))) = remaining {
+                        results.push(meta);
+                    }
+                }
+                return Err(err);
+            }
+        }
+
+        Ok(results)
+    }
+
     /// Sync wrapper for callers that cannot use async yet.
     pub fn flush_all(&self) -> Result<Vec<SstMeta>> {
         crate::io::block_on_sync(self.flush_all_async())
@@ -1784,6 +1980,30 @@ impl LsmEngine {
     /// Sync wrapper for callers that cannot use async yet.
     pub fn flush_all_with_active(&self) -> Result<Vec<SstMeta>> {
         crate::io::block_on_sync(self.flush_all_with_active_async())
+    }
+
+    /// Configured concurrent flush worker limit.
+    pub fn flush_workers_limit(&self) -> usize {
+        self.config.flush_threads.max(1)
+    }
+
+    /// Effective scheduler dispatch limit after L0 coupling guard.
+    pub fn effective_flush_dispatch_limit(&self) -> usize {
+        let configured = self.flush_workers_limit();
+        if configured <= 1 {
+            return 1;
+        }
+
+        let l0_count = self.current_version().level_size(0);
+        let near_stop = self
+            .config
+            .l0_stop_trigger
+            .saturating_sub(self.config.l0_flush_dispatch_guard_band);
+        if l0_count >= near_stop && self.has_pending_compaction() {
+            1
+        } else {
+            configured
+        }
     }
 
     /// Set a callback to be invoked after flush completes.
@@ -1862,6 +2082,10 @@ impl LsmEngine {
         )
     }
 
+    pub fn frozen_waiter_count(&self) -> u64 {
+        self.frozen_waiters.load(AtomicOrdering::Relaxed)
+    }
+
     fn observe_backpressure_transition(&self, next_state: BackpressureState, l0_count: usize) {
         loop {
             let old_raw = self.backpressure_state.load(AtomicOrdering::Acquire);
@@ -1930,6 +2154,229 @@ impl LsmEngine {
         }
     }
 
+    fn observe_binary_transition(counter: &AtomicU64, latch: &AtomicBool, active: bool) {
+        if active {
+            if !latch.swap(true, AtomicOrdering::AcqRel) {
+                counter.fetch_add(1, AtomicOrdering::Relaxed);
+            }
+        } else {
+            latch.store(false, AtomicOrdering::Release);
+        }
+    }
+
+    fn total_memtable_bytes_for_pressure(&self) -> usize {
+        let state = self.state.read();
+        let mut total = state.active.approximate_size();
+        for frozen in &state.frozen {
+            total = total.saturating_add(frozen.approximate_size());
+        }
+        total
+    }
+
+    fn record_mem_pressure_state(&self, total_memtable_bytes: usize) {
+        let soft_limit = self.config.mem_pressure_soft_limit_bytes;
+        let hard_limit = self.config.mem_pressure_hard_limit_bytes;
+        let soft_active = soft_limit > 0 && total_memtable_bytes >= soft_limit;
+        let hard_active = hard_limit > 0 && total_memtable_bytes >= hard_limit;
+        let now = Instant::now();
+
+        let mut tracker = self.mem_pressure_tracker.lock();
+
+        if soft_active {
+            match tracker.soft_enter_at {
+                Some(start) => {
+                    self.mem_pressure_soft_residency_ms.fetch_add(
+                        now.duration_since(start).as_millis() as u64,
+                        AtomicOrdering::Relaxed,
+                    );
+                    tracker.soft_enter_at = Some(now);
+                }
+                None => {
+                    tracker.soft_enter_at = Some(now);
+                    self.mem_pressure_soft_events
+                        .fetch_add(1, AtomicOrdering::Relaxed);
+                }
+            }
+        } else if let Some(start) = tracker.soft_enter_at.take() {
+            self.mem_pressure_soft_residency_ms.fetch_add(
+                now.duration_since(start).as_millis() as u64,
+                AtomicOrdering::Relaxed,
+            );
+        }
+
+        if hard_active {
+            match tracker.hard_enter_at {
+                Some(start) => {
+                    self.mem_pressure_hard_residency_ms.fetch_add(
+                        now.duration_since(start).as_millis() as u64,
+                        AtomicOrdering::Relaxed,
+                    );
+                    tracker.hard_enter_at = Some(now);
+                }
+                None => {
+                    tracker.hard_enter_at = Some(now);
+                    self.mem_pressure_hard_events
+                        .fetch_add(1, AtomicOrdering::Relaxed);
+                }
+            }
+        } else if let Some(start) = tracker.hard_enter_at.take() {
+            self.mem_pressure_hard_residency_ms.fetch_add(
+                now.duration_since(start).as_millis() as u64,
+                AtomicOrdering::Relaxed,
+            );
+        }
+    }
+
+    fn update_frozen_slowdown_hysteresis(&self, frozen_count: usize) -> bool {
+        let max_frozen = self.config.max_frozen_memtables;
+        let enter = frozen_count.saturating_mul(100)
+            >= max_frozen.saturating_mul(self.config.frozen_slowdown_enter_percent as usize);
+        let exit = frozen_count.saturating_mul(100)
+            <= max_frozen.saturating_mul(self.config.frozen_slowdown_exit_percent as usize);
+
+        let current = self.frozen_slowdown_active.load(AtomicOrdering::Acquire);
+        let next = if current { !exit } else { enter };
+        if next != current {
+            self.frozen_slowdown_active
+                .store(next, AtomicOrdering::Release);
+            if next {
+                self.frozen_slowdown_events
+                    .fetch_add(1, AtomicOrdering::Relaxed);
+            }
+        }
+        next
+    }
+
+    fn compute_frozen_write_delay(&self, frozen_count: usize) -> Duration {
+        let min_ms = self.config.frozen_slowdown_min_delay_ms;
+        let max_ms = self.config.frozen_slowdown_max_delay_ms;
+        let max_frozen = self.config.max_frozen_memtables;
+        let enter_count =
+            max_frozen.saturating_mul(self.config.frozen_slowdown_enter_percent as usize) / 100;
+        if max_frozen <= enter_count {
+            return Duration::from_millis(min_ms);
+        }
+        let range = (max_frozen - enter_count) as u64;
+        let excess = (frozen_count
+            .saturating_sub(enter_count)
+            .min(max_frozen - enter_count)) as u64;
+        let span = max_ms.saturating_sub(min_ms);
+        let delay_ms = min_ms + (span * excess / range);
+        Duration::from_millis(delay_ms)
+    }
+
+    fn compute_mem_pressure_delay(&self, total_memtable_bytes: usize) -> Duration {
+        let min_ms = self.config.mem_pressure_min_delay_ms;
+        let max_ms = self.config.mem_pressure_max_delay_ms;
+        let soft_limit = self.config.mem_pressure_soft_limit_bytes;
+        let hard_limit = self.config.mem_pressure_hard_limit_bytes;
+        if hard_limit <= soft_limit || soft_limit == 0 {
+            return Duration::from_millis(min_ms);
+        }
+        let range = (hard_limit - soft_limit) as u64;
+        let excess = (total_memtable_bytes
+            .saturating_sub(soft_limit)
+            .min(hard_limit - soft_limit)) as u64;
+        let span = max_ms.saturating_sub(min_ms);
+        let delay_ms = min_ms + (span * excess / range);
+        Duration::from_millis(delay_ms)
+    }
+
+    fn decision_to_backpressure_state(decision: WritePressureDecision) -> BackpressureState {
+        match decision {
+            WritePressureDecision::Normal => BackpressureState::Normal,
+            WritePressureDecision::Slowdown(_) => BackpressureState::Slowdown,
+            WritePressureDecision::Stall(_) => BackpressureState::Stall,
+        }
+    }
+
+    fn notify_frozen_waiters(&self) {
+        if self.frozen_waiters.load(AtomicOrdering::Relaxed) > 0 {
+            self.frozen_wait_notify.notify_waiters();
+        }
+    }
+
+    fn evaluate_write_pressure_with_l0(&self, l0_count: usize) -> WritePressureDecision {
+        let (active_size, frozen_count, total_memtable_bytes) = {
+            let state = self.state.read();
+            let mut total_bytes = state.active.approximate_size();
+            for frozen in &state.frozen {
+                total_bytes = total_bytes.saturating_add(frozen.approximate_size());
+            }
+            (
+                state.active.approximate_size(),
+                state.frozen.len(),
+                total_bytes,
+            )
+        };
+
+        self.record_mem_pressure_state(total_memtable_bytes);
+
+        let l0_stop = self.config.should_stop_writes(l0_count);
+        let frozen_hard_stall = active_size >= self.config.memtable_size
+            && frozen_count >= self.config.max_frozen_memtables;
+        let mem_hard_stall = self.config.mem_pressure_hard_limit_bytes > 0
+            && total_memtable_bytes >= self.config.mem_pressure_hard_limit_bytes;
+
+        Self::observe_binary_transition(
+            &self.l0_stop_stall_events,
+            &self.l0_stop_stall_active,
+            l0_stop,
+        );
+        Self::observe_binary_transition(
+            &self.frozen_stall_events,
+            &self.frozen_hard_stall_active,
+            frozen_hard_stall,
+        );
+
+        if l0_stop {
+            return WritePressureDecision::Stall(WriteStallReason::L0Stop);
+        }
+        if frozen_hard_stall {
+            return WritePressureDecision::Stall(WriteStallReason::FrozenCap);
+        }
+        if mem_hard_stall {
+            return WritePressureDecision::Stall(WriteStallReason::MemPressureHard);
+        }
+
+        let l0_delay = if self.config.should_slowdown_writes(l0_count) {
+            Some((SlowdownCause::L0, self.compute_write_delay(l0_count)))
+        } else {
+            None
+        };
+        let frozen_delay = if self.update_frozen_slowdown_hysteresis(frozen_count) {
+            Some((
+                SlowdownCause::Frozen,
+                self.compute_frozen_write_delay(frozen_count),
+            ))
+        } else {
+            None
+        };
+        let mem_delay = if self.config.mem_pressure_soft_limit_bytes > 0
+            && total_memtable_bytes >= self.config.mem_pressure_soft_limit_bytes
+        {
+            Some((
+                SlowdownCause::MemPressure,
+                self.compute_mem_pressure_delay(total_memtable_bytes),
+            ))
+        } else {
+            None
+        };
+
+        let mut selected: Option<(SlowdownCause, Duration)> = None;
+        for item in [l0_delay, frozen_delay, mem_delay].into_iter().flatten() {
+            selected = match selected {
+                Some(current) if current.1 >= item.1 => Some(current),
+                _ => Some(item),
+            };
+        }
+
+        match selected {
+            Some((_cause, delay)) => WritePressureDecision::Slowdown(delay),
+            None => WritePressureDecision::Normal,
+        }
+    }
+
     /// Check write backpressure conditions. Returns the L0 slowdown delay (if any)
     /// or an error for frozen memtable stall.
     ///
@@ -1944,43 +2391,26 @@ impl LsmEngine {
     }
 
     fn check_write_stall_with_l0(&self, l0_count: usize) -> Result<Option<Duration>> {
-        // L0 slowdown: compute delay
-        let delay = if self.config.should_slowdown_writes(l0_count)
-            && !self.config.should_stop_writes(l0_count)
-        {
-            Some(self.compute_write_delay(l0_count))
-        } else {
-            None
-        };
-
-        // Frozen memtable stall: reject immediately
-        let state = self.state.read();
-        let frozen_stall = state.active.approximate_size() >= self.config.memtable_size
-            && state.frozen.len() >= self.config.max_frozen_memtables;
-        drop(state);
-
-        if self.config.should_stop_writes(l0_count) {
-            self.observe_backpressure_transition(BackpressureState::Stall, l0_count);
-            return Err(TiSqlError::Storage(
+        let decision = self.evaluate_write_pressure_with_l0(l0_count);
+        self.observe_backpressure_transition(
+            Self::decision_to_backpressure_state(decision),
+            l0_count,
+        );
+        match decision {
+            WritePressureDecision::Normal => Ok(None),
+            WritePressureDecision::Slowdown(delay) => Ok(Some(delay)),
+            WritePressureDecision::Stall(WriteStallReason::L0Stop) => Err(TiSqlError::Storage(
                 "Too many L0 files, writes temporarily stopped for compaction".into(),
-            ));
-        }
-
-        if frozen_stall {
-            self.observe_backpressure_transition(BackpressureState::Stall, l0_count);
-            return Err(TiSqlError::Storage(
+            )),
+            WritePressureDecision::Stall(WriteStallReason::FrozenCap) => Err(TiSqlError::Storage(
                 "Write stalled: frozen memtables at capacity, flush is not keeping up".into(),
-            ));
+            )),
+            WritePressureDecision::Stall(WriteStallReason::MemPressureHard) => {
+                Err(TiSqlError::Storage(
+                    "Write stalled: memtable memory pressure above hard limit".into(),
+                ))
+            }
         }
-
-        let next = if delay.is_some() {
-            BackpressureState::Slowdown
-        } else {
-            BackpressureState::Normal
-        };
-        self.observe_backpressure_transition(next, l0_count);
-
-        Ok(delay)
     }
 
     /// Compute write delay for L0 slowdown. Linearly interpolates from 1ms to 20ms
@@ -2006,14 +2436,19 @@ impl LsmEngine {
     /// whether to sleep/retry on `WriteStall { delay: Some(..) }`.
     fn pending_write_pressure_status(&self) -> std::result::Result<(), PessimisticWriteError> {
         let l0_count = self.current_version().level_size(0);
-        if self.config.should_stop_writes(l0_count) {
-            self.observe_backpressure_transition(BackpressureState::Stall, l0_count);
-            return Err(PessimisticWriteError::WriteStall { delay: None });
-        }
-        match self.check_write_stall_with_l0(l0_count) {
-            Ok(Some(delay)) => Err(PessimisticWriteError::WriteStall { delay: Some(delay) }),
-            Ok(None) => Ok(()),
-            Err(_) => Err(PessimisticWriteError::WriteStall { delay: None }),
+        let decision = self.evaluate_write_pressure_with_l0(l0_count);
+        self.observe_backpressure_transition(
+            Self::decision_to_backpressure_state(decision),
+            l0_count,
+        );
+        match decision {
+            WritePressureDecision::Normal => Ok(()),
+            WritePressureDecision::Slowdown(delay) => {
+                Err(PessimisticWriteError::WriteStall { delay: Some(delay) })
+            }
+            WritePressureDecision::Stall(_) => {
+                Err(PessimisticWriteError::WriteStall { delay: None })
+            }
         }
     }
 
@@ -2063,22 +2498,72 @@ impl LsmEngine {
     /// instead of blocking the thread. Prefer this over the sync trait method
     /// when calling from an async context.
     pub async fn write_batch_async(&self, batch: WriteBatch) -> Result<()> {
-        // L0 write backpressure: reject writes when too many L0 files accumulate
-        let l0_count = self.current_version().level_size(0);
-        if self.config.should_stop_writes(l0_count) {
-            self.observe_backpressure_transition(BackpressureState::Stall, l0_count);
-            return Err(TiSqlError::Storage(
-                "Too many L0 files, writes temporarily stopped for compaction".into(),
-            ));
+        let mut pending_batch = Some(batch);
+        loop {
+            // Subscribe before checking pressure to avoid missing a wake-up that
+            // lands between stall evaluation and `notified()` registration.
+            let frozen_stall_notified = self.frozen_wait_notify.notified();
+            let l0_count = self.current_version().level_size(0);
+            let decision = self.evaluate_write_pressure_with_l0(l0_count);
+            self.observe_backpressure_transition(
+                Self::decision_to_backpressure_state(decision),
+                l0_count,
+            );
+            match decision {
+                WritePressureDecision::Normal => {
+                    return self.write_batch_inner(
+                        pending_batch
+                            .take()
+                            .expect("pending batch must exist before write"),
+                    );
+                }
+                WritePressureDecision::Slowdown(delay) => {
+                    tokio::time::sleep(delay).await;
+                    // Keep sync/async semantics aligned: slowdown delays once per
+                    // write attempt, then proceed even if pressure remains.
+                    return self.write_batch_inner(
+                        pending_batch
+                            .take()
+                            .expect("pending batch must exist before write"),
+                    );
+                }
+                WritePressureDecision::Stall(WriteStallReason::FrozenCap) => {
+                    self.writer_wait_events
+                        .fetch_add(1, AtomicOrdering::Relaxed);
+                    self.frozen_waiters.fetch_add(1, AtomicOrdering::Relaxed);
+                    let wait_result = tokio::time::timeout(
+                        Duration::from_millis(self.config.frozen_stall_wait_timeout_ms),
+                        frozen_stall_notified,
+                    )
+                    .await;
+                    self.frozen_waiters.fetch_sub(1, AtomicOrdering::Relaxed);
+                    match wait_result {
+                        Ok(_) => {
+                            self.writer_wake_events
+                                .fetch_add(1, AtomicOrdering::Relaxed);
+                        }
+                        Err(_) => {
+                            self.writer_wait_timeout_events
+                                .fetch_add(1, AtomicOrdering::Relaxed);
+                            return Err(TiSqlError::Storage(
+                                "Write stalled: frozen memtables at capacity, flush wake timeout"
+                                    .into(),
+                            ));
+                        }
+                    }
+                }
+                WritePressureDecision::Stall(WriteStallReason::L0Stop) => {
+                    return Err(TiSqlError::Storage(
+                        "Too many L0 files, writes temporarily stopped for compaction".into(),
+                    ));
+                }
+                WritePressureDecision::Stall(WriteStallReason::MemPressureHard) => {
+                    return Err(TiSqlError::Storage(
+                        "Write stalled: memtable memory pressure above hard limit".into(),
+                    ));
+                }
+            }
         }
-
-        // Slow down or reject if L0 files are accumulating or frozen memtables at capacity.
-        // Yields the async task instead of blocking the thread.
-        if let Some(delay) = self.check_write_stall()? {
-            tokio::time::sleep(delay).await;
-        }
-
-        self.write_batch_inner(batch)
     }
 
     /// Perform one round of compaction.
@@ -2375,12 +2860,16 @@ impl LsmEngine {
                 size_bytes: version.level_size_bytes(level),
             });
         }
+        let flush_workers_active = frozen_memtable_state_counts.flushing;
 
         LsmStats {
             active_memtable_size: state.active.approximate_size(),
             frozen_memtable_count: state.frozen.len(),
             frozen_memtable_bytes,
             frozen_memtable_state_counts,
+            flush_workers_active,
+            flush_workers_limit: self.flush_workers_limit(),
+            frozen_waiters: self.frozen_waiters.load(AtomicOrdering::Relaxed) as usize,
             l0_sst_count: version.level_size(0),
             total_sst_count: version.total_sst_count(),
             total_sst_bytes: version.total_size_bytes(),
@@ -2390,6 +2879,22 @@ impl LsmEngine {
             backpressure_state: self.current_backpressure_state(),
             slowdown_events: self.slowdown_events.load(AtomicOrdering::Relaxed),
             stall_events: self.stall_events.load(AtomicOrdering::Relaxed),
+            frozen_slowdown_events: self.frozen_slowdown_events.load(AtomicOrdering::Relaxed),
+            frozen_stall_events: self.frozen_stall_events.load(AtomicOrdering::Relaxed),
+            l0_stop_stall_events: self.l0_stop_stall_events.load(AtomicOrdering::Relaxed),
+            mem_pressure_soft_events: self.mem_pressure_soft_events.load(AtomicOrdering::Relaxed),
+            mem_pressure_hard_events: self.mem_pressure_hard_events.load(AtomicOrdering::Relaxed),
+            mem_pressure_soft_residency_ms: self
+                .mem_pressure_soft_residency_ms
+                .load(AtomicOrdering::Relaxed),
+            mem_pressure_hard_residency_ms: self
+                .mem_pressure_hard_residency_ms
+                .load(AtomicOrdering::Relaxed),
+            writer_wait_events: self.writer_wait_events.load(AtomicOrdering::Relaxed),
+            writer_wake_events: self.writer_wake_events.load(AtomicOrdering::Relaxed),
+            writer_wait_timeout_events: self
+                .writer_wait_timeout_events
+                .load(AtomicOrdering::Relaxed),
             obsolete_delete_attempts: self.obsolete_delete_attempts.load(AtomicOrdering::Relaxed),
             obsolete_delete_success: self.obsolete_delete_success.load(AtomicOrdering::Relaxed),
             obsolete_delete_fail: self.obsolete_delete_fail.load(AtomicOrdering::Relaxed),
@@ -3736,15 +4241,6 @@ impl StorageEngine for LsmEngine {
     }
 
     fn write_batch(&self, batch: WriteBatch) -> Result<()> {
-        // L0 write backpressure: reject writes when too many L0 files accumulate
-        let l0_count = self.current_version().level_size(0);
-        if self.config.should_stop_writes(l0_count) {
-            self.observe_backpressure_transition(BackpressureState::Stall, l0_count);
-            return Err(TiSqlError::Storage(
-                "Too many L0 files, writes temporarily stopped for compaction".into(),
-            ));
-        }
-
         // Slow down or reject if L0 files are accumulating or frozen memtables at capacity.
         // Uses blocking sleep — only safe during recovery (startup, no tokio runtime).
         // For async callers, use `write_batch_async()` instead.
@@ -4057,6 +4553,15 @@ pub struct LsmStats {
     /// Frozen memtable count grouped by flush state.
     pub frozen_memtable_state_counts: FrozenMemtableStateStats,
 
+    /// Number of frozen memtables currently in `Flushing` state.
+    pub flush_workers_active: usize,
+
+    /// Configured flush worker limit for this tablet.
+    pub flush_workers_limit: usize,
+
+    /// Number of async writers currently waiting for frozen-cap relief.
+    pub frozen_waiters: usize,
+
     /// Number of SST files at L0.
     pub l0_sst_count: usize,
 
@@ -4081,6 +4586,26 @@ pub struct LsmStats {
     pub slowdown_events: u64,
     /// Number of transitions into stall.
     pub stall_events: u64,
+    /// Number of transitions into frozen-count slowdown.
+    pub frozen_slowdown_events: u64,
+    /// Number of transitions into hard frozen-cap stall.
+    pub frozen_stall_events: u64,
+    /// Number of transitions into hard L0-stop stall.
+    pub l0_stop_stall_events: u64,
+    /// Byte-pressure soft-threshold transition count.
+    pub mem_pressure_soft_events: u64,
+    /// Byte-pressure hard-threshold transition count.
+    pub mem_pressure_hard_events: u64,
+    /// Cumulative residency above byte soft threshold (ms).
+    pub mem_pressure_soft_residency_ms: u64,
+    /// Cumulative residency above byte hard threshold (ms).
+    pub mem_pressure_hard_residency_ms: u64,
+    /// Writer wait attempts on hard frozen-cap stalls.
+    pub writer_wait_events: u64,
+    /// Writer wake notifications observed.
+    pub writer_wake_events: u64,
+    /// Writer wait timeout count.
+    pub writer_wait_timeout_events: u64,
 
     /// Obsolete-SST delete accounting.
     pub obsolete_delete_attempts: u64,
@@ -4162,6 +4687,22 @@ mod tests {
                 backpressure_state: AtomicU8::new(BackpressureState::Normal.as_u8()),
                 slowdown_events: AtomicU64::new(0),
                 stall_events: AtomicU64::new(0),
+                frozen_slowdown_events: AtomicU64::new(0),
+                frozen_stall_events: AtomicU64::new(0),
+                l0_stop_stall_events: AtomicU64::new(0),
+                mem_pressure_soft_events: AtomicU64::new(0),
+                mem_pressure_hard_events: AtomicU64::new(0),
+                mem_pressure_soft_residency_ms: AtomicU64::new(0),
+                mem_pressure_hard_residency_ms: AtomicU64::new(0),
+                mem_pressure_tracker: parking_lot::Mutex::new(MemPressureTracker::default()),
+                frozen_slowdown_active: AtomicBool::new(false),
+                frozen_hard_stall_active: AtomicBool::new(false),
+                l0_stop_stall_active: AtomicBool::new(false),
+                frozen_waiters: AtomicU64::new(0),
+                writer_wait_events: AtomicU64::new(0),
+                writer_wake_events: AtomicU64::new(0),
+                writer_wait_timeout_events: AtomicU64::new(0),
+                frozen_wait_notify: Notify::new(),
                 obsolete_delete_attempts: AtomicU64::new(0),
                 obsolete_delete_success: AtomicU64::new(0),
                 obsolete_delete_fail: AtomicU64::new(0),
@@ -9558,6 +10099,124 @@ mod tests {
     }
 
     #[test]
+    fn test_next_claimable_frozen_single_winner_under_race() {
+        use std::sync::atomic::AtomicUsize;
+        use std::sync::{Arc, Barrier};
+
+        let tmp = TempDir::new().unwrap();
+        let config = LsmConfig::builder(tmp.path())
+            .memtable_size(1024)
+            .max_frozen_memtables(4)
+            .build()
+            .unwrap();
+        let engine = Arc::new(LsmEngine::open(config).unwrap());
+
+        let mut batch = WriteBatch::new();
+        batch.set_commit_ts(1);
+        batch.put(b"k1".to_vec(), vec![b'a'; 32]);
+        engine.write_batch(batch).unwrap();
+        engine.freeze_active();
+
+        let claimed_id = {
+            let state = engine.state.read();
+            assert_eq!(
+                state.frozen.len(),
+                1,
+                "test setup should produce one frozen"
+            );
+            state.frozen.front().expect("missing frozen memtable").id()
+        };
+
+        let racers = 8;
+        let barrier = Arc::new(Barrier::new(racers));
+        let winners = Arc::new(AtomicUsize::new(0));
+        let mut handles = Vec::new();
+
+        for _ in 0..racers {
+            let engine = Arc::clone(&engine);
+            let barrier = Arc::clone(&barrier);
+            let winners = Arc::clone(&winners);
+            handles.push(std::thread::spawn(move || {
+                barrier.wait();
+                if engine.next_claimable_frozen().is_some() {
+                    winners.fetch_add(1, AtomicOrdering::Relaxed);
+                }
+            }));
+        }
+
+        for handle in handles {
+            handle.join().unwrap();
+        }
+
+        assert_eq!(
+            winners.load(AtomicOrdering::Relaxed),
+            1,
+            "exactly one worker should claim the frozen memtable"
+        );
+        let state = engine.state.read();
+        let memtable = state
+            .frozen
+            .front()
+            .expect("frozen memtable removed unexpectedly");
+        assert_eq!(memtable.id(), claimed_id);
+        assert_eq!(memtable.flush_state(), FlushState::Flushing);
+    }
+
+    #[tokio::test]
+    async fn test_flushed_lsn_monotonic_when_newer_flush_commits_first() {
+        let dir = TempDir::new().unwrap();
+        let config = LsmConfig::builder(dir.path())
+            .memtable_size(4096)
+            .max_frozen_memtables(4)
+            .build()
+            .unwrap();
+        let engine = LsmEngine::open(config).unwrap();
+
+        // Older frozen memtable.
+        let mut batch = new_batch(1);
+        batch.put(b"older".to_vec(), b"v1".to_vec());
+        batch.set_clog_lsn(100);
+        engine.write_batch(batch).unwrap();
+        engine.freeze_active();
+
+        // Newer frozen memtable.
+        let mut batch = new_batch(2);
+        batch.put(b"newer".to_vec(), b"v2".to_vec());
+        batch.set_clog_lsn(200);
+        engine.write_batch(batch).unwrap();
+        engine.freeze_active();
+
+        let (older, newer) = {
+            let state = engine.state.read();
+            let older = state.frozen.front().cloned().unwrap();
+            let newer = state.frozen.back().cloned().unwrap();
+            (older, newer)
+        };
+
+        // Commit newer memtable first.
+        engine.flush_memtable_async(&newer).await.unwrap();
+        assert_eq!(
+            engine.current_version().flushed_lsn(),
+            99,
+            "newer flush should be capped by older in-memory memtable"
+        );
+
+        // Introduce a low-LSN straggler before older flush commits.
+        let mut batch = new_batch(3);
+        batch.put(b"straggler".to_vec(), b"v3".to_vec());
+        batch.set_clog_lsn(20);
+        engine.write_batch(batch).unwrap();
+
+        // Older flush computes a smaller safe boundary; .max() must prevent regression.
+        engine.flush_memtable_async(&older).await.unwrap();
+        assert_eq!(
+            engine.current_version().flushed_lsn(),
+            99,
+            "out-of-order flush commits must keep flushed_lsn monotonic"
+        );
+    }
+
+    #[test]
     fn test_write_stall_l0_slowdown() {
         // Create engine with low L0 thresholds
         let tmp = TempDir::new().unwrap();
@@ -9596,6 +10255,38 @@ mod tests {
             elapsed >= Duration::from_millis(1),
             "Write should be slowed by at least 1ms, took {elapsed:?}",
         );
+    }
+
+    #[tokio::test]
+    async fn test_write_batch_async_slowdown_sleeps_once_then_proceeds() {
+        let tmp = TempDir::new().unwrap();
+        let config = LsmConfig::builder(tmp.path())
+            .memtable_size(100)
+            .max_frozen_memtables(20)
+            .l0_compaction_trigger(1)
+            .l0_slowdown_trigger(1)
+            .l0_stop_trigger(10)
+            .build()
+            .unwrap();
+        let engine = LsmEngine::open(config).unwrap();
+
+        let mut seed = WriteBatch::new();
+        seed.set_commit_ts(1);
+        seed.put(b"seed".to_vec(), vec![b'x'; 80]);
+        engine.write_batch(seed).unwrap();
+        engine.flush_all_with_active().unwrap();
+        assert!(
+            engine.current_version().level_size(0) >= 1,
+            "test setup should keep L0 in slowdown region"
+        );
+
+        let mut batch = WriteBatch::new();
+        batch.set_commit_ts(2);
+        batch.put(b"slow_async".to_vec(), vec![b'y'; 16]);
+        tokio::time::timeout(Duration::from_millis(200), engine.write_batch_async(batch))
+            .await
+            .expect("async slowdown should delay once then proceed")
+            .unwrap();
     }
 
     #[test]
@@ -9693,6 +10384,242 @@ mod tests {
         assert!(
             engine.write_batch(batch).is_ok(),
             "Should succeed after flush"
+        );
+    }
+
+    #[test]
+    fn test_frozen_slowdown_hysteresis_boundaries_use_integer_arithmetic() {
+        let tmp = TempDir::new().unwrap();
+        let config = LsmConfig::builder(tmp.path())
+            .memtable_size(1024)
+            .max_frozen_memtables(16)
+            .build()
+            .unwrap();
+        let engine = LsmEngine::open(config).unwrap();
+
+        assert!(
+            !engine.update_frozen_slowdown_hysteresis(11),
+            "11/16 is below 75%; should not enter slowdown"
+        );
+        assert!(
+            engine.update_frozen_slowdown_hysteresis(12),
+            "12/16 is 75%; should enter slowdown"
+        );
+        assert!(
+            engine.update_frozen_slowdown_hysteresis(10),
+            "10/16 is above 60%; hysteresis should keep slowdown active"
+        );
+        assert!(
+            !engine.update_frozen_slowdown_hysteresis(9),
+            "9/16 is <=60%; should exit slowdown"
+        );
+        assert!(
+            !engine.update_frozen_slowdown_hysteresis(11),
+            "11/16 remains below enter threshold; should stay normal"
+        );
+        assert!(
+            engine.update_frozen_slowdown_hysteresis(12),
+            "12/16 should re-enter slowdown"
+        );
+        assert_eq!(
+            engine.frozen_slowdown_events.load(AtomicOrdering::Relaxed),
+            2,
+            "slowdown transition counter should increment once per enter"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_write_batch_async_waits_for_flush_and_wakes() {
+        let tmp = TempDir::new().unwrap();
+        let config = LsmConfig::builder(tmp.path())
+            .memtable_size(100)
+            .max_frozen_memtables(1)
+            .frozen_stall_wait_timeout_ms(200)
+            .l0_compaction_trigger(100)
+            .l0_slowdown_trigger(200)
+            .l0_stop_trigger(300)
+            .build()
+            .unwrap();
+        let engine = Arc::new(LsmEngine::open(config).unwrap());
+
+        // Build hard frozen-cap stall condition.
+        for (idx, payload) in [60_usize, 60, 60, 60].into_iter().enumerate() {
+            let mut batch = WriteBatch::new();
+            batch.set_commit_ts((idx + 1) as Timestamp);
+            batch.put(format!("k{idx}").into_bytes(), vec![b'x'; payload]);
+            let _ = engine.write_batch(batch);
+        }
+
+        let mut probe = WriteBatch::new();
+        probe.set_commit_ts(99);
+        probe.put(b"probe".to_vec(), vec![b'p'; 8]);
+        assert!(
+            engine.write_batch(probe).is_err(),
+            "engine should be in hard frozen-cap stall before async wait test"
+        );
+
+        let engine_for_write = Arc::clone(&engine);
+        let writer = tokio::spawn(async move {
+            let mut batch = WriteBatch::new();
+            batch.set_commit_ts(100);
+            batch.put(b"async_wait".to_vec(), vec![b'v'; 16]);
+            engine_for_write.write_batch_async(batch).await
+        });
+
+        tokio::time::timeout(Duration::from_secs(2), async {
+            loop {
+                if engine.frozen_waiter_count() > 0 {
+                    break;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("writer did not enter wait state");
+
+        engine.flush_all_async().await.unwrap();
+
+        let write_result = tokio::time::timeout(Duration::from_secs(2), writer)
+            .await
+            .expect("writer task timed out")
+            .unwrap();
+        assert!(
+            write_result.is_ok(),
+            "async writer should be woken by flush"
+        );
+
+        let stats = engine.stats();
+        assert!(
+            stats.writer_wait_events >= 1,
+            "writer wait event should be recorded"
+        );
+        assert!(
+            stats.writer_wake_events >= 1,
+            "writer wake event should be recorded"
+        );
+        assert_eq!(
+            stats.writer_wait_timeout_events, 0,
+            "wait should complete via wake, not timeout"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_write_batch_async_wait_timeout_on_frozen_stall() {
+        let tmp = TempDir::new().unwrap();
+        let config = LsmConfig::builder(tmp.path())
+            .memtable_size(100)
+            .max_frozen_memtables(1)
+            .frozen_stall_wait_timeout_ms(20)
+            .l0_compaction_trigger(100)
+            .l0_slowdown_trigger(200)
+            .l0_stop_trigger(300)
+            .build()
+            .unwrap();
+        let engine = LsmEngine::open(config).unwrap();
+
+        // Build hard frozen-cap stall condition.
+        for (idx, payload) in [60_usize, 60, 60, 60].into_iter().enumerate() {
+            let mut batch = WriteBatch::new();
+            batch.set_commit_ts((idx + 1) as Timestamp);
+            batch.put(format!("k{idx}").into_bytes(), vec![b'x'; payload]);
+            let _ = engine.write_batch(batch);
+        }
+
+        let mut batch = WriteBatch::new();
+        batch.set_commit_ts(100);
+        batch.put(b"timeout".to_vec(), vec![b't'; 8]);
+        let err = tokio::time::timeout(Duration::from_secs(2), engine.write_batch_async(batch))
+            .await
+            .expect("write_batch_async should return after timeout")
+            .unwrap_err();
+        let msg = err.to_string();
+        assert!(
+            msg.contains("flush wake timeout"),
+            "hard-stall timeout should surface wake-timeout error, got: {msg}"
+        );
+
+        let stats = engine.stats();
+        assert!(
+            stats.writer_wait_timeout_events >= 1,
+            "writer timeout event should be recorded"
+        );
+    }
+
+    #[test]
+    fn test_mem_pressure_hard_limit_stalls_writes() {
+        let tmp = TempDir::new().unwrap();
+        let config = LsmConfig::builder(tmp.path())
+            .memtable_size(1 << 20)
+            .max_frozen_memtables(8)
+            .mem_pressure_limits_bytes(1, 1)
+            .l0_compaction_trigger(100)
+            .l0_slowdown_trigger(200)
+            .l0_stop_trigger(300)
+            .build()
+            .unwrap();
+        let engine = LsmEngine::open(config).unwrap();
+
+        let mut first = WriteBatch::new();
+        first.set_commit_ts(1);
+        first.put(b"k1".to_vec(), b"v1".to_vec());
+        engine.write_batch(first).unwrap();
+
+        let mut second = WriteBatch::new();
+        second.set_commit_ts(2);
+        second.put(b"k2".to_vec(), b"v2".to_vec());
+        let err = engine.write_batch(second).unwrap_err().to_string();
+        assert!(
+            err.contains("memory pressure above hard limit"),
+            "hard byte-pressure stall should be reported, got: {err}"
+        );
+
+        let stats = engine.stats();
+        assert!(
+            stats.mem_pressure_hard_events >= 1,
+            "hard byte-pressure transition should be counted"
+        );
+    }
+
+    #[test]
+    fn test_effective_flush_dispatch_limit_throttles_near_l0_stop() {
+        let tmp = TempDir::new().unwrap();
+        let config = LsmConfig::builder(tmp.path())
+            .memtable_size(100)
+            .max_frozen_memtables(4)
+            .flush_threads(4)
+            .l0_compaction_trigger(2)
+            .l0_slowdown_trigger(4)
+            .l0_stop_trigger(6)
+            .l0_flush_dispatch_guard_band(2)
+            .build()
+            .unwrap();
+        let engine = LsmEngine::open(config).unwrap();
+
+        assert_eq!(engine.flush_workers_limit(), 4);
+        assert_eq!(
+            engine.effective_flush_dispatch_limit(),
+            4,
+            "dispatch limit should match configured workers when L0 pressure is low"
+        );
+
+        for i in 0..4 {
+            let mut batch = WriteBatch::new();
+            batch.set_commit_ts((i + 1) as Timestamp);
+            batch.put(format!("k{i}").into_bytes(), vec![b'v'; 80]);
+            engine.write_batch(batch).unwrap();
+            engine.flush_all_with_active().unwrap();
+        }
+
+        let l0_count = engine.current_version().level_size(0);
+        assert!(
+            l0_count >= 4,
+            "test setup should create near-stop L0 pressure, got {l0_count}"
+        );
+        assert!(engine.has_pending_compaction());
+        assert_eq!(
+            engine.effective_flush_dispatch_limit(),
+            1,
+            "near-stop L0 with pending compaction should force single flush dispatch"
         );
     }
 

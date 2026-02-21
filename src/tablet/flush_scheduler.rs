@@ -208,14 +208,20 @@ impl FlushSchedulerInner {
             let frozen_count = self.engine.frozen_count();
 
             if frozen_count > 0 {
+                let dispatch_limit = self.engine.effective_flush_dispatch_limit();
                 self.in_progress.fetch_add(1, Ordering::Relaxed);
                 let start = Instant::now();
                 tracing::info!(
-                    "[engine-event] op=flush phase=begin tablet_ns={} frozen={}",
+                    "[engine-event] op=flush phase=begin tablet_ns={} frozen={} workers_limit={}",
                     self.engine.tablet_cache_ns(),
-                    frozen_count
+                    frozen_count,
+                    dispatch_limit
                 );
-                match self.engine.flush_all_async().await {
+                match self
+                    .engine
+                    .dispatch_concurrent_flushes(dispatch_limit)
+                    .await
+                {
                     Ok(metas) => {
                         if !metas.is_empty() {
                             self.flush_count

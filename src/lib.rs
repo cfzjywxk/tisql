@@ -628,9 +628,43 @@ impl Database {
         let cpu_count = std::thread::available_parallelism()
             .map(|n| n.get())
             .unwrap_or(4);
-        let planned_threads = config
+        let mut planned_threads = config
             .runtime_threads
             .apply(RuntimeThreads::plan(cpu_count));
+
+        // 1. Create I/O runtime FIRST — recovery needs it for GroupCommitWriter + IoService
+        let io_runtime = OpenRuntimeGuard::new(
+            tokio::runtime::Builder::new_multi_thread()
+                .worker_threads(planned_threads.io)
+                .thread_name("tisql-io")
+                .enable_all()
+                .build()
+                .map_err(|e| {
+                    crate::util::error::TiSqlError::Internal(format!(
+                        "Failed to create I/O runtime: {e}"
+                    ))
+                })?,
+        );
+
+        log_info!("I/O runtime created with {} threads", planned_threads.io);
+
+        let lsm_config = config.lsm_config_for_dir(&config.data_dir)?;
+        if lsm_config.flush_threads > 1
+            && config.runtime_threads.background.is_none()
+            && planned_threads.background < 4
+        {
+            planned_threads.background = 4;
+        }
+        if lsm_config.flush_threads > 1
+            && planned_threads.background < lsm_config.flush_threads.saturating_add(1)
+        {
+            return Err(crate::util::error::TiSqlError::Storage(format!(
+                "flush_threads={} requires background threads >= {} (current bg={})",
+                lsm_config.flush_threads,
+                lsm_config.flush_threads.saturating_add(1),
+                planned_threads.background
+            )));
+        }
         let total_threads = planned_threads.protocol
             + planned_threads.worker
             + planned_threads.background
@@ -656,24 +690,6 @@ impl Database {
                 total_threads
             );
         }
-
-        // 1. Create I/O runtime FIRST — recovery needs it for GroupCommitWriter + IoService
-        let io_runtime = OpenRuntimeGuard::new(
-            tokio::runtime::Builder::new_multi_thread()
-                .worker_threads(planned_threads.io)
-                .thread_name("tisql-io")
-                .enable_all()
-                .build()
-                .map_err(|e| {
-                    crate::util::error::TiSqlError::Internal(format!(
-                        "Failed to create I/O runtime: {e}"
-                    ))
-                })?,
-        );
-
-        log_info!("I/O runtime created with {} threads", planned_threads.io);
-
-        let lsm_config = config.lsm_config_for_dir(&config.data_dir)?;
         log_info!(
             "Bloom config: enabled={}, bits_per_key={}",
             lsm_config.bloom_enabled,
