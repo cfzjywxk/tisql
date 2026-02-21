@@ -886,7 +886,7 @@ impl VersionedMemTableEngine {
     /// - `Err(lock_owner)` if the key is already locked by another transaction
     ///
     /// If the key is already locked by the same transaction, the value is updated in place.
-    pub fn put_pending_counted(
+    pub(crate) fn put_pending_counted(
         &self,
         key: &[u8],
         value: &[u8],
@@ -912,7 +912,7 @@ impl VersionedMemTableEngine {
     }
 
     /// Write pending value and ignore whether a new pending node was created.
-    pub fn put_pending(
+    fn put_pending(
         &self,
         key: &[u8],
         value: &[u8],
