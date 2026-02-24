@@ -48,6 +48,15 @@ use super::{record_io, IoOpKind, IoTraceTag};
 /// Result type for IO operations — contains either data or an error message.
 type IoResult<T> = Result<T, String>;
 
+/// File sync mode for durability barriers.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum IoSyncMode {
+    /// Full file integrity sync (`fsync` semantics).
+    FullSync,
+    /// Data-only sync (`fdatasync` semantics).
+    DataSync,
+}
+
 /// A future representing a pending I/O operation.
 ///
 /// Supports both async (`.await`) and sync (`.wait()`) consumption,
@@ -107,8 +116,9 @@ enum IoOp {
         trace: IoTraceTag,
         reply: tokio::sync::oneshot::Sender<IoResult<usize>>,
     },
-    Fsync {
+    Sync {
         fd: RawFd,
+        mode: IoSyncMode,
         trace: IoTraceTag,
         reply: tokio::sync::oneshot::Sender<IoResult<()>>,
     },
@@ -264,11 +274,26 @@ impl IoService {
 
     /// Fsync with an explicit observability trace tag.
     pub fn fsync_with_trace(&self, file: &DmaFile, trace: IoTraceTag) -> IoFuture<()> {
+        self.sync_with_trace(file, IoSyncMode::FullSync, trace)
+    }
+
+    /// Data-only sync (`fdatasync` semantics) for the file.
+    pub fn datasync(&self, file: &DmaFile) -> IoFuture<()> {
+        self.datasync_with_trace(file, IoTraceTag::default())
+    }
+
+    /// Data-only sync with an explicit observability trace tag.
+    pub fn datasync_with_trace(&self, file: &DmaFile, trace: IoTraceTag) -> IoFuture<()> {
+        self.sync_with_trace(file, IoSyncMode::DataSync, trace)
+    }
+
+    fn sync_with_trace(&self, file: &DmaFile, mode: IoSyncMode, trace: IoTraceTag) -> IoFuture<()> {
         let (reply_tx, reply_rx) = tokio::sync::oneshot::channel();
         if self
             .tx
-            .send(IoOp::Fsync {
+            .send(IoOp::Sync {
                 fd: file.fd(),
+                mode,
                 trace,
                 reply: reply_tx,
             })
@@ -401,15 +426,22 @@ fn io_thread_main(rx: crossbeam_channel::Receiver<IoOp>, ring_size: u32) -> Resu
                     }
                     remaining += 1;
                 }
-                IoOp::Fsync { fd, trace, reply } => {
-                    let sqe = io_uring::opcode::Fsync::new(io_uring::types::Fd(fd))
-                        .build()
-                        .user_data(id);
+                IoOp::Sync {
+                    fd,
+                    mode,
+                    trace,
+                    reply,
+                } => {
+                    let mut fsync_op = io_uring::opcode::Fsync::new(io_uring::types::Fd(fd));
+                    if matches!(mode, IoSyncMode::DataSync) {
+                        fsync_op = fsync_op.flags(io_uring::types::FsyncFlags::DATASYNC);
+                    }
+                    let sqe = fsync_op.build().user_data(id);
 
                     while pending.len() <= id as usize {
                         pending.push(None);
                     }
-                    pending[id as usize] = Some(PendingOp::Fsync { trace, reply });
+                    pending[id as usize] = Some(PendingOp::Sync { mode, trace, reply });
 
                     unsafe {
                         ring.submission()
@@ -481,10 +513,14 @@ fn io_thread_main(rx: crossbeam_channel::Receiver<IoOp>, ring_size: u32) -> Resu
                                 let _ = reply.send(Ok(result as usize));
                             }
                         }
-                        PendingOp::Fsync { trace, reply } => {
+                        PendingOp::Sync { mode, trace, reply } => {
                             if result < 0 {
+                                let op_name = match mode {
+                                    IoSyncMode::FullSync => "fsync",
+                                    IoSyncMode::DataSync => "fdatasync",
+                                };
                                 let _ = reply.send(Err(format!(
-                                    "io_uring fsync failed: {}",
+                                    "io_uring {op_name} failed: {}",
                                     std::io::Error::from_raw_os_error(-result)
                                 )));
                             } else {
@@ -517,7 +553,8 @@ enum PendingOp {
         trace: IoTraceTag,
         reply: tokio::sync::oneshot::Sender<IoResult<usize>>,
     },
-    Fsync {
+    Sync {
+        mode: IoSyncMode,
         trace: IoTraceTag,
         reply: tokio::sync::oneshot::Sender<IoResult<()>>,
     },
@@ -559,8 +596,13 @@ fn io_thread_main(rx: crossbeam_channel::Receiver<IoOp>, _ring_size: u32) -> Res
                     let _ = reply.send(Err(e));
                 }
             },
-            IoOp::Fsync { fd, trace, reply } => {
-                let result = fsync_sync(fd);
+            IoOp::Sync {
+                fd,
+                mode,
+                trace,
+                reply,
+            } => {
+                let result = sync_sync(fd, mode);
                 if result.is_ok() {
                     record_io(trace, IoOpKind::Fsync, 0);
                 }
@@ -646,11 +688,23 @@ fn write_at_sync(fd: RawFd, offset: u64, buf: &AlignedBuf) -> IoResult<usize> {
 }
 
 #[cfg(not(target_os = "linux"))]
-fn fsync_sync(fd: RawFd) -> IoResult<()> {
+fn sync_sync(fd: RawFd, mode: IoSyncMode) -> IoResult<()> {
     // SAFETY: `fd` belongs to an open file descriptor owned by DmaFile.
-    let rc = unsafe { libc::fsync(fd) };
+    let rc = unsafe {
+        match mode {
+            IoSyncMode::FullSync => libc::fsync(fd),
+            IoSyncMode::DataSync => libc::fdatasync(fd),
+        }
+    };
     if rc < 0 {
-        return Err(format!("fsync failed: {}", std::io::Error::last_os_error()));
+        let op_name = match mode {
+            IoSyncMode::FullSync => "fsync",
+            IoSyncMode::DataSync => "fdatasync",
+        };
+        return Err(format!(
+            "{op_name} failed: {}",
+            std::io::Error::last_os_error()
+        ));
     }
     Ok(())
 }
@@ -693,6 +747,24 @@ mod tests {
         let buf = io.read_at(&file, 0, 4096).await.unwrap();
         assert_eq!(buf.len(), 4096);
         assert!(buf.iter().all(|&b| b == 0xAA));
+    }
+
+    #[tokio::test]
+    async fn test_io_service_datasync_write_and_read() {
+        let dir = tempdir().unwrap();
+        let io = IoService::new_for_test(32).unwrap();
+        let path = dir.path().join("test_io_datasync.dat");
+
+        let file = DmaFile::open_write(&path).unwrap();
+        let data = AlignedBuf::from_slice(&[0xBB; 4096], DMA_ALIGNMENT);
+        io.write_at(&file, 0, data).await.unwrap();
+        io.datasync(&file).await.unwrap();
+        drop(file);
+
+        let file = DmaFile::open_read(&path).unwrap();
+        let buf = io.read_at(&file, 0, 4096).await.unwrap();
+        assert_eq!(buf.len(), 4096);
+        assert!(buf.iter().all(|&b| b == 0xBB));
     }
 
     #[tokio::test]

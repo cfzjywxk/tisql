@@ -19,7 +19,9 @@
 
 use std::collections::BTreeMap;
 use std::ops::Range;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
+use std::time::{Duration, Instant};
 
 #[cfg(feature = "failpoints")]
 use fail::fail_point;
@@ -28,7 +30,7 @@ use crate::clog::{ClogEntry, ClogOp, ClogOpRef, ClogService};
 use crate::tso::TsoService;
 use crate::util::error::{Result, TiSqlError};
 
-use super::api::{CommitInfo, MutationMeta, MutationType, TxnCtx, TxnService, TxnState};
+use super::api::{CommitInfo, MutationMeta, MutationPayload, TxnCtx, TxnService, TxnState};
 use super::concurrency::ConcurrencyManager;
 use crate::catalog::types::{Key, RawValue, TableId, Timestamp, TxnId};
 use crate::inner_table::core_tables::USER_TABLE_ID_START;
@@ -58,9 +60,146 @@ pub struct TransactionService<S: StorageEngine, L: ClogService, T: TsoService> {
     tso: Arc<T>,
     /// ConcurrencyManager for lock table and max_ts tracking
     concurrency_manager: Arc<ConcurrencyManager>,
+    /// Aggregated write-path diagnostics exposed through SHOW ENGINE STATUS.
+    write_path_diagnostics: Arc<WritePathDiagnostics>,
 }
 
 type GroupedTabletKeys = Vec<(TabletId, Vec<Key>)>;
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+struct TimingStageSnapshot {
+    count: u64,
+    total_us: u64,
+    avg_us: u64,
+    max_us: u64,
+}
+
+#[derive(Debug, Default)]
+struct TimingStageCounter {
+    count: AtomicU64,
+    total_us: AtomicU64,
+    max_us: AtomicU64,
+}
+
+impl TimingStageCounter {
+    fn record_duration(&self, duration: Duration) {
+        let us = duration_to_micros_u64(duration);
+        self.count.fetch_add(1, Ordering::Relaxed);
+        self.total_us.fetch_add(us, Ordering::Relaxed);
+        update_max_relaxed(&self.max_us, us);
+    }
+
+    fn snapshot(&self) -> TimingStageSnapshot {
+        let count = self.count.load(Ordering::Relaxed);
+        let total_us = self.total_us.load(Ordering::Relaxed);
+        TimingStageSnapshot {
+            count,
+            total_us,
+            avg_us: if count == 0 { 0 } else { total_us / count },
+            max_us: self.max_us.load(Ordering::Relaxed),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+struct WritePathDiagnosticsSnapshot {
+    duplicate_check: TimingStageSnapshot,
+    put_pending: TimingStageSnapshot,
+    lock_pending: TimingStageSnapshot,
+    commit_read_values: TimingStageSnapshot,
+    commit_prepare_ts: TimingStageSnapshot,
+    commit_clog_write: TimingStageSnapshot,
+    commit_fsync_wait: TimingStageSnapshot,
+    commit_finalize: TimingStageSnapshot,
+    commit_total: TimingStageSnapshot,
+    commit_success: u64,
+    commit_failure: u64,
+}
+
+#[derive(Debug, Default)]
+struct WritePathDiagnostics {
+    duplicate_check: TimingStageCounter,
+    put_pending: TimingStageCounter,
+    lock_pending: TimingStageCounter,
+    commit_read_values: TimingStageCounter,
+    commit_prepare_ts: TimingStageCounter,
+    commit_clog_write: TimingStageCounter,
+    commit_fsync_wait: TimingStageCounter,
+    commit_finalize: TimingStageCounter,
+    commit_total: TimingStageCounter,
+    commit_success: AtomicU64,
+    commit_failure: AtomicU64,
+}
+
+impl WritePathDiagnostics {
+    fn snapshot(&self) -> WritePathDiagnosticsSnapshot {
+        WritePathDiagnosticsSnapshot {
+            duplicate_check: self.duplicate_check.snapshot(),
+            put_pending: self.put_pending.snapshot(),
+            lock_pending: self.lock_pending.snapshot(),
+            commit_read_values: self.commit_read_values.snapshot(),
+            commit_prepare_ts: self.commit_prepare_ts.snapshot(),
+            commit_clog_write: self.commit_clog_write.snapshot(),
+            commit_fsync_wait: self.commit_fsync_wait.snapshot(),
+            commit_finalize: self.commit_finalize.snapshot(),
+            commit_total: self.commit_total.snapshot(),
+            commit_success: self.commit_success.load(Ordering::Relaxed),
+            commit_failure: self.commit_failure.load(Ordering::Relaxed),
+        }
+    }
+
+    fn metric_pairs(&self) -> Vec<(String, String)> {
+        let snapshot = self.snapshot();
+        let mut pairs = Vec::with_capacity(32);
+        push_stage_metrics(&mut pairs, "duplicate_check", snapshot.duplicate_check);
+        push_stage_metrics(&mut pairs, "put_pending", snapshot.put_pending);
+        push_stage_metrics(&mut pairs, "lock_pending", snapshot.lock_pending);
+        push_stage_metrics(
+            &mut pairs,
+            "commit.read_values",
+            snapshot.commit_read_values,
+        );
+        push_stage_metrics(&mut pairs, "commit.prepare_ts", snapshot.commit_prepare_ts);
+        push_stage_metrics(&mut pairs, "commit.clog_write", snapshot.commit_clog_write);
+        push_stage_metrics(&mut pairs, "commit.fsync_wait", snapshot.commit_fsync_wait);
+        push_stage_metrics(&mut pairs, "commit.finalize", snapshot.commit_finalize);
+        push_stage_metrics(&mut pairs, "commit.total", snapshot.commit_total);
+        pairs.push((
+            "commit.success_count".to_string(),
+            snapshot.commit_success.to_string(),
+        ));
+        pairs.push((
+            "commit.failure_count".to_string(),
+            snapshot.commit_failure.to_string(),
+        ));
+        pairs
+    }
+}
+
+fn push_stage_metrics(
+    pairs: &mut Vec<(String, String)>,
+    stage_name: &str,
+    stage: TimingStageSnapshot,
+) {
+    pairs.push((format!("{stage_name}.count"), stage.count.to_string()));
+    pairs.push((format!("{stage_name}.avg_us"), stage.avg_us.to_string()));
+    pairs.push((format!("{stage_name}.max_us"), stage.max_us.to_string()));
+}
+
+fn duration_to_micros_u64(duration: Duration) -> u64 {
+    duration.as_micros().min(u128::from(u64::MAX)) as u64
+}
+
+fn update_max_relaxed(target: &AtomicU64, observed: u64) {
+    let mut current = target.load(Ordering::Relaxed);
+    while observed > current {
+        match target.compare_exchange_weak(current, observed, Ordering::Relaxed, Ordering::Relaxed)
+        {
+            Ok(_) => return,
+            Err(actual) => current = actual,
+        }
+    }
+}
 
 /// Ensures commit reservations are released on every exit path.
 struct CommitReservationReleaseGuard<'a, S: PessimisticStorage + ?Sized> {
@@ -106,6 +245,7 @@ impl<S: StorageEngine, L: ClogService, T: TsoService> TransactionService<S, L, T
             clog_service,
             tso,
             concurrency_manager,
+            write_path_diagnostics: Arc::new(WritePathDiagnostics::default()),
         }
     }
 
@@ -252,6 +392,10 @@ impl<S: StorageEngine, L: ClogService, T: TsoService> TransactionService<S, L, T
         &self.concurrency_manager
     }
 
+    pub fn write_path_metric_pairs(&self) -> Vec<(String, String)> {
+        self.write_path_diagnostics.metric_pairs()
+    }
+
     /// Check if transaction is in active state
     fn check_active(ctx: &TxnCtx) -> Result<()> {
         match ctx.state {
@@ -316,15 +460,16 @@ impl<S: StorageEngine, L: ClogService, T: TsoService> TransactionService<S, L, T
         let mut write_grouped: BTreeMap<TabletId, Vec<Key>> = BTreeMap::new();
         let mut lock_grouped: BTreeMap<TabletId, Vec<Key>> = BTreeMap::new();
         for (key, mutation_meta) in mutations {
-            match mutation_meta.mutation_type {
-                MutationType::Write => write_grouped
+            if mutation_meta.mutation.is_write() {
+                write_grouped
                     .entry(mutation_meta.tablet_id)
                     .or_default()
-                    .push(key),
-                MutationType::Lock => lock_grouped
+                    .push(key);
+            } else {
+                lock_grouped
                     .entry(mutation_meta.tablet_id)
                     .or_default()
-                    .push(key),
+                    .push(key);
             }
         }
         (
@@ -362,6 +507,12 @@ impl<S: PessimisticStorage + 'static, L: ClogService + 'static, T: TsoService> T
 
     fn get_txn_state(&self, start_ts: Timestamp) -> Option<TxnState> {
         self.concurrency_manager.get_txn_state(start_ts)
+    }
+
+    fn record_duplicate_check_duration(&self, duration: Duration) {
+        self.write_path_diagnostics
+            .duplicate_check
+            .record_duration(duration);
     }
 
     async fn get(&self, ctx: &TxnCtx, table_id: TableId, key: &[u8]) -> Result<Option<RawValue>> {
@@ -434,10 +585,14 @@ impl<S: PessimisticStorage + 'static, L: ClogService + 'static, T: TsoService> T
         }
 
         let tablet_id = route_table_to_tablet(table_id);
-        match self
+        let put_begin = Instant::now();
+        let put_result = self
             .put_pending_with_retry(tablet_id, key, &value, ctx.start_ts)
-            .await
-        {
+            .await;
+        self.write_path_diagnostics
+            .put_pending
+            .record_duration(put_begin.elapsed());
+        match put_result {
             Ok(()) => {
                 let key = key.to_vec();
                 // Single insert handles both: adding a new Write entry AND
@@ -445,7 +600,7 @@ impl<S: PessimisticStorage + 'static, L: ClogService + 'static, T: TsoService> T
                 ctx.mutations.insert(
                     key,
                     MutationMeta {
-                        mutation_type: MutationType::Write,
+                        mutation: MutationPayload::Put(value),
                         tablet_id,
                     },
                 );
@@ -492,16 +647,20 @@ impl<S: PessimisticStorage + 'static, L: ClogService + 'static, T: TsoService> T
 
         if value_exists {
             // Value exists (committed or own pending) → TOMBSTONE
-            match self
+            let put_begin = Instant::now();
+            let put_result = self
                 .put_pending_with_retry(tablet_id, key, TOMBSTONE, ctx.start_ts)
-                .await
-            {
+                .await;
+            self.write_path_diagnostics
+                .put_pending
+                .record_duration(put_begin.elapsed());
+            match put_result {
                 Ok(()) => {
                     let key = key.to_vec();
                     ctx.mutations.insert(
                         key,
                         MutationMeta {
-                            mutation_type: MutationType::Write,
+                            mutation: MutationPayload::Delete,
                             tablet_id,
                         },
                     );
@@ -523,16 +682,20 @@ impl<S: PessimisticStorage + 'static, L: ClogService + 'static, T: TsoService> T
             }
         } else {
             // No value exists → LOCK (pessimistic lock only, not persisted to clog)
-            match self
+            let lock_begin = Instant::now();
+            let lock_result = self
                 .put_pending_with_retry(tablet_id, key, LOCK, ctx.start_ts)
-                .await
-            {
+                .await;
+            self.write_path_diagnostics
+                .lock_pending
+                .record_duration(lock_begin.elapsed());
+            match lock_result {
                 Ok(()) => {
                     let key = key.to_vec();
                     // or_insert preserves existing Write if key was previously put
                     // (won't downgrade Write→Lock).
                     ctx.mutations.entry(key).or_insert(MutationMeta {
-                        mutation_type: MutationType::Lock,
+                        mutation: MutationPayload::Lock,
                         tablet_id,
                     });
                     Ok(())
@@ -564,17 +727,19 @@ impl<S: PessimisticStorage + 'static, L: ClogService + 'static, T: TsoService> T
         Self::validate_table_target_key(table_id, key, "TxnService::lock_key")?;
 
         // Existing write mutation already protects this key; don't downgrade.
-        if matches!(
-            ctx.mutations.get(key).map(|meta| meta.mutation_type),
-            Some(MutationType::Write)
-        ) {
+        if ctx
+            .mutations
+            .get(key)
+            .is_some_and(|meta| meta.mutation.is_write())
+        {
             return Ok(());
         }
         // Existing lock mutation is already in place.
-        if matches!(
-            ctx.mutations.get(key).map(|meta| meta.mutation_type),
-            Some(MutationType::Lock)
-        ) {
+        if ctx
+            .mutations
+            .get(key)
+            .is_some_and(|meta| meta.mutation.is_lock())
+        {
             return Ok(());
         }
 
@@ -584,14 +749,18 @@ impl<S: PessimisticStorage + 'static, L: ClogService + 'static, T: TsoService> T
         }
 
         let tablet_id = route_table_to_tablet(table_id);
-        match self
+        let lock_begin = Instant::now();
+        let lock_result = self
             .put_pending_with_retry(tablet_id, key, LOCK, ctx.start_ts)
-            .await
-        {
+            .await;
+        self.write_path_diagnostics
+            .lock_pending
+            .record_duration(lock_begin.elapsed());
+        match lock_result {
             Ok(()) => {
                 let key = key.to_vec();
                 ctx.mutations.entry(key).or_insert(MutationMeta {
-                    mutation_type: MutationType::Lock,
+                    mutation: MutationPayload::Lock,
                     tablet_id,
                 });
                 Ok(())
@@ -612,6 +781,7 @@ impl<S: PessimisticStorage + 'static, L: ClogService + 'static, T: TsoService> T
 
     async fn commit(&self, mut ctx: TxnCtx) -> Result<CommitInfo> {
         Self::check_active(&ctx)?;
+        let commit_begin = Instant::now();
 
         let txn_id = ctx.txn_id;
         let start_ts = ctx.start_ts;
@@ -633,30 +803,23 @@ impl<S: PessimisticStorage + 'static, L: ClogService + 'static, T: TsoService> T
             });
         }
 
-        // Read values for Write keys from storage. Keys are borrowed from
-        // the mutations BTreeMap; values are owned (read from storage).
-        // Lock keys are skipped — they have no data to persist.
-        let mut read_values: Vec<(&[u8], Option<RawValue>)> = Vec::new();
+        // Build ClogOpRef entries directly from transaction-tracked mutations.
+        // This avoids commit-time storage readback for write keys.
+        let read_values_begin = Instant::now();
+        let mut ops: Vec<ClogOpRef<'_>> = Vec::with_capacity(mutations.len());
         for (key, mutation_meta) in &mutations {
-            if mutation_meta.mutation_type == MutationType::Lock {
-                continue;
-            }
-            let tablet_id = mutation_meta.tablet_id;
-            // TOMBSTONE: MemTableEngine returns Some(TOMBSTONE),
-            // LsmEngine returns None. Both handled as Delete in clog.
-            match self
-                .storage
-                .get_with_owner_on_tablet(tablet_id, key, start_ts, start_ts)
-                .await
-            {
-                Some(value) if !is_tombstone(&value) && !is_lock(&value) => {
-                    read_values.push((key.as_slice(), Some(value)));
-                }
-                _ => {
-                    read_values.push((key.as_slice(), None));
-                }
+            match &mutation_meta.mutation {
+                MutationPayload::Put(value) => ops.push(ClogOpRef::Put {
+                    key,
+                    value: value.as_slice(),
+                }),
+                MutationPayload::Delete => ops.push(ClogOpRef::Delete { key }),
+                MutationPayload::Lock => {}
             }
         }
+        self.write_path_diagnostics
+            .commit_read_values
+            .record_duration(read_values_begin.elapsed());
 
         // FAILPOINT: After locks acquired (pending nodes written), before commit_ts computation
         #[cfg(feature = "failpoints")]
@@ -664,6 +827,7 @@ impl<S: PessimisticStorage + 'static, L: ClogService + 'static, T: TsoService> T
 
         // Step 1: Signal that we're computing commit_ts.
         // Readers encountering our pending nodes will spin-wait until Prepared.
+        let prepare_begin = Instant::now();
         self.concurrency_manager.set_preparing_txn(start_ts)?;
 
         // Step 2: Compute commit_ts (safe: readers spin on Preparing)
@@ -673,19 +837,11 @@ impl<S: PessimisticStorage + 'static, L: ClogService + 'static, T: TsoService> T
 
         // Step 3: Set prepared_ts for readers to check visibility
         self.concurrency_manager.prepare_txn(start_ts, commit_ts)?;
+        self.write_path_diagnostics
+            .commit_prepare_ts
+            .record_duration(prepare_begin.elapsed());
 
-        // Step 4: Build ClogOpRef entries from read values (zero key clone —
-        // keys borrow from mutations BTreeMap, values borrow from read_values).
-        let ops: Vec<ClogOpRef<'_>> = read_values
-            .iter()
-            .map(|(key, val)| match val {
-                Some(v) => ClogOpRef::Put {
-                    key,
-                    value: v.as_slice(),
-                },
-                None => ClogOpRef::Delete { key },
-            })
-            .collect();
+        // Step 4: `ops` already borrows keys/values from mutation tracking.
         let has_wal_ops = !ops.is_empty();
 
         // V2.6: reserve commit LSN ahead of WAL write.
@@ -700,95 +856,121 @@ impl<S: PessimisticStorage + 'static, L: ClogService + 'static, T: TsoService> T
         fail_point!("txn_after_alloc_and_reserve_before_clog_write_v26");
 
         // Step 5: Write to clog for durability (serializes synchronously, returns
-        // future for fsync). After this call, ops/read_values are no longer needed.
+        // future for fsync). After this call, ops are no longer needed.
         debug_assert!(
             self.storage.is_commit_lsn_reserved(start_ts, txn_lsn),
             "reserved commit lsn missing before clog write: start_ts={start_ts}, lsn={txn_lsn}",
         );
+        let clog_write_begin = Instant::now();
         let clog_result = self
             .clog_service
             .write_ops(txn_id, &ops, commit_ts, Some(txn_lsn), true);
+        self.write_path_diagnostics
+            .commit_clog_write
+            .record_duration(clog_write_begin.elapsed());
 
         #[cfg(feature = "failpoints")]
         fail_point!("txn_after_clog_write_before_fsync_wait_v26");
 
-        // Release borrows on mutations (ops → read_values → mutations).
+        // Release borrows on mutations (ops → mutations).
         drop(ops);
-        drop(read_values);
         let mut grouped_mutations = Some(mutations);
 
         match clog_result {
-            Ok(fsync_future) => match fsync_future.await {
-                Ok(lsn) => {
-                    #[cfg(feature = "failpoints")]
-                    fail_point!("txn_after_clog_fsync_before_finalize_v26");
+            Ok(fsync_future) => {
+                let fsync_wait_begin = Instant::now();
+                let fsync_result = fsync_future.await;
+                self.write_path_diagnostics
+                    .commit_fsync_wait
+                    .record_duration(fsync_wait_begin.elapsed());
+                match fsync_result {
+                    Ok(lsn) => {
+                        #[cfg(feature = "failpoints")]
+                        fail_point!("txn_after_clog_fsync_before_finalize_v26");
 
-                    if has_wal_ops {
-                        debug_assert_eq!(
-                            txn_lsn, lsn,
-                            "clog returned lsn differs from reserved lsn (start_ts={start_ts})",
-                        );
+                        if has_wal_ops {
+                            debug_assert_eq!(
+                                txn_lsn, lsn,
+                                "clog returned lsn differs from reserved lsn (start_ts={start_ts})",
+                            );
+                        }
+                        let commit_lsn = txn_lsn;
+                        let (write_grouped_keys, lock_grouped_keys) =
+                            Self::group_owned_mutation_keys_by_tablet_and_type(
+                                grouped_mutations
+                                    .take()
+                                    .expect("commit mutation set should be available exactly once"),
+                            );
+                        let finalize_begin = Instant::now();
+
+                        // Step 6: Finalize write keys and abort lock-only keys so LOCK
+                        // sentinels never become committed user-visible versions.
+                        if !write_grouped_keys.is_empty() {
+                            self.storage.finalize_pending_grouped_with_lsn(
+                                &write_grouped_keys,
+                                start_ts,
+                                commit_ts,
+                                commit_lsn,
+                            );
+                        }
+                        if !lock_grouped_keys.is_empty() {
+                            self.storage
+                                .abort_pending_grouped(&lock_grouped_keys, start_ts);
+                        }
+
+                        #[cfg(feature = "failpoints")]
+                        fail_point!("txn_after_finalize_before_reservation_release_v26");
+
+                        if let Some(guard) = reservation_guard.take() {
+                            let _ = guard.release();
+                        }
+                        ctx.reserved_lsn = None;
+
+                        #[cfg(feature = "failpoints")]
+                        fail_point!("txn_after_reservation_release_before_state_commit_v26");
+
+                        // Step 7: Transition to Committed in state cache
+                        self.concurrency_manager.commit_txn(start_ts, commit_ts)?;
+                        self.concurrency_manager.remove_txn(start_ts);
+                        ctx.state = TxnState::Committed { commit_ts };
+                        self.write_path_diagnostics
+                            .commit_finalize
+                            .record_duration(finalize_begin.elapsed());
+                        self.write_path_diagnostics
+                            .commit_total
+                            .record_duration(commit_begin.elapsed());
+                        self.write_path_diagnostics
+                            .commit_success
+                            .fetch_add(1, Ordering::Relaxed);
+                        Ok(CommitInfo {
+                            txn_id,
+                            commit_ts,
+                            lsn: commit_lsn,
+                        })
                     }
-                    let commit_lsn = txn_lsn;
-                    let (write_grouped_keys, lock_grouped_keys) =
-                        Self::group_owned_mutation_keys_by_tablet_and_type(
+                    Err(e) => {
+                        if let Some(guard) = reservation_guard.take() {
+                            let _ = guard.release();
+                        }
+                        ctx.reserved_lsn = None;
+                        let grouped_keys = Self::group_owned_mutation_keys_by_tablet(
                             grouped_mutations
                                 .take()
                                 .expect("commit mutation set should be available exactly once"),
                         );
-
-                    // Step 6: Finalize write keys and abort lock-only keys so LOCK
-                    // sentinels never become committed user-visible versions.
-                    if !write_grouped_keys.is_empty() {
-                        self.storage.finalize_pending_grouped_with_lsn(
-                            &write_grouped_keys,
-                            start_ts,
-                            commit_ts,
-                            commit_lsn,
-                        );
+                        self.storage.abort_pending_grouped(&grouped_keys, start_ts);
+                        self.concurrency_manager.abort_txn(start_ts).ok();
+                        self.concurrency_manager.remove_txn(start_ts);
+                        self.write_path_diagnostics
+                            .commit_total
+                            .record_duration(commit_begin.elapsed());
+                        self.write_path_diagnostics
+                            .commit_failure
+                            .fetch_add(1, Ordering::Relaxed);
+                        Err(e)
                     }
-                    if !lock_grouped_keys.is_empty() {
-                        self.storage
-                            .abort_pending_grouped(&lock_grouped_keys, start_ts);
-                    }
-
-                    #[cfg(feature = "failpoints")]
-                    fail_point!("txn_after_finalize_before_reservation_release_v26");
-
-                    if let Some(guard) = reservation_guard.take() {
-                        let _ = guard.release();
-                    }
-                    ctx.reserved_lsn = None;
-
-                    #[cfg(feature = "failpoints")]
-                    fail_point!("txn_after_reservation_release_before_state_commit_v26");
-
-                    // Step 7: Transition to Committed in state cache
-                    self.concurrency_manager.commit_txn(start_ts, commit_ts)?;
-                    self.concurrency_manager.remove_txn(start_ts);
-                    ctx.state = TxnState::Committed { commit_ts };
-                    Ok(CommitInfo {
-                        txn_id,
-                        commit_ts,
-                        lsn: commit_lsn,
-                    })
                 }
-                Err(e) => {
-                    if let Some(guard) = reservation_guard.take() {
-                        let _ = guard.release();
-                    }
-                    ctx.reserved_lsn = None;
-                    let grouped_keys = Self::group_owned_mutation_keys_by_tablet(
-                        grouped_mutations
-                            .take()
-                            .expect("commit mutation set should be available exactly once"),
-                    );
-                    self.storage.abort_pending_grouped(&grouped_keys, start_ts);
-                    self.concurrency_manager.abort_txn(start_ts).ok();
-                    self.concurrency_manager.remove_txn(start_ts);
-                    Err(e)
-                }
-            },
+            }
             Err(e) => {
                 if let Some(guard) = reservation_guard.take() {
                     let _ = guard.release();
@@ -802,6 +984,12 @@ impl<S: PessimisticStorage + 'static, L: ClogService + 'static, T: TsoService> T
                 self.storage.abort_pending_grouped(&grouped_keys, start_ts);
                 self.concurrency_manager.abort_txn(start_ts).ok();
                 self.concurrency_manager.remove_txn(start_ts);
+                self.write_path_diagnostics
+                    .commit_total
+                    .record_duration(commit_begin.elapsed());
+                self.write_path_diagnostics
+                    .commit_failure
+                    .fetch_add(1, Ordering::Relaxed);
                 Err(e)
             }
         }
@@ -1150,6 +1338,7 @@ mod tests {
     use crate::inner_table::core_tables::ALL_META_TABLE_ID;
     use crate::tablet::MemTableEngine;
     use crate::tso::LocalTso;
+    use std::time::Duration;
     use tempfile::tempdir;
 
     type TestStorage = MemTableEngine;
@@ -3417,5 +3606,40 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(val.as_deref(), Some(b"v2".as_slice()));
+    }
+
+    #[tokio::test]
+    async fn test_write_path_diagnostics_duplicate_check_counter() {
+        let (_storage, txn_service, _dir) = create_test_service();
+
+        txn_service.record_duplicate_check_duration(Duration::from_micros(7));
+        txn_service.record_duplicate_check_duration(Duration::from_micros(13));
+
+        let snapshot = txn_service.write_path_diagnostics.snapshot();
+        assert_eq!(snapshot.duplicate_check.count, 2);
+        assert_eq!(snapshot.duplicate_check.total_us, 20);
+        assert_eq!(snapshot.duplicate_check.avg_us, 10);
+        assert_eq!(snapshot.duplicate_check.max_us, 13);
+    }
+
+    #[tokio::test]
+    async fn test_write_path_diagnostics_commit_stage_counters() {
+        let (_storage, txn_service, _dir) = create_test_service();
+
+        txn_service
+            .autocommit_put(b"diag-k", b"diag-v")
+            .await
+            .unwrap();
+
+        let snapshot = txn_service.write_path_diagnostics.snapshot();
+        assert_eq!(snapshot.commit_success, 1);
+        assert_eq!(snapshot.commit_failure, 0);
+        assert!(snapshot.put_pending.count >= 1);
+        assert!(snapshot.commit_read_values.count >= 1);
+        assert!(snapshot.commit_prepare_ts.count >= 1);
+        assert!(snapshot.commit_clog_write.count >= 1);
+        assert!(snapshot.commit_fsync_wait.count >= 1);
+        assert!(snapshot.commit_finalize.count >= 1);
+        assert!(snapshot.commit_total.count >= 1);
     }
 }

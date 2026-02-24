@@ -25,6 +25,7 @@
 
 use std::future::Future;
 use std::pin::Pin;
+use std::time::Instant;
 
 use crate::catalog::types::{ColumnId, ColumnInfo, DataType, Key, Row, Schema, TableId, Value};
 use crate::catalog::{Catalog, TableDef};
@@ -1540,7 +1541,10 @@ impl SimpleExecutor {
                     };
 
                     // Check for duplicate primary key
-                    if txn_service.get(ctx, table.id(), &key).await?.is_some() {
+                    let duplicate_check_begin = Instant::now();
+                    let duplicate_exists = txn_service.get(ctx, table.id(), &key).await?.is_some();
+                    txn_service.record_duplicate_check_duration(duplicate_check_begin.elapsed());
+                    if duplicate_exists {
                         if ignore {
                             txn_service.lock_key(ctx, table.id(), &key).await?;
                             continue;

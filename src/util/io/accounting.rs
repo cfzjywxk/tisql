@@ -22,6 +22,7 @@ use dashmap::DashMap;
 pub enum IoSource {
     ForegroundPointRead,
     ForegroundScan,
+    Clog,
     Flush,
     Compaction,
     Manifest,

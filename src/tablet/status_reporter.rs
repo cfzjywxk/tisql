@@ -236,6 +236,10 @@ impl EngineStatusReporter {
     pub fn collect_once(&self) -> Arc<EngineStatusSnapshot> {
         self.inner.collect_and_publish(true)
     }
+
+    pub fn collect_once_quiet(&self) -> Arc<EngineStatusSnapshot> {
+        self.inner.collect_and_publish(false)
+    }
 }
 
 impl Drop for EngineStatusReporter {
@@ -680,6 +684,13 @@ pub fn snapshot_to_metric_rows(snapshot: &EngineStatusSnapshot) -> Vec<EngineSta
             "",
             &format!("{prefix}.write_bytes"),
             source.write_bytes,
+        );
+        push_metric(
+            &mut rows,
+            "global",
+            "",
+            &format!("{prefix}.fsync_ops"),
+            source.fsync_ops,
         );
     }
 

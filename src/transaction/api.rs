@@ -43,29 +43,42 @@
 use std::collections::BTreeMap;
 use std::future::Future;
 use std::ops::Range;
+use std::time::Duration;
 
 use crate::catalog::types::{Key, Lsn, RawValue, TableId, Timestamp, TxnId};
 use crate::tablet::{MvccIterator, TabletId};
 use crate::util::error::Result;
 
-/// Mutation type for keys tracked in a transaction.
+/// Final per-key mutation payload tracked in a transaction context.
 ///
-/// Each key in the transaction's mutations map is either a Write (real data change)
-/// or a Lock (pessimistic lock on a non-existent key, skipped during clog persist).
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) enum MutationType {
-    /// Key has a real data change (put or delete with tombstone).
-    Write,
-    /// Key has only a pessimistic lock (delete on non-existent key).
-    /// Not persisted to clog.
+/// The payload mirrors what will be persisted to clog at commit:
+/// - `Put(value)` for INSERT/UPDATE
+/// - `Delete` for deletes on existing values
+/// - `Lock` for delete/lock on non-existent keys (not persisted to clog)
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum MutationPayload {
+    Put(RawValue),
+    Delete,
     Lock,
 }
 
+impl MutationPayload {
+    #[inline]
+    pub(crate) fn is_write(&self) -> bool {
+        !matches!(self, Self::Lock)
+    }
+
+    #[inline]
+    pub(crate) fn is_lock(&self) -> bool {
+        matches!(self, Self::Lock)
+    }
+}
+
 /// Per-key mutation metadata tracked inside a transaction context.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct MutationMeta {
-    /// Logical mutation type for commit/rollback handling.
-    pub(crate) mutation_type: MutationType,
+    /// Final mutation payload for commit/rollback handling.
+    pub(crate) mutation: MutationPayload,
     /// Tablet routing captured when the mutation was recorded.
     pub(crate) tablet_id: TabletId,
 }
@@ -138,11 +151,10 @@ pub struct TxnCtx {
     /// Whether this is an explicit transaction (started with BEGIN).
     /// Explicit transactions use pessimistic locking.
     pub(crate) explicit: bool,
-    /// Keys mutated by this transaction with combined mutation metadata.
+    /// Keys mutated by this transaction with final per-key mutation payload.
     ///
-    /// Write keys have real data changes; Lock keys are pessimistic locks on
-    /// non-existent keys (skipped during clog persist). Tablet routing is stored
-    /// in the same map to avoid duplicate key allocations.
+    /// Each entry tracks the final operation (`Put`, `Delete`, or `Lock`) plus
+    /// tablet routing. Commit serializes durable clog ops directly from this map.
     pub(crate) mutations: BTreeMap<Key, MutationMeta>,
     /// Whether this transaction has been registered in the state cache.
     /// Registration happens on first write (put/delete) for implicit txns,
@@ -354,6 +366,12 @@ pub trait TxnService: Send + Sync {
         table_id: TableId,
         key: &'a [u8],
     ) -> impl Future<Output = Result<Option<RawValue>>> + Send + 'a;
+
+    /// Record time spent in duplicate-check reads on write paths.
+    ///
+    /// The default implementation is a no-op so test mocks and alternative
+    /// transaction services do not need to provide diagnostics.
+    fn record_duplicate_check_duration(&self, _duration: Duration) {}
 
     /// Scan a range of keys within one table target (streaming).
     ///

@@ -70,7 +70,27 @@ cargo run -- --help
 # -P, --port <PORT>            Port to listen on (default: 4000)
 # -D, --data-dir <DATA_DIR>    Data directory for persistence (default: data)
 # -L, --log-level <LOG_LEVEL>  Log level: trace/debug/info/warn/error (default: info)
+# --clog-sync-mode <MODE>      Clog sync mode: full|data (default: full)
+# --group-commit-delay-us <US> Group commit delay window in microseconds (default: 0)
+# --group-commit-no-delay-count <N>
+#                              Skip delay once batch size reaches N (default: 16)
+# --protocol-threads <N>       Protocol runtime threads (optional override)
+# --worker-threads <N>         Worker runtime threads (optional override)
+# --bg-threads <N>             Background runtime threads (optional override)
+# --io-threads <N>             I/O runtime threads (optional override)
+# --flush-threads <N>          Per-tablet flush threads (optional override)
 ```
+
+## Performance Snapshot (Strict Durability, COM_QUERY)
+
+- Benchmark mode: insert-only go-ycsb, `recordcount=100000`, `operationcount=300000`, `threadcount=16`, COM_QUERY path for both engines.
+- Strict safety settings:
+  - TiSQL: `--clog-sync-mode full`
+  - MySQL 8.0: `innodb_flush_log_at_trx_commit=1`, `sync_binlog=1`, `log_bin=ON`, `innodb_doublewrite=ON`
+- Recent tuned strict runs on this host:
+  - MySQL 8.0 (strict + tuned): `~7.4k-7.8k OPS`
+  - TiSQL (strict): `~12.3k-13.5k OPS`
+- Takeaway: TiSQL write throughput is in the same order of magnitude as MySQL 8.0 under strict durability settings, and remains competitive in this benchmark profile.
 
 ## Build & Test
 
@@ -78,6 +98,9 @@ cargo run -- --help
 # Build
 cargo build
 cargo build --release
+
+# Full local quality gate (fmt + clippy + tests)
+make prepare
 
 # Format + lint
 cargo fmt

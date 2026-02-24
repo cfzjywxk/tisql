@@ -171,7 +171,7 @@ pub mod testkit {
 // Internal imports (not re-exported)
 use catalog::types::{Lsn, Value};
 use catalog::MvccCatalog;
-use clog::{FileClogConfig, FileClogService, TruncateStats};
+use clog::{ClogSyncMode, FileClogConfig, FileClogService, TruncateStats};
 use executor::{ExecutionOutput, ExecutionResult, Executor, SimpleExecutor};
 use sql::Parser;
 use tablet::{
@@ -191,6 +191,7 @@ use util::error::Result;
 
 use std::path::PathBuf;
 use std::sync::Arc;
+use std::time::Duration;
 
 #[cfg(feature = "failpoints")]
 use fail::fail_point;
@@ -241,6 +242,12 @@ pub struct DatabaseConfig {
     pub engine_status_report_interval_secs: u64,
     /// Max tablets emitted in one status report block (0 = all).
     pub engine_status_top_n_tablets: usize,
+    /// Clog sync mode for commit durability barriers.
+    pub clog_sync_mode: ClogSyncMode,
+    /// Group-commit delay window.
+    pub group_commit_delay: Duration,
+    /// Skip group-commit delay once batch reaches this size.
+    pub group_commit_no_delay_count: usize,
 }
 
 impl Default for DatabaseConfig {
@@ -265,6 +272,9 @@ impl Default for DatabaseConfig {
             max_levels: DEFAULT_MAX_LEVELS,
             engine_status_report_interval_secs: 60,
             engine_status_top_n_tablets: 20,
+            clog_sync_mode: ClogSyncMode::default(),
+            group_commit_delay: Duration::ZERO,
+            group_commit_no_delay_count: 16,
         }
     }
 }
@@ -374,6 +384,24 @@ impl DatabaseConfig {
 
     pub fn with_engine_status_top_n_tablets(mut self, top_n: usize) -> Self {
         self.engine_status_top_n_tablets = top_n;
+        self
+    }
+
+    /// Set clog sync mode (`FullSync` or `DataSync`).
+    pub fn with_clog_sync_mode(mut self, mode: ClogSyncMode) -> Self {
+        self.clog_sync_mode = mode;
+        self
+    }
+
+    /// Set group-commit delay window.
+    pub fn with_group_commit_delay(mut self, delay: Duration) -> Self {
+        self.group_commit_delay = delay;
+        self
+    }
+
+    /// Set no-delay batch-size threshold (minimum 1).
+    pub fn with_group_commit_no_delay_count(mut self, count: usize) -> Self {
+        self.group_commit_no_delay_count = count.max(1);
         self
     }
 
@@ -782,9 +810,19 @@ impl Database {
         );
 
         // 2. Staged recovery bootstrap (system ilog + raw clog, no replay yet).
+        let clog_config = FileClogConfig::with_dir(&config.data_dir)
+            .with_sync_mode(config.clog_sync_mode)
+            .with_group_commit_delay(config.group_commit_delay)
+            .with_group_commit_no_delay_count(config.group_commit_no_delay_count);
+        log_info!(
+            "Clog config: sync_mode={:?}, group_commit_delay_us={}, group_commit_no_delay_count={}",
+            clog_config.sync_mode,
+            clog_config.group_commit.delay.as_micros(),
+            clog_config.group_commit.no_delay_count
+        );
         let mut recovery = LsmRecovery::with_configs(
             lsm_config.clone(),
-            FileClogConfig::with_dir(&config.data_dir),
+            clog_config,
             IlogConfig::new(&config.data_dir),
         )
         .recover_bootstrap(io_runtime.handle())?;
@@ -1103,7 +1141,23 @@ impl Database {
 
     /// Flattened metric rows used by `SHOW ENGINE STATUS`.
     pub fn engine_status_metric_rows(&self) -> Vec<EngineStatusMetricRow> {
-        snapshot_to_metric_rows(self.engine_status_snapshot().as_ref())
+        // SHOW ENGINE STATUS is an on-demand diagnostic path; collect a fresh
+        // snapshot so per-interval deltas (especially I/O counters) are up-to-date.
+        let snapshot = if let Some(reporter) = &self.engine_status_reporter {
+            reporter.collect_once_quiet()
+        } else {
+            self.engine_status_snapshot()
+        };
+        let mut rows = snapshot_to_metric_rows(snapshot.as_ref());
+        for (metric, value) in self.txn_service.write_path_metric_pairs() {
+            rows.push(EngineStatusMetricRow {
+                scope: "txn_write".to_string(),
+                tablet: String::new(),
+                metric,
+                value,
+            });
+        }
+        rows
     }
 
     fn mount_tablet_if_needed(&self, tablet_id: TabletId) -> Result<()> {

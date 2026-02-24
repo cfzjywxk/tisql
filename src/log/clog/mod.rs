@@ -36,6 +36,7 @@ pub(crate) use group_commit::GroupCommitWriter;
 use std::future::Future;
 use std::pin::Pin;
 use std::task::{Context, Poll};
+use std::time::Duration;
 
 use crate::catalog::types::{Key, Lsn, RawValue, Timestamp, TxnId};
 use crate::util::error::{Result, TiSqlError};
@@ -82,6 +83,39 @@ pub enum ClogOpRef<'a> {
     Put { key: &'a [u8], value: &'a [u8] },
     Delete { key: &'a [u8] },
     Commit { commit_ts: Timestamp },
+}
+
+/// Sync mode used by clog group commit durability barriers.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ClogSyncMode {
+    /// Full file integrity sync (`fsync` semantics).
+    FullSync,
+    /// Data-only sync (`fdatasync` semantics).
+    DataSync,
+}
+
+impl Default for ClogSyncMode {
+    fn default() -> Self {
+        Self::FullSync
+    }
+}
+
+/// Group commit batching knobs.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct GroupCommitTuning {
+    /// Delay window after the first request arrives before sealing a batch.
+    pub delay: Duration,
+    /// Skip delay once the ready batch reaches this size.
+    pub no_delay_count: usize,
+}
+
+impl Default for GroupCommitTuning {
+    fn default() -> Self {
+        Self {
+            delay: Duration::ZERO,
+            no_delay_count: 16,
+        }
+    }
 }
 
 /// Batch of commit log entries for atomic append
@@ -161,8 +195,8 @@ pub trait ClogService: Send + Sync {
     /// Write pre-built clog ops directly.
     ///
     /// This is the zero-copy commit path: the caller builds `ClogOpRef` entries
-    /// that borrow keys from the transaction's mutations BTreeMap and values from
-    /// storage reads. The clog appends a Commit record, serializes, and submits to
+    /// that borrow keys/values from the transaction's mutation tracking map.
+    /// The clog appends a Commit record, serializes, and submits to
     /// group commit. No key or value cloning occurs.
     ///
     /// - `lsn = Some(reserved_lsn)`: use caller-provided pre-allocated LSN

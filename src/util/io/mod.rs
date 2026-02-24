@@ -45,7 +45,7 @@ pub use accounting::{
 };
 pub use aligned_buf::{AlignedBuf, DMA_ALIGNMENT};
 pub use dma_file::DmaFile;
-pub use service::{IoFuture, IoService};
+pub use service::{IoFuture, IoService, IoSyncMode};
 
 /// Minimal single-future executor that blocks the current thread until completion.
 ///
