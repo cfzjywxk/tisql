@@ -1,22 +1,27 @@
 # TiSQL
 
-A minimal SQL database in Rust with MySQL protocol support, designed for learning database internals.
+A MySQL-compatible SQL database in Rust focused on correctness-first transaction semantics and practical storage-engine design.
 
 [![CI](https://github.com/cfzjywxk/tisql/actions/workflows/ci.yml/badge.svg)](https://github.com/cfzjywxk/tisql/actions/workflows/ci.yml)
 [![License](https://img.shields.io/badge/license-Apache%202.0-blue.svg)](LICENSE)
 
-## Features
+## Key Designs and Highlights
 
-- **MySQL protocol server** (`opensrv-mysql`), connect with standard MySQL clients
+- **MySQL wire compatibility**: connect with standard MySQL clients/tools over the MySQL protocol (`opensrv-mysql`).
+- **Layered architecture**: parser/binder/executor + transaction manager + LSM storage engine (`VersionedMemTableEngine` + SST).
+- **Durability model**: WAL-style commit log (`clog`) plus manifest/metadata log (`ilog`) with shared unified LSN ordering.
+- **Configurable group commit**: supports `full` (`fsync`) and `data` (`fdatasync`) sync modes, delay window, and no-delay-count threshold.
+- **Correctness-first transactions**: snapshot reads, read-your-writes, pessimistic lock conflict detection, and explicit txn lifecycle.
+- **Runtime isolation**: dedicated protocol, worker, background, and I/O runtimes to reduce contention.
+- **I/O strategy**: Linux `io_uring` for async SST I/O (`O_DIRECT` path), with non-Linux sync fallback for development.
+- **Operational safety**: persistent MVCC catalog, recovery path for clog/ilog, and drop-table GC with read-path SST skipping.
+
+## Current Capabilities
+
 - **SQL support**: `CREATE TABLE`, `DROP TABLE`, `INSERT`, `SELECT`, `UPDATE`, `DELETE`, `USE`, `SHOW`, `BEGIN/COMMIT/ROLLBACK`
-- **Explicit transactions** with snapshot reads, read-your-writes, and pessimistic lock conflict detection
-- **Streaming execution**: volcano-style operator tree, worker-to-protocol batched row streaming
-- **Storage engine**: LSM tree (`VersionedMemTableEngine` + SSTables) with background flush and compaction
-- **Durability & recovery**: commit log (WAL) + ilog with group commit and unified LSN ordering
-- **Async SST I/O**: Linux uses `io_uring` (`O_DIRECT`, positional I/O); non-Linux dev builds use a sync fallback backend
-- **Persistent catalog**: MVCC inner-table metadata with bootstrap and schema-version checks
-- **Drop-table GC**: background worker with read-path SST skip and proactive dropped-SST cleanup
-- **Runtime separation**: protocol/runtime work split across dedicated worker, background, and I/O runtimes
+- **Streaming execution**: volcano-style operator tree with worker-to-protocol batched row streaming
+- **Storage maintenance**: background flush, compaction, and dropped-SST cleanup
+- **Observability**: `SHOW STATUS` and periodic engine status reporting
 
 ## Quick Start
 
@@ -81,16 +86,19 @@ cargo run -- --help
 # --flush-threads <N>          Per-tablet flush threads (optional override)
 ```
 
-## Performance Snapshot (Strict Durability, COM_QUERY)
+## Performance Snapshot (COM_QUERY Write-Only)
 
-- Benchmark mode: insert-only go-ycsb, `recordcount=100000`, `operationcount=300000`, `threadcount=16`, COM_QUERY path for both engines.
-- Strict safety settings:
+Benchmark profile: go-ycsb insert-only, `recordcount=100000`, `operationcount=300000`, `threadcount=16`, COM_QUERY path.
+
+- **Strict durability profile**:
   - TiSQL: `--clog-sync-mode full`
   - MySQL 8.0: `innodb_flush_log_at_trx_commit=1`, `sync_binlog=1`, `log_bin=ON`, `innodb_doublewrite=ON`
-- Recent tuned strict runs on this host:
-  - MySQL 8.0 (strict + tuned): `~7.4k-7.8k OPS`
-  - TiSQL (strict): `~12.3k-13.5k OPS`
-- Takeaway: TiSQL write throughput is in the same order of magnitude as MySQL 8.0 under strict durability settings, and remains competitive in this benchmark profile.
+  - Observed range (tuned runs on this host): TiSQL `~12.3k-13.5k OPS`, MySQL `~7.4k-7.8k OPS`
+- **InnoDB-only MySQL profile** (binlog write/sync disabled):
+  - MySQL 8.0: `innodb_flush_log_at_trx_commit=1`, `skip-log-bin`, `sync_binlog=0`, `innodb_doublewrite=ON`
+  - Observed run: MySQL `~13.5k OPS`
+
+Takeaway: TiSQL shows comparable write throughput to MySQL 8.0 in this workload class, and remains competitive under strict-durability settings.
 
 ## Build & Test
 
