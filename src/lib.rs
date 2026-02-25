@@ -171,7 +171,7 @@ pub mod testkit {
 // Internal imports (not re-exported)
 use catalog::types::{Lsn, Value};
 use catalog::MvccCatalog;
-use clog::{ClogSyncMode, FileClogConfig, FileClogService, TruncateStats};
+use clog::{FileClogConfig, FileClogService, TruncateStats};
 use executor::{ExecutionOutput, ExecutionResult, Executor, SimpleExecutor};
 use sql::Parser;
 use tablet::{
@@ -242,8 +242,6 @@ pub struct DatabaseConfig {
     pub engine_status_report_interval_secs: u64,
     /// Max tablets emitted in one status report block (0 = all).
     pub engine_status_top_n_tablets: usize,
-    /// Clog sync mode for commit durability barriers.
-    pub clog_sync_mode: ClogSyncMode,
     /// Group-commit delay window.
     pub group_commit_delay: Duration,
     /// Skip group-commit delay once batch reaches this size.
@@ -272,7 +270,6 @@ impl Default for DatabaseConfig {
             max_levels: DEFAULT_MAX_LEVELS,
             engine_status_report_interval_secs: 60,
             engine_status_top_n_tablets: 20,
-            clog_sync_mode: ClogSyncMode::default(),
             group_commit_delay: Duration::ZERO,
             group_commit_no_delay_count: 16,
         }
@@ -384,12 +381,6 @@ impl DatabaseConfig {
 
     pub fn with_engine_status_top_n_tablets(mut self, top_n: usize) -> Self {
         self.engine_status_top_n_tablets = top_n;
-        self
-    }
-
-    /// Set clog sync mode (`FullSync` or `DataSync`).
-    pub fn with_clog_sync_mode(mut self, mode: ClogSyncMode) -> Self {
-        self.clog_sync_mode = mode;
         self
     }
 
@@ -810,12 +801,10 @@ impl Database {
 
         // 2. Staged recovery bootstrap (system ilog + raw clog, no replay yet).
         let clog_config = FileClogConfig::with_dir(&config.data_dir)
-            .with_sync_mode(config.clog_sync_mode)
             .with_group_commit_delay(config.group_commit_delay)
             .with_group_commit_no_delay_count(config.group_commit_no_delay_count);
         log_info!(
-            "Clog config: sync_mode={:?}, group_commit_delay_us={}, group_commit_no_delay_count={}",
-            clog_config.sync_mode,
+            "Clog config: group_commit_delay_us={}, group_commit_no_delay_count={}",
             clog_config.group_commit.delay.as_micros(),
             clog_config.group_commit.no_delay_count
         );

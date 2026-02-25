@@ -108,7 +108,7 @@ Benchmark: [go-ycsb](https://github.com/pingcap/go-ycsb) insert-only, `recordcou
 | **Strict durability** | **~20.7k OPS** | ~7.4k–7.8k OPS |
 | **InnoDB-only** (binlog disabled, doublewrite ON) | — | ~13.5k OPS |
 
-> TiSQL config: `--clog-sync-mode full` — group buffer WAL with `O_DIRECT|O_SYNC` pwrite (no fsync).
+> TiSQL config: group buffer WAL with `O_DIRECT|O_SYNC` pwrite and commit-time durability sync.
 > MySQL config: `innodb_flush_log_at_trx_commit=1`, `sync_binlog=1`, `log_bin=ON`, `innodb_doublewrite=ON`.
 
 <details>
@@ -119,7 +119,6 @@ Benchmark: [go-ycsb](https://github.com/pingcap/go-ycsb) insert-only, `recordcou
 -P, --port <PORT>            Port (default: 4000)
 -D, --data-dir <DATA_DIR>    Data directory (default: data)
 -L, --log-level <LEVEL>      trace/debug/info/warn/error (default: info)
---clog-sync-mode <MODE>      full|data (default: full)
 --group-commit-delay-us <N>  Group commit delay in µs (default: 0)
 --group-commit-no-delay-count <N>
                              Skip delay at batch size N (default: 16)

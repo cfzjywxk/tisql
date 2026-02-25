@@ -16,7 +16,7 @@
 //!
 //! Multiple concurrent callers submit serialized records via `submit()`.
 //! A writer task/thread batches records, writes via `IoService::write_at()`,
-//! and issues a single durability sync (`fsync` or `fdatasync`) for the batch.
+//! and issues a single durability sync (`fdatasync`) for the batch.
 //!
 //! ## Design
 //!
@@ -39,17 +39,17 @@
 use std::sync::Arc;
 use std::time::Duration;
 
-use crate::io::{AlignedBuf, DmaFile, IoService, IoSyncMode, IoTraceTag, DMA_ALIGNMENT};
+use crate::io::{AlignedBuf, DmaFile, IoService, IoTraceTag, DMA_ALIGNMENT};
 
-use super::{ClogSyncMode, GroupCommitTuning};
+use super::GroupCommitTuning;
 
 /// A request submitted to the group commit writer.
 struct GroupCommitRequest {
     /// Serialized record data to write.
     data: Vec<u8>,
-    /// Whether this request requires fsync.
+    /// Whether this request requires durability sync.
     sync: bool,
-    /// Channel to notify the caller when the write (+ optional fsync) is complete.
+    /// Channel to notify the caller when the write (+ optional sync) is complete.
     reply: tokio::sync::oneshot::Sender<Result<(), String>>,
 }
 
@@ -83,46 +83,36 @@ enum WriterInner {
 ///
 /// Supports `stop_and_drain()` for truncation (async drain of in-flight
 /// writes) and `restart()` to resume with a new file.
-pub struct GroupCommitWriter {
+pub(crate) struct GroupCommitWriter {
     inner: parking_lot::Mutex<WriterInner>,
     available: parking_lot::Condvar,
     io_trace: IoTraceTag,
-    sync_mode: IoSyncMode,
     group_commit_delay: Duration,
     group_commit_no_delay_count: usize,
 }
 
 impl GroupCommitWriter {
     /// Create a new group commit writer with an explicit I/O trace tag.
-    pub fn new_with_trace(
+    pub(crate) fn new_with_trace(
         file: DmaFile,
         io: Arc<IoService>,
         handle: &tokio::runtime::Handle,
         io_trace: IoTraceTag,
     ) -> Self {
-        Self::new_with_config_with_trace(
-            file,
-            io,
-            handle,
-            io_trace,
-            ClogSyncMode::default(),
-            GroupCommitTuning::default(),
-        )
+        Self::new_with_config_with_trace(file, io, handle, io_trace, GroupCommitTuning::default())
     }
 
-    /// Create a new group commit writer with explicit sync mode and batching knobs.
-    pub fn new_with_config_with_trace(
+    /// Create a new group commit writer with explicit batching knobs.
+    pub(crate) fn new_with_config_with_trace(
         file: DmaFile,
         io: Arc<IoService>,
         handle: &tokio::runtime::Handle,
         io_trace: IoTraceTag,
-        sync_mode: ClogSyncMode,
         group_commit: GroupCommitTuning,
     ) -> Self {
         let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
 
         let io_clone = Arc::clone(&io);
-        let io_sync_mode = io_sync_mode(sync_mode);
         let group_commit_delay = group_commit.delay;
         let group_commit_no_delay_count = group_commit.no_delay_count.max(1);
         let jh = handle.spawn(async move {
@@ -131,7 +121,6 @@ impl GroupCommitWriter {
                 io_clone,
                 rx,
                 io_trace,
-                io_sync_mode,
                 group_commit_delay,
                 group_commit_no_delay_count,
             )
@@ -145,7 +134,6 @@ impl GroupCommitWriter {
             })),
             available: parking_lot::Condvar::new(),
             io_trace,
-            sync_mode: io_sync_mode,
             group_commit_delay,
             group_commit_no_delay_count,
         }
@@ -155,32 +143,24 @@ impl GroupCommitWriter {
     ///
     /// Uses `blocking_recv()` and `.wait()` for synchronous I/O.
     /// Use this in test code or when no tokio runtime handle is available.
-    pub fn new_with_thread_with_trace(
+    pub(crate) fn new_with_thread_with_trace(
         file: DmaFile,
         io: Arc<IoService>,
         io_trace: IoTraceTag,
     ) -> Self {
-        Self::new_with_thread_config_with_trace(
-            file,
-            io,
-            io_trace,
-            ClogSyncMode::default(),
-            GroupCommitTuning::default(),
-        )
+        Self::new_with_thread_config_with_trace(file, io, io_trace, GroupCommitTuning::default())
     }
 
-    /// Create a thread-backed group commit writer with explicit sync and delay knobs.
-    pub fn new_with_thread_config_with_trace(
+    /// Create a thread-backed group commit writer with explicit delay knobs.
+    pub(crate) fn new_with_thread_config_with_trace(
         file: DmaFile,
         io: Arc<IoService>,
         io_trace: IoTraceTag,
-        sync_mode: ClogSyncMode,
         group_commit: GroupCommitTuning,
     ) -> Self {
         let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
 
         let io_clone = Arc::clone(&io);
-        let io_sync_mode = io_sync_mode(sync_mode);
         let group_commit_delay = group_commit.delay;
         let group_commit_no_delay_count = group_commit.no_delay_count.max(1);
         let jh = std::thread::spawn(move || {
@@ -189,7 +169,6 @@ impl GroupCommitWriter {
                 io_clone,
                 rx,
                 io_trace,
-                io_sync_mode,
                 group_commit_delay,
                 group_commit_no_delay_count,
             );
@@ -202,20 +181,19 @@ impl GroupCommitWriter {
             })),
             available: parking_lot::Condvar::new(),
             io_trace,
-            sync_mode: io_sync_mode,
             group_commit_delay,
             group_commit_no_delay_count,
         }
     }
 
-    /// Submit a serialized record for writing, optionally with fsync.
+    /// Submit a serialized record for writing, optionally with durability sync.
     ///
     /// Returns a `tokio::sync::oneshot::Receiver` that resolves when the write
-    /// (+ optional fsync) is complete.
+    /// (+ optional sync) is complete.
     ///
     /// If the writer is `Draining`, blocks on a Condvar until it becomes
     /// `Active` (after `restart()`) or `Failed`.
-    pub fn submit(
+    pub(crate) fn submit(
         &self,
         data: Vec<u8>,
         sync: bool,
@@ -254,7 +232,7 @@ impl GroupCommitWriter {
     /// Sets state to `Draining`, closes the channel, and awaits the
     /// writer task/thread to complete. Callers of `submit()` will block
     /// on a Condvar until `restart()` or `set_failed()` is called.
-    pub async fn stop_and_drain(&self) -> Result<(), String> {
+    pub(crate) async fn stop_and_drain(&self) -> Result<(), String> {
         let drain_handle = {
             let mut guard = self.inner.lock();
             if matches!(&*guard, WriterInner::Draining) {
@@ -327,7 +305,6 @@ impl GroupCommitWriter {
         let drain_handle = if let Some(h) = handle {
             let io_clone = Arc::clone(&io);
             let io_trace = self.io_trace;
-            let sync_mode = self.sync_mode;
             let group_commit_delay = self.group_commit_delay;
             let group_commit_no_delay_count = self.group_commit_no_delay_count;
             let jh = h.spawn(async move {
@@ -336,7 +313,6 @@ impl GroupCommitWriter {
                     io_clone,
                     rx,
                     io_trace,
-                    sync_mode,
                     group_commit_delay,
                     group_commit_no_delay_count,
                 )
@@ -346,7 +322,6 @@ impl GroupCommitWriter {
         } else {
             let io_clone = Arc::clone(&io);
             let io_trace = self.io_trace;
-            let sync_mode = self.sync_mode;
             let group_commit_delay = self.group_commit_delay;
             let group_commit_no_delay_count = self.group_commit_no_delay_count;
             let jh = std::thread::spawn(move || {
@@ -355,7 +330,6 @@ impl GroupCommitWriter {
                     io_clone,
                     rx,
                     io_trace,
-                    sync_mode,
                     group_commit_delay,
                     group_commit_no_delay_count,
                 );
@@ -372,7 +346,7 @@ impl GroupCommitWriter {
     ///
     /// Fire-and-forget: does NOT await the writer task/thread.
     /// The JoinHandle is dropped, so the task/thread detaches.
-    pub fn shutdown(&self) {
+    pub(crate) fn shutdown(&self) {
         let mut guard = self.inner.lock();
         *guard = WriterInner::Failed("shutdown".to_string());
         self.available.notify_all();
@@ -401,7 +375,6 @@ async fn async_writer_loop(
     io: Arc<IoService>,
     mut rx: tokio::sync::mpsc::UnboundedReceiver<GroupCommitRequest>,
     io_trace: IoTraceTag,
-    sync_mode: IoSyncMode,
     group_commit_delay: Duration,
     group_commit_no_delay_count: usize,
 ) {
@@ -410,7 +383,7 @@ async fn async_writer_loop(
     let mut next_batch: Vec<GroupCommitRequest> = Vec::with_capacity(64);
 
     // Bootstrap the first batch. Subsequent batches are collected while the
-    // previous batch's I/O is in-flight to overlap queueing with fsync latency.
+    // previous batch's I/O is in-flight to overlap queueing with sync latency.
     let mut channel_closed = collect_batch_with_delay_async(
         &mut rx,
         &mut current_batch,
@@ -431,8 +404,7 @@ async fn async_writer_loop(
         }
 
         let write_error = {
-            let write_future =
-                write_batch_async(&file, &io, &mut offset, &current_batch, io_trace, sync_mode);
+            let write_future = write_batch_async(&file, &io, &mut offset, &current_batch, io_trace);
             tokio::pin!(write_future);
 
             loop {
@@ -495,7 +467,6 @@ fn thread_writer_loop(
     io: Arc<IoService>,
     mut rx: tokio::sync::mpsc::UnboundedReceiver<GroupCommitRequest>,
     io_trace: IoTraceTag,
-    sync_mode: IoSyncMode,
     group_commit_delay: Duration,
     group_commit_no_delay_count: usize,
 ) {
@@ -517,7 +488,7 @@ fn thread_writer_loop(
         #[cfg(feature = "failpoints")]
         fail::fail_point!("clog_writer_loop_pause");
 
-        let write_error = write_batch_sync(&file, &io, &mut offset, &batch, io_trace, sync_mode);
+        let write_error = write_batch_sync(&file, &io, &mut offset, &batch, io_trace);
 
         let result = match &write_error {
             Some(e) => Err(e.clone()),
@@ -530,13 +501,6 @@ fn thread_writer_loop(
         if write_error.is_some() {
             return;
         }
-    }
-}
-
-fn io_sync_mode(sync_mode: ClogSyncMode) -> IoSyncMode {
-    match sync_mode {
-        ClogSyncMode::FullSync => IoSyncMode::FullSync,
-        ClogSyncMode::DataSync => IoSyncMode::DataSync,
     }
 }
 
@@ -603,7 +567,6 @@ async fn write_batch_async(
     offset: &mut u64,
     batch: &[GroupCommitRequest],
     io_trace: IoTraceTag,
-    sync_mode: IoSyncMode,
 ) -> Option<String> {
     // Combine data from all requests
     let total_len: usize = batch.iter().map(|r| r.data.len()).sum();
@@ -628,10 +591,7 @@ async fn write_batch_async(
     // Sync once if any request in the batch requires it.
     let needs_sync = batch.iter().any(|r| r.sync);
     if needs_sync {
-        let sync_result = match sync_mode {
-            IoSyncMode::FullSync => io.fsync_with_trace(file, io_trace).await,
-            IoSyncMode::DataSync => io.datasync_with_trace(file, io_trace).await,
-        };
+        let sync_result = io.datasync_with_trace(file, io_trace).await;
         if let Err(e) = sync_result {
             return Some(format!("Sync error: {e}"));
         }
@@ -647,7 +607,6 @@ fn write_batch_sync(
     offset: &mut u64,
     batch: &[GroupCommitRequest],
     io_trace: IoTraceTag,
-    sync_mode: IoSyncMode,
 ) -> Option<String> {
     let total_len: usize = batch.iter().map(|r| r.data.len()).sum();
     if total_len > 0 {
@@ -670,10 +629,7 @@ fn write_batch_sync(
 
     let needs_sync = batch.iter().any(|r| r.sync);
     if needs_sync {
-        let sync_result = match sync_mode {
-            IoSyncMode::FullSync => io.fsync_with_trace(file, io_trace).wait(),
-            IoSyncMode::DataSync => io.datasync_with_trace(file, io_trace).wait(),
-        };
+        let sync_result = io.datasync_with_trace(file, io_trace).wait();
         if let Err(e) = sync_result {
             return Some(format!("Sync error: {e}"));
         }
@@ -779,7 +735,7 @@ mod tests {
         // submit returns a future
         let rx = gc.submit(b"async_data".to_vec(), true).unwrap();
 
-        // Await the future — resolves when fsync completes
+        // Await the future — resolves when sync completes
         rx.await.unwrap().unwrap();
         drop(gc);
 
@@ -855,7 +811,6 @@ mod tests {
             io,
             &tokio::runtime::Handle::current(),
             IoTraceTag::default(),
-            ClogSyncMode::FullSync,
             GroupCommitTuning {
                 delay: Duration::from_secs(10),
                 no_delay_count: 1,
@@ -879,7 +834,6 @@ mod tests {
             io,
             &tokio::runtime::Handle::current(),
             IoTraceTag::default(),
-            ClogSyncMode::FullSync,
             GroupCommitTuning {
                 delay: Duration::from_secs(10),
                 no_delay_count: usize::MAX,

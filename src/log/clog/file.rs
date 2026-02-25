@@ -38,8 +38,7 @@ use crate::util::io::DMA_ALIGNMENT;
 use crate::{log_info, log_trace, log_warn};
 
 use super::{
-    ClogBatch, ClogEntry, ClogEntryRef, ClogFsyncFuture, ClogOpRef, ClogService, ClogSyncMode,
-    GroupCommitTuning,
+    ClogBatch, ClogEntry, ClogEntryRef, ClogFsyncFuture, ClogOpRef, ClogService, GroupCommitTuning,
 };
 
 /// File header magic bytes: "CLOG"
@@ -120,8 +119,6 @@ pub struct FileClogConfig {
     pub clog_dir: PathBuf,
     /// Commit log file name
     pub clog_file: String,
-    /// Durability sync mode used by group commit.
-    pub sync_mode: ClogSyncMode,
     /// Group-commit batching delay knobs.
     pub group_commit: GroupCommitTuning,
 }
@@ -131,7 +128,6 @@ impl Default for FileClogConfig {
         Self {
             clog_dir: PathBuf::from("data"),
             clog_file: "tisql.clog".to_string(),
-            sync_mode: ClogSyncMode::default(),
             group_commit: GroupCommitTuning::default(),
         }
     }
@@ -143,15 +139,8 @@ impl FileClogConfig {
         Self {
             clog_dir: dir.into(),
             clog_file: "tisql.clog".to_string(),
-            sync_mode: ClogSyncMode::default(),
             group_commit: GroupCommitTuning::default(),
         }
-    }
-
-    /// Set clog sync mode.
-    pub fn with_sync_mode(mut self, sync_mode: ClogSyncMode) -> Self {
-        self.sync_mode = sync_mode;
-        self
     }
 
     /// Set group-commit delay window.
@@ -3229,7 +3218,6 @@ mod tests {
         let config = FileClogConfig::default();
         assert_eq!(config.clog_dir, PathBuf::from("data"));
         assert_eq!(config.clog_file, "tisql.clog");
-        assert_eq!(config.sync_mode, ClogSyncMode::FullSync);
         assert_eq!(config.group_commit.delay, std::time::Duration::ZERO);
         assert_eq!(config.group_commit.no_delay_count, 16);
         assert_eq!(config.clog_path(), PathBuf::from("data/tisql.clog"));
@@ -3241,7 +3229,6 @@ mod tests {
         let config = FileClogConfig::with_dir("/custom/path");
         assert_eq!(config.clog_dir, PathBuf::from("/custom/path"));
         assert_eq!(config.clog_file, "tisql.clog");
-        assert_eq!(config.sync_mode, ClogSyncMode::FullSync);
         assert_eq!(config.group_commit.delay, std::time::Duration::ZERO);
         assert_eq!(config.group_commit.no_delay_count, 16);
         assert_eq!(config.clog_path(), PathBuf::from("/custom/path/tisql.clog"));
@@ -3250,10 +3237,8 @@ mod tests {
     #[test]
     fn test_config_group_commit_builder_methods() {
         let config = FileClogConfig::default()
-            .with_sync_mode(ClogSyncMode::DataSync)
             .with_group_commit_delay(std::time::Duration::from_micros(80))
             .with_group_commit_no_delay_count(0);
-        assert_eq!(config.sync_mode, ClogSyncMode::DataSync);
         assert_eq!(
             config.group_commit.delay,
             std::time::Duration::from_micros(80)
@@ -3707,7 +3692,6 @@ mod tests {
         let cloned_config = config.clone();
         assert_eq!(cloned_config.clog_dir, config.clog_dir);
         assert_eq!(cloned_config.clog_file, config.clog_file);
-        assert_eq!(cloned_config.sync_mode, config.sync_mode);
         assert_eq!(cloned_config.group_commit, config.group_commit);
     }
 

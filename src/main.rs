@@ -23,7 +23,6 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use clap::Parser as ClapParser;
-use tisql::clog::ClogSyncMode;
 use tisql::tablet::{
     DEFAULT_BLOOM_BITS_PER_KEY, DEFAULT_CACHE_TOTAL_RATIO, DEFAULT_L0_COMPACTION_TRIGGER,
     DEFAULT_L0_SLOWDOWN_TRIGGER, DEFAULT_L0_STOP_TRIGGER, DEFAULT_MAX_LEVELS,
@@ -215,10 +214,6 @@ struct Args {
     #[arg(long, default_value_t = 20)]
     engine_status_top_n_tablets: usize,
 
-    /// Clog sync mode: full fsync or data-only sync.
-    #[arg(long, value_enum, default_value_t = ClogSyncModeArg::Full)]
-    clog_sync_mode: ClogSyncModeArg,
-
     /// Group commit delay window in microseconds (0 disables delay).
     #[arg(long, default_value_t = 0)]
     group_commit_delay_us: u64,
@@ -226,21 +221,6 @@ struct Args {
     /// Skip group commit delay once ready batch reaches this size.
     #[arg(long, default_value_t = 16, value_parser = clap::value_parser!(u32).range(1..))]
     group_commit_no_delay_count: u32,
-}
-
-#[derive(clap::ValueEnum, Clone, Copy, Debug, PartialEq, Eq)]
-enum ClogSyncModeArg {
-    Full,
-    Data,
-}
-
-impl From<ClogSyncModeArg> for ClogSyncMode {
-    fn from(value: ClogSyncModeArg) -> Self {
-        match value {
-            ClogSyncModeArg::Full => ClogSyncMode::FullSync,
-            ClogSyncModeArg::Data => ClogSyncMode::DataSync,
-        }
-    }
 }
 
 fn main() {
@@ -303,7 +283,6 @@ fn main() {
         .with_max_levels(args.max_levels as usize)
         .with_engine_status_report_interval_secs(args.engine_status_report_interval_secs)
         .with_engine_status_top_n_tablets(args.engine_status_top_n_tablets)
-        .with_clog_sync_mode(args.clog_sync_mode.into())
         .with_group_commit_delay(Duration::from_micros(args.group_commit_delay_us))
         .with_group_commit_no_delay_count(args.group_commit_no_delay_count as usize);
     if let Some(flush_threads) = args.flush_threads {
@@ -377,8 +356,8 @@ fn main() {
         args.engine_status_report_interval_secs, args.engine_status_top_n_tablets
     );
     println!(
-        "Clog group commit: sync_mode={:?}, delay_us={}, no_delay_count={}",
-        args.clog_sync_mode, args.group_commit_delay_us, args.group_commit_no_delay_count
+        "Clog group commit: delay_us={}, no_delay_count={}",
+        args.group_commit_delay_us, args.group_commit_no_delay_count
     );
     println!(
         "Connect with: mysql -h{} -P{} -uroot test",
@@ -572,7 +551,6 @@ mod tests {
             args.engine_status_top_n_tablets,
             defaults.engine_status_top_n_tablets
         );
-        assert_eq!(args.clog_sync_mode, ClogSyncModeArg::Full);
         assert_eq!(args.group_commit_delay_us, 0);
         assert_eq!(args.group_commit_no_delay_count, 16);
     }
@@ -649,12 +627,6 @@ mod tests {
     fn test_flush_threads_flag_must_be_positive() {
         let parsed = Args::try_parse_from(["tisql", "--flush-threads", "0"]);
         assert!(parsed.is_err());
-    }
-
-    #[test]
-    fn test_clog_sync_mode_parse() {
-        let args = Args::try_parse_from(["tisql", "--clog-sync-mode", "data"]).unwrap();
-        assert_eq!(args.clog_sync_mode, ClogSyncModeArg::Data);
     }
 
     #[test]

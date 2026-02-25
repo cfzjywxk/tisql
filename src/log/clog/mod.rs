@@ -87,21 +87,6 @@ pub enum ClogOpRef<'a> {
     Commit { commit_ts: Timestamp },
 }
 
-/// Sync mode used by clog group commit durability barriers.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum ClogSyncMode {
-    /// Full file integrity sync (`fsync` semantics).
-    FullSync,
-    /// Data-only sync (`fdatasync` semantics).
-    DataSync,
-}
-
-impl Default for ClogSyncMode {
-    fn default() -> Self {
-        Self::FullSync
-    }
-}
-
 /// Group commit batching knobs.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct GroupCommitTuning {
