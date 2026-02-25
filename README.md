@@ -5,172 +5,219 @@ A MySQL-compatible SQL database in Rust focused on correctness-first transaction
 [![CI](https://github.com/cfzjywxk/tisql/actions/workflows/ci.yml/badge.svg)](https://github.com/cfzjywxk/tisql/actions/workflows/ci.yml)
 [![License](https://img.shields.io/badge/license-Apache%202.0-blue.svg)](LICENSE)
 
-## Key Designs and Highlights
+## Design Highlights
 
-- **MySQL wire compatibility**: connect with standard MySQL clients/tools over the MySQL protocol (`opensrv-mysql`).
-- **Layered architecture**: parser/binder/executor + transaction manager + LSM storage engine (`VersionedMemTableEngine` + SST).
-- **Durability model**: WAL-style commit log (`clog`) plus manifest/metadata log (`ilog`) with shared unified LSN ordering.
-- **Configurable group commit**: supports `full` (`fsync`) and `data` (`fdatasync`) sync modes, delay window, and no-delay-count threshold.
-- **Correctness-first transactions**: snapshot reads, read-your-writes, pessimistic lock conflict detection, and explicit txn lifecycle.
-- **Runtime isolation**: dedicated protocol, worker, background, and I/O runtimes to reduce contention.
-- **I/O strategy**: Linux `io_uring` for async SST I/O (`O_DIRECT` path), with non-Linux sync fallback for development.
-- **Operational safety**: persistent MVCC catalog, recovery path for clog/ilog, and drop-table GC with read-path SST skipping.
+- **MySQL wire protocol** — standard MySQL clients connect on port 4000 (`opensrv-mysql`)
+- **Non-blocking async commit** — protocol dispatches to worker runtime via oneshot; worker yields at clog fsync (no thread blocked waiting for disk); writer thread batches and flushes with `O_DIRECT|O_SYNC` — the entire commit path is async end-to-end, with worker threads never blocking on I/O
+- **4-runtime architecture** — physical thread isolation between protocol, worker, background, and I/O runtimes
+- **OceanBase-style group buffer WAL** — preallocated circular buffer with slot reservations, zero-copy serialization directly into ring, single writer thread via `spawn_blocking` with `O_DIRECT|O_SYNC` pwrite
+- **Snapshot isolation with pessimistic locking** — lock-on-write, `commit_ts` computed after locks acquired
+- **LSM storage** — bloom filters, block cache, `io_uring` (Linux), per-tablet engines
+- **Unified LSN** — clog + ilog share a single LSN provider for consistent recovery ordering
 
-## Current Capabilities
+## Architecture
 
-- **SQL support**: `CREATE TABLE`, `DROP TABLE`, `INSERT`, `SELECT`, `UPDATE`, `DELETE`, `USE`, `SHOW`, `BEGIN/COMMIT/ROLLBACK`
-- **Streaming execution**: volcano-style operator tree with worker-to-protocol batched row streaming
-- **Storage maintenance**: background flush, compaction, and dropped-SST cleanup
-- **Observability**: `SHOW STATUS` and periodic engine status reporting
+```mermaid
+flowchart TB
+    Client([MySQL Client])
+
+    subgraph Protocol["Protocol Runtime"]
+        Wire[MySQL Wire I/O]
+        Fast[Session Fast Path<br/><small>SET / USE / @@vars</small>]
+    end
+
+    subgraph Worker["Worker Runtime"]
+        Parse[Parse + Bind]
+        Exec[Execute + Txn Control]
+    end
+
+    subgraph SQL["SQL Layer"]
+        Parser[Parser] --> Binder[Binder] --> Executor[Volcano Executor]
+    end
+
+    subgraph Txn["Transaction Layer"]
+        TxnSvc[TxnService]
+        CM[ConcurrencyManager]
+        TSO[TSO]
+    end
+
+    subgraph Storage["Storage Layer"]
+        TM[TabletManager]
+        LSM[LsmEngine]
+        Mem[MemTable] --> Frozen[Frozen] --> L0[L0] --> L1[L1] --> L2[L2]
+    end
+
+    subgraph BG["Background Runtime"]
+        Flush[Flush]
+        Compact[Compaction]
+        GC[GC]
+    end
+
+    subgraph IO["I/O Runtime"]
+        GW[Group Buffer<br/>Writer]
+        Ring[io_uring]
+    end
+
+    Client --> Wire
+    Wire -->|mpsc row batches| Parse
+    Parse --> Exec
+    Exec --> Executor --> TxnSvc
+    TxnSvc --> CM
+    TxnSvc --> TSO
+    TxnSvc --> TM --> LSM
+    LSM --> Mem
+    LSM -.->|schedule| Flush
+    LSM -.->|schedule| Compact
+    LSM -.->|WAL| GW
+    GW -.->|pwrite O_DIRECT| Ring
+
+    style Protocol fill:#e8f4f8,stroke:#5ba3c7
+    style Worker fill:#e8f8e8,stroke:#5bc75b
+    style SQL fill:#f0f0e0,stroke:#b8b85b
+    style Txn fill:#f8e8f8,stroke:#c75bc7
+    style Storage fill:#f8f0e8,stroke:#c7a35b
+    style BG fill:#f0e8e8,stroke:#c75b5b
+    style IO fill:#e8e8f8,stroke:#5b5bc7
+```
+
+## Component Layers
+
+```mermaid
+block-beta
+    columns 3
+
+    block:sqlblock:3
+        columns 3
+        sql_h["SQL"]:3
+        P["Parser"] B["Binder"] E["Volcano Executor"]
+    end
+
+    block:txnblock:3
+        columns 3
+        txn_h["Transaction"]:3
+        TS["TxnService"] CCM["ConcurrencyManager"] TTSO["TSO"]
+    end
+
+    block:stblock:3
+        columns 3
+        st_h["Storage"]:3
+        TBM["TabletManager"] LSME["LsmEngine"] BF["Bloom + BlockCache"]
+    end
+
+    block:walblock:3
+        columns 3
+        wal_h["WAL"]:3
+        CL["Clog (group buffer)"] IL["Ilog (manifest)"] LSN["Unified LSN"]
+    end
+
+    sqlblock --> txnblock --> stblock --> walblock
+
+    style sql_h fill:#f0f0e0,stroke:#b8b85b
+    style txn_h fill:#f8e8f8,stroke:#c75bc7
+    style st_h fill:#f8f0e8,stroke:#c7a35b
+    style wal_h fill:#e8e8f8,stroke:#5b5bc7
+```
+
+| Layer | Components | Key Details |
+|-------|-----------|-------------|
+| **SQL** | Parser → Binder → Executor | Volcano-style operator tree, streaming row batches |
+| **Transaction** | TxnService + ConcurrencyManager + TSO | Snapshot isolation, pessimistic locking, `max_ts` tracking |
+| **Storage** | TabletManager → LsmEngine | MemTable → Frozen → L0 → L1 → L2, bloom filters, block cache |
+| **WAL** | Clog + Ilog + LsnProvider | Group buffer writer (`O_DIRECT\|O_SYNC`), manifest checkpoints |
 
 ## Quick Start
 
 ```bash
-# Start server
-cargo run
-
-# Connect from another terminal
-mysql -h127.0.0.1 -P4000 -uroot test
+cargo run                                    # start server
+mysql -h127.0.0.1 -P4000 -uroot test        # connect
 ```
 
 ```sql
--- Built-in schemas: default, test
-SHOW DATABASES;
-
-CREATE TABLE users (
-  id INT PRIMARY KEY,
-  name VARCHAR(100),
-  age INT
-);
-
+CREATE TABLE users (id INT PRIMARY KEY, name VARCHAR(100), age INT);
 INSERT INTO users VALUES (1, 'Alice', 25), (2, 'Bob', 30);
-
 BEGIN;
 UPDATE users SET age = age + 1 WHERE id = 1;
 COMMIT;
-
 SELECT id, name, age FROM users ORDER BY id;
-DROP TABLE users;
 ```
 
-## SQL Coverage (Current)
+## SQL Coverage
 
-- **DDL**: `CREATE TABLE [IF NOT EXISTS]`, `DROP TABLE [IF EXISTS]`
-- **DML**: `INSERT`, `UPDATE`, `DELETE`
-- **Query**: `SELECT` with expressions, `WHERE`, `ORDER BY`, `LIMIT/OFFSET`, aggregate functions (`COUNT/SUM/AVG/MIN/MAX`)
-- **Session/Txn**: `USE`, `BEGIN`, `START TRANSACTION`, `COMMIT`, `ROLLBACK`
-- **SHOW commands**: `SHOW DATABASES`, `SHOW TABLES`, `SHOW WARNINGS`, `SHOW STATUS`
+| Category | Statements |
+|----------|-----------|
+| **DDL** | `CREATE TABLE [IF NOT EXISTS]`, `DROP TABLE [IF EXISTS]` |
+| **DML** | `INSERT`, `UPDATE`, `DELETE` |
+| **Query** | `SELECT` with expressions, `WHERE`, `ORDER BY`, `LIMIT/OFFSET`, aggregates (`COUNT/SUM/AVG/MIN/MAX`) |
+| **Session** | `USE`, `BEGIN`, `START TRANSACTION`, `COMMIT`, `ROLLBACK` |
+| **SHOW** | `SHOW DATABASES`, `SHOW TABLES`, `SHOW WARNINGS`, `SHOW STATUS` |
 
-Notes:
-- Tables currently require a `PRIMARY KEY`.
-- `JOIN` and `GROUP BY` execution are not implemented yet.
-- Prepared statement protocol hooks exist, but execution is currently a stub.
+> **Notes:** Tables require a `PRIMARY KEY`. `JOIN` and `GROUP BY` are not yet implemented. Prepared statement hooks exist but execution is stubbed.
 
-## Server Options
+## Performance Snapshot
 
-```bash
-cargo run -- --help
+Benchmark: go-ycsb insert-only, `recordcount=100k`, `operationcount=300k`, 16 threads, COM_QUERY path.
 
-# -H, --host <HOST>            Host address to bind to (default: 127.0.0.1)
-# -P, --port <PORT>            Port to listen on (default: 4000)
-# -D, --data-dir <DATA_DIR>    Data directory for persistence (default: data)
-# -L, --log-level <LOG_LEVEL>  Log level: trace/debug/info/warn/error (default: info)
-# --clog-sync-mode <MODE>      Clog sync mode: full|data (default: full)
-# --group-commit-delay-us <US> Group commit delay window in microseconds (default: 0)
-# --group-commit-no-delay-count <N>
-#                              Skip delay once batch size reaches N (default: 16)
-# --protocol-threads <N>       Protocol runtime threads (optional override)
-# --worker-threads <N>         Worker runtime threads (optional override)
-# --bg-threads <N>             Background runtime threads (optional override)
-# --io-threads <N>             I/O runtime threads (optional override)
-# --flush-threads <N>          Per-tablet flush threads (optional override)
+| Configuration | TiSQL | MySQL 8.0 |
+|--------------|-------|-----------|
+| **Strict durability** (`fsync` + binlog + doublewrite) | **~20.7k OPS** | ~7.4k–7.8k OPS |
+| **InnoDB-only** (binlog disabled, doublewrite ON) | — | ~13.5k OPS |
+
+> TiSQL config: `--clog-sync-mode full` (group buffer WAL).
+> MySQL config: `innodb_flush_log_at_trx_commit=1`, `sync_binlog=1`, `log_bin=ON`, `innodb_doublewrite=ON`.
+
+<details>
+<summary><strong>Server Options</strong></summary>
+
+```
+-H, --host <HOST>            Host address (default: 127.0.0.1)
+-P, --port <PORT>            Port (default: 4000)
+-D, --data-dir <DATA_DIR>    Data directory (default: data)
+-L, --log-level <LEVEL>      trace/debug/info/warn/error (default: info)
+--clog-sync-mode <MODE>      full|data (default: full)
+--group-commit-delay-us <N>  Group commit delay in µs (default: 0)
+--group-commit-no-delay-count <N>
+                             Skip delay at batch size N (default: 16)
+--protocol-threads <N>       Protocol runtime threads
+--worker-threads <N>         Worker runtime threads
+--bg-threads <N>             Background runtime threads
+--io-threads <N>             I/O runtime threads
+--flush-threads <N>          Per-tablet flush threads
 ```
 
-## Performance Snapshot (COM_QUERY Write-Only)
+</details>
 
-Benchmark profile: go-ycsb insert-only, `recordcount=100000`, `operationcount=300000`, `threadcount=16`, COM_QUERY path.
-
-- **Strict durability profile**:
-  - TiSQL: `--clog-sync-mode full`
-  - MySQL 8.0: `innodb_flush_log_at_trx_commit=1`, `sync_binlog=1`, `log_bin=ON`, `innodb_doublewrite=ON`
-  - Observed range (tuned runs on this host): TiSQL `~12.3k-13.5k OPS`, MySQL `~7.4k-7.8k OPS`
-- **InnoDB-only MySQL profile** (binlog write/sync disabled):
-  - MySQL 8.0: `innodb_flush_log_at_trx_commit=1`, `skip-log-bin`, `sync_binlog=0`, `innodb_doublewrite=ON`
-  - Observed run: MySQL `~13.5k OPS`
-
-Takeaway: TiSQL shows comparable write throughput to MySQL 8.0 in this workload class, and remains competitive under strict-durability settings.
-
-## Build & Test
+## Development
 
 ```bash
-# Build
-cargo build
-cargo build --release
+cargo build                              # debug build
+cargo build --release                    # release build
+make prepare                             # fmt + clippy + tests (quality gate)
+```
 
-# Full local quality gate (fmt + clippy + tests)
-make prepare
+**Test strategy:** run targeted tests first, full suite as final gate.
 
-# Format + lint
-cargo fmt
-cargo clippy --all-targets -- -D warnings
-
-# Core tests
-cargo test --lib
+```bash
+# targeted tests
+cargo test storage::lsm::tests
 cargo test --test store_test
 cargo test --test mysql_protocol_test
 
-# E2E (mysql-test style)
+# e2e (mysql-test style)
 cargo run --bin mysqltest-runner -- --all
 
-# Failpoint tests
+# failpoint tests
 cargo test --test concurrency_test --features failpoints
 
-# Full local CI gate
-make ci
+# sysbench-like benchmark
+cargo run --release --bin sysbench-sim -- --threads 8 --time 60
 ```
 
-macOS dev note:
-- TiSQL supports macOS for development (with a non-Linux sync I/O fallback), but production target is Linux.
-- `make store-test` and `make prepare` automatically run store tests single-threaded on macOS to avoid file-descriptor/runtime churn issues.
-- If you run store tests directly on macOS, prefer:
+> **macOS:** development supported with sync I/O fallback. Store tests run single-threaded via `make` on macOS.
 
-```bash
-cargo test --test store_test -- --test-threads=1
+<details>
+<summary><strong>Project Structure</strong></summary>
+
 ```
-
-## Architecture
-
-```text
-MySQL Client
-    |
-    v
-Protocol Layer (main tokio runtime)
-  - MySQL wire I/O
-  - session fast path (SET / USE / @@vars)
-    |
-    | mpsc row batches (1024 rows, cap=4)
-    v
-Worker Runtime (tisql-worker)
-  - parse + bind + execute + txn control + SHOW
-    |
-    v
-SQL Layer (Parser -> Binder -> Executor)
-    |
-    v
-Transaction Layer (TxnService + ConcurrencyManager + TSO)
-    |
-    v
-Storage Layer (LsmEngine + Clog + Ilog + LsnProvider)
-
-Side runtimes/services:
-- Background runtime (tisql-bg): flush scheduler, compaction scheduler, drop-table GC worker
-- I/O runtime (tisql-io): group-commit blocking tasks used by clog/ilog
-- SST I/O service thread: Linux `io_uring`; non-Linux sync fallback (dev only)
-```
-
-## Project Structure
-
-```text
 src/
 ├── lib.rs           # Database entry point and wiring
 ├── main.rs          # CLI server binary
@@ -182,7 +229,7 @@ src/
 ├── transaction/     # TxnService, concurrency manager, txn state
 ├── tablet/          # LSM engine, memtable, SST, recovery
 ├── log/             # Durability logs
-│   ├── clog/        # WAL with group commit
+│   ├── clog/        # WAL with group buffer writer
 │   ├── ilog.rs      # Manifest/flush/compaction metadata log
 │   └── lsn.rs       # Shared LSN allocator for clog/ilog
 ├── protocol/        # MySQL wire protocol handler
@@ -196,12 +243,7 @@ src/
 │   └── ...          # Logging, fs utils, timing, arena, etc.
 ```
 
-## Extra Tools
-
-```bash
-# Sysbench-like memtable benchmark
-cargo run --release --bin sysbench-sim -- --threads 8 --time 60
-```
+</details>
 
 ## License
 
