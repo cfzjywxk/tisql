@@ -25,6 +25,7 @@ use crate::tablet::{encode_key, encode_pk};
 use crate::util::error::{Result, TiSqlError};
 
 use super::plan::{AggFunc, BinaryOp, Expr, JoinType, LogicalPlan, OrderByExpr, UnaryOp};
+use super::show_create::render_create_table;
 
 /// SQL Binder - resolves names, checks types, produces logical plan
 pub struct Binder<'a, C: Catalog> {
@@ -85,6 +86,9 @@ impl<'a, C: Catalog> Binder<'a, C> {
             SqlStatement::Use { db_name } => Ok(LogicalPlan::UseDatabase {
                 db_name: db_name.value.clone(),
             }),
+            SqlStatement::ShowCreate { obj_type, obj_name } => {
+                self.bind_show_create(obj_type, obj_name)
+            }
 
             // Transaction control statements
             // Note: MySQL's BEGIN is mapped to StartTransaction in sqlparser
@@ -851,6 +855,45 @@ impl<'a, C: Catalog> Binder<'a, C> {
         Ok(LogicalPlan::Values { rows, schema })
     }
 
+    fn bind_show_create(
+        &self,
+        obj_type: ast::ShowCreateObject,
+        obj_name: ast::ObjectName,
+    ) -> Result<LogicalPlan> {
+        if obj_type != ast::ShowCreateObject::Table {
+            return Err(TiSqlError::Bind(format!(
+                "SHOW CREATE {obj_type} not supported"
+            )));
+        }
+
+        let (schema_name, table_name) = match obj_name.0.len() {
+            1 => (self.current_schema.as_str(), obj_name.0[0].value.as_str()),
+            2 => (obj_name.0[0].value.as_str(), obj_name.0[1].value.as_str()),
+            _ => return Err(TiSqlError::Bind("Invalid table name".into())),
+        };
+
+        let table = match self.snapshot_ts {
+            Some(ts) => self.catalog.get_table_at(schema_name, table_name, ts)?,
+            None => self.catalog.get_table(schema_name, table_name)?,
+        }
+        .ok_or_else(|| TiSqlError::TableNotFound(format!("{schema_name}.{table_name}")))?;
+
+        let ddl = render_create_table(&table)?;
+        let values_schema = Schema::new(vec![
+            ColumnInfo::new("Table".to_string(), DataType::Varchar(255), false),
+            ColumnInfo::new("Create Table".to_string(), DataType::Text, false),
+        ]);
+        let rows = vec![vec![
+            Expr::Literal(Value::String(table.name().to_string())),
+            Expr::Literal(Value::String(ddl)),
+        ]];
+
+        Ok(LogicalPlan::Values {
+            rows,
+            schema: values_schema,
+        })
+    }
+
     fn bind_data_type(&self, dt: &ast::DataType) -> Result<DataType> {
         match dt {
             ast::DataType::Boolean => Ok(DataType::Boolean),
@@ -1152,13 +1195,17 @@ mod tests {
     use sqlparser::parser::Parser as SqlParser;
 
     use super::*;
-    use crate::catalog::MemoryCatalog;
+    use crate::catalog::{DefaultValue, IndexDef, MemoryCatalog};
     use crate::tablet::{encode_key, encode_pk};
 
     fn bind_sql(catalog: &MemoryCatalog, sql: &str) -> LogicalPlan {
+        bind_sql_result(catalog, sql).unwrap()
+    }
+
+    fn bind_sql_result(catalog: &MemoryCatalog, sql: &str) -> Result<LogicalPlan> {
         let mut stmts = SqlParser::parse_sql(&MySqlDialect {}, sql).unwrap();
         let stmt = stmts.remove(0);
-        Binder::new(catalog, "default").bind(stmt).unwrap()
+        Binder::new(catalog, "default").bind(stmt)
     }
 
     fn setup_table() -> MemoryCatalog {
@@ -1213,6 +1260,46 @@ mod tests {
             ],
             vec![1],
         );
+        crate::io::block_on_sync(catalog.create_table(table)).unwrap();
+        catalog
+    }
+
+    fn setup_table_for_show_create(schema: &str, table_name: &str) -> MemoryCatalog {
+        let catalog = MemoryCatalog::new();
+        if schema != "default" {
+            crate::io::block_on_sync(catalog.create_schema(schema)).unwrap();
+        }
+
+        let mut table = TableDef::new(
+            100,
+            table_name.to_string(),
+            schema.to_string(),
+            vec![
+                ColumnDef::new(1, "id".into(), DataType::Int, false, None, true),
+                ColumnDef::new(
+                    2,
+                    "name".into(),
+                    DataType::Varchar(64),
+                    true,
+                    Some(DefaultValue::String("o'reilly".into())),
+                    false,
+                ),
+                ColumnDef::new(
+                    3,
+                    "enabled".into(),
+                    DataType::Boolean,
+                    false,
+                    Some(DefaultValue::Bool(true)),
+                    false,
+                ),
+            ],
+            vec![1],
+        );
+        table.add_index(IndexDef::new(7, "idx_name".into(), vec![2], false));
+        table.add_index(IndexDef::new(8, "uniq_enabled".into(), vec![3], true));
+        for _ in 0..5 {
+            table.increment_auto_id();
+        }
         crate::io::block_on_sync(catalog.create_table(table)).unwrap();
         catalog
     }
@@ -1421,5 +1508,84 @@ mod tests {
             LogicalPlan::Insert { ignore, .. } => assert!(ignore),
             _ => panic!("expected Insert root"),
         }
+    }
+
+    #[test]
+    fn test_bind_show_create_table_returns_values_plan() {
+        let catalog = setup_table_for_show_create("default", "show_t");
+        let plan = bind_sql(&catalog, "SHOW CREATE TABLE show_t");
+        match plan {
+            LogicalPlan::Values { rows, schema } => {
+                assert_eq!(schema.column_count(), 2);
+                assert_eq!(schema.column(0).unwrap().name(), "Table");
+                assert_eq!(schema.column(1).unwrap().name(), "Create Table");
+                assert_eq!(rows.len(), 1);
+                assert_eq!(rows[0].len(), 2);
+                match &rows[0][0] {
+                    Expr::Literal(Value::String(v)) => assert_eq!(v, "show_t"),
+                    _ => panic!("expected table name literal"),
+                }
+                match &rows[0][1] {
+                    Expr::Literal(Value::String(v)) => {
+                        assert!(v.starts_with("CREATE TABLE `default`.`show_t` ("));
+                        assert!(v.contains("PRIMARY KEY (`id`)"));
+                        assert!(v.contains("KEY `idx_name` (`name`)"));
+                    }
+                    _ => panic!("expected create table literal"),
+                }
+            }
+            _ => panic!("expected Values root"),
+        }
+    }
+
+    #[test]
+    fn test_bind_show_create_table_schema_qualified_name() {
+        let catalog = setup_table_for_show_create("analytics", "events");
+        let plan = bind_sql(&catalog, "SHOW CREATE TABLE analytics.events");
+        match plan {
+            LogicalPlan::Values { rows, .. } => match &rows[0][1] {
+                Expr::Literal(Value::String(v)) => {
+                    assert!(v.starts_with("CREATE TABLE `analytics`.`events` ("));
+                }
+                _ => panic!("expected create table literal"),
+            },
+            _ => panic!("expected Values root"),
+        }
+    }
+
+    #[test]
+    fn test_bind_show_create_invalid_multipart_name_returns_error() {
+        let catalog = setup_table();
+        let err = bind_sql_result(&catalog, "SHOW CREATE TABLE a.b.c").unwrap_err();
+        assert!(matches!(err, TiSqlError::Bind(_)));
+        assert!(err.to_string().contains("Invalid table name"));
+    }
+
+    #[test]
+    fn test_bind_show_create_empty_object_name_returns_error() {
+        let catalog = setup_table();
+        let stmt = SqlStatement::ShowCreate {
+            obj_type: ast::ShowCreateObject::Table,
+            obj_name: ast::ObjectName(vec![]),
+        };
+        let err = Binder::new(&catalog, "default").bind(stmt).unwrap_err();
+        assert!(matches!(err, TiSqlError::Bind(_)));
+        assert!(err.to_string().contains("Invalid table name"));
+    }
+
+    #[test]
+    fn test_bind_show_create_not_found_returns_table_not_found() {
+        let catalog = setup_table();
+        let err = bind_sql_result(&catalog, "SHOW CREATE TABLE not_exist").unwrap_err();
+        assert!(matches!(err, TiSqlError::TableNotFound(_)));
+        assert!(err.to_string().contains("default.not_exist"));
+    }
+
+    #[test]
+    fn test_bind_show_create_unsupported_object_type_returns_error() {
+        let catalog = setup_table();
+        let err = bind_sql_result(&catalog, "SHOW CREATE VIEW v").unwrap_err();
+        assert!(matches!(err, TiSqlError::Bind(_)));
+        assert!(err.to_string().contains("SHOW CREATE VIEW not supported"));
     }
 }

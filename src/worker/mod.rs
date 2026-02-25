@@ -134,11 +134,12 @@ pub async fn dispatch_full_query(
     let (response_tx, response_rx) = oneshot::channel::<QueryResponse>();
 
     let task = async move {
-        // Check for SHOW commands (string-matched, not parsed)
+        // Check for legacy SHOW commands (string-matched, not parsed).
+        // SHOW CREATE falls through to parser/binder for robust name handling.
         let sql_trimmed = sql.trim();
         let sql_lower = sql_trimmed.to_lowercase();
-        if sql_lower.starts_with("show ") {
-            let response = handle_show(&db, &sql_lower, &exec_ctx);
+        if !is_show_create(&sql_lower) && sql_lower.starts_with("show ") {
+            let response = handle_show(&db, &sql_lower, &exec_ctx, txn_ctx);
             let _ = response_tx.send(response);
             return;
         }
@@ -220,6 +221,16 @@ pub async fn dispatch_full_query(
         error: TiSqlError::Internal("Worker task dropped".into()),
         txn_ctx: None,
     })
+}
+
+fn is_show_create(sql_lower: &str) -> bool {
+    if !sql_lower.starts_with("show") {
+        return false;
+    }
+    sql_lower
+        .strip_prefix("show")
+        .map(str::trim_start)
+        .is_some_and(|s| s.starts_with("create"))
 }
 
 /// Pull rows from the Execution handle and send batches through the channel.
@@ -869,7 +880,12 @@ fn lenenc_prefix_len(len: usize) -> usize {
 }
 
 /// Handle SHOW commands directly on the worker (catalog scan).
-fn handle_show(db: &Database, sql_lower: &str, exec_ctx: &ExecutionCtx) -> QueryResponse {
+fn handle_show(
+    db: &Database,
+    sql_lower: &str,
+    exec_ctx: &ExecutionCtx,
+    txn_ctx: Option<TxnCtx>,
+) -> QueryResponse {
     if sql_lower.contains("databases") {
         match db.list_schemas() {
             Ok(databases) => {
@@ -877,12 +893,9 @@ fn handle_show(db: &Database, sql_lower: &str, exec_ctx: &ExecutionCtx) -> Query
                     .into_iter()
                     .map(|name| Row::new(vec![crate::catalog::types::Value::String(name)]))
                     .collect();
-                make_show_response(vec!["Database".to_string()], rows)
+                make_show_response(vec!["Database".to_string()], rows, txn_ctx)
             }
-            Err(e) => QueryResponse::Error {
-                error: e,
-                txn_ctx: None,
-            },
+            Err(e) => QueryResponse::Error { error: e, txn_ctx },
         }
     } else if sql_lower.contains("tables") {
         let database = &exec_ctx.current_db;
@@ -893,12 +906,9 @@ fn handle_show(db: &Database, sql_lower: &str, exec_ctx: &ExecutionCtx) -> Query
                     .into_iter()
                     .map(|name| Row::new(vec![crate::catalog::types::Value::String(name)]))
                     .collect();
-                make_show_response(vec![col_name], rows)
+                make_show_response(vec![col_name], rows, txn_ctx)
             }
-            Err(e) => QueryResponse::Error {
-                error: e,
-                txn_ctx: None,
-            },
+            Err(e) => QueryResponse::Error { error: e, txn_ctx },
         }
     } else if sql_lower.contains("engine status") {
         let rows: Vec<Row> = db
@@ -921,6 +931,7 @@ fn handle_show(db: &Database, sql_lower: &str, exec_ctx: &ExecutionCtx) -> Query
                 "value".to_string(),
             ],
             rows,
+            txn_ctx,
         )
     } else if sql_lower.contains("warnings") {
         make_show_response(
@@ -930,22 +941,28 @@ fn handle_show(db: &Database, sql_lower: &str, exec_ctx: &ExecutionCtx) -> Query
                 "Message".to_string(),
             ],
             vec![],
+            txn_ctx,
         )
     } else if sql_lower.contains("status") {
         make_show_response(
             vec!["Variable_name".to_string(), "Value".to_string()],
             vec![],
+            txn_ctx,
         )
     } else {
         QueryResponse::Error {
             error: TiSqlError::Internal(format!("Unsupported SHOW command: {sql_lower}")),
-            txn_ctx: None,
+            txn_ctx,
         }
     }
 }
 
 /// Create a QueryResponse::Rows with all rows in a single batch.
-fn make_show_response(columns: Vec<String>, rows: Vec<Row>) -> QueryResponse {
+fn make_show_response(
+    columns: Vec<String>,
+    rows: Vec<Row>,
+    txn_ctx: Option<TxnCtx>,
+) -> QueryResponse {
     let (batch_tx, batch_rx) = mpsc::channel(1);
     if !rows.is_empty() {
         // Send all rows as one batch (SHOW results are always small)
@@ -956,7 +973,7 @@ fn make_show_response(columns: Vec<String>, rows: Vec<Row>) -> QueryResponse {
     QueryResponse::Rows {
         columns,
         batch_rx,
-        txn_ctx: None,
+        txn_ctx,
     }
 }
 
@@ -988,6 +1005,7 @@ fn make_typed_batch(rows: Vec<Row>) -> Result<ResultBatch, TiSqlError> {
 mod tests {
     use super::*;
     use crate::catalog::types::Value;
+    use crate::transaction::TxnCtx;
 
     #[test]
     fn test_channel_capacity_from_budget_defaults() {
@@ -1072,5 +1090,30 @@ mod tests {
         }
         let mode = decide_stream_mode(&sample, 2, false);
         assert_eq!(mode, StreamMode::Typed);
+    }
+
+    #[test]
+    fn test_is_show_create_detection() {
+        assert!(is_show_create("show create table t"));
+        assert!(is_show_create("show    create table t"));
+        assert!(!is_show_create("show tables"));
+        assert!(!is_show_create("select 1"));
+    }
+
+    #[test]
+    fn test_make_show_response_preserves_txn_context() {
+        let txn = TxnCtx::new_for_test(42, 100, false, true);
+        let response = make_show_response(vec!["c".into()], vec![], Some(txn));
+        match response {
+            QueryResponse::Rows {
+                txn_ctx: Some(returned),
+                ..
+            } => {
+                assert_eq!(returned.txn_id(), 42);
+                assert_eq!(returned.start_ts(), 100);
+                assert!(returned.is_explicit());
+            }
+            _ => panic!("expected rows response with txn context"),
+        }
     }
 }

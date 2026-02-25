@@ -1473,3 +1473,73 @@ async fn test_multiple_keys_lock_release() {
     assert_eq!(rows[1], vec!["2", "locked2"]);
     assert_eq!(rows[2], vec!["3", "free3"]);
 }
+
+// ============================================================================
+// SHOW Tests
+// ============================================================================
+
+#[tokio::test]
+async fn test_show_create_table_returns_expected_row() {
+    let ctx = TestContext::new().await;
+    let mut conn = ctx.conn().await;
+
+    exec(
+        &mut conn,
+        "CREATE TABLE show_create_t (id INT PRIMARY KEY, name VARCHAR(32) NOT NULL)",
+    )
+    .await;
+
+    let rows = query_all(&mut conn, "SHOW CREATE TABLE show_create_t").await;
+    assert_eq!(rows.len(), 1);
+    assert_eq!(rows[0].len(), 2);
+    assert_eq!(rows[0][0], "show_create_t");
+    let ddl = &rows[0][1];
+    assert!(ddl.starts_with("CREATE TABLE `default`.`show_create_t` ("));
+    assert!(ddl.contains("`id` INT NOT NULL"));
+    assert!(ddl.contains("PRIMARY KEY (`id`)"));
+}
+
+#[tokio::test]
+async fn test_show_create_table_preserves_explicit_transaction_context() {
+    let ctx = TestContext::new().await;
+    let mut conn = ctx.conn().await;
+
+    exec(
+        &mut conn,
+        "CREATE TABLE show_create_txn (id INT PRIMARY KEY, val VARCHAR(32))",
+    )
+    .await;
+
+    exec(&mut conn, "BEGIN").await;
+    let rows = query_all(&mut conn, "SHOW CREATE TABLE show_create_txn").await;
+    assert_eq!(rows.len(), 1);
+    exec(&mut conn, "INSERT INTO show_create_txn VALUES (1, 'ok')").await;
+    exec(&mut conn, "COMMIT").await;
+
+    let val = query_one(&mut conn, "SELECT val FROM show_create_txn WHERE id = 1").await;
+    assert_eq!(val, "ok");
+}
+
+#[tokio::test]
+async fn test_legacy_show_databases_and_tables_still_work() {
+    let ctx = TestContext::new().await;
+    let mut conn = ctx.conn().await;
+
+    exec(&mut conn, "CREATE TABLE show_legacy_t (id INT PRIMARY KEY)").await;
+
+    let db_rows = query_all(&mut conn, "SHOW DATABASES").await;
+    assert!(
+        db_rows
+            .iter()
+            .any(|row| row.first() == Some(&"default".to_string())),
+        "SHOW DATABASES should include default schema"
+    );
+
+    let table_rows = query_all(&mut conn, "SHOW TABLES").await;
+    assert!(
+        table_rows
+            .iter()
+            .any(|row| row.first() == Some(&"show_legacy_t".to_string())),
+        "SHOW TABLES should include created table"
+    );
+}

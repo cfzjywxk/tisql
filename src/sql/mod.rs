@@ -15,6 +15,7 @@
 mod binder;
 mod parser;
 mod plan;
+mod show_create;
 
 // Crate-internal types - not exposed publicly
 // Parser, Binder, and LogicalPlan are encapsulated within Database
