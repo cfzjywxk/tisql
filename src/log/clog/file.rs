@@ -27,6 +27,8 @@ use std::sync::Arc;
 
 #[cfg(feature = "failpoints")]
 use fail::fail_point;
+use serde::ser::SerializeSeq;
+use serde::{Serialize, Serializer};
 
 use crate::catalog::types::{Lsn, Timestamp, TxnId};
 use crate::lsn::{AtomicLsnProvider, LsnProvider, SharedLsnProvider};
@@ -544,9 +546,55 @@ impl FileClogService {
         Self::validate_and_frame(&data)
     }
 
-    /// Serialize reference-based entries to bytes (header + data) without writing.
-    fn serialize_record_refs(entries: &[ClogEntryRef<'_>]) -> Result<Vec<u8>> {
-        let data = bincode::serialize(entries).map_err(|e| {
+    /// Serialize ops as clog entries and append commit record without building
+    /// an intermediate `Vec<ClogEntryRef>`.
+    fn serialize_ops_with_commit(
+        txn_id: TxnId,
+        txn_lsn: Lsn,
+        ops: &[ClogOpRef<'_>],
+        commit_ts: Timestamp,
+    ) -> Result<Vec<u8>> {
+        struct OpsWithCommit<'op, 'slice> {
+            txn_id: TxnId,
+            txn_lsn: Lsn,
+            commit_ts: Timestamp,
+            ops: &'slice [ClogOpRef<'op>],
+        }
+
+        impl<'op, 'slice> Serialize for OpsWithCommit<'op, 'slice> {
+            fn serialize<S>(&self, serializer: S) -> std::result::Result<S::Ok, S::Error>
+            where
+                S: Serializer,
+            {
+                let mut seq = serializer.serialize_seq(Some(self.ops.len() + 1))?;
+                for op in self.ops {
+                    let entry = ClogEntryRef {
+                        lsn: self.txn_lsn,
+                        txn_id: self.txn_id,
+                        op: *op,
+                    };
+                    seq.serialize_element(&entry)?;
+                }
+
+                let commit_entry = ClogEntryRef {
+                    lsn: self.txn_lsn,
+                    txn_id: self.txn_id,
+                    op: ClogOpRef::Commit {
+                        commit_ts: self.commit_ts,
+                    },
+                };
+                seq.serialize_element(&commit_entry)?;
+                seq.end()
+            }
+        }
+
+        let data = bincode::serialize(&OpsWithCommit {
+            txn_id,
+            txn_lsn,
+            commit_ts,
+            ops,
+        })
+        .map_err(|e| {
             TiSqlError::Internal(format!("Failed to serialize commit log entries: {e}"))
         })?;
 
@@ -650,25 +698,8 @@ impl FileClogService {
         }
 
         let entry_count = ops.len() + 1; // +1 for commit record
-        let mut entries: Vec<super::ClogEntryRef<'_>> = Vec::with_capacity(entry_count);
-
-        for op in ops {
-            entries.push(super::ClogEntryRef {
-                lsn: txn_lsn,
-                txn_id,
-                op: *op,
-            });
-        }
-
-        // Add commit record
         let end_lsn = txn_lsn;
-        entries.push(super::ClogEntryRef {
-            lsn: end_lsn,
-            txn_id,
-            op: ClogOpRef::Commit { commit_ts },
-        });
-
-        let record_bytes = Self::serialize_record_refs(&entries)?;
+        let record_bytes = Self::serialize_ops_with_commit(txn_id, txn_lsn, ops, commit_ts)?;
 
         Ok(PreparedBatch {
             record_bytes,
@@ -1089,6 +1120,52 @@ mod tests {
 
     fn make_test_io() -> Arc<crate::io::IoService> {
         crate::io::IoService::new_for_test(32).unwrap()
+    }
+
+    #[test]
+    fn test_serialize_ops_with_commit_matches_owned_entries() {
+        let txn_id = 7;
+        let txn_lsn = 11;
+        let commit_ts = 123;
+        let key_put = b"key-put".as_slice();
+        let val_put = b"value-put".as_slice();
+        let key_del = b"key-del".as_slice();
+        let ops = [
+            ClogOpRef::Put {
+                key: key_put,
+                value: val_put,
+            },
+            ClogOpRef::Delete { key: key_del },
+        ];
+
+        let serialized_refs =
+            FileClogService::serialize_ops_with_commit(txn_id, txn_lsn, &ops, commit_ts).unwrap();
+
+        let entries = vec![
+            ClogEntry {
+                lsn: txn_lsn,
+                txn_id,
+                op: ClogOp::Put {
+                    key: key_put.to_vec(),
+                    value: val_put.to_vec(),
+                },
+            },
+            ClogEntry {
+                lsn: txn_lsn,
+                txn_id,
+                op: ClogOp::Delete {
+                    key: key_del.to_vec(),
+                },
+            },
+            ClogEntry {
+                lsn: txn_lsn,
+                txn_id,
+                op: ClogOp::Commit { commit_ts },
+            },
+        ];
+        let serialized_owned = FileClogService::serialize_record(&entries).unwrap();
+
+        assert_eq!(serialized_refs, serialized_owned);
     }
 
     /// Locate the byte offset of the nth logical record (0-based), skipping
