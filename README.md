@@ -8,7 +8,7 @@ A MySQL-compatible SQL database in Rust focused on correctness-first transaction
 ## Design Highlights
 
 - **MySQL wire protocol** — standard MySQL clients connect on port 4000 (`opensrv-mysql`)
-- **Non-blocking async commit** — protocol dispatches to worker runtime via oneshot; worker yields at clog fsync (no thread blocked waiting for disk); writer thread batches and flushes with `O_DIRECT|O_SYNC` — the entire commit path is async end-to-end, with worker threads never blocking on I/O
+- **Non-blocking async commit** — protocol dispatches to worker runtime via oneshot; worker yields at clog write (no thread blocked waiting for disk); dedicated writer thread batches and flushes with `O_DIRECT|O_SYNC` pwrite — the entire commit path is async end-to-end, with worker threads never blocking on I/O
 - **4-runtime architecture** — physical thread isolation between protocol, worker, background, and I/O runtimes
 - **OceanBase-style group buffer WAL** — preallocated circular buffer with slot reservations, zero-copy serialization directly into ring, single writer thread via `spawn_blocking` with `O_DIRECT|O_SYNC` pwrite
 - **Snapshot isolation with pessimistic locking** — lock-on-write, `commit_ts` computed after locks acquired
@@ -17,113 +17,59 @@ A MySQL-compatible SQL database in Rust focused on correctness-first transaction
 
 ## Architecture
 
-```mermaid
-flowchart TB
-    Client([MySQL Client])
-
-    subgraph Protocol["Protocol Runtime"]
-        Wire[MySQL Wire I/O]
-        Fast[Session Fast Path<br/><small>SET / USE / @@vars</small>]
-    end
-
-    subgraph Worker["Worker Runtime"]
-        Parse[Parse + Bind]
-        Exec[Execute + Txn Control]
-    end
-
-    subgraph SQL["SQL Layer"]
-        Parser[Parser] --> Binder[Binder] --> Executor[Volcano Executor]
-    end
-
-    subgraph Txn["Transaction Layer"]
-        TxnSvc[TxnService]
-        CM[ConcurrencyManager]
-        TSO[TSO]
-    end
-
-    subgraph Storage["Storage Layer"]
-        TM[TabletManager]
-        LSM[LsmEngine]
-        Mem[MemTable] --> Frozen[Frozen] --> L0[L0] --> L1[L1] --> L2[L2]
-    end
-
-    subgraph BG["Background Runtime"]
-        Flush[Flush]
-        Compact[Compaction]
-        GC[GC]
-    end
-
-    subgraph IO["I/O Runtime"]
-        GW[Group Buffer<br/>Writer]
-        Ring[io_uring]
-    end
-
-    Client --> Wire
-    Wire -->|mpsc row batches| Parse
-    Parse --> Exec
-    Exec --> Executor --> TxnSvc
-    TxnSvc --> CM
-    TxnSvc --> TSO
-    TxnSvc --> TM --> LSM
-    LSM --> Mem
-    LSM -.->|schedule| Flush
-    LSM -.->|schedule| Compact
-    LSM -.->|WAL| GW
-    GW -.->|pwrite O_DIRECT| Ring
-
-    style Protocol fill:#e8f4f8,stroke:#5ba3c7
-    style Worker fill:#e8f8e8,stroke:#5bc75b
-    style SQL fill:#f0f0e0,stroke:#b8b85b
-    style Txn fill:#f8e8f8,stroke:#c75bc7
-    style Storage fill:#f8f0e8,stroke:#c7a35b
-    style BG fill:#f0e8e8,stroke:#c75b5b
-    style IO fill:#e8e8f8,stroke:#5b5bc7
+```
+                          ┌─────────────────┐
+                          │  MySQL Client    │
+                          └────────┬────────┘
+                                   │
+              ┌────────────────────▼─────────────────────┐
+              │  Protocol Runtime (main)                  │
+              │  MySQL wire I/O · session fast path       │
+              │  (SET / USE / @@vars)                     │
+              └────────────────────┬─────────────────────┘
+                                   │ mpsc row batches
+              ┌────────────────────▼─────────────────────┐
+              │  Worker Runtime (tisql-worker)            │
+              │  parse + bind + execute + txn control     │
+              └──────┬──────────────┬──────────┬─────────┘
+                     │              │          │
+        ┌────────────▼───┐  ┌──────▼───┐  ┌───▼──────────┐
+        │  SQL Layer     │  │  Txn     │  │  Storage     │
+        │  Parser        │  │  TxnSvc  │  │  TabletMgr   │
+        │  Binder        │  │  ConcMgr │  │  LsmEngine   │
+        │  Executor      │  │  TSO     │  │  MemTable    │
+        │  (volcano)     │  │          │  │  → Frozen    │
+        └────────────────┘  └──────────┘  │  → L0→L1→L2 │
+                                          └───┬──────┬───┘
+                                              │      │
+                ┌─────────────────────────────┘      │
+                │                                     │
+   ┌────────────▼────────────┐   ┌────────────────────▼──┐
+   │  Background Runtime     │   │  I/O Runtime           │
+   │  (tisql-bg)             │   │  (tisql-io)            │
+   │  flush · compaction     │   │  group buffer writer   │
+   │  drop-table GC          │   │  (O_DIRECT|O_SYNC)    │
+   │  log GC                 │   │  io_uring (SST I/O)   │
+   └─────────────────────────┘   └────────────────────────┘
 ```
 
 ## Component Layers
 
-```mermaid
-block-beta
-    columns 3
-
-    block:sqlblock:3
-        columns 3
-        sql_h["SQL"]:3
-        P["Parser"] B["Binder"] E["Volcano Executor"]
-    end
-
-    block:txnblock:3
-        columns 3
-        txn_h["Transaction"]:3
-        TS["TxnService"] CCM["ConcurrencyManager"] TTSO["TSO"]
-    end
-
-    block:stblock:3
-        columns 3
-        st_h["Storage"]:3
-        TBM["TabletManager"] LSME["LsmEngine"] BF["Bloom + BlockCache"]
-    end
-
-    block:walblock:3
-        columns 3
-        wal_h["WAL"]:3
-        CL["Clog (group buffer)"] IL["Ilog (manifest)"] LSN["Unified LSN"]
-    end
-
-    sqlblock --> txnblock --> stblock --> walblock
-
-    style sql_h fill:#f0f0e0,stroke:#b8b85b
-    style txn_h fill:#f8e8f8,stroke:#c75bc7
-    style st_h fill:#f8f0e8,stroke:#c7a35b
-    style wal_h fill:#e8e8f8,stroke:#5b5bc7
 ```
-
-| Layer | Components | Key Details |
-|-------|-----------|-------------|
-| **SQL** | Parser → Binder → Executor | Volcano-style operator tree, streaming row batches |
-| **Transaction** | TxnService + ConcurrencyManager + TSO | Snapshot isolation, pessimistic locking, `max_ts` tracking |
-| **Storage** | TabletManager → LsmEngine | MemTable → Frozen → L0 → L1 → L2, bloom filters, block cache |
-| **WAL** | Clog + Ilog + LsnProvider | Group buffer writer (`O_DIRECT\|O_SYNC`), manifest checkpoints |
+  ┌──────────────────────────────────────────────────────┐
+  │  SQL          Parser ─▶ Binder ─▶ Volcano Executor   │
+  ├──────────────────────────────────────────────────────┤
+  │  Transaction  TxnService · ConcurrencyManager · TSO  │
+  ├──────────────────────────────────────────────────────┤
+  │  Storage      TabletManager ─▶ LsmEngine             │
+  │               MemTable → Frozen → L0 → L1 → L2      │
+  │               bloom filters · block cache             │
+  ├──────────────────────────────────────────────────────┤
+  │  WAL          Clog (group buffer, O_DIRECT|O_SYNC)   │
+  │               Ilog (manifest checkpoints)             │
+  │               Unified LSN provider                    │
+  └──────────────────────────────────────────────────────┘
+```
 
 ## Quick Start
 
@@ -155,14 +101,14 @@ SELECT id, name, age FROM users ORDER BY id;
 
 ## Performance Snapshot
 
-Benchmark: go-ycsb insert-only, `recordcount=100k`, `operationcount=300k`, 16 threads, COM_QUERY path.
+Benchmark: [go-ycsb](https://github.com/pingcap/go-ycsb) insert-only, `recordcount=100k`, `operationcount=300k`, 16 threads, COM_QUERY path.
 
 | Configuration | TiSQL | MySQL 8.0 |
 |--------------|-------|-----------|
-| **Strict durability** (`fsync` + binlog + doublewrite) | **~20.7k OPS** | ~7.4k–7.8k OPS |
+| **Strict durability** | **~20.7k OPS** | ~7.4k–7.8k OPS |
 | **InnoDB-only** (binlog disabled, doublewrite ON) | — | ~13.5k OPS |
 
-> TiSQL config: `--clog-sync-mode full` (group buffer WAL).
+> TiSQL config: `--clog-sync-mode full` — group buffer WAL with `O_DIRECT|O_SYNC` pwrite (no fsync).
 > MySQL config: `innodb_flush_log_at_trx_commit=1`, `sync_binlog=1`, `log_bin=ON`, `innodb_doublewrite=ON`.
 
 <details>
