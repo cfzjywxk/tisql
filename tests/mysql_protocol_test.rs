@@ -213,7 +213,7 @@ async fn test_commit_persists_changes() {
     // Commit
     exec(&mut conn, "COMMIT").await;
 
-    // Verify all data persisted (don't use COUNT due to aggregate limitation)
+    // Verify all data persisted
     let rows = query_all(&mut conn, "SELECT id, val FROM commit_test ORDER BY id").await;
     assert_eq!(rows.len(), 3);
     assert_eq!(rows[0], vec!["1", "100"]);
@@ -339,7 +339,7 @@ async fn test_multiple_statements_in_transaction() {
     // Commit all at once
     exec(&mut conn, "COMMIT").await;
 
-    // Verify all rows persisted by checking actual rows (not using COUNT due to aggregate limitation)
+    // Verify all rows persisted by checking actual rows
     let rows = query_all(&mut conn, "SELECT id, val FROM multi_test ORDER BY id").await;
     assert_eq!(rows.len(), 10, "Should have 10 rows");
     assert_eq!(rows[0], vec!["1", "10"]);

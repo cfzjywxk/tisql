@@ -194,7 +194,7 @@ impl<'a, C: Catalog> Binder<'a, C> {
                 .collect::<Result<Vec<_>>>()?,
         };
 
-        let (proj_exprs, _has_agg) = self.bind_select_items(&select.projection, &table_refs)?;
+        let (proj_exprs, has_agg) = self.bind_select_items(&select.projection, &table_refs)?;
 
         let having_predicate = select
             .having
@@ -221,27 +221,46 @@ impl<'a, C: Catalog> Binder<'a, C> {
             };
         }
 
-        // GROUP BY
-        if !group_by_exprs.is_empty() {
+        if has_agg {
+            if !group_by_exprs.is_empty() {
+                return Err(TiSqlError::Bind(
+                    "GROUP BY with aggregate expressions is not implemented yet".into(),
+                ));
+            }
+            if having_predicate.is_some() {
+                return Err(TiSqlError::Bind(
+                    "HAVING with aggregate expressions is not implemented yet".into(),
+                ));
+            }
+            let agg_exprs = self.extract_simple_aggregate_exprs(&proj_exprs)?;
             plan = LogicalPlan::Aggregate {
                 input: Box::new(plan),
-                group_by: group_by_exprs,
-                agg_exprs: vec![],
+                group_by: vec![],
+                agg_exprs,
             };
-        }
+        } else {
+            // GROUP BY
+            if !group_by_exprs.is_empty() {
+                plan = LogicalPlan::Aggregate {
+                    input: Box::new(plan),
+                    group_by: group_by_exprs,
+                    agg_exprs: vec![],
+                };
+            }
 
-        // SELECT list (projection)
-        plan = LogicalPlan::Project {
-            input: Box::new(plan),
-            exprs: proj_exprs,
-        };
-
-        // HAVING (applied after aggregation)
-        if let Some(predicate) = having_predicate {
-            plan = LogicalPlan::Filter {
+            // SELECT list (projection)
+            plan = LogicalPlan::Project {
                 input: Box::new(plan),
-                predicate,
+                exprs: proj_exprs,
             };
+
+            // HAVING (applied after aggregation)
+            if let Some(predicate) = having_predicate {
+                plan = LogicalPlan::Filter {
+                    input: Box::new(plan),
+                    predicate,
+                };
+            }
         }
 
         Ok(plan)
@@ -1164,8 +1183,40 @@ impl<'a, C: Catalog> Binder<'a, C> {
             }
             Expr::UnaryOp { expr, .. } => self.contains_aggregate(expr),
             Expr::Function { args, .. } => args.iter().any(|a| self.contains_aggregate(a)),
+            Expr::IsNull { expr, .. } => self.contains_aggregate(expr),
+            Expr::Cast { expr, .. } => self.contains_aggregate(expr),
             _ => false,
         }
+    }
+
+    fn extract_simple_aggregate_exprs(
+        &self,
+        proj_exprs: &[(Expr, String)],
+    ) -> Result<Vec<(AggFunc, Expr, String)>> {
+        let mut agg_exprs = Vec::with_capacity(proj_exprs.len());
+        for (expr, alias) in proj_exprs {
+            match expr {
+                Expr::Aggregate {
+                    func,
+                    arg,
+                    distinct: false,
+                } => {
+                    agg_exprs.push((*func, (**arg).clone(), alias.clone()));
+                }
+                Expr::Aggregate { distinct: true, .. } => {
+                    return Err(TiSqlError::Bind(
+                        "DISTINCT aggregates are not supported yet".into(),
+                    ));
+                }
+                _ => {
+                    return Err(TiSqlError::Bind(
+                        "Mixing aggregate and non-aggregate expressions without GROUP BY is not supported"
+                            .into(),
+                    ));
+                }
+            }
+        }
+        Ok(agg_exprs)
     }
 
     fn expr_alias(&self, expr: &SqlExpr) -> String {
@@ -1468,6 +1519,63 @@ mod tests {
             }
             _ => panic!("expected Project plan root"),
         }
+    }
+
+    #[test]
+    fn test_bind_select_single_aggregate_uses_aggregate_plan() {
+        let catalog = setup_table();
+        let plan = bind_sql(&catalog, "SELECT COUNT(id) FROM t");
+        match plan {
+            LogicalPlan::Aggregate {
+                group_by,
+                agg_exprs,
+                ..
+            } => {
+                assert!(group_by.is_empty());
+                assert_eq!(agg_exprs.len(), 1);
+                assert!(matches!(agg_exprs[0].0, AggFunc::Count));
+            }
+            _ => panic!("expected Aggregate plan root"),
+        }
+    }
+
+    #[test]
+    fn test_bind_select_multiple_aggregates_uses_aggregate_plan() {
+        let catalog = setup_table();
+        let plan = bind_sql(&catalog, "SELECT COUNT(id), SUM(id) FROM t");
+        match plan {
+            LogicalPlan::Aggregate {
+                group_by,
+                agg_exprs,
+                ..
+            } => {
+                assert!(group_by.is_empty());
+                assert_eq!(agg_exprs.len(), 2);
+                assert!(matches!(agg_exprs[0].0, AggFunc::Count));
+                assert!(matches!(agg_exprs[1].0, AggFunc::Sum));
+            }
+            _ => panic!("expected Aggregate plan root"),
+        }
+    }
+
+    #[test]
+    fn test_bind_select_mixed_aggregate_and_scalar_without_group_by_errors() {
+        let catalog = setup_table();
+        let err = bind_sql_result(&catalog, "SELECT COUNT(id), name FROM t").unwrap_err();
+        assert!(matches!(err, TiSqlError::Bind(_)));
+        assert!(err
+            .to_string()
+            .contains("Mixing aggregate and non-aggregate"));
+    }
+
+    #[test]
+    fn test_bind_select_distinct_aggregate_errors() {
+        let catalog = setup_table();
+        let err = bind_sql_result(&catalog, "SELECT COUNT(DISTINCT id) FROM t").unwrap_err();
+        assert!(matches!(err, TiSqlError::Bind(_)));
+        assert!(err
+            .to_string()
+            .contains("DISTINCT aggregates are not supported"));
     }
 
     #[test]

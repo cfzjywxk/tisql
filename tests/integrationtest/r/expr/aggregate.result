@@ -3,49 +3,23 @@ INSERT INTO t_agg VALUES (1, 10, 'A'), (2, 20, 'A'), (3, 30, 'B'), (4, 40, 'B'),
 AFFECTED 5
 SELECT COUNT(id) FROM t_agg
 COUNT
-1
-2
-3
-4
 5
 SELECT SUM(val) FROM t_agg
 SUM
-10
-20
-30
-40
-50
+150
 SELECT AVG(val) FROM t_agg
 AVG
-10
-20
 30
-40
-50
 SELECT MIN(val) FROM t_agg
 MIN
 10
-20
-30
-40
-50
 SELECT MAX(val) FROM t_agg
 MAX
-10
-20
-30
-40
 50
 SELECT COUNT(id), SUM(val), AVG(val), MIN(val), MAX(val) FROM t_agg
 COUNT	SUM	AVG	MIN	MAX
-1	10	10	10	10
-2	20	20	20	20
-3	30	30	30	30
-4	40	40	40	40
-5	50	50	50	50
+5	150	30	10	50
 SELECT COUNT(id), SUM(val) FROM t_agg WHERE category = 'B'
 COUNT	SUM
-3	30
-4	40
-5	50
+3	120
 DROP TABLE t_agg
