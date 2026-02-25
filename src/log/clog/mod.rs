@@ -192,6 +192,9 @@ impl ClogBatch {
 /// the future.
 pub trait ClogService: Send + Sync {
     /// Append batch atomically, returns future that yields the last LSN.
+    ///
+    /// `sync` is a compatibility flag: implementations with always-durable
+    /// write semantics (for example `O_SYNC` writer paths) may ignore it.
     fn write(&self, batch: &mut ClogBatch, sync: bool) -> Result<ClogFsyncFuture>;
 
     /// Write pre-built clog ops directly.
@@ -204,6 +207,7 @@ pub trait ClogService: Send + Sync {
     /// - `lsn = Some(reserved_lsn)`: use caller-provided pre-allocated LSN
     ///   (V2.6 reservation path).
     /// - `lsn = None`: allocate transaction LSN inside clog (compat/test path).
+    /// - `sync`: compatibility flag; may be ignored by always-durable writers.
     fn write_ops(
         &self,
         txn_id: TxnId,

@@ -207,7 +207,6 @@ impl ClogGroupBuffer {
             });
         }
 
-        let (wait_tx, wait_rx) = oneshot::channel();
         let mut alloc = self.alloc_mu.lock();
 
         if self.shutdown.load(Ordering::Acquire) {
@@ -253,6 +252,9 @@ impl ClogGroupBuffer {
             return Err(GroupBufferError::StreamFailed);
         }
 
+        // Allocate completion waiter only after capacity checks and slot claim
+        // succeed, so backpressure retries do not allocate/drop oneshot pairs.
+        let (wait_tx, wait_rx) = oneshot::channel();
         slot.buf_offset.store(data_offset as u64, Ordering::Release);
         slot.buf_size.store(size as u32, Ordering::Release);
         slot.skip_bytes.store(skip as u32, Ordering::Release);
