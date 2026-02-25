@@ -51,6 +51,9 @@ struct AllocState {
 pub(crate) struct FlushSlot {
     pub slot_idx: u64,
     pub buf_offset: usize,
+    /// Bytes reserved in the ring for this slot (cursor/reclaim accounting).
+    pub reserved_size: usize,
+    /// Bytes to copy/write for this slot.
     pub buf_size: usize,
     pub skip_bytes: usize,
 }
@@ -64,6 +67,7 @@ pub(crate) struct FlushBatchMeta {
 struct ClogSlot {
     state: AtomicU8,
     buf_offset: AtomicU64,
+    reserved_size: AtomicU32,
     buf_size: AtomicU32,
     skip_bytes: AtomicU32,
     waiter: Mutex<Option<oneshot::Sender<std::result::Result<(), String>>>>,
@@ -74,6 +78,7 @@ impl ClogSlot {
         Self {
             state: AtomicU8::new(SLOT_FREE),
             buf_offset: AtomicU64::new(0),
+            reserved_size: AtomicU32::new(0),
             buf_size: AtomicU32::new(0),
             skip_bytes: AtomicU32::new(0),
             waiter: Mutex::new(None),
@@ -256,6 +261,7 @@ impl ClogGroupBuffer {
         // succeed, so backpressure retries do not allocate/drop oneshot pairs.
         let (wait_tx, wait_rx) = oneshot::channel();
         slot.buf_offset.store(data_offset as u64, Ordering::Release);
+        slot.reserved_size.store(size as u32, Ordering::Release);
         slot.buf_size.store(size as u32, Ordering::Release);
         slot.skip_bytes.store(skip as u32, Ordering::Release);
         *slot.waiter.lock() = Some(wait_tx);
@@ -323,7 +329,7 @@ impl ClogGroupBuffer {
             }
 
             let skip = slot.skip_bytes.load(Ordering::Acquire) as u64;
-            let size = slot.buf_size.load(Ordering::Acquire) as u64;
+            let size = slot.reserved_size.load(Ordering::Acquire) as u64;
 
             if let Some(waiter) = slot.waiter.lock().take() {
                 let _ = waiter.send(Err(err.to_string()));
@@ -358,6 +364,7 @@ impl ClogGroupBuffer {
             }
 
             let buf_offset = slot.buf_offset.load(Ordering::Acquire) as usize;
+            let reserved_size = slot.reserved_size.load(Ordering::Acquire) as usize;
             let buf_size = slot.buf_size.load(Ordering::Acquire) as usize;
             let skip_bytes = slot.skip_bytes.load(Ordering::Acquire) as usize;
 
@@ -365,7 +372,7 @@ impl ClogGroupBuffer {
                 break;
             }
             if let Some(expected) = expect_next_offset {
-                if buf_size > 0 && buf_offset != expected {
+                if reserved_size > 0 && buf_offset != expected {
                     break;
                 }
             }
@@ -374,13 +381,16 @@ impl ClogGroupBuffer {
             out.push(FlushSlot {
                 slot_idx,
                 buf_offset,
+                reserved_size,
                 buf_size,
                 skip_bytes,
             });
 
+            if reserved_size > 0 {
+                expect_next_offset = Some(buf_offset + reserved_size);
+            }
             if buf_size > 0 {
                 data_size += buf_size;
-                expect_next_offset = Some(buf_offset + buf_size);
             }
 
             slot_idx += 1;
@@ -431,7 +441,7 @@ impl ClogGroupBuffer {
             }
 
             slot.state.store(SLOT_FREE, Ordering::Release);
-            reclaimed_bytes += (slot_desc.skip_bytes + slot_desc.buf_size) as u64;
+            reclaimed_bytes += (slot_desc.skip_bytes + slot_desc.reserved_size) as u64;
         }
 
         self.flush_slot_idx
@@ -453,6 +463,7 @@ impl ClogGroupBuffer {
             }
             slot.state.store(SLOT_FREE, Ordering::Release);
             slot.buf_offset.store(0, Ordering::Release);
+            slot.reserved_size.store(0, Ordering::Release);
             slot.buf_size.store(0, Ordering::Release);
             slot.skip_bytes.store(0, Ordering::Release);
         }
@@ -483,6 +494,7 @@ impl ClogGroupBuffer {
             *slot.waiter.lock() = None;
             slot.state.store(SLOT_FREE, Ordering::Release);
             slot.buf_offset.store(0, Ordering::Release);
+            slot.reserved_size.store(0, Ordering::Release);
             slot.buf_size.store(0, Ordering::Release);
             slot.skip_bytes.store(0, Ordering::Release);
         }
@@ -538,9 +550,23 @@ impl Reservation {
         }
     }
 
-    pub(crate) fn commit(mut self) -> oneshot::Receiver<std::result::Result<(), String>> {
+    pub(crate) fn commit_with_size(
+        mut self,
+        size: usize,
+    ) -> oneshot::Receiver<std::result::Result<(), String>> {
+        if size > self.buf_size || size > u32::MAX as usize {
+            let msg = format!(
+                "clog reservation commit size invalid (slot={}, size={}, reserved={})",
+                self.slot_idx, size, self.buf_size
+            );
+            self.owner.fail_all_pending(&msg);
+            self.committed = true;
+            return self.waiter_rx.take().expect("reservation waiter missing");
+        }
+
         self.committed = true;
         let slot = self.owner.slot(self.slot_idx);
+        slot.buf_size.store(size as u32, Ordering::Release);
         if slot
             .state
             .compare_exchange(
@@ -560,6 +586,11 @@ impl Reservation {
             self.owner.bump_data_epoch(false);
         }
         self.waiter_rx.take().expect("reservation waiter missing")
+    }
+
+    pub(crate) fn commit(self) -> oneshot::Receiver<std::result::Result<(), String>> {
+        let size = self.buf_size;
+        self.commit_with_size(size)
     }
 }
 
@@ -612,6 +643,28 @@ mod tests {
     }
 
     #[test]
+    fn test_drain_cancelled_head_reclaims_reserved_capacity() {
+        let gb = ClogGroupBuffer::new(64, 4);
+        let r1 = gb.alloc(32).unwrap();
+        let r2 = gb.alloc(32).unwrap();
+
+        drop(r1);
+
+        // Simulate a future path where cancelled slot payload bytes diverge
+        // from reserved bytes; reclaim must still use reserved_size.
+        let slot0 = gb.slot(0);
+        slot0.buf_size.store(8, Ordering::Release);
+
+        assert!(gb.drain_cancelled_head("cancel"));
+
+        let r3 = gb
+            .alloc(32)
+            .expect("reclaim must use reserved_size for cancelled head");
+        drop(r3);
+        drop(r2);
+    }
+
+    #[test]
     fn test_record_too_large() {
         let gb = ClogGroupBuffer::new(1024, 8);
         let err = match gb.alloc(2048) {
@@ -625,5 +678,38 @@ mod tests {
                 max: 1024
             }
         ));
+    }
+
+    #[test]
+    fn test_commit_with_size_reclaims_reserved_capacity() {
+        let gb = ClogGroupBuffer::new(64, 4);
+        let mut r = gb.alloc(32).unwrap();
+        r.as_mut_slice()[0..8].copy_from_slice(b"abcdefgh");
+        let _rx = r.commit_with_size(8);
+
+        let mut batch = Vec::new();
+        let meta = gb.collect_filled_batch(&mut batch).expect("filled batch");
+        assert_eq!(meta.data_size, 8);
+        assert_eq!(batch.len(), 1);
+        assert_eq!(batch[0].reserved_size, 32);
+        assert_eq!(batch[0].buf_size, 8);
+
+        gb.complete_batch(&batch, Ok(()));
+
+        // Drive write_cursor away from 0 and then request a wrapped allocation.
+        // If reclaim used buf_size instead of reserved_size in the first flush,
+        // the leaked bytes make this wrapped allocation fail with BufferFull.
+        let r_mid = gb.alloc(24).expect("middle reservation");
+        let _rx_mid = r_mid.commit();
+        let mut batch_mid = Vec::new();
+        let _meta_mid = gb
+            .collect_filled_batch(&mut batch_mid)
+            .expect("mid filled batch");
+        gb.complete_batch(&batch_mid, Ok(()));
+
+        let r2 = gb
+            .alloc(40)
+            .expect("wrapped reservation should fit after full reclaim");
+        drop(r2);
     }
 }

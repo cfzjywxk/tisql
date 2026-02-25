@@ -79,6 +79,40 @@ fn writer_start_offset(file_len: u64) -> u64 {
     }
 }
 
+struct OpsWithCommit<'op, 'slice> {
+    txn_id: TxnId,
+    txn_lsn: Lsn,
+    commit_ts: Timestamp,
+    ops: &'slice [ClogOpRef<'op>],
+}
+
+impl<'op, 'slice> Serialize for OpsWithCommit<'op, 'slice> {
+    fn serialize<S>(&self, serializer: S) -> std::result::Result<S::Ok, S::Error>
+    where
+        S: Serializer,
+    {
+        let mut seq = serializer.serialize_seq(Some(self.ops.len() + 1))?;
+        for op in self.ops {
+            let entry = ClogEntryRef {
+                lsn: self.txn_lsn,
+                txn_id: self.txn_id,
+                op: *op,
+            };
+            seq.serialize_element(&entry)?;
+        }
+
+        let commit_entry = ClogEntryRef {
+            lsn: self.txn_lsn,
+            txn_id: self.txn_id,
+            op: ClogOpRef::Commit {
+                commit_ts: self.commit_ts,
+            },
+        };
+        seq.serialize_element(&commit_entry)?;
+        seq.end()
+    }
+}
+
 /// Configuration for file-based commit log service
 #[derive(Clone, Debug)]
 pub struct FileClogConfig {
@@ -546,59 +580,84 @@ impl FileClogService {
         Self::validate_and_frame(&data)
     }
 
-    /// Serialize ops as clog entries and append commit record without building
-    /// an intermediate `Vec<ClogEntryRef>`.
-    fn serialize_ops_with_commit(
+    /// Compute serialized payload size for ops + trailing Commit record.
+    fn serialized_ops_payload_size(
         txn_id: TxnId,
         txn_lsn: Lsn,
         ops: &[ClogOpRef<'_>],
         commit_ts: Timestamp,
-    ) -> Result<Vec<u8>> {
-        struct OpsWithCommit<'op, 'slice> {
-            txn_id: TxnId,
-            txn_lsn: Lsn,
-            commit_ts: Timestamp,
-            ops: &'slice [ClogOpRef<'op>],
-        }
-
-        impl<'op, 'slice> Serialize for OpsWithCommit<'op, 'slice> {
-            fn serialize<S>(&self, serializer: S) -> std::result::Result<S::Ok, S::Error>
-            where
-                S: Serializer,
-            {
-                let mut seq = serializer.serialize_seq(Some(self.ops.len() + 1))?;
-                for op in self.ops {
-                    let entry = ClogEntryRef {
-                        lsn: self.txn_lsn,
-                        txn_id: self.txn_id,
-                        op: *op,
-                    };
-                    seq.serialize_element(&entry)?;
-                }
-
-                let commit_entry = ClogEntryRef {
-                    lsn: self.txn_lsn,
-                    txn_id: self.txn_id,
-                    op: ClogOpRef::Commit {
-                        commit_ts: self.commit_ts,
-                    },
-                };
-                seq.serialize_element(&commit_entry)?;
-                seq.end()
-            }
-        }
-
-        let data = bincode::serialize(&OpsWithCommit {
+    ) -> Result<usize> {
+        let payload_size_u64 = bincode::serialized_size(&OpsWithCommit {
             txn_id,
             txn_lsn,
             commit_ts,
             ops,
         })
         .map_err(|e| {
-            TiSqlError::Internal(format!("Failed to serialize commit log entries: {e}"))
+            TiSqlError::Internal(format!("Failed to compute commit log serialized size: {e}"))
         })?;
+        if payload_size_u64 > usize::MAX as u64 {
+            return Err(TiSqlError::Internal(format!(
+                "Record size {payload_size_u64} exceeds usize::MAX"
+            )));
+        }
+        let payload_size = payload_size_u64 as usize;
+        if payload_size > u32::MAX as usize {
+            return Err(TiSqlError::Internal(format!(
+                "Record size {} exceeds maximum {} (u32::MAX)",
+                payload_size,
+                u32::MAX
+            )));
+        }
+        if payload_size > MAX_RECORD_SIZE {
+            return Err(TiSqlError::Internal(format!(
+                "Record size {payload_size} exceeds maximum {MAX_RECORD_SIZE}"
+            )));
+        }
+        Ok(payload_size)
+    }
 
-        Self::validate_and_frame(&data)
+    /// Serialize ops as clog entries into a pre-sized framed record buffer:
+    /// [12-byte header][bincode payload].
+    fn serialize_ops_with_commit_into(
+        record_buf: &mut [u8],
+        txn_id: TxnId,
+        txn_lsn: Lsn,
+        ops: &[ClogOpRef<'_>],
+        commit_ts: Timestamp,
+    ) -> Result<usize> {
+        if record_buf.len() < RECORD_HEADER_SIZE {
+            return Err(TiSqlError::Internal(format!(
+                "record buffer too small: {} < {}",
+                record_buf.len(),
+                RECORD_HEADER_SIZE
+            )));
+        }
+
+        let payload_written = {
+            let payload_capacity = record_buf.len() - RECORD_HEADER_SIZE;
+            let mut payload = &mut record_buf[RECORD_HEADER_SIZE..];
+            bincode::serialize_into(
+                &mut payload,
+                &OpsWithCommit {
+                    txn_id,
+                    txn_lsn,
+                    commit_ts,
+                    ops,
+                },
+            )
+            .map_err(|e| {
+                TiSqlError::Internal(format!("Failed to serialize commit log entries: {e}"))
+            })?;
+            payload_capacity - payload.len()
+        };
+        let payload_end = RECORD_HEADER_SIZE + payload_written;
+        let checksum = crc32(&record_buf[RECORD_HEADER_SIZE..payload_end]);
+        let record_type: u32 = 1;
+        record_buf[0..4].copy_from_slice(&record_type.to_le_bytes());
+        record_buf[4..8].copy_from_slice(&(payload_written as u32).to_le_bytes());
+        record_buf[8..12].copy_from_slice(&checksum.to_le_bytes());
+        Ok(payload_end)
     }
 
     /// Validate record size and frame with header (type + length + checksum).
@@ -671,9 +730,9 @@ impl FileClogService {
     }
 }
 
-/// Result of preparing clog ops for writing: serialized bytes + end LSN.
+/// Result of preparing clog ops for writing.
 struct PreparedBatch {
-    record_bytes: Vec<u8>,
+    reserved_record_len: usize,
     end_lsn: Lsn,
     entry_count: usize,
 }
@@ -699,10 +758,13 @@ impl FileClogService {
 
         let entry_count = ops.len() + 1; // +1 for commit record
         let end_lsn = txn_lsn;
-        let record_bytes = Self::serialize_ops_with_commit(txn_id, txn_lsn, ops, commit_ts)?;
+        let payload_size = Self::serialized_ops_payload_size(txn_id, txn_lsn, ops, commit_ts)?;
+        let reserved_record_len = RECORD_HEADER_SIZE
+            .checked_add(payload_size)
+            .ok_or_else(|| TiSqlError::Internal("record size overflow".to_string()))?;
 
         Ok(PreparedBatch {
-            record_bytes,
+            reserved_record_len,
             end_lsn,
             entry_count,
         })
@@ -738,24 +800,29 @@ impl FileClogService {
         Ok(reservation.commit())
     }
 
-    async fn submit_record_async(
+    async fn submit_ops_async(
         &self,
-        record_bytes: &[u8],
+        reserved_record_len: usize,
+        txn_id: TxnId,
+        txn_lsn: Lsn,
+        ops: &[ClogOpRef<'_>],
+        commit_ts: Timestamp,
     ) -> Result<tokio::sync::oneshot::Receiver<std::result::Result<(), String>>> {
         use super::group_buffer::GroupBufferError;
 
-        let record_len = record_bytes.len();
-        // Fast path: avoid creating a watch receiver unless we actually hit
-        // backpressure. Most writes reserve immediately in steady state.
         let mut space_rx: Option<tokio::sync::watch::Receiver<u64>> = None;
 
         loop {
-            match self.group_buffer.alloc(record_len) {
+            match self.group_buffer.alloc(reserved_record_len) {
                 Ok(mut reservation) => {
-                    if !record_bytes.is_empty() {
-                        reservation.as_mut_slice().copy_from_slice(record_bytes);
-                    }
-                    return Ok(reservation.commit());
+                    let actual_len = Self::serialize_ops_with_commit_into(
+                        reservation.as_mut_slice(),
+                        txn_id,
+                        txn_lsn,
+                        ops,
+                        commit_ts,
+                    )?;
+                    return Ok(reservation.commit_with_size(actual_len));
                 }
                 Err(GroupBufferError::StreamFailed) => {
                     return Err(TiSqlError::Internal(
@@ -772,12 +839,16 @@ impl FileClogService {
                         .get_or_insert_with(|| self.group_buffer.space_watch_tx.subscribe());
                     let seen = *rx.borrow_and_update();
 
-                    match self.group_buffer.alloc(record_len) {
+                    match self.group_buffer.alloc(reserved_record_len) {
                         Ok(mut reservation) => {
-                            if !record_bytes.is_empty() {
-                                reservation.as_mut_slice().copy_from_slice(record_bytes);
-                            }
-                            return Ok(reservation.commit());
+                            let actual_len = Self::serialize_ops_with_commit_into(
+                                reservation.as_mut_slice(),
+                                txn_id,
+                                txn_lsn,
+                                ops,
+                                commit_ts,
+                            )?;
+                            return Ok(reservation.commit_with_size(actual_len));
                         }
                         Err(GroupBufferError::StreamFailed) => {
                             return Err(TiSqlError::Internal(
@@ -879,7 +950,15 @@ impl ClogService for FileClogService {
         fail_point!("clog_before_sync");
 
         let _ = sync; // O_DIRECT|O_SYNC writer is always durable per completed write.
-        let rx = self.submit_record_async(&prepared.record_bytes).await?;
+        let rx = self
+            .submit_ops_async(
+                prepared.reserved_record_len,
+                txn_id,
+                txn_lsn,
+                ops,
+                commit_ts,
+            )
+            .await?;
 
         #[cfg(feature = "failpoints")]
         fail_point!("clog_after_sync");
@@ -1138,8 +1217,17 @@ mod tests {
             ClogOpRef::Delete { key: key_del },
         ];
 
-        let serialized_refs =
-            FileClogService::serialize_ops_with_commit(txn_id, txn_lsn, &ops, commit_ts).unwrap();
+        let payload_size =
+            FileClogService::serialized_ops_payload_size(txn_id, txn_lsn, &ops, commit_ts).unwrap();
+        let mut serialized_refs = vec![0u8; RECORD_HEADER_SIZE + payload_size];
+        FileClogService::serialize_ops_with_commit_into(
+            &mut serialized_refs,
+            txn_id,
+            txn_lsn,
+            &ops,
+            commit_ts,
+        )
+        .unwrap();
 
         let entries = vec![
             ClogEntry {
@@ -1166,6 +1254,125 @@ mod tests {
         let serialized_owned = FileClogService::serialize_record(&entries).unwrap();
 
         assert_eq!(serialized_refs, serialized_owned);
+    }
+
+    #[test]
+    fn test_serialized_ops_payload_size_matches_bincode_size() {
+        let key_short = b"k".to_vec();
+        let key_mid = vec![b'a'; 127];
+        let key_long = vec![b'b'; 128];
+        let val_short = b"v".to_vec();
+        let val_long = vec![b'c'; 129];
+
+        let cases = vec![
+            (1_u64, 1_u64, 1_u64),
+            (7_u64, 11_u64, 123_u64),
+            (u64::from(u32::MAX) + 17, u64::from(u32::MAX) + 23, 1 << 20),
+        ];
+
+        for (txn_id, txn_lsn, commit_ts) in cases {
+            let ops = [
+                ClogOpRef::Put {
+                    key: key_short.as_slice(),
+                    value: val_short.as_slice(),
+                },
+                ClogOpRef::Delete {
+                    key: key_mid.as_slice(),
+                },
+                ClogOpRef::Put {
+                    key: key_long.as_slice(),
+                    value: val_long.as_slice(),
+                },
+            ];
+
+            let expected = bincode::serialized_size(&OpsWithCommit {
+                txn_id,
+                txn_lsn,
+                commit_ts,
+                ops: &ops,
+            })
+            .unwrap() as usize;
+            let got =
+                FileClogService::serialized_ops_payload_size(txn_id, txn_lsn, &ops, commit_ts)
+                    .unwrap();
+
+            assert_eq!(
+                got, expected,
+                "payload size mismatch for txn_id={txn_id}, txn_lsn={txn_lsn}, commit_ts={commit_ts}"
+            );
+
+            let mut framed = vec![0_u8; RECORD_HEADER_SIZE + got];
+            FileClogService::serialize_ops_with_commit_into(
+                &mut framed,
+                txn_id,
+                txn_lsn,
+                &ops,
+                commit_ts,
+            )
+            .unwrap();
+            assert_eq!(
+                u32::from_le_bytes(framed[4..8].try_into().unwrap()) as usize,
+                got
+            );
+        }
+    }
+
+    #[test]
+    fn test_serialized_ops_record_len_matches_serialize_into_bytes() {
+        let id_cases = [
+            (1_u64, 1_u64, 1_u64),
+            (127_u64, 127_u64, 127_u64),
+            (128_u64, 128_u64, 128_u64),
+            (u64::from(u32::MAX) + 17, u64::from(u32::MAX) + 33, 1 << 20),
+        ];
+        let len_cases = [
+            (1_usize, 1_usize),
+            (127_usize, 127_usize),
+            (128_usize, 128_usize),
+            (16384_usize, 16384_usize),
+        ];
+
+        for (txn_id, txn_lsn, commit_ts) in id_cases {
+            for (klen, vlen) in len_cases {
+                let key_put_1 = vec![b'k'; klen];
+                let key_del = vec![b'd'; klen];
+                let key_put_2 = vec![b'p'; klen + 1];
+                let val_put_1 = vec![b'v'; vlen];
+                let val_put_2 = vec![b'w'; vlen + 1];
+                let ops = [
+                    ClogOpRef::Put {
+                        key: key_put_1.as_slice(),
+                        value: val_put_1.as_slice(),
+                    },
+                    ClogOpRef::Delete {
+                        key: key_del.as_slice(),
+                    },
+                    ClogOpRef::Put {
+                        key: key_put_2.as_slice(),
+                        value: val_put_2.as_slice(),
+                    },
+                ];
+
+                let payload_size =
+                    FileClogService::serialized_ops_payload_size(txn_id, txn_lsn, &ops, commit_ts)
+                        .unwrap();
+                let exact_record_len = RECORD_HEADER_SIZE + payload_size;
+                let mut framed = vec![0_u8; exact_record_len];
+                let written = FileClogService::serialize_ops_with_commit_into(
+                    &mut framed,
+                    txn_id,
+                    txn_lsn,
+                    &ops,
+                    commit_ts,
+                )
+                .unwrap();
+                assert_eq!(written, exact_record_len);
+                assert_eq!(
+                    u32::from_le_bytes(framed[4..8].try_into().unwrap()) as usize,
+                    payload_size
+                );
+            }
+        }
     }
 
     /// Locate the byte offset of the nth logical record (0-based), skipping
