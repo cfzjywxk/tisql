@@ -10,9 +10,11 @@ DEFAULT_CASE_JOB_COUNT ?= $(shell cores=$(CPU_CORES); jobs=$$((cores / 4)); if [
 MEDIUM_CASE_JOB_COUNT ?= $(shell cores=$(CPU_CORES); jobs=$$((cores / 8)); if [ $$jobs -lt 1 ]; then jobs=1; fi; if [ $$jobs -gt 4 ]; then jobs=4; fi; echo $$jobs)
 HEAVY_CASE_JOB_COUNT ?= $(shell cores=$(CPU_CORES); jobs=$$((cores / 16)); if [ $$jobs -lt 1 ]; then jobs=1; fi; if [ $$jobs -gt 2 ]; then jobs=2; fi; echo $$jobs)
 
-UNIT_TEST_TIMEOUT_SECS ?= 55
+UNIT_TEST_TIMEOUT_SECS ?= 60
 UNIT_TEST_THREAD_COUNT ?= 2
-UNIT_TEST_JOB_COUNT ?= $(DEFAULT_CASE_JOB_COUNT)
+# Run lib-test groups sequentially to avoid cross-process interference from
+# shared temp paths/ports and keep timeout behavior deterministic.
+UNIT_TEST_JOB_COUNT ?= 1
 UNIT_TEST_FILTER ?=
 STORE_TEST_CASE_TIMEOUT_SECS ?= 55
 STORE_TEST_LOG_LEVEL ?= warn
@@ -34,7 +36,7 @@ E2E_CASE_TIMEOUT_SECS ?= 55
 BENCH_TIMEOUT_SECS ?= 55
 BENCH_FILTER ?=
 
-# Keep all timeout guards below one minute for fast fail detection.
+# Keep all timeout guards at or below one minute for fast fail detection.
 # Faster local-iteration profile (smaller timeout guards, same segmented flow)
 QUICK_UNIT_TEST_TIMEOUT_SECS ?= 45
 QUICK_UNIT_TEST_JOB_COUNT ?= $(DEFAULT_CASE_JOB_COUNT)

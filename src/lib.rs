@@ -539,11 +539,9 @@ mod database_config_tests {
                 io: Some(1),
             },
         );
-        let db = Database::open(config);
-        assert!(
-            db.is_ok(),
-            "auto flush_threads should be capped to fit background override"
-        );
+        let db = Database::open(config)
+            .expect("auto flush_threads should be capped to fit background override");
+        crate::io::block_on_sync(db.close()).expect("database close should succeed");
     }
 
     #[test]
@@ -623,7 +621,8 @@ pub struct Database {
     worker_runtime: Option<tokio::runtime::Runtime>,
     /// Background runtime for flush, compaction, GC workers.
     bg_runtime: Option<tokio::runtime::Runtime>,
-    /// I/O runtime for group commit (clog + ilog) and io_uring.
+    /// I/O runtime for group-commit writer tasks (clog + ilog).
+    /// IoService io_uring backends run on dedicated OS threads.
     io_runtime: Option<tokio::runtime::Runtime>,
     /// Registry of active explicit transactions for GC safe point computation.
     session_registry: Arc<session::SessionRegistry>,
@@ -861,7 +860,7 @@ impl Database {
             let recovered = LsmRecovery::recover_tablet_with_template(
                 &tablet_manager.tablet_dir(tablet_id),
                 Arc::clone(&recovery.lsn_provider),
-                Arc::clone(&recovery.io_service),
+                Arc::clone(&recovery.storage_io_service),
                 io_runtime.handle(),
                 &lsm_config,
             )?;
@@ -919,7 +918,7 @@ impl Database {
                 let recovered = LsmRecovery::recover_tablet_with_template(
                     &tablet_manager.tablet_dir(tablet_id),
                     Arc::clone(&recovery.lsn_provider),
-                    Arc::clone(&recovery.io_service),
+                    Arc::clone(&recovery.storage_io_service),
                     io_runtime.handle(),
                     &lsm_config,
                 )?;
@@ -1469,6 +1468,7 @@ impl Database {
 
         // Close commit log
         self.txn_service.clog_service().close().await?;
+        self.txn_service.clog_service().shutdown();
 
         // Close mounted user-tablet ilogs first, then the shared system ilog.
         self.tablet_manager.close_non_system_tablet_ilogs()?;
@@ -1494,18 +1494,16 @@ impl Drop for Database {
         // 3. Drain/stop manifest writer before ilog close.
         self.tablet_manager.shutdown_manifest_writers();
 
-        // 4. Close clog + ilog (sync pending writes)
-        let _ = crate::io::block_on_sync(self.txn_service.clog_service().close());
-        let _ = self.tablet_manager.close_non_system_tablet_ilogs();
-        let _ = self.ilog.close();
-
-        // 5. Shutdown all spawn_blocking task channels BEFORE dropping io_runtime.
-        //
-        // GroupCommitWriter (clog + ilog) and IoService each run a spawn_blocking
-        // task on io_runtime that blocks on rx.recv(). Closing the sender channels
-        // causes recv() to return Err, exiting the loops. Without this,
-        // io_runtime.drop() blocks forever waiting for those tasks.
+        // 4. Best-effort asynchronous shutdown for WAL/manifest writers.
+        // Drop must not block indefinitely on durability paths; callers that
+        // need a graceful durable shutdown should call `Database::close()`.
         self.txn_service.clog_service().shutdown();
+
+        // 5. Shutdown storage-side writer channels BEFORE dropping io_runtime.
+        //
+        // GroupCommitWriter (ilog) runs on io_runtime and blocks on rx.recv().
+        // Closing sender channels causes recv() to return Err and exit. Without
+        // this, io_runtime.drop() can block waiting for those tasks.
         self.tablet_manager.shutdown_non_system_tablet_ilogs();
         self.ilog.shutdown();
         self.storage.io_service().shutdown();

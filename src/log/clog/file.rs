@@ -32,6 +32,7 @@ use crate::catalog::types::{Lsn, Timestamp, TxnId};
 use crate::lsn::{AtomicLsnProvider, LsnProvider, SharedLsnProvider};
 use crate::util::error::{Result, TiSqlError};
 use crate::util::fs::{rename_durable, sync_dir};
+use crate::util::io::DMA_ALIGNMENT;
 use crate::{log_info, log_trace, log_warn};
 
 use super::{
@@ -53,6 +54,28 @@ const RECORD_HEADER_SIZE: usize = 12;
 
 /// Maximum record size (256 MB) to prevent OOM from corrupted length fields
 const MAX_RECORD_SIZE: usize = 256 * 1024 * 1024;
+
+/// Default in-memory clog group buffer capacity (8 MiB).
+const DEFAULT_GROUP_BUFFER_SIZE: usize = 8 * 1024 * 1024;
+/// Default maximum concurrent reservation slots.
+const DEFAULT_GROUP_BUFFER_SLOTS: usize = 8192;
+
+#[inline]
+fn align_up_u64(value: u64, alignment: u64) -> u64 {
+    (value + alignment - 1) & !(alignment - 1)
+}
+
+#[inline]
+fn writer_start_offset(file_len: u64) -> u64 {
+    let alignment = DMA_ALIGNMENT as u64;
+    if file_len % alignment == 0 {
+        file_len
+    } else {
+        // Ensure the zero-padding region is at least one full record header,
+        // so recovery never reads a mixed (padding + next-header) header.
+        align_up_u64(file_len + RECORD_HEADER_SIZE as u64, alignment)
+    }
+}
 
 /// Configuration for file-based commit log service
 #[derive(Clone, Debug)]
@@ -142,15 +165,10 @@ pub struct FileClogService {
     config: FileClogConfig,
     /// LSN provider (shared or local)
     lsn_provider: LsnProviderKind,
-    /// Group commit writer for batched durability sync barriers.
-    ///
-    /// Concurrency is handled internally by the writer's 3-state machine
-    /// (Active/Draining/Failed with Condvar). No outer Mutex needed.
-    group_writer: super::group_commit::GroupCommitWriter,
-    /// IoService for io_uring-backed writes.
-    io_service: Arc<crate::io::IoService>,
-    /// Runtime handle for spawning new GroupCommitWriter tasks (e.g. on clog rotation).
-    io_handle: tokio::runtime::Handle,
+    /// Producer-side circular reservation buffer.
+    group_buffer: Arc<super::group_buffer::ClogGroupBuffer>,
+    /// Dedicated O_DIRECT|O_SYNC clog writer.
+    writer: super::writer::ClogWriter,
 }
 
 impl FileClogService {
@@ -180,7 +198,7 @@ impl FileClogService {
     fn open_internal(
         config: FileClogConfig,
         shared_provider: Option<SharedLsnProvider>,
-        io: Arc<crate::io::IoService>,
+        _io: Arc<crate::io::IoService>,
         io_handle: &tokio::runtime::Handle,
     ) -> Result<Self> {
         // Ensure directory exists
@@ -243,10 +261,15 @@ impl FileClogService {
             }
         }
 
-        // Close the std File, reopen as DmaFile for io_uring-backed writes
+        let current_len = file_for_write.metadata()?.len();
+        let writer_start = writer_start_offset(current_len);
+        if writer_start > current_len {
+            // Reserve explicit zero padding so O_DIRECT writer always starts at
+            // an aligned offset and recovery sees deterministic zero regions.
+            file_for_write.set_len(writer_start)?;
+            file_for_write.sync_data()?;
+        }
         drop(file_for_write);
-        let dma_file = crate::io::DmaFile::open_append_buffered(&clog_path)
-            .map_err(|e| TiSqlError::Internal(format!("Failed to open clog as DmaFile: {e}")))?;
 
         // Create LSN provider
         let lsn_provider = match shared_provider {
@@ -270,21 +293,25 @@ impl FileClogService {
             lsn_provider.current_lsn()
         );
 
-        let group_writer = super::group_commit::GroupCommitWriter::new_with_config_with_trace(
-            dma_file,
-            Arc::clone(&io),
-            io_handle,
-            crate::io::IoTraceTag::new(0, crate::io::IoSource::Clog),
-            config.sync_mode,
-            config.group_commit,
+        let group_buffer = super::group_buffer::ClogGroupBuffer::new(
+            DEFAULT_GROUP_BUFFER_SIZE,
+            DEFAULT_GROUP_BUFFER_SLOTS,
         );
+        let writer = super::writer::ClogWriter::new(
+            clog_path.clone(),
+            Arc::clone(&group_buffer),
+            io_handle,
+            writer_start,
+            DEFAULT_GROUP_BUFFER_SIZE,
+            super::writer::default_fatal_action(),
+        )
+        .map_err(|e| TiSqlError::Internal(format!("Failed to start clog writer: {e}")))?;
 
         Ok(Self {
             config,
             lsn_provider,
-            group_writer,
-            io_service: io,
-            io_handle: io_handle.clone(),
+            group_buffer,
+            writer,
         })
     }
 
@@ -407,11 +434,13 @@ impl FileClogService {
     fn read_entries_with_valid_length<R: Read>(reader: &mut R) -> Result<(Vec<ClogEntry>, u64)> {
         let mut entries = Vec::new();
         let mut valid_bytes = 0u64;
+        let mut file_offset = FILE_HEADER_SIZE as u64;
 
         loop {
-            match Self::read_record_with_size(reader) {
+            match Self::read_record_with_size(reader, file_offset as usize) {
                 Ok(Some((batch_entries, record_size))) => {
                     valid_bytes += record_size as u64;
+                    file_offset += record_size as u64;
                     entries.extend(batch_entries);
                 }
                 Ok(None) => {
@@ -430,7 +459,10 @@ impl FileClogService {
     }
 
     /// Read a single record from the commit log, returning entries and record size in bytes.
-    fn read_record_with_size<R: Read>(reader: &mut R) -> Result<Option<(Vec<ClogEntry>, usize)>> {
+    fn read_record_with_size<R: Read>(
+        reader: &mut R,
+        record_start_offset: usize,
+    ) -> Result<Option<(Vec<ClogEntry>, usize)>> {
         // Read record header
         let mut header = [0u8; RECORD_HEADER_SIZE];
         match reader.read_exact(&mut header) {
@@ -445,6 +477,15 @@ impl FileClogService {
         let record_type = u32::from_le_bytes(header[0..4].try_into().unwrap());
         let length = u32::from_le_bytes(header[4..8].try_into().unwrap()) as usize;
         let checksum = u32::from_le_bytes(header[8..12].try_into().unwrap());
+
+        // O_DIRECT padding region: zero header means skip to next aligned block.
+        if record_type == 0 && length == 0 {
+            let next =
+                align_up_u64((record_start_offset as u64) + 1, DMA_ALIGNMENT as u64) as usize;
+            let skip_after_header = next.saturating_sub(record_start_offset + RECORD_HEADER_SIZE);
+            Self::discard_bytes(reader, skip_after_header)?;
+            return Ok(Some((Vec::new(), RECORD_HEADER_SIZE + skip_after_header)));
+        }
 
         // Only support entry records (type 1)
         if record_type != 1 {
@@ -482,6 +523,16 @@ impl FileClogService {
         let record_size = RECORD_HEADER_SIZE + length;
 
         Ok(Some((entries, record_size)))
+    }
+
+    fn discard_bytes<R: Read>(reader: &mut R, mut bytes: usize) -> Result<()> {
+        let mut scratch = [0u8; 4096];
+        while bytes > 0 {
+            let chunk = bytes.min(scratch.len());
+            reader.read_exact(&mut scratch[..chunk])?;
+            bytes -= chunk;
+        }
+        Ok(())
     }
 
     /// Serialize a record to bytes (header + data) without writing.
@@ -625,6 +676,102 @@ impl FileClogService {
             entry_count,
         })
     }
+
+    fn map_group_buffer_error(err: super::group_buffer::GroupBufferError) -> TiSqlError {
+        use super::group_buffer::GroupBufferError;
+
+        match err {
+            GroupBufferError::RecordTooLarge { size, max } => TiSqlError::Internal(format!(
+                "clog record too large for group buffer: size={size}, max={max}"
+            )),
+            GroupBufferError::BufferFull | GroupBufferError::SlotsFull => {
+                TiSqlError::Internal("clog group buffer full".to_string())
+            }
+            GroupBufferError::StreamFailed => {
+                TiSqlError::Internal("clog writer stream failed".to_string())
+            }
+        }
+    }
+
+    fn submit_record_sync(
+        &self,
+        record_bytes: &[u8],
+    ) -> Result<tokio::sync::oneshot::Receiver<std::result::Result<(), String>>> {
+        let mut reservation = self
+            .group_buffer
+            .alloc_sync_wait(record_bytes.len())
+            .map_err(Self::map_group_buffer_error)?;
+        if !record_bytes.is_empty() {
+            reservation.as_mut_slice().copy_from_slice(record_bytes);
+        }
+        Ok(reservation.commit())
+    }
+
+    async fn submit_record_async(
+        &self,
+        record_bytes: &[u8],
+    ) -> Result<tokio::sync::oneshot::Receiver<std::result::Result<(), String>>> {
+        use super::group_buffer::GroupBufferError;
+
+        let record_len = record_bytes.len();
+        // Fast path: avoid creating a watch receiver unless we actually hit
+        // backpressure. Most writes reserve immediately in steady state.
+        let mut space_rx: Option<tokio::sync::watch::Receiver<u64>> = None;
+
+        loop {
+            match self.group_buffer.alloc(record_len) {
+                Ok(mut reservation) => {
+                    if !record_bytes.is_empty() {
+                        reservation.as_mut_slice().copy_from_slice(record_bytes);
+                    }
+                    return Ok(reservation.commit());
+                }
+                Err(GroupBufferError::StreamFailed) => {
+                    return Err(TiSqlError::Internal(
+                        "clog writer stream failed".to_string(),
+                    ));
+                }
+                Err(GroupBufferError::RecordTooLarge { size, max }) => {
+                    return Err(TiSqlError::Internal(format!(
+                        "clog record too large for group buffer: size={size}, max={max}"
+                    )));
+                }
+                Err(GroupBufferError::BufferFull | GroupBufferError::SlotsFull) => {
+                    let rx = space_rx
+                        .get_or_insert_with(|| self.group_buffer.space_watch_tx.subscribe());
+                    let seen = *rx.borrow_and_update();
+
+                    match self.group_buffer.alloc(record_len) {
+                        Ok(mut reservation) => {
+                            if !record_bytes.is_empty() {
+                                reservation.as_mut_slice().copy_from_slice(record_bytes);
+                            }
+                            return Ok(reservation.commit());
+                        }
+                        Err(GroupBufferError::StreamFailed) => {
+                            return Err(TiSqlError::Internal(
+                                "clog writer stream failed".to_string(),
+                            ));
+                        }
+                        Err(GroupBufferError::RecordTooLarge { size, max }) => {
+                            return Err(TiSqlError::Internal(format!(
+                                "clog record too large for group buffer: size={size}, max={max}"
+                            )));
+                        }
+                        Err(GroupBufferError::BufferFull | GroupBufferError::SlotsFull) => {
+                            while *rx.borrow() == seen {
+                                if rx.changed().await.is_err() {
+                                    return Err(TiSqlError::Internal(
+                                        "clog writer stream failed".to_string(),
+                                    ));
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
 }
 
 impl ClogService for FileClogService {
@@ -658,11 +805,8 @@ impl ClogService for FileClogService {
         #[cfg(feature = "failpoints")]
         fail_point!("clog_before_sync");
 
-        // Submit to group commit writer (batches fsync with concurrent writers)
-        let rx = self
-            .group_writer
-            .submit(record_bytes, sync)
-            .map_err(|e| TiSqlError::Internal(format!("Clog group commit failed: {e}")))?;
+        let _ = sync; // O_DIRECT|O_SYNC writer is always durable per completed write.
+        let rx = self.submit_record_sync(&record_bytes)?;
 
         // Failpoint: crash after clog fsync
         #[cfg(feature = "failpoints")]
@@ -678,7 +822,7 @@ impl ClogService for FileClogService {
         Ok(ClogFsyncFuture::new(txn_lsn, rx))
     }
 
-    fn write_ops(
+    async fn write_ops(
         &self,
         txn_id: TxnId,
         ops: &[ClogOpRef<'_>],
@@ -703,10 +847,8 @@ impl ClogService for FileClogService {
         #[cfg(feature = "failpoints")]
         fail_point!("clog_before_sync");
 
-        let rx = self
-            .group_writer
-            .submit(prepared.record_bytes, sync)
-            .map_err(|e| TiSqlError::Internal(format!("Clog group commit failed: {e}")))?;
+        let _ = sync; // O_DIRECT|O_SYNC writer is always durable per completed write.
+        let rx = self.submit_record_async(&prepared.record_bytes).await?;
 
         #[cfg(feature = "failpoints")]
         fail_point!("clog_after_sync");
@@ -721,11 +863,12 @@ impl ClogService for FileClogService {
     }
 
     fn sync(&self) -> Result<ClogFsyncFuture> {
-        // Submit an empty write with sync=true to force a flush+fsync
-        let rx = self
-            .group_writer
-            .submit(Vec::new(), true)
-            .map_err(|e| TiSqlError::Internal(format!("Clog group commit sync failed: {e}")))?;
+        // Sync barrier: enqueue a zero-byte slot and wait for writer ordering.
+        let reservation = self
+            .group_buffer
+            .alloc_sync_wait(0)
+            .map_err(Self::map_group_buffer_error)?;
+        let rx = reservation.commit();
         Ok(ClogFsyncFuture::new(self.lsn_provider.current_lsn(), rx))
     }
 
@@ -742,15 +885,19 @@ impl ClogService for FileClogService {
     }
 
     async fn close(&self) -> Result<()> {
-        // Force a final sync through the group writer, then it will be
-        // cleanly shut down when dropped.
+        // Enqueue a barrier so all prior submissions are durably flushed, then
+        // drain and stop the writer loop.
         let future = self.sync()?;
         future.await?;
+        self.writer
+            .stop_and_drain("clog close")
+            .await
+            .map_err(|e| TiSqlError::Internal(format!("clog close failed: {e}")))?;
         Ok(())
     }
 
     fn shutdown(&self) {
-        self.group_writer.shutdown();
+        self.writer.shutdown();
     }
 }
 
@@ -794,8 +941,8 @@ impl FileClogService {
     /// have been durably persisted elsewhere (e.g., in SST files).
     pub async fn truncate_to(&self, safe_lsn: Lsn) -> Result<TruncateStats> {
         // Stop the writer and drain all in-flight requests.
-        self.group_writer
-            .stop_and_drain()
+        self.writer
+            .stop_and_drain("clog writer draining for truncate")
             .await
             .map_err(|e| TiSqlError::Internal(format!("Clog stop_and_drain failed: {e}")))?;
 
@@ -823,13 +970,10 @@ impl FileClogService {
 
             if to_remove.is_empty() {
                 // Nothing to truncate — restart the writer
-                let file = crate::io::DmaFile::open_append_buffered(&clog_path)
-                    .map_err(|e| TiSqlError::Internal(format!("Failed to reopen clog: {e}")))?;
-                self.group_writer.restart(
-                    file,
-                    Arc::clone(&self.io_service),
-                    Some(&self.io_handle),
-                );
+                let restart_offset = writer_start_offset(old_size);
+                self.writer.restart(restart_offset).map_err(|e| {
+                    TiSqlError::Internal(format!("Failed to restart clog writer: {e}"))
+                })?;
                 return Ok(TruncateStats {
                     entries_removed: 0,
                     entries_kept: to_keep.len(),
@@ -866,10 +1010,14 @@ impl FileClogService {
             .await
             .map_err(|e| TiSqlError::Internal(format!("Clog rewrite task panicked: {e}")))??;
 
-            let file = crate::io::DmaFile::open_append_buffered(self.config.clog_path())
-                .map_err(|e| TiSqlError::Internal(format!("Failed to reopen clog: {e}")))?;
-            self.group_writer
-                .restart(file, Arc::clone(&self.io_service), Some(&self.io_handle));
+            let restart_offset = writer_start_offset(
+                std::fs::metadata(self.config.clog_path())
+                    .map(|m| m.len())
+                    .unwrap_or(0),
+            );
+            self.writer
+                .restart(restart_offset)
+                .map_err(|e| TiSqlError::Internal(format!("Failed to restart clog writer: {e}")))?;
 
             let new_size = std::fs::metadata(self.config.clog_path())
                 .map(|m| m.len())
@@ -892,9 +1040,7 @@ impl FileClogService {
         .await;
 
         if let Err(e) = &result {
-            // stop_and_drain() moved writer to Draining; any error before restart
-            // must transition to Failed so submitters return error instead of waiting.
-            self.group_writer.set_failed(format!("{e}"));
+            self.group_buffer.fail_all_pending(&format!("{e}"));
         }
 
         result
@@ -937,11 +1083,41 @@ fn crc32(data: &[u8]) -> u32 {
 mod tests {
     use super::*;
     use crate::clog::{ClogOp, ClogOpRef};
-    use std::io::{Seek, SeekFrom};
+    use std::io::{BufReader, Seek, SeekFrom};
+    use std::path::Path;
     use tempfile::tempdir;
 
     fn make_test_io() -> Arc<crate::io::IoService> {
         crate::io::IoService::new_for_test(32).unwrap()
+    }
+
+    /// Locate the byte offset of the nth logical record (0-based), skipping
+    /// any O_DIRECT alignment padding regions.
+    fn nth_record_offset(path: &Path, nth: usize) -> u64 {
+        let file = std::fs::File::open(path).unwrap();
+        let mut reader = BufReader::new(file);
+        reader
+            .seek(SeekFrom::Start(FILE_HEADER_SIZE as u64))
+            .unwrap();
+
+        let mut file_offset = FILE_HEADER_SIZE as u64;
+        let mut logical_idx = 0usize;
+        loop {
+            let record_offset = file_offset;
+            match FileClogService::read_record_with_size(&mut reader, file_offset as usize).unwrap()
+            {
+                Some((entries, record_size)) => {
+                    if !entries.is_empty() {
+                        if logical_idx == nth {
+                            return record_offset;
+                        }
+                        logical_idx += 1;
+                    }
+                    file_offset += record_size as u64;
+                }
+                None => panic!("record index {nth} out of range (found {logical_idx})"),
+            }
+        }
     }
 
     #[tokio::test]
@@ -1177,23 +1353,8 @@ mod tests {
                 .open(&clog_path)
                 .unwrap();
 
-            // Skip to the checksum of the second record
-            // Header (16) + first record header (12) + first record data (variable)
-            // We need to find where the second record starts
-
-            // Read the file to find the structure
-            file.seek(SeekFrom::Start(16)).unwrap(); // Skip file header
-
-            // Read first record header
-            let mut header = [0u8; 12];
-            file.read_exact(&mut header).unwrap();
-            let first_data_len = u32::from_le_bytes(header[4..8].try_into().unwrap()) as u64;
-
-            // Skip first record data
-            file.seek(SeekFrom::Current(first_data_len as i64)).unwrap();
-
-            // Now at second record header - corrupt the checksum (offset 8-12 in header)
-            let second_record_start = file.stream_position().unwrap();
+            // Locate second logical record and corrupt its checksum field.
+            let second_record_start = nth_record_offset(&clog_path, 1);
             file.seek(SeekFrom::Start(second_record_start + 8)).unwrap();
 
             // Write corrupted checksum
@@ -1677,13 +1838,7 @@ mod tests {
                 .open(&clog_path)
                 .unwrap();
 
-            file.seek(SeekFrom::Start(FILE_HEADER_SIZE as u64)).unwrap();
-            let mut first_header = [0u8; RECORD_HEADER_SIZE];
-            file.read_exact(&mut first_header).unwrap();
-            let first_len = u32::from_le_bytes(first_header[4..8].try_into().unwrap()) as u64;
-
-            let second_record_start =
-                FILE_HEADER_SIZE as u64 + RECORD_HEADER_SIZE as u64 + first_len;
+            let second_record_start = nth_record_offset(&clog_path, 1);
             file.seek(SeekFrom::Start(second_record_start + 8)).unwrap();
             file.write_all(&0xFFFF_FFFFu32.to_le_bytes()).unwrap();
             file.sync_all().unwrap();
@@ -2138,9 +2293,10 @@ mod tests {
         )
         .unwrap();
 
-        // Initial file has just header (16 bytes)
+        // Initial file includes header and O_DIRECT alignment padding.
         let initial_size = service.file_size().unwrap();
-        assert_eq!(initial_size, FILE_HEADER_SIZE as u64);
+        assert!(initial_size >= FILE_HEADER_SIZE as u64);
+        assert_eq!(initial_size % DMA_ALIGNMENT as u64, 0);
 
         // Write some data
         let mut batch = ClogBatch::new();
@@ -2340,6 +2496,7 @@ mod tests {
         }];
         let written_lsn = service
             .write_ops(7, &ops, 100, Some(txn_lsn), true)
+            .await
             .unwrap()
             .await
             .unwrap();
@@ -2371,7 +2528,7 @@ mod tests {
             key: b"k1",
             value: b"v1",
         }];
-        let err = match service.write_ops(7, &ops, 100, Some(1), true) {
+        let err = match service.write_ops(7, &ops, 100, Some(1), true).await {
             Ok(_) => panic!("write_ops should reject unallocated reserved LSN"),
             Err(err) => format!("{err}"),
         };
@@ -2407,6 +2564,7 @@ mod tests {
         ];
         let commit_lsn = service
             .write_ops(1, &ops, 100, None, true)
+            .await
             .unwrap()
             .await
             .unwrap();
@@ -2454,6 +2612,7 @@ mod tests {
         }];
         service
             .write_ops(1, &ops1, 100, None, true)
+            .await
             .unwrap()
             .await
             .unwrap();
@@ -2475,6 +2634,7 @@ mod tests {
         ];
         let commit_lsn = service
             .write_ops(2, &ops2, 200, None, true)
+            .await
             .unwrap()
             .await
             .unwrap();
@@ -2523,6 +2683,7 @@ mod tests {
         ];
         service
             .write_ops(1, &ops, 100, None, true)
+            .await
             .unwrap()
             .await
             .unwrap();
@@ -2563,6 +2724,7 @@ mod tests {
             ];
             service
                 .write_ops(txn_id, &ops, txn_id * 100, None, true)
+                .await
                 .unwrap()
                 .await
                 .unwrap();
@@ -2604,12 +2766,12 @@ mod tests {
     // truncate_to() Drain Safety Tests
     // ========================================================================
 
-    /// Test that truncate_to() drains pending group commit writes before
-    /// reading the file. Without the drain barrier, writes enqueued on the
-    /// writer queue but not yet processed by the writer loop could be
-    /// lost when the file is rewritten.
+    /// Test that truncate_to() preserves already-durable entries.
+    ///
+    /// Pending non-durable slots are intentionally failed during graceful
+    /// truncate/restart; this test validates the durable side of the contract.
     #[tokio::test]
-    async fn test_truncate_to_drains_pending_writes() {
+    async fn test_truncate_to_preserves_durable_writes() {
         let dir = tempdir().unwrap();
         let config = FileClogConfig::with_dir(dir.path());
         let service = FileClogService::open(
@@ -2619,8 +2781,7 @@ mod tests {
         )
         .unwrap();
 
-        // Submit 10 writes without waiting for replies. Some may still be
-        // queued when truncate_to runs.
+        // Write 10 entries and await durability.
         for i in 1..=10u64 {
             let mut batch = ClogBatch::new();
             batch.add_put(
@@ -2628,8 +2789,7 @@ mod tests {
                 format!("key{i}").into_bytes(),
                 format!("val{i}").into_bytes(),
             );
-            let _future = service.write(&mut batch, true).unwrap();
-            // Deliberately NOT awaiting _future
+            service.write(&mut batch, true).unwrap().await.unwrap();
         }
 
         // Truncate immediately (keep all — safe_lsn=0)
@@ -2646,7 +2806,7 @@ mod tests {
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    async fn test_truncate_to_read_error_sets_writer_failed() {
+    async fn test_truncate_to_read_error_fails_follow_up_writes() {
         let dir = tempdir().unwrap();
         let config = FileClogConfig::with_dir(dir.path());
         let service = FileClogService::open(
@@ -2663,11 +2823,17 @@ mod tests {
         std::fs::remove_file(config.clog_path()).unwrap();
 
         assert!(service.truncate_to(0).await.is_err());
-
-        let err1 = service.group_writer.stop_and_drain().await.unwrap_err();
-        let err2 = service.group_writer.stop_and_drain().await.unwrap_err();
-        assert_eq!(err1, err2);
-        assert!(!err1.contains("Already draining"));
+        let mut next_batch = ClogBatch::new();
+        next_batch.add_put(2, b"k2".to_vec(), b"v2".to_vec());
+        let err = match service.write(&mut next_batch, true) {
+            Ok(_) => panic!("write should fail after truncate_to error"),
+            Err(err) => err,
+        };
+        let msg = format!("{err}");
+        assert!(
+            msg.contains("stream failed") || msg.contains("writer stream failed"),
+            "unexpected error: {msg}"
+        );
     }
 
     // ========================================================================

@@ -57,6 +57,8 @@ use crate::{log_info, log_warn};
 use super::ilog::{IlogConfig, IlogService};
 use super::router::{is_system_table_id, route_index_to_tablet, route_table_to_tablet};
 
+const STORAGE_IO_RING_SIZE: u32 = 256;
+
 /// Recovery state for a transaction during clog replay.
 #[derive(Default)]
 struct TxnReplayState {
@@ -95,8 +97,8 @@ pub struct RecoveryBootstrap {
     pub ilog: Arc<IlogService>,
     /// Shared LSN provider.
     pub lsn_provider: SharedLsnProvider,
-    /// Shared I/O service for recovering additional tablets.
-    pub io_service: Arc<crate::io::IoService>,
+    /// Shared storage I/O service for ilog + LSM and additional tablet recovery.
+    pub storage_io_service: Arc<crate::io::IoService>,
     /// Raw clog entries loaded from disk.
     pub clog_entries: Vec<ClogEntry>,
     /// Max commit_ts observed from recovered system SST metadata.
@@ -177,10 +179,13 @@ impl LsmRecovery {
         // Create shared LSN provider
         let lsn_provider = new_lsn_provider();
 
-        // Create shared IoService for clog/ilog group commit writers
-        let io_service = crate::io::IoService::new(256).map_err(|e| {
-            crate::util::error::TiSqlError::Storage(format!("Failed to create IoService: {e}"))
-        })?;
+        // Shared IoService for storage-side io_uring users (ilog + LSM reads/writes).
+        let storage_io_service =
+            crate::io::IoService::new_with_role(STORAGE_IO_RING_SIZE, "storage").map_err(|e| {
+                crate::util::error::TiSqlError::Storage(format!(
+                    "Failed to create storage IoService: {e}"
+                ))
+            })?;
 
         // Step 1: Recover ilog to rebuild Version
         log_info!(
@@ -190,7 +195,7 @@ impl LsmRecovery {
         let (ilog, version, orphan_ssts) = IlogService::recover(
             self.ilog_config.clone(),
             Arc::clone(&lsn_provider),
-            Arc::clone(&io_service),
+            Arc::clone(&storage_io_service),
             io_handle,
         )?;
         let ilog = Arc::new(ilog);
@@ -222,7 +227,7 @@ impl LsmRecovery {
             Arc::clone(&lsn_provider),
             Arc::clone(&ilog),
             version,
-            Arc::clone(&io_service),
+            Arc::clone(&storage_io_service),
         )?;
 
         // Step 4: Recover clog with shared LSN provider
@@ -234,7 +239,7 @@ impl LsmRecovery {
         let (clog, clog_entries) = FileClogService::recover_with_lsn_provider(
             self.clog_config,
             Arc::clone(&lsn_provider),
-            Arc::clone(&io_service),
+            Arc::clone(&storage_io_service),
             io_handle,
         )?;
         let clog = Arc::new(clog);
@@ -254,7 +259,7 @@ impl LsmRecovery {
             clog,
             ilog,
             lsn_provider,
-            io_service,
+            storage_io_service,
             clog_entries,
             max_ts_from_ssts,
             stats,

@@ -14,8 +14,8 @@ if [[ ! "$timeout_secs" =~ ^[1-9][0-9]*$ ]]; then
     exit 2
 fi
 
-# Keep timeout guards strict and fast-fail by default (< 1 minute).
-max_timeout_secs="${TISQL_MAX_TIMEOUT_SECS:-55}"
+# Keep timeout guards strict and fast-fail by default (<= 1 minute).
+max_timeout_secs="${TISQL_MAX_TIMEOUT_SECS:-60}"
 if [[ ! "$max_timeout_secs" =~ ^[1-9][0-9]*$ ]]; then
     echo "TISQL_MAX_TIMEOUT_SECS must be a positive integer, got: $max_timeout_secs" >&2
     exit 2

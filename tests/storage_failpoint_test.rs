@@ -2810,6 +2810,7 @@ async fn write_durable_multi_put(
 
     let commit_lsn = clog
         .write_ops(txn_id, &ops, commit_ts, None, true)
+        .await
         .unwrap()
         .await
         .unwrap();

@@ -25,7 +25,9 @@
 //! confusion with application logging.
 
 mod file;
+pub(crate) mod group_buffer;
 pub(crate) mod group_commit;
+pub(crate) mod writer;
 
 // Implementation types - not re-exported from main API
 // Available via testkit for integration tests
@@ -209,7 +211,7 @@ pub trait ClogService: Send + Sync {
         commit_ts: Timestamp,
         lsn: Option<Lsn>,
         sync: bool,
-    ) -> Result<ClogFsyncFuture>;
+    ) -> impl Future<Output = Result<ClogFsyncFuture>> + Send;
 
     /// Append single entry, returns future that yields the LSN.
     fn append(&self, entry: ClogEntry, sync: bool) -> Result<ClogFsyncFuture> {

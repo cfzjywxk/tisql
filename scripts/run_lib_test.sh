@@ -98,14 +98,16 @@ fi
 run_group() {
     local mode="$1"
     local name="$2"
+    local effective_thread_count="$thread_count"
+
     if [[ "$mode" == "exact" ]]; then
         echo "Running lib test case: $name"
         ./scripts/run_with_timeout.sh "$timeout_secs" \
-            "$lib_test_bin" "$name" --exact --test-threads="$thread_count"
+            "$lib_test_bin" "$name" --exact --test-threads="$effective_thread_count" --quiet
     else
         echo "Running lib test group: $name"
         ./scripts/run_with_timeout.sh "$timeout_secs" \
-            "$lib_test_bin" "$name" --test-threads="$thread_count"
+            "$lib_test_bin" "$name" --test-threads="$effective_thread_count" --quiet
     fi
 }
 

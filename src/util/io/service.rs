@@ -146,14 +146,11 @@ impl std::fmt::Debug for IoService {
 }
 
 impl IoService {
-    /// Create a new IoService with the given ring size hint.
+    /// Create a new IoService with the given ring size hint and thread-role label.
     ///
-    /// On Linux, `ring_size` determines the io_uring submission queue depth.
-    /// On non-Linux targets, it is ignored by the synchronous fallback backend.
-    ///
-    /// Spawns a dedicated OS thread for the I/O event loop. The thread
-    /// exits when the channel is closed (all senders dropped via Drop or `shutdown()`).
-    pub fn new(ring_size: u32) -> Result<Arc<Self>, String> {
+    /// `thread_role` is used only for the dedicated OS thread name to make
+    /// profiling/diagnostics distinguish multiple IoService instances.
+    pub fn new_with_role(ring_size: u32, thread_role: &str) -> Result<Arc<Self>, String> {
         let (tx, rx) = crossbeam_channel::unbounded::<IoOp>();
         let shutdown_tx = tx.clone();
 
@@ -163,12 +160,17 @@ impl IoService {
         );
 
         #[cfg(target_os = "linux")]
-        let thread_name = "tisql-io-uring";
+        let thread_base = "tisql-io-uring";
         #[cfg(not(target_os = "linux"))]
-        let thread_name = "tisql-io-sync-fallback";
+        let thread_base = "tisql-io-sync-fallback";
+        let thread_name = if thread_role.is_empty() {
+            thread_base.to_string()
+        } else {
+            format!("{thread_base}-{thread_role}")
+        };
 
         std::thread::Builder::new()
-            .name(thread_name.into())
+            .name(thread_name)
             .spawn(move || {
                 if let Err(e) = io_thread_main(rx, ring_size) {
                     tracing::error!("IoService thread failed: {e}");
@@ -180,6 +182,17 @@ impl IoService {
             tx,
             shutdown_tx: parking_lot::Mutex::new(Some(shutdown_tx)),
         }))
+    }
+
+    /// Create a new IoService with the given ring size hint.
+    ///
+    /// On Linux, `ring_size` determines the io_uring submission queue depth.
+    /// On non-Linux targets, it is ignored by the synchronous fallback backend.
+    ///
+    /// Spawns a dedicated OS thread for the I/O event loop. The thread
+    /// exits when the channel is closed (all senders dropped via Drop or `shutdown()`).
+    pub fn new(ring_size: u32) -> Result<Arc<Self>, String> {
+        Self::new_with_role(ring_size, "")
     }
 
     /// Create an IoService for tests (alias for `new()`).

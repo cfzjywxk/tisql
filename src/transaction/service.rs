@@ -864,7 +864,8 @@ impl<S: PessimisticStorage + 'static, L: ClogService + 'static, T: TsoService> T
         let clog_write_begin = Instant::now();
         let clog_result = self
             .clog_service
-            .write_ops(txn_id, &ops, commit_ts, Some(txn_lsn), true);
+            .write_ops(txn_id, &ops, commit_ts, Some(txn_lsn), true)
+            .await;
         self.write_path_diagnostics
             .commit_clog_write
             .record_duration(clog_write_begin.elapsed());

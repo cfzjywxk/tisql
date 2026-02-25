@@ -406,20 +406,23 @@ async fn async_writer_loop(
     group_commit_no_delay_count: usize,
 ) {
     let mut offset = file.file_size();
-    let mut batch: Vec<GroupCommitRequest> = Vec::with_capacity(64);
+    let mut current_batch: Vec<GroupCommitRequest> = Vec::with_capacity(64);
+    let mut next_batch: Vec<GroupCommitRequest> = Vec::with_capacity(64);
+
+    // Bootstrap the first batch. Subsequent batches are collected while the
+    // previous batch's I/O is in-flight to overlap queueing with fsync latency.
+    let mut channel_closed = collect_batch_with_delay_async(
+        &mut rx,
+        &mut current_batch,
+        group_commit_delay,
+        group_commit_no_delay_count,
+    )
+    .await;
+    if current_batch.is_empty() {
+        return;
+    }
 
     loop {
-        let channel_closed = collect_batch_with_delay_async(
-            &mut rx,
-            &mut batch,
-            group_commit_delay,
-            group_commit_no_delay_count,
-        )
-        .await;
-        if batch.is_empty() {
-            return;
-        }
-
         #[cfg(feature = "failpoints")]
         if let Some(dur) = fail::eval("clog_writer_loop_pause", |_| {
             std::time::Duration::from_millis(100)
@@ -427,26 +430,60 @@ async fn async_writer_loop(
             tokio::time::sleep(dur).await;
         }
 
-        // Write the batch via io_uring
-        let write_error =
-            write_batch_async(&file, &io, &mut offset, &batch, io_trace, sync_mode).await;
+        let write_error = {
+            let write_future =
+                write_batch_async(&file, &io, &mut offset, &current_batch, io_trace, sync_mode);
+            tokio::pin!(write_future);
 
-        // Notify all callers
-        let result = match &write_error {
-            Some(e) => Err(e.clone()),
-            None => Ok(()),
+            loop {
+                if channel_closed {
+                    break write_future.await;
+                }
+
+                tokio::select! {
+                    write_error = &mut write_future => break write_error,
+                    req = rx.recv() => match req {
+                        Some(req) => {
+                            next_batch.push(req);
+                            drain_ready_requests(&mut rx, &mut next_batch);
+                        }
+                        None => {
+                            channel_closed = true;
+                        }
+                    }
+                }
+            }
         };
-        for req in batch.drain(..) {
-            let _ = req.reply.send(result.clone());
+
+        match write_error {
+            Some(err) => {
+                reply_batch(&mut current_batch, Err(err.clone()));
+                reply_batch(&mut next_batch, Err(err));
+                return;
+            }
+            None => {
+                reply_batch(&mut current_batch, Ok(()));
+            }
         }
 
-        // Fail-stop on error
-        if write_error.is_some() {
-            return;
+        if next_batch.is_empty() {
+            if channel_closed {
+                return;
+            }
+
+            channel_closed = collect_batch_with_delay_async(
+                &mut rx,
+                &mut next_batch,
+                group_commit_delay,
+                group_commit_no_delay_count,
+            )
+            .await;
+            if next_batch.is_empty() {
+                return;
+            }
         }
-        if channel_closed {
-            return;
-        }
+
+        std::mem::swap(&mut current_batch, &mut next_batch);
     }
 }
 
@@ -509,6 +546,12 @@ fn drain_ready_requests(
 ) {
     while let Ok(req) = rx.try_recv() {
         batch.push(req);
+    }
+}
+
+fn reply_batch(batch: &mut Vec<GroupCommitRequest>, result: Result<(), String>) {
+    for req in batch.drain(..) {
+        let _ = req.reply.send(result.clone());
     }
 }
 
