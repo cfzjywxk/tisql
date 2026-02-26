@@ -18,6 +18,7 @@ use sqlparser::ast::{
     self, Expr as SqlExpr, GroupByExpr, Query, Select, SelectItem, SetExpr,
     Statement as SqlStatement, TableFactor, TableWithJoins, Value as SqlValue,
 };
+use sqlparser::tokenizer::Token;
 
 use crate::catalog::types::{ColumnInfo, DataType, Schema, Timestamp, Value};
 use crate::catalog::{Catalog, ColumnDef, TableDef};
@@ -75,8 +76,15 @@ impl<'a, C: Catalog> Binder<'a, C> {
                 columns,
                 constraints,
                 if_not_exists,
+                auto_increment_offset,
                 ..
-            } => self.bind_create_table(name, columns, constraints, if_not_exists),
+            } => self.bind_create_table(
+                name,
+                columns,
+                constraints,
+                if_not_exists,
+                auto_increment_offset,
+            ),
             SqlStatement::Drop {
                 object_type,
                 names,
@@ -740,6 +748,7 @@ impl<'a, C: Catalog> Binder<'a, C> {
         columns: Vec<ast::ColumnDef>,
         constraints: Vec<ast::TableConstraint>,
         if_not_exists: bool,
+        auto_increment_offset: Option<u32>,
     ) -> Result<LogicalPlan> {
         let table_name = name
             .0
@@ -764,7 +773,7 @@ impl<'a, C: Catalog> Binder<'a, C> {
             let data_type = self.bind_data_type(&col.data_type)?;
 
             let mut nullable = true;
-            let auto_increment = false;
+            let mut auto_increment = false;
 
             for option in &col.options {
                 match &option.option {
@@ -775,6 +784,11 @@ impl<'a, C: Catalog> Binder<'a, C> {
                             primary_key.push(col_id);
                             nullable = false;
                         }
+                    }
+                    ast::ColumnOption::DialectSpecific(tokens)
+                        if Self::is_mysql_auto_increment_option(tokens) =>
+                    {
+                        auto_increment = true;
                     }
                     _ => {}
                 }
@@ -799,20 +813,55 @@ impl<'a, C: Catalog> Binder<'a, C> {
             } = constraint
             {
                 for pk_col in pk_cols {
-                    if let Some(col) = col_defs.iter().find(|c| c.name() == pk_col.value) {
-                        if !primary_key.contains(&col.id()) {
-                            primary_key.push(col.id());
+                    if let Some(col_idx) = col_defs.iter().position(|c| c.name() == pk_col.value) {
+                        let col_id = col_defs[col_idx].id();
+                        if !primary_key.contains(&col_id) {
+                            primary_key.push(col_id);
+                        }
+                        if col_defs[col_idx].nullable() {
+                            let col = &col_defs[col_idx];
+                            let id = col.id();
+                            let name = col.name().to_string();
+                            let data_type = col.data_type().clone();
+                            let default = col.default().cloned();
+                            let auto_increment = col.auto_increment();
+                            col_defs[col_idx] =
+                                ColumnDef::new(id, name, data_type, false, default, auto_increment);
                         }
                     }
                 }
             }
         }
 
+        let auto_inc_columns: Vec<&ColumnDef> =
+            col_defs.iter().filter(|col| col.auto_increment()).collect();
+        if auto_inc_columns.len() > 1 {
+            return Err(TiSqlError::Bind(
+                "AUTO_INCREMENT is allowed on at most one column".into(),
+            ));
+        }
+        if let Some(auto_inc_col) = auto_inc_columns.first() {
+            if !matches!(auto_inc_col.data_type(), DataType::Int | DataType::BigInt) {
+                return Err(TiSqlError::Bind(format!(
+                    "AUTO_INCREMENT column '{}' must be INT or BIGINT",
+                    auto_inc_col.name()
+                )));
+            }
+            if auto_inc_col.nullable() {
+                return Err(TiSqlError::Bind(format!(
+                    "AUTO_INCREMENT column '{}' must be NOT NULL",
+                    auto_inc_col.name()
+                )));
+            }
+        }
+
         let table_def = TableDef::new(table_id, table_name, schema, col_defs, primary_key);
+        let auto_increment_offset = auto_increment_offset.map(|offset| u64::from(offset.max(1)));
 
         Ok(LogicalPlan::CreateTable {
             table: table_def,
             if_not_exists,
+            auto_increment_offset,
         })
     }
 
@@ -1238,6 +1287,10 @@ impl<'a, C: Catalog> Binder<'a, C> {
             _ => Err(TiSqlError::Bind("LIMIT/OFFSET must be a number".into())),
         }
     }
+
+    fn is_mysql_auto_increment_option(tokens: &[Token]) -> bool {
+        tokens.len() == 1 && tokens[0].to_string().eq_ignore_ascii_case("AUTO_INCREMENT")
+    }
 }
 
 #[cfg(test)]
@@ -1353,6 +1406,77 @@ mod tests {
         }
         crate::io::block_on_sync(catalog.create_table(table)).unwrap();
         catalog
+    }
+
+    #[test]
+    fn test_bind_create_table_auto_increment_column() {
+        let catalog = MemoryCatalog::new();
+        let plan = bind_sql(
+            &catalog,
+            "CREATE TABLE t_ai (id INT NOT NULL AUTO_INCREMENT PRIMARY KEY, name VARCHAR(64)) AUTO_INCREMENT=9",
+        );
+
+        match plan {
+            LogicalPlan::CreateTable {
+                table,
+                auto_increment_offset,
+                ..
+            } => {
+                let id_col = table.column_by_name("id").unwrap();
+                assert!(id_col.auto_increment());
+                assert!(!id_col.nullable());
+                assert_eq!(auto_increment_offset, Some(9));
+            }
+            _ => panic!("expected create table plan"),
+        }
+    }
+
+    #[test]
+    fn test_bind_create_table_rejects_multiple_auto_increment_columns() {
+        let catalog = MemoryCatalog::new();
+        let err = bind_sql_result(
+            &catalog,
+            "CREATE TABLE t_ai_bad (id INT NOT NULL AUTO_INCREMENT, id2 BIGINT NOT NULL AUTO_INCREMENT, PRIMARY KEY(id))",
+        )
+        .unwrap_err();
+        assert!(matches!(err, TiSqlError::Bind(msg) if msg.contains("at most one")));
+    }
+
+    #[test]
+    fn test_bind_create_table_rejects_auto_increment_non_integer_type() {
+        let catalog = MemoryCatalog::new();
+        let err = bind_sql_result(
+            &catalog,
+            "CREATE TABLE t_ai_bad (id VARCHAR(32) NOT NULL AUTO_INCREMENT, PRIMARY KEY(id))",
+        )
+        .unwrap_err();
+        assert!(matches!(err, TiSqlError::Bind(msg) if msg.contains("INT or BIGINT")));
+    }
+
+    #[test]
+    fn test_bind_create_table_rejects_nullable_auto_increment() {
+        let catalog = MemoryCatalog::new();
+        let err =
+            bind_sql_result(&catalog, "CREATE TABLE t_ai_bad (id INT AUTO_INCREMENT)").unwrap_err();
+        assert!(matches!(err, TiSqlError::Bind(msg) if msg.contains("NOT NULL")));
+    }
+
+    #[test]
+    fn test_bind_create_table_clamps_auto_increment_seed_zero_to_one() {
+        let catalog = MemoryCatalog::new();
+        let plan = bind_sql(
+            &catalog,
+            "CREATE TABLE t_ai_seed (id INT NOT NULL AUTO_INCREMENT PRIMARY KEY) AUTO_INCREMENT=0",
+        );
+        match plan {
+            LogicalPlan::CreateTable {
+                auto_increment_offset,
+                ..
+            } => {
+                assert_eq!(auto_increment_offset, Some(1));
+            }
+            _ => panic!("expected create table plan"),
+        }
     }
 
     #[test]

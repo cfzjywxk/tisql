@@ -872,6 +872,82 @@ struct PkBound {
     inclusive: bool,
 }
 
+enum AutoIncrementRowAction {
+    Generate,
+    ExplicitNoObserve,
+    ExplicitObserve(u64),
+}
+
+fn generated_auto_increment_value(next_id: u64, data_type: &DataType) -> Result<Value> {
+    match data_type {
+        DataType::Int => {
+            if next_id > i32::MAX as u64 {
+                return Err(TiSqlError::Execution(
+                    "AUTO_INCREMENT overflow for INT column".into(),
+                ));
+            }
+            Ok(Value::BigInt(next_id as i64))
+        }
+        DataType::BigInt => {
+            if next_id > i64::MAX as u64 {
+                return Err(TiSqlError::Execution(
+                    "AUTO_INCREMENT overflow for BIGINT column".into(),
+                ));
+            }
+            Ok(Value::BigInt(next_id as i64))
+        }
+        _ => Err(TiSqlError::Execution(
+            "AUTO_INCREMENT is only supported for INT/BIGINT".into(),
+        )),
+    }
+}
+
+fn classify_auto_increment_row_value(
+    value: &Value,
+    data_type: &DataType,
+) -> Result<AutoIncrementRowAction> {
+    if value.is_null() {
+        return Ok(AutoIncrementRowAction::Generate);
+    }
+
+    let signed = match value {
+        Value::TinyInt(v) => i64::from(*v),
+        Value::SmallInt(v) => i64::from(*v),
+        Value::Int(v) => i64::from(*v),
+        Value::BigInt(v) => *v,
+        _ => {
+            return Err(TiSqlError::TypeMismatch {
+                expected: "INT/BIGINT".into(),
+                got: format!("{value:?}"),
+            });
+        }
+    };
+
+    match data_type {
+        DataType::Int => {
+            if signed < i32::MIN as i64 || signed > i32::MAX as i64 {
+                return Err(TiSqlError::Execution(
+                    "AUTO_INCREMENT explicit value out of INT range".into(),
+                ));
+            }
+        }
+        DataType::BigInt => {}
+        _ => {
+            return Err(TiSqlError::Execution(
+                "AUTO_INCREMENT is only supported for INT/BIGINT".into(),
+            ));
+        }
+    }
+
+    if signed == 0 {
+        Ok(AutoIncrementRowAction::Generate)
+    } else if signed > 0 {
+        Ok(AutoIncrementRowAction::ExplicitObserve(signed as u64))
+    } else {
+        Ok(AutoIncrementRowAction::ExplicitNoObserve)
+    }
+}
+
 fn conjoin_predicate(existing: Option<Expr>, predicate: Expr) -> Option<Expr> {
     match existing {
         Some(prev) => Some(Expr::BinaryOp {
@@ -1408,8 +1484,9 @@ impl SimpleExecutor {
     ) -> Result<ExecutionOutput> {
         match plan {
             LogicalPlan::CreateTable {
-                table,
+                mut table,
                 if_not_exists,
+                auto_increment_offset,
             } => {
                 // Require primary key for now (hidden row-id not fully supported)
                 if table.primary_key().is_empty() {
@@ -1427,6 +1504,10 @@ impl SimpleExecutor {
                         "Table '{}' already exists",
                         table.name()
                     )));
+                }
+
+                if let Some(seed) = auto_increment_offset {
+                    table.set_auto_increment_id(seed.saturating_sub(1));
                 }
 
                 let table_id = catalog.create_table(table).await?;
@@ -1492,6 +1573,11 @@ impl SimpleExecutor {
             } => {
                 let pk_indices = table.pk_column_indices();
                 let mut count = 0u64;
+                let auto_inc_column = table
+                    .columns()
+                    .iter()
+                    .enumerate()
+                    .find(|(_, col)| col.auto_increment());
 
                 // Get column IDs for encoding
                 let col_ids: Vec<ColumnId> = table.columns().iter().map(|c| c.id()).collect();
@@ -1520,14 +1606,24 @@ impl SimpleExecutor {
                         None
                     };
 
-                    // Handle auto-increment
-                    for (idx, col) in table.columns().iter().enumerate() {
-                        if col.auto_increment() && row_values[idx].is_null() {
-                            let next_id = match row_id_for_key {
-                                Some(v) => v,
-                                None => catalog.next_auto_increment(table.id())?,
-                            };
-                            row_values[idx] = Value::BigInt(next_id as i64);
+                    let mut explicit_auto_inc_observe = None;
+
+                    // Handle explicit/null AUTO_INCREMENT semantics in row order.
+                    if let Some((idx, col)) = auto_inc_column {
+                        match classify_auto_increment_row_value(&row_values[idx], col.data_type())?
+                        {
+                            AutoIncrementRowAction::Generate => {
+                                let next_id = match row_id_for_key {
+                                    Some(v) => v,
+                                    None => catalog.next_auto_increment(table.id())?,
+                                };
+                                row_values[idx] =
+                                    generated_auto_increment_value(next_id, col.data_type())?;
+                            }
+                            AutoIncrementRowAction::ExplicitNoObserve => {}
+                            AutoIncrementRowAction::ExplicitObserve(v) => {
+                                explicit_auto_inc_observe = Some(v);
+                            }
                         }
                     }
 
@@ -1568,6 +1664,9 @@ impl SimpleExecutor {
 
                     // Buffer write in transaction
                     txn_service.put(ctx, table.id(), &key, value).await?;
+                    if let Some(explicit_v) = explicit_auto_inc_observe {
+                        catalog.observe_auto_increment_explicit(table.id(), explicit_v)?;
+                    }
                     count += 1;
                 }
 

@@ -19,17 +19,20 @@
 //! write rows to inner tables and update the cache atomically.
 
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::Arc;
 
 use parking_lot::RwLock;
 
+use crate::catalog::auto_increment::{AutoIncService, DEFAULT_AUTO_INC_CACHE_SIZE};
 use crate::catalog::types::{IndexId, TableId, Timestamp, Value};
 use crate::codec::key::{
     encode_index_seek_key, encode_record_key_with_handle, gen_table_record_prefix,
 };
 use crate::codec::row::encode_row;
 use crate::inner_table::bootstrap::{
-    self, delete_column_rows, delete_index_rows, update_meta_row, write_gc_task_row,
-    write_index_row, write_user_column_rows, write_user_table_row,
+    self, delete_autoinc_row, delete_column_rows, delete_index_rows, update_meta_row,
+    write_autoinc_row, write_gc_task_row, write_index_row, write_user_column_rows,
+    write_user_table_row,
 };
 use crate::inner_table::catalog_loader::{self, CatalogCache};
 use crate::inner_table::core_tables::*;
@@ -53,12 +56,14 @@ struct SchemaState {
 ///
 /// ## Storage Model
 ///
-/// All schema metadata is stored in 5 core inner tables:
+/// All schema metadata is stored in core inner tables:
 /// - `__all_meta` — global counters (schema_version, next_table_id, etc.)
 /// - `__all_schema` — schema definitions
 /// - `__all_table` — table definitions
 /// - `__all_column` — column definitions
 /// - `__all_index` — index definitions
+/// - `__all_gc_delete_range` — DDL garbage-collection tasks
+/// - `__all_autoinc` — durable AUTO_INCREMENT allocator state
 ///
 /// ## DDL/DML Concurrency Control
 ///
@@ -87,6 +92,8 @@ pub struct MvccCatalog<T: TxnService> {
     next_schema_id: AtomicU64,
     /// Atomic counter for GC task IDs.
     next_gc_task_id: AtomicU64,
+    /// AUTO_INCREMENT allocator service.
+    auto_inc_service: AutoIncService<T>,
 }
 
 impl<T: TxnService> MvccCatalog<T> {
@@ -96,7 +103,7 @@ impl<T: TxnService> MvccCatalog<T> {
     /// For existing databases, call `load_schema_version()` to recover state.
     pub fn new(txn_service: std::sync::Arc<T>) -> Self {
         Self {
-            txn_service,
+            txn_service: Arc::clone(&txn_service),
             schema_state: RwLock::new(SchemaState {
                 version: 0,
                 cache: CatalogCache {
@@ -111,6 +118,10 @@ impl<T: TxnService> MvccCatalog<T> {
             next_index_id: AtomicU64::new(1),
             next_schema_id: AtomicU64::new(USER_SCHEMA_ID_START),
             next_gc_task_id: AtomicU64::new(1),
+            auto_inc_service: AutoIncService::new(
+                Arc::clone(&txn_service),
+                DEFAULT_AUTO_INC_CACHE_SIZE,
+            ),
         }
     }
 
@@ -131,6 +142,9 @@ impl<T: TxnService> MvccCatalog<T> {
     ///
     /// Call this after opening an existing database to recover state.
     pub fn load_schema_version(&self) -> Result<()> {
+        crate::io::block_on_sync(bootstrap::migrate_all_autoinc_if_needed(
+            self.txn_service.as_ref(),
+        ))?;
         let (cache, counters) = catalog_loader::load_catalog(self.txn_service.as_ref())?;
 
         let mut state = self.schema_state.write();
@@ -347,6 +361,7 @@ impl<T: TxnService> Catalog for MvccCatalog<T> {
         };
 
         let table_id = table.id();
+        let auto_inc_next_value = table.auto_increment_id().saturating_add(1).max(1);
 
         // Phase 2: Async txn work
         let mut ctx = self.begin_internal()?;
@@ -357,6 +372,13 @@ impl<T: TxnService> Catalog for MvccCatalog<T> {
             self.txn_service.as_ref(),
             table_id,
             table.columns(),
+        )
+        .await?;
+        write_autoinc_row(
+            &mut ctx,
+            self.txn_service.as_ref(),
+            table_id,
+            auto_inc_next_value,
         )
         .await?;
 
@@ -379,6 +401,7 @@ impl<T: TxnService> Catalog for MvccCatalog<T> {
         let key = (table.schema().to_string(), table.name().to_string());
         state.cache.table_id_map.insert(table_id, key.clone());
         state.cache.tables.insert(key, table);
+        self.auto_inc_service.remove_table(table_id);
 
         Ok(table_id)
     }
@@ -450,6 +473,7 @@ impl<T: TxnService> Catalog for MvccCatalog<T> {
             table_def.indexes(),
         )
         .await?;
+        delete_autoinc_row(&mut ctx, self.txn_service.as_ref(), table_id).await?;
 
         for task in &gc_tasks {
             write_gc_task_row(
@@ -505,6 +529,7 @@ impl<T: TxnService> Catalog for MvccCatalog<T> {
         let key = (schema.to_string(), table.to_string());
         state.cache.tables.remove(&key);
         state.cache.table_id_map.remove(&table_id);
+        self.auto_inc_service.remove_table(table_id);
 
         Ok(super::DropTableInfo {
             table_id,
@@ -695,45 +720,11 @@ impl<T: TxnService> Catalog for MvccCatalog<T> {
     }
 
     fn next_auto_increment(&self, table_id: TableId) -> Result<u64> {
-        let mut state = self.schema_state.write();
+        self.auto_inc_service.next_value(table_id)
+    }
 
-        let table_key = match state.cache.table_id_map.get(&table_id) {
-            Some(k) => k.clone(),
-            None => {
-                return Err(TiSqlError::Catalog(format!(
-                    "Table with ID {table_id} not found"
-                )));
-            }
-        };
-
-        let schema_name = table_key.0.clone();
-        let schema_id = match state.cache.schemas.get(&schema_name) {
-            Some(&id) => id,
-            None => {
-                return Err(TiSqlError::Catalog(format!(
-                    "Schema '{schema_name}' not found"
-                )));
-            }
-        };
-
-        let table_def =
-            state.cache.tables.get_mut(&table_key).ok_or_else(|| {
-                TiSqlError::Catalog(format!("Table with ID {table_id} not found"))
-            })?;
-
-        let new_id = table_def.increment_auto_id();
-
-        // Persist: use block_on_sync since this is a sync method
-        let mut ctx = self.begin_internal()?;
-        crate::io::block_on_sync(write_user_table_row(
-            &mut ctx,
-            self.txn_service.as_ref(),
-            table_def,
-            schema_id,
-        ))?;
-        crate::io::block_on_sync(self.commit_internal(ctx))?;
-
-        Ok(new_id)
+    fn observe_auto_increment_explicit(&self, table_id: TableId, explicit_v: u64) -> Result<()> {
+        self.auto_inc_service.observe_explicit(table_id, explicit_v)
     }
 
     fn next_table_id(&self) -> Result<TableId> {
@@ -780,6 +771,7 @@ mod tests {
     use crate::catalog::types::DataType;
     use crate::catalog::ColumnDef;
     use crate::clog::{FileClogConfig, FileClogService};
+    use crate::inner_table::bootstrap::read_autoinc_row;
     use crate::tablet::MemTableEngine;
     use crate::transaction::{ConcurrencyManager, TransactionService};
     use crate::tso::LocalTso;
@@ -825,6 +817,16 @@ mod tests {
         let (catalog, dir) = create_test_catalog();
         catalog.bootstrap().await.unwrap();
         (catalog, dir)
+    }
+
+    async fn read_durable_autoinc_next(
+        catalog: &MvccCatalog<TestTxnService>,
+        table_id: TableId,
+    ) -> Option<u64> {
+        let ctx = catalog.txn_service.begin(true).unwrap();
+        read_autoinc_row(&ctx, catalog.txn_service.as_ref(), table_id)
+            .await
+            .unwrap()
     }
 
     fn make_test_table(catalog: &MvccCatalog<TestTxnService>, name: &str) -> TableDef {
@@ -929,6 +931,109 @@ mod tests {
         assert_eq!(catalog.next_auto_increment(table_id).unwrap(), 1);
         assert_eq!(catalog.next_auto_increment(table_id).unwrap(), 2);
         assert_eq!(catalog.next_auto_increment(table_id).unwrap(), 3);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn test_auto_increment_observe_explicit() {
+        let (catalog, _dir) = create_test_catalog_bootstrapped().await;
+        let table = make_test_table(&catalog, "users");
+        let table_id = table.id();
+
+        catalog.create_table(table).await.unwrap();
+
+        assert_eq!(catalog.next_auto_increment(table_id).unwrap(), 1);
+        catalog
+            .observe_auto_increment_explicit(table_id, 100)
+            .unwrap();
+        assert_eq!(catalog.next_auto_increment(table_id).unwrap(), 101);
+        catalog
+            .observe_auto_increment_explicit(table_id, 50)
+            .unwrap();
+        assert_eq!(catalog.next_auto_increment(table_id).unwrap(), 102);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn test_auto_increment_concurrent_allocation_unique() {
+        let (catalog, _dir) = create_test_catalog_bootstrapped().await;
+        let table = make_test_table(&catalog, "users");
+        let table_id = table.id();
+
+        catalog.create_table(table).await.unwrap();
+
+        let catalog = Arc::new(catalog);
+        let workers = 8usize;
+        let per_worker = 32usize;
+        let mut join_set = tokio::task::JoinSet::new();
+
+        for _ in 0..workers {
+            let catalog = Arc::clone(&catalog);
+            join_set.spawn(async move {
+                let mut allocated = Vec::with_capacity(per_worker);
+                for _ in 0..per_worker {
+                    allocated.push(catalog.next_auto_increment(table_id).unwrap());
+                }
+                allocated
+            });
+        }
+
+        let mut all_ids = Vec::with_capacity(workers * per_worker);
+        while let Some(result) = join_set.join_next().await {
+            all_ids.extend(result.unwrap());
+        }
+        all_ids.sort_unstable();
+
+        assert_eq!(all_ids.len(), workers * per_worker);
+        for (idx, id) in all_ids.iter().enumerate() {
+            assert_eq!(*id, (idx as u64) + 1);
+        }
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn test_auto_increment_seed_via_table_definition() {
+        let (catalog, _dir) = create_test_catalog_bootstrapped().await;
+        let mut table = make_test_table(&catalog, "users");
+        let table_id = table.id();
+        table.set_auto_increment_id(9);
+
+        catalog.create_table(table).await.unwrap();
+        assert_eq!(catalog.next_auto_increment(table_id).unwrap(), 10);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn test_auto_increment_explicit_in_range_keeps_durable_next_unchanged() {
+        let (catalog, _dir) = create_test_catalog_bootstrapped().await;
+        let table = make_test_table(&catalog, "users");
+        let table_id = table.id();
+        catalog.create_table(table).await.unwrap();
+
+        assert_eq!(read_durable_autoinc_next(&catalog, table_id).await, Some(1));
+        assert_eq!(catalog.next_auto_increment(table_id).unwrap(), 1);
+        assert_eq!(
+            read_durable_autoinc_next(&catalog, table_id).await,
+            Some(65)
+        );
+
+        // Explicit value falls in currently reserved [2, 64], so this stays local-only.
+        catalog
+            .observe_auto_increment_explicit(table_id, 10)
+            .unwrap();
+        assert_eq!(
+            read_durable_autoinc_next(&catalog, table_id).await,
+            Some(65)
+        );
+        assert_eq!(catalog.next_auto_increment(table_id).unwrap(), 11);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn test_drop_table_removes_durable_autoinc_row() {
+        let (catalog, _dir) = create_test_catalog_bootstrapped().await;
+        let table = make_test_table(&catalog, "users");
+        let table_id = table.id();
+        catalog.create_table(table).await.unwrap();
+
+        assert_eq!(read_durable_autoinc_next(&catalog, table_id).await, Some(1));
+        catalog.drop_table("default", "users").await.unwrap();
+        assert_eq!(read_durable_autoinc_next(&catalog, table_id).await, None);
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

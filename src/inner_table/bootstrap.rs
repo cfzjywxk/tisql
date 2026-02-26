@@ -20,8 +20,10 @@
 
 use crate::catalog::types::Value;
 use crate::codec::key::encode_record_key_with_handle;
-use crate::codec::row::encode_row;
+use crate::codec::key::gen_table_record_prefix;
+use crate::codec::row::{decode_row_to_values, encode_row};
 use crate::inner_table::core_tables::*;
+use crate::tablet::MvccIterator;
 use crate::transaction::{TxnCtx, TxnService};
 use crate::util::error::Result;
 
@@ -38,29 +40,36 @@ pub async fn is_bootstrapped<T: TxnService>(txn: &T) -> Result<bool> {
 /// Writes:
 /// 1. `__all_schema` rows (inner, default, test)
 /// 2. `__all_table` rows (one per core table)
-/// 3. `__all_column` rows (columns of all 5 core tables)
-/// 4. `__all_meta` rows (bootstrap_version, next_table_id, next_index_id, schema_version, next_schema_id)
+/// 3. `__all_column` rows (columns of all core tables)
+/// 4. `__all_autoinc` rows (one per core table, `next_value = 1`)
+/// 5. `__all_meta` rows (bootstrap_version, next_table_id, next_index_id, schema_version, next_schema_id)
 pub async fn bootstrap_core_tables<T: TxnService>(txn: &T) -> Result<()> {
     let mut ctx = txn.begin(false)?;
+    let core_defs = core_table_defs();
 
     // 1. Write __all_schema rows
     write_schema_row(&mut ctx, txn, INNER_SCHEMA_ID, INNER_SCHEMA).await?;
     write_schema_row(&mut ctx, txn, DEFAULT_SCHEMA_ID, "default").await?;
     write_schema_row(&mut ctx, txn, TEST_SCHEMA_ID, "test").await?;
 
-    // 2. Write __all_table rows for all 5 core tables
-    for table_def in core_table_defs() {
-        write_table_row(&mut ctx, txn, &table_def).await?;
+    // 2. Write __all_table rows for all core tables
+    for table_def in &core_defs {
+        write_table_row(&mut ctx, txn, table_def).await?;
     }
 
-    // 3. Write __all_column rows for all columns of all 5 core tables
-    for table_def in core_table_defs() {
+    // 3. Write __all_column rows for all columns of all core tables
+    for table_def in &core_defs {
         for (ordinal, col) in table_def.columns().iter().enumerate() {
             write_column_row(&mut ctx, txn, table_def.id(), col, ordinal).await?;
         }
     }
 
-    // 4. Write __all_meta bootstrap entries
+    // 4. Initialize durable AUTO_INCREMENT state for all core tables.
+    for table_def in &core_defs {
+        write_autoinc_row(&mut ctx, txn, table_def.id(), 1).await?;
+    }
+
+    // 5. Write __all_meta bootstrap entries
     write_meta_row(
         &mut ctx,
         txn,
@@ -88,6 +97,42 @@ pub async fn bootstrap_core_tables<T: TxnService>(txn: &T) -> Result<()> {
     )
     .await?;
     write_meta_row(&mut ctx, txn, META_NEXT_GC_TASK_ID, "next_gc_task_id", "1").await?;
+
+    txn.commit(ctx).await?;
+    Ok(())
+}
+
+/// Migrate pre-`__all_autoinc` catalogs to include allocator metadata.
+///
+/// The migration is idempotent and atomic:
+/// - no-op if `__all_autoinc` already exists in `__all_table`.
+/// - otherwise inserts `__all_autoinc` table+column metadata and backfills one
+///   durable row per existing table in a single transaction.
+pub async fn migrate_all_autoinc_if_needed<T: TxnService>(txn: &T) -> Result<()> {
+    let check_ctx = txn.begin(true)?;
+    if has_all_autoinc_table_row(txn, &check_ctx).await? {
+        return Ok(());
+    }
+
+    let mut ctx = txn.begin(false)?;
+    if has_all_autoinc_table_row(txn, &ctx).await? {
+        txn.rollback(ctx)?;
+        return Ok(());
+    }
+
+    let existing_tables = load_table_auto_increment_counters(txn, &ctx).await?;
+
+    let all_autoinc = all_autoinc_def();
+    write_table_row(&mut ctx, txn, &all_autoinc).await?;
+    for (ordinal, col) in all_autoinc.columns().iter().enumerate() {
+        write_column_row(&mut ctx, txn, all_autoinc.id(), col, ordinal).await?;
+    }
+
+    for (table_id, auto_increment_id) in existing_tables {
+        let next_value = auto_increment_id.saturating_add(1).max(1);
+        write_autoinc_row(&mut ctx, txn, table_id, next_value).await?;
+    }
+    write_autoinc_row(&mut ctx, txn, all_autoinc.id(), 1).await?;
 
     txn.commit(ctx).await?;
     Ok(())
@@ -345,6 +390,57 @@ pub(crate) async fn update_gc_task_status<T: TxnService>(
     .await
 }
 
+/// Read a row from `__all_autoinc` by table ID.
+pub(crate) async fn read_autoinc_row<T: TxnService>(
+    ctx: &TxnCtx,
+    txn: &T,
+    table_id: u64,
+) -> Result<Option<u64>> {
+    let key = encode_record_key_with_handle(ALL_AUTOINC_TABLE_ID, table_id as i64);
+    let Some(row_data) = txn.get(ctx, ALL_AUTOINC_TABLE_ID, &key).await? else {
+        return Ok(None);
+    };
+    let col_ids = &[0, 1, 2];
+    let data_types = &[
+        crate::catalog::types::DataType::BigInt,
+        crate::catalog::types::DataType::BigInt,
+        crate::catalog::types::DataType::BigInt,
+    ];
+    let values = decode_row_to_values(&row_data, col_ids, data_types)?;
+    match values[1] {
+        Value::BigInt(v) => Ok(Some(decode_autoinc_next_value(v).max(1))),
+        _ => Ok(None),
+    }
+}
+
+/// Write a row into `__all_autoinc` (table_id=7).
+pub(crate) async fn write_autoinc_row<T: TxnService>(
+    ctx: &mut TxnCtx,
+    txn: &T,
+    table_id: u64,
+    next_value: u64,
+) -> Result<()> {
+    let key = encode_record_key_with_handle(ALL_AUTOINC_TABLE_ID, table_id as i64);
+    let col_ids = &[0, 1, 2];
+    let values = &[
+        Value::BigInt(table_id as i64),
+        Value::BigInt(encode_autoinc_next_value(next_value)),
+        Value::BigInt(0), // updated_ts placeholder
+    ];
+    let row_data = encode_row(col_ids, values);
+    txn.put(ctx, ALL_AUTOINC_TABLE_ID, &key, row_data).await
+}
+
+/// Delete a row from `__all_autoinc` (table_id=7).
+pub(crate) async fn delete_autoinc_row<T: TxnService>(
+    ctx: &mut TxnCtx,
+    txn: &T,
+    table_id: u64,
+) -> Result<()> {
+    let key = encode_record_key_with_handle(ALL_AUTOINC_TABLE_ID, table_id as i64);
+    txn.delete(ctx, ALL_AUTOINC_TABLE_ID, &key).await
+}
+
 /// Update a meta row in `__all_meta` (overwrite existing row).
 pub(crate) async fn update_meta_row<T: TxnService>(
     ctx: &mut TxnCtx,
@@ -354,6 +450,63 @@ pub(crate) async fn update_meta_row<T: TxnService>(
 ) -> Result<()> {
     let meta_key = META_KEYS[meta_id as usize];
     write_meta_row(ctx, txn, meta_id, meta_key, &value.to_string()).await
+}
+
+async fn has_all_autoinc_table_row<T: TxnService>(txn: &T, ctx: &TxnCtx) -> Result<bool> {
+    let key = encode_record_key_with_handle(ALL_TABLE_TABLE_ID, ALL_AUTOINC_TABLE_ID as i64);
+    Ok(txn.get(ctx, ALL_TABLE_TABLE_ID, &key).await?.is_some())
+}
+
+// Encode/decode helpers intentionally preserve the full u64 space in an i64
+// column by round-tripping raw two's-complement bits.
+fn encode_autoinc_next_value(next_value: u64) -> i64 {
+    i64::from_be_bytes(next_value.to_be_bytes())
+}
+
+fn decode_autoinc_next_value(stored: i64) -> u64 {
+    u64::from_be_bytes(stored.to_be_bytes())
+}
+
+async fn load_table_auto_increment_counters<T: TxnService>(
+    txn: &T,
+    ctx: &TxnCtx,
+) -> Result<Vec<(u64, u64)>> {
+    let prefix = gen_table_record_prefix(ALL_TABLE_TABLE_ID);
+    let mut end = prefix.clone();
+    if let Some(last) = end.last_mut() {
+        *last = last.saturating_add(1);
+    }
+
+    let mut iter = txn.scan_iter(ctx, ALL_TABLE_TABLE_ID, prefix..end)?;
+    let col_ids = &[0, 1, 2, 3, 4];
+    let data_types = &[
+        crate::catalog::types::DataType::BigInt,
+        crate::catalog::types::DataType::BigInt,
+        crate::catalog::types::DataType::Varchar(128),
+        crate::catalog::types::DataType::Varchar(256),
+        crate::catalog::types::DataType::BigInt,
+    ];
+
+    let mut out = Vec::new();
+    iter.advance().await?;
+    while iter.valid() {
+        let row = decode_row_to_values(iter.value(), col_ids, data_types)?;
+        let table_id = match row[0] {
+            Value::BigInt(v) => v as u64,
+            _ => {
+                iter.advance().await?;
+                continue;
+            }
+        };
+        let auto_increment_id = match row[4] {
+            Value::BigInt(v) if v > 0 => v as u64,
+            Value::BigInt(_) => 0,
+            _ => 0,
+        };
+        out.push((table_id, auto_increment_id));
+        iter.advance().await?;
+    }
+    Ok(out)
 }
 
 #[cfg(test)]
@@ -448,7 +601,7 @@ mod tests {
         for schema_id in [INNER_SCHEMA_ID, DEFAULT_SCHEMA_ID, TEST_SCHEMA_ID] {
             let key = encode_record_key_with_handle(ALL_SCHEMA_TABLE_ID, schema_id as i64);
             assert!(
-                txn.get(&ctx, ALL_META_TABLE_ID, &key)
+                txn.get(&ctx, ALL_SCHEMA_TABLE_ID, &key)
                     .await
                     .unwrap()
                     .is_some(),
@@ -463,15 +616,90 @@ mod tests {
         bootstrap_core_tables(txn.as_ref()).await.unwrap();
 
         let ctx = txn.begin(true).unwrap();
-        for table_id in 1..=5u64 {
+        for table_id in 1..=ALL_AUTOINC_TABLE_ID {
             let key = encode_record_key_with_handle(ALL_TABLE_TABLE_ID, table_id as i64);
             assert!(
-                txn.get(&ctx, ALL_META_TABLE_ID, &key)
+                txn.get(&ctx, ALL_TABLE_TABLE_ID, &key)
                     .await
                     .unwrap()
                     .is_some(),
                 "Table row {table_id} missing"
             );
+        }
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn test_bootstrap_writes_autoinc_rows_for_core_tables() {
+        let (txn, _dir) = create_test_txn();
+        bootstrap_core_tables(txn.as_ref()).await.unwrap();
+
+        let ctx = txn.begin(true).unwrap();
+        for table_def in core_table_defs() {
+            let next = read_autoinc_row(&ctx, txn.as_ref(), table_def.id())
+                .await
+                .unwrap();
+            assert_eq!(next, Some(1), "missing autoinc row for {}", table_def.id());
+        }
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn test_autoinc_row_roundtrip_large_next_value() {
+        let (txn, _dir) = create_test_txn();
+        bootstrap_core_tables(txn.as_ref()).await.unwrap();
+
+        let table_id = 42_4242u64;
+        let large_next = (i64::MAX as u64) + 1;
+
+        let mut write_ctx = txn.begin(false).unwrap();
+        write_autoinc_row(&mut write_ctx, txn.as_ref(), table_id, large_next)
+            .await
+            .unwrap();
+        txn.commit(write_ctx).await.unwrap();
+
+        let read_ctx = txn.begin(true).unwrap();
+        let next = read_autoinc_row(&read_ctx, txn.as_ref(), table_id)
+            .await
+            .unwrap();
+        assert_eq!(next, Some(large_next));
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn test_migrate_all_autoinc_backfills_when_missing() {
+        let (txn, _dir) = create_test_txn();
+        bootstrap_core_tables(txn.as_ref()).await.unwrap();
+
+        // Simulate pre-migration catalog by removing __all_autoinc metadata and rows.
+        let mut ctx = txn.begin(false).unwrap();
+        let all_autoinc = all_autoinc_def();
+        let table_key =
+            encode_record_key_with_handle(ALL_TABLE_TABLE_ID, ALL_AUTOINC_TABLE_ID as i64);
+        txn.delete(&mut ctx, ALL_TABLE_TABLE_ID, &table_key)
+            .await
+            .unwrap();
+        for col in all_autoinc.columns() {
+            let column_key = ALL_AUTOINC_TABLE_ID * 10000 + col.id() as u64;
+            let key = encode_record_key_with_handle(ALL_COLUMN_TABLE_ID, column_key as i64);
+            txn.delete(&mut ctx, ALL_COLUMN_TABLE_ID, &key)
+                .await
+                .unwrap();
+        }
+        for table_id in 1..=ALL_AUTOINC_TABLE_ID {
+            let key = encode_record_key_with_handle(ALL_AUTOINC_TABLE_ID, table_id as i64);
+            txn.delete(&mut ctx, ALL_AUTOINC_TABLE_ID, &key)
+                .await
+                .unwrap();
+        }
+        txn.commit(ctx).await.unwrap();
+
+        migrate_all_autoinc_if_needed(txn.as_ref()).await.unwrap();
+        migrate_all_autoinc_if_needed(txn.as_ref()).await.unwrap();
+
+        let check_ctx = txn.begin(true).unwrap();
+        for table_id in 1..=ALL_AUTOINC_TABLE_ID {
+            let next = read_autoinc_row(&check_ctx, txn.as_ref(), table_id)
+                .await
+                .unwrap();
+            assert_eq!(next, Some(1), "autoinc row {table_id} missing");
         }
     }
 }

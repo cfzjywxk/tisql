@@ -103,6 +103,7 @@ pub enum LogicalPlan {
     CreateTable {
         table: TableDef,
         if_not_exists: bool,
+        auto_increment_offset: Option<u64>,
     },
 
     /// Drop table

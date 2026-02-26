@@ -993,17 +993,27 @@ impl Database {
         storage.set_gc_safe_point_updater(Arc::clone(&gc_safe_point_updater));
 
         // Load pending GC tasks from inner tables (for observability).
+        // Run on a blocking pool so startup never parks a runtime worker on
+        // scan-table futures.
         {
             use inner_table::catalog_loader::load_gc_tasks;
-            match load_gc_tasks(txn_service.as_ref()) {
-                Ok(tasks) => {
+
+            let txn_service = Arc::clone(&txn_service);
+            let load_tasks = bg_runtime
+                .handle()
+                .spawn_blocking(move || load_gc_tasks(txn_service.as_ref()));
+            match crate::io::block_on_sync(load_tasks) {
+                Ok(Ok(tasks)) => {
                     let pending_count = tasks.iter().filter(|task| task.status != "done").count();
                     if pending_count > 0 {
                         log_info!("Recovered {} pending GC delete-range tasks", pending_count);
                     }
                 }
-                Err(e) => {
+                Ok(Err(e)) => {
                     log_warn!("Failed to load GC tasks (non-fatal): {}", e);
+                }
+                Err(e) => {
+                    log_warn!("Failed to join GC task loader (non-fatal): {}", e);
                 }
             }
         }
@@ -1631,8 +1641,9 @@ mod tests {
     use super::*;
     use crate::inner_table::catalog_loader::load_gc_tasks;
     use crate::inner_table::core_tables::{
-        ALL_COLUMN_TABLE_ID, ALL_GC_DELETE_RANGE_TABLE_ID, ALL_INDEX_TABLE_ID, ALL_META_TABLE_ID,
-        ALL_SCHEMA_TABLE_ID, ALL_TABLE_TABLE_ID, USER_TABLE_ID_START,
+        ALL_AUTOINC_TABLE_ID, ALL_COLUMN_TABLE_ID, ALL_GC_DELETE_RANGE_TABLE_ID,
+        ALL_INDEX_TABLE_ID, ALL_META_TABLE_ID, ALL_SCHEMA_TABLE_ID, ALL_TABLE_TABLE_ID,
+        USER_TABLE_ID_START,
     };
     use crate::tablet::{
         encode_key, encode_pk, is_tombstone, IlogConfig, IlogService, LsmConfig, MvccIterator,
@@ -1929,6 +1940,174 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn test_auto_increment_mixed_explicit_and_generated_order() {
+        let (db, _dir) = create_test_db();
+
+        db.execute_query(
+            "CREATE TABLE ai_mix (id BIGINT NOT NULL AUTO_INCREMENT PRIMARY KEY, v INT)",
+        )
+        .await
+        .unwrap();
+        db.execute_query("INSERT INTO ai_mix (v) VALUES (10), (20), (30)")
+            .await
+            .unwrap();
+        db.execute_query("INSERT INTO ai_mix (id, v) VALUES (100, 40)")
+            .await
+            .unwrap();
+        db.execute_query("INSERT INTO ai_mix (v) VALUES (50)")
+            .await
+            .unwrap();
+
+        let result = db
+            .execute_query("SELECT id FROM ai_mix ORDER BY id")
+            .await
+            .unwrap();
+        match result {
+            QueryResult::Rows { data, .. } => {
+                let ids: Vec<i64> = data
+                    .into_iter()
+                    .map(|row| row[0].parse::<i64>().unwrap())
+                    .collect();
+                assert_eq!(ids, vec![1, 2, 3, 100, 101]);
+            }
+            _ => panic!("Expected rows"),
+        }
+    }
+
+    #[tokio::test]
+    async fn test_auto_increment_seed_applies_to_first_generated_value() {
+        let (db, _dir) = create_test_db();
+
+        db.execute_query(
+            "CREATE TABLE ai_seed (id INT NOT NULL AUTO_INCREMENT PRIMARY KEY, v INT) AUTO_INCREMENT=7",
+        )
+        .await
+        .unwrap();
+        db.execute_query("INSERT INTO ai_seed (v) VALUES (1), (2)")
+            .await
+            .unwrap();
+
+        let result = db
+            .execute_query("SELECT id FROM ai_seed ORDER BY id")
+            .await
+            .unwrap();
+        match result {
+            QueryResult::Rows { data, .. } => {
+                let ids: Vec<i32> = data
+                    .into_iter()
+                    .map(|row| row[0].parse::<i32>().unwrap())
+                    .collect();
+                assert_eq!(ids, vec![7, 8]);
+            }
+            _ => panic!("Expected rows"),
+        }
+    }
+
+    #[tokio::test]
+    async fn test_auto_increment_int_pk_literal_lookup_and_duplicate_check() {
+        let (db, _dir) = create_test_db();
+
+        db.execute_query(
+            "CREATE TABLE ai_int_pk (id INT NOT NULL AUTO_INCREMENT PRIMARY KEY, v INT)",
+        )
+        .await
+        .unwrap();
+        db.execute_query("INSERT INTO ai_int_pk (v) VALUES (10)")
+            .await
+            .unwrap();
+
+        let result = db
+            .execute_query("SELECT v FROM ai_int_pk WHERE id = 1")
+            .await
+            .unwrap();
+        match result {
+            QueryResult::Rows { data, .. } => {
+                assert_eq!(data.len(), 1);
+                assert_eq!(data[0][0], "10");
+            }
+            _ => panic!("Expected rows"),
+        }
+
+        let err = db
+            .execute_query("INSERT INTO ai_int_pk (id, v) VALUES (1, 20)")
+            .await
+            .unwrap_err();
+        let err_msg = err.to_string();
+        assert!(
+            err_msg.contains("Duplicate") || err_msg.contains("duplicate"),
+            "expected duplicate key error, got: {err_msg}"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_auto_increment_int_overflow_returns_error() {
+        let (db, _dir) = create_test_db();
+
+        db.execute_query(
+            "CREATE TABLE ai_overflow (id INT NOT NULL AUTO_INCREMENT PRIMARY KEY, v INT) AUTO_INCREMENT=2147483647",
+        )
+        .await
+        .unwrap();
+        db.execute_query("INSERT INTO ai_overflow (v) VALUES (1)")
+            .await
+            .unwrap();
+
+        let err = db
+            .execute_query("INSERT INTO ai_overflow (v) VALUES (2)")
+            .await
+            .unwrap_err();
+        assert!(
+            err.to_string().contains("overflow"),
+            "unexpected error: {err}"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_auto_increment_recovery_continues_from_durable_next_value() {
+        let dir = tempdir().unwrap();
+        let config = DatabaseConfig::with_data_dir(dir.path());
+
+        {
+            let db = Database::open(config.clone()).unwrap();
+            db.execute_query(
+                "CREATE TABLE ai_recover (id BIGINT NOT NULL AUTO_INCREMENT PRIMARY KEY, v INT)",
+            )
+            .await
+            .unwrap();
+            db.execute_query("INSERT INTO ai_recover (v) VALUES (1), (2)")
+                .await
+                .unwrap();
+            db.execute_query("INSERT INTO ai_recover (id, v) VALUES (100, 3)")
+                .await
+                .unwrap();
+            db.close().await.unwrap();
+        }
+
+        {
+            let db = Database::open(config).unwrap();
+            db.execute_query("INSERT INTO ai_recover (v) VALUES (4)")
+                .await
+                .unwrap();
+
+            let result = db
+                .execute_query("SELECT id FROM ai_recover ORDER BY id")
+                .await
+                .unwrap();
+            match result {
+                QueryResult::Rows { data, .. } => {
+                    let ids: Vec<i64> = data
+                        .into_iter()
+                        .map(|row| row[0].parse::<i64>().unwrap())
+                        .collect();
+                    assert_eq!(ids, vec![1, 2, 100, 101]);
+                }
+                other => panic!("expected rows, got {other:?}"),
+            }
+            db.close().await.unwrap();
+        }
+    }
+
+    #[tokio::test]
     async fn test_database_with_durability() {
         let dir = tempdir().unwrap();
         let config = DatabaseConfig::with_data_dir(dir.path());
@@ -1980,6 +2159,7 @@ mod tests {
             ALL_COLUMN_TABLE_ID,
             ALL_INDEX_TABLE_ID,
             ALL_GC_DELETE_RANGE_TABLE_ID,
+            ALL_AUTOINC_TABLE_ID,
         ] {
             assert!(
                 !tablets_dir.join(format!("t_{inner_table_id}")).exists(),

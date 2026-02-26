@@ -244,6 +244,26 @@ impl Catalog for MemoryCatalog {
         Ok(table.increment_auto_id())
     }
 
+    fn observe_auto_increment_explicit(&self, table_id: TableId, explicit_v: u64) -> Result<()> {
+        let tables_by_id = self.tables_by_id.read();
+        let mut schemas = self.schemas.write();
+
+        let (schema, table_name) = tables_by_id
+            .get(&table_id)
+            .ok_or_else(|| TiSqlError::Catalog(format!("Table with ID {table_id} not found")))?
+            .clone();
+
+        let table = schemas
+            .get_mut(&schema)
+            .and_then(|tables| tables.get_mut(&table_name))
+            .ok_or_else(|| TiSqlError::Catalog("Table not found".into()))?;
+
+        if explicit_v > table.auto_increment_id() {
+            table.set_auto_increment_id(explicit_v);
+        }
+        Ok(())
+    }
+
     fn next_table_id(&self) -> Result<TableId> {
         Ok(self.next_table_id.fetch_add(1, Ordering::SeqCst))
     }
@@ -319,5 +339,24 @@ mod tests {
         assert_eq!(catalog.next_auto_increment(table_id).unwrap(), 1);
         assert_eq!(catalog.next_auto_increment(table_id).unwrap(), 2);
         assert_eq!(catalog.next_auto_increment(table_id).unwrap(), 3);
+    }
+
+    #[tokio::test]
+    async fn test_auto_increment_observe_explicit() {
+        let catalog = MemoryCatalog::new();
+        let table = make_test_table(&catalog, "users");
+        let table_id = table.id();
+
+        catalog.create_table(table).await.unwrap();
+
+        assert_eq!(catalog.next_auto_increment(table_id).unwrap(), 1);
+        catalog
+            .observe_auto_increment_explicit(table_id, 100)
+            .unwrap();
+        assert_eq!(catalog.next_auto_increment(table_id).unwrap(), 101);
+        catalog
+            .observe_auto_increment_explicit(table_id, 50)
+            .unwrap();
+        assert_eq!(catalog.next_auto_increment(table_id).unwrap(), 102);
     }
 }

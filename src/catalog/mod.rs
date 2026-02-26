@@ -24,6 +24,7 @@
 //! - `MemoryCatalog` - In-memory implementation
 //! - `TableDef`, `ColumnDef`, `IndexDef` - Schema definitions
 
+mod auto_increment;
 mod memory;
 mod mvcc;
 pub mod types;
@@ -289,6 +290,10 @@ impl TableDef {
         self.auto_increment_id += 1;
         self.auto_increment_id
     }
+
+    pub(crate) fn set_auto_increment_id(&mut self, auto_increment_id: u64) {
+        self.auto_increment_id = auto_increment_id;
+    }
 }
 
 // ============================================================================
@@ -367,6 +372,11 @@ pub trait Catalog: Send + Sync {
 
     /// Get and increment the auto-increment value for a table.
     fn next_auto_increment(&self, table_id: TableId) -> Result<u64>;
+
+    /// Observe a successfully inserted explicit AUTO_INCREMENT value.
+    ///
+    /// Implementations must ensure later generated values are `> explicit_v`.
+    fn observe_auto_increment_explicit(&self, table_id: TableId, explicit_v: u64) -> Result<()>;
 
     // ID generation
 

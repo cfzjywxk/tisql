@@ -175,8 +175,9 @@ mod tests {
     use super::*;
     use crate::catalog::types::Value;
     use crate::inner_table::core_tables::{
-        ALL_COLUMN_TABLE_ID, ALL_GC_DELETE_RANGE_TABLE_ID, ALL_INDEX_TABLE_ID, ALL_META_TABLE_ID,
-        ALL_SCHEMA_TABLE_ID, ALL_TABLE_TABLE_ID, USER_TABLE_ID_START,
+        ALL_AUTOINC_TABLE_ID, ALL_COLUMN_TABLE_ID, ALL_GC_DELETE_RANGE_TABLE_ID,
+        ALL_INDEX_TABLE_ID, ALL_META_TABLE_ID, ALL_SCHEMA_TABLE_ID, ALL_TABLE_TABLE_ID,
+        USER_TABLE_ID_START,
     };
     use crate::util::codec::key::{
         encode_index_seek_key, encode_record_key, encode_record_key_with_handle,
@@ -376,7 +377,7 @@ mod tests {
         );
     }
 
-    /// T1.5i: All 6 inner/system table IDs (1-6) must route to System.
+    /// T1.5i: All inner/system table IDs (1-7) must route to System.
     #[test]
     fn route_all_inner_table_ids_to_system() {
         let inner_table_ids = [
@@ -386,6 +387,7 @@ mod tests {
             ALL_COLUMN_TABLE_ID,
             ALL_INDEX_TABLE_ID,
             ALL_GC_DELETE_RANGE_TABLE_ID,
+            ALL_AUTOINC_TABLE_ID,
         ];
 
         for &tid in &inner_table_ids {

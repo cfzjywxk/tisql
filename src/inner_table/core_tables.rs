@@ -14,7 +14,7 @@
 
 //! Core system table definitions for the inner-table-based catalog.
 //!
-//! Defines hardcoded schemas for the 5 core system tables following
+//! Defines hardcoded schemas for the core system tables following
 //! the OceanBase bootstrap pattern. These tables are the single source
 //! of truth for all schema metadata.
 
@@ -51,6 +51,7 @@ pub const ALL_TABLE_TABLE_ID: u64 = 3;
 pub const ALL_COLUMN_TABLE_ID: u64 = 4;
 pub const ALL_INDEX_TABLE_ID: u64 = 5;
 pub const ALL_GC_DELETE_RANGE_TABLE_ID: u64 = 6;
+pub const ALL_AUTOINC_TABLE_ID: u64 = 7;
 
 // Well-known meta IDs in __all_meta
 pub const META_BOOTSTRAP_VERSION: i64 = 1;
@@ -298,7 +299,22 @@ pub fn all_gc_delete_range_def() -> TableDef {
     )
 }
 
-/// Returns all 6 core table definitions.
+/// Build the hardcoded TableDef for `__all_autoinc`.
+pub fn all_autoinc_def() -> TableDef {
+    TableDef::new(
+        ALL_AUTOINC_TABLE_ID,
+        "__all_autoinc".to_string(),
+        INNER_SCHEMA.to_string(),
+        vec![
+            ColumnDef::new(0, "table_id".into(), DataType::BigInt, false, None, false),
+            ColumnDef::new(1, "next_value".into(), DataType::BigInt, false, None, false),
+            ColumnDef::new(2, "updated_ts".into(), DataType::BigInt, false, None, false),
+        ],
+        vec![0], // PK = table_id
+    )
+}
+
+/// Returns all core table definitions.
 pub fn core_table_defs() -> Vec<TableDef> {
     vec![
         all_meta_def(),
@@ -307,6 +323,7 @@ pub fn core_table_defs() -> Vec<TableDef> {
         all_column_def(),
         all_index_def(),
         all_gc_delete_range_def(),
+        all_autoinc_def(),
     ]
 }
 
@@ -476,13 +493,14 @@ mod tests {
     #[test]
     fn test_core_table_defs_count() {
         let defs = core_table_defs();
-        assert_eq!(defs.len(), 6);
+        assert_eq!(defs.len(), 7);
         assert_eq!(defs[0].id(), ALL_META_TABLE_ID);
         assert_eq!(defs[1].id(), ALL_SCHEMA_TABLE_ID);
         assert_eq!(defs[2].id(), ALL_TABLE_TABLE_ID);
         assert_eq!(defs[3].id(), ALL_COLUMN_TABLE_ID);
         assert_eq!(defs[4].id(), ALL_INDEX_TABLE_ID);
         assert_eq!(defs[5].id(), ALL_GC_DELETE_RANGE_TABLE_ID);
+        assert_eq!(defs[6].id(), ALL_AUTOINC_TABLE_ID);
     }
 
     #[test]
@@ -494,6 +512,7 @@ mod tests {
         assert_eq!(defs[3].name(), "__all_column");
         assert_eq!(defs[4].name(), "__all_index");
         assert_eq!(defs[5].name(), "__all_gc_delete_range");
+        assert_eq!(defs[6].name(), "__all_autoinc");
     }
 
     #[test]

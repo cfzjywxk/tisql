@@ -144,13 +144,19 @@ impl<T: TxnService + 'static> GcWorkerInner<T> {
             tracing::warn!("GC worker: force-released {released} stale commit reservations");
         }
 
-        let tasks = match load_gc_tasks(self.txn_service.as_ref()) {
-            Ok(tasks) => tasks,
-            Err(e) => {
-                tracing::warn!("GC worker: failed to load tasks: {e}");
-                return;
-            }
-        };
+        let txn_service = Arc::clone(&self.txn_service);
+        let tasks =
+            match tokio::task::spawn_blocking(move || load_gc_tasks(txn_service.as_ref())).await {
+                Ok(Ok(tasks)) => tasks,
+                Ok(Err(e)) => {
+                    tracing::warn!("GC worker: failed to load tasks: {e}");
+                    return;
+                }
+                Err(e) => {
+                    tracing::warn!("GC worker: load_gc_tasks join error: {e}");
+                    return;
+                }
+            };
 
         let gc_safe_point = (self.gc_safe_point)();
 

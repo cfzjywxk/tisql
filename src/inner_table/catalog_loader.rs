@@ -358,10 +358,8 @@ fn load_tables<T: TxnService>(txn: &T, ctx: &TxnCtx, cache: &mut CatalogCache) -
             primary_key,
         );
 
-        // Set auto_increment_id
-        for _ in 0..auto_increment_id {
-            table_def.increment_auto_id();
-        }
+        // Set auto_increment_id in O(1).
+        table_def.set_auto_increment_id(auto_increment_id);
 
         // Reconstruct indexes
         if let Some(idx_rows) = indexes_by_table.get(&table_id) {
@@ -839,10 +837,8 @@ fn reconstruct_table_def(
 
     let mut table_def = TableDef::new(table_id, table_name, schema_name, columns, primary_key);
 
-    // Restore auto_increment_id
-    for _ in 0..auto_increment_id {
-        table_def.increment_auto_id();
-    }
+    // Restore auto_increment_id in O(1).
+    table_def.set_auto_increment_id(auto_increment_id);
 
     // Reconstruct indexes
     if let Some(idx_rows) = indexes_by_table.get(&table_id) {
@@ -1049,13 +1045,16 @@ mod tests {
         assert_eq!(counters.next_schema_id, USER_SCHEMA_ID_START);
 
         // Check core tables are loaded
-        assert_eq!(cache.tables.len(), 6);
+        assert_eq!(cache.tables.len(), 7);
         assert!(cache
             .tables
             .contains_key(&(INNER_SCHEMA.to_string(), "__all_meta".to_string())));
         assert!(cache
             .tables
             .contains_key(&(INNER_SCHEMA.to_string(), "__all_table".to_string())));
+        assert!(cache
+            .tables
+            .contains_key(&(INNER_SCHEMA.to_string(), "__all_autoinc".to_string())));
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -1094,8 +1093,8 @@ mod tests {
 
         let (cache, _) = load_catalog(txn.as_ref()).unwrap();
 
-        // All 6 core tables should be in table_id_map
-        assert_eq!(cache.table_id_map.len(), 6);
+        // All core tables should be in table_id_map
+        assert_eq!(cache.table_id_map.len(), 7);
         assert_eq!(
             cache.table_id_map[&ALL_META_TABLE_ID],
             (INNER_SCHEMA.to_string(), "__all_meta".to_string())
@@ -1103,6 +1102,10 @@ mod tests {
         assert_eq!(
             cache.table_id_map[&ALL_TABLE_TABLE_ID],
             (INNER_SCHEMA.to_string(), "__all_table".to_string())
+        );
+        assert_eq!(
+            cache.table_id_map[&ALL_AUTOINC_TABLE_ID],
+            (INNER_SCHEMA.to_string(), "__all_autoinc".to_string())
         );
     }
 }

@@ -1475,6 +1475,96 @@ async fn test_multiple_keys_lock_release() {
 }
 
 // ============================================================================
+// AUTO_INCREMENT Tests
+// ============================================================================
+
+#[tokio::test]
+async fn test_auto_increment_mixed_explicit_and_generated_order() {
+    let ctx = TestContext::new().await;
+    let mut conn = ctx.conn().await;
+
+    exec(
+        &mut conn,
+        "CREATE TABLE ai_mix_proto (id BIGINT NOT NULL AUTO_INCREMENT PRIMARY KEY, v INT)",
+    )
+    .await;
+
+    exec(
+        &mut conn,
+        "INSERT INTO ai_mix_proto (id, v) VALUES (NULL, 10), (NULL, 20), (100, 30), (NULL, 40)",
+    )
+    .await;
+
+    let rows = query_all(&mut conn, "SELECT id FROM ai_mix_proto ORDER BY id").await;
+    assert_eq!(rows, vec![vec!["1"], vec!["2"], vec!["100"], vec!["101"]]);
+}
+
+#[tokio::test]
+async fn test_auto_increment_seed_applies_to_first_generated_value() {
+    let ctx = TestContext::new().await;
+    let mut conn = ctx.conn().await;
+
+    exec(
+        &mut conn,
+        "CREATE TABLE ai_seed_proto (id INT NOT NULL AUTO_INCREMENT PRIMARY KEY, v INT) AUTO_INCREMENT=7",
+    )
+    .await;
+    exec(&mut conn, "INSERT INTO ai_seed_proto (v) VALUES (1), (2)").await;
+
+    let rows = query_all(&mut conn, "SELECT id FROM ai_seed_proto ORDER BY id").await;
+    assert_eq!(rows, vec![vec!["7"], vec!["8"]]);
+}
+
+#[tokio::test]
+async fn test_auto_increment_int_pk_literal_lookup_and_duplicate_check() {
+    let ctx = TestContext::new().await;
+    let mut conn = ctx.conn().await;
+
+    exec(
+        &mut conn,
+        "CREATE TABLE ai_int_pk_proto (id INT NOT NULL AUTO_INCREMENT PRIMARY KEY, v INT)",
+    )
+    .await;
+    exec(&mut conn, "INSERT INTO ai_int_pk_proto (v) VALUES (10)").await;
+
+    let v = query_one(&mut conn, "SELECT v FROM ai_int_pk_proto WHERE id = 1").await;
+    assert_eq!(v, "10");
+
+    let result = conn
+        .query_drop("INSERT INTO ai_int_pk_proto (id, v) VALUES (1, 20)")
+        .await;
+    assert!(result.is_err(), "Expected duplicate-key error");
+    let err_msg = format!("{:?}", result.unwrap_err()).to_lowercase();
+    assert!(
+        err_msg.contains("duplicate"),
+        "Expected duplicate-key error, got: {err_msg}"
+    );
+}
+
+#[tokio::test]
+async fn test_auto_increment_int_overflow_returns_error() {
+    let ctx = TestContext::new().await;
+    let mut conn = ctx.conn().await;
+
+    exec(
+        &mut conn,
+        "CREATE TABLE ai_overflow_proto (id INT NOT NULL AUTO_INCREMENT PRIMARY KEY, v INT) AUTO_INCREMENT=2147483647",
+    )
+    .await;
+    exec(&mut conn, "INSERT INTO ai_overflow_proto (v) VALUES (1)").await;
+
+    let result = conn
+        .query_drop("INSERT INTO ai_overflow_proto (v) VALUES (2)")
+        .await;
+    assert!(result.is_err(), "Expected overflow error");
+    let err_msg = format!("{:?}", result.unwrap_err()).to_lowercase();
+    assert!(
+        err_msg.contains("overflow"),
+        "Expected overflow error, got: {err_msg}"
+    );
+}
+
+// ============================================================================
 // SHOW Tests
 // ============================================================================
 
