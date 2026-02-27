@@ -1716,8 +1716,8 @@ impl LsmEngine {
                     ns: self.tablet_cache_ns,
                     sst_id,
                 };
-                if let Some(reader) = reader_cache.get_typed::<SstReaderRef>(&key) {
-                    return Ok((*reader).clone());
+                if let Some(reader) = reader_cache.get(&key) {
+                    return Ok(reader);
                 }
 
                 let options = SstReadOptions {
@@ -1731,7 +1731,7 @@ impl LsmEngine {
                 let reader =
                     SstReaderRef::open_with_options(sst_path, Arc::clone(&self.io), options)
                         .await?;
-                reader_cache.insert_typed(key, Arc::new(reader.clone()));
+                reader_cache.insert(key, reader.clone());
                 return Ok(reader);
             }
         }

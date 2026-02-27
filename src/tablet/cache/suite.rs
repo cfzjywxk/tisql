@@ -17,7 +17,7 @@ use std::sync::Arc;
 use crate::tablet::config::LsmConfig;
 
 use super::block_cache::SharedBlockCache;
-use super::reader_cache::ReaderCache;
+use super::reader_cache::{normalize_reader_shards, ReaderCache};
 use super::row_cache::RowCache;
 
 /// Global cache-suite configuration.
@@ -30,6 +30,8 @@ pub struct CacheSuiteConfig {
     pub scan_fill_cache_threshold_blocks: usize,
     pub cache_total_ratio: f64,
     pub reader_cache_max_entries: usize,
+    /// Reader-cache shard override (0 = auto).
+    pub reader_cache_shards: usize,
 }
 
 impl CacheSuiteConfig {
@@ -42,6 +44,7 @@ impl CacheSuiteConfig {
             scan_fill_cache_threshold_blocks: config.scan_fill_cache_threshold_blocks,
             cache_total_ratio: config.cache_total_ratio,
             reader_cache_max_entries: config.reader_cache_max_entries,
+            reader_cache_shards: config.reader_cache_shards,
         }
     }
 
@@ -60,6 +63,7 @@ impl Default for CacheSuiteConfig {
             scan_fill_cache_threshold_blocks: 8,
             cache_total_ratio: 0.50,
             reader_cache_max_entries: 100_000,
+            reader_cache_shards: 0,
         }
     }
 }
@@ -112,7 +116,18 @@ impl CacheSuite {
             None
         };
         let reader_cache = if config.reader_cache_enabled {
-            Some(Arc::new(ReaderCache::new(config.reader_cache_max_entries)))
+            let shard_count = match normalize_reader_shards(config.reader_cache_shards) {
+                Some(shards) => shards,
+                None if config.reader_cache_shards == 0 => ReaderCache::auto_shard_count(),
+                None => panic!(
+                    "invalid reader_cache_shards={} (expected 0 or power-of-two in [1,16])",
+                    config.reader_cache_shards
+                ),
+            };
+            Some(Arc::new(ReaderCache::new(
+                config.reader_cache_max_entries,
+                shard_count,
+            )))
         } else {
             None
         };
@@ -161,6 +176,7 @@ mod tests {
             scan_fill_cache_threshold_blocks: 8,
             cache_total_ratio: 0.50,
             reader_cache_max_entries: 10,
+            reader_cache_shards: 0,
         });
 
         assert!(suite.block_cache().is_some());
@@ -178,6 +194,7 @@ mod tests {
             .scan_fill_cache_threshold_blocks(12)
             .cache_total_ratio(0.6)
             .reader_cache_max_entries(321)
+            .reader_cache_shards(8)
             .build()
             .unwrap();
 
@@ -188,6 +205,7 @@ mod tests {
         assert!(suite_cfg.scan_fill_cache);
         assert_eq!(suite_cfg.scan_fill_cache_threshold_blocks, 12);
         assert_eq!(suite_cfg.reader_cache_max_entries, 321);
+        assert_eq!(suite_cfg.reader_cache_shards, 8);
     }
 
     #[test]
@@ -200,10 +218,12 @@ mod tests {
             scan_fill_cache_threshold_blocks: 16,
             cache_total_ratio: 0.50,
             reader_cache_max_entries: 64,
+            reader_cache_shards: 4,
         });
 
         assert!(suite.block_cache().is_some());
         assert!(suite.reader_cache().is_some());
         assert!(suite.row_cache().is_some());
+        assert_eq!(suite.reader_cache().unwrap().shard_count(), 4);
     }
 }

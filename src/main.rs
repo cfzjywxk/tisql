@@ -26,7 +26,8 @@ use clap::Parser as ClapParser;
 use tisql::tablet::{
     DEFAULT_BLOOM_BITS_PER_KEY, DEFAULT_CACHE_TOTAL_RATIO, DEFAULT_L0_COMPACTION_TRIGGER,
     DEFAULT_L0_SLOWDOWN_TRIGGER, DEFAULT_L0_STOP_TRIGGER, DEFAULT_MAX_LEVELS,
-    DEFAULT_READER_CACHE_MAX_ENTRIES, DEFAULT_SCAN_FILL_CACHE_THRESHOLD_BLOCKS,
+    DEFAULT_READER_CACHE_MAX_ENTRIES, DEFAULT_READER_CACHE_SHARDS,
+    DEFAULT_SCAN_FILL_CACHE_THRESHOLD_BLOCKS,
 };
 use tisql::util::LogLevel;
 use tisql::{log_error, log_info};
@@ -174,6 +175,10 @@ struct Args {
     )]
     reader_cache_max_entries: usize,
 
+    /// Reader-cache shards (0 = auto, or power-of-two in [1, 16]).
+    #[arg(long, default_value_t = DEFAULT_READER_CACHE_SHARDS)]
+    reader_cache_shards: usize,
+
     /// L0 file count that triggers compaction.
     #[arg(
         long,
@@ -277,6 +282,7 @@ fn main() {
         .with_scan_fill_cache_threshold_blocks(args.scan_fill_cache_threshold_blocks)
         .with_cache_total_ratio(args.cache_total_ratio)
         .with_reader_cache_max_entries(args.reader_cache_max_entries)
+        .with_reader_cache_shards(args.reader_cache_shards)
         .with_l0_compaction_trigger(args.l0_compaction_trigger as usize)
         .with_l0_slowdown_trigger(args.l0_slowdown_trigger as usize)
         .with_l0_stop_trigger(args.l0_stop_trigger as usize)
@@ -322,7 +328,7 @@ fn main() {
         args.bloom_bits_per_key
     );
     println!(
-        "Cache suite: block={}, reader={}, row={}, scan_fill={} (threshold_blocks={}, ratio={}, reader_cap={})",
+        "Cache suite: block={}, reader={}, row={}, scan_fill={} (threshold_blocks={}, ratio={}, reader_cap={}, reader_shards={})",
         if shared_block_cache_enabled {
             "enabled"
         } else {
@@ -345,7 +351,8 @@ fn main() {
         },
         args.scan_fill_cache_threshold_blocks,
         args.cache_total_ratio,
-        args.reader_cache_max_entries
+        args.reader_cache_max_entries,
+        args.reader_cache_shards
     );
     println!(
         "LSM flow control: levels={} l0(compact/slowdown/stop)=({}/{}/{})",
@@ -536,6 +543,7 @@ mod tests {
             args.reader_cache_max_entries,
             DEFAULT_READER_CACHE_MAX_ENTRIES
         );
+        assert_eq!(args.reader_cache_shards, DEFAULT_READER_CACHE_SHARDS);
         assert_eq!(
             args.l0_compaction_trigger,
             DEFAULT_L0_COMPACTION_TRIGGER as u32
@@ -615,6 +623,12 @@ mod tests {
         assert_eq!(args.l0_slowdown_trigger, 24);
         assert_eq!(args.l0_stop_trigger, 36);
         assert_eq!(args.max_levels, 4);
+    }
+
+    #[test]
+    fn test_reader_cache_shards_flag_parse() {
+        let args = Args::try_parse_from(["tisql", "--reader-cache-shards", "8"]).unwrap();
+        assert_eq!(args.reader_cache_shards, 8);
     }
 
     #[test]

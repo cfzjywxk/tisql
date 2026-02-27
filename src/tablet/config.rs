@@ -137,6 +137,9 @@ pub const DEFAULT_CACHE_TOTAL_RATIO: f64 = 0.50;
 /// Reader-cache entry cap.
 pub const DEFAULT_READER_CACHE_MAX_ENTRIES: usize = 100_000;
 
+/// Reader-cache shard count override (0 = auto).
+pub const DEFAULT_READER_CACHE_SHARDS: usize = 0;
+
 /// Rollout mode for V2.6 reservation/in-flight boundaries.
 ///
 /// Note: Phase 5 normalizes runtime behavior to `On` inside `LsmEngine`.
@@ -263,6 +266,9 @@ pub struct LsmConfig {
     /// Reader cache max entry count.
     pub reader_cache_max_entries: usize,
 
+    /// Reader-cache shard override (0 = auto).
+    pub reader_cache_shards: usize,
+
     /// Target SST file size (bytes).
     ///
     /// SST files will be split to stay near this size.
@@ -357,6 +363,7 @@ impl LsmConfig {
             scan_fill_cache_threshold_blocks: DEFAULT_SCAN_FILL_CACHE_THRESHOLD_BLOCKS,
             cache_total_ratio: DEFAULT_CACHE_TOTAL_RATIO,
             reader_cache_max_entries: DEFAULT_READER_CACHE_MAX_ENTRIES,
+            reader_cache_shards: DEFAULT_READER_CACHE_SHARDS,
             target_file_size: DEFAULT_TARGET_FILE_SIZE,
             l0_compaction_trigger: DEFAULT_L0_COMPACTION_TRIGGER,
             l0_slowdown_trigger: DEFAULT_L0_SLOWDOWN_TRIGGER,
@@ -507,6 +514,13 @@ impl LsmConfig {
                 "reader_cache_max_entries must be > 0 when reader cache is enabled".to_string(),
             );
         }
+        if self.reader_cache_shards != 0
+            && (!self.reader_cache_shards.is_power_of_two() || self.reader_cache_shards > 16)
+        {
+            return Err(
+                "reader_cache_shards must be 0 (auto) or power-of-two in [1, 16]".to_string(),
+            );
+        }
         Ok(())
     }
 }
@@ -650,6 +664,12 @@ impl LsmConfigBuilder {
     /// Set reader cache max entry count.
     pub fn reader_cache_max_entries(mut self, max_entries: usize) -> Self {
         self.config.reader_cache_max_entries = max_entries;
+        self
+    }
+
+    /// Set reader-cache shards (0 = auto).
+    pub fn reader_cache_shards(mut self, shards: usize) -> Self {
+        self.config.reader_cache_shards = shards;
         self
     }
 
@@ -817,6 +837,7 @@ mod tests {
             config.reader_cache_max_entries,
             DEFAULT_READER_CACHE_MAX_ENTRIES
         );
+        assert_eq!(config.reader_cache_shards, DEFAULT_READER_CACHE_SHARDS);
         assert_eq!(config.v26_boundary_mode, V26BoundaryMode::On);
         assert!(config.validate().is_ok());
     }
@@ -838,6 +859,7 @@ mod tests {
             .scan_fill_cache_threshold_blocks(16)
             .cache_total_ratio(0.6)
             .reader_cache_max_entries(2048)
+            .reader_cache_shards(8)
             .v26_boundary_mode(V26BoundaryMode::On)
             .build()
             .unwrap();
@@ -856,6 +878,7 @@ mod tests {
         assert_eq!(config.scan_fill_cache_threshold_blocks, 16);
         assert_eq!(config.cache_total_ratio, 0.6);
         assert_eq!(config.reader_cache_max_entries, 2048);
+        assert_eq!(config.reader_cache_shards, 8);
         assert_eq!(config.v26_boundary_mode, V26BoundaryMode::On);
     }
 
@@ -1073,6 +1096,27 @@ mod tests {
         let result = config.validate();
         assert!(result.is_err());
         assert!(result.unwrap_err().contains("reader_cache_max_entries"));
+    }
+
+    #[test]
+    fn test_config_validation_reader_cache_shards_bounds() {
+        let invalid_non_pow2 = LsmConfig::builder("./test")
+            .reader_cache_shards(3)
+            .build_unchecked();
+        let err = invalid_non_pow2.validate().unwrap_err();
+        assert!(err.contains("reader_cache_shards"));
+
+        let invalid_too_large = LsmConfig::builder("./test")
+            .reader_cache_shards(32)
+            .build_unchecked();
+        let err = invalid_too_large.validate().unwrap_err();
+        assert!(err.contains("reader_cache_shards"));
+
+        let auto = LsmConfig::builder("./test")
+            .reader_cache_shards(0)
+            .build()
+            .unwrap();
+        assert_eq!(auto.reader_cache_shards, 0);
     }
 
     #[test]

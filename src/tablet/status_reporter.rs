@@ -534,6 +534,8 @@ fn io_counters_is_zero(counters: IoCounterSnapshot) -> bool {
 
 pub fn log_snapshot(snapshot: &EngineStatusSnapshot) {
     let block_delta = snapshot.global.cache_delta.block.unwrap_or_default();
+    let reader_delta = snapshot.global.cache_delta.reader.unwrap_or_default();
+    let row_delta = snapshot.global.cache_delta.row.unwrap_or_default();
     let fg_read_ops: u64 = snapshot
         .global
         .io
@@ -568,13 +570,28 @@ pub fn log_snapshot(snapshot: &EngineStatusSnapshot) {
         .sum();
 
     log_info!(
-        "[engine-status] ts={} collect_us={} tablets={} reported={} cache_delta:hits={} misses={} io:fg_read={}/{} bg_write={}/{}",
+        "[engine-status] ts={} collect_us={} tablets={} reported={} cache_delta:block(h/m/i/e/x/r)={}/{}/{}/{}/{}/{} reader(h/m/i/e/x)={}/{}/{}/{}/{} row(h/m/i/e/x/r)={}/{}/{}/{}/{}/{} io:fg_read={}/{} bg_write={}/{}",
         snapshot.ts_unix_ms,
         snapshot.collection_duration_us,
         snapshot.global.tablet_count,
         snapshot.global.reported_tablets,
         block_delta.hits,
         block_delta.misses,
+        block_delta.inserts,
+        block_delta.evictions,
+        block_delta.invalidations,
+        block_delta.insert_rejects,
+        reader_delta.hits,
+        reader_delta.misses,
+        reader_delta.inserts,
+        reader_delta.evictions,
+        reader_delta.invalidations,
+        row_delta.hits,
+        row_delta.misses,
+        row_delta.inserts,
+        row_delta.evictions,
+        row_delta.invalidations,
+        row_delta.insert_rejects,
         fg_read_ops,
         fg_read_bytes,
         bg_write_ops,
@@ -632,6 +649,9 @@ fn push_metric(
 
 pub fn snapshot_to_metric_rows(snapshot: &EngineStatusSnapshot) -> Vec<EngineStatusMetricRow> {
     let mut rows = Vec::new();
+    let block_delta = snapshot.global.cache_delta.block.unwrap_or_default();
+    let reader_delta = snapshot.global.cache_delta.reader.unwrap_or_default();
+    let row_delta = snapshot.global.cache_delta.row.unwrap_or_default();
     push_metric(&mut rows, "global", "", "ts_unix_ms", snapshot.ts_unix_ms);
     push_metric(
         &mut rows,
@@ -660,6 +680,125 @@ pub fn snapshot_to_metric_rows(snapshot: &EngineStatusSnapshot) -> Vec<EngineSta
         "",
         "total_sst_bytes",
         snapshot.global.total_sst_bytes,
+    );
+    push_metric(
+        &mut rows,
+        "global",
+        "",
+        "cache.block.delta.hits",
+        block_delta.hits,
+    );
+    push_metric(
+        &mut rows,
+        "global",
+        "",
+        "cache.block.delta.misses",
+        block_delta.misses,
+    );
+    push_metric(
+        &mut rows,
+        "global",
+        "",
+        "cache.block.delta.inserts",
+        block_delta.inserts,
+    );
+    push_metric(
+        &mut rows,
+        "global",
+        "",
+        "cache.block.delta.evictions",
+        block_delta.evictions,
+    );
+    push_metric(
+        &mut rows,
+        "global",
+        "",
+        "cache.block.delta.invalidations",
+        block_delta.invalidations,
+    );
+    push_metric(
+        &mut rows,
+        "global",
+        "",
+        "cache.block.delta.insert_rejects",
+        block_delta.insert_rejects,
+    );
+    push_metric(
+        &mut rows,
+        "global",
+        "",
+        "cache.reader.delta.hits",
+        reader_delta.hits,
+    );
+    push_metric(
+        &mut rows,
+        "global",
+        "",
+        "cache.reader.delta.misses",
+        reader_delta.misses,
+    );
+    push_metric(
+        &mut rows,
+        "global",
+        "",
+        "cache.reader.delta.inserts",
+        reader_delta.inserts,
+    );
+    push_metric(
+        &mut rows,
+        "global",
+        "",
+        "cache.reader.delta.evictions",
+        reader_delta.evictions,
+    );
+    push_metric(
+        &mut rows,
+        "global",
+        "",
+        "cache.reader.delta.invalidations",
+        reader_delta.invalidations,
+    );
+    push_metric(
+        &mut rows,
+        "global",
+        "",
+        "cache.row.delta.hits",
+        row_delta.hits,
+    );
+    push_metric(
+        &mut rows,
+        "global",
+        "",
+        "cache.row.delta.misses",
+        row_delta.misses,
+    );
+    push_metric(
+        &mut rows,
+        "global",
+        "",
+        "cache.row.delta.inserts",
+        row_delta.inserts,
+    );
+    push_metric(
+        &mut rows,
+        "global",
+        "",
+        "cache.row.delta.evictions",
+        row_delta.evictions,
+    );
+    push_metric(
+        &mut rows,
+        "global",
+        "",
+        "cache.row.delta.invalidations",
+        row_delta.invalidations,
+    );
+    push_metric(
+        &mut rows,
+        "global",
+        "",
+        "cache.row.delta.insert_rejects",
+        row_delta.insert_rejects,
     );
 
     for source in &snapshot.global.io.by_source {
