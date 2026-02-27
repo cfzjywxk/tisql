@@ -20,7 +20,9 @@
 // and @@variables.
 
 use std::io;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
+use std::time::Instant;
 
 use async_trait::async_trait;
 use opensrv_mysql::{
@@ -30,12 +32,167 @@ use opensrv_mysql::{
 use tokio::io::AsyncWrite;
 
 use crate::catalog::types::Value;
+use crate::protocol::point_get_short::{
+    starts_with_select_ascii_case_insensitive, try_parse_point_get_short,
+};
 use crate::session::{ExecutionCtx, Session};
 use crate::util::mysql_text::{
     format_date_canonical, format_datetime_canonical, format_time_canonical,
 };
 use crate::worker::{self, EncodedBatch, QueryResponse, ResultBatch};
-use crate::{log_debug, log_info, Database};
+use crate::{
+    log_debug, log_info, Database, ShortPointGetExecOutcome, ShortPointGetFallback,
+    ShortPointGetProfile,
+};
+
+static PROTO_PROFILE_COUNT: AtomicU64 = AtomicU64::new(0);
+static PROTO_PROFILE_DISPATCH_US_TOTAL: AtomicU64 = AtomicU64::new(0);
+static PROTO_PROFILE_COLDEF_US_TOTAL: AtomicU64 = AtomicU64::new(0);
+static PROTO_PROFILE_BATCH_WAIT_US_TOTAL: AtomicU64 = AtomicU64::new(0);
+static PROTO_PROFILE_ENCODE_US_TOTAL: AtomicU64 = AtomicU64::new(0);
+static PROTO_PROFILE_FINISH_US_TOTAL: AtomicU64 = AtomicU64::new(0);
+const PROTO_PROFILE_LOG_EVERY: u64 = 10_000;
+static SHORT_PATH_ATTEMPTS: AtomicU64 = AtomicU64::new(0);
+static SHORT_PATH_HITS: AtomicU64 = AtomicU64::new(0);
+static SHORT_PATH_FALLBACKS_TOTAL: AtomicU64 = AtomicU64::new(0);
+static SHORT_PATH_FALLBACK_NOT_AUTOCOMMIT: AtomicU64 = AtomicU64::new(0);
+static SHORT_PATH_FALLBACK_SHAPE_MISMATCH: AtomicU64 = AtomicU64::new(0);
+static SHORT_PATH_FALLBACK_TABLE_NOT_FOUND: AtomicU64 = AtomicU64::new(0);
+static SHORT_PATH_FALLBACK_PK_MISMATCH: AtomicU64 = AtomicU64::new(0);
+static SHORT_PATH_FALLBACK_COLUMN_NOT_FOUND: AtomicU64 = AtomicU64::new(0);
+static SHORT_PATH_FALLBACK_LITERAL_CAST_ERROR: AtomicU64 = AtomicU64::new(0);
+static SHORT_PATH_FALLBACK_DECODE_ERROR: AtomicU64 = AtomicU64::new(0);
+static SHORT_PATH_FALLBACK_EXECUTION_ERROR: AtomicU64 = AtomicU64::new(0);
+static SHORT_PATH_PROFILE_COUNT: AtomicU64 = AtomicU64::new(0);
+static SHORT_PATH_PROFILE_RECOGNIZE_US_TOTAL: AtomicU64 = AtomicU64::new(0);
+static SHORT_PATH_PROFILE_CATALOG_US_TOTAL: AtomicU64 = AtomicU64::new(0);
+static SHORT_PATH_PROFILE_CAST_ENCODE_US_TOTAL: AtomicU64 = AtomicU64::new(0);
+static SHORT_PATH_PROFILE_BEGIN_US_TOTAL: AtomicU64 = AtomicU64::new(0);
+static SHORT_PATH_PROFILE_GET_US_TOTAL: AtomicU64 = AtomicU64::new(0);
+static SHORT_PATH_PROFILE_DECODE_US_TOTAL: AtomicU64 = AtomicU64::new(0);
+static SHORT_PATH_PROFILE_OUTPUT_BUILD_US_TOTAL: AtomicU64 = AtomicU64::new(0);
+static SHORT_PATH_PROFILE_COLDEF_US_TOTAL: AtomicU64 = AtomicU64::new(0);
+static SHORT_PATH_PROFILE_ENCODE_US_TOTAL: AtomicU64 = AtomicU64::new(0);
+static SHORT_PATH_PROFILE_FINISH_US_TOTAL: AtomicU64 = AtomicU64::new(0);
+static SHORT_PATH_PROFILE_TOTAL_US_TOTAL: AtomicU64 = AtomicU64::new(0);
+const SHORT_PATH_PROFILE_LOG_EVERY: u64 = 10_000;
+
+fn record_protocol_profile(
+    dispatch_us: u64,
+    coldef_us: u64,
+    batch_wait_us: u64,
+    encode_us: u64,
+    finish_us: u64,
+) {
+    let count = PROTO_PROFILE_COUNT.fetch_add(1, Ordering::Relaxed) + 1;
+    PROTO_PROFILE_DISPATCH_US_TOTAL.fetch_add(dispatch_us, Ordering::Relaxed);
+    PROTO_PROFILE_COLDEF_US_TOTAL.fetch_add(coldef_us, Ordering::Relaxed);
+    PROTO_PROFILE_BATCH_WAIT_US_TOTAL.fetch_add(batch_wait_us, Ordering::Relaxed);
+    PROTO_PROFILE_ENCODE_US_TOTAL.fetch_add(encode_us, Ordering::Relaxed);
+    PROTO_PROFILE_FINISH_US_TOTAL.fetch_add(finish_us, Ordering::Relaxed);
+
+    if count % PROTO_PROFILE_LOG_EVERY != 0 {
+        return;
+    }
+
+    let dispatch_total = PROTO_PROFILE_DISPATCH_US_TOTAL.load(Ordering::Relaxed);
+    let coldef_total = PROTO_PROFILE_COLDEF_US_TOTAL.load(Ordering::Relaxed);
+    let bw_total = PROTO_PROFILE_BATCH_WAIT_US_TOTAL.load(Ordering::Relaxed);
+    let enc_total = PROTO_PROFILE_ENCODE_US_TOTAL.load(Ordering::Relaxed);
+    let fin_total = PROTO_PROFILE_FINISH_US_TOTAL.load(Ordering::Relaxed);
+    let avg_dispatch = dispatch_total / count;
+    let avg_coldef = coldef_total / count;
+    let avg_bw = bw_total / count;
+    let avg_enc = enc_total / count;
+    let avg_fin = fin_total / count;
+    let avg_wire = avg_coldef + avg_bw + avg_enc + avg_fin;
+    let avg_total = avg_dispatch + avg_wire;
+    log_info!(
+        "[read-protocol-profile] reads={} avg_us(dispatch/coldef/batch_wait/encode/finish/wire/total)={}/{}/{}/{}/{}/{}/{}",
+        count,
+        avg_dispatch,
+        avg_coldef,
+        avg_bw,
+        avg_enc,
+        avg_fin,
+        avg_wire,
+        avg_total
+    );
+}
+
+fn record_short_path_fallback(counter: &AtomicU64) {
+    SHORT_PATH_FALLBACKS_TOTAL.fetch_add(1, Ordering::Relaxed);
+    counter.fetch_add(1, Ordering::Relaxed);
+}
+
+fn record_short_path_profile(
+    recognize_us: u64,
+    short_profile: &ShortPointGetProfile,
+    coldef_us: u64,
+    encode_us: u64,
+    finish_us: u64,
+) {
+    let catalog_us = short_profile.catalog_us;
+    let cast_encode_us = short_profile.cast_encode_us;
+    let begin_us = short_profile.begin_us;
+    let get_us = short_profile.get_us;
+    let decode_us = short_profile.decode_us;
+    let output_build_us = short_profile.output_build_us;
+    let total_us = recognize_us
+        + catalog_us
+        + cast_encode_us
+        + begin_us
+        + get_us
+        + decode_us
+        + output_build_us
+        + coldef_us
+        + encode_us
+        + finish_us;
+    let count = SHORT_PATH_PROFILE_COUNT.fetch_add(1, Ordering::Relaxed) + 1;
+    SHORT_PATH_PROFILE_RECOGNIZE_US_TOTAL.fetch_add(recognize_us, Ordering::Relaxed);
+    SHORT_PATH_PROFILE_CATALOG_US_TOTAL.fetch_add(catalog_us, Ordering::Relaxed);
+    SHORT_PATH_PROFILE_CAST_ENCODE_US_TOTAL.fetch_add(cast_encode_us, Ordering::Relaxed);
+    SHORT_PATH_PROFILE_BEGIN_US_TOTAL.fetch_add(begin_us, Ordering::Relaxed);
+    SHORT_PATH_PROFILE_GET_US_TOTAL.fetch_add(get_us, Ordering::Relaxed);
+    SHORT_PATH_PROFILE_DECODE_US_TOTAL.fetch_add(decode_us, Ordering::Relaxed);
+    SHORT_PATH_PROFILE_OUTPUT_BUILD_US_TOTAL.fetch_add(output_build_us, Ordering::Relaxed);
+    SHORT_PATH_PROFILE_COLDEF_US_TOTAL.fetch_add(coldef_us, Ordering::Relaxed);
+    SHORT_PATH_PROFILE_ENCODE_US_TOTAL.fetch_add(encode_us, Ordering::Relaxed);
+    SHORT_PATH_PROFILE_FINISH_US_TOTAL.fetch_add(finish_us, Ordering::Relaxed);
+    SHORT_PATH_PROFILE_TOTAL_US_TOTAL.fetch_add(total_us, Ordering::Relaxed);
+
+    if count % SHORT_PATH_PROFILE_LOG_EVERY != 0 {
+        return;
+    }
+
+    let avg_recognize = SHORT_PATH_PROFILE_RECOGNIZE_US_TOTAL.load(Ordering::Relaxed) / count;
+    let avg_catalog = SHORT_PATH_PROFILE_CATALOG_US_TOTAL.load(Ordering::Relaxed) / count;
+    let avg_cast_encode = SHORT_PATH_PROFILE_CAST_ENCODE_US_TOTAL.load(Ordering::Relaxed) / count;
+    let avg_begin = SHORT_PATH_PROFILE_BEGIN_US_TOTAL.load(Ordering::Relaxed) / count;
+    let avg_get = SHORT_PATH_PROFILE_GET_US_TOTAL.load(Ordering::Relaxed) / count;
+    let avg_decode = SHORT_PATH_PROFILE_DECODE_US_TOTAL.load(Ordering::Relaxed) / count;
+    let avg_output_build = SHORT_PATH_PROFILE_OUTPUT_BUILD_US_TOTAL.load(Ordering::Relaxed) / count;
+    let avg_coldef = SHORT_PATH_PROFILE_COLDEF_US_TOTAL.load(Ordering::Relaxed) / count;
+    let avg_encode = SHORT_PATH_PROFILE_ENCODE_US_TOTAL.load(Ordering::Relaxed) / count;
+    let avg_finish = SHORT_PATH_PROFILE_FINISH_US_TOTAL.load(Ordering::Relaxed) / count;
+    let avg_total = SHORT_PATH_PROFILE_TOTAL_US_TOTAL.load(Ordering::Relaxed) / count;
+
+    log_info!(
+        "[read-short-profile] reads={} avg_us(recognize/catalog/cast_encode/begin/get/decode/output_build/coldef/encode/finish/total)={}/{}/{}/{}/{}/{}/{}/{}/{}/{}/{}",
+        count,
+        avg_recognize,
+        avg_catalog,
+        avg_cast_encode,
+        avg_begin,
+        avg_get,
+        avg_decode,
+        avg_output_build,
+        avg_coldef,
+        avg_encode,
+        avg_finish,
+        avg_total
+    );
+}
 
 /// MySQL protocol backend for a single client connection.
 pub struct MySqlBackend {
@@ -91,8 +248,119 @@ impl<W: AsyncWrite + Send + Unpin> AsyncMysqlShim<W> for MySqlBackend {
         results: QueryResultWriter<'a, W>,
     ) -> io::Result<()> {
         log_debug!("Session {} query: {}", self.session.id(), query);
+        let query_trimmed = query.trim();
 
-        let query_lower = query.trim().to_lowercase();
+        if self.db.point_get_short_path_enabled()
+            && starts_with_select_ascii_case_insensitive(query_trimmed)
+        {
+            SHORT_PATH_ATTEMPTS.fetch_add(1, Ordering::Relaxed);
+
+            if !self.session.vars().autocommit || self.session.has_active_txn() {
+                record_short_path_fallback(&SHORT_PATH_FALLBACK_NOT_AUTOCOMMIT);
+            } else {
+                let recognize_begin = Instant::now();
+                match try_parse_point_get_short(query_trimmed) {
+                    Some(short_query) => {
+                        let recognize_us = recognize_begin.elapsed().as_micros() as u64;
+                        let exec_ctx = ExecutionCtx::from_session(&self.session);
+                        match self
+                            .db
+                            .execute_point_get_short(&exec_ctx, &short_query)
+                            .await
+                        {
+                            Ok(ShortPointGetExecOutcome::Hit(output)) => {
+                                SHORT_PATH_HITS.fetch_add(1, Ordering::Relaxed);
+
+                                let cols: Vec<Column> = output
+                                    .columns
+                                    .iter()
+                                    .map(|name| Column {
+                                        table: String::new(),
+                                        column: name.clone(),
+                                        coltype: ColumnType::MYSQL_TYPE_VAR_STRING,
+                                        colflags: ColumnFlags::empty(),
+                                    })
+                                    .collect();
+
+                                let mut coldef_us = 0u64;
+                                let mut encode_us = 0u64;
+                                let mut finish_us = 0u64;
+                                let wire_result = async {
+                                    let coldef_begin = Instant::now();
+                                    let mut rw = results.start(&cols).await?;
+                                    coldef_us = coldef_begin.elapsed().as_micros() as u64;
+
+                                    let encode_begin = Instant::now();
+                                    if let Some(row) = output.row.as_ref() {
+                                        for val in row {
+                                            write_value_fast(&mut rw, val)?;
+                                        }
+                                        rw.end_row().await?;
+                                    }
+                                    encode_us = encode_begin.elapsed().as_micros() as u64;
+
+                                    let finish_begin = Instant::now();
+                                    let result = rw.finish().await;
+                                    finish_us = finish_begin.elapsed().as_micros() as u64;
+                                    result
+                                }
+                                .await;
+
+                                self.update_session_registry();
+
+                                if wire_result.is_ok() {
+                                    record_short_path_profile(
+                                        recognize_us,
+                                        &output.profile,
+                                        coldef_us,
+                                        encode_us,
+                                        finish_us,
+                                    );
+                                }
+
+                                return wire_result;
+                            }
+                            Ok(ShortPointGetExecOutcome::Fallback(reason)) => match reason {
+                                ShortPointGetFallback::TableNotFound => {
+                                    record_short_path_fallback(
+                                        &SHORT_PATH_FALLBACK_TABLE_NOT_FOUND,
+                                    );
+                                }
+                                ShortPointGetFallback::PkMismatch => {
+                                    record_short_path_fallback(&SHORT_PATH_FALLBACK_PK_MISMATCH);
+                                }
+                                ShortPointGetFallback::ColumnNotFound => {
+                                    record_short_path_fallback(
+                                        &SHORT_PATH_FALLBACK_COLUMN_NOT_FOUND,
+                                    );
+                                }
+                                ShortPointGetFallback::LiteralCastError => {
+                                    record_short_path_fallback(
+                                        &SHORT_PATH_FALLBACK_LITERAL_CAST_ERROR,
+                                    );
+                                }
+                                ShortPointGetFallback::DecodeError => {
+                                    record_short_path_fallback(&SHORT_PATH_FALLBACK_DECODE_ERROR);
+                                }
+                            },
+                            Err(e) => {
+                                log_debug!(
+                                    "Session {} short-path execution error: {}",
+                                    self.session.id(),
+                                    e
+                                );
+                                record_short_path_fallback(&SHORT_PATH_FALLBACK_EXECUTION_ERROR);
+                            }
+                        }
+                    }
+                    None => {
+                        record_short_path_fallback(&SHORT_PATH_FALLBACK_SHAPE_MISMATCH);
+                    }
+                }
+            }
+        }
+
+        let query_lower = query_trimmed.to_lowercase();
 
         // SET — pure session state, no DB access
         if query_lower.starts_with("set ") {
@@ -106,7 +374,7 @@ impl<W: AsyncWrite + Send + Unpin> AsyncMysqlShim<W> for MySqlBackend {
 
         // USE — session state update, no DB access
         if query_lower.starts_with("use ") {
-            let db_name = query.trim()[4..].trim();
+            let db_name = query_trimmed[4..].trim();
             let db_name = db_name.trim_matches('`').trim_end_matches(';').trim();
             log_info!(
                 "Session {} selected database via USE query: {}",
@@ -155,6 +423,7 @@ impl MySqlBackend {
         query: &str,
         results: QueryResultWriter<'_, W>,
     ) -> io::Result<()> {
+        let dispatch_begin = Instant::now();
         let db = Arc::clone(&self.db);
         let worker_handle = db.worker_handle().cloned();
         let exec_ctx = ExecutionCtx::from_session(&self.session);
@@ -175,6 +444,9 @@ impl MySqlBackend {
                 mut batch_rx,
                 txn_ctx,
             } => {
+                let dispatch_us = dispatch_begin.elapsed().as_micros() as u64;
+                let coldef_begin = Instant::now();
+
                 if let Some(ctx) = txn_ctx {
                     self.session.set_current_txn(ctx);
                 }
@@ -190,9 +462,22 @@ impl MySqlBackend {
                     .collect();
 
                 let mut rw = results.start(&cols).await?;
+                let coldef_us = coldef_begin.elapsed().as_micros() as u64;
+
+                let mut batch_wait_us_acc: u64 = 0;
+                let mut encode_us_acc: u64 = 0;
 
                 // Receive row batches from the worker
-                while let Some(batch_result) = batch_rx.recv().await {
+                loop {
+                    let wait_begin = Instant::now();
+                    let batch_result = batch_rx.recv().await;
+                    batch_wait_us_acc += wait_begin.elapsed().as_micros() as u64;
+
+                    let Some(batch_result) = batch_result else {
+                        break; // channel closed = EOF
+                    };
+
+                    let enc_begin = Instant::now();
                     match batch_result {
                         Ok(batch) => match batch {
                             ResultBatch::Typed(batch) => {
@@ -226,9 +511,20 @@ impl MySqlBackend {
                                 .await;
                         }
                     }
+                    encode_us_acc += enc_begin.elapsed().as_micros() as u64;
                 }
 
-                rw.finish().await
+                let finish_begin = Instant::now();
+                let wire_result = rw.finish().await;
+                let finish_us = finish_begin.elapsed().as_micros() as u64;
+                record_protocol_profile(
+                    dispatch_us,
+                    coldef_us,
+                    batch_wait_us_acc,
+                    encode_us_acc,
+                    finish_us,
+                );
+                wire_result
             }
             QueryResponse::Affected { count, txn_ctx } => {
                 if let Some(ctx) = txn_ctx {

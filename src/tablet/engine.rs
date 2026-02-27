@@ -11620,6 +11620,7 @@ mod tests {
         let config = LsmConfig::builder(dir.path())
             .block_size(64)
             .shared_block_cache_enabled(true)
+            .row_cache_enabled(false)
             .bloom_enabled(false)
             .build()
             .unwrap();
@@ -11678,6 +11679,7 @@ mod tests {
         let config = LsmConfig::builder(dir.path())
             .block_size(64)
             .shared_block_cache_enabled(true)
+            .row_cache_enabled(false)
             .bloom_enabled(true)
             .build()
             .unwrap();
@@ -11734,6 +11736,7 @@ mod tests {
         let config = LsmConfig::builder(dir.path())
             .block_size(64)
             .shared_block_cache_enabled(true)
+            .row_cache_enabled(false)
             .bloom_enabled(false)
             .build()
             .unwrap();

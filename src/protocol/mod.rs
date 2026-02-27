@@ -15,6 +15,7 @@
 // Protocol module - MySQL wire protocol implementation
 
 pub mod mysql;
+pub(crate) mod point_get_short;
 
 use std::net::SocketAddr;
 use std::sync::Arc;

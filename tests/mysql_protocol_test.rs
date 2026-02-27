@@ -346,6 +346,94 @@ async fn test_multiple_statements_in_transaction() {
     assert_eq!(rows[9], vec!["10", "100"]);
 }
 
+/// Short path should be bypassed inside explicit transactions.
+#[tokio::test]
+async fn test_point_get_short_path_bypasses_explicit_txn_reads() {
+    let ctx = TestContext::new().await;
+    let mut conn = ctx.conn().await;
+
+    exec(
+        &mut conn,
+        "CREATE TABLE sp_txn (id VARCHAR(64) PRIMARY KEY, v INT)",
+    )
+    .await;
+    exec(&mut conn, "INSERT INTO sp_txn VALUES ('k1', 10)").await;
+
+    exec(&mut conn, "BEGIN").await;
+    exec(&mut conn, "UPDATE sp_txn SET v = 20 WHERE id = 'k1'").await;
+    let v = query_one(&mut conn, "SELECT v FROM sp_txn WHERE id = 'k1'").await;
+    assert_eq!(v, "20");
+    exec(&mut conn, "ROLLBACK").await;
+}
+
+/// Integer PK point-get must remain key-compatible with the existing path.
+#[tokio::test]
+async fn test_point_get_short_path_int_pk_lookup() {
+    let ctx = TestContext::new().await;
+    let mut conn = ctx.conn().await;
+
+    exec(&mut conn, "CREATE TABLE sp_int (id INT PRIMARY KEY, v INT)").await;
+    exec(&mut conn, "INSERT INTO sp_int VALUES (1, 42)").await;
+
+    let v = query_one(&mut conn, "SELECT v FROM sp_int WHERE id = 1").await;
+    assert_eq!(v, "42");
+}
+
+/// Short path recognizer should handle backticks and escaped SQL strings.
+#[tokio::test]
+async fn test_point_get_short_path_backticks_and_escaped_string() {
+    let ctx = TestContext::new().await;
+    let mut conn = ctx.conn().await;
+
+    exec(
+        &mut conn,
+        "CREATE TABLE sp_bt (YCSB_KEY VARCHAR(64) PRIMARY KEY, v INT)",
+    )
+    .await;
+    exec(&mut conn, "INSERT INTO sp_bt VALUES ('ab''cd', 55)").await;
+
+    let v = query_one(
+        &mut conn,
+        "SELECT `v` FROM sp_bt WHERE `YCSB_KEY` = 'ab''cd'",
+    )
+    .await;
+    assert_eq!(v, "55");
+}
+
+/// Non-eligible shapes must safely fallback to normal planner/executor.
+#[tokio::test]
+async fn test_point_get_short_path_fallback_for_extra_predicate() {
+    let ctx = TestContext::new().await;
+    let mut conn = ctx.conn().await;
+
+    exec(
+        &mut conn,
+        "CREATE TABLE sp_fb (id VARCHAR(64) PRIMARY KEY, v INT)",
+    )
+    .await;
+    exec(&mut conn, "INSERT INTO sp_fb VALUES ('k1', 33)").await;
+
+    let v = query_one(&mut conn, "SELECT v FROM sp_fb WHERE id = 'k1' AND v = 33").await;
+    assert_eq!(v, "33");
+}
+
+/// Signed integer literals with leading zeros should remain query-compatible.
+#[tokio::test]
+async fn test_point_get_short_path_signed_integer_literal_lookup() {
+    let ctx = TestContext::new().await;
+    let mut conn = ctx.conn().await;
+
+    exec(
+        &mut conn,
+        "CREATE TABLE sp_signed (id INT PRIMARY KEY, v INT)",
+    )
+    .await;
+    exec(&mut conn, "INSERT INTO sp_signed VALUES (-7, 70)").await;
+
+    let v = query_one(&mut conn, "SELECT v FROM sp_signed WHERE id = -007").await;
+    assert_eq!(v, "70");
+}
+
 /// Test that COMMIT without BEGIN is a no-op (MySQL behavior).
 #[tokio::test]
 async fn test_commit_without_transaction_is_noop() {

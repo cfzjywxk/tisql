@@ -169,21 +169,22 @@ pub mod testkit {
 }
 
 // Internal imports (not re-exported)
-use catalog::types::{Lsn, Value};
-use catalog::MvccCatalog;
+use catalog::types::{ColumnId, DataType, Lsn, Value};
+use catalog::{MvccCatalog, TableDef};
 use clog::{FileClogConfig, FileClogService, TruncateStats};
 use executor::{ExecutionOutput, ExecutionResult, Executor, SimpleExecutor};
+use protocol::point_get_short::{PointGetShortQuery, ProjectionRef};
 use sql::Parser;
 use tablet::{
-    collect_snapshot, route_table_to_tablet, snapshot_to_metric_rows, CacheSuite, CacheSuiteConfig,
-    EngineStatusMetricRow, EngineStatusReporter, EngineStatusSnapshot, GlobalLogGcBoundary,
-    IlogConfig, IlogService, IlogTruncateStats, LsmConfig, LsmEngine, LsmRecovery,
-    RoutedTabletStorage, TabletId, TabletManager, DEFAULT_BLOOM_BITS_PER_KEY,
-    DEFAULT_BLOOM_ENABLED, DEFAULT_CACHE_TOTAL_RATIO, DEFAULT_L0_COMPACTION_TRIGGER,
-    DEFAULT_L0_SLOWDOWN_TRIGGER, DEFAULT_L0_STOP_TRIGGER, DEFAULT_MAX_LEVELS,
-    DEFAULT_READER_CACHE_ENABLED, DEFAULT_READER_CACHE_MAX_ENTRIES, DEFAULT_READER_CACHE_SHARDS,
-    DEFAULT_ROW_CACHE_ENABLED, DEFAULT_SCAN_FILL_CACHE, DEFAULT_SCAN_FILL_CACHE_THRESHOLD_BLOCKS,
-    DEFAULT_SHARED_BLOCK_CACHE_ENABLED,
+    collect_snapshot, decode_row_to_values, encode_key, encode_pk, route_table_to_tablet,
+    snapshot_to_metric_rows, CacheSuite, CacheSuiteConfig, EngineStatusMetricRow,
+    EngineStatusReporter, EngineStatusSnapshot, GlobalLogGcBoundary, IlogConfig, IlogService,
+    IlogTruncateStats, LsmConfig, LsmEngine, LsmRecovery, RoutedTabletStorage, TabletId,
+    TabletManager, DEFAULT_BLOOM_BITS_PER_KEY, DEFAULT_BLOOM_ENABLED, DEFAULT_CACHE_TOTAL_RATIO,
+    DEFAULT_L0_COMPACTION_TRIGGER, DEFAULT_L0_SLOWDOWN_TRIGGER, DEFAULT_L0_STOP_TRIGGER,
+    DEFAULT_MAX_LEVELS, DEFAULT_READER_CACHE_ENABLED, DEFAULT_READER_CACHE_MAX_ENTRIES,
+    DEFAULT_READER_CACHE_SHARDS, DEFAULT_ROW_CACHE_ENABLED, DEFAULT_SCAN_FILL_CACHE,
+    DEFAULT_SCAN_FILL_CACHE_THRESHOLD_BLOCKS, DEFAULT_SHARED_BLOCK_CACHE_ENABLED,
 };
 use transaction::{ConcurrencyManager, TransactionService};
 use tso::LocalTso;
@@ -191,7 +192,7 @@ use util::error::Result;
 
 use std::path::PathBuf;
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 #[cfg(feature = "failpoints")]
 use fail::fail_point;
@@ -212,6 +213,8 @@ pub struct DatabaseConfig {
     pub flush_threads: Option<usize>,
     /// Enable adaptive encoded result batches (phase 3, experimental).
     pub enable_encoded_result_batch: bool,
+    /// Enable protocol short-path for eligible point-get selects.
+    pub enable_point_get_short_path: bool,
     /// Enable bloom filter usage in SST paths.
     pub bloom_enabled: bool,
     /// Bloom filter bits-per-key setting.
@@ -257,6 +260,7 @@ impl Default for DatabaseConfig {
             runtime_threads: RuntimeThreadOverrides::default(),
             flush_threads: None,
             enable_encoded_result_batch: false,
+            enable_point_get_short_path: true,
             bloom_enabled: DEFAULT_BLOOM_ENABLED,
             bloom_bits_per_key: DEFAULT_BLOOM_BITS_PER_KEY,
             shared_block_cache_enabled: DEFAULT_SHARED_BLOCK_CACHE_ENABLED,
@@ -303,6 +307,11 @@ impl DatabaseConfig {
     /// Enable/disable adaptive encoded result batches.
     pub fn with_encoded_result_batch(mut self, enabled: bool) -> Self {
         self.enable_encoded_result_batch = enabled;
+        self
+    }
+
+    pub fn with_point_get_short_path(mut self, enabled: bool) -> Self {
+        self.enable_point_get_short_path = enabled;
         self
     }
 
@@ -439,6 +448,7 @@ mod database_config_tests {
     #[test]
     fn test_database_config_bloom_defaults() {
         let config = DatabaseConfig::default();
+        assert!(config.enable_point_get_short_path);
         assert!(config.bloom_enabled);
         assert_eq!(config.bloom_bits_per_key, DEFAULT_BLOOM_BITS_PER_KEY);
         assert!(config.shared_block_cache_enabled);
@@ -464,6 +474,7 @@ mod database_config_tests {
     #[test]
     fn test_database_config_with_bloom_overrides() {
         let config = DatabaseConfig::with_data_dir("data")
+            .with_point_get_short_path(true)
             .with_bloom_enabled(true)
             .with_bloom_bits_per_key(16)
             .with_shared_block_cache_enabled(true)
@@ -478,6 +489,7 @@ mod database_config_tests {
             .with_l0_slowdown_trigger(20)
             .with_l0_stop_trigger(30)
             .with_max_levels(4);
+        assert!(config.enable_point_get_short_path);
         assert!(config.bloom_enabled);
         assert_eq!(config.bloom_bits_per_key, 16);
         assert!(config.shared_block_cache_enabled);
@@ -631,6 +643,8 @@ pub struct Database {
     session_registry: Arc<session::SessionRegistry>,
     /// Result-path mode toggle for adaptive encoded batches.
     enable_encoded_result_batch: bool,
+    /// Protocol fast lane toggle for autocommit point-get queries.
+    enable_point_get_short_path: bool,
 }
 
 fn drop_runtime_safely(runtime: tokio::runtime::Runtime) {
@@ -718,6 +732,35 @@ pub struct TabletIlogGcStats {
     pub tablet_id: TabletId,
     pub checkpoint_lsn: Lsn,
     pub truncate: IlogTruncateStats,
+}
+
+pub(crate) struct ShortPointGetOutput {
+    pub columns: Vec<String>,
+    pub row: Option<Vec<Value>>,
+    pub profile: ShortPointGetProfile,
+}
+
+pub(crate) enum ShortPointGetFallback {
+    TableNotFound,
+    PkMismatch,
+    ColumnNotFound,
+    LiteralCastError,
+    DecodeError,
+}
+
+pub(crate) enum ShortPointGetExecOutcome {
+    Hit(ShortPointGetOutput),
+    Fallback(ShortPointGetFallback),
+}
+
+#[derive(Default)]
+pub(crate) struct ShortPointGetProfile {
+    pub catalog_us: u64,
+    pub cast_encode_us: u64,
+    pub begin_us: u64,
+    pub get_us: u64,
+    pub decode_us: u64,
+    pub output_build_us: u64,
 }
 
 impl Database {
@@ -1098,6 +1141,7 @@ impl Database {
             io_runtime: Some(io_runtime.into_inner()),
             session_registry,
             enable_encoded_result_batch: config.enable_encoded_result_batch,
+            enable_point_get_short_path: config.enable_point_get_short_path,
         })
     }
 
@@ -1122,6 +1166,10 @@ impl Database {
     /// Whether adaptive encoded result batches are enabled.
     pub fn encoded_result_batch_enabled(&self) -> bool {
         self.enable_encoded_result_batch
+    }
+
+    pub fn point_get_short_path_enabled(&self) -> bool {
+        self.enable_point_get_short_path
     }
 
     /// Get the tablet manager.
@@ -1235,6 +1283,100 @@ impl Database {
         }
         let output = output?;
         Self::to_query_result(output.into_result().await?)
+    }
+
+    pub(crate) async fn execute_point_get_short(
+        &self,
+        exec_ctx: &ExecutionCtx,
+        q: &PointGetShortQuery<'_>,
+    ) -> Result<ShortPointGetExecOutcome> {
+        let catalog_begin = Instant::now();
+        let table = match self.catalog.get_table(&exec_ctx.current_db, q.table)? {
+            Some(table) => table,
+            None => {
+                return Ok(ShortPointGetExecOutcome::Fallback(
+                    ShortPointGetFallback::TableNotFound,
+                ))
+            }
+        };
+
+        let pk_column = match short_path_pk_column(&table, q.pk_column) {
+            Some(col) => col,
+            None => {
+                return Ok(ShortPointGetExecOutcome::Fallback(
+                    ShortPointGetFallback::PkMismatch,
+                ))
+            }
+        };
+        let projection = match short_path_projection_specs(&table, &q.projection) {
+            Some(specs) => specs,
+            None => {
+                return Ok(ShortPointGetExecOutcome::Fallback(
+                    ShortPointGetFallback::ColumnNotFound,
+                ))
+            }
+        };
+        let catalog_us = catalog_begin.elapsed().as_micros() as u64;
+
+        let cast_encode_begin = Instant::now();
+        let parsed_literal = match parse_short_pk_literal(q.pk_literal) {
+            Some(v) => v,
+            None => {
+                return Ok(ShortPointGetExecOutcome::Fallback(
+                    ShortPointGetFallback::LiteralCastError,
+                ))
+            }
+        };
+        // Keep the same integer-literal compatibility behavior as the normal
+        // read path: integer PK comparisons accept any integer Value variant
+        // and preserve the parsed value kind for key encoding parity.
+        if !short_path_literal_matches_pk(pk_column.data_type(), &parsed_literal) {
+            return Ok(ShortPointGetExecOutcome::Fallback(
+                ShortPointGetFallback::LiteralCastError,
+            ));
+        }
+        let pk_bytes = encode_pk(std::slice::from_ref(&parsed_literal));
+        let encoded_key = encode_key(table.id(), &pk_bytes);
+        let cast_encode_us = cast_encode_begin.elapsed().as_micros() as u64;
+
+        let begin_begin = Instant::now();
+        let ctx = self.txn_service.begin(true)?;
+        let begin_us = begin_begin.elapsed().as_micros() as u64;
+
+        let get_begin = Instant::now();
+        let raw_row = self.txn_service.get(&ctx, table.id(), &encoded_key).await?;
+        let get_us = get_begin.elapsed().as_micros() as u64;
+
+        let decode_begin = Instant::now();
+        let row = if let Some(raw_row) = raw_row {
+            match decode_row_to_values(&raw_row, &projection.col_ids, &projection.data_types) {
+                Ok(values) => Some(values),
+                Err(_) => {
+                    return Ok(ShortPointGetExecOutcome::Fallback(
+                        ShortPointGetFallback::DecodeError,
+                    ))
+                }
+            }
+        } else {
+            None
+        };
+        let decode_us = decode_begin.elapsed().as_micros() as u64;
+
+        let output_build_begin = Instant::now();
+        let output = ShortPointGetOutput {
+            columns: projection.columns,
+            row,
+            profile: ShortPointGetProfile {
+                catalog_us,
+                cast_encode_us,
+                begin_us,
+                get_us,
+                decode_us,
+                output_build_us: output_build_begin.elapsed().as_micros() as u64,
+            },
+        };
+
+        Ok(ShortPointGetExecOutcome::Hit(output))
     }
 
     /// Convert ExecutionResult to QueryResult (stringified for wire/test output).
@@ -1547,6 +1689,116 @@ impl Drop for Database {
             do_shutdown();
         }
     }
+}
+
+// ============================================================================
+// Point-Get Short Path Helpers
+// ============================================================================
+
+struct ShortProjectionSpecs {
+    columns: Vec<String>,
+    col_ids: Vec<ColumnId>,
+    data_types: Vec<DataType>,
+}
+
+fn short_path_pk_column<'a>(
+    table: &'a TableDef,
+    pk_name_from_sql: &str,
+) -> Option<&'a catalog::ColumnDef> {
+    let pk = table.primary_key();
+    if pk.len() != 1 {
+        return None;
+    }
+    let pk_col = table.column_by_id(pk[0])?;
+    if !pk_col.name().eq_ignore_ascii_case(pk_name_from_sql) {
+        return None;
+    }
+    Some(pk_col)
+}
+
+fn short_path_projection_specs(
+    table: &TableDef,
+    projection: &ProjectionRef<'_>,
+) -> Option<ShortProjectionSpecs> {
+    let mut columns = Vec::new();
+    let mut col_ids = Vec::new();
+    let mut data_types = Vec::new();
+
+    match projection {
+        ProjectionRef::All => {
+            for col in table.columns() {
+                columns.push(col.name().to_string());
+                col_ids.push(col.id());
+                data_types.push(col.data_type().clone());
+            }
+        }
+        ProjectionRef::Columns(wanted) => {
+            for wanted_name in wanted {
+                let col = table
+                    .columns()
+                    .iter()
+                    .find(|c| c.name().eq_ignore_ascii_case(wanted_name))?;
+                columns.push(col.name().to_string());
+                col_ids.push(col.id());
+                data_types.push(col.data_type().clone());
+            }
+        }
+    }
+
+    Some(ShortProjectionSpecs {
+        columns,
+        col_ids,
+        data_types,
+    })
+}
+
+fn parse_short_pk_literal(raw: &str) -> Option<Value> {
+    if raw.starts_with('\'') {
+        return parse_short_sql_string_literal(raw).map(Value::String);
+    }
+    raw.parse::<i64>().ok().map(Value::BigInt)
+}
+
+fn parse_short_sql_string_literal(raw: &str) -> Option<String> {
+    if raw.len() < 2 || !raw.starts_with('\'') || !raw.ends_with('\'') {
+        return None;
+    }
+    let mut out = String::with_capacity(raw.len() - 2);
+    let body = &raw[1..raw.len() - 1];
+    let mut idx = 0usize;
+
+    while idx < body.len() {
+        let tail = &body[idx..];
+        let ch = tail.chars().next()?;
+        if ch == '\'' {
+            let quote_len = ch.len_utf8();
+            let next = &tail[quote_len..];
+            if next.starts_with('\'') {
+                out.push('\'');
+                idx += quote_len + 1;
+            } else {
+                return None;
+            }
+            continue;
+        }
+        out.push(ch);
+        idx += ch.len_utf8();
+    }
+
+    Some(out)
+}
+
+fn short_path_literal_matches_pk(pk_type: &DataType, literal: &Value) -> bool {
+    matches!(
+        (pk_type, literal),
+        (
+            DataType::TinyInt | DataType::SmallInt | DataType::Int | DataType::BigInt,
+            Value::BigInt(_),
+        ) | (
+            DataType::Char(_) | DataType::Varchar(_) | DataType::Text,
+            Value::String(_)
+        )
+    )
 }
 
 // ============================================================================

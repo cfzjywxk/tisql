@@ -93,6 +93,22 @@ struct Args {
     )]
     disable_encoded_result_batch: bool,
 
+    /// Enable point-get short path for eligible SELECT queries.
+    #[arg(
+        long,
+        default_value_t = false,
+        conflicts_with = "disable_point_get_short_path"
+    )]
+    enable_point_get_short_path: bool,
+
+    /// Disable point-get short path for eligible SELECT queries.
+    #[arg(
+        long,
+        default_value_t = false,
+        conflicts_with = "enable_point_get_short_path"
+    )]
+    disable_point_get_short_path: bool,
+
     /// Enable bloom filter for SST point-lookups.
     #[arg(long, default_value_t = false, conflicts_with = "disable_bloom")]
     enable_bloom: bool,
@@ -247,6 +263,11 @@ fn main() {
         args.enable_encoded_result_batch,
         args.disable_encoded_result_batch,
     );
+    let point_get_short_path = resolve_flag_setting(
+        args.enable_point_get_short_path,
+        args.disable_point_get_short_path,
+        DatabaseConfig::default().enable_point_get_short_path,
+    );
     let bloom_enabled = resolve_bloom_enabled_setting(args.enable_bloom, args.disable_bloom);
     let shared_block_cache_enabled = resolve_flag_setting(
         args.enable_shared_block_cache,
@@ -273,6 +294,7 @@ fn main() {
     let mut db_config = DatabaseConfig::with_data_dir(&args.data_dir)
         .with_runtime_threads(runtime_overrides)
         .with_encoded_result_batch(encoded_result_batch)
+        .with_point_get_short_path(point_get_short_path)
         .with_bloom_enabled(bloom_enabled)
         .with_bloom_bits_per_key(args.bloom_bits_per_key)
         .with_shared_block_cache_enabled(shared_block_cache_enabled)
@@ -317,6 +339,14 @@ fn main() {
     println!(
         "Encoded result batches: {}",
         if encoded_result_batch {
+            "enabled"
+        } else {
+            "disabled"
+        }
+    );
+    println!(
+        "Point-get short path: {}",
+        if point_get_short_path {
             "enabled"
         } else {
             "disabled"
@@ -454,6 +484,49 @@ mod tests {
             "tisql",
             "--enable-encoded-result-batch",
             "--disable-encoded-result-batch",
+        ]);
+        assert!(parsed.is_err());
+    }
+
+    #[test]
+    fn test_point_get_short_path_defaults_to_config() {
+        let args = Args::try_parse_from(["tisql"]).unwrap();
+        assert_eq!(
+            resolve_flag_setting(
+                args.enable_point_get_short_path,
+                args.disable_point_get_short_path,
+                DatabaseConfig::default().enable_point_get_short_path
+            ),
+            DatabaseConfig::default().enable_point_get_short_path
+        );
+    }
+
+    #[test]
+    fn test_point_get_short_path_enable_flag() {
+        let args = Args::try_parse_from(["tisql", "--enable-point-get-short-path"]).unwrap();
+        assert!(resolve_flag_setting(
+            args.enable_point_get_short_path,
+            args.disable_point_get_short_path,
+            false
+        ));
+    }
+
+    #[test]
+    fn test_point_get_short_path_disable_flag() {
+        let args = Args::try_parse_from(["tisql", "--disable-point-get-short-path"]).unwrap();
+        assert!(!resolve_flag_setting(
+            args.enable_point_get_short_path,
+            args.disable_point_get_short_path,
+            true
+        ));
+    }
+
+    #[test]
+    fn test_point_get_short_path_flags_conflict() {
+        let parsed = Args::try_parse_from([
+            "tisql",
+            "--enable-point-get-short-path",
+            "--disable-point-get-short-path",
         ]);
         assert!(parsed.is_err());
     }
