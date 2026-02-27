@@ -1644,14 +1644,10 @@ impl LsmEngine {
     fn row_cache_get(&self, key: &[u8], ts: Timestamp) -> Option<Option<RawValue>> {
         let cache_suite = self.cache_suite()?;
         let row_cache = cache_suite.row_cache()?;
-        row_cache.get(&RowCacheKey {
-            ns: self.tablet_cache_ns,
-            user_key: key.to_vec(),
-            read_ts: ts,
-        })
+        row_cache.get(self.tablet_cache_ns, key, ts)
     }
 
-    fn row_cache_insert(&self, key: &[u8], ts: Timestamp, value: Option<RawValue>) {
+    fn row_cache_insert(&self, key: &[u8], commit_ts: Timestamp, value: Option<RawValue>) {
         let Some(cache_suite) = self.cache_suite() else {
             return;
         };
@@ -1662,7 +1658,7 @@ impl LsmEngine {
             RowCacheKey {
                 ns: self.tablet_cache_ns,
                 user_key: key.to_vec(),
-                read_ts: ts,
+                commit_ts,
             },
             value,
         );
@@ -1747,14 +1743,19 @@ impl LsmEngine {
         SstReaderRef::open_with_options(sst_path, Arc::clone(&self.io), options).await
     }
 
-    /// Read a key from SST files with MVCC timestamp filtering.
+    /// Read a key from SST files with MVCC timestamp filtering and return
+    /// the visible committed version timestamp together with value/tombstone.
     ///
     /// Searches L0 first (newest to oldest), then L1, L2, etc.
     /// SSTs contain MVCC keys (key || !commit_ts), so for each candidate SST:
     /// 1. Seek to `(key, read_ts)` using MVCC ordering
     /// 2. Check whether the positioned entry still belongs to `key`
     /// 3. Merge best visible version across candidate SSTs
-    async fn get_from_sst(&self, key: &[u8], ts: Timestamp) -> Result<Option<RawValue>> {
+    async fn get_from_sst_with_commit_ts(
+        &self,
+        key: &[u8],
+        ts: Timestamp,
+    ) -> Result<Option<(Timestamp, Option<RawValue>)>> {
         let version = self.current_version();
 
         // Find SSTs that may contain this key
@@ -1810,10 +1811,20 @@ impl LsmEngine {
 
         // Return the best match, checking for tombstone
         match best_match {
-            Some((_, value)) if is_tombstone(&value) => Ok(None),
-            Some((_, value)) => Ok(Some(value)),
+            Some((commit_ts, value)) if is_tombstone(&value) => Ok(Some((commit_ts, None))),
+            Some((commit_ts, value)) => Ok(Some((commit_ts, Some(value)))),
             None => Ok(None),
         }
+    }
+
+    /// Read a key from SST files with MVCC timestamp filtering.
+    ///
+    /// Returns value-only form used by non-row-cache paths.
+    async fn get_from_sst(&self, key: &[u8], ts: Timestamp) -> Result<Option<RawValue>> {
+        Ok(self
+            .get_from_sst_with_commit_ts(key, ts)
+            .await?
+            .and_then(|(_, value)| value))
     }
 
     /// Force freeze the active memtable.
@@ -2967,9 +2978,15 @@ impl LsmEngine {
             }
 
             // Check SSTs
-            let result = self.get_from_sst(key, ts).await?;
+            let sst_lookup = self.get_from_sst_with_commit_ts(key, ts).await?;
+            let (cache_commit_ts, result) = match sst_lookup {
+                Some((commit_ts, value)) => (Some(commit_ts), value),
+                None => (None, None),
+            };
             if self.row_cache_epoch() == epoch_start {
-                self.row_cache_insert(key, ts, result.clone());
+                if let Some(commit_ts) = cache_commit_ts {
+                    self.row_cache_insert(key, commit_ts, result.clone());
+                }
                 return Ok(result);
             }
         }
@@ -4495,9 +4512,19 @@ impl PessimisticStorage for LsmEngine {
             }
 
             // Check SST files via async point lookup
-            let sst_result = self.get_from_sst(key, read_ts).await.ok().flatten();
+            let sst_lookup = self
+                .get_from_sst_with_commit_ts(key, read_ts)
+                .await
+                .ok()
+                .flatten();
+            let (cache_commit_ts, sst_result) = match sst_lookup {
+                Some((commit_ts, value)) => (Some(commit_ts), value),
+                None => (None, None),
+            };
             if self.row_cache_epoch() == epoch_start {
-                self.row_cache_insert(key, read_ts, sst_result.clone());
+                if let Some(commit_ts) = cache_commit_ts {
+                    self.row_cache_insert(key, commit_ts, sst_result.clone());
+                }
                 return sst_result;
             }
         }

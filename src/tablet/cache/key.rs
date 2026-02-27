@@ -50,12 +50,12 @@ pub struct ReaderCacheKey {
     pub sst_id: u64,
 }
 
-/// Row-cache key for snapshot point reads.
+/// Row-cache key for committed snapshot versions.
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub struct RowCacheKey {
     pub ns: TabletCacheNs,
     pub user_key: Vec<u8>,
-    pub read_ts: u64,
+    pub commit_ts: u64,
 }
 
 /// Stable namespace derived from a tablet's data directory.
