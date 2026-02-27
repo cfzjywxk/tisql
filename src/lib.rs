@@ -443,7 +443,7 @@ mod database_config_tests {
         assert_eq!(config.bloom_bits_per_key, DEFAULT_BLOOM_BITS_PER_KEY);
         assert!(config.shared_block_cache_enabled);
         assert!(config.reader_cache_enabled);
-        assert!(!config.row_cache_enabled);
+        assert!(config.row_cache_enabled);
         assert!(!config.scan_fill_cache);
         assert_eq!(
             config.scan_fill_cache_threshold_blocks,

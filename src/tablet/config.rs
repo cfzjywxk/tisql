@@ -122,8 +122,8 @@ pub const DEFAULT_SHARED_BLOCK_CACHE_ENABLED: bool = true;
 /// such as INSERT duplicate checks.
 pub const DEFAULT_READER_CACHE_ENABLED: bool = true;
 
-/// Row cache is disabled by default (rollout gate).
-pub const DEFAULT_ROW_CACHE_ENABLED: bool = false;
+/// Row cache is enabled by default.
+pub const DEFAULT_ROW_CACHE_ENABLED: bool = true;
 
 /// Foreground scan cache-fill policy gate (off by default in v1 rollout).
 pub const DEFAULT_SCAN_FILL_CACHE: bool = false;
