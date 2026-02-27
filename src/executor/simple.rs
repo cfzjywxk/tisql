@@ -25,6 +25,7 @@
 
 use std::future::Future;
 use std::pin::Pin;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Instant;
 
 use crate::catalog::types::{ColumnId, ColumnInfo, DataType, Key, Row, Schema, TableId, Value};
@@ -1269,6 +1270,35 @@ fn build_dml_read_plan(input: LogicalPlan, table: &TableDef) -> Result<DmlReadPl
 // SimpleExecutor
 // ============================================================================
 
+// ---- Execute-phase profiling for auto-commit point reads ----
+static EXEC_PROFILE_COUNT: AtomicU64 = AtomicU64::new(0);
+static EXEC_PROFILE_BEGIN_US_TOTAL: AtomicU64 = AtomicU64::new(0);
+static EXEC_PROFILE_BUILD_OP_US_TOTAL: AtomicU64 = AtomicU64::new(0);
+const EXEC_PROFILE_LOG_EVERY: u64 = 10_000;
+
+fn record_exec_profile(begin_us: u64, build_op_us: u64) {
+    let count = EXEC_PROFILE_COUNT.fetch_add(1, Ordering::Relaxed) + 1;
+    EXEC_PROFILE_BEGIN_US_TOTAL.fetch_add(begin_us, Ordering::Relaxed);
+    EXEC_PROFILE_BUILD_OP_US_TOTAL.fetch_add(build_op_us, Ordering::Relaxed);
+
+    if count % EXEC_PROFILE_LOG_EVERY != 0 {
+        return;
+    }
+
+    let begin_total = EXEC_PROFILE_BEGIN_US_TOTAL.load(Ordering::Relaxed);
+    let build_total = EXEC_PROFILE_BUILD_OP_US_TOTAL.load(Ordering::Relaxed);
+    let avg_begin = begin_total / count;
+    let avg_build = build_total / count;
+    let avg_total = avg_begin + avg_build;
+    crate::log_info!(
+        "[read-exec-profile] reads={} avg_us(begin/build_op/total)={}/{}/{}",
+        count,
+        avg_begin,
+        avg_build,
+        avg_total
+    );
+}
+
 /// Simple volcano-style executor
 pub struct SimpleExecutor;
 
@@ -1385,14 +1415,26 @@ impl Executor for SimpleExecutor {
                     }
                 } else {
                     // Auto-commit streaming read — no materialization
+                    let is_read = plan.is_read_query();
+                    let begin_t = Instant::now();
                     match txn_service.begin(true) {
-                        Ok(ctx) => match self
-                            .execute_with_ctx(plan, &ctx, txn_service, catalog)
-                            .await
-                        {
-                            Ok(output) => (Ok(output), None),
-                            Err(e) => (Err(e), None),
-                        },
+                        Ok(ctx) => {
+                            let begin_us = begin_t.elapsed().as_micros() as u64;
+                            let build_t = Instant::now();
+                            match self
+                                .execute_with_ctx(plan, &ctx, txn_service, catalog)
+                                .await
+                            {
+                                Ok(output) => {
+                                    if is_read {
+                                        let build_op_us = build_t.elapsed().as_micros() as u64;
+                                        record_exec_profile(begin_us, build_op_us);
+                                    }
+                                    (Ok(output), None)
+                                }
+                                Err(e) => (Err(e), None),
+                            }
+                        }
                         Err(e) => (Err(e), None),
                     }
                 }

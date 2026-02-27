@@ -87,6 +87,7 @@ static RESULT_PATH_MODE_TYPED_TOTAL: AtomicU64 = AtomicU64::new(0);
 static RESULT_PATH_MODE_ENCODED_TOTAL: AtomicU64 = AtomicU64::new(0);
 static RESULT_PATH_MODE_FALLBACK_TOTAL: AtomicU64 = AtomicU64::new(0);
 static READ_QUERY_PROFILE_COUNT: AtomicU64 = AtomicU64::new(0);
+static READ_QUERY_PROFILE_OVERHEAD_US_TOTAL: AtomicU64 = AtomicU64::new(0);
 static READ_QUERY_PROFILE_PARSE_BIND_US_TOTAL: AtomicU64 = AtomicU64::new(0);
 static READ_QUERY_PROFILE_EXECUTE_US_TOTAL: AtomicU64 = AtomicU64::new(0);
 static READ_QUERY_PROFILE_STREAM_US_TOTAL: AtomicU64 = AtomicU64::new(0);
@@ -140,6 +141,8 @@ pub async fn dispatch_full_query(
     let (response_tx, response_rx) = oneshot::channel::<QueryResponse>();
 
     let task = async move {
+        let task_entry = Instant::now();
+
         // Check for legacy SHOW commands (string-matched, not parsed).
         // SHOW CREATE falls through to parser/binder for robust name handling.
         let sql_trimmed = sql.trim();
@@ -151,6 +154,7 @@ pub async fn dispatch_full_query(
         }
 
         // CPU: parse and bind
+        let overhead_us = task_entry.elapsed().as_micros() as u64;
         let parse_bind_begin = Instant::now();
         let plan = match db.parse_and_bind(&sql, &exec_ctx) {
             Ok(plan) => plan,
@@ -198,7 +202,7 @@ pub async fn dispatch_full_query(
                 .await;
                 let stream_us = stream_begin.elapsed().as_micros() as u64;
                 if is_read_query {
-                    record_read_query_profile(parse_bind_us, execute_us, stream_us);
+                    record_read_query_profile(overhead_us, parse_bind_us, execute_us, stream_us);
                 }
             }
             (Ok(ExecutionOutput::Affected { count }), ctx) => {
@@ -239,8 +243,14 @@ pub async fn dispatch_full_query(
     })
 }
 
-fn record_read_query_profile(parse_bind_us: u64, execute_us: u64, stream_us: u64) {
+fn record_read_query_profile(
+    overhead_us: u64,
+    parse_bind_us: u64,
+    execute_us: u64,
+    stream_us: u64,
+) {
     let count = READ_QUERY_PROFILE_COUNT.fetch_add(1, Ordering::Relaxed) + 1;
+    READ_QUERY_PROFILE_OVERHEAD_US_TOTAL.fetch_add(overhead_us, Ordering::Relaxed);
     READ_QUERY_PROFILE_PARSE_BIND_US_TOTAL.fetch_add(parse_bind_us, Ordering::Relaxed);
     READ_QUERY_PROFILE_EXECUTE_US_TOTAL.fetch_add(execute_us, Ordering::Relaxed);
     READ_QUERY_PROFILE_STREAM_US_TOTAL.fetch_add(stream_us, Ordering::Relaxed);
@@ -249,16 +259,19 @@ fn record_read_query_profile(parse_bind_us: u64, execute_us: u64, stream_us: u64
         return;
     }
 
+    let overhead_total = READ_QUERY_PROFILE_OVERHEAD_US_TOTAL.load(Ordering::Relaxed);
     let parse_total = READ_QUERY_PROFILE_PARSE_BIND_US_TOTAL.load(Ordering::Relaxed);
     let execute_total = READ_QUERY_PROFILE_EXECUTE_US_TOTAL.load(Ordering::Relaxed);
     let stream_total = READ_QUERY_PROFILE_STREAM_US_TOTAL.load(Ordering::Relaxed);
+    let avg_overhead = overhead_total / count;
     let avg_parse = parse_total / count;
     let avg_execute = execute_total / count;
     let avg_stream = stream_total / count;
-    let avg_total = avg_parse + avg_execute + avg_stream;
+    let avg_total = avg_overhead + avg_parse + avg_execute + avg_stream;
     log_info!(
-        "[read-phase-profile] reads={} avg_us(parse_bind/execute/stream/total)={}/{}/{}/{}",
+        "[read-phase-profile] reads={} avg_us(overhead/parse_bind/execute/stream/total)={}/{}/{}/{}/{}",
         count,
+        avg_overhead,
         avg_parse,
         avg_execute,
         avg_stream,

@@ -98,6 +98,122 @@ thread_local! {
     static TRACKER_SLOT_INDEX: usize = TRACKER_SLOT_COUNTER.fetch_add(1, AtomicOrdering::Relaxed);
 }
 
+// ---- Storage point-read profiling ----
+static STORAGE_PROFILE_COUNT: AtomicU64 = AtomicU64::new(0);
+static STORAGE_PROFILE_MEMTABLE_US_TOTAL: AtomicU64 = AtomicU64::new(0);
+static STORAGE_PROFILE_ROW_CACHE_US_TOTAL: AtomicU64 = AtomicU64::new(0);
+static STORAGE_PROFILE_SST_US_TOTAL: AtomicU64 = AtomicU64::new(0);
+static STORAGE_PROFILE_MEMTABLE_HITS: AtomicU64 = AtomicU64::new(0);
+static STORAGE_PROFILE_ROW_CACHE_HITS: AtomicU64 = AtomicU64::new(0);
+static STORAGE_PROFILE_SST_HITS: AtomicU64 = AtomicU64::new(0);
+const STORAGE_PROFILE_LOG_EVERY: u64 = 10_000;
+
+fn record_storage_profile(memtable_us: u64, row_cache_us: u64, sst_us: u64, hit: &str) {
+    let count = STORAGE_PROFILE_COUNT.fetch_add(1, AtomicOrdering::Relaxed) + 1;
+    STORAGE_PROFILE_MEMTABLE_US_TOTAL.fetch_add(memtable_us, AtomicOrdering::Relaxed);
+    STORAGE_PROFILE_ROW_CACHE_US_TOTAL.fetch_add(row_cache_us, AtomicOrdering::Relaxed);
+    STORAGE_PROFILE_SST_US_TOTAL.fetch_add(sst_us, AtomicOrdering::Relaxed);
+    match hit {
+        "mem" => {
+            STORAGE_PROFILE_MEMTABLE_HITS.fetch_add(1, AtomicOrdering::Relaxed);
+        }
+        "rc" => {
+            STORAGE_PROFILE_ROW_CACHE_HITS.fetch_add(1, AtomicOrdering::Relaxed);
+        }
+        "sst" => {
+            STORAGE_PROFILE_SST_HITS.fetch_add(1, AtomicOrdering::Relaxed);
+        }
+        _ => {}
+    }
+
+    if count % STORAGE_PROFILE_LOG_EVERY != 0 {
+        return;
+    }
+
+    let mem_total = STORAGE_PROFILE_MEMTABLE_US_TOTAL.load(AtomicOrdering::Relaxed);
+    let rc_total = STORAGE_PROFILE_ROW_CACHE_US_TOTAL.load(AtomicOrdering::Relaxed);
+    let sst_total = STORAGE_PROFILE_SST_US_TOTAL.load(AtomicOrdering::Relaxed);
+    let mem_hits = STORAGE_PROFILE_MEMTABLE_HITS.load(AtomicOrdering::Relaxed);
+    let rc_hits = STORAGE_PROFILE_ROW_CACHE_HITS.load(AtomicOrdering::Relaxed);
+    let sst_hits = STORAGE_PROFILE_SST_HITS.load(AtomicOrdering::Relaxed);
+    let avg_mem = mem_total / count;
+    let avg_rc = rc_total / count;
+    let avg_sst = sst_total / count;
+    let avg_total = avg_mem + avg_rc + avg_sst;
+    log_info!(
+        "[read-storage-profile] reads={} avg_us(memtable/row_cache/sst/total)={}/{}/{}/{} hits(mem/rc/sst)={}/{}/{}",
+        count, avg_mem, avg_rc, avg_sst, avg_total, mem_hits, rc_hits, sst_hits
+    );
+}
+
+// ---- SST sub-phase profiling ----
+static SST_PROFILE_COUNT: AtomicU64 = AtomicU64::new(0);
+static SST_PROFILE_VERSION_US_TOTAL: AtomicU64 = AtomicU64::new(0);
+static SST_PROFILE_READER_US_TOTAL: AtomicU64 = AtomicU64::new(0);
+static SST_PROFILE_BLOOM_US_TOTAL: AtomicU64 = AtomicU64::new(0);
+static SST_PROFILE_SEEK_US_TOTAL: AtomicU64 = AtomicU64::new(0);
+static SST_PROFILE_COMPARE_US_TOTAL: AtomicU64 = AtomicU64::new(0);
+static SST_PROFILE_SSTS_VISITED: AtomicU64 = AtomicU64::new(0);
+static SST_PROFILE_BLOOM_REJECTIONS: AtomicU64 = AtomicU64::new(0);
+const SST_PROFILE_LOG_EVERY: u64 = 10_000;
+
+struct SstProfileAccum {
+    reader_us: u64,
+    bloom_us: u64,
+    seek_us: u64,
+    compare_us: u64,
+    ssts_visited: u64,
+    bloom_rejections: u64,
+}
+
+impl SstProfileAccum {
+    fn new() -> Self {
+        Self {
+            reader_us: 0,
+            bloom_us: 0,
+            seek_us: 0,
+            compare_us: 0,
+            ssts_visited: 0,
+            bloom_rejections: 0,
+        }
+    }
+}
+
+fn record_sst_profile(version_us: u64, accum: &SstProfileAccum) {
+    let count = SST_PROFILE_COUNT.fetch_add(1, AtomicOrdering::Relaxed) + 1;
+    SST_PROFILE_VERSION_US_TOTAL.fetch_add(version_us, AtomicOrdering::Relaxed);
+    SST_PROFILE_READER_US_TOTAL.fetch_add(accum.reader_us, AtomicOrdering::Relaxed);
+    SST_PROFILE_BLOOM_US_TOTAL.fetch_add(accum.bloom_us, AtomicOrdering::Relaxed);
+    SST_PROFILE_SEEK_US_TOTAL.fetch_add(accum.seek_us, AtomicOrdering::Relaxed);
+    SST_PROFILE_COMPARE_US_TOTAL.fetch_add(accum.compare_us, AtomicOrdering::Relaxed);
+    SST_PROFILE_SSTS_VISITED.fetch_add(accum.ssts_visited, AtomicOrdering::Relaxed);
+    SST_PROFILE_BLOOM_REJECTIONS.fetch_add(accum.bloom_rejections, AtomicOrdering::Relaxed);
+
+    if count % SST_PROFILE_LOG_EVERY != 0 {
+        return;
+    }
+
+    let ver_total = SST_PROFILE_VERSION_US_TOTAL.load(AtomicOrdering::Relaxed);
+    let rdr_total = SST_PROFILE_READER_US_TOTAL.load(AtomicOrdering::Relaxed);
+    let blm_total = SST_PROFILE_BLOOM_US_TOTAL.load(AtomicOrdering::Relaxed);
+    let seek_total = SST_PROFILE_SEEK_US_TOTAL.load(AtomicOrdering::Relaxed);
+    let cmp_total = SST_PROFILE_COMPARE_US_TOTAL.load(AtomicOrdering::Relaxed);
+    let ssts = SST_PROFILE_SSTS_VISITED.load(AtomicOrdering::Relaxed);
+    let rejects = SST_PROFILE_BLOOM_REJECTIONS.load(AtomicOrdering::Relaxed);
+    let avg_ver = ver_total / count;
+    let avg_rdr = rdr_total / count;
+    let avg_blm = blm_total / count;
+    let avg_seek = seek_total / count;
+    let avg_cmp = cmp_total / count;
+    let avg_total = avg_ver + avg_rdr + avg_blm + avg_seek + avg_cmp;
+    let avg_ssts = ssts as f64 / count as f64;
+    let avg_rejects = rejects as f64 / count as f64;
+    log_info!(
+        "[read-sst-profile] reads={} avg_us(version/reader/bloom/seek/compare/total)={}/{}/{}/{}/{}/{} avg_ssts={:.2} avg_bloom_reject={:.2}",
+        count, avg_ver, avg_rdr, avg_blm, avg_seek, avg_cmp, avg_total, avg_ssts, avg_rejects
+    );
+}
+
 /// Cache-line-aligned atomic u64 to prevent false sharing between threads.
 #[repr(align(64))]
 struct PaddedAtomicU64(AtomicU64);
@@ -1756,20 +1872,24 @@ impl LsmEngine {
         key: &[u8],
         ts: Timestamp,
     ) -> Result<Option<(Timestamp, Option<RawValue>)>> {
+        let version_begin = Instant::now();
         let version = self.current_version();
 
         // Find SSTs that may contain this key
         let candidates = version.find_ssts_for_key(key);
         let seek_target = MvccKey::seek_for_read(key, ts);
+        let version_us = version_begin.elapsed().as_micros() as u64;
 
         // Track best match: (entry_ts, value) where entry_ts <= ts
         let mut best_match: Option<(Timestamp, RawValue)> = None;
+        let mut accum = SstProfileAccum::new();
 
         for sst_meta in candidates {
             // Quick reject: this SST only has versions newer than our snapshot.
             if sst_meta.min_ts > ts {
                 continue;
             }
+            accum.ssts_visited += 1;
 
             let sst_path = self
                 .config
@@ -1778,21 +1898,35 @@ impl LsmEngine {
 
             // Point-seek the best visible MVCC version for this user key in this SST.
             // Propagate errors instead of silently ignoring (risks wrong reads).
+            let reader_begin = Instant::now();
             let reader = self.open_point_reader(&sst_path, sst_meta.id, true).await?;
+            accum.reader_us += reader_begin.elapsed().as_micros() as u64;
+
+            let bloom_begin = Instant::now();
             if self.config.bloom_enabled && !reader.may_contain_user_key(key).await? {
+                accum.bloom_us += bloom_begin.elapsed().as_micros() as u64;
+                accum.bloom_rejections += 1;
                 continue;
             }
+            accum.bloom_us += bloom_begin.elapsed().as_micros() as u64;
+
+            let seek_begin = Instant::now();
             let mut iter = SstIterator::new(reader)?;
             iter.seek(seek_target.as_bytes()).await?;
+            accum.seek_us += seek_begin.elapsed().as_micros() as u64;
+
             if !iter.valid() {
                 continue;
             }
 
+            let cmp_begin = Instant::now();
             let mvcc_key = iter.key();
             if extract_key(mvcc_key) != key {
+                accum.compare_us += cmp_begin.elapsed().as_micros() as u64;
                 continue;
             }
             let Some(entry_ts) = extract_timestamp(mvcc_key) else {
+                accum.compare_us += cmp_begin.elapsed().as_micros() as u64;
                 continue;
             };
             debug_assert!(
@@ -1807,7 +1941,10 @@ impl LsmEngine {
             if !dominated {
                 best_match = Some((entry_ts, iter.value().to_vec()));
             }
+            accum.compare_us += cmp_begin.elapsed().as_micros() as u64;
         }
+
+        record_sst_profile(version_us, &accum);
 
         // Return the best match, checking for tombstone
         match best_match {
@@ -4465,6 +4602,8 @@ impl PessimisticStorage for LsmEngine {
         }
 
         loop {
+            let prof_start = Instant::now();
+
             let epoch_start = self.row_cache_epoch();
             if epoch_start & 1 == 1 {
                 tokio::task::yield_now().await;
@@ -4499,19 +4638,26 @@ impl PessimisticStorage for LsmEngine {
                     found
                 }
             };
+            let memtable_us = prof_start.elapsed().as_micros() as u64;
 
             if let Some(result) = memtable_result {
+                record_storage_profile(memtable_us, 0, 0, "mem");
                 return result;
             }
 
+            let rc_start = Instant::now();
             if let Some(cached) = self.row_cache_get(key, read_ts) {
                 if self.row_cache_epoch() == epoch_start {
+                    let row_cache_us = rc_start.elapsed().as_micros() as u64;
+                    record_storage_profile(memtable_us, row_cache_us, 0, "rc");
                     return cached;
                 }
                 continue;
             }
+            let row_cache_us = rc_start.elapsed().as_micros() as u64;
 
             // Check SST files via async point lookup
+            let sst_start = Instant::now();
             let sst_lookup = self
                 .get_from_sst_with_commit_ts(key, read_ts)
                 .await
@@ -4521,10 +4667,12 @@ impl PessimisticStorage for LsmEngine {
                 Some((commit_ts, value)) => (Some(commit_ts), value),
                 None => (None, None),
             };
+            let sst_us = sst_start.elapsed().as_micros() as u64;
             if self.row_cache_epoch() == epoch_start {
                 if let Some(commit_ts) = cache_commit_ts {
                     self.row_cache_insert(key, commit_ts, sst_result.clone());
                 }
+                record_storage_profile(memtable_us, row_cache_us, sst_us, "sst");
                 return sst_result;
             }
         }
