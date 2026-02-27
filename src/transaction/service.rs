@@ -518,9 +518,13 @@ impl<S: PessimisticStorage + 'static, L: ClogService + 'static, T: TsoService> T
     async fn get(&self, ctx: &TxnCtx, table_id: TableId, key: &[u8]) -> Result<Option<RawValue>> {
         Self::validate_table_target_key(table_id, key, "TxnService::get")?;
         let tablet_id = route_table_to_tablet(table_id);
+        // Keep point-get ownership semantics aligned with scan_iter:
+        // - explicit txn reads can see their own pending writes
+        // - implicit txn reads use owner=0 to avoid intra-statement self-visibility
+        let owner_ts = if ctx.is_explicit() { ctx.start_ts } else { 0 };
         let value = self
             .storage
-            .get_with_owner_on_tablet(tablet_id, key, ctx.start_ts, ctx.start_ts)
+            .get_with_owner_on_tablet(tablet_id, key, ctx.start_ts, owner_ts)
             .await;
         Ok(value.filter(|v| !is_tombstone(v) && !is_lock(v)))
     }
@@ -2295,6 +2299,35 @@ mod tests {
 
         // Clean up
         txn_service.rollback(ctx).unwrap();
+    }
+
+    #[tokio::test]
+    async fn test_implicit_txn_get_does_not_see_own_pending_write() {
+        let (_storage, txn_service, _dir) = create_test_service();
+
+        // begin() creates an implicit context (`explicit = false`)
+        let mut ctx = txn_service.begin(false).unwrap();
+        txn_service
+            .put(&mut ctx, ALL_META_TABLE_ID, b"key1", b"value1".to_vec())
+            .await
+            .unwrap();
+
+        // Implicit reads use owner_ts=0, so pending writes from this same context
+        // are not visible before commit.
+        let pre_commit = txn_service
+            .get(&ctx, ALL_META_TABLE_ID, b"key1")
+            .await
+            .unwrap();
+        assert_eq!(pre_commit, None);
+
+        txn_service.commit(ctx).await.unwrap();
+
+        let reader = txn_service.begin(true).unwrap();
+        let post_commit = txn_service
+            .get(&reader, ALL_META_TABLE_ID, b"key1")
+            .await
+            .unwrap();
+        assert_eq!(post_commit, Some(b"value1".to_vec()));
     }
 
     #[tokio::test]

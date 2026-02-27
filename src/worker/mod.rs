@@ -25,6 +25,7 @@
 
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
+use std::time::Instant;
 
 use tokio::sync::{mpsc, oneshot, OwnedSemaphorePermit, Semaphore};
 
@@ -37,7 +38,7 @@ use crate::util::mysql_text::{
     format_date_canonical, format_datetime_canonical, format_time_canonical,
 };
 use crate::Database;
-use crate::{log_debug, log_warn};
+use crate::{log_debug, log_info, log_warn};
 
 /// Result batch transport between worker and protocol runtimes.
 pub enum ResultBatch {
@@ -85,6 +86,11 @@ const VARLEN_PAYLOAD_RATIO_THRESHOLD: f64 = 0.2;
 static RESULT_PATH_MODE_TYPED_TOTAL: AtomicU64 = AtomicU64::new(0);
 static RESULT_PATH_MODE_ENCODED_TOTAL: AtomicU64 = AtomicU64::new(0);
 static RESULT_PATH_MODE_FALLBACK_TOTAL: AtomicU64 = AtomicU64::new(0);
+static READ_QUERY_PROFILE_COUNT: AtomicU64 = AtomicU64::new(0);
+static READ_QUERY_PROFILE_PARSE_BIND_US_TOTAL: AtomicU64 = AtomicU64::new(0);
+static READ_QUERY_PROFILE_EXECUTE_US_TOTAL: AtomicU64 = AtomicU64::new(0);
+static READ_QUERY_PROFILE_STREAM_US_TOTAL: AtomicU64 = AtomicU64::new(0);
+const READ_QUERY_PROFILE_LOG_EVERY: u64 = 10_000;
 
 /// Bounded channel capacity (number of batches in flight).
 const CHANNEL_CAPACITY: usize = if CHANNEL_CAPACITY_FROM_BUDGET < MIN_CHANNEL_CAPACITY {
@@ -145,6 +151,7 @@ pub async fn dispatch_full_query(
         }
 
         // CPU: parse and bind
+        let parse_bind_begin = Instant::now();
         let plan = match db.parse_and_bind(&sql, &exec_ctx) {
             Ok(plan) => plan,
             Err(e) => {
@@ -152,15 +159,19 @@ pub async fn dispatch_full_query(
                 return;
             }
         };
+        let parse_bind_us = parse_bind_begin.elapsed().as_micros() as u64;
 
-        let columns = if plan.is_read_query() {
+        let is_read_query = plan.is_read_query();
+        let columns = if is_read_query {
             Some(plan.output_columns())
         } else {
             None
         };
 
         // Execute plan (async — iterators yield during SST I/O)
+        let execute_begin = Instant::now();
         let (exec_result, returned_ctx) = db.execute_plan(plan, &exec_ctx, txn_ctx).await;
+        let execute_us = execute_begin.elapsed().as_micros() as u64;
 
         match (exec_result, returned_ctx) {
             (Ok(ExecutionOutput::Rows { exec, .. }), returned_ctx) => {
@@ -177,6 +188,7 @@ pub async fn dispatch_full_query(
                 });
 
                 // Pull rows from operator tree and stream batches
+                let stream_begin = Instant::now();
                 stream_rows(
                     exec,
                     num_columns,
@@ -184,6 +196,10 @@ pub async fn dispatch_full_query(
                     batch_tx,
                 )
                 .await;
+                let stream_us = stream_begin.elapsed().as_micros() as u64;
+                if is_read_query {
+                    record_read_query_profile(parse_bind_us, execute_us, stream_us);
+                }
             }
             (Ok(ExecutionOutput::Affected { count }), ctx) => {
                 let _ = response_tx.send(QueryResponse::Affected {
@@ -221,6 +237,33 @@ pub async fn dispatch_full_query(
         error: TiSqlError::Internal("Worker task dropped".into()),
         txn_ctx: None,
     })
+}
+
+fn record_read_query_profile(parse_bind_us: u64, execute_us: u64, stream_us: u64) {
+    let count = READ_QUERY_PROFILE_COUNT.fetch_add(1, Ordering::Relaxed) + 1;
+    READ_QUERY_PROFILE_PARSE_BIND_US_TOTAL.fetch_add(parse_bind_us, Ordering::Relaxed);
+    READ_QUERY_PROFILE_EXECUTE_US_TOTAL.fetch_add(execute_us, Ordering::Relaxed);
+    READ_QUERY_PROFILE_STREAM_US_TOTAL.fetch_add(stream_us, Ordering::Relaxed);
+
+    if count % READ_QUERY_PROFILE_LOG_EVERY != 0 {
+        return;
+    }
+
+    let parse_total = READ_QUERY_PROFILE_PARSE_BIND_US_TOTAL.load(Ordering::Relaxed);
+    let execute_total = READ_QUERY_PROFILE_EXECUTE_US_TOTAL.load(Ordering::Relaxed);
+    let stream_total = READ_QUERY_PROFILE_STREAM_US_TOTAL.load(Ordering::Relaxed);
+    let avg_parse = parse_total / count;
+    let avg_execute = execute_total / count;
+    let avg_stream = stream_total / count;
+    let avg_total = avg_parse + avg_execute + avg_stream;
+    log_info!(
+        "[read-phase-profile] reads={} avg_us(parse_bind/execute/stream/total)={}/{}/{}/{}",
+        count,
+        avg_parse,
+        avg_execute,
+        avg_stream,
+        avg_total
+    );
 }
 
 fn is_show_create(sql_lower: &str) -> bool {
