@@ -2,6 +2,14 @@
 
 A MySQL-compatible SQL database in Rust focused on correctness-first transaction semantics and practical storage-engine design.
 
+TiSQL explores key architectural designs and implementation techniques for transaction processing and storage engines, including:
+
+- **Architecture design** — for example, [one-node-fits-all TiSQL RFC](https://github.com/TiDBHackers/rfc/blob/master/text/one_node_fits_all_tisql.md)
+- **Transaction processing** — concurrency control protocols
+- **Log service** — single-node log stream design
+- **Data sharding**
+- **Storage engine** — LSM-tree optimizations
+
 [![CI](https://github.com/cfzjywxk/tisql/actions/workflows/ci.yml/badge.svg)](https://github.com/cfzjywxk/tisql/actions/workflows/ci.yml)
 [![License](https://img.shields.io/badge/license-Apache%202.0-blue.svg)](LICENSE)
 
