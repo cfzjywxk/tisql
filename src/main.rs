@@ -36,6 +36,25 @@ use tisql::{
     MYSQL_DEFAULT_PORT,
 };
 
+#[cfg(unix)]
+async fn wait_for_shutdown_signal() -> std::io::Result<&'static str> {
+    use tokio::signal::unix::{signal, SignalKind};
+
+    let mut sigint = signal(SignalKind::interrupt())?;
+    let mut sigterm = signal(SignalKind::terminate())?;
+
+    tokio::select! {
+        _ = sigint.recv() => Ok("SIGINT"),
+        _ = sigterm.recv() => Ok("SIGTERM"),
+    }
+}
+
+#[cfg(not(unix))]
+async fn wait_for_shutdown_signal() -> std::io::Result<&'static str> {
+    tokio::signal::ctrl_c().await?;
+    Ok("Ctrl+C")
+}
+
 #[derive(ClapParser, Debug)]
 #[command(name = "tisql")]
 #[command(about = "TiSQL - A minimal SQL database in Rust")]
@@ -419,8 +438,28 @@ fn main() {
         tisql::util::init_logger(log_level);
 
         log_info!("TiSQL server starting on {}", addr);
+        let server_result = server
+            .run_until_shutdown(async {
+                match wait_for_shutdown_signal().await {
+                    Ok(signal) => {
+                        log_info!("Received {signal}, starting graceful shutdown");
+                    }
+                    Err(e) => {
+                        log_error!(
+                            "Failed to wait for shutdown signal: {} (initiating shutdown anyway)",
+                            e
+                        );
+                    }
+                }
+            })
+            .await;
 
-        if let Err(e) = server.run().await {
+        if let Err(e) = db.close().await {
+            log_error!("Database close error: {}", e);
+            eprintln!("Database close error: {e}");
+        }
+
+        if let Err(e) = server_result {
             log_error!("Server error: {}", e);
             eprintln!("Server error: {e}");
         }
