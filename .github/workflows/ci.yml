@@ -169,10 +169,34 @@ jobs:
           path: target/release/tisql
           retention-days: 7
 
+  macos_build:
+    name: Build (macOS)
+    runs-on: macos-latest
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache cargo registry
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: ${{ runner.os }}-cargo-${{ hashFiles('**/Cargo.lock') }}
+          restore-keys: |
+            ${{ runner.os }}-cargo-
+
+      - name: Build (all targets)
+        run: cargo build --locked --all-targets
+
   # Summary job that depends on all other jobs
   ci-success:
     name: CI Success
-    needs: [check, fmt, clippy, test, e2e-test, build]
+    needs: [check, fmt, clippy, test, e2e-test, build, macos_build]
     runs-on: ubuntu-latest
     if: always()
     steps:
@@ -183,7 +207,8 @@ jobs:
              [[ "${{ needs.clippy.result }}" != "success" ]] || \
              [[ "${{ needs.test.result }}" != "success" ]] || \
              [[ "${{ needs.e2e-test.result }}" != "success" ]] || \
-             [[ "${{ needs.build.result }}" != "success" ]]; then
+             [[ "${{ needs.build.result }}" != "success" ]] || \
+             [[ "${{ needs.macos_build.result }}" != "success" ]]; then
             echo "One or more jobs failed"
             exit 1
           fi

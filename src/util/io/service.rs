@@ -700,7 +700,32 @@ fn write_at_sync(fd: RawFd, offset: u64, buf: &AlignedBuf) -> IoResult<usize> {
     Ok(total_written)
 }
 
-#[cfg(not(target_os = "linux"))]
+#[cfg(target_os = "macos")]
+fn sync_sync(fd: RawFd, mode: IoSyncMode) -> IoResult<()> {
+    // SAFETY: `fd` belongs to an open file descriptor owned by DmaFile.
+    let rc = unsafe {
+        match mode {
+            // `fsync` on macOS may not flush drive write caches, while `F_FULLFSYNC` requests
+            // data to be committed to stable storage (as best as the platform can provide).
+            IoSyncMode::FullSync => libc::fcntl(fd, libc::F_FULLFSYNC),
+            // macOS doesn't have `fdatasync`, so `DataSync` falls back to `fsync`.
+            IoSyncMode::DataSync => libc::fsync(fd),
+        }
+    };
+    if rc < 0 {
+        let op_name = match mode {
+            IoSyncMode::FullSync => "fcntl(F_FULLFSYNC)",
+            IoSyncMode::DataSync => "fsync",
+        };
+        return Err(format!(
+            "{op_name} failed: {}",
+            std::io::Error::last_os_error()
+        ));
+    }
+    Ok(())
+}
+
+#[cfg(all(not(target_os = "linux"), not(target_os = "macos")))]
 fn sync_sync(fd: RawFd, mode: IoSyncMode) -> IoResult<()> {
     // SAFETY: `fd` belongs to an open file descriptor owned by DmaFile.
     let rc = unsafe {
