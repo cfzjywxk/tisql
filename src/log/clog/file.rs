@@ -121,6 +121,8 @@ pub struct FileClogConfig {
     pub clog_file: String,
     /// Group-commit batching delay knobs.
     pub group_commit: GroupCommitTuning,
+    /// Spin iterations before parking clog writer on empty buffer.
+    pub clog_spin_before_park_iters: u32,
 }
 
 impl Default for FileClogConfig {
@@ -129,6 +131,7 @@ impl Default for FileClogConfig {
             clog_dir: PathBuf::from("data"),
             clog_file: "tisql.clog".to_string(),
             group_commit: GroupCommitTuning::default(),
+            clog_spin_before_park_iters: 0,
         }
     }
 }
@@ -140,6 +143,7 @@ impl FileClogConfig {
             clog_dir: dir.into(),
             clog_file: "tisql.clog".to_string(),
             group_commit: GroupCommitTuning::default(),
+            clog_spin_before_park_iters: 0,
         }
     }
 
@@ -152,6 +156,12 @@ impl FileClogConfig {
     /// Set no-delay threshold (minimum 1).
     pub fn with_group_commit_no_delay_count(mut self, no_delay_count: usize) -> Self {
         self.group_commit.no_delay_count = no_delay_count.max(1);
+        self
+    }
+
+    /// Set spin iterations before parking clog writer on empty buffer.
+    pub fn with_clog_spin_before_park_iters(mut self, iters: u32) -> Self {
+        self.clog_spin_before_park_iters = iters;
         self
     }
 
@@ -322,12 +332,19 @@ impl FileClogService {
             DEFAULT_GROUP_BUFFER_SIZE,
             DEFAULT_GROUP_BUFFER_SLOTS,
         );
+        let writer_tuning = super::writer::ClogWriterTuning {
+            spin_before_park_iters: config.clog_spin_before_park_iters,
+            micro_batch_delay: config.group_commit.delay,
+            micro_batch_no_delay_count: config.group_commit.no_delay_count.max(1),
+            ..Default::default()
+        };
         let writer = super::writer::ClogWriter::new(
             clog_path.clone(),
             Arc::clone(&group_buffer),
             io_handle,
             writer_start,
             DEFAULT_GROUP_BUFFER_SIZE,
+            writer_tuning,
             super::writer::default_fatal_action(),
         )
         .map_err(|e| TiSqlError::Internal(format!("Failed to start clog writer: {e}")))?;
@@ -3220,6 +3237,7 @@ mod tests {
         assert_eq!(config.clog_file, "tisql.clog");
         assert_eq!(config.group_commit.delay, std::time::Duration::ZERO);
         assert_eq!(config.group_commit.no_delay_count, 16);
+        assert_eq!(config.clog_spin_before_park_iters, 0);
         assert_eq!(config.clog_path(), PathBuf::from("data/tisql.clog"));
     }
 
@@ -3231,6 +3249,7 @@ mod tests {
         assert_eq!(config.clog_file, "tisql.clog");
         assert_eq!(config.group_commit.delay, std::time::Duration::ZERO);
         assert_eq!(config.group_commit.no_delay_count, 16);
+        assert_eq!(config.clog_spin_before_park_iters, 0);
         assert_eq!(config.clog_path(), PathBuf::from("/custom/path/tisql.clog"));
     }
 
@@ -3238,12 +3257,14 @@ mod tests {
     fn test_config_group_commit_builder_methods() {
         let config = FileClogConfig::default()
             .with_group_commit_delay(std::time::Duration::from_micros(80))
-            .with_group_commit_no_delay_count(0);
+            .with_group_commit_no_delay_count(0)
+            .with_clog_spin_before_park_iters(128);
         assert_eq!(
             config.group_commit.delay,
             std::time::Duration::from_micros(80)
         );
         assert_eq!(config.group_commit.no_delay_count, 1);
+        assert_eq!(config.clog_spin_before_park_iters, 128);
     }
 
     // ========================================================================

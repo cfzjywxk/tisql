@@ -251,6 +251,8 @@ pub struct DatabaseConfig {
     pub group_commit_delay: Duration,
     /// Skip group-commit delay once batch reaches this size.
     pub group_commit_no_delay_count: usize,
+    /// Number of spin iterations before parking writer on empty clog buffer.
+    pub clog_spin_before_park_iters: u32,
 }
 
 impl Default for DatabaseConfig {
@@ -279,6 +281,7 @@ impl Default for DatabaseConfig {
             engine_status_top_n_tablets: 20,
             group_commit_delay: Duration::ZERO,
             group_commit_no_delay_count: 16,
+            clog_spin_before_park_iters: 0,
         }
     }
 }
@@ -413,6 +416,12 @@ impl DatabaseConfig {
         self
     }
 
+    /// Set spin iterations before parking on empty clog buffer.
+    pub fn with_clog_spin_before_park_iters(mut self, iters: u32) -> Self {
+        self.clog_spin_before_park_iters = iters;
+        self
+    }
+
     fn lsm_config_for_dir(
         &self,
         data_dir: impl Into<PathBuf>,
@@ -469,6 +478,7 @@ mod database_config_tests {
         assert_eq!(config.l0_slowdown_trigger, DEFAULT_L0_SLOWDOWN_TRIGGER);
         assert_eq!(config.l0_stop_trigger, DEFAULT_L0_STOP_TRIGGER);
         assert_eq!(config.max_levels, DEFAULT_MAX_LEVELS);
+        assert_eq!(config.clog_spin_before_park_iters, 0);
     }
 
     #[test]
@@ -857,11 +867,13 @@ impl Database {
         // 2. Staged recovery bootstrap (system ilog + raw clog, no replay yet).
         let clog_config = FileClogConfig::with_dir(&config.data_dir)
             .with_group_commit_delay(config.group_commit_delay)
-            .with_group_commit_no_delay_count(config.group_commit_no_delay_count);
+            .with_group_commit_no_delay_count(config.group_commit_no_delay_count)
+            .with_clog_spin_before_park_iters(config.clog_spin_before_park_iters);
         log_info!(
-            "Clog config: group_commit_delay_us={}, group_commit_no_delay_count={}",
+            "Clog config: group_commit_delay_us={}, group_commit_no_delay_count={}, clog_spin_before_park_iters={}",
             clog_config.group_commit.delay.as_micros(),
-            clog_config.group_commit.no_delay_count
+            clog_config.group_commit.no_delay_count,
+            clog_config.clog_spin_before_park_iters
         );
         let mut recovery = LsmRecovery::with_configs(
             lsm_config.clone(),

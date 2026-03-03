@@ -109,15 +109,27 @@ SELECT id, name, age FROM users ORDER BY id;
 
 ## Performance Snapshot
 
-Benchmark: [go-ycsb](https://github.com/pingcap/go-ycsb) insert-only, `recordcount=100k`, `operationcount=300k`, 16 threads, COM_QUERY path.
+All benchmarks: 16 threads, COM_QUERY path (no prepared statements).
+
+**go-ycsb insert-only** (`recordcount=100k`, `operationcount=300k`):
 
 | Configuration | TiSQL | MySQL 8.0 |
 |--------------|-------|-----------|
 | **Strict durability** | **~20.7k OPS** | ~7.4k–7.8k OPS |
 | **InnoDB-only** (binlog disabled, doublewrite ON) | — | ~13.5k OPS |
 
+**sysbench oltp_update_non_index** (no secondary index, 300s warmup + 300s measured):
+
+| Dataset | TiSQL | MySQL strict | MySQL redo-only |
+|---------|-------|-------------|-----------------|
+| **100k rows** | **2171 TPS** (p95 8.0ms) | 1033 TPS (p95 20.7ms) | 2908 TPS (p95 7.7ms) |
+| **1M rows** | **2176 TPS** (p95 8.0ms) | 1150 TPS (p95 20.4ms) | 2550 TPS (p95 7.8ms) |
+
+TiSQL delivers **~2x** the throughput of MySQL at matching durability (strict: redo fsync + binlog fsync per txn). Against MySQL with binlog disabled (redo-only), TiSQL is within ~15% on aggregate TPS and within ~2% on median sustained throughput — comparable, with significantly more stable latency (zero stall events vs MySQL's periodic checkpoint stalls).
+
 > TiSQL config: group buffer WAL with `O_DIRECT|O_SYNC` pwrite and commit-time durability sync.
-> MySQL config: `innodb_flush_log_at_trx_commit=1`, `sync_binlog=1`, `log_bin=ON`, `innodb_doublewrite=ON`.
+> MySQL config (strict): `innodb_flush_log_at_trx_commit=1`, `sync_binlog=1`, `log_bin=ON`, `innodb_doublewrite=ON`, `innodb_flush_method=O_DIRECT`.
+> MySQL config (redo-only): same but `log_bin=OFF`.
 
 <details>
 <summary><strong>Server Options</strong></summary>

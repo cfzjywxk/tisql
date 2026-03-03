@@ -20,6 +20,7 @@
 
 use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, AtomicU8, Ordering};
 use std::sync::Arc;
+use std::time::{Duration, Instant};
 
 use parking_lot::{Condvar, Mutex};
 use tokio::sync::{oneshot, watch};
@@ -294,6 +295,15 @@ impl ClogGroupBuffer {
     }
 
     pub(crate) fn wait_for_data_or_shutdown(&self) {
+        self.wait_for_data_or_shutdown_with_spin(0);
+    }
+
+    pub(crate) fn wait_for_data_or_shutdown_with_spin(&self, spin_iters: u32) {
+        if self.spin_wait_for_data_or_shutdown(spin_iters) || self.shutdown.load(Ordering::Acquire)
+        {
+            return;
+        }
+
         let mut guard = self.data_notify_mu.lock();
         loop {
             if self.shutdown.load(Ordering::Acquire) || self.head_state_ready() {
@@ -306,6 +316,148 @@ impl ClogGroupBuffer {
                 && !self.head_state_ready()
             {
                 self.data_notify_cv.wait(&mut guard);
+            }
+        }
+    }
+
+    pub(crate) fn spin_wait_for_data_or_shutdown(&self, spin_iters: u32) -> bool {
+        if self.shutdown.load(Ordering::Acquire) {
+            return false;
+        }
+        if self.head_state_ready() {
+            return true;
+        }
+        if spin_iters == 0 {
+            return false;
+        }
+
+        let mut seen_epoch = self.data_epoch.load(Ordering::Acquire);
+        for _ in 0..spin_iters {
+            if self.shutdown.load(Ordering::Acquire) {
+                return false;
+            }
+            if self.head_state_ready() {
+                return true;
+            }
+
+            let epoch = self.data_epoch.load(Ordering::Acquire);
+            if epoch != seen_epoch {
+                if self.head_state_ready() {
+                    return true;
+                }
+                seen_epoch = epoch;
+            }
+            std::hint::spin_loop();
+        }
+
+        self.head_state_ready()
+    }
+
+    pub(crate) fn count_contiguous_filled_from_head(&self, cap: usize) -> usize {
+        let limit = cap.min(self.max_slots);
+        if limit == 0 {
+            return 0;
+        }
+
+        let mut slot_idx = self.flush_slot_idx.load(Ordering::Acquire);
+        let mut count = 0usize;
+        let mut expect_next_offset: Option<usize> = None;
+
+        while count < limit {
+            let slot = self.slot(slot_idx);
+            if slot.state.load(Ordering::Acquire) != SLOT_FILLED {
+                break;
+            }
+
+            let buf_offset = slot.buf_offset.load(Ordering::Acquire) as usize;
+            let reserved_size = slot.reserved_size.load(Ordering::Acquire) as usize;
+            let skip_bytes = slot.skip_bytes.load(Ordering::Acquire) as usize;
+
+            if count > 0 && skip_bytes > 0 {
+                break;
+            }
+            if let Some(expected) = expect_next_offset {
+                if reserved_size > 0 && buf_offset != expected {
+                    break;
+                }
+            }
+
+            if reserved_size > 0 {
+                expect_next_offset = Some(buf_offset + reserved_size);
+            }
+            count += 1;
+            slot_idx += 1;
+        }
+
+        count
+    }
+
+    pub(crate) fn wait_for_min_filled_or_shutdown(
+        &self,
+        min_slots: usize,
+        timeout: Duration,
+        spin_iters: u32,
+    ) -> usize {
+        let target = min_slots.max(1).min(self.max_slots);
+        if timeout.is_zero() {
+            return self.count_contiguous_filled_from_head(target);
+        }
+        let deadline = Instant::now().checked_add(timeout);
+
+        loop {
+            let mut ready = self.count_contiguous_filled_from_head(target);
+            if ready >= target || self.shutdown.load(Ordering::Acquire) {
+                return ready;
+            }
+
+            if spin_iters > 0 {
+                for _ in 0..spin_iters {
+                    if self.shutdown.load(Ordering::Acquire) {
+                        return ready;
+                    }
+                    ready = self.count_contiguous_filled_from_head(target);
+                    if ready >= target {
+                        return ready;
+                    }
+                    if let Some(deadline) = deadline {
+                        if Instant::now() >= deadline {
+                            return ready;
+                        }
+                    }
+                    std::hint::spin_loop();
+                }
+            }
+
+            let mut guard = self.data_notify_mu.lock();
+            loop {
+                let ready = self.count_contiguous_filled_from_head(target);
+                if ready >= target || self.shutdown.load(Ordering::Acquire) {
+                    return ready;
+                }
+
+                let wait_dur = match deadline {
+                    Some(deadline) => {
+                        let now = Instant::now();
+                        if now >= deadline {
+                            return ready;
+                        }
+                        deadline.saturating_duration_since(now)
+                    }
+                    None => Duration::from_secs(3600),
+                };
+
+                let seen = self.data_epoch.load(Ordering::Acquire);
+                if self
+                    .data_notify_cv
+                    .wait_for(&mut guard, wait_dur)
+                    .timed_out()
+                {
+                    return self.count_contiguous_filled_from_head(target);
+                }
+
+                if self.data_epoch.load(Ordering::Acquire) != seen {
+                    break;
+                }
             }
         }
     }
@@ -622,6 +774,7 @@ impl Drop for Reservation {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::mpsc;
 
     #[test]
     fn test_alloc_and_cancel_reclaims_capacity() {
@@ -711,5 +864,98 @@ mod tests {
             .alloc(40)
             .expect("wrapped reservation should fit after full reclaim");
         drop(r2);
+    }
+
+    #[test]
+    fn test_wait_for_data_or_shutdown_with_spin_observes_wakeup() {
+        let gb = ClogGroupBuffer::new(128, 8);
+        let (ready_tx, ready_rx) = mpsc::channel();
+        let (done_tx, done_rx) = mpsc::channel();
+
+        let waiter_gb = Arc::clone(&gb);
+        let handle = std::thread::spawn(move || {
+            ready_tx.send(()).unwrap();
+            waiter_gb.wait_for_data_or_shutdown_with_spin(256);
+            done_tx.send(()).unwrap();
+        });
+
+        ready_rx.recv().unwrap();
+        let mut reservation = gb.alloc(8).unwrap();
+        reservation.as_mut_slice().copy_from_slice(b"12345678");
+        let _rx = reservation.commit();
+
+        done_rx
+            .recv_timeout(Duration::from_secs(1))
+            .expect("waiter should wake on FILLED slot");
+        handle.join().unwrap();
+
+        let mut batch = Vec::new();
+        let _meta = gb.collect_filled_batch(&mut batch).expect("filled batch");
+        gb.complete_batch(&batch, Ok(()));
+    }
+
+    #[test]
+    fn test_count_contiguous_filled_from_head_stops_at_wrap_boundary() {
+        let gb = ClogGroupBuffer::new(16, 8);
+
+        // Move write cursor to offset 4 with no outstanding reservations.
+        let r0 = gb.alloc(4).unwrap();
+        let _rx0 = r0.commit();
+        let mut warmup_batch = Vec::new();
+        let _meta0 = gb
+            .collect_filled_batch(&mut warmup_batch)
+            .expect("warmup batch");
+        gb.complete_batch(&warmup_batch, Ok(()));
+
+        // First slot stays in-place (offset 4, len 11), second wraps with skip=1.
+        let r1 = gb.alloc(11).unwrap();
+        let _rx1 = r1.commit();
+        let r2 = gb.alloc(2).unwrap();
+        let _rx2 = r2.commit();
+
+        assert_eq!(gb.count_contiguous_filled_from_head(8), 1);
+
+        let mut batch = Vec::new();
+        let _meta = gb.collect_filled_batch(&mut batch).expect("first batch");
+        assert_eq!(batch.len(), 1);
+        gb.complete_batch(&batch, Ok(()));
+
+        assert_eq!(gb.count_contiguous_filled_from_head(8), 1);
+    }
+
+    #[test]
+    fn test_wait_for_min_filled_or_shutdown_timeout_and_early_ready() {
+        let gb = ClogGroupBuffer::new(128, 8);
+
+        let r1 = gb.alloc(8).unwrap();
+        let _rx1 = r1.commit();
+        let start = Instant::now();
+        let ready = gb.wait_for_min_filled_or_shutdown(2, Duration::from_millis(2), 128);
+        assert_eq!(ready, 1);
+        assert!(start.elapsed() < Duration::from_secs(1));
+
+        let (started_tx, started_rx) = mpsc::channel();
+        let (done_tx, done_rx) = mpsc::channel();
+        let waiter_gb = Arc::clone(&gb);
+        let handle = std::thread::spawn(move || {
+            started_tx.send(()).unwrap();
+            let ready = waiter_gb.wait_for_min_filled_or_shutdown(2, Duration::from_secs(1), 128);
+            done_tx.send(ready).unwrap();
+        });
+
+        started_rx.recv().unwrap();
+        let r2 = gb.alloc(8).unwrap();
+        let _rx2 = r2.commit();
+
+        let ready = done_rx
+            .recv_timeout(Duration::from_secs(1))
+            .expect("waiter should observe second FILLED slot");
+        assert_eq!(ready, 2);
+        handle.join().unwrap();
+
+        let mut batch = Vec::new();
+        let _meta = gb.collect_filled_batch(&mut batch).expect("filled batch");
+        assert_eq!(batch.len(), 2);
+        gb.complete_batch(&batch, Ok(()));
     }
 }

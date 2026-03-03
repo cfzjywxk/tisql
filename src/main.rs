@@ -242,6 +242,10 @@ struct Args {
     /// Skip group commit delay once ready batch reaches this size.
     #[arg(long, default_value_t = 16, value_parser = clap::value_parser!(u32).range(1..))]
     group_commit_no_delay_count: u32,
+
+    /// Spin iterations before parking clog writer on empty buffer.
+    #[arg(long, default_value_t = 0)]
+    clog_spin_before_park_iters: u32,
 }
 
 fn main() {
@@ -312,7 +316,8 @@ fn main() {
         .with_engine_status_report_interval_secs(args.engine_status_report_interval_secs)
         .with_engine_status_top_n_tablets(args.engine_status_top_n_tablets)
         .with_group_commit_delay(Duration::from_micros(args.group_commit_delay_us))
-        .with_group_commit_no_delay_count(args.group_commit_no_delay_count as usize);
+        .with_group_commit_no_delay_count(args.group_commit_no_delay_count as usize)
+        .with_clog_spin_before_park_iters(args.clog_spin_before_park_iters);
     if let Some(flush_threads) = args.flush_threads {
         db_config = db_config.with_flush_threads(flush_threads as usize);
     }
@@ -393,8 +398,10 @@ fn main() {
         args.engine_status_report_interval_secs, args.engine_status_top_n_tablets
     );
     println!(
-        "Clog group commit: delay_us={}, no_delay_count={}",
-        args.group_commit_delay_us, args.group_commit_no_delay_count
+        "Clog writer tuning: delay_us={}, no_delay_count={}, spin_before_park_iters={}",
+        args.group_commit_delay_us,
+        args.group_commit_no_delay_count,
+        args.clog_spin_before_park_iters
     );
     println!(
         "Connect with: mysql -h{} -P{} -uroot test",
@@ -634,6 +641,7 @@ mod tests {
         );
         assert_eq!(args.group_commit_delay_us, 0);
         assert_eq!(args.group_commit_no_delay_count, 16);
+        assert_eq!(args.clog_spin_before_park_iters, 0);
     }
 
     #[test]
@@ -720,5 +728,11 @@ mod tests {
     fn test_group_commit_no_delay_count_must_be_positive() {
         let parsed = Args::try_parse_from(["tisql", "--group-commit-no-delay-count", "0"]);
         assert!(parsed.is_err());
+    }
+
+    #[test]
+    fn test_clog_spin_before_park_iters_flag_parse() {
+        let args = Args::try_parse_from(["tisql", "--clog-spin-before-park-iters", "128"]).unwrap();
+        assert_eq!(args.clog_spin_before_park_iters, 128);
     }
 }
