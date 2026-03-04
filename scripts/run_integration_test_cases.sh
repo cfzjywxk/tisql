@@ -46,7 +46,10 @@ if [[ -z "$test_bin" || ! -x "$test_bin" ]]; then
     exit 1
 fi
 
-mapfile -t case_names < <(
+case_names=()
+while IFS= read -r line; do
+    case_names+=("$line")
+done < <(
     TEST_LIST_OUTPUT="$list_output" python3 - "$name_filter" "$skip_patterns_csv" <<'PY'
 import os
 import re
@@ -91,25 +94,48 @@ run_case() {
         "$test_bin" "$name" --exact --test-threads="$thread_count"
 }
 
+active_pids() {
+    jobs -pr || true
+}
+
 count_active_jobs() {
-    local pids=()
-    mapfile -t pids < <(jobs -pr || true)
-    echo "${#pids[@]}"
+    local pids
+    pids="$(active_pids)"
+    if [[ -z "$pids" ]]; then
+        echo 0
+    else
+        printf '%s\n' "$pids" | wc -l | tr -d ' '
+    fi
 }
 
 kill_active_jobs() {
-    local pids=()
-    mapfile -t pids < <(jobs -pr || true)
-    if [[ ${#pids[@]} -gt 0 ]]; then
-        kill "${pids[@]}" 2>/dev/null || true
+    local pids
+    pids="$(active_pids)"
+    if [[ -n "$pids" ]]; then
+        kill $pids 2>/dev/null || true
         wait || true
     fi
+}
+
+wait_for_any_job() {
+    if (( BASH_VERSINFO[0] >= 4 )); then
+        wait -n
+        return
+    fi
+
+    local pids first_pid
+    pids="$(active_pids)"
+    if [[ -z "$pids" ]]; then
+        return 0
+    fi
+    first_pid="${pids%%$'\n'*}"
+    wait "$first_pid"
 }
 
 failed=0
 for case_name in "${case_names[@]}"; do
     while (( $(count_active_jobs) >= job_count )); do
-        if ! wait -n; then
+        if ! wait_for_any_job; then
             failed=1
             break 2
         fi
@@ -119,7 +145,7 @@ done
 
 if (( failed == 0 )); then
     while (( $(count_active_jobs) > 0 )); do
-        if ! wait -n; then
+        if ! wait_for_any_job; then
             failed=1
             break
         fi

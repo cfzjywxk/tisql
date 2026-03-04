@@ -27,7 +27,10 @@ if [[ ! "$job_count" =~ ^[1-9][0-9]*$ ]]; then
 fi
 
 base_dir="tests/integrationtest/t"
-mapfile -t test_files < <(find "$base_dir" -type f \( -name '*.test' -o -name '*.t' \) | sort)
+test_files=()
+while IFS= read -r line; do
+    test_files+=("$line")
+done < <(find "$base_dir" -type f \( -name '*.test' -o -name '*.t' \) | sort)
 
 if [[ ${#test_files[@]} -eq 0 ]]; then
     echo "no mysqltest files discovered under $base_dir" >&2
@@ -69,25 +72,48 @@ run_case() {
         "$runner_bin" --test "$test_name" --statement-timeout-secs "$stmt_timeout_secs"
 }
 
+active_pids() {
+    jobs -pr || true
+}
+
 count_active_jobs() {
-    local pids=()
-    mapfile -t pids < <(jobs -pr || true)
-    echo "${#pids[@]}"
+    local pids
+    pids="$(active_pids)"
+    if [[ -z "$pids" ]]; then
+        echo 0
+    else
+        printf '%s\n' "$pids" | wc -l | tr -d ' '
+    fi
 }
 
 kill_active_jobs() {
-    local pids=()
-    mapfile -t pids < <(jobs -pr || true)
-    if [[ ${#pids[@]} -gt 0 ]]; then
-        kill "${pids[@]}" 2>/dev/null || true
+    local pids
+    pids="$(active_pids)"
+    if [[ -n "$pids" ]]; then
+        kill $pids 2>/dev/null || true
         wait || true
     fi
+}
+
+wait_for_any_job() {
+    if (( BASH_VERSINFO[0] >= 4 )); then
+        wait -n
+        return
+    fi
+
+    local pids first_pid
+    pids="$(active_pids)"
+    if [[ -z "$pids" ]]; then
+        return 0
+    fi
+    first_pid="${pids%%$'\n'*}"
+    wait "$first_pid"
 }
 
 failed=0
 for test_name in "${test_names[@]}"; do
     while (( $(count_active_jobs) >= job_count )); do
-        if ! wait -n; then
+        if ! wait_for_any_job; then
             failed=1
             break 2
         fi
@@ -97,7 +123,7 @@ done
 
 if (( failed == 0 )); then
     while (( $(count_active_jobs) > 0 )); do
-        if ! wait -n; then
+        if ! wait_for_any_job; then
             failed=1
             break
         fi

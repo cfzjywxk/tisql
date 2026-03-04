@@ -42,15 +42,19 @@ if [[ -z "$store_test_bin" || ! -x "$store_test_bin" ]]; then
     echo "failed to locate store_test binary from cargo --list output" >&2
     exit 1
 fi
-mapfile -t test_names < <(printf '%s\n' "$list_output" | sed -n 's/^\(.*\): test$/\1/p')
+
+test_names=()
+while IFS= read -r line; do
+    test_names+=("$line")
+done < <(printf '%s\n' "$list_output" | sed -n 's/^\(.*\): test$/\1/p')
 
 if [[ ${#test_names[@]} -eq 0 ]]; then
     echo "failed to discover store_test cases" >&2
     exit 1
 fi
 
-declare -A module_prefixes=()
-declare -a persistence_cases=()
+module_prefixes=()
+persistence_cases=()
 
 for test_name in "${test_names[@]}"; do
     if [[ -n "$name_filter" && "$test_name" != *"$name_filter"* ]]; then
@@ -60,18 +64,22 @@ for test_name in "${test_names[@]}"; do
     if [[ "$test_name" == persistence::* ]]; then
         persistence_cases+=("$test_name")
     else
-        module_prefixes["${test_name%%::*}::"]=1
+        module_prefixes+=("${test_name%%::*}::")
     fi
 done
 
 sorted_modules=()
 if [[ ${#module_prefixes[@]} -gt 0 ]]; then
-    mapfile -t sorted_modules < <(printf '%s\n' "${!module_prefixes[@]}" | sort)
+    while IFS= read -r line; do
+        sorted_modules+=("$line")
+    done < <(printf '%s\n' "${module_prefixes[@]}" | sort -u)
 fi
 
 sorted_persistence=()
 if [[ ${#persistence_cases[@]} -gt 0 ]]; then
-    mapfile -t sorted_persistence < <(printf '%s\n' "${persistence_cases[@]}" | sort)
+    while IFS= read -r line; do
+        sorted_persistence+=("$line")
+    done < <(printf '%s\n' "${persistence_cases[@]}" | sort)
 fi
 
 if [[ ${#sorted_modules[@]} -eq 0 && ${#sorted_persistence[@]} -eq 0 ]]; then
@@ -86,25 +94,48 @@ run_module() {
         env RUST_LOG="$log_level" "$store_test_bin" "$module_prefix" --test-threads="$thread_count"
 }
 
+active_pids() {
+    jobs -pr || true
+}
+
 count_active_jobs() {
-    local pids=()
-    mapfile -t pids < <(jobs -pr || true)
-    echo "${#pids[@]}"
+    local pids
+    pids="$(active_pids)"
+    if [[ -z "$pids" ]]; then
+        echo 0
+    else
+        printf '%s\n' "$pids" | wc -l | tr -d ' '
+    fi
 }
 
 kill_active_jobs() {
-    local pids=()
-    mapfile -t pids < <(jobs -pr || true)
-    if [[ ${#pids[@]} -gt 0 ]]; then
-        kill "${pids[@]}" 2>/dev/null || true
+    local pids
+    pids="$(active_pids)"
+    if [[ -n "$pids" ]]; then
+        kill $pids 2>/dev/null || true
         wait || true
     fi
+}
+
+wait_for_any_job() {
+    if (( BASH_VERSINFO[0] >= 4 )); then
+        wait -n
+        return
+    fi
+
+    local pids first_pid
+    pids="$(active_pids)"
+    if [[ -z "$pids" ]]; then
+        return 0
+    fi
+    first_pid="${pids%%$'\n'*}"
+    wait "$first_pid"
 }
 
 failed=0
 for module_prefix in "${sorted_modules[@]}"; do
     while (( $(count_active_jobs) >= job_count )); do
-        if ! wait -n; then
+        if ! wait_for_any_job; then
             failed=1
             break 2
         fi
@@ -114,7 +145,7 @@ done
 
 if (( failed == 0 )); then
     while (( $(count_active_jobs) > 0 )); do
-        if ! wait -n; then
+        if ! wait_for_any_job; then
             failed=1
             break
         fi
