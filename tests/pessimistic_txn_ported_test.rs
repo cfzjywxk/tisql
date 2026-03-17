@@ -29,7 +29,8 @@ const CASE_TIMEOUT_ENV: &str = "TISQL_PESSIMISTIC_CASE_TIMEOUT_SECS";
 
 fn open_test_db() -> (Database, TempDir) {
     let dir = tempfile::tempdir().unwrap();
-    let config = DatabaseConfig::with_data_dir(dir.path());
+    let config = DatabaseConfig::with_data_dir(dir.path())
+        .with_lock_wait_timeout(Duration::from_millis(100));
     let db = Database::open(config).unwrap();
     (db, dir)
 }
@@ -82,11 +83,11 @@ async fn query_rows_with_session(
     }
 }
 
-async fn expect_key_locked(result: Result<QueryResult, TiSqlError>, sql: &str) {
+async fn expect_lock_wait_timeout(result: Result<QueryResult, TiSqlError>, sql: &str) {
     match result {
-        Err(TiSqlError::KeyIsLocked { .. }) => {}
-        Err(e) => panic!("Expected KeyIsLocked, got {e:?}\nSQL: {sql}"),
-        Ok(r) => panic!("Expected KeyIsLocked, got success {r:?}\nSQL: {sql}"),
+        Err(TiSqlError::LockWaitTimeout) => {}
+        Err(e) => panic!("Expected LockWaitTimeout, got {e:?}\nSQL: {sql}"),
+        Ok(r) => panic!("Expected LockWaitTimeout, got success {r:?}\nSQL: {sql}"),
     }
 }
 
@@ -105,18 +106,19 @@ async fn test_ported_explicit_conflict_rollback_then_retry_and_commit() {
             exec_with_session(&db, &mut s1, "INSERT INTO t_lock_retry VALUES (2, 0)").await;
 
             exec_with_session(&db, &mut s2, "BEGIN").await;
-            expect_key_locked(
+            expect_lock_wait_timeout(
                 db.execute_query_with_session("INSERT INTO t_lock_retry VALUES (2, 22)", &mut s2)
                     .await,
                 "INSERT INTO t_lock_retry VALUES (2, 22)",
             )
             .await;
             assert!(
-                s2.has_active_txn(),
-                "lock conflict must not clear explicit transaction"
+                !s2.has_active_txn(),
+                "lock wait timeout must clear explicit transaction"
             );
 
             exec_with_session(&db, &mut s1, "ROLLBACK").await;
+            exec_with_session(&db, &mut s2, "BEGIN").await;
             exec_with_session(&db, &mut s2, "INSERT INTO t_lock_retry VALUES (2, 22)").await;
 
             let uncommitted = query_rows(&db, "SELECT a, b FROM t_lock_retry").await;
@@ -137,9 +139,9 @@ async fn test_ported_explicit_conflict_rollback_then_retry_and_commit() {
 }
 
 #[tokio::test]
-async fn test_ported_stmt_conflict_keeps_explicit_txn_and_allows_more_writes() {
+async fn test_ported_lock_wait_timeout_aborts_explicit_txn_and_requires_rebegin() {
     run_with_case_timeout(
-        "test_ported_stmt_conflict_keeps_explicit_txn_and_allows_more_writes",
+        "test_ported_lock_wait_timeout_aborts_explicit_txn_and_requires_rebegin",
         async {
             let (db, _dir) = open_test_db();
             let mut s1 = Session::new();
@@ -151,7 +153,7 @@ async fn test_ported_stmt_conflict_keeps_explicit_txn_and_allows_more_writes() {
             exec_with_session(&db, &mut s1, "INSERT INTO t_txn_keep VALUES (1, 10)").await;
 
             exec_with_session(&db, &mut s2, "BEGIN").await;
-            expect_key_locked(
+            expect_lock_wait_timeout(
                 db.execute_query_with_session("INSERT INTO t_txn_keep VALUES (1, 20)", &mut s2)
                     .await,
                 "INSERT INTO t_txn_keep VALUES (1, 20)",
@@ -159,13 +161,13 @@ async fn test_ported_stmt_conflict_keeps_explicit_txn_and_allows_more_writes() {
             .await;
 
             assert!(
-                s2.has_active_txn(),
-                "explicit txn should remain active after statement error"
+                !s2.has_active_txn(),
+                "explicit txn should be cleared after lock wait timeout"
             );
 
-            exec_with_session(&db, &mut s2, "INSERT INTO t_txn_keep VALUES (3, 30)").await;
-
             exec_with_session(&db, &mut s1, "ROLLBACK").await;
+            exec_with_session(&db, &mut s2, "BEGIN").await;
+            exec_with_session(&db, &mut s2, "INSERT INTO t_txn_keep VALUES (3, 30)").await;
             exec_with_session(&db, &mut s2, "INSERT INTO t_txn_keep VALUES (1, 20)").await;
             exec_with_session(&db, &mut s2, "COMMIT").await;
 
@@ -207,7 +209,7 @@ async fn test_ported_autocommit_vs_explicit_write_conflict_and_retry_after_commi
             )
             .await;
 
-            expect_key_locked(
+            expect_lock_wait_timeout(
                 db.execute_query("UPDATE t_auto_conflict SET v = 102 WHERE id = 1")
                     .await,
                 "UPDATE t_auto_conflict SET v = 102 WHERE id = 1",

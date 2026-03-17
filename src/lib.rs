@@ -62,7 +62,7 @@ pub use protocol::{MySqlServer, MYSQL_DEFAULT_PORT};
 pub use runtime::{RuntimeThreadOverrides, RuntimeThreads};
 pub use session::{ExecutionCtx, Priority, QueryCtx, Session, SessionRegistry, SessionVars};
 pub use tablet::{PessimisticStorage, StorageEngine, V26BoundaryMode};
-pub use transaction::{CommitInfo, TxnCtx, TxnService, TxnState};
+pub use transaction::{CommitInfo, ConflictWaitConfig, TxnCtx, TxnService, TxnState};
 pub use tso::TsoService;
 pub use worker::QueryResponse;
 
@@ -100,7 +100,7 @@ pub mod testkit {
     // Re-export IoService for testing
     pub use crate::io::IoService;
 
-    pub use crate::transaction::{ConcurrencyManager, TransactionService};
+    pub use crate::transaction::{ConcurrencyManager, ConflictWaitConfig, TransactionService};
     pub use crate::tso::LocalTso;
 
     // Executor types for testing
@@ -253,6 +253,8 @@ pub struct DatabaseConfig {
     pub group_commit_no_delay_count: usize,
     /// Number of spin iterations before parking writer on empty clog buffer.
     pub clog_spin_before_park_iters: u32,
+    /// Total wait budget for transactional lock conflicts.
+    pub lock_wait_timeout: Duration,
 }
 
 impl Default for DatabaseConfig {
@@ -282,6 +284,7 @@ impl Default for DatabaseConfig {
             group_commit_delay: Duration::ZERO,
             group_commit_no_delay_count: 16,
             clog_spin_before_park_iters: 0,
+            lock_wait_timeout: Duration::from_secs(10),
         }
     }
 }
@@ -315,6 +318,12 @@ impl DatabaseConfig {
 
     pub fn with_point_get_short_path(mut self, enabled: bool) -> Self {
         self.enable_point_get_short_path = enabled;
+        self
+    }
+
+    /// Set the lock-wait timeout used by transaction conflict handling.
+    pub fn with_lock_wait_timeout(mut self, timeout: Duration) -> Self {
+        self.lock_wait_timeout = timeout;
         self
     }
 
@@ -947,11 +956,12 @@ impl Database {
 
         // Create transaction service with recovered shared clog.
         let routed_storage = Arc::new(RoutedTabletStorage::new(Arc::clone(&tablet_manager)));
-        let txn_service = Arc::new(TransactionService::new(
+        let txn_service = Arc::new(TransactionService::new_with_conflict_wait_config(
             Arc::clone(&routed_storage),
             Arc::clone(&recovery.clog),
             Arc::clone(&tso),
             Arc::clone(&concurrency_manager),
+            ConflictWaitConfig::default().with_lock_wait_timeout(config.lock_wait_timeout),
         ));
 
         // Create MVCC catalog using same txn_service
@@ -2954,7 +2964,11 @@ mod tests {
     #[tokio::test]
     async fn test_phase3_lock_conflict_only_on_same_tablet() {
         let dir = tempdir().unwrap();
-        let db = Database::open(DatabaseConfig::with_data_dir(dir.path())).unwrap();
+        let db = Database::open(
+            DatabaseConfig::with_data_dir(dir.path())
+                .with_lock_wait_timeout(Duration::from_millis(100)),
+        )
+        .unwrap();
 
         db.execute_query("CREATE TABLE p3_lock_t1 (id INT PRIMARY KEY, v INT)")
             .await
@@ -2990,7 +3004,7 @@ mod tests {
             .await;
         assert!(matches!(
             conflict,
-            Err(crate::util::error::TiSqlError::KeyIsLocked { .. })
+            Err(crate::util::error::TiSqlError::LockWaitTimeout)
         ));
 
         db.txn_service.commit(txn2).await.unwrap();

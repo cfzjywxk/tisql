@@ -22,6 +22,7 @@ use std::ops::Range;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
+use tokio::time::Instant as TokioInstant;
 
 #[cfg(feature = "failpoints")]
 use fail::fail_point;
@@ -60,11 +61,115 @@ pub struct TransactionService<S: StorageEngine, L: ClogService, T: TsoService> {
     tso: Arc<T>,
     /// ConcurrencyManager for lock table and max_ts tracking
     concurrency_manager: Arc<ConcurrencyManager>,
+    /// Wait/backoff policy for lock conflicts and ambiguous prepared reads.
+    conflict_wait_config: ConflictWaitConfig,
     /// Aggregated write-path diagnostics exposed through SHOW ENGINE STATUS.
     write_path_diagnostics: Arc<WritePathDiagnostics>,
 }
 
 type GroupedTabletKeys = Vec<(TabletId, Vec<Key>)>;
+
+/// Lock-conflict wait policy shared by read and write paths.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ConflictWaitConfig {
+    /// Total wait budget before surfacing `LockWaitTimeout`.
+    pub lock_wait_timeout: Duration,
+    /// Number of cooperative yields before sleeping.
+    pub spin_retries: u32,
+    /// Initial sleep delay after the spin phase.
+    pub initial_backoff: Duration,
+    /// Maximum sleep delay.
+    pub max_backoff: Duration,
+}
+
+impl Default for ConflictWaitConfig {
+    fn default() -> Self {
+        Self {
+            lock_wait_timeout: Duration::from_secs(10),
+            spin_retries: 32,
+            initial_backoff: Duration::from_millis(1),
+            max_backoff: Duration::from_millis(100),
+        }
+    }
+}
+
+impl ConflictWaitConfig {
+    pub fn with_lock_wait_timeout(mut self, timeout: Duration) -> Self {
+        self.lock_wait_timeout = timeout;
+        self
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ConflictWaitOutcome {
+    RetryNow,
+    TimedOut,
+}
+
+#[derive(Debug, Clone, Copy)]
+struct ConflictBackoff {
+    started_at: TokioInstant,
+    timeout: Duration,
+    remaining_spins: u32,
+    next_sleep: Duration,
+    max_sleep: Duration,
+}
+
+impl ConflictBackoff {
+    fn new(config: ConflictWaitConfig) -> Self {
+        Self {
+            started_at: TokioInstant::now(),
+            timeout: config.lock_wait_timeout,
+            remaining_spins: config.spin_retries,
+            next_sleep: config.initial_backoff,
+            max_sleep: config.max_backoff,
+        }
+    }
+
+    fn remaining_time(&self) -> Option<Duration> {
+        self.timeout.checked_sub(self.started_at.elapsed())
+    }
+
+    async fn wait_next(&mut self) -> ConflictWaitOutcome {
+        let Some(remaining) = self.remaining_time() else {
+            return ConflictWaitOutcome::TimedOut;
+        };
+        if remaining.is_zero() {
+            return ConflictWaitOutcome::TimedOut;
+        }
+
+        if self.remaining_spins > 0 {
+            self.remaining_spins -= 1;
+            tokio::task::yield_now().await;
+            return if self.remaining_time().is_some_and(|left| !left.is_zero()) {
+                ConflictWaitOutcome::RetryNow
+            } else {
+                ConflictWaitOutcome::TimedOut
+            };
+        }
+
+        let sleep_for = self.next_sleep.min(remaining);
+        if sleep_for.is_zero() {
+            tokio::task::yield_now().await;
+        } else {
+            tokio::time::sleep(sleep_for).await;
+        }
+        let doubled = self.next_sleep.checked_mul(2).unwrap_or(Duration::MAX);
+        self.next_sleep = doubled.min(self.max_sleep);
+
+        if self.remaining_time().is_some_and(|left| !left.is_zero()) {
+            ConflictWaitOutcome::RetryNow
+        } else {
+            ConflictWaitOutcome::TimedOut
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum PointReadConflictAction {
+    Proceed,
+    Wait,
+}
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 struct TimingStageSnapshot {
@@ -240,11 +345,29 @@ impl<S: StorageEngine, L: ClogService, T: TsoService> TransactionService<S, L, T
         tso: Arc<T>,
         concurrency_manager: Arc<ConcurrencyManager>,
     ) -> Self {
+        Self::new_with_conflict_wait_config(
+            storage,
+            clog_service,
+            tso,
+            concurrency_manager,
+            ConflictWaitConfig::default(),
+        )
+    }
+
+    /// Create a new transaction service with an explicit conflict wait policy.
+    pub fn new_with_conflict_wait_config(
+        storage: Arc<S>,
+        clog_service: Arc<L>,
+        tso: Arc<T>,
+        concurrency_manager: Arc<ConcurrencyManager>,
+        conflict_wait_config: ConflictWaitConfig,
+    ) -> Self {
         Self {
             storage,
             clog_service,
             tso,
             concurrency_manager,
+            conflict_wait_config,
             write_path_diagnostics: Arc::new(WritePathDiagnostics::default()),
         }
     }
@@ -285,7 +408,7 @@ impl<S: StorageEngine, L: ClogService, T: TsoService> TransactionService<S, L, T
         key: &[u8],
         value: &[u8],
         owner_start_ts: Timestamp,
-    ) -> std::result::Result<(), PessimisticWriteError>
+    ) -> Result<()>
     where
         S: PessimisticStorage,
     {
@@ -293,6 +416,7 @@ impl<S: StorageEngine, L: ClogService, T: TsoService> TransactionService<S, L, T
         // indefinitely if background compaction cannot clear slowdown pressure.
         const MAX_SLOWDOWN_RETRIES: usize = 32;
         let mut retries = 0;
+        let mut conflict_backoff = ConflictBackoff::new(self.conflict_wait_config);
         loop {
             let result = self
                 .storage
@@ -300,15 +424,55 @@ impl<S: StorageEngine, L: ClogService, T: TsoService> TransactionService<S, L, T
 
             match result {
                 Ok(()) => return Ok(()),
+                Err(PessimisticWriteError::LockConflict(_)) => {
+                    match conflict_backoff.wait_next().await {
+                        ConflictWaitOutcome::RetryNow => continue,
+                        ConflictWaitOutcome::TimedOut => {
+                            return Err(TiSqlError::LockWaitTimeout);
+                        }
+                    }
+                }
                 Err(PessimisticWriteError::WriteStall { delay: Some(delay) }) => {
                     if retries >= MAX_SLOWDOWN_RETRIES {
-                        return Err(PessimisticWriteError::WriteStall { delay: None });
+                        return Err(TiSqlError::Storage(
+                            "Write stalled: storage backpressure, retry later".to_string(),
+                        ));
                     }
                     retries += 1;
                     tokio::time::sleep(delay).await;
                 }
-                Err(e) => return Err(e),
+                Err(PessimisticWriteError::WriteStall { delay: None }) => {
+                    return Err(TiSqlError::Storage(
+                        "Write stalled: storage backpressure, retry later".to_string(),
+                    ));
+                }
             }
+        }
+    }
+
+    fn classify_point_read_conflict(
+        &self,
+        lock_owner: Option<Timestamp>,
+        reader_owner_ts: Timestamp,
+        read_ts: Timestamp,
+    ) -> PointReadConflictAction {
+        let Some(lock_owner) = lock_owner else {
+            return PointReadConflictAction::Proceed;
+        };
+        if lock_owner == reader_owner_ts {
+            return PointReadConflictAction::Proceed;
+        }
+
+        match self.concurrency_manager.get_txn_state(lock_owner) {
+            Some(TxnState::Preparing) => PointReadConflictAction::Wait,
+            Some(TxnState::Prepared { prepared_ts }) if prepared_ts <= read_ts => {
+                PointReadConflictAction::Wait
+            }
+            Some(TxnState::Running)
+            | Some(TxnState::Prepared { .. })
+            | Some(TxnState::Committed { .. })
+            | Some(TxnState::Aborted)
+            | None => PointReadConflictAction::Proceed,
         }
     }
 
@@ -522,11 +686,26 @@ impl<S: PessimisticStorage + 'static, L: ClogService + 'static, T: TsoService> T
         // - explicit txn reads can see their own pending writes
         // - implicit txn reads use owner=0 to avoid intra-statement self-visibility
         let owner_ts = if ctx.is_explicit() { ctx.start_ts } else { 0 };
-        let value = self
-            .storage
-            .get_with_owner_on_tablet(tablet_id, key, ctx.start_ts, owner_ts)
-            .await;
-        Ok(value.filter(|v| !is_tombstone(v) && !is_lock(v)))
+        let mut conflict_backoff = ConflictBackoff::new(self.conflict_wait_config);
+
+        loop {
+            let lock_owner = self.storage.get_lock_owner_on_tablet(tablet_id, key);
+            match self.classify_point_read_conflict(lock_owner, owner_ts, ctx.start_ts) {
+                PointReadConflictAction::Proceed => {
+                    let value = self
+                        .storage
+                        .get_with_owner_on_tablet(tablet_id, key, ctx.start_ts, owner_ts)
+                        .await;
+                    return Ok(value.filter(|v| !is_tombstone(v) && !is_lock(v)));
+                }
+                PointReadConflictAction::Wait => match conflict_backoff.wait_next().await {
+                    ConflictWaitOutcome::RetryNow => continue,
+                    ConflictWaitOutcome::TimedOut => {
+                        return Err(TiSqlError::LockWaitTimeout);
+                    }
+                },
+            }
+        }
     }
 
     fn scan_iter(
@@ -563,7 +742,13 @@ impl<S: PessimisticStorage + 'static, L: ClogService + 'static, T: TsoService> T
             .scan_iter_on_tablet(tablet_id, mvcc_range, owner_ts)?;
 
         let cm = Some(Arc::clone(&self.concurrency_manager));
-        Ok(MvccScanIterator::new(storage_iter, ctx.start_ts, range, cm))
+        Ok(MvccScanIterator::new(
+            storage_iter,
+            ctx.start_ts,
+            range,
+            cm,
+            self.conflict_wait_config,
+        ))
     }
 
     async fn put(
@@ -610,17 +795,7 @@ impl<S: PessimisticStorage + 'static, L: ClogService + 'static, T: TsoService> T
                 );
                 Ok(())
             }
-            Err(PessimisticWriteError::LockConflict(lock_owner)) => Err(TiSqlError::KeyIsLocked {
-                key: key.to_vec(),
-                lock_ts: lock_owner,
-                primary: vec![],
-            }),
-            Err(PessimisticWriteError::WriteStall { delay: None }) => Err(TiSqlError::Storage(
-                "Write stalled: storage backpressure, retry later".to_string(),
-            )),
-            Err(PessimisticWriteError::WriteStall { delay: Some(_) }) => {
-                unreachable!("put_pending_with_retry returns only LockConflict or hard WriteStall")
-            }
+            Err(e) => Err(e),
         }
     }
 
@@ -670,19 +845,7 @@ impl<S: PessimisticStorage + 'static, L: ClogService + 'static, T: TsoService> T
                     );
                     Ok(())
                 }
-                Err(PessimisticWriteError::LockConflict(lock_owner)) => {
-                    Err(TiSqlError::KeyIsLocked {
-                        key: key.to_vec(),
-                        lock_ts: lock_owner,
-                        primary: vec![],
-                    })
-                }
-                Err(PessimisticWriteError::WriteStall { delay: None }) => Err(TiSqlError::Storage(
-                    "Write stalled: storage backpressure, retry later".into(),
-                )),
-                Err(PessimisticWriteError::WriteStall { delay: Some(_) }) => unreachable!(
-                    "put_pending_with_retry returns only LockConflict or hard WriteStall"
-                ),
+                Err(e) => Err(e),
             }
         } else {
             // No value exists → LOCK (pessimistic lock only, not persisted to clog)
@@ -704,19 +867,7 @@ impl<S: PessimisticStorage + 'static, L: ClogService + 'static, T: TsoService> T
                     });
                     Ok(())
                 }
-                Err(PessimisticWriteError::LockConflict(lock_owner)) => {
-                    Err(TiSqlError::KeyIsLocked {
-                        key: key.to_vec(),
-                        lock_ts: lock_owner,
-                        primary: vec![],
-                    })
-                }
-                Err(PessimisticWriteError::WriteStall { delay: None }) => Err(TiSqlError::Storage(
-                    "Write stalled: storage backpressure, retry later".into(),
-                )),
-                Err(PessimisticWriteError::WriteStall { delay: Some(_) }) => unreachable!(
-                    "put_pending_with_retry returns only LockConflict or hard WriteStall"
-                ),
+                Err(e) => Err(e),
             }
         }
     }
@@ -769,17 +920,7 @@ impl<S: PessimisticStorage + 'static, L: ClogService + 'static, T: TsoService> T
                 });
                 Ok(())
             }
-            Err(PessimisticWriteError::LockConflict(lock_owner)) => Err(TiSqlError::KeyIsLocked {
-                key: key.to_vec(),
-                lock_ts: lock_owner,
-                primary: vec![],
-            }),
-            Err(PessimisticWriteError::WriteStall { delay: None }) => Err(TiSqlError::Storage(
-                "Write stalled: storage backpressure, retry later".into(),
-            )),
-            Err(PessimisticWriteError::WriteStall { delay: Some(_) }) => {
-                unreachable!("put_pending_with_retry returns only LockConflict or hard WriteStall")
-            }
+            Err(e) => Err(e),
         }
     }
 
@@ -1078,6 +1219,8 @@ pub struct MvccScanIterator<I: MvccIterator> {
     /// ConcurrencyManager for resolving pending writes from other transactions.
     /// None for explicit transactions (they use read-your-writes directly).
     concurrency_manager: Option<Arc<ConcurrencyManager>>,
+    /// Wait/backoff policy for pending owners that cannot be skipped.
+    conflict_wait_config: ConflictWaitConfig,
 }
 
 /// Result of resolving a pending write via TxnStateCache.
@@ -1104,6 +1247,7 @@ impl<I: MvccIterator> MvccScanIterator<I> {
         read_ts: Timestamp,
         range: Range<Key>,
         concurrency_manager: Option<Arc<ConcurrencyManager>>,
+        conflict_wait_config: ConflictWaitConfig,
     ) -> Self {
         Self {
             storage_iter,
@@ -1112,6 +1256,7 @@ impl<I: MvccIterator> MvccScanIterator<I> {
             last_returned_key: None,
             is_positioned: false,
             concurrency_manager,
+            conflict_wait_config,
         }
     }
 
@@ -1119,11 +1264,13 @@ impl<I: MvccIterator> MvccScanIterator<I> {
     ///
     /// This determines whether the pending node should be skipped or is visible
     /// based on the owning transaction's current state.
-    fn resolve_pending(
-        &self,
+    async fn resolve_pending(
+        concurrency_manager: Option<Arc<ConcurrencyManager>>,
+        conflict_wait_config: ConflictWaitConfig,
+        read_ts: Timestamp,
         owner_ts: Timestamp,
     ) -> crate::util::error::Result<PendingResolution> {
-        let cm = match &self.concurrency_manager {
+        let cm = match concurrency_manager {
             Some(cm) => cm,
             None => {
                 // No concurrency manager (explicit txn path) - skip pending
@@ -1131,8 +1278,8 @@ impl<I: MvccIterator> MvccScanIterator<I> {
             }
         };
 
-        const MAX_SPIN: u32 = 40;
-        for _ in 0..MAX_SPIN {
+        let mut conflict_backoff = ConflictBackoff::new(conflict_wait_config);
+        loop {
             match cm.get_txn_state(owner_ts) {
                 Some(TxnState::Running) => {
                     // Writer is still running. Safe to skip because:
@@ -1143,25 +1290,29 @@ impl<I: MvccIterator> MvccScanIterator<I> {
                 Some(TxnState::Preparing) => {
                     // Writer is computing commit_ts. Spin-wait until it transitions
                     // to Prepared (where we can check the actual commit_ts).
-                    std::thread::yield_now();
-                    continue;
+                    match conflict_backoff.wait_next().await {
+                        ConflictWaitOutcome::RetryNow => continue,
+                        ConflictWaitOutcome::TimedOut => {
+                            return Err(TiSqlError::LockWaitTimeout);
+                        }
+                    }
                 }
                 Some(TxnState::Prepared { prepared_ts }) => {
-                    if prepared_ts > self.read_ts {
+                    if prepared_ts > read_ts {
                         // commit_ts > read_ts, not visible to us
                         return Ok(PendingResolution::Skip);
                     }
                     // prepared_ts <= read_ts: we can't determine visibility yet.
                     // The writer may commit with this ts, making it visible.
-                    // Return KeyIsLocked to force retry.
-                    return Err(TiSqlError::KeyIsLocked {
-                        key: self.storage_iter.user_key().to_vec(),
-                        lock_ts: owner_ts,
-                        primary: vec![],
-                    });
+                    match conflict_backoff.wait_next().await {
+                        ConflictWaitOutcome::RetryNow => continue,
+                        ConflictWaitOutcome::TimedOut => {
+                            return Err(TiSqlError::LockWaitTimeout);
+                        }
+                    }
                 }
                 Some(TxnState::Committed { commit_ts }) => {
-                    if commit_ts > self.read_ts {
+                    if commit_ts > read_ts {
                         return Ok(PendingResolution::Skip);
                     }
                     // Committed with commit_ts <= read_ts: visible!
@@ -1173,13 +1324,6 @@ impl<I: MvccIterator> MvccScanIterator<I> {
                 }
             }
         }
-
-        // Exceeded spin limit - return KeyIsLocked
-        Err(TiSqlError::KeyIsLocked {
-            key: self.storage_iter.user_key().to_vec(),
-            lock_ts: owner_ts,
-            primary: vec![],
-        })
     }
 
     /// Find the next visible entry from storage.
@@ -1223,7 +1367,14 @@ impl<I: MvccIterator> MvccScanIterator<I> {
 
             // Resolve pending writes before visibility check
             if self.storage_iter.is_pending() {
-                match self.resolve_pending(self.storage_iter.pending_owner())? {
+                match Self::resolve_pending(
+                    self.concurrency_manager.clone(),
+                    self.conflict_wait_config,
+                    self.read_ts,
+                    self.storage_iter.pending_owner(),
+                )
+                .await?
+                {
                     PendingResolution::Skip => {
                         self.storage_iter.advance().await?;
                         continue;
@@ -1372,7 +1523,18 @@ mod tests {
         );
         let tso = Arc::new(LocalTso::new(1));
         let cm = Arc::new(ConcurrencyManager::new(0));
-        let txn_service = TransactionService::new(Arc::clone(&storage), clog_service, tso, cm);
+        let txn_service = TransactionService::new_with_conflict_wait_config(
+            Arc::clone(&storage),
+            clog_service,
+            tso,
+            cm,
+            ConflictWaitConfig {
+                lock_wait_timeout: Duration::from_millis(100),
+                spin_retries: 0,
+                initial_backoff: Duration::from_millis(10),
+                max_backoff: Duration::from_millis(10),
+            },
+        );
         (storage, txn_service, dir)
     }
 
@@ -1911,6 +2073,71 @@ mod tests {
         }
     }
 
+    struct PendingIterator {
+        entries: Vec<(MvccKey, RawValue, Timestamp)>,
+        position: usize,
+    }
+
+    impl PendingIterator {
+        fn new(entries: Vec<(MvccKey, RawValue, Timestamp)>) -> Self {
+            Self {
+                entries,
+                position: 0,
+            }
+        }
+
+        fn current(&self) -> Option<&(MvccKey, RawValue, Timestamp)> {
+            self.entries.get(self.position)
+        }
+    }
+
+    impl MvccIterator for PendingIterator {
+        async fn seek(&mut self, _target: &MvccKey) -> Result<()> {
+            self.position = 0;
+            Ok(())
+        }
+
+        async fn advance(&mut self) -> Result<()> {
+            self.position += 1;
+            Ok(())
+        }
+
+        fn valid(&self) -> bool {
+            self.position < self.entries.len()
+        }
+
+        fn user_key(&self) -> &[u8] {
+            self.current()
+                .expect("user_key() called on invalid iterator")
+                .0
+                .key()
+        }
+
+        fn timestamp(&self) -> Timestamp {
+            self.current()
+                .expect("timestamp() called on invalid iterator")
+                .0
+                .timestamp()
+        }
+
+        fn value(&self) -> &[u8] {
+            self.current()
+                .expect("value() called on invalid iterator")
+                .1
+                .as_slice()
+        }
+
+        fn is_pending(&self) -> bool {
+            self.valid()
+        }
+
+        fn pending_owner(&self) -> Timestamp {
+            self.current()
+                .expect("pending_owner() called on invalid iterator")
+                .2
+        }
+    }
+
     /// Helper to collect scan results using streaming API
     async fn collect_scan_results<I: MvccIterator>(
         mut iter: MvccScanIterator<I>,
@@ -1955,6 +2182,7 @@ mod tests {
             10, // read_ts
             b"a".to_vec()..b"z".to_vec(),
             None,
+            ConflictWaitConfig::default(),
         );
 
         let results = collect_scan_results(scan_iter).await;
@@ -1990,7 +2218,13 @@ mod tests {
         // Result: 1 Ok entry + 1 Err
         let mock_iter = ErrorInjectingIterator::new(entries, 0);
 
-        let scan_iter = MvccScanIterator::new(mock_iter, 10, b"a".to_vec()..b"z".to_vec(), None);
+        let scan_iter = MvccScanIterator::new(
+            mock_iter,
+            10,
+            b"a".to_vec()..b"z".to_vec(),
+            None,
+            ConflictWaitConfig::default(),
+        );
 
         let results = collect_scan_results(scan_iter).await;
 
@@ -2011,7 +2245,13 @@ mod tests {
         // Error after 10 successful next() calls - won't trigger (only 2 entries)
         let mock_iter = ErrorInjectingIterator::new(entries, 10);
 
-        let scan_iter = MvccScanIterator::new(mock_iter, 10, b"a".to_vec()..b"z".to_vec(), None);
+        let scan_iter = MvccScanIterator::new(
+            mock_iter,
+            10,
+            b"a".to_vec()..b"z".to_vec(),
+            None,
+            ConflictWaitConfig::default(),
+        );
 
         let results = collect_scan_results(scan_iter).await;
 
@@ -2039,7 +2279,13 @@ mod tests {
         // Result: 2 successful entries before error
         let mock_iter = ErrorInjectingIterator::new(entries.clone(), 1);
 
-        let scan_iter = MvccScanIterator::new(mock_iter, 10, b"a".to_vec()..b"z".to_vec(), None);
+        let scan_iter = MvccScanIterator::new(
+            mock_iter,
+            10,
+            b"a".to_vec()..b"z".to_vec(),
+            None,
+            ConflictWaitConfig::default(),
+        );
 
         let results = collect_scan_results(scan_iter).await;
 
@@ -2901,9 +3147,10 @@ mod tests {
         assert_eq!(value3, Some(b"v3".to_vec()));
     }
 
-    #[tokio::test]
-    async fn test_explicit_txn_write_conflict() {
+    #[tokio::test(start_paused = true)]
+    async fn test_explicit_txn_write_conflict_times_out() {
         let (_storage, txn_service, _dir) = create_test_service();
+        let txn_service = Arc::new(txn_service);
 
         // Transaction 1: Lock key
         let mut ctx1 = txn_service.begin_explicit(false).unwrap();
@@ -2918,33 +3165,40 @@ mod tests {
             .unwrap();
 
         // Transaction 2: Try to write same key - should fail
-        let mut ctx2 = txn_service.begin_explicit(false).unwrap();
-        let result = txn_service
-            .put(
-                &mut ctx2,
-                ALL_META_TABLE_ID,
-                b"conflict_key",
-                b"value2".to_vec(),
-            )
-            .await;
+        let conflict_service = Arc::clone(&txn_service);
+        let conflict_handle = tokio::spawn(async move {
+            let mut ctx2 = conflict_service.begin_explicit(false).unwrap();
+            let result = conflict_service
+                .put(
+                    &mut ctx2,
+                    ALL_META_TABLE_ID,
+                    b"conflict_key",
+                    b"value2".to_vec(),
+                )
+                .await;
+            let _ = conflict_service.rollback(ctx2);
+            result
+        });
 
-        assert!(result.is_err());
-        match result.unwrap_err() {
-            TiSqlError::KeyIsLocked { key, lock_ts, .. } => {
-                assert_eq!(key, b"conflict_key".to_vec());
-                assert_eq!(lock_ts, ctx1.start_ts);
-            }
-            other => panic!("Expected KeyIsLocked error, got: {other:?}"),
-        }
+        tokio::task::yield_now().await;
+        assert!(
+            !conflict_handle.is_finished(),
+            "conflicting writer should still be waiting"
+        );
+        tokio::time::advance(Duration::from_millis(100)).await;
+        assert!(matches!(
+            conflict_handle.await.unwrap(),
+            Err(TiSqlError::LockWaitTimeout)
+        ));
 
         // Cleanup
         txn_service.rollback(ctx1).unwrap();
-        txn_service.rollback(ctx2).unwrap();
     }
 
-    #[tokio::test]
-    async fn test_explicit_txn_delete_conflict() {
+    #[tokio::test(start_paused = true)]
+    async fn test_explicit_txn_delete_conflict_times_out() {
         let (_storage, txn_service, _dir) = create_test_service();
+        let txn_service = Arc::new(txn_service);
 
         // Commit initial value
         txn_service
@@ -2960,23 +3214,182 @@ mod tests {
             .unwrap();
 
         // Transaction 2: Try to delete same key - should fail
-        let mut ctx2 = txn_service.begin_explicit(false).unwrap();
-        let result = txn_service
-            .delete(&mut ctx2, ALL_META_TABLE_ID, b"delete_key")
-            .await;
+        let conflict_service = Arc::clone(&txn_service);
+        let conflict_handle = tokio::spawn(async move {
+            let mut ctx2 = conflict_service.begin_explicit(false).unwrap();
+            let result = conflict_service
+                .delete(&mut ctx2, ALL_META_TABLE_ID, b"delete_key")
+                .await;
+            let _ = conflict_service.rollback(ctx2);
+            result
+        });
 
-        assert!(result.is_err());
-        match result.unwrap_err() {
-            TiSqlError::KeyIsLocked { key, lock_ts, .. } => {
-                assert_eq!(key, b"delete_key".to_vec());
-                assert_eq!(lock_ts, ctx1.start_ts);
-            }
-            other => panic!("Expected KeyIsLocked error, got: {other:?}"),
-        }
+        tokio::task::yield_now().await;
+        assert!(
+            !conflict_handle.is_finished(),
+            "conflicting delete should still be waiting"
+        );
+        tokio::time::advance(Duration::from_millis(100)).await;
+        assert!(matches!(
+            conflict_handle.await.unwrap(),
+            Err(TiSqlError::LockWaitTimeout)
+        ));
 
         // Cleanup
         txn_service.rollback(ctx1).unwrap();
-        txn_service.rollback(ctx2).unwrap();
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn test_explicit_txn_write_conflict_waits_then_succeeds_after_rollback() {
+        let (_storage, txn_service, _dir) = create_test_service();
+        let txn_service = Arc::new(txn_service);
+
+        let mut ctx1 = txn_service.begin_explicit(false).unwrap();
+        txn_service
+            .put(
+                &mut ctx1,
+                ALL_META_TABLE_ID,
+                b"retry_key",
+                b"value1".to_vec(),
+            )
+            .await
+            .unwrap();
+
+        let retry_service = Arc::clone(&txn_service);
+        let retry_handle = tokio::spawn(async move {
+            let mut ctx2 = retry_service.begin_explicit(false).unwrap();
+            retry_service
+                .put(
+                    &mut ctx2,
+                    ALL_META_TABLE_ID,
+                    b"retry_key",
+                    b"value2".to_vec(),
+                )
+                .await?;
+            retry_service.commit(ctx2).await?;
+            Ok::<(), TiSqlError>(())
+        });
+
+        tokio::task::yield_now().await;
+        assert!(
+            !retry_handle.is_finished(),
+            "conflicting writer should be waiting for lock release"
+        );
+
+        txn_service.rollback(ctx1).unwrap();
+        tokio::time::advance(Duration::from_millis(10)).await;
+        retry_handle.await.unwrap().unwrap();
+
+        let reader = txn_service.begin(true).unwrap();
+        let value = txn_service
+            .get(&reader, ALL_META_TABLE_ID, b"retry_key")
+            .await
+            .unwrap();
+        assert_eq!(value, Some(b"value2".to_vec()));
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn test_point_get_waits_for_prepared_owner_then_returns_committed_value() {
+        let (_storage, txn_service, _dir) = create_test_service();
+        let txn_service = Arc::new(txn_service);
+
+        txn_service
+            .autocommit_put(b"prepared_key", b"base")
+            .await
+            .unwrap();
+
+        let mut writer = txn_service.begin_explicit(false).unwrap();
+        txn_service
+            .put(
+                &mut writer,
+                ALL_META_TABLE_ID,
+                b"prepared_key",
+                b"prepared".to_vec(),
+            )
+            .await
+            .unwrap();
+
+        let reader = txn_service.begin(true).unwrap();
+        let read_ts = reader.start_ts;
+        txn_service
+            .concurrency_manager
+            .set_preparing_txn(writer.start_ts)
+            .unwrap();
+        txn_service
+            .concurrency_manager
+            .prepare_txn(writer.start_ts, read_ts)
+            .unwrap();
+
+        let read_service = Arc::clone(&txn_service);
+        let read_handle = tokio::spawn(async move {
+            read_service
+                .get(&reader, ALL_META_TABLE_ID, b"prepared_key")
+                .await
+        });
+
+        tokio::task::yield_now().await;
+        assert!(
+            !read_handle.is_finished(),
+            "reader should wait while prepared owner is unresolved"
+        );
+
+        txn_service
+            .storage
+            .finalize_pending(&[b"prepared_key".to_vec()], writer.start_ts, read_ts);
+        txn_service
+            .concurrency_manager
+            .commit_txn(writer.start_ts, read_ts)
+            .unwrap();
+        txn_service.concurrency_manager.remove_txn(writer.start_ts);
+
+        tokio::time::advance(Duration::from_millis(10)).await;
+        let value = read_handle.await.unwrap().unwrap();
+        assert_eq!(value, Some(b"prepared".to_vec()));
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn test_mvcc_scan_iterator_pending_prepared_times_out() {
+        let cm = Arc::new(ConcurrencyManager::new(0));
+        let owner_ts = 42;
+        cm.register_txn(owner_ts);
+        cm.set_preparing_txn(owner_ts).unwrap();
+        cm.prepare_txn(owner_ts, 10).unwrap();
+
+        let iter = PendingIterator::new(vec![(
+            MvccKey::encode(b"pending_key", 0),
+            b"pending".to_vec(),
+            owner_ts,
+        )]);
+
+        let scan_iter = MvccScanIterator::new(
+            iter,
+            10,
+            b"a".to_vec()..b"z".to_vec(),
+            Some(cm),
+            ConflictWaitConfig {
+                lock_wait_timeout: Duration::from_millis(100),
+                spin_retries: 0,
+                initial_backoff: Duration::from_millis(10),
+                max_backoff: Duration::from_millis(10),
+            },
+        );
+
+        let scan_handle = tokio::spawn(async move {
+            let mut scan_iter = scan_iter;
+            scan_iter.advance().await
+        });
+
+        tokio::task::yield_now().await;
+        assert!(
+            !scan_handle.is_finished(),
+            "scan should wait while prepared owner is unresolved"
+        );
+
+        tokio::time::advance(Duration::from_millis(100)).await;
+        assert!(matches!(
+            scan_handle.await.unwrap(),
+            Err(TiSqlError::LockWaitTimeout)
+        ));
     }
 
     #[tokio::test]

@@ -1394,6 +1394,12 @@ impl Executor for SimpleExecutor {
                         .await
                     {
                         Ok(result) => (Ok(result), Some(ctx)),
+                        Err(e) if matches!(e, TiSqlError::LockWaitTimeout) => {
+                            match txn_service.rollback(ctx) {
+                                Ok(()) => (Err(e), None),
+                                Err(rollback_err) => (Err(rollback_err), None),
+                            }
+                        }
                         Err(e) => (Err(e), Some(ctx)),
                     }
                 } else {
@@ -1403,6 +1409,12 @@ impl Executor for SimpleExecutor {
                         .await
                     {
                         Ok(output) => (Ok(output), Some(ctx)),
+                        Err(e) if matches!(e, TiSqlError::LockWaitTimeout) => {
+                            match txn_service.rollback(ctx) {
+                                Ok(()) => (Err(e), None),
+                                Err(rollback_err) => (Err(rollback_err), None),
+                            }
+                        }
                         Err(e) => (Err(e), Some(ctx)),
                     }
                 }

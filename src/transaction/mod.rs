@@ -69,4 +69,4 @@ pub use api::{CommitInfo, IsolationLevel, TxnCtx, TxnService, TxnState};
 // Implementation types - not re-exported from lib.rs main API
 // Available via testkit for integration tests
 pub use concurrency::ConcurrencyManager;
-pub use service::TransactionService;
+pub use service::{ConflictWaitConfig, TransactionService};

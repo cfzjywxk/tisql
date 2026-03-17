@@ -30,8 +30,8 @@ use std::sync::Arc;
 use tisql::catalog::types::{RawValue, Timestamp};
 use tisql::tablet::mvcc::{is_tombstone, MvccIterator, MvccKey};
 use tisql::testkit::{
-    ConcurrencyManager, FileClogConfig, FileClogService, LocalTso, MemTableEngine,
-    TransactionService, TxnServiceTestExt,
+    ConcurrencyManager, ConflictWaitConfig, FileClogConfig, FileClogService, LocalTso,
+    MemTableEngine, TransactionService, TxnServiceTestExt,
 };
 use tisql::util::error::TiSqlError;
 use tisql::StorageEngine;
@@ -105,11 +105,17 @@ fn create_test_service() -> TestServiceTuple {
     );
     let tso = Arc::new(LocalTso::new(1));
     let cm = Arc::new(ConcurrencyManager::new(0));
-    let txn_service = Arc::new(TransactionService::new(
+    let txn_service = Arc::new(TransactionService::new_with_conflict_wait_config(
         Arc::clone(&storage),
         clog_service,
         Arc::clone(&tso),
         Arc::clone(&cm),
+        ConflictWaitConfig {
+            lock_wait_timeout: std::time::Duration::from_millis(100),
+            spin_retries: 0,
+            initial_backoff: std::time::Duration::from_millis(10),
+            max_backoff: std::time::Duration::from_millis(10),
+        },
     ));
     (storage, txn_service, tso, cm, dir)
 }
@@ -294,7 +300,7 @@ async fn test_concurrent_writes_same_key() {
                 Ok(_) => {
                     success_count.fetch_add(1, Ordering::Relaxed);
                 }
-                Err(TiSqlError::KeyIsLocked { .. }) => {
+                Err(TiSqlError::LockWaitTimeout) => {
                     conflict_count.fetch_add(1, Ordering::Relaxed);
                 }
                 Err(e) => {
@@ -1165,7 +1171,7 @@ async fn test_concurrent_scan_while_writers_run() {
                     .await
                 {
                     Ok(_) => success += 1,
-                    Err(TiSqlError::KeyIsLocked { .. }) => {} // Expected under contention
+                    Err(TiSqlError::LockWaitTimeout) => {} // Expected under contention
                     Err(e) => panic!("Unexpected error: {e:?}"),
                 }
                 tokio::task::yield_now().await;
@@ -1207,7 +1213,7 @@ async fn test_concurrent_scan_while_writers_run() {
                         }
                         total_entries += count;
                     }
-                    Err(TiSqlError::KeyIsLocked { .. }) => {
+                    Err(TiSqlError::LockWaitTimeout) => {
                         // Shouldn't happen for safe range, but handle gracefully
                     }
                     Err(e) => panic!("Unexpected scan error: {e:?}"),
@@ -1413,7 +1419,7 @@ async fn test_mvcc_scan_iterator_returns_latest_visible_only() {
 // E2E Tests for KeyIsLocked Error Path
 // ============================================================================
 
-/// E2E test for concurrent SQL INSERTs to the same key triggering KeyIsLocked error.
+/// E2E test for concurrent SQL INSERTs to the same key triggering timeout/duplicate errors.
 ///
 /// This tests the full path from SQL layer through transaction layer to storage layer,
 /// verifying that concurrent writes to the same primary key result in proper lock
@@ -1423,7 +1429,8 @@ async fn test_e2e_key_is_locked_concurrent_inserts() {
     use tisql::{Database, DatabaseConfig, QueryResult};
 
     let dir = tempfile::tempdir().unwrap();
-    let config = DatabaseConfig::with_data_dir(dir.path());
+    let config = DatabaseConfig::with_data_dir(dir.path())
+        .with_lock_wait_timeout(std::time::Duration::from_millis(100));
     let db = Arc::new(Database::open(config).unwrap());
 
     // Create table with primary key
@@ -1457,7 +1464,7 @@ async fn test_e2e_key_is_locked_concurrent_inserts() {
                 }
                 Err(e) => {
                     let msg = e.to_string().to_lowercase();
-                    if msg.contains("key is locked") || msg.contains("locked") {
+                    if msg.contains("lock wait timeout") || msg.contains("locked") {
                         lock_error_count.fetch_add(1, Ordering::Relaxed);
                     } else if msg.contains("duplicate") {
                         duplicate_error_count.fetch_add(1, Ordering::Relaxed);
@@ -1511,7 +1518,7 @@ async fn test_e2e_key_is_locked_concurrent_inserts() {
     db.close().await.unwrap();
 }
 
-/// E2E test for concurrent SQL UPDATEs to the same key triggering KeyIsLocked error.
+/// E2E test for concurrent SQL UPDATEs to the same key triggering timeout errors.
 ///
 /// Similar to the INSERT test, but tests UPDATE operations where multiple threads
 /// try to update the same row concurrently.
@@ -1520,7 +1527,8 @@ async fn test_e2e_key_is_locked_concurrent_updates() {
     use tisql::{Database, DatabaseConfig, QueryResult};
 
     let dir = tempfile::tempdir().unwrap();
-    let config = DatabaseConfig::with_data_dir(dir.path());
+    let config = DatabaseConfig::with_data_dir(dir.path())
+        .with_lock_wait_timeout(std::time::Duration::from_millis(100));
     let db = Arc::new(Database::open(config).unwrap());
 
     // Create table and insert initial row
@@ -1559,9 +1567,9 @@ async fn test_e2e_key_is_locked_concurrent_updates() {
                     Err(e) => {
                         let msg = e.to_string().to_lowercase();
                         // In highly concurrent UPDATE scenarios, we may see:
-                        // - KeyIsLocked: another txn holds the lock
+                        // - LockWaitTimeout: another txn kept the row locked past the wait budget
                         // - DuplicateKey: race condition during PK check (false positive)
-                        if msg.contains("key is locked")
+                        if msg.contains("lock wait timeout")
                             || msg.contains("locked")
                             || msg.contains("duplicate")
                         {
@@ -1797,11 +1805,12 @@ mod explicit_transaction_tests {
         db.close().await.unwrap();
     }
 
-    /// Statement lock-conflict errors should keep explicit transaction context.
+    /// Lock wait timeout should clear the explicit transaction context.
     #[tokio::test]
-    async fn test_lock_conflict_keeps_explicit_txn_active() {
+    async fn test_lock_wait_timeout_clears_explicit_txn() {
         let dir = tempdir().unwrap();
-        let config = DatabaseConfig::with_data_dir(dir.path());
+        let config = DatabaseConfig::with_data_dir(dir.path())
+            .with_lock_wait_timeout(std::time::Duration::from_millis(100));
         let db = Database::open(config).unwrap();
         let mut s1 = Session::new();
         let mut s2 = Session::new();
@@ -1825,18 +1834,21 @@ mod explicit_transaction_tests {
             .await
             .unwrap_err();
         assert!(
-            err.to_string().to_lowercase().contains("locked"),
-            "expected lock conflict, got: {err}"
+            err.to_string().to_lowercase().contains("timeout"),
+            "expected lock wait timeout, got: {err}"
         );
         assert!(
-            s2.has_active_txn(),
-            "explicit txn should remain active after statement lock error"
+            !s2.has_active_txn(),
+            "explicit txn should be cleared after lock wait timeout"
         );
 
         db.execute_query_with_session("ROLLBACK", &mut s1)
             .await
             .unwrap();
 
+        db.execute_query_with_session("BEGIN", &mut s2)
+            .await
+            .unwrap();
         db.execute_query_with_session("INSERT INTO lock_ctx_local VALUES (2, 22)", &mut s2)
             .await
             .unwrap();
@@ -1849,8 +1861,12 @@ mod explicit_transaction_tests {
             .await
             .unwrap_err();
         assert!(
-            err.to_string().to_lowercase().contains("locked"),
-            "s1 should hit lock conflict, got: {err}"
+            err.to_string().to_lowercase().contains("timeout"),
+            "s1 should hit lock wait timeout, got: {err}"
+        );
+        assert!(
+            !s1.has_active_txn(),
+            "s1 transaction should be cleared after lock wait timeout"
         );
 
         match db
@@ -1889,7 +1905,8 @@ mod explicit_transaction_tests {
     #[tokio::test]
     async fn test_insert_ignore_duplicate_holds_lock_until_commit() {
         let dir = tempdir().unwrap();
-        let config = DatabaseConfig::with_data_dir(dir.path());
+        let config = DatabaseConfig::with_data_dir(dir.path())
+            .with_lock_wait_timeout(std::time::Duration::from_millis(100));
         let db = Database::open(config).unwrap();
         let mut s1 = Session::new();
         let mut s2 = Session::new();
@@ -1927,15 +1944,18 @@ mod explicit_transaction_tests {
             .await
             .unwrap_err();
         assert!(
-            err.to_string().to_lowercase().contains("locked"),
-            "expected lock conflict before s1 commit, got: {err}"
+            err.to_string().to_lowercase().contains("timeout"),
+            "expected lock wait timeout before s1 commit, got: {err}"
         );
         assert!(
-            s2.has_active_txn(),
-            "explicit txn should remain active after lock conflict"
+            !s2.has_active_txn(),
+            "explicit txn should be cleared after lock wait timeout"
         );
 
         db.execute_query_with_session("COMMIT", &mut s1)
+            .await
+            .unwrap();
+        db.execute_query_with_session("BEGIN", &mut s2)
             .await
             .unwrap();
         db.execute_query_with_session(

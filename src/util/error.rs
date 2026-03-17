@@ -70,6 +70,9 @@ pub enum TiSqlError {
         primary: Vec<u8>,
     },
 
+    #[error("Lock wait timeout exceeded; try restarting transaction")]
+    LockWaitTimeout,
+
     #[error("Schema changed during transaction, please retry")]
     SchemaChanged,
 

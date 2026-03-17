@@ -36,6 +36,7 @@ use crate::protocol::point_get_short::{
     starts_with_select_ascii_case_insensitive, try_parse_point_get_short,
 };
 use crate::session::{ExecutionCtx, Session};
+use crate::util::error::TiSqlError;
 use crate::util::mysql_text::{
     format_date_canonical, format_datetime_canonical, format_time_canonical,
 };
@@ -220,6 +221,13 @@ impl MySqlBackend {
             warnings: 0,
             info: String::new(),
             session_state_info: String::new(),
+        }
+    }
+
+    fn mysql_error_kind(error: &TiSqlError) -> ErrorKind {
+        match error {
+            TiSqlError::LockWaitTimeout => ErrorKind::ER_LOCK_WAIT_TIMEOUT,
+            _ => ErrorKind::ER_UNKNOWN_ERROR,
         }
     }
 }
@@ -505,7 +513,7 @@ impl MySqlBackend {
                             self.update_session_registry();
                             return rw
                                 .finish_error(
-                                    ErrorKind::ER_UNKNOWN_ERROR,
+                                    Self::mysql_error_kind(&e),
                                     &e.to_string().into_bytes(),
                                 )
                                 .await;
@@ -543,7 +551,7 @@ impl MySqlBackend {
                     self.session.set_current_txn(ctx);
                 }
                 results
-                    .error(ErrorKind::ER_UNKNOWN_ERROR, error.to_string().as_bytes())
+                    .error(Self::mysql_error_kind(&error), error.to_string().as_bytes())
                     .await
             }
         };
@@ -963,5 +971,13 @@ mod tests {
         let mut row = reader.next_row().unwrap().unwrap();
         assert!(row.next_col().unwrap().is_some());
         assert!(row.next_col().is_err());
+    }
+
+    #[test]
+    fn test_mysql_error_kind_maps_lock_wait_timeout() {
+        assert_eq!(
+            MySqlBackend::mysql_error_kind(&TiSqlError::LockWaitTimeout),
+            ErrorKind::ER_LOCK_WAIT_TIMEOUT
+        );
     }
 }

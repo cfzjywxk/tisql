@@ -12,7 +12,7 @@ default-run = "tisql"
 sqlparser = "0.40"
 
 # Async runtime
-tokio = { version = "1", features = ["full"] }
+tokio = { version = "1", features = ["full", "test-util"] }
 
 # Serialization
 bincode = "1.3"

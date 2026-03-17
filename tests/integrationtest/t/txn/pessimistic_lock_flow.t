@@ -10,15 +10,16 @@ UPDATE lock_ctx_mtr SET b = 11 WHERE a = 1;
 
 --session s2
 BEGIN;
---error 1105
---error_kind KeyIsLocked
---error_contains locked
+--error 1205
+--error_kind LockWaitTimeout
+--error_contains timeout
 UPDATE lock_ctx_mtr SET b = 20 WHERE a = 1;
 
 --session s1
 ROLLBACK;
 
 --session s2
+BEGIN;
 UPDATE lock_ctx_mtr SET b = 20 WHERE a = 1;
 
 --session s3
@@ -38,13 +39,12 @@ INSERT INTO lock_ctx_mtr VALUES (2, 200);
 
 --session s1
 BEGIN;
---error 1105
---error_kind KeyIsLocked
---error_contains locked
+--error 1205
+--error_kind LockWaitTimeout
+--error_contains timeout
 INSERT INTO lock_ctx_mtr VALUES (2, 999);
 --rows 0
 SELECT a, b FROM lock_ctx_mtr WHERE a = 2;
-ROLLBACK;
 
 --session s2
 ROLLBACK;

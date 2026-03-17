@@ -292,13 +292,14 @@ async fn run_test(config: &Config, test_case: &TestCase) -> TestResult {
     let _temp_guard = TempDirGuard(temp_dir.clone());
     // Keep per-test runtime footprint small to avoid thread churn across many
     // mysqltest cases in a single runner process.
-    let db_config =
-        DatabaseConfig::with_data_dir(&temp_dir).with_runtime_threads(RuntimeThreadOverrides {
+    let db_config = DatabaseConfig::with_data_dir(&temp_dir)
+        .with_runtime_threads(RuntimeThreadOverrides {
             protocol: Some(1),
             worker: Some(1),
             background: Some(1),
             io: Some(1),
-        });
+        })
+        .with_lock_wait_timeout(Duration::from_millis(100));
     let db = Arc::new(Database::open(db_config).expect("Failed to open database"));
 
     // Execute statements and collect output
@@ -782,6 +783,7 @@ fn tisql_error_kind(err: &TiSqlError) -> String {
         TiSqlError::ReadOnlyTransaction => "ReadOnlyTransaction".into(),
         TiSqlError::TransactionNotActive(_) => "TransactionNotActive".into(),
         TiSqlError::KeyIsLocked { .. } => "KeyIsLocked".into(),
+        TiSqlError::LockWaitTimeout => "LockWaitTimeout".into(),
         TiSqlError::SchemaChanged => "SchemaChanged".into(),
         TiSqlError::Io(_) => "Io".into(),
         TiSqlError::Internal(_) => "Internal".into(),
@@ -795,6 +797,7 @@ fn mysql_error_code(err: &TiSqlError) -> u32 {
         TiSqlError::TableNotFound(_) => 1146,    // ER_NO_SUCH_TABLE
         TiSqlError::ColumnNotFound(_) => 1054,   // ER_BAD_FIELD_ERROR
         TiSqlError::DuplicateKey(_) => 1062,     // ER_DUP_ENTRY
+        TiSqlError::LockWaitTimeout => 1205,     // ER_LOCK_WAIT_TIMEOUT
         TiSqlError::Parse(_) => 1064,            // ER_PARSE_ERROR
         TiSqlError::TypeMismatch { .. } => 1366, // ER_TRUNCATED_WRONG_VALUE_FOR_FIELD (approx)
 

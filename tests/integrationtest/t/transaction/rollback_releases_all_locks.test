@@ -18,12 +18,15 @@ UPDATE lock_release_test SET val = 'locked3' WHERE id = 3;
 # Session s2: Try to update locked rows - should conflict
 --session s2
 BEGIN;
---error
+--error 1205
+--error_kind LockWaitTimeout
 UPDATE lock_release_test SET val = 's2_attempt1' WHERE id = 1;
---error
+BEGIN;
+--error 1205
+--error_kind LockWaitTimeout
 UPDATE lock_release_test SET val = 's2_attempt2' WHERE id = 2;
 
-# Session s2: Verify still in transaction after conflicts
+# Session s2: Session remains usable after timeout cleanup
 SELECT 1;
 
 # Session s1: Rollback to release all locks
@@ -31,6 +34,7 @@ SELECT 1;
 ROLLBACK;
 
 # Session s2: Now should be able to update all previously locked rows
+BEGIN;
 UPDATE lock_release_test SET val = 's2_success1' WHERE id = 1;
 UPDATE lock_release_test SET val = 's2_success2' WHERE id = 2;
 UPDATE lock_release_test SET val = 's2_success3' WHERE id = 3;
