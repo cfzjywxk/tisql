@@ -113,12 +113,11 @@ async fn test_ported_explicit_conflict_rollback_then_retry_and_commit() {
             )
             .await;
             assert!(
-                !s2.has_active_txn(),
-                "lock wait timeout must clear explicit transaction"
+                s2.has_active_txn(),
+                "lock wait timeout must preserve explicit transaction"
             );
 
             exec_with_session(&db, &mut s1, "ROLLBACK").await;
-            exec_with_session(&db, &mut s2, "BEGIN").await;
             exec_with_session(&db, &mut s2, "INSERT INTO t_lock_retry VALUES (2, 22)").await;
 
             let uncommitted = query_rows(&db, "SELECT a, b FROM t_lock_retry").await;
@@ -132,16 +131,17 @@ async fn test_ported_explicit_conflict_rollback_then_retry_and_commit() {
             let rows = query_rows(&db, "SELECT a, b FROM t_lock_retry ORDER BY a").await;
             assert_eq!(rows, vec![vec!["2".to_string(), "22".to_string()]]);
 
-            db.close().await.unwrap();
+            drop(s1);
+            drop(s2);
         },
     )
     .await;
 }
 
 #[tokio::test]
-async fn test_ported_lock_wait_timeout_aborts_explicit_txn_and_requires_rebegin() {
+async fn test_ported_lock_wait_timeout_keeps_explicit_txn_open() {
     run_with_case_timeout(
-        "test_ported_lock_wait_timeout_aborts_explicit_txn_and_requires_rebegin",
+        "test_ported_lock_wait_timeout_keeps_explicit_txn_open",
         async {
             let (db, _dir) = open_test_db();
             let mut s1 = Session::new();
@@ -161,12 +161,11 @@ async fn test_ported_lock_wait_timeout_aborts_explicit_txn_and_requires_rebegin(
             .await;
 
             assert!(
-                !s2.has_active_txn(),
-                "explicit txn should be cleared after lock wait timeout"
+                s2.has_active_txn(),
+                "explicit txn should stay active after lock wait timeout"
             );
 
             exec_with_session(&db, &mut s1, "ROLLBACK").await;
-            exec_with_session(&db, &mut s2, "BEGIN").await;
             exec_with_session(&db, &mut s2, "INSERT INTO t_txn_keep VALUES (3, 30)").await;
             exec_with_session(&db, &mut s2, "INSERT INTO t_txn_keep VALUES (1, 20)").await;
             exec_with_session(&db, &mut s2, "COMMIT").await;
@@ -180,7 +179,8 @@ async fn test_ported_lock_wait_timeout_aborts_explicit_txn_and_requires_rebegin(
                 ]
             );
 
-            db.close().await.unwrap();
+            drop(s1);
+            drop(s2);
         },
     )
     .await;

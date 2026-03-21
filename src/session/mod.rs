@@ -65,7 +65,7 @@ use std::collections::HashMap;
 use std::sync::atomic::{AtomicU64, Ordering};
 
 use crate::catalog::types::Timestamp;
-use crate::transaction::{IsolationLevel, TxnCtx};
+use crate::transaction::{IsolationLevel, MutationMeta, StatementUndo, TxnCtx};
 
 // ============================================================================
 // Session ID Generator
@@ -450,6 +450,9 @@ pub struct QueryCtx {
 
     /// Last insert ID (for auto-increment)
     last_insert_id: u64,
+
+    /// Statement-local undo log for rolling back explicit transaction failures.
+    statement_undo: StatementUndo,
     // Future: Add more statement context fields
     // - warnings: Vec<Warning>
     // - in_insert_stmt, in_update_stmt, etc.
@@ -457,6 +460,8 @@ pub struct QueryCtx {
     // - plan_digest
     // - original_sql
 }
+
+pub type StatementCtx = QueryCtx;
 
 impl QueryCtx {
     /// Create a new QueryCtx with default values.
@@ -471,6 +476,7 @@ impl QueryCtx {
             affected_rows: 0,
             found_rows: 0,
             last_insert_id: 0,
+            statement_undo: StatementUndo::default(),
         }
     }
 
@@ -489,6 +495,7 @@ impl QueryCtx {
             affected_rows: 0,
             found_rows: 0,
             last_insert_id: 0,
+            statement_undo: StatementUndo::default(),
         }
     }
 
@@ -540,6 +547,18 @@ impl QueryCtx {
     /// Mark this as an internal SQL statement.
     pub fn set_internal(&mut self, internal: bool) {
         self.is_internal = internal;
+    }
+
+    pub(crate) fn has_undo_for(&self, key: &[u8]) -> bool {
+        self.statement_undo.contains_key(key)
+    }
+
+    pub(crate) fn record_first_touch(&mut self, key: &[u8], previous: Option<MutationMeta>) {
+        self.statement_undo.record_first_touch(key, previous);
+    }
+
+    pub(crate) fn take_undo(&mut self) -> StatementUndo {
+        std::mem::take(&mut self.statement_undo)
     }
 }
 

@@ -31,7 +31,10 @@ use crate::clog::{ClogEntry, ClogOp, ClogOpRef, ClogService};
 use crate::tso::TsoService;
 use crate::util::error::{Result, TiSqlError};
 
-use super::api::{CommitInfo, MutationMeta, MutationPayload, TxnCtx, TxnService, TxnState};
+use super::api::{
+    CommitInfo, MutationMeta, MutationPayload, StatementUndo, StatementUndoEntry, TxnCtx,
+    TxnService, TxnState,
+};
 use super::concurrency::ConcurrencyManager;
 use crate::catalog::types::{Key, RawValue, TableId, Timestamp, TxnId};
 use crate::inner_table::core_tables::USER_TABLE_ID_START;
@@ -431,6 +434,54 @@ impl<S: StorageEngine, L: ClogService, T: TsoService> TransactionService<S, L, T
                             return Err(TiSqlError::LockWaitTimeout);
                         }
                     }
+                }
+                Err(PessimisticWriteError::WriteStall { delay: Some(delay) }) => {
+                    if retries >= MAX_SLOWDOWN_RETRIES {
+                        return Err(TiSqlError::Storage(
+                            "Write stalled: storage backpressure, retry later".to_string(),
+                        ));
+                    }
+                    retries += 1;
+                    tokio::time::sleep(delay).await;
+                }
+                Err(PessimisticWriteError::WriteStall { delay: None }) => {
+                    return Err(TiSqlError::Storage(
+                        "Write stalled: storage backpressure, retry later".to_string(),
+                    ));
+                }
+            }
+        }
+    }
+
+    async fn restore_pending_same_owner(
+        &self,
+        tablet_id: TabletId,
+        key: &[u8],
+        previous: &MutationMeta,
+        owner_start_ts: Timestamp,
+    ) -> Result<()>
+    where
+        S: PessimisticStorage,
+    {
+        const MAX_SLOWDOWN_RETRIES: usize = 32;
+        let mut retries = 0;
+
+        loop {
+            let value = match &previous.mutation {
+                MutationPayload::Put(value) => value.as_slice(),
+                MutationPayload::Delete => TOMBSTONE,
+                MutationPayload::Lock => LOCK,
+            };
+            match self
+                .storage
+                .put_pending_on_tablet(tablet_id, key, value, owner_start_ts)
+            {
+                Ok(()) => return Ok(()),
+                Err(PessimisticWriteError::LockConflict(other_owner)) => {
+                    return Err(TiSqlError::Internal(format!(
+                        "statement rollback owner mismatch for key {:?}: expected owner {}, found {}",
+                        key, owner_start_ts, other_owner
+                    )));
                 }
                 Err(PessimisticWriteError::WriteStall { delay: Some(delay) }) => {
                     if retries >= MAX_SLOWDOWN_RETRIES {
@@ -922,6 +973,66 @@ impl<S: PessimisticStorage + 'static, L: ClogService + 'static, T: TsoService> T
             }
             Err(e) => Err(e),
         }
+    }
+
+    async fn rollback_statement(&self, ctx: &mut TxnCtx, undo: StatementUndo) -> Result<()> {
+        if ctx.state != TxnState::Running {
+            return Err(TiSqlError::TransactionNotActive(format!("{:?}", ctx.state)));
+        }
+
+        if undo.is_empty() {
+            return Ok(());
+        }
+
+        let mut restore_entries = Vec::new();
+        let mut absent_entries = Vec::new();
+        for (key, entry) in undo.into_entries() {
+            match entry {
+                StatementUndoEntry::Restore(previous) => restore_entries.push((key, previous)),
+                StatementUndoEntry::Absent => absent_entries.push(key),
+            }
+        }
+
+        for (key, previous) in restore_entries {
+            let current = ctx.mutations.get(&key).ok_or_else(|| {
+                TiSqlError::Internal(format!(
+                    "statement rollback missing current mutation for key {:?}",
+                    key
+                ))
+            })?;
+            if current.tablet_id != previous.tablet_id {
+                return Err(TiSqlError::Internal(format!(
+                    "statement rollback tablet mismatch for key {:?}: current={}, previous={}",
+                    key, current.tablet_id, previous.tablet_id
+                )));
+            }
+            self.restore_pending_same_owner(current.tablet_id, &key, &previous, ctx.start_ts)
+                .await?;
+            ctx.mutations.insert(key, previous);
+        }
+
+        let mut absent_mutations = BTreeMap::new();
+        for key in &absent_entries {
+            let current = ctx.mutations.get(key).ok_or_else(|| {
+                TiSqlError::Internal(format!(
+                    "statement rollback missing current mutation for key {:?}",
+                    key
+                ))
+            })?;
+            absent_mutations.insert(key.clone(), current.clone());
+        }
+
+        if !absent_mutations.is_empty() {
+            let grouped_keys = Self::group_owned_mutation_keys_by_tablet(absent_mutations);
+            self.storage
+                .abort_pending_grouped(&grouped_keys, ctx.start_ts);
+        }
+
+        for key in absent_entries {
+            ctx.mutations.remove(&key);
+        }
+
+        Ok(())
     }
 
     async fn commit(&self, mut ctx: TxnCtx) -> Result<CommitInfo> {
@@ -3716,6 +3827,274 @@ mod tests {
             .await
             .unwrap();
         assert!(value.is_none(), "LOCK sentinel must be hidden from get()");
+    }
+
+    #[tokio::test]
+    async fn test_statement_rollback_removes_statement_created_key() {
+        let (_storage, txn_service, _dir) = create_test_service();
+
+        let mut ctx = txn_service.begin_explicit(false).unwrap();
+        let mut undo = StatementUndo::default();
+
+        txn_service
+            .put(&mut ctx, ALL_META_TABLE_ID, b"stmt_key", b"value".to_vec())
+            .await
+            .unwrap();
+        undo.record_first_touch(b"stmt_key", None);
+
+        txn_service
+            .rollback_statement(&mut ctx, undo)
+            .await
+            .unwrap();
+
+        assert!(
+            ctx.mutations.is_empty(),
+            "statement-created key should be removed"
+        );
+        assert_eq!(
+            txn_service
+                .get(&ctx, ALL_META_TABLE_ID, b"stmt_key")
+                .await
+                .unwrap(),
+            None
+        );
+
+        txn_service.rollback(ctx).unwrap();
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn test_statement_rollback_restores_prior_put_without_releasing_lock() {
+        let (_storage, txn_service, _dir) = create_test_service();
+        let txn_service = Arc::new(txn_service);
+
+        let mut ctx = txn_service.begin_explicit(false).unwrap();
+        txn_service
+            .put(&mut ctx, ALL_META_TABLE_ID, b"restore_put", b"v1".to_vec())
+            .await
+            .unwrap();
+
+        let mut undo = StatementUndo::default();
+        undo.record_first_touch(
+            b"restore_put",
+            ctx.mutations.get(b"restore_put".as_slice()).cloned(),
+        );
+
+        txn_service
+            .put(&mut ctx, ALL_META_TABLE_ID, b"restore_put", b"v2".to_vec())
+            .await
+            .unwrap();
+
+        txn_service
+            .rollback_statement(&mut ctx, undo)
+            .await
+            .unwrap();
+
+        assert!(matches!(
+            ctx.mutations
+                .get(b"restore_put".as_slice())
+                .map(|meta| &meta.mutation),
+            Some(MutationPayload::Put(value)) if value == b"v1"
+        ));
+        assert_eq!(
+            txn_service
+                .get(&ctx, ALL_META_TABLE_ID, b"restore_put")
+                .await
+                .unwrap(),
+            Some(b"v1".to_vec())
+        );
+
+        let conflict_service = Arc::clone(&txn_service);
+        let conflict_handle = tokio::spawn(async move {
+            let mut ctx2 = conflict_service.begin_explicit(false).unwrap();
+            let result = conflict_service
+                .put(
+                    &mut ctx2,
+                    ALL_META_TABLE_ID,
+                    b"restore_put",
+                    b"other".to_vec(),
+                )
+                .await;
+            let _ = conflict_service.rollback(ctx2);
+            result
+        });
+
+        tokio::task::yield_now().await;
+        assert!(
+            !conflict_handle.is_finished(),
+            "restored key should stay protected by the original transaction"
+        );
+        tokio::time::advance(Duration::from_millis(100)).await;
+        assert!(matches!(
+            conflict_handle.await.unwrap(),
+            Err(TiSqlError::LockWaitTimeout)
+        ));
+
+        txn_service.rollback(ctx).unwrap();
+    }
+
+    #[tokio::test]
+    async fn test_statement_rollback_restores_prior_delete() {
+        let (_storage, txn_service, _dir) = create_test_service();
+
+        txn_service
+            .autocommit_put(b"restore_delete", b"base")
+            .await
+            .unwrap();
+
+        let mut ctx = txn_service.begin_explicit(false).unwrap();
+        txn_service
+            .delete(&mut ctx, ALL_META_TABLE_ID, b"restore_delete")
+            .await
+            .unwrap();
+
+        let mut undo = StatementUndo::default();
+        undo.record_first_touch(
+            b"restore_delete",
+            ctx.mutations.get(b"restore_delete".as_slice()).cloned(),
+        );
+
+        txn_service
+            .put(
+                &mut ctx,
+                ALL_META_TABLE_ID,
+                b"restore_delete",
+                b"replacement".to_vec(),
+            )
+            .await
+            .unwrap();
+
+        txn_service
+            .rollback_statement(&mut ctx, undo)
+            .await
+            .unwrap();
+
+        assert!(matches!(
+            ctx.mutations
+                .get(b"restore_delete".as_slice())
+                .map(|meta| &meta.mutation),
+            Some(MutationPayload::Delete)
+        ));
+        assert_eq!(
+            txn_service
+                .get(&ctx, ALL_META_TABLE_ID, b"restore_delete")
+                .await
+                .unwrap(),
+            None
+        );
+
+        txn_service.rollback(ctx).unwrap();
+    }
+
+    #[tokio::test]
+    async fn test_statement_rollback_restores_prior_lock() {
+        let (_storage, txn_service, _dir) = create_test_service();
+
+        let mut ctx = txn_service.begin_explicit(false).unwrap();
+        txn_service
+            .lock_key(&mut ctx, ALL_META_TABLE_ID, b"restore_lock")
+            .await
+            .unwrap();
+
+        let mut undo = StatementUndo::default();
+        undo.record_first_touch(
+            b"restore_lock",
+            ctx.mutations.get(b"restore_lock".as_slice()).cloned(),
+        );
+
+        txn_service
+            .put(
+                &mut ctx,
+                ALL_META_TABLE_ID,
+                b"restore_lock",
+                b"replacement".to_vec(),
+            )
+            .await
+            .unwrap();
+
+        txn_service
+            .rollback_statement(&mut ctx, undo)
+            .await
+            .unwrap();
+
+        assert!(matches!(
+            ctx.mutations
+                .get(b"restore_lock".as_slice())
+                .map(|meta| &meta.mutation),
+            Some(MutationPayload::Lock)
+        ));
+        assert_eq!(
+            txn_service
+                .get(&ctx, ALL_META_TABLE_ID, b"restore_lock")
+                .await
+                .unwrap(),
+            None
+        );
+
+        txn_service.rollback(ctx).unwrap();
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn test_statement_rollback_restore_conflict_fails_immediately() {
+        let (_storage, txn_service, _dir) = create_test_service();
+        let txn_service = Arc::new(txn_service);
+
+        let mut ctx = txn_service.begin_explicit(false).unwrap();
+        txn_service
+            .put(
+                &mut ctx,
+                ALL_META_TABLE_ID,
+                b"restore_conflict",
+                b"v1".to_vec(),
+            )
+            .await
+            .unwrap();
+
+        let mut undo = StatementUndo::default();
+        undo.record_first_touch(
+            b"restore_conflict",
+            ctx.mutations.get(b"restore_conflict".as_slice()).cloned(),
+        );
+
+        txn_service
+            .put(
+                &mut ctx,
+                ALL_META_TABLE_ID,
+                b"restore_conflict",
+                b"v2".to_vec(),
+            )
+            .await
+            .unwrap();
+
+        let tablet_id = route_table_to_tablet(ALL_META_TABLE_ID);
+        txn_service
+            .storage
+            .abort_pending(&[b"restore_conflict".to_vec()], ctx.start_ts);
+        txn_service
+            .storage
+            .put_pending_on_tablet(tablet_id, b"restore_conflict", b"foreign", 9_999)
+            .unwrap();
+
+        let rollback_service = Arc::clone(&txn_service);
+        let rollback_handle = tokio::spawn(async move {
+            let mut ctx = ctx;
+            rollback_service.rollback_statement(&mut ctx, undo).await
+        });
+
+        tokio::task::yield_now().await;
+        assert!(
+            rollback_handle.is_finished(),
+            "restore conflict should fail immediately instead of waiting for lock timeout"
+        );
+
+        let err = rollback_handle.await.unwrap().unwrap_err();
+        assert!(matches!(
+            err,
+            TiSqlError::Internal(message) if message.contains("owner mismatch")
+        ));
+
+        txn_service
+            .storage
+            .abort_pending(&[b"restore_conflict".to_vec()], 9_999);
     }
 
     #[tokio::test]

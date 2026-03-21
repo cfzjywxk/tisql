@@ -1805,9 +1805,9 @@ mod explicit_transaction_tests {
         db.close().await.unwrap();
     }
 
-    /// Lock wait timeout should clear the explicit transaction context.
+    /// Lock wait timeout should keep the explicit transaction context alive.
     #[tokio::test]
-    async fn test_lock_wait_timeout_clears_explicit_txn() {
+    async fn test_lock_wait_timeout_keeps_explicit_txn() {
         let dir = tempdir().unwrap();
         let config = DatabaseConfig::with_data_dir(dir.path())
             .with_lock_wait_timeout(std::time::Duration::from_millis(100));
@@ -1838,17 +1838,14 @@ mod explicit_transaction_tests {
             "expected lock wait timeout, got: {err}"
         );
         assert!(
-            !s2.has_active_txn(),
-            "explicit txn should be cleared after lock wait timeout"
+            s2.has_active_txn(),
+            "explicit txn should stay active after lock wait timeout"
         );
 
         db.execute_query_with_session("ROLLBACK", &mut s1)
             .await
             .unwrap();
 
-        db.execute_query_with_session("BEGIN", &mut s2)
-            .await
-            .unwrap();
         db.execute_query_with_session("INSERT INTO lock_ctx_local VALUES (2, 22)", &mut s2)
             .await
             .unwrap();
@@ -1865,8 +1862,8 @@ mod explicit_transaction_tests {
             "s1 should hit lock wait timeout, got: {err}"
         );
         assert!(
-            !s1.has_active_txn(),
-            "s1 transaction should be cleared after lock wait timeout"
+            s1.has_active_txn(),
+            "s1 transaction should stay active after lock wait timeout"
         );
 
         match db
@@ -1898,7 +1895,8 @@ mod explicit_transaction_tests {
             other => panic!("Expected rows, got: {other:?}"),
         }
 
-        db.close().await.unwrap();
+        drop(s1);
+        drop(s2);
     }
 
     /// INSERT IGNORE on an existing PK should acquire a lock until transaction end.
@@ -1948,14 +1946,11 @@ mod explicit_transaction_tests {
             "expected lock wait timeout before s1 commit, got: {err}"
         );
         assert!(
-            !s2.has_active_txn(),
-            "explicit txn should be cleared after lock wait timeout"
+            s2.has_active_txn(),
+            "explicit txn should stay active after lock wait timeout"
         );
 
         db.execute_query_with_session("COMMIT", &mut s1)
-            .await
-            .unwrap();
-        db.execute_query_with_session("BEGIN", &mut s2)
             .await
             .unwrap();
         db.execute_query_with_session(
@@ -1979,7 +1974,8 @@ mod explicit_transaction_tests {
             other => panic!("Expected rows, got: {other:?}"),
         }
 
-        db.close().await.unwrap();
+        drop(s1);
+        drop(s2);
     }
 
     /// UPDATE that changes PK during explicit txn should process each original row once.

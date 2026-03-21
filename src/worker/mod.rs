@@ -31,7 +31,7 @@ use tokio::sync::{mpsc, oneshot, OwnedSemaphorePermit, Semaphore};
 
 use crate::catalog::types::{Row, Value};
 use crate::executor::ExecutionOutput;
-use crate::session::ExecutionCtx;
+use crate::session::{ExecutionCtx, StatementCtx};
 use crate::transaction::TxnCtx;
 use crate::util::error::TiSqlError;
 use crate::util::mysql_text::{
@@ -136,6 +136,7 @@ pub async fn dispatch_full_query(
     db: Arc<Database>,
     sql: String,
     exec_ctx: ExecutionCtx,
+    mut stmt_ctx: StatementCtx,
     txn_ctx: Option<TxnCtx>,
 ) -> QueryResponse {
     let (response_tx, response_rx) = oneshot::channel::<QueryResponse>();
@@ -174,7 +175,9 @@ pub async fn dispatch_full_query(
 
         // Execute plan (async — iterators yield during SST I/O)
         let execute_begin = Instant::now();
-        let (exec_result, returned_ctx) = db.execute_plan(plan, &exec_ctx, txn_ctx).await;
+        let (exec_result, returned_ctx) = db
+            .execute_plan(plan, &exec_ctx, &mut stmt_ctx, txn_ctx)
+            .await;
         let execute_us = execute_begin.elapsed().as_micros() as u64;
 
         match (exec_result, returned_ctx) {

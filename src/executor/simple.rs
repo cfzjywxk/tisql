@@ -30,7 +30,7 @@ use std::time::Instant;
 
 use crate::catalog::types::{ColumnId, ColumnInfo, DataType, Key, Row, Schema, TableId, Value};
 use crate::catalog::{Catalog, TableDef};
-use crate::session::ExecutionCtx;
+use crate::session::{ExecutionCtx, StatementCtx};
 use crate::sql::{AggFunc, BinaryOp, Expr, LogicalPlan, OrderByExpr, UnaryOp};
 use crate::tablet::{
     decode_row_to_values, encode_int_key, encode_key, encode_pk, encode_row, next_key_bound,
@@ -968,14 +968,68 @@ fn row_matches_filter(filter: Option<&Expr>, row: &Row) -> Result<bool> {
     value_to_bool(&result)
 }
 
+async fn stmt_put<T: TxnService>(
+    txn_service: &T,
+    stmt_ctx: &mut StatementCtx,
+    ctx: &mut TxnCtx,
+    table_id: TableId,
+    key: &[u8],
+    value: Vec<u8>,
+) -> Result<()> {
+    let record_undo = ctx.is_explicit() && !stmt_ctx.has_undo_for(key);
+    let previous = record_undo
+        .then(|| ctx.mutations.get(key).cloned())
+        .flatten();
+    txn_service.put(ctx, table_id, key, value).await?;
+    if record_undo {
+        stmt_ctx.record_first_touch(key, previous);
+    }
+    Ok(())
+}
+
+async fn stmt_delete<T: TxnService>(
+    txn_service: &T,
+    stmt_ctx: &mut StatementCtx,
+    ctx: &mut TxnCtx,
+    table_id: TableId,
+    key: &[u8],
+) -> Result<()> {
+    let record_undo = ctx.is_explicit() && !stmt_ctx.has_undo_for(key);
+    let previous = record_undo
+        .then(|| ctx.mutations.get(key).cloned())
+        .flatten();
+    txn_service.delete(ctx, table_id, key).await?;
+    if record_undo {
+        stmt_ctx.record_first_touch(key, previous);
+    }
+    Ok(())
+}
+
+async fn stmt_lock_key<T: TxnService>(
+    txn_service: &T,
+    stmt_ctx: &mut StatementCtx,
+    ctx: &mut TxnCtx,
+    table_id: TableId,
+    key: &[u8],
+) -> Result<()> {
+    let record_undo =
+        ctx.is_explicit() && !stmt_ctx.has_undo_for(key) && !ctx.mutations.contains_key(key);
+    txn_service.lock_key(ctx, table_id, key).await?;
+    if record_undo && ctx.mutations.contains_key(key) {
+        stmt_ctx.record_first_touch(key, None);
+    }
+    Ok(())
+}
+
 async fn lock_key_if_explicit<T: TxnService>(
     txn_service: &T,
+    stmt_ctx: &mut StatementCtx,
     ctx: &mut TxnCtx,
     table_id: TableId,
     key: &[u8],
 ) -> Result<()> {
     if ctx.is_explicit() {
-        txn_service.lock_key(ctx, table_id, key).await?;
+        stmt_lock_key(txn_service, stmt_ctx, ctx, table_id, key).await?;
     }
     Ok(())
 }
@@ -1319,6 +1373,7 @@ impl Executor for SimpleExecutor {
         &self,
         plan: LogicalPlan,
         _exec_ctx: &ExecutionCtx,
+        stmt_ctx: &mut StatementCtx,
         txn_service: &T,
         catalog: &C,
         txn_ctx: Option<TxnCtx>,
@@ -1390,17 +1445,22 @@ impl Executor for SimpleExecutor {
                     }
 
                     match self
-                        .execute_write_with_ctx(plan, &mut ctx, txn_service, catalog)
+                        .execute_write_with_ctx(plan, stmt_ctx, &mut ctx, txn_service, catalog)
                         .await
                     {
                         Ok(result) => (Ok(result), Some(ctx)),
-                        Err(e) if matches!(e, TiSqlError::LockWaitTimeout) => {
-                            match txn_service.rollback(ctx) {
-                                Ok(()) => (Err(e), None),
-                                Err(rollback_err) => (Err(rollback_err), None),
+                        Err(e) => {
+                            let rollback_result = txn_service
+                                .rollback_statement(&mut ctx, stmt_ctx.take_undo())
+                                .await;
+                            match rollback_result {
+                                Ok(()) => (Err(e), Some(ctx)),
+                                Err(stmt_rollback_err) => match txn_service.rollback(ctx) {
+                                    Ok(()) => (Err(stmt_rollback_err), None),
+                                    Err(rollback_err) => (Err(rollback_err), None),
+                                },
                             }
                         }
-                        Err(e) => (Err(e), Some(ctx)),
                     }
                 } else {
                     // Streaming read in explicit txn — no materialization
@@ -1409,19 +1469,16 @@ impl Executor for SimpleExecutor {
                         .await
                     {
                         Ok(output) => (Ok(output), Some(ctx)),
-                        Err(e) if matches!(e, TiSqlError::LockWaitTimeout) => {
-                            match txn_service.rollback(ctx) {
-                                Ok(()) => (Err(e), None),
-                                Err(rollback_err) => (Err(rollback_err), None),
-                            }
-                        }
                         Err(e) => (Err(e), Some(ctx)),
                     }
                 }
             }
             None => {
                 if plan.is_write() {
-                    match self.execute_write(plan, txn_service, catalog).await {
+                    match self
+                        .execute_write(plan, stmt_ctx, txn_service, catalog)
+                        .await
+                    {
                         Ok(result) => (Ok(result), None),
                         Err(e) => (Err(e), None),
                     }
@@ -1487,6 +1544,7 @@ impl SimpleExecutor {
     async fn execute_write<T: TxnService, C: Catalog>(
         &self,
         plan: LogicalPlan,
+        stmt_ctx: &mut StatementCtx,
         txn_service: &T,
         catalog: &C,
     ) -> Result<ExecutionOutput> {
@@ -1506,7 +1564,7 @@ impl SimpleExecutor {
 
         // Execute the write plan and get the result
         let result = match self
-            .execute_write_with_ctx(plan, &mut ctx, txn_service, catalog)
+            .execute_write_with_ctx(plan, stmt_ctx, &mut ctx, txn_service, catalog)
             .await
         {
             Ok(r) => r,
@@ -1614,6 +1672,7 @@ impl SimpleExecutor {
     async fn execute_write_with_ctx<T: TxnService, C: Catalog>(
         &self,
         plan: LogicalPlan,
+        stmt_ctx: &mut StatementCtx,
         ctx: &mut TxnCtx,
         txn_service: &T,
         catalog: &C,
@@ -1696,7 +1755,7 @@ impl SimpleExecutor {
                     txn_service.record_duplicate_check_duration(duplicate_check_begin.elapsed());
                     if duplicate_exists {
                         if ignore {
-                            txn_service.lock_key(ctx, table.id(), &key).await?;
+                            stmt_lock_key(txn_service, stmt_ctx, ctx, table.id(), &key).await?;
                             continue;
                         }
                         let pk_desc = if pk_indices.is_empty() {
@@ -1717,7 +1776,7 @@ impl SimpleExecutor {
                     let value = encode_row(&col_ids, &row_values);
 
                     // Buffer write in transaction
-                    txn_service.put(ctx, table.id(), &key, value).await?;
+                    stmt_put(txn_service, stmt_ctx, ctx, table.id(), &key, value).await?;
                     if let Some(explicit_v) = explicit_auto_inc_observe {
                         catalog.observe_auto_increment_explicit(table.id(), explicit_v)?;
                     }
@@ -1743,10 +1802,10 @@ impl SimpleExecutor {
                             let values = decode_row_to_values(&value, &col_ids, &data_types)?;
                             let row = Row::new(values);
                             if row_matches_filter(filter.as_ref(), &row)? {
-                                txn_service.delete(ctx, table_id, &key).await?;
+                                stmt_delete(txn_service, stmt_ctx, ctx, table_id, &key).await?;
                                 count += 1;
                             } else {
-                                txn_service.lock_key(ctx, table_id, &key).await?;
+                                stmt_lock_key(txn_service, stmt_ctx, ctx, table_id, &key).await?;
                             }
                         }
                     }
@@ -1764,10 +1823,11 @@ impl SimpleExecutor {
                             for (key, values) in scanned_rows {
                                 let row = Row::new(values);
                                 if row_matches_filter(filter.as_ref(), &row)? {
-                                    txn_service.delete(ctx, table_id, &key).await?;
+                                    stmt_delete(txn_service, stmt_ctx, ctx, table_id, &key).await?;
                                     count += 1;
                                 } else {
-                                    txn_service.lock_key(ctx, table_id, &key).await?;
+                                    stmt_lock_key(txn_service, stmt_ctx, ctx, table_id, &key)
+                                        .await?;
                                 }
                             }
                         } else {
@@ -1779,12 +1839,13 @@ impl SimpleExecutor {
                                     decode_row_to_values(iter.value(), &col_ids, &data_types)?;
                                 let row = Row::new(values);
                                 if row_matches_filter(filter.as_ref(), &row)? {
-                                    txn_service.delete(ctx, table_id, key).await?;
+                                    stmt_delete(txn_service, stmt_ctx, ctx, table_id, key).await?;
                                     count += 1;
                                 } else {
                                     // In implicit autocommit this is a no-op; keep the helper
                                     // for defensive consistency with explicit paths.
-                                    lock_key_if_explicit(txn_service, ctx, table_id, key).await?;
+                                    lock_key_if_explicit(txn_service, stmt_ctx, ctx, table_id, key)
+                                        .await?;
                                 }
                                 iter.advance().await?;
                             }
@@ -1853,7 +1914,8 @@ impl SimpleExecutor {
                                 let row_unchanged =
                                     !key_changed && row.values() == original_values.as_slice();
                                 if row_unchanged {
-                                    txn_service.lock_key(ctx, table_id, &key).await?;
+                                    stmt_lock_key(txn_service, stmt_ctx, ctx, table_id, &key)
+                                        .await?;
                                 } else {
                                     if key_changed
                                         && txn_service
@@ -1872,16 +1934,23 @@ impl SimpleExecutor {
                                     }
 
                                     if key_changed {
-                                        txn_service.delete(ctx, table_id, &key).await?;
+                                        stmt_delete(txn_service, stmt_ctx, ctx, table_id, &key)
+                                            .await?;
                                     }
                                     let new_value = encode_row(&col_ids, row.values());
-                                    txn_service
-                                        .put(ctx, table_id, target_key, new_value)
-                                        .await?;
+                                    stmt_put(
+                                        txn_service,
+                                        stmt_ctx,
+                                        ctx,
+                                        table_id,
+                                        target_key,
+                                        new_value,
+                                    )
+                                    .await?;
                                 }
                                 count += 1;
                             } else {
-                                txn_service.lock_key(ctx, table_id, &key).await?;
+                                stmt_lock_key(txn_service, stmt_ctx, ctx, table_id, &key).await?;
                             }
                         }
                     }
@@ -1933,8 +2002,14 @@ impl SimpleExecutor {
                                     if row_unchanged {
                                         // In implicit autocommit this is a no-op; keep the helper
                                         // for defensive consistency with explicit paths.
-                                        lock_key_if_explicit(txn_service, ctx, table_id, &old_key)
-                                            .await?;
+                                        lock_key_if_explicit(
+                                            txn_service,
+                                            stmt_ctx,
+                                            ctx,
+                                            table_id,
+                                            &old_key,
+                                        )
+                                        .await?;
                                     } else {
                                         if key_changed
                                             && txn_service
@@ -1955,17 +2030,31 @@ impl SimpleExecutor {
                                         }
 
                                         if key_changed {
-                                            txn_service.delete(ctx, table_id, &old_key).await?;
+                                            stmt_delete(
+                                                txn_service,
+                                                stmt_ctx,
+                                                ctx,
+                                                table_id,
+                                                &old_key,
+                                            )
+                                            .await?;
                                         }
 
                                         let new_value = encode_row(&col_ids, row.values());
-                                        txn_service
-                                            .put(ctx, table_id, target_key, new_value)
-                                            .await?;
+                                        stmt_put(
+                                            txn_service,
+                                            stmt_ctx,
+                                            ctx,
+                                            table_id,
+                                            target_key,
+                                            new_value,
+                                        )
+                                        .await?;
                                     }
                                     count += 1;
                                 } else {
-                                    txn_service.lock_key(ctx, table_id, &old_key).await?;
+                                    stmt_lock_key(txn_service, stmt_ctx, ctx, table_id, &old_key)
+                                        .await?;
                                 }
                             }
                         } else {
@@ -2007,7 +2096,14 @@ impl SimpleExecutor {
                                     let row_unchanged =
                                         !key_changed && row.values() == original_values.as_slice();
                                     if row_unchanged {
-                                        txn_service.lock_key(ctx, table_id, key_ref).await?;
+                                        stmt_lock_key(
+                                            txn_service,
+                                            stmt_ctx,
+                                            ctx,
+                                            table_id,
+                                            key_ref,
+                                        )
+                                        .await?;
                                     } else {
                                         if key_changed
                                             && txn_service
@@ -2028,20 +2124,39 @@ impl SimpleExecutor {
                                         }
 
                                         if key_changed {
-                                            txn_service.delete(ctx, table_id, key_ref).await?;
+                                            stmt_delete(
+                                                txn_service,
+                                                stmt_ctx,
+                                                ctx,
+                                                table_id,
+                                                key_ref,
+                                            )
+                                            .await?;
                                         }
 
                                         let new_value = encode_row(&col_ids, row.values());
-                                        txn_service
-                                            .put(ctx, table_id, target_key, new_value)
-                                            .await?;
+                                        stmt_put(
+                                            txn_service,
+                                            stmt_ctx,
+                                            ctx,
+                                            table_id,
+                                            target_key,
+                                            new_value,
+                                        )
+                                        .await?;
                                     }
                                     count += 1;
                                 } else {
                                     // In implicit autocommit this is a no-op; keep the helper
                                     // for defensive consistency with explicit paths.
-                                    lock_key_if_explicit(txn_service, ctx, table_id, key_ref)
-                                        .await?;
+                                    lock_key_if_explicit(
+                                        txn_service,
+                                        stmt_ctx,
+                                        ctx,
+                                        table_id,
+                                        key_ref,
+                                    )
+                                    .await?;
                                 }
                                 iter.advance().await?;
                             }
@@ -2179,12 +2294,27 @@ mod tests {
 
         async fn lock_key<'a>(
             &'a self,
-            _ctx: &'a mut TxnCtx,
+            ctx: &'a mut TxnCtx,
             table_id: TableId,
-            _key: &'a [u8],
+            key: &'a [u8],
         ) -> Result<()> {
             assert_eq!(table_id, self.table_id);
             self.lock_calls.fetch_add(1, Ordering::SeqCst);
+            ctx.mutations.insert(
+                key.to_vec(),
+                crate::transaction::MutationMeta {
+                    mutation: crate::transaction::MutationPayload::Lock,
+                    tablet_id: crate::tablet::TabletId::Table { table_id },
+                },
+            );
+            Ok(())
+        }
+
+        async fn rollback_statement<'a>(
+            &'a self,
+            _ctx: &'a mut TxnCtx,
+            _undo: crate::transaction::StatementUndo,
+        ) -> Result<()> {
             Ok(())
         }
 
@@ -2329,6 +2459,14 @@ mod tests {
             Ok(())
         }
 
+        async fn rollback_statement<'a>(
+            &'a self,
+            _ctx: &'a mut TxnCtx,
+            _undo: crate::transaction::StatementUndo,
+        ) -> Result<()> {
+            Ok(())
+        }
+
         async fn commit(&self, _ctx: TxnCtx) -> Result<CommitInfo> {
             Ok(CommitInfo {
                 txn_id: 1 as TxnId,
@@ -2338,6 +2476,107 @@ mod tests {
         }
 
         fn rollback(&self, _ctx: TxnCtx) -> Result<()> {
+            Ok(())
+        }
+    }
+
+    struct MockStatementRollbackTxnService {
+        table_id: TableId,
+        put_fail_on_call: usize,
+        put_calls: AtomicUsize,
+        rollback_statement_calls: AtomicUsize,
+        rollback_calls: AtomicUsize,
+        last_undo_len: AtomicUsize,
+    }
+
+    impl TxnService for MockStatementRollbackTxnService {
+        type ScanIter = DummyIter;
+
+        fn begin(&self, read_only: bool) -> Result<TxnCtx> {
+            Ok(TxnCtx::new(1, 1, read_only))
+        }
+
+        fn begin_explicit(&self, read_only: bool) -> Result<TxnCtx> {
+            Ok(TxnCtx::new_explicit(1, 1, read_only))
+        }
+
+        fn get_txn_state(&self, _start_ts: Timestamp) -> Option<TxnState> {
+            Some(TxnState::Running)
+        }
+
+        async fn get<'a>(
+            &'a self,
+            _ctx: &'a TxnCtx,
+            table_id: TableId,
+            _key: &'a [u8],
+        ) -> Result<Option<RawValue>> {
+            assert_eq!(table_id, self.table_id);
+            Ok(None)
+        }
+
+        fn scan_iter(
+            &self,
+            _ctx: &TxnCtx,
+            _table_id: TableId,
+            _range: Range<Vec<u8>>,
+        ) -> Result<Self::ScanIter> {
+            Ok(DummyIter)
+        }
+
+        async fn put<'a>(
+            &'a self,
+            _ctx: &'a mut TxnCtx,
+            table_id: TableId,
+            _key: &'a [u8],
+            _value: RawValue,
+        ) -> Result<()> {
+            assert_eq!(table_id, self.table_id);
+            let call = self.put_calls.fetch_add(1, Ordering::SeqCst) + 1;
+            if call == self.put_fail_on_call {
+                Err(TiSqlError::LockWaitTimeout)
+            } else {
+                Ok(())
+            }
+        }
+
+        async fn delete<'a>(
+            &'a self,
+            _ctx: &'a mut TxnCtx,
+            _table_id: TableId,
+            _key: &'a [u8],
+        ) -> Result<()> {
+            Ok(())
+        }
+
+        async fn lock_key<'a>(
+            &'a self,
+            _ctx: &'a mut TxnCtx,
+            _table_id: TableId,
+            _key: &'a [u8],
+        ) -> Result<()> {
+            Ok(())
+        }
+
+        async fn rollback_statement<'a>(
+            &'a self,
+            _ctx: &'a mut TxnCtx,
+            undo: crate::transaction::StatementUndo,
+        ) -> Result<()> {
+            self.rollback_statement_calls.fetch_add(1, Ordering::SeqCst);
+            self.last_undo_len.store(undo.len(), Ordering::SeqCst);
+            Ok(())
+        }
+
+        async fn commit(&self, _ctx: TxnCtx) -> Result<CommitInfo> {
+            Ok(CommitInfo {
+                txn_id: 1 as TxnId,
+                commit_ts: 2,
+                lsn: 3 as Lsn,
+            })
+        }
+
+        fn rollback(&self, _ctx: TxnCtx) -> Result<()> {
+            self.rollback_calls.fetch_add(1, Ordering::SeqCst);
             Ok(())
         }
     }
@@ -2635,8 +2874,15 @@ mod tests {
             }),
         };
 
+        let mut stmt_ctx = StatementCtx::new();
         let output = SimpleExecutor::new()
-            .execute_write_with_ctx(plan, &mut ctx, &service, &MemoryCatalog::new())
+            .execute_write_with_ctx(
+                plan,
+                &mut stmt_ctx,
+                &mut ctx,
+                &service,
+                &MemoryCatalog::new(),
+            )
             .await
             .unwrap();
 
@@ -2690,8 +2936,15 @@ mod tests {
             }),
         };
 
+        let mut stmt_ctx = StatementCtx::new();
         let output = SimpleExecutor::new()
-            .execute_write_with_ctx(plan, &mut ctx, &service, &MemoryCatalog::new())
+            .execute_write_with_ctx(
+                plan,
+                &mut stmt_ctx,
+                &mut ctx,
+                &service,
+                &MemoryCatalog::new(),
+            )
             .await
             .unwrap();
 
@@ -2744,8 +2997,15 @@ mod tests {
             }),
         };
 
+        let mut stmt_ctx = StatementCtx::new();
         let output = SimpleExecutor::new()
-            .execute_write_with_ctx(plan, &mut ctx, &service, &MemoryCatalog::new())
+            .execute_write_with_ctx(
+                plan,
+                &mut stmt_ctx,
+                &mut ctx,
+                &service,
+                &MemoryCatalog::new(),
+            )
             .await
             .unwrap();
 
@@ -2800,8 +3060,15 @@ mod tests {
             }),
         };
 
+        let mut stmt_ctx = StatementCtx::new();
         let output = SimpleExecutor::new()
-            .execute_write_with_ctx(plan, &mut ctx, &service, &MemoryCatalog::new())
+            .execute_write_with_ctx(
+                plan,
+                &mut stmt_ctx,
+                &mut ctx,
+                &service,
+                &MemoryCatalog::new(),
+            )
             .await
             .unwrap();
 
@@ -2862,8 +3129,15 @@ mod tests {
             }),
         };
 
+        let mut stmt_ctx = StatementCtx::new();
         let output = SimpleExecutor::new()
-            .execute_write_with_ctx(plan, &mut ctx, &service, &MemoryCatalog::new())
+            .execute_write_with_ctx(
+                plan,
+                &mut stmt_ctx,
+                &mut ctx,
+                &service,
+                &MemoryCatalog::new(),
+            )
             .await
             .unwrap();
 
@@ -2931,8 +3205,15 @@ mod tests {
             }),
         };
 
+        let mut stmt_ctx = StatementCtx::new();
         let output = SimpleExecutor::new()
-            .execute_write_with_ctx(plan, &mut ctx, &service, &MemoryCatalog::new())
+            .execute_write_with_ctx(
+                plan,
+                &mut stmt_ctx,
+                &mut ctx,
+                &service,
+                &MemoryCatalog::new(),
+            )
             .await
             .unwrap();
 
@@ -3005,8 +3286,15 @@ mod tests {
             }),
         };
 
+        let mut stmt_ctx = StatementCtx::new();
         let output = SimpleExecutor::new()
-            .execute_write_with_ctx(plan, &mut ctx, &service, &MemoryCatalog::new())
+            .execute_write_with_ctx(
+                plan,
+                &mut stmt_ctx,
+                &mut ctx,
+                &service,
+                &MemoryCatalog::new(),
+            )
             .await
             .unwrap();
 
@@ -3061,8 +3349,15 @@ mod tests {
         };
 
         let mut ctx = TxnCtx::new(51, 500, false);
+        let mut stmt_ctx = StatementCtx::new();
         let output = SimpleExecutor::new()
-            .execute_write_with_ctx(plan, &mut ctx, &service, &MemoryCatalog::new())
+            .execute_write_with_ctx(
+                plan,
+                &mut stmt_ctx,
+                &mut ctx,
+                &service,
+                &MemoryCatalog::new(),
+            )
             .await
             .unwrap();
 
@@ -3088,11 +3383,13 @@ mod tests {
         };
 
         let mut ctx = TxnCtx::new(61, 600, false);
-        lock_key_if_explicit(&service, &mut ctx, 606, b"k")
+        let mut stmt_ctx = StatementCtx::new();
+        lock_key_if_explicit(&service, &mut stmt_ctx, &mut ctx, 606, b"k")
             .await
             .unwrap();
 
         assert_eq!(service.lock_calls.load(Ordering::SeqCst), 0);
+        assert!(stmt_ctx.take_undo().is_empty());
     }
 
     #[tokio::test]
@@ -3110,10 +3407,71 @@ mod tests {
         };
 
         let mut ctx = TxnCtx::new_explicit(62, 601, false);
-        lock_key_if_explicit(&service, &mut ctx, 607, b"k")
+        let mut stmt_ctx = StatementCtx::new();
+        lock_key_if_explicit(&service, &mut stmt_ctx, &mut ctx, 607, b"k")
             .await
             .unwrap();
 
         assert_eq!(service.lock_calls.load(Ordering::SeqCst), 1);
+        assert_eq!(stmt_ctx.take_undo().len(), 1);
+    }
+
+    #[tokio::test]
+    async fn test_execute_unified_rolls_back_statement_on_explicit_write_error() {
+        let table = TableDef::new(
+            808,
+            "t".to_string(),
+            "default".to_string(),
+            vec![ColumnDef::new(
+                1,
+                "id".into(),
+                DataType::BigInt,
+                false,
+                None,
+                false,
+            )],
+            vec![1],
+        );
+        let service = MockStatementRollbackTxnService {
+            table_id: table.id(),
+            put_fail_on_call: 2,
+            put_calls: AtomicUsize::new(0),
+            rollback_statement_calls: AtomicUsize::new(0),
+            rollback_calls: AtomicUsize::new(0),
+            last_undo_len: AtomicUsize::new(0),
+        };
+        let plan = LogicalPlan::Insert {
+            table,
+            columns: vec![1],
+            values: vec![
+                vec![Expr::Literal(Value::BigInt(1))],
+                vec![Expr::Literal(Value::BigInt(2))],
+            ],
+            ignore: false,
+        };
+
+        let exec_ctx = ExecutionCtx::with_db("default");
+        let mut stmt_ctx = StatementCtx::new();
+        let txn_ctx = Some(TxnCtx::new_explicit(71, 701, false));
+
+        let (result, returned_ctx) = SimpleExecutor::new()
+            .execute_unified(
+                plan,
+                &exec_ctx,
+                &mut stmt_ctx,
+                &service,
+                &MemoryCatalog::new(),
+                txn_ctx,
+            )
+            .await;
+
+        assert!(matches!(result, Err(TiSqlError::LockWaitTimeout)));
+        assert!(
+            returned_ctx.is_some(),
+            "explicit txn should survive statement error"
+        );
+        assert_eq!(service.rollback_statement_calls.load(Ordering::SeqCst), 1);
+        assert_eq!(service.last_undo_len.load(Ordering::SeqCst), 1);
+        assert_eq!(service.rollback_calls.load(Ordering::SeqCst), 0);
     }
 }

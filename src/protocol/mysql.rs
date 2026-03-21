@@ -257,6 +257,7 @@ impl<W: AsyncWrite + Send + Unpin> AsyncMysqlShim<W> for MySqlBackend {
     ) -> io::Result<()> {
         log_debug!("Session {} query: {}", self.session.id(), query);
         let query_trimmed = query.trim();
+        let mut stmt_ctx = self.session.new_query_ctx();
 
         if self.db.point_get_short_path_enabled()
             && starts_with_select_ascii_case_insensitive(query_trimmed)
@@ -273,7 +274,7 @@ impl<W: AsyncWrite + Send + Unpin> AsyncMysqlShim<W> for MySqlBackend {
                         let exec_ctx = ExecutionCtx::from_session(&self.session);
                         match self
                             .db
-                            .execute_point_get_short(&exec_ctx, &short_query)
+                            .execute_point_get_short(&exec_ctx, &mut stmt_ctx, &short_query)
                             .await
                         {
                             Ok(ShortPointGetExecOutcome::Hit(output)) => {
@@ -394,7 +395,7 @@ impl<W: AsyncWrite + Send + Unpin> AsyncMysqlShim<W> for MySqlBackend {
         }
 
         // Everything else → worker runtime
-        self.dispatch_query(query, results).await
+        self.dispatch_query(query, stmt_ctx, results).await
     }
 
     async fn on_prepare<'a>(
@@ -429,6 +430,7 @@ impl MySqlBackend {
     async fn dispatch_query<W: AsyncWrite + Send + Unpin>(
         &mut self,
         query: &str,
+        stmt_ctx: crate::session::StatementCtx,
         results: QueryResultWriter<'_, W>,
     ) -> io::Result<()> {
         let dispatch_begin = Instant::now();
@@ -442,6 +444,7 @@ impl MySqlBackend {
             db,
             query.to_string(),
             exec_ctx,
+            stmt_ctx,
             txn_ctx,
         )
         .await;

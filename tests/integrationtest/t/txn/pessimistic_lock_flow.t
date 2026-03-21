@@ -19,7 +19,6 @@ UPDATE lock_ctx_mtr SET b = 20 WHERE a = 1;
 ROLLBACK;
 
 --session s2
-BEGIN;
 UPDATE lock_ctx_mtr SET b = 20 WHERE a = 1;
 
 --session s3
@@ -45,6 +44,7 @@ BEGIN;
 INSERT INTO lock_ctx_mtr VALUES (2, 999);
 --rows 0
 SELECT a, b FROM lock_ctx_mtr WHERE a = 2;
+ROLLBACK;
 
 --session s2
 ROLLBACK;

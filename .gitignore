@@ -22,3 +22,6 @@ storage_engine_thought.md
 
 # Backup
 CLAUDE_bak_0218.md
+
+# Local file
+*.md

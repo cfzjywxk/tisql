@@ -60,9 +60,14 @@ pub use clog::{ClogFsyncFuture, ClogService};
 pub use lsn::{new_lsn_provider, LsnProvider, SharedLsnProvider};
 pub use protocol::{MySqlServer, MYSQL_DEFAULT_PORT};
 pub use runtime::{RuntimeThreadOverrides, RuntimeThreads};
-pub use session::{ExecutionCtx, Priority, QueryCtx, Session, SessionRegistry, SessionVars};
+pub use session::{
+    ExecutionCtx, Priority, QueryCtx, Session, SessionRegistry, SessionVars, StatementCtx,
+};
 pub use tablet::{PessimisticStorage, StorageEngine, V26BoundaryMode};
-pub use transaction::{CommitInfo, ConflictWaitConfig, TxnCtx, TxnService, TxnState};
+pub use transaction::{
+    CommitInfo, ConflictWaitConfig, MutationMeta, MutationPayload, StatementUndo,
+    StatementUndoEntry, TxnCtx, TxnService, TxnState,
+};
 pub use tso::TsoService;
 pub use worker::QueryResponse;
 
@@ -1282,8 +1287,11 @@ impl Database {
     /// This is a convenience wrapper for tests and the integration test runner.
     pub async fn execute_query(&self, sql: &str) -> Result<QueryResult> {
         let exec_ctx = session::ExecutionCtx::with_db("default");
+        let mut stmt_ctx = session::StatementCtx::new();
         let plan = self.parse_and_bind(sql, &exec_ctx)?;
-        let (output, _) = self.execute_plan(plan, &exec_ctx, None).await;
+        let (output, _) = self
+            .execute_plan(plan, &exec_ctx, &mut stmt_ctx, None)
+            .await;
         let output = output?;
         Self::to_query_result(output.into_result().await?)
     }
@@ -1297,9 +1305,12 @@ impl Database {
         session: &mut session::Session,
     ) -> Result<QueryResult> {
         let exec_ctx = session::ExecutionCtx::from_session(session);
+        let mut stmt_ctx = session.new_query_ctx();
         let plan = self.parse_and_bind(sql, &exec_ctx)?;
         let txn_ctx = session.take_current_txn();
-        let (output, returned_ctx) = self.execute_plan(plan, &exec_ctx, txn_ctx).await;
+        let (output, returned_ctx) = self
+            .execute_plan(plan, &exec_ctx, &mut stmt_ctx, txn_ctx)
+            .await;
         if let Some(ctx) = returned_ctx {
             session.set_current_txn(ctx);
         }
@@ -1310,6 +1321,7 @@ impl Database {
     pub(crate) async fn execute_point_get_short(
         &self,
         exec_ctx: &ExecutionCtx,
+        _stmt_ctx: &mut session::StatementCtx,
         q: &PointGetShortQuery<'_>,
     ) -> Result<ShortPointGetExecOutcome> {
         let catalog_begin = Instant::now();
@@ -1599,6 +1611,7 @@ impl Database {
         &self,
         plan: sql::LogicalPlan,
         exec_ctx: &session::ExecutionCtx,
+        stmt_ctx: &mut session::StatementCtx,
         txn_ctx: Option<transaction::TxnCtx>,
     ) -> (Result<ExecutionOutput>, Option<transaction::TxnCtx>) {
         let (mut output, ctx) = self
@@ -1606,6 +1619,7 @@ impl Database {
             .execute_unified(
                 plan,
                 exec_ctx,
+                stmt_ctx,
                 self.txn_service.as_ref(),
                 &self.catalog,
                 txn_ctx,

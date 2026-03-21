@@ -22,7 +22,7 @@ use std::pin::Pin;
 
 use crate::catalog::types::{Row, Schema, TableId};
 use crate::catalog::Catalog;
-use crate::session::ExecutionCtx;
+use crate::session::{ExecutionCtx, StatementCtx};
 use crate::sql::LogicalPlan;
 use crate::transaction::{TxnCtx, TxnService};
 use crate::util::error::Result;
@@ -145,6 +145,7 @@ pub trait Executor: Send + Sync {
         &self,
         plan: LogicalPlan,
         exec_ctx: &ExecutionCtx,
+        stmt_ctx: &mut StatementCtx,
         txn_service: &T,
         catalog: &C,
         txn_ctx: Option<TxnCtx>,

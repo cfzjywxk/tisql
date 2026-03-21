@@ -56,7 +56,7 @@ use crate::util::error::Result;
 /// - `Delete` for deletes on existing values
 /// - `Lock` for delete/lock on non-existent keys (not persisted to clog)
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub(crate) enum MutationPayload {
+pub enum MutationPayload {
     Put(RawValue),
     Delete,
     Lock,
@@ -64,23 +64,77 @@ pub(crate) enum MutationPayload {
 
 impl MutationPayload {
     #[inline]
-    pub(crate) fn is_write(&self) -> bool {
+    pub fn is_write(&self) -> bool {
         !matches!(self, Self::Lock)
     }
 
     #[inline]
-    pub(crate) fn is_lock(&self) -> bool {
+    pub fn is_lock(&self) -> bool {
         matches!(self, Self::Lock)
     }
 }
 
 /// Per-key mutation metadata tracked inside a transaction context.
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub(crate) struct MutationMeta {
+pub struct MutationMeta {
     /// Final mutation payload for commit/rollback handling.
     pub(crate) mutation: MutationPayload,
     /// Tablet routing captured when the mutation was recorded.
     pub(crate) tablet_id: TabletId,
+}
+
+impl MutationMeta {
+    #[inline]
+    pub fn mutation(&self) -> &MutationPayload {
+        &self.mutation
+    }
+
+    #[inline]
+    pub fn tablet_id(&self) -> TabletId {
+        self.tablet_id
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum StatementUndoEntry {
+    Absent,
+    Restore(MutationMeta),
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct StatementUndo {
+    entries: BTreeMap<Key, StatementUndoEntry>,
+}
+
+impl StatementUndo {
+    #[inline]
+    pub fn is_empty(&self) -> bool {
+        self.entries.is_empty()
+    }
+
+    #[inline]
+    pub fn len(&self) -> usize {
+        self.entries.len()
+    }
+
+    #[inline]
+    pub fn into_entries(self) -> BTreeMap<Key, StatementUndoEntry> {
+        self.entries
+    }
+
+    #[inline]
+    pub(crate) fn contains_key(&self, key: &[u8]) -> bool {
+        self.entries.contains_key(key)
+    }
+
+    pub(crate) fn record_first_touch(&mut self, key: &[u8], previous: Option<MutationMeta>) {
+        self.entries
+            .entry(key.to_vec())
+            .or_insert_with(|| match previous {
+                Some(previous) => StatementUndoEntry::Restore(previous),
+                None => StatementUndoEntry::Absent,
+            });
+    }
 }
 
 /// Transaction state machine for OceanBase-style pessimistic locking.
@@ -431,6 +485,13 @@ pub trait TxnService: Send + Sync {
         ctx: &'a mut TxnCtx,
         table_id: TableId,
         key: &'a [u8],
+    ) -> impl Future<Output = Result<()>> + Send + 'a;
+
+    /// Roll back only the mutations created by the current statement.
+    fn rollback_statement<'a>(
+        &'a self,
+        ctx: &'a mut TxnCtx,
+        undo: StatementUndo,
     ) -> impl Future<Output = Result<()>> + Send + 'a;
 
     // === Finalization ===
