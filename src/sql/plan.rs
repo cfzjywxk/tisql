@@ -20,8 +20,9 @@
 // Allow dead code for future features that are defined but not yet implemented
 #![allow(dead_code)]
 
-use crate::catalog::types::{ColumnId, DataType, Key, Schema, Value};
+use crate::catalog::types::{ColumnId, DataType, Schema, Value};
 use crate::catalog::TableDef;
+use crate::kernel::execution::LogicalPointKey;
 
 /// Logical plan tree
 #[derive(Debug, Clone)]
@@ -34,7 +35,10 @@ pub enum LogicalPlan {
     },
 
     /// Point get by primary key.
-    PointGet { table: TableDef, key: Key },
+    PointGet {
+        table: TableDef,
+        key: LogicalPointKey,
+    },
 
     /// Projection (SELECT expressions)
     Project {

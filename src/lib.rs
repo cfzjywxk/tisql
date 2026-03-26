@@ -50,6 +50,7 @@ pub use util::io;
 pub mod catalog;
 mod executor;
 pub(crate) mod inner_table;
+pub(crate) mod kernel;
 mod sql;
 mod transaction;
 mod tso;
@@ -178,22 +179,25 @@ use catalog::types::{ColumnId, DataType, Lsn, Value};
 use catalog::{MvccCatalog, TableDef};
 use clog::{FileClogConfig, FileClogService, TruncateStats};
 use executor::{ExecutionOutput, ExecutionResult, Executor, SimpleExecutor};
+use kernel::execution::{
+    ExecutionBackend, LogicalPointKey, PointGetRequest, ProjectionSpec, TxnExecutionBackend,
+};
 use protocol::point_get_short::{PointGetShortQuery, ProjectionRef};
 use sql::Parser;
 use tablet::{
-    collect_snapshot, decode_row_to_values, encode_key, encode_pk, route_table_to_tablet,
-    snapshot_to_metric_rows, CacheSuite, CacheSuiteConfig, EngineStatusMetricRow,
-    EngineStatusReporter, EngineStatusSnapshot, GlobalLogGcBoundary, IlogConfig, IlogService,
-    IlogTruncateStats, LsmConfig, LsmEngine, LsmRecovery, RoutedTabletStorage, TabletId,
-    TabletManager, DEFAULT_BLOOM_BITS_PER_KEY, DEFAULT_BLOOM_ENABLED, DEFAULT_CACHE_TOTAL_RATIO,
-    DEFAULT_L0_COMPACTION_TRIGGER, DEFAULT_L0_SLOWDOWN_TRIGGER, DEFAULT_L0_STOP_TRIGGER,
-    DEFAULT_MAX_LEVELS, DEFAULT_READER_CACHE_ENABLED, DEFAULT_READER_CACHE_MAX_ENTRIES,
-    DEFAULT_READER_CACHE_SHARDS, DEFAULT_ROW_CACHE_ENABLED, DEFAULT_SCAN_FILL_CACHE,
-    DEFAULT_SCAN_FILL_CACHE_THRESHOLD_BLOCKS, DEFAULT_SHARED_BLOCK_CACHE_ENABLED,
+    collect_snapshot, route_table_to_tablet, snapshot_to_metric_rows, CacheSuite, CacheSuiteConfig,
+    EngineStatusMetricRow, EngineStatusReporter, EngineStatusSnapshot, GlobalLogGcBoundary,
+    IlogConfig, IlogService, IlogTruncateStats, LsmConfig, LsmEngine, LsmRecovery,
+    RoutedTabletStorage, TabletId, TabletManager, DEFAULT_BLOOM_BITS_PER_KEY,
+    DEFAULT_BLOOM_ENABLED, DEFAULT_CACHE_TOTAL_RATIO, DEFAULT_L0_COMPACTION_TRIGGER,
+    DEFAULT_L0_SLOWDOWN_TRIGGER, DEFAULT_L0_STOP_TRIGGER, DEFAULT_MAX_LEVELS,
+    DEFAULT_READER_CACHE_ENABLED, DEFAULT_READER_CACHE_MAX_ENTRIES, DEFAULT_READER_CACHE_SHARDS,
+    DEFAULT_ROW_CACHE_ENABLED, DEFAULT_SCAN_FILL_CACHE, DEFAULT_SCAN_FILL_CACHE_THRESHOLD_BLOCKS,
+    DEFAULT_SHARED_BLOCK_CACHE_ENABLED,
 };
 use transaction::{ConcurrencyManager, TransactionService};
 use tso::LocalTso;
-use util::error::Result;
+use util::error::{Result, TiSqlError};
 
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -612,6 +616,7 @@ type DbStorage = RoutedTabletStorage;
 /// Internal type alias for concrete transaction service.
 /// Not exposed publicly - callers only see TxnService trait.
 type DbTxnService = TransactionService<DbStorage, FileClogService, LocalTso>;
+type DbExecutionBackend = TxnExecutionBackend<DbTxnService>;
 
 /// TiSQL Database instance.
 ///
@@ -637,6 +642,8 @@ pub struct Database {
     parser: Parser,
     /// SQL executor (encapsulated)
     executor: SimpleExecutor,
+    /// Logical point-get boundary used by executor and protocol short path.
+    execution_backend: DbExecutionBackend,
     /// Transaction service - internal implementation hidden
     txn_service: Arc<DbTxnService>,
     /// Schema metadata catalog (MVCC-based, persistent)
@@ -758,12 +765,14 @@ pub struct TabletIlogGcStats {
     pub truncate: IlogTruncateStats,
 }
 
+#[derive(Debug)]
 pub(crate) struct ShortPointGetOutput {
     pub columns: Vec<String>,
     pub row: Option<Vec<Value>>,
     pub profile: ShortPointGetProfile,
 }
 
+#[derive(Debug)]
 pub(crate) enum ShortPointGetFallback {
     TableNotFound,
     PkMismatch,
@@ -772,18 +781,18 @@ pub(crate) enum ShortPointGetFallback {
     DecodeError,
 }
 
+#[derive(Debug)]
 pub(crate) enum ShortPointGetExecOutcome {
     Hit(ShortPointGetOutput),
     Fallback(ShortPointGetFallback),
 }
 
-#[derive(Default)]
+#[derive(Debug, Default)]
 pub(crate) struct ShortPointGetProfile {
     pub catalog_us: u64,
     pub cast_encode_us: u64,
     pub begin_us: u64,
-    pub get_us: u64,
-    pub decode_us: u64,
+    pub backend_us: u64,
     pub output_build_us: u64,
 }
 
@@ -1154,6 +1163,7 @@ impl Database {
         Ok(Self {
             parser: Parser::new(),
             executor: SimpleExecutor::new(),
+            execution_backend: TxnExecutionBackend::new(Arc::clone(&txn_service)),
             txn_service,
             catalog,
             ilog: recovery.ilog,
@@ -1369,32 +1379,32 @@ impl Database {
                 ShortPointGetFallback::LiteralCastError,
             ));
         }
-        let pk_bytes = encode_pk(std::slice::from_ref(&parsed_literal));
-        let encoded_key = encode_key(table.id(), &pk_bytes);
         let cast_encode_us = cast_encode_begin.elapsed().as_micros() as u64;
 
         let begin_begin = Instant::now();
         let ctx = self.txn_service.begin(true)?;
         let begin_us = begin_begin.elapsed().as_micros() as u64;
 
-        let get_begin = Instant::now();
-        let raw_row = self.txn_service.get(&ctx, table.id(), &encoded_key).await?;
-        let get_us = get_begin.elapsed().as_micros() as u64;
-
-        let decode_begin = Instant::now();
-        let row = if let Some(raw_row) = raw_row {
-            match decode_row_to_values(&raw_row, &projection.col_ids, &projection.data_types) {
-                Ok(values) => Some(values),
-                Err(_) => {
-                    return Ok(ShortPointGetExecOutcome::Fallback(
-                        ShortPointGetFallback::DecodeError,
-                    ))
-                }
-            }
-        } else {
-            None
+        let backend_begin = Instant::now();
+        let point_get = PointGetRequest {
+            table,
+            key: LogicalPointKey::PrimaryKey(vec![parsed_literal]),
+            projection: ProjectionSpec::Columns {
+                col_ids: projection.col_ids.clone(),
+                data_types: projection.data_types.clone(),
+            },
         };
-        let decode_us = decode_begin.elapsed().as_micros() as u64;
+        let row = match self.execution_backend.point_get(&ctx, point_get).await {
+            Ok(Some(row)) => Some(row.row.into_values()),
+            Ok(None) => None,
+            Err(TiSqlError::Codec(_)) => {
+                return Ok(ShortPointGetExecOutcome::Fallback(
+                    ShortPointGetFallback::DecodeError,
+                ))
+            }
+            Err(e) => return Err(e),
+        };
+        let backend_us = backend_begin.elapsed().as_micros() as u64;
 
         let output_build_begin = Instant::now();
         let output = ShortPointGetOutput {
@@ -1404,8 +1414,7 @@ impl Database {
                 catalog_us,
                 cast_encode_us,
                 begin_us,
-                get_us,
-                decode_us,
+                backend_us,
                 output_build_us: output_build_begin.elapsed().as_micros() as u64,
             },
         };
@@ -1621,6 +1630,7 @@ impl Database {
                 exec_ctx,
                 stmt_ctx,
                 self.txn_service.as_ref(),
+                &self.execution_backend,
                 &self.catalog,
                 txn_ctx,
             )
@@ -1951,6 +1961,7 @@ mod tests {
         ALL_INDEX_TABLE_ID, ALL_META_TABLE_ID, ALL_SCHEMA_TABLE_ID, ALL_TABLE_TABLE_ID,
         USER_TABLE_ID_START,
     };
+    use crate::protocol::point_get_short::try_parse_point_get_short;
     use crate::tablet::{
         encode_key, encode_pk, is_tombstone, IlogConfig, IlogService, LsmConfig, MvccIterator,
         MvccKey, TabletEngine, TabletId, Version,
@@ -2061,6 +2072,42 @@ mod tests {
             }
             None
         })
+    }
+
+    #[tokio::test]
+    async fn test_execute_point_get_short_returns_projected_row() {
+        let (db, _dir) = create_test_db();
+        db.execute_query(
+            "CREATE TABLE t_short (id BIGINT NOT NULL, name VARCHAR(32), age BIGINT, PRIMARY KEY(id))",
+        )
+        .await
+        .unwrap();
+        db.execute_query("INSERT INTO t_short (id, name, age) VALUES (7, 'alice', 42)")
+            .await
+            .unwrap();
+
+        let query = try_parse_point_get_short("SELECT name, age FROM t_short WHERE id = 7")
+            .expect("short-path parser should accept point get query");
+        let exec_ctx = ExecutionCtx::with_db("default");
+        let mut stmt_ctx = StatementCtx::new();
+
+        match db
+            .execute_point_get_short(&exec_ctx, &mut stmt_ctx, &query)
+            .await
+            .unwrap()
+        {
+            ShortPointGetExecOutcome::Hit(output) => {
+                assert_eq!(output.columns, vec!["name", "age"]);
+                assert_eq!(
+                    output.row,
+                    Some(vec![Value::String("alice".into()), Value::BigInt(42)])
+                );
+                assert!(output.profile.backend_us <= u64::MAX);
+            }
+            ShortPointGetExecOutcome::Fallback(reason) => {
+                panic!("unexpected short-path fallback: {reason:?}");
+            }
+        }
     }
 
     async fn prepare_phase4_two_tablet_recovery_case(

@@ -30,6 +30,9 @@ use std::time::Instant;
 
 use crate::catalog::types::{ColumnId, ColumnInfo, DataType, Key, Row, Schema, TableId, Value};
 use crate::catalog::{Catalog, TableDef};
+use crate::kernel::execution::{
+    ExecutionBackend, LogicalPointKey, PointGetRequest, ProjectionSpec,
+};
 use crate::session::{ExecutionCtx, StatementCtx};
 use crate::sql::{AggFunc, BinaryOp, Expr, LogicalPlan, OrderByExpr, UnaryOp};
 use crate::tablet::{
@@ -673,6 +676,7 @@ impl<I: MvccIterator> AggregateOp<I> {
 async fn build_read_operator<T: TxnService>(
     plan: LogicalPlan,
     txn_service: &T,
+    execution_backend: &impl ExecutionBackend,
     ctx: &TxnCtx,
 ) -> Result<Operator<T::ScanIter>> {
     match plan {
@@ -727,12 +731,6 @@ async fn build_read_operator<T: TxnService>(
         }
 
         LogicalPlan::PointGet { table, key } => {
-            let col_ids: Vec<ColumnId> = table.columns().iter().map(|c| c.id()).collect();
-            let data_types: Vec<DataType> = table
-                .columns()
-                .iter()
-                .map(|c| c.data_type().clone())
-                .collect();
             let schema = Schema::new(
                 table
                     .columns()
@@ -744,9 +742,18 @@ async fn build_read_operator<T: TxnService>(
             );
 
             let mut rows = Vec::new();
-            if let Some(value) = txn_service.get(ctx, table.id(), &key).await? {
-                let decoded = decode_row_to_values(&value, &col_ids, &data_types)?;
-                rows.push(Row::new(decoded));
+            if let Some(row) = execution_backend
+                .point_get(
+                    ctx,
+                    PointGetRequest {
+                        table,
+                        key,
+                        projection: ProjectionSpec::All,
+                    },
+                )
+                .await?
+            {
+                rows.push(row.row);
             }
 
             Ok(Operator::Values(ValuesOp {
@@ -776,7 +783,13 @@ async fn build_read_operator<T: TxnService>(
         LogicalPlan::Empty { schema } => Ok(Operator::Empty(EmptyOp { schema })),
 
         LogicalPlan::Project { input, exprs } => {
-            let child = Box::pin(build_read_operator(*input, txn_service, ctx)).await?;
+            let child = Box::pin(build_read_operator(
+                *input,
+                txn_service,
+                execution_backend,
+                ctx,
+            ))
+            .await?;
             let schema = Schema::new(
                 exprs
                     .iter()
@@ -791,7 +804,13 @@ async fn build_read_operator<T: TxnService>(
         }
 
         LogicalPlan::Filter { input, predicate } => {
-            let child = Box::pin(build_read_operator(*input, txn_service, ctx)).await?;
+            let child = Box::pin(build_read_operator(
+                *input,
+                txn_service,
+                execution_backend,
+                ctx,
+            ))
+            .await?;
             Ok(Operator::Filter(FilterOp {
                 child: Box::new(child),
                 predicate,
@@ -803,7 +822,13 @@ async fn build_read_operator<T: TxnService>(
             limit,
             offset,
         } => {
-            let child = Box::pin(build_read_operator(*input, txn_service, ctx)).await?;
+            let child = Box::pin(build_read_operator(
+                *input,
+                txn_service,
+                execution_backend,
+                ctx,
+            ))
+            .await?;
             Ok(Operator::Limit(LimitOp {
                 child: Box::new(child),
                 limit,
@@ -814,7 +839,13 @@ async fn build_read_operator<T: TxnService>(
         }
 
         LogicalPlan::Sort { input, order_by } => {
-            let child = Box::pin(build_read_operator(*input, txn_service, ctx)).await?;
+            let child = Box::pin(build_read_operator(
+                *input,
+                txn_service,
+                execution_backend,
+                ctx,
+            ))
+            .await?;
             Ok(Operator::Sort(SortOp {
                 child: Box::new(child),
                 order_by,
@@ -827,7 +858,13 @@ async fn build_read_operator<T: TxnService>(
             group_by,
             agg_exprs,
         } => {
-            let child = Box::pin(build_read_operator(*input, txn_service, ctx)).await?;
+            let child = Box::pin(build_read_operator(
+                *input,
+                txn_service,
+                execution_backend,
+                ctx,
+            ))
+            .await?;
             let schema = Schema::new(
                 agg_exprs
                     .iter()
@@ -1307,7 +1344,10 @@ fn build_dml_read_plan(input: LogicalPlan, table: &TableDef) -> Result<DmlReadPl
                         "DML input point-get table does not match target table".into(),
                     ));
                 }
-                return Ok(DmlReadPlan::PointGet { key, filter });
+                return Ok(DmlReadPlan::PointGet {
+                    key: encode_legacy_dml_point_get_key(point_get_table.id(), &key),
+                    filter,
+                });
             }
             LogicalPlan::Empty { .. } => return Ok(DmlReadPlan::Empty),
             other => {
@@ -1317,6 +1357,14 @@ fn build_dml_read_plan(input: LogicalPlan, table: &TableDef) -> Result<DmlReadPl
                 )));
             }
         }
+    }
+}
+
+fn encode_legacy_dml_point_get_key(table_id: TableId, key: &LogicalPointKey) -> Key {
+    // Transitional bridge until slice 3 moves DML fully behind `ExecutionBackend`.
+    match key {
+        LogicalPointKey::PrimaryKey(values) => encode_key(table_id, &encode_pk(values)),
+        LogicalPointKey::HiddenRowId(handle) => encode_int_key(table_id, *handle),
     }
 }
 
@@ -1369,12 +1417,13 @@ impl Default for SimpleExecutor {
 }
 
 impl Executor for SimpleExecutor {
-    async fn execute_unified<T: TxnService, C: Catalog>(
+    async fn execute_unified<T: TxnService, B: ExecutionBackend, C: Catalog>(
         &self,
         plan: LogicalPlan,
         _exec_ctx: &ExecutionCtx,
         stmt_ctx: &mut StatementCtx,
         txn_service: &T,
+        execution_backend: &B,
         catalog: &C,
         txn_ctx: Option<TxnCtx>,
     ) -> (Result<ExecutionOutput>, Option<TxnCtx>) {
@@ -1465,7 +1514,7 @@ impl Executor for SimpleExecutor {
                 } else {
                     // Streaming read in explicit txn — no materialization
                     match self
-                        .execute_with_ctx(plan, &ctx, txn_service, catalog)
+                        .execute_with_ctx(plan, &ctx, txn_service, execution_backend, catalog)
                         .await
                     {
                         Ok(output) => (Ok(output), Some(ctx)),
@@ -1491,7 +1540,13 @@ impl Executor for SimpleExecutor {
                             let begin_us = begin_t.elapsed().as_micros() as u64;
                             let build_t = Instant::now();
                             match self
-                                .execute_with_ctx(plan, &ctx, txn_service, catalog)
+                                .execute_with_ctx(
+                                    plan,
+                                    &ctx,
+                                    txn_service,
+                                    execution_backend,
+                                    catalog,
+                                )
                                 .await
                             {
                                 Ok(output) => {
@@ -1652,14 +1707,15 @@ impl SimpleExecutor {
     ///
     /// Builds a volcano-style operator tree from the plan, opens it,
     /// and returns a live `ExecutionOutput` — zero materialization.
-    async fn execute_with_ctx<T: TxnService, C: Catalog>(
+    async fn execute_with_ctx<T: TxnService, B: ExecutionBackend, C: Catalog>(
         &self,
         plan: LogicalPlan,
         ctx: &TxnCtx,
         txn_service: &T,
+        execution_backend: &B,
         _catalog: &C,
     ) -> Result<ExecutionOutput> {
-        let mut op = build_read_operator(plan, txn_service, ctx).await?;
+        let mut op = build_read_operator(plan, txn_service, execution_backend, ctx).await?;
         op.open().await?;
         let schema = op.schema().clone();
         Ok(ExecutionOutput::Rows {
@@ -2185,6 +2241,9 @@ mod tests {
     use super::*;
     use crate::catalog::types::{Lsn, RawValue, TableId, Timestamp, TxnId};
     use crate::catalog::{ColumnDef, MemoryCatalog, TableDef};
+    use crate::kernel::execution::{
+        ExecutionBackend, ExecutionRow, LogicalPointKey, PointGetRequest, RowKey,
+    };
     use crate::tablet::MvccKey;
     use crate::transaction::{CommitInfo, TxnState};
 
@@ -2226,6 +2285,46 @@ mod tests {
         delete_calls: AtomicUsize,
         lock_calls: AtomicUsize,
         last_scan_range: Mutex<Option<Range<Vec<u8>>>>,
+    }
+
+    struct UnusedExecutionBackend;
+
+    impl ExecutionBackend for UnusedExecutionBackend {
+        fn point_get<'a>(
+            &'a self,
+            _ctx: &'a TxnCtx,
+            _req: PointGetRequest,
+        ) -> impl Future<Output = Result<Option<ExecutionRow>>> + Send + 'a {
+            async move { panic!("unused execution backend should not be called") }
+        }
+    }
+
+    struct MockPointGetExecutionBackend {
+        expected_table_id: TableId,
+        expected_key: LogicalPointKey,
+        row: Option<Row>,
+        point_get_calls: AtomicUsize,
+    }
+
+    impl ExecutionBackend for MockPointGetExecutionBackend {
+        fn point_get<'a>(
+            &'a self,
+            _ctx: &'a TxnCtx,
+            req: PointGetRequest,
+        ) -> impl Future<Output = Result<Option<ExecutionRow>>> + Send + 'a {
+            async move {
+                self.point_get_calls.fetch_add(1, Ordering::SeqCst);
+                assert_eq!(req.table.id(), self.expected_table_id);
+                assert_eq!(req.key, self.expected_key);
+                Ok(self.row.clone().map(|row| ExecutionRow {
+                    key: match &self.expected_key {
+                        LogicalPointKey::PrimaryKey(values) => RowKey::PrimaryKey(values.clone()),
+                        LogicalPointKey::HiddenRowId(handle) => RowKey::HiddenRowId(*handle),
+                    },
+                    row,
+                }))
+            }
+        }
     }
 
     impl TxnService for MockPointGetTxnService {
@@ -2582,7 +2681,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_point_get_plan_uses_txn_get_instead_of_scan_iter() {
+    async fn test_point_get_plan_uses_execution_backend_instead_of_txn_get() {
         let table = TableDef::new(
             101,
             "t".to_string(),
@@ -2593,14 +2692,10 @@ mod tests {
             ],
             vec![1],
         );
-        let pk = vec![Value::BigInt(7)];
-        let key = encode_key(table.id(), &encode_pk(&pk));
-        let row = encode_row(&[1, 2], &[Value::BigInt(7), Value::String("alice".into())]);
-
         let service = MockPointGetTxnService {
             table_id: table.id(),
-            expected_key: Some(key.clone()),
-            row_value: Some(row),
+            expected_key: None,
+            row_value: None,
             get_calls: AtomicUsize::new(0),
             scan_calls: AtomicUsize::new(0),
             put_calls: AtomicUsize::new(0),
@@ -2608,14 +2703,24 @@ mod tests {
             lock_calls: AtomicUsize::new(0),
             last_scan_range: Mutex::new(None),
         };
+        let backend = MockPointGetExecutionBackend {
+            expected_table_id: table.id(),
+            expected_key: LogicalPointKey::PrimaryKey(vec![Value::BigInt(7)]),
+            row: Some(Row::new(vec![
+                Value::BigInt(7),
+                Value::String("alice".into()),
+            ])),
+            point_get_calls: AtomicUsize::new(0),
+        };
         let ctx = TxnCtx::new(11, 100, true);
 
         let mut op = build_read_operator(
             LogicalPlan::PointGet {
                 table,
-                key: key.clone(),
+                key: LogicalPointKey::PrimaryKey(vec![Value::BigInt(7)]),
             },
             &service,
+            &backend,
             &ctx,
         )
         .await
@@ -2630,7 +2735,8 @@ mod tests {
         assert_eq!(first.get(0), Some(&Value::BigInt(7)));
         assert_eq!(first.get(1), Some(&Value::String("alice".into())));
         assert!(op.next().await.unwrap().is_none());
-        assert_eq!(service.get_calls.load(Ordering::SeqCst), 1);
+        assert_eq!(backend.point_get_calls.load(Ordering::SeqCst), 1);
+        assert_eq!(service.get_calls.load(Ordering::SeqCst), 0);
         assert_eq!(service.scan_calls.load(Ordering::SeqCst), 0);
     }
 
@@ -2646,11 +2752,9 @@ mod tests {
             ],
             vec![1],
         );
-        let key = encode_key(table.id(), &encode_pk(&[Value::BigInt(8)]));
-
         let service = MockPointGetTxnService {
             table_id: table.id(),
-            expected_key: Some(key.clone()),
+            expected_key: None,
             row_value: None,
             get_calls: AtomicUsize::new(0),
             scan_calls: AtomicUsize::new(0),
@@ -2659,15 +2763,30 @@ mod tests {
             lock_calls: AtomicUsize::new(0),
             last_scan_range: Mutex::new(None),
         };
+        let backend = MockPointGetExecutionBackend {
+            expected_table_id: table.id(),
+            expected_key: LogicalPointKey::PrimaryKey(vec![Value::BigInt(8)]),
+            row: None,
+            point_get_calls: AtomicUsize::new(0),
+        };
         let ctx = TxnCtx::new(12, 101, true);
 
-        let mut op = build_read_operator(LogicalPlan::PointGet { table, key }, &service, &ctx)
-            .await
-            .unwrap();
+        let mut op = build_read_operator(
+            LogicalPlan::PointGet {
+                table,
+                key: LogicalPointKey::PrimaryKey(vec![Value::BigInt(8)]),
+            },
+            &service,
+            &backend,
+            &ctx,
+        )
+        .await
+        .unwrap();
 
         op.open().await.unwrap();
         assert!(op.next().await.unwrap().is_none());
-        assert_eq!(service.get_calls.load(Ordering::SeqCst), 1);
+        assert_eq!(backend.point_get_calls.load(Ordering::SeqCst), 1);
+        assert_eq!(service.get_calls.load(Ordering::SeqCst), 0);
         assert_eq!(service.scan_calls.load(Ordering::SeqCst), 0);
     }
 
@@ -2805,6 +2924,7 @@ mod tests {
                 filter: Some(filter),
             },
             &service,
+            &UnusedExecutionBackend,
             &ctx,
         )
         .await
@@ -2859,7 +2979,7 @@ mod tests {
             input: Box::new(LogicalPlan::Filter {
                 input: Box::new(LogicalPlan::PointGet {
                     table,
-                    key: key.clone(),
+                    key: LogicalPointKey::PrimaryKey(vec![Value::BigInt(7)]),
                 }),
                 predicate: Expr::BinaryOp {
                     left: Box::new(Expr::Column {
@@ -3056,7 +3176,7 @@ mod tests {
             )],
             input: Box::new(LogicalPlan::PointGet {
                 table,
-                key: key.clone(),
+                key: LogicalPointKey::PrimaryKey(vec![Value::BigInt(7)]),
             }),
         };
 
@@ -3114,7 +3234,7 @@ mod tests {
             input: Box::new(LogicalPlan::Filter {
                 input: Box::new(LogicalPlan::PointGet {
                     table,
-                    key: key.clone(),
+                    key: LogicalPointKey::PrimaryKey(vec![Value::BigInt(7)]),
                 }),
                 predicate: Expr::BinaryOp {
                     left: Box::new(Expr::Column {
@@ -3460,6 +3580,7 @@ mod tests {
                 &exec_ctx,
                 &mut stmt_ctx,
                 &service,
+                &UnusedExecutionBackend,
                 &MemoryCatalog::new(),
                 txn_ctx,
             )

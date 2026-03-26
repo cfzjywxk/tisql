@@ -69,8 +69,7 @@ static SHORT_PATH_PROFILE_RECOGNIZE_US_TOTAL: AtomicU64 = AtomicU64::new(0);
 static SHORT_PATH_PROFILE_CATALOG_US_TOTAL: AtomicU64 = AtomicU64::new(0);
 static SHORT_PATH_PROFILE_CAST_ENCODE_US_TOTAL: AtomicU64 = AtomicU64::new(0);
 static SHORT_PATH_PROFILE_BEGIN_US_TOTAL: AtomicU64 = AtomicU64::new(0);
-static SHORT_PATH_PROFILE_GET_US_TOTAL: AtomicU64 = AtomicU64::new(0);
-static SHORT_PATH_PROFILE_DECODE_US_TOTAL: AtomicU64 = AtomicU64::new(0);
+static SHORT_PATH_PROFILE_BACKEND_US_TOTAL: AtomicU64 = AtomicU64::new(0);
 static SHORT_PATH_PROFILE_OUTPUT_BUILD_US_TOTAL: AtomicU64 = AtomicU64::new(0);
 static SHORT_PATH_PROFILE_COLDEF_US_TOTAL: AtomicU64 = AtomicU64::new(0);
 static SHORT_PATH_PROFILE_ENCODE_US_TOTAL: AtomicU64 = AtomicU64::new(0);
@@ -136,15 +135,13 @@ fn record_short_path_profile(
     let catalog_us = short_profile.catalog_us;
     let cast_encode_us = short_profile.cast_encode_us;
     let begin_us = short_profile.begin_us;
-    let get_us = short_profile.get_us;
-    let decode_us = short_profile.decode_us;
+    let backend_us = short_profile.backend_us;
     let output_build_us = short_profile.output_build_us;
     let total_us = recognize_us
         + catalog_us
         + cast_encode_us
         + begin_us
-        + get_us
-        + decode_us
+        + backend_us
         + output_build_us
         + coldef_us
         + encode_us
@@ -154,8 +151,7 @@ fn record_short_path_profile(
     SHORT_PATH_PROFILE_CATALOG_US_TOTAL.fetch_add(catalog_us, Ordering::Relaxed);
     SHORT_PATH_PROFILE_CAST_ENCODE_US_TOTAL.fetch_add(cast_encode_us, Ordering::Relaxed);
     SHORT_PATH_PROFILE_BEGIN_US_TOTAL.fetch_add(begin_us, Ordering::Relaxed);
-    SHORT_PATH_PROFILE_GET_US_TOTAL.fetch_add(get_us, Ordering::Relaxed);
-    SHORT_PATH_PROFILE_DECODE_US_TOTAL.fetch_add(decode_us, Ordering::Relaxed);
+    SHORT_PATH_PROFILE_BACKEND_US_TOTAL.fetch_add(backend_us, Ordering::Relaxed);
     SHORT_PATH_PROFILE_OUTPUT_BUILD_US_TOTAL.fetch_add(output_build_us, Ordering::Relaxed);
     SHORT_PATH_PROFILE_COLDEF_US_TOTAL.fetch_add(coldef_us, Ordering::Relaxed);
     SHORT_PATH_PROFILE_ENCODE_US_TOTAL.fetch_add(encode_us, Ordering::Relaxed);
@@ -170,8 +166,7 @@ fn record_short_path_profile(
     let avg_catalog = SHORT_PATH_PROFILE_CATALOG_US_TOTAL.load(Ordering::Relaxed) / count;
     let avg_cast_encode = SHORT_PATH_PROFILE_CAST_ENCODE_US_TOTAL.load(Ordering::Relaxed) / count;
     let avg_begin = SHORT_PATH_PROFILE_BEGIN_US_TOTAL.load(Ordering::Relaxed) / count;
-    let avg_get = SHORT_PATH_PROFILE_GET_US_TOTAL.load(Ordering::Relaxed) / count;
-    let avg_decode = SHORT_PATH_PROFILE_DECODE_US_TOTAL.load(Ordering::Relaxed) / count;
+    let avg_backend = SHORT_PATH_PROFILE_BACKEND_US_TOTAL.load(Ordering::Relaxed) / count;
     let avg_output_build = SHORT_PATH_PROFILE_OUTPUT_BUILD_US_TOTAL.load(Ordering::Relaxed) / count;
     let avg_coldef = SHORT_PATH_PROFILE_COLDEF_US_TOTAL.load(Ordering::Relaxed) / count;
     let avg_encode = SHORT_PATH_PROFILE_ENCODE_US_TOTAL.load(Ordering::Relaxed) / count;
@@ -179,14 +174,13 @@ fn record_short_path_profile(
     let avg_total = SHORT_PATH_PROFILE_TOTAL_US_TOTAL.load(Ordering::Relaxed) / count;
 
     log_info!(
-        "[read-short-profile] reads={} avg_us(recognize/catalog/cast_encode/begin/get/decode/output_build/coldef/encode/finish/total)={}/{}/{}/{}/{}/{}/{}/{}/{}/{}/{}",
+        "[read-short-profile] reads={} avg_us(recognize/catalog/cast_encode/begin/backend/output_build/coldef/encode/finish/total)={}/{}/{}/{}/{}/{}/{}/{}/{}/{}",
         count,
         avg_recognize,
         avg_catalog,
         avg_cast_encode,
         avg_begin,
-        avg_get,
-        avg_decode,
+        avg_backend,
         avg_output_build,
         avg_coldef,
         avg_encode,

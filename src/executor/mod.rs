@@ -22,6 +22,7 @@ use std::pin::Pin;
 
 use crate::catalog::types::{Row, Schema, TableId};
 use crate::catalog::Catalog;
+use crate::kernel::execution::ExecutionBackend;
 use crate::session::{ExecutionCtx, StatementCtx};
 use crate::sql::LogicalPlan;
 use crate::transaction::{TxnCtx, TxnService};
@@ -141,12 +142,13 @@ pub trait Executor: Send + Sync {
     ///   - `Err(error)` on statement failure
     ///   - `Option<TxnCtx>` always carries the post-statement transaction context
     ///     (for explicit transactions, statement errors should keep the txn open)
-    fn execute_unified<T: TxnService, C: Catalog>(
+    fn execute_unified<T: TxnService, B: ExecutionBackend, C: Catalog>(
         &self,
         plan: LogicalPlan,
         exec_ctx: &ExecutionCtx,
         stmt_ctx: &mut StatementCtx,
         txn_service: &T,
+        execution_backend: &B,
         catalog: &C,
         txn_ctx: Option<TxnCtx>,
     ) -> impl std::future::Future<Output = (Result<ExecutionOutput>, Option<TxnCtx>)> + Send;

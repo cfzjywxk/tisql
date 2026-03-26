@@ -22,7 +22,7 @@ use sqlparser::tokenizer::Token;
 
 use crate::catalog::types::{ColumnInfo, DataType, Schema, Timestamp, Value};
 use crate::catalog::{Catalog, ColumnDef, TableDef};
-use crate::tablet::{encode_key, encode_pk};
+use crate::kernel::execution::LogicalPointKey;
 use crate::util::error::{Result, TiSqlError};
 
 use super::plan::{AggFunc, BinaryOp, Expr, JoinType, LogicalPlan, OrderByExpr, UnaryOp};
@@ -1074,11 +1074,10 @@ impl<'a, C: Catalog> Binder<'a, C> {
                 .filter_map(|(expr, is_consumed)| (!is_consumed).then_some(expr.clone()))
                 .collect(),
         );
-        let key = encode_key(table.id(), &encode_pk(&pk_values));
         Some(PointGetRewrite {
             plan: LogicalPlan::PointGet {
                 table: table.clone(),
-                key,
+                key: LogicalPointKey::PrimaryKey(pk_values),
             },
             residual_predicate,
         })
@@ -1300,7 +1299,7 @@ mod tests {
 
     use super::*;
     use crate::catalog::{DefaultValue, IndexDef, MemoryCatalog};
-    use crate::tablet::{encode_key, encode_pk};
+    use crate::kernel::execution::LogicalPointKey;
 
     fn bind_sql(catalog: &MemoryCatalog, sql: &str) -> LogicalPlan {
         bind_sql_result(catalog, sql).unwrap()
@@ -1570,11 +1569,13 @@ mod tests {
         match plan {
             LogicalPlan::Project { input, .. } => match *input {
                 LogicalPlan::PointGet { key, .. } => {
-                    let expected = encode_key(
-                        43,
-                        &encode_pk(&[Value::BigInt(7), Value::String("us".into())]),
+                    assert_eq!(
+                        key,
+                        LogicalPointKey::PrimaryKey(vec![
+                            Value::BigInt(7),
+                            Value::String("us".into())
+                        ])
                     );
-                    assert_eq!(key, expected);
                 }
                 _ => panic!("expected bare PointGet"),
             },
