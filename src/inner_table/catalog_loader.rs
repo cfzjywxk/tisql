@@ -27,8 +27,8 @@ use crate::codec::key::{
 };
 use crate::codec::row::decode_row_to_values;
 use crate::inner_table::core_tables::*;
-use crate::tablet::{route_index_to_tablet, route_table_to_tablet, MvccIterator, TabletId};
-use crate::transaction::{TxnCtx, TxnService};
+use crate::tablet::{route_index_to_tablet, route_table_to_tablet, TabletId};
+use crate::transaction::{TxnCtx, TxnScanCursor, TxnService};
 use crate::util::error::{Result, TiSqlError};
 
 // ============================================================================
@@ -111,13 +111,12 @@ fn scan_table_rows<T: TxnService>(
         *last = last.saturating_add(1);
     }
 
-    let mut iter = txn.scan_iter(ctx, table_id, prefix..end)?;
+    let mut iter = txn.scan(ctx, table_id, prefix..end)?;
     let mut rows = Vec::new();
 
     crate::io::block_on_sync(iter.advance())?;
-    while iter.valid() {
-        let value = iter.value();
-        let decoded = decode_row_to_values(value, col_ids, data_types)?;
+    while let Some(entry) = iter.current() {
+        let decoded = decode_row_to_values(&entry.value, col_ids, data_types)?;
         rows.push(decoded);
         crate::io::block_on_sync(iter.advance())?;
     }

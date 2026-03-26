@@ -46,7 +46,7 @@ use std::ops::Range;
 use std::time::Duration;
 
 use crate::catalog::types::{Key, Lsn, RawValue, TableId, Timestamp, TxnId};
-use crate::tablet::{MvccIterator, TabletId};
+use crate::tablet::TabletId;
 use crate::util::error::Result;
 
 /// Final per-key mutation payload tracked in a transaction context.
@@ -76,49 +76,37 @@ impl MutationPayload {
 
 /// Per-key mutation metadata tracked inside a transaction context.
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub struct MutationMeta {
+pub(crate) struct MutationMeta {
     /// Final mutation payload for commit/rollback handling.
     pub(crate) mutation: MutationPayload,
     /// Tablet routing captured when the mutation was recorded.
     pub(crate) tablet_id: TabletId,
 }
 
-impl MutationMeta {
-    #[inline]
-    pub fn mutation(&self) -> &MutationPayload {
-        &self.mutation
-    }
-
-    #[inline]
-    pub fn tablet_id(&self) -> TabletId {
-        self.tablet_id
-    }
-}
-
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub enum StatementUndoEntry {
+pub(crate) enum StatementUndoEntry {
     Absent,
     Restore(MutationMeta),
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
-pub struct StatementUndo {
+pub(crate) struct StatementUndo {
     entries: BTreeMap<Key, StatementUndoEntry>,
 }
 
 impl StatementUndo {
     #[inline]
-    pub fn is_empty(&self) -> bool {
+    fn is_empty(&self) -> bool {
         self.entries.is_empty()
     }
 
     #[inline]
-    pub fn len(&self) -> usize {
+    fn len(&self) -> usize {
         self.entries.len()
     }
 
     #[inline]
-    pub fn into_entries(self) -> BTreeMap<Key, StatementUndoEntry> {
+    fn into_entries(self) -> BTreeMap<Key, StatementUndoEntry> {
         self.entries
     }
 
@@ -135,6 +123,58 @@ impl StatementUndo {
                 None => StatementUndoEntry::Absent,
             });
     }
+}
+
+/// Opaque statement-local rollback token.
+#[derive(Debug, Default)]
+pub struct StatementGuard {
+    _private: (),
+    undo: StatementUndo,
+}
+
+impl StatementGuard {
+    #[inline]
+    pub(crate) fn from_undo(undo: StatementUndo) -> Self {
+        Self { _private: (), undo }
+    }
+
+    #[inline]
+    pub(crate) fn is_empty(&self) -> bool {
+        self.undo.is_empty()
+    }
+
+    #[inline]
+    pub(crate) fn len(&self) -> usize {
+        self.undo.len()
+    }
+
+    #[inline]
+    pub(crate) fn contains_key(&self, key: &[u8]) -> bool {
+        self.undo.contains_key(key)
+    }
+
+    #[inline]
+    pub(crate) fn record_first_touch(&mut self, key: &[u8], previous: Option<MutationMeta>) {
+        self.undo.record_first_touch(key, previous);
+    }
+
+    #[inline]
+    pub(crate) fn into_entries(self) -> BTreeMap<Key, StatementUndoEntry> {
+        self.undo.into_entries()
+    }
+}
+
+/// One logical key/value pair yielded by a transaction scan.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TxnScanEntry {
+    pub user_key: Key,
+    pub value: RawValue,
+}
+
+/// Forward-only logical scan cursor.
+pub trait TxnScanCursor: Send {
+    fn advance(&mut self) -> impl Future<Output = Result<()>> + Send + '_;
+    fn current(&self) -> Option<&TxnScanEntry>;
 }
 
 /// Transaction state machine for OceanBase-style pessimistic locking.
@@ -348,7 +388,7 @@ impl TxnCtx {
 /// // CORRECT: MVCC-aware read with transaction semantics
 /// let ctx = txn_service.begin(true)?;  // read-only transaction
 /// let value = txn_service.get(&ctx, table_id, key)?;
-/// let iter = txn_service.scan_iter(&ctx, table_id, range)?;
+/// let mut scan = txn_service.scan(&ctx, table_id, range)?;
 ///
 /// // WRONG: Bypasses MVCC visibility rules
 /// let value = storage.get(key)?;  // DON'T DO THIS
@@ -381,11 +421,11 @@ impl TxnCtx {
 /// read-write transactions at the API level. The `read_only` flag is
 /// a hint for optimization, not a hard constraint.
 pub trait TxnService: Send + Sync {
-    /// The iterator type returned by `scan_iter`.
+    /// The cursor type returned by `scan`.
     ///
     /// Using an associated type avoids boxing and dynamic dispatch overhead.
-    /// Each transaction service implementation defines its own concrete iterator type.
-    type ScanIter: MvccIterator + 'static;
+    /// Each transaction service implementation defines its own concrete cursor type.
+    type ScanCursor: TxnScanCursor + 'static;
 
     // === Factory ===
 
@@ -429,17 +469,23 @@ pub trait TxnService: Send + Sync {
 
     /// Scan a range of keys within one table target (streaming).
     ///
-    /// Returns an iterator over key-value pairs visible at `start_ts`.
-    /// Each item is wrapped in `Result` to propagate I/O or corruption errors
-    /// that may occur during streaming iteration over storage.
+    /// Returns a forward-only cursor over logical key-value pairs visible at `start_ts`.
     /// For explicit transactions, sees own pending writes (read-your-writes).
     ///
+    fn scan(&self, ctx: &TxnCtx, table_id: TableId, range: Range<Key>) -> Result<Self::ScanCursor>;
+
+    #[doc(hidden)]
     fn scan_iter(
         &self,
         ctx: &TxnCtx,
         table_id: TableId,
         range: Range<Key>,
-    ) -> Result<Self::ScanIter>;
+    ) -> Result<Self::ScanCursor> {
+        self.scan(ctx, table_id, range)
+    }
+
+    /// Begin a statement-local rollback scope for subsequent staged writes.
+    fn begin_statement(&self, ctx: &mut TxnCtx) -> StatementGuard;
 
     /// Write a pending put to storage.
     ///
@@ -454,6 +500,7 @@ pub trait TxnService: Send + Sync {
     fn put<'a>(
         &'a self,
         ctx: &'a mut TxnCtx,
+        stmt: &'a mut StatementGuard,
         table_id: TableId,
         key: &'a [u8],
         value: RawValue,
@@ -472,6 +519,7 @@ pub trait TxnService: Send + Sync {
     fn delete<'a>(
         &'a self,
         ctx: &'a mut TxnCtx,
+        stmt: &'a mut StatementGuard,
         table_id: TableId,
         key: &'a [u8],
     ) -> impl Future<Output = Result<()>> + Send + 'a;
@@ -483,6 +531,7 @@ pub trait TxnService: Send + Sync {
     fn lock_key<'a>(
         &'a self,
         ctx: &'a mut TxnCtx,
+        stmt: &'a mut StatementGuard,
         table_id: TableId,
         key: &'a [u8],
     ) -> impl Future<Output = Result<()>> + Send + 'a;
@@ -491,7 +540,7 @@ pub trait TxnService: Send + Sync {
     fn rollback_statement<'a>(
         &'a self,
         ctx: &'a mut TxnCtx,
-        undo: StatementUndo,
+        stmt: StatementGuard,
     ) -> impl Future<Output = Result<()>> + Send + 'a;
 
     // === Finalization ===

@@ -65,9 +65,11 @@ mod txn_state_cache;
 
 // Public API - only expose traits and types needed by consumers
 pub use api::{
-    CommitInfo, IsolationLevel, MutationMeta, MutationPayload, StatementUndo, StatementUndoEntry,
-    TxnCtx, TxnService, TxnState,
+    CommitInfo, IsolationLevel, MutationPayload, StatementGuard, TxnCtx, TxnScanCursor,
+    TxnScanEntry, TxnService, TxnState,
 };
+
+pub(crate) use api::MutationMeta;
 
 // Implementation types - not re-exported from lib.rs main API
 // Available via testkit for integration tests

@@ -23,9 +23,29 @@ use crate::codec::key::encode_record_key_with_handle;
 use crate::codec::key::gen_table_record_prefix;
 use crate::codec::row::{decode_row_to_values, encode_row};
 use crate::inner_table::core_tables::*;
-use crate::tablet::MvccIterator;
-use crate::transaction::{TxnCtx, TxnService};
+use crate::transaction::{TxnCtx, TxnScanCursor, TxnService};
 use crate::util::error::Result;
+
+async fn txn_put<T: TxnService>(
+    txn: &T,
+    ctx: &mut TxnCtx,
+    table_id: u64,
+    key: &[u8],
+    value: Vec<u8>,
+) -> Result<()> {
+    let mut stmt = txn.begin_statement(ctx);
+    txn.put(ctx, &mut stmt, table_id, key, value).await
+}
+
+async fn txn_delete<T: TxnService>(
+    txn: &T,
+    ctx: &mut TxnCtx,
+    table_id: u64,
+    key: &[u8],
+) -> Result<()> {
+    let mut stmt = txn.begin_statement(ctx);
+    txn.delete(ctx, &mut stmt, table_id, key).await
+}
 
 /// Check if the database has been bootstrapped by reading the `__all_meta`
 /// bootstrap_version row (meta_id=1) via direct KV read.
@@ -159,7 +179,7 @@ async fn write_meta_row<T: TxnService>(
         Value::BigInt(0), // updated_ts placeholder
     ];
     let row_data = encode_row(col_ids, values);
-    txn.put(ctx, ALL_META_TABLE_ID, &key, row_data).await
+    txn_put(txn, ctx, ALL_META_TABLE_ID, &key, row_data).await
 }
 
 /// Write a row into `__all_schema` (table_id=2).
@@ -176,7 +196,7 @@ async fn write_schema_row<T: TxnService>(
         Value::String(schema_name.to_string()),
     ];
     let row_data = encode_row(col_ids, values);
-    txn.put(ctx, ALL_SCHEMA_TABLE_ID, &key, row_data).await
+    txn_put(txn, ctx, ALL_SCHEMA_TABLE_ID, &key, row_data).await
 }
 
 /// Write a row into `__all_table` (table_id=3).
@@ -203,7 +223,7 @@ async fn write_table_row<T: TxnService>(
         Value::BigInt(table.auto_increment_id() as i64),
     ];
     let row_data = encode_row(col_ids, values);
-    txn.put(ctx, ALL_TABLE_TABLE_ID, &key, row_data).await
+    txn_put(txn, ctx, ALL_TABLE_TABLE_ID, &key, row_data).await
 }
 
 /// Write a row into `__all_column` (table_id=4).
@@ -235,7 +255,7 @@ async fn write_column_row<T: TxnService>(
         Value::Int(col.auto_increment() as i32),
     ];
     let row_data = encode_row(col_ids, values);
-    txn.put(ctx, ALL_COLUMN_TABLE_ID, &key, row_data).await
+    txn_put(txn, ctx, ALL_COLUMN_TABLE_ID, &key, row_data).await
 }
 
 /// Write a row into `__all_table` for a user table with an explicit schema_id.
@@ -262,7 +282,7 @@ pub(crate) async fn write_user_table_row<T: TxnService>(
         Value::BigInt(table.auto_increment_id() as i64),
     ];
     let row_data = encode_row(col_ids, values);
-    txn.put(ctx, ALL_TABLE_TABLE_ID, &key, row_data).await
+    txn_put(txn, ctx, ALL_TABLE_TABLE_ID, &key, row_data).await
 }
 
 /// Write column rows into `__all_column` for a user table.
@@ -305,7 +325,7 @@ pub(crate) async fn write_index_row<T: TxnService>(
         Value::Int(index.unique() as i32),
     ];
     let row_data = encode_row(col_ids, values);
-    txn.put(ctx, ALL_INDEX_TABLE_ID, &key, row_data).await
+    txn_put(txn, ctx, ALL_INDEX_TABLE_ID, &key, row_data).await
 }
 
 /// Delete all column rows for a table from `__all_column`.
@@ -318,7 +338,7 @@ pub(crate) async fn delete_column_rows<T: TxnService>(
     for col in columns {
         let column_key = table_id * 10000 + col.id() as u64;
         let key = encode_record_key_with_handle(ALL_COLUMN_TABLE_ID, column_key as i64);
-        txn.delete(ctx, ALL_COLUMN_TABLE_ID, &key).await?;
+        txn_delete(txn, ctx, ALL_COLUMN_TABLE_ID, &key).await?;
     }
     Ok(())
 }
@@ -333,7 +353,7 @@ pub(crate) async fn delete_index_rows<T: TxnService>(
     for index in indexes {
         let index_key = table_id * 10000 + index.id();
         let key = encode_record_key_with_handle(ALL_INDEX_TABLE_ID, index_key as i64);
-        txn.delete(ctx, ALL_INDEX_TABLE_ID, &key).await?;
+        txn_delete(txn, ctx, ALL_INDEX_TABLE_ID, &key).await?;
     }
     Ok(())
 }
@@ -361,8 +381,7 @@ pub(crate) async fn write_gc_task_row<T: TxnService>(
         Value::String(status.to_string()),
     ];
     let row_data = encode_row(col_ids, values);
-    txn.put(ctx, ALL_GC_DELETE_RANGE_TABLE_ID, &key, row_data)
-        .await
+    txn_put(txn, ctx, ALL_GC_DELETE_RANGE_TABLE_ID, &key, row_data).await
 }
 
 /// Update the status of a GC task in `__all_gc_delete_range`.
@@ -428,7 +447,7 @@ pub(crate) async fn write_autoinc_row<T: TxnService>(
         Value::BigInt(0), // updated_ts placeholder
     ];
     let row_data = encode_row(col_ids, values);
-    txn.put(ctx, ALL_AUTOINC_TABLE_ID, &key, row_data).await
+    txn_put(txn, ctx, ALL_AUTOINC_TABLE_ID, &key, row_data).await
 }
 
 /// Delete a row from `__all_autoinc` (table_id=7).
@@ -438,7 +457,7 @@ pub(crate) async fn delete_autoinc_row<T: TxnService>(
     table_id: u64,
 ) -> Result<()> {
     let key = encode_record_key_with_handle(ALL_AUTOINC_TABLE_ID, table_id as i64);
-    txn.delete(ctx, ALL_AUTOINC_TABLE_ID, &key).await
+    txn_delete(txn, ctx, ALL_AUTOINC_TABLE_ID, &key).await
 }
 
 /// Update a meta row in `__all_meta` (overwrite existing row).
@@ -489,8 +508,8 @@ async fn load_table_auto_increment_counters<T: TxnService>(
 
     let mut out = Vec::new();
     iter.advance().await?;
-    while iter.valid() {
-        let row = decode_row_to_values(iter.value(), col_ids, data_types)?;
+    while let Some(entry) = iter.current() {
+        let row = decode_row_to_values(&entry.value, col_ids, data_types)?;
         let table_id = match row[0] {
             Value::BigInt(v) => v as u64,
             _ => {
@@ -673,19 +692,19 @@ mod tests {
         let all_autoinc = all_autoinc_def();
         let table_key =
             encode_record_key_with_handle(ALL_TABLE_TABLE_ID, ALL_AUTOINC_TABLE_ID as i64);
-        txn.delete(&mut ctx, ALL_TABLE_TABLE_ID, &table_key)
+        txn_delete(txn.as_ref(), &mut ctx, ALL_TABLE_TABLE_ID, &table_key)
             .await
             .unwrap();
         for col in all_autoinc.columns() {
             let column_key = ALL_AUTOINC_TABLE_ID * 10000 + col.id() as u64;
             let key = encode_record_key_with_handle(ALL_COLUMN_TABLE_ID, column_key as i64);
-            txn.delete(&mut ctx, ALL_COLUMN_TABLE_ID, &key)
+            txn_delete(txn.as_ref(), &mut ctx, ALL_COLUMN_TABLE_ID, &key)
                 .await
                 .unwrap();
         }
         for table_id in 1..=ALL_AUTOINC_TABLE_ID {
             let key = encode_record_key_with_handle(ALL_AUTOINC_TABLE_ID, table_id as i64);
-            txn.delete(&mut ctx, ALL_AUTOINC_TABLE_ID, &key)
+            txn_delete(txn.as_ref(), &mut ctx, ALL_AUTOINC_TABLE_ID, &key)
                 .await
                 .unwrap();
         }

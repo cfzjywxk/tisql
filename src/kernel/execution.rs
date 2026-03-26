@@ -24,7 +24,6 @@ use crate::util::error::Result;
 #[derive(Debug, Clone, PartialEq)]
 pub(crate) enum LogicalPointKey {
     PrimaryKey(Vec<Value>),
-    #[allow(dead_code)]
     HiddenRowId(i64),
 }
 
@@ -50,7 +49,6 @@ pub(crate) struct PointGetRequest {
     pub projection: ProjectionSpec,
 }
 
-#[allow(dead_code)]
 #[derive(Debug, Clone)]
 pub(crate) struct ExecutionRow {
     pub key: RowKey,
@@ -132,5 +130,171 @@ impl<T: TxnService> ExecutionBackend for TxnExecutionBackend<T> {
                 row: Row::new(values),
             }))
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::ops::Range;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    use super::*;
+    use crate::catalog::types::{Lsn, RawValue, Timestamp, TxnId};
+    use crate::catalog::ColumnDef;
+    use crate::tablet::encode_row;
+    use crate::transaction::{CommitInfo, StatementGuard, TxnScanCursor, TxnScanEntry, TxnState};
+
+    struct DummyCursor;
+
+    impl TxnScanCursor for DummyCursor {
+        fn advance(&mut self) -> impl Future<Output = Result<()>> + Send + '_ {
+            async move { Ok(()) }
+        }
+
+        fn current(&self) -> Option<&TxnScanEntry> {
+            None
+        }
+    }
+
+    struct MockTxnService {
+        expected_table_id: TableId,
+        expected_key: Key,
+        row_value: RawValue,
+        get_calls: AtomicUsize,
+    }
+
+    impl TxnService for MockTxnService {
+        type ScanCursor = DummyCursor;
+
+        fn begin(&self, read_only: bool) -> Result<TxnCtx> {
+            Ok(TxnCtx::new_for_test(1, 1, read_only, false))
+        }
+
+        fn begin_explicit(&self, read_only: bool) -> Result<TxnCtx> {
+            Ok(TxnCtx::new_for_test(1, 1, read_only, true))
+        }
+
+        fn get_txn_state(&self, _start_ts: Timestamp) -> Option<TxnState> {
+            Some(TxnState::Running)
+        }
+
+        async fn get<'a>(
+            &'a self,
+            _ctx: &'a TxnCtx,
+            table_id: TableId,
+            key: &'a [u8],
+        ) -> Result<Option<RawValue>> {
+            self.get_calls.fetch_add(1, Ordering::SeqCst);
+            assert_eq!(table_id, self.expected_table_id);
+            assert_eq!(key, self.expected_key.as_slice());
+            Ok(Some(self.row_value.clone()))
+        }
+
+        fn scan(
+            &self,
+            _ctx: &TxnCtx,
+            _table_id: TableId,
+            _range: Range<Key>,
+        ) -> Result<Self::ScanCursor> {
+            Ok(DummyCursor)
+        }
+
+        fn begin_statement(&self, _ctx: &mut TxnCtx) -> StatementGuard {
+            StatementGuard::default()
+        }
+
+        async fn put<'a>(
+            &'a self,
+            _ctx: &'a mut TxnCtx,
+            _stmt: &'a mut StatementGuard,
+            _table_id: TableId,
+            _key: &'a [u8],
+            _value: RawValue,
+        ) -> Result<()> {
+            unreachable!("put should not be called in point-get tests")
+        }
+
+        async fn delete<'a>(
+            &'a self,
+            _ctx: &'a mut TxnCtx,
+            _stmt: &'a mut StatementGuard,
+            _table_id: TableId,
+            _key: &'a [u8],
+        ) -> Result<()> {
+            unreachable!("delete should not be called in point-get tests")
+        }
+
+        async fn lock_key<'a>(
+            &'a self,
+            _ctx: &'a mut TxnCtx,
+            _stmt: &'a mut StatementGuard,
+            _table_id: TableId,
+            _key: &'a [u8],
+        ) -> Result<()> {
+            unreachable!("lock_key should not be called in point-get tests")
+        }
+
+        async fn rollback_statement<'a>(
+            &'a self,
+            _ctx: &'a mut TxnCtx,
+            _stmt: StatementGuard,
+        ) -> Result<()> {
+            unreachable!("rollback_statement should not be called in point-get tests")
+        }
+
+        async fn commit(&self, _ctx: TxnCtx) -> Result<CommitInfo> {
+            Ok(CommitInfo {
+                txn_id: 1 as TxnId,
+                commit_ts: 2,
+                lsn: 3 as Lsn,
+            })
+        }
+
+        fn rollback(&self, _ctx: TxnCtx) -> Result<()> {
+            Ok(())
+        }
+    }
+
+    #[tokio::test]
+    async fn test_point_get_backend_returns_hidden_row_id_key() {
+        let table = TableDef::new(
+            501,
+            "t".to_string(),
+            "default".to_string(),
+            vec![
+                ColumnDef::new(1, "id".into(), DataType::BigInt, false, None, false),
+                ColumnDef::new(2, "name".into(), DataType::Varchar(32), true, None, false),
+            ],
+            vec![1],
+        );
+        let row_value = encode_row(&[1, 2], &[Value::BigInt(42), Value::String("alice".into())]);
+        let service = Arc::new(MockTxnService {
+            expected_table_id: table.id(),
+            expected_key: encode_int_key(table.id(), 42),
+            row_value,
+            get_calls: AtomicUsize::new(0),
+        });
+        let backend = TxnExecutionBackend::new(Arc::clone(&service));
+        let ctx = TxnCtx::new_for_test(7, 70, true, false);
+
+        let row = backend
+            .point_get(
+                &ctx,
+                PointGetRequest {
+                    table,
+                    key: LogicalPointKey::HiddenRowId(42),
+                    projection: ProjectionSpec::All,
+                },
+            )
+            .await
+            .unwrap()
+            .expect("point-get should return one row");
+
+        assert_eq!(row.key, RowKey::HiddenRowId(42));
+        assert_eq!(
+            row.row.values(),
+            &[Value::BigInt(42), Value::String("alice".into())]
+        );
+        assert_eq!(service.get_calls.load(Ordering::SeqCst), 1);
     }
 }

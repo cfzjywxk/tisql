@@ -66,8 +66,8 @@ pub use session::{
 };
 pub use tablet::{PessimisticStorage, StorageEngine, V26BoundaryMode};
 pub use transaction::{
-    CommitInfo, ConflictWaitConfig, MutationMeta, MutationPayload, StatementUndo,
-    StatementUndoEntry, TxnCtx, TxnService, TxnState,
+    CommitInfo, ConflictWaitConfig, MutationPayload, StatementGuard, TxnCtx, TxnScanCursor,
+    TxnScanEntry, TxnService, TxnState,
 };
 pub use tso::TsoService;
 pub use worker::QueryResponse;

@@ -54,7 +54,7 @@ pub enum ExecutionResult {
 
 /// Type-erased async row producer for the volcano-style pipeline.
 ///
-/// `Operator<I>` is generic over `I: MvccIterator`. To return it through
+/// `Operator<I>` is generic over `I: TxnScanCursor`. To return it through
 /// the non-generic `Execution`, we erase the type via this trait.
 pub(crate) trait RowPuller: Send {
     fn next(&mut self) -> Pin<Box<dyn Future<Output = Result<Option<Row>>> + Send + '_>>;

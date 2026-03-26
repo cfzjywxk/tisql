@@ -37,9 +37,8 @@ use crate::session::{ExecutionCtx, StatementCtx};
 use crate::sql::{AggFunc, BinaryOp, Expr, LogicalPlan, OrderByExpr, UnaryOp};
 use crate::tablet::{
     decode_row_to_values, encode_int_key, encode_key, encode_pk, encode_row, next_key_bound,
-    MvccIterator,
 };
-use crate::transaction::{TxnCtx, TxnService};
+use crate::transaction::{StatementGuard, TxnCtx, TxnScanCursor, TxnService};
 use crate::util::error::{Result, TiSqlError};
 
 use super::{DdlEffect, Execution, ExecutionOutput, Executor, RowPuller};
@@ -385,8 +384,8 @@ fn compute_aggregate(func: &AggFunc, arg: &Expr, rows: &[Row]) -> Result<Value> 
 // Operator Structs
 // ============================================================================
 
-/// Table scan operator — reads rows from storage via MvccIterator.
-struct ScanOp<I: MvccIterator> {
+/// Table scan operator — reads rows from storage via TxnScanCursor.
+struct ScanOp<I: TxnScanCursor> {
     iter: I,
     schema: Schema,
     col_ids: Vec<ColumnId>,
@@ -408,20 +407,20 @@ struct EmptyOp {
 }
 
 /// Projection operator — evaluates expressions on each row.
-struct ProjectOp<I: MvccIterator> {
+struct ProjectOp<I: TxnScanCursor> {
     child: Box<Operator<I>>,
     exprs: Vec<(Expr, String)>,
     schema: Schema,
 }
 
 /// Filter operator — keeps rows matching predicate.
-struct FilterOp<I: MvccIterator> {
+struct FilterOp<I: TxnScanCursor> {
     child: Box<Operator<I>>,
     predicate: Expr,
 }
 
 /// Limit/offset operator — caps output row count.
-struct LimitOp<I: MvccIterator> {
+struct LimitOp<I: TxnScanCursor> {
     child: Box<Operator<I>>,
     limit: Option<usize>,
     offset: usize,
@@ -430,14 +429,14 @@ struct LimitOp<I: MvccIterator> {
 }
 
 /// Sort operator — materializes all rows on first next(), then yields sorted.
-struct SortOp<I: MvccIterator> {
+struct SortOp<I: TxnScanCursor> {
     child: Box<Operator<I>>,
     order_by: Vec<OrderByExpr>,
     sorted_rows: Option<std::vec::IntoIter<Row>>,
 }
 
 /// Aggregate operator — materializes all rows on first next(), computes aggregates.
-struct AggregateOp<I: MvccIterator> {
+struct AggregateOp<I: TxnScanCursor> {
     child: Box<Operator<I>>,
     group_by: Vec<Expr>,
     agg_exprs: Vec<(AggFunc, Expr, String)>,
@@ -451,9 +450,9 @@ struct AggregateOp<I: MvccIterator> {
 
 /// Volcano-style operator tree node.
 ///
-/// Generic over `I: MvccIterator` — the storage iterator type, known at
-/// compile time via `TxnService::ScanIter`.
-enum Operator<I: MvccIterator> {
+/// Generic over `I: TxnScanCursor` — the storage iterator type, known at
+/// compile time via `TxnService::ScanCursor`.
+enum Operator<I: TxnScanCursor> {
     Scan(ScanOp<I>),
     Values(ValuesOp),
     Empty(EmptyOp),
@@ -464,7 +463,7 @@ enum Operator<I: MvccIterator> {
     Aggregate(AggregateOp<I>),
 }
 
-impl<I: MvccIterator> Operator<I> {
+impl<I: TxnScanCursor> Operator<I> {
     /// Cascade open to children. Leaf nodes are no-ops.
     /// No I/O happens here — real work is deferred to first `next()` call.
     fn open(&mut self) -> Pin<Box<dyn Future<Output = Result<()>> + Send + '_>> {
@@ -511,7 +510,7 @@ impl<I: MvccIterator> Operator<I> {
     }
 }
 
-impl<I: MvccIterator> RowPuller for Operator<I> {
+impl<I: TxnScanCursor> RowPuller for Operator<I> {
     fn next(&mut self) -> Pin<Box<dyn Future<Output = Result<Option<Row>>> + Send + '_>> {
         Operator::next(self)
     }
@@ -521,15 +520,15 @@ impl<I: MvccIterator> RowPuller for Operator<I> {
 // Individual Operator Implementations
 // ============================================================================
 
-impl<I: MvccIterator> ScanOp<I> {
+impl<I: TxnScanCursor> ScanOp<I> {
     async fn next(&mut self) -> Result<Option<Row>> {
         if !self.initialized {
             self.initialized = true;
             self.iter.advance().await?;
         }
 
-        while self.iter.valid() {
-            let value = self.iter.value();
+        while let Some(entry) = self.iter.current() {
+            let value = entry.value.as_slice();
             let values = decode_row_to_values(value, &self.col_ids, &self.data_types)?;
             let row = Row::new(values);
 
@@ -559,7 +558,7 @@ impl<I: MvccIterator> ScanOp<I> {
     }
 }
 
-impl<I: MvccIterator> ProjectOp<I> {
+impl<I: TxnScanCursor> ProjectOp<I> {
     async fn next(&mut self) -> Result<Option<Row>> {
         if let Some(row) = self.child.next().await? {
             let values = self
@@ -574,7 +573,7 @@ impl<I: MvccIterator> ProjectOp<I> {
     }
 }
 
-impl<I: MvccIterator> FilterOp<I> {
+impl<I: TxnScanCursor> FilterOp<I> {
     async fn next(&mut self) -> Result<Option<Row>> {
         while let Some(row) = self.child.next().await? {
             let result = eval_expr(&self.predicate, &row)?;
@@ -586,7 +585,7 @@ impl<I: MvccIterator> FilterOp<I> {
     }
 }
 
-impl<I: MvccIterator> LimitOp<I> {
+impl<I: TxnScanCursor> LimitOp<I> {
     async fn next(&mut self) -> Result<Option<Row>> {
         // Skip offset rows
         while self.skipped < self.offset {
@@ -611,7 +610,7 @@ impl<I: MvccIterator> LimitOp<I> {
     }
 }
 
-impl<I: MvccIterator> SortOp<I> {
+impl<I: TxnScanCursor> SortOp<I> {
     async fn next(&mut self) -> Result<Option<Row>> {
         if self.sorted_rows.is_none() {
             // Materialize all rows from child, then sort
@@ -638,7 +637,7 @@ impl<I: MvccIterator> SortOp<I> {
     }
 }
 
-impl<I: MvccIterator> AggregateOp<I> {
+impl<I: TxnScanCursor> AggregateOp<I> {
     async fn next(&mut self) -> Result<Option<Row>> {
         if self.result.is_none() {
             // Materialize all rows from child
@@ -678,7 +677,7 @@ async fn build_read_operator<T: TxnService>(
     txn_service: &T,
     execution_backend: &impl ExecutionBackend,
     ctx: &TxnCtx,
-) -> Result<Operator<T::ScanIter>> {
+) -> Result<Operator<T::ScanCursor>> {
     match plan {
         LogicalPlan::Scan {
             table,
@@ -717,7 +716,7 @@ async fn build_read_operator<T: TxnService>(
                 None => start_key..end_key,
             };
 
-            let iter = txn_service.scan_iter(ctx, table_id, scan_range)?;
+            let iter = txn_service.scan(ctx, table_id, scan_range)?;
 
             Ok(Operator::Scan(ScanOp {
                 iter,
@@ -1007,66 +1006,44 @@ fn row_matches_filter(filter: Option<&Expr>, row: &Row) -> Result<bool> {
 
 async fn stmt_put<T: TxnService>(
     txn_service: &T,
-    stmt_ctx: &mut StatementCtx,
+    stmt: &mut StatementGuard,
     ctx: &mut TxnCtx,
     table_id: TableId,
     key: &[u8],
     value: Vec<u8>,
 ) -> Result<()> {
-    let record_undo = ctx.is_explicit() && !stmt_ctx.has_undo_for(key);
-    let previous = record_undo
-        .then(|| ctx.mutations.get(key).cloned())
-        .flatten();
-    txn_service.put(ctx, table_id, key, value).await?;
-    if record_undo {
-        stmt_ctx.record_first_touch(key, previous);
-    }
-    Ok(())
+    txn_service.put(ctx, stmt, table_id, key, value).await
 }
 
 async fn stmt_delete<T: TxnService>(
     txn_service: &T,
-    stmt_ctx: &mut StatementCtx,
+    stmt: &mut StatementGuard,
     ctx: &mut TxnCtx,
     table_id: TableId,
     key: &[u8],
 ) -> Result<()> {
-    let record_undo = ctx.is_explicit() && !stmt_ctx.has_undo_for(key);
-    let previous = record_undo
-        .then(|| ctx.mutations.get(key).cloned())
-        .flatten();
-    txn_service.delete(ctx, table_id, key).await?;
-    if record_undo {
-        stmt_ctx.record_first_touch(key, previous);
-    }
-    Ok(())
+    txn_service.delete(ctx, stmt, table_id, key).await
 }
 
 async fn stmt_lock_key<T: TxnService>(
     txn_service: &T,
-    stmt_ctx: &mut StatementCtx,
+    stmt: &mut StatementGuard,
     ctx: &mut TxnCtx,
     table_id: TableId,
     key: &[u8],
 ) -> Result<()> {
-    let record_undo =
-        ctx.is_explicit() && !stmt_ctx.has_undo_for(key) && !ctx.mutations.contains_key(key);
-    txn_service.lock_key(ctx, table_id, key).await?;
-    if record_undo && ctx.mutations.contains_key(key) {
-        stmt_ctx.record_first_touch(key, None);
-    }
-    Ok(())
+    txn_service.lock_key(ctx, stmt, table_id, key).await
 }
 
 async fn lock_key_if_explicit<T: TxnService>(
     txn_service: &T,
-    stmt_ctx: &mut StatementCtx,
+    stmt: &mut StatementGuard,
     ctx: &mut TxnCtx,
     table_id: TableId,
     key: &[u8],
 ) -> Result<()> {
     if ctx.is_explicit() {
-        stmt_lock_key(txn_service, stmt_ctx, ctx, table_id, key).await?;
+        stmt_lock_key(txn_service, stmt, ctx, table_id, key).await?;
     }
     Ok(())
 }
@@ -1079,14 +1056,13 @@ async fn collect_scan_rows<T: TxnService>(
     col_ids: &[ColumnId],
     data_types: &[DataType],
 ) -> Result<Vec<(Key, Vec<Value>)>> {
-    let mut iter = txn_service.scan_iter(ctx, table_id, range)?;
+    let mut iter = txn_service.scan(ctx, table_id, range)?;
     iter.advance().await?;
 
     let mut rows = Vec::new();
-    while iter.valid() {
-        let key = iter.user_key().to_vec();
-        let values = decode_row_to_values(iter.value(), col_ids, data_types)?;
-        rows.push((key, values));
+    while let Some(entry) = iter.current() {
+        let values = decode_row_to_values(&entry.value, col_ids, data_types)?;
+        rows.push((entry.user_key.clone(), values));
         iter.advance().await?;
     }
     Ok(rows)
@@ -1493,15 +1469,22 @@ impl Executor for SimpleExecutor {
                         );
                     }
 
+                    let mut stmt = txn_service.begin_statement(&mut ctx);
                     match self
-                        .execute_write_with_ctx(plan, stmt_ctx, &mut ctx, txn_service, catalog)
+                        .execute_write_with_ctx(
+                            plan,
+                            stmt_ctx,
+                            &mut stmt,
+                            &mut ctx,
+                            txn_service,
+                            catalog,
+                        )
                         .await
                     {
                         Ok(result) => (Ok(result), Some(ctx)),
                         Err(e) => {
-                            let rollback_result = txn_service
-                                .rollback_statement(&mut ctx, stmt_ctx.take_undo())
-                                .await;
+                            let rollback_result =
+                                txn_service.rollback_statement(&mut ctx, stmt).await;
                             match rollback_result {
                                 Ok(()) => (Err(e), Some(ctx)),
                                 Err(stmt_rollback_err) => match txn_service.rollback(ctx) {
@@ -1616,10 +1599,11 @@ impl SimpleExecutor {
 
         // Begin a read-write transaction (allocates txn_id and start_ts)
         let mut ctx = txn_service.begin(false)?;
+        let mut stmt = txn_service.begin_statement(&mut ctx);
 
         // Execute the write plan and get the result
         let result = match self
-            .execute_write_with_ctx(plan, stmt_ctx, &mut ctx, txn_service, catalog)
+            .execute_write_with_ctx(plan, stmt_ctx, &mut stmt, &mut ctx, txn_service, catalog)
             .await
         {
             Ok(r) => r,
@@ -1728,7 +1712,8 @@ impl SimpleExecutor {
     async fn execute_write_with_ctx<T: TxnService, C: Catalog>(
         &self,
         plan: LogicalPlan,
-        stmt_ctx: &mut StatementCtx,
+        _stmt_ctx: &mut StatementCtx,
+        stmt: &mut StatementGuard,
         ctx: &mut TxnCtx,
         txn_service: &T,
         catalog: &C,
@@ -1811,7 +1796,7 @@ impl SimpleExecutor {
                     txn_service.record_duplicate_check_duration(duplicate_check_begin.elapsed());
                     if duplicate_exists {
                         if ignore {
-                            stmt_lock_key(txn_service, stmt_ctx, ctx, table.id(), &key).await?;
+                            stmt_lock_key(txn_service, stmt, ctx, table.id(), &key).await?;
                             continue;
                         }
                         let pk_desc = if pk_indices.is_empty() {
@@ -1832,7 +1817,7 @@ impl SimpleExecutor {
                     let value = encode_row(&col_ids, &row_values);
 
                     // Buffer write in transaction
-                    stmt_put(txn_service, stmt_ctx, ctx, table.id(), &key, value).await?;
+                    stmt_put(txn_service, stmt, ctx, table.id(), &key, value).await?;
                     if let Some(explicit_v) = explicit_auto_inc_observe {
                         catalog.observe_auto_increment_explicit(table.id(), explicit_v)?;
                     }
@@ -1858,10 +1843,10 @@ impl SimpleExecutor {
                             let values = decode_row_to_values(&value, &col_ids, &data_types)?;
                             let row = Row::new(values);
                             if row_matches_filter(filter.as_ref(), &row)? {
-                                stmt_delete(txn_service, stmt_ctx, ctx, table_id, &key).await?;
+                                stmt_delete(txn_service, stmt, ctx, table_id, &key).await?;
                                 count += 1;
                             } else {
-                                stmt_lock_key(txn_service, stmt_ctx, ctx, table_id, &key).await?;
+                                stmt_lock_key(txn_service, stmt, ctx, table_id, &key).await?;
                             }
                         }
                     }
@@ -1879,28 +1864,27 @@ impl SimpleExecutor {
                             for (key, values) in scanned_rows {
                                 let row = Row::new(values);
                                 if row_matches_filter(filter.as_ref(), &row)? {
-                                    stmt_delete(txn_service, stmt_ctx, ctx, table_id, &key).await?;
+                                    stmt_delete(txn_service, stmt, ctx, table_id, &key).await?;
                                     count += 1;
                                 } else {
-                                    stmt_lock_key(txn_service, stmt_ctx, ctx, table_id, &key)
-                                        .await?;
+                                    stmt_lock_key(txn_service, stmt, ctx, table_id, &key).await?;
                                 }
                             }
                         } else {
-                            let mut iter = txn_service.scan_iter(ctx, table_id, range)?;
+                            let mut iter = txn_service.scan(ctx, table_id, range)?;
                             iter.advance().await?;
-                            while iter.valid() {
-                                let key = iter.user_key();
+                            while let Some(entry) = iter.current() {
+                                let key = entry.user_key.as_slice();
                                 let values =
-                                    decode_row_to_values(iter.value(), &col_ids, &data_types)?;
+                                    decode_row_to_values(&entry.value, &col_ids, &data_types)?;
                                 let row = Row::new(values);
                                 if row_matches_filter(filter.as_ref(), &row)? {
-                                    stmt_delete(txn_service, stmt_ctx, ctx, table_id, key).await?;
+                                    stmt_delete(txn_service, stmt, ctx, table_id, key).await?;
                                     count += 1;
                                 } else {
                                     // In implicit autocommit this is a no-op; keep the helper
                                     // for defensive consistency with explicit paths.
-                                    lock_key_if_explicit(txn_service, stmt_ctx, ctx, table_id, key)
+                                    lock_key_if_explicit(txn_service, stmt, ctx, table_id, key)
                                         .await?;
                                 }
                                 iter.advance().await?;
@@ -1970,8 +1954,7 @@ impl SimpleExecutor {
                                 let row_unchanged =
                                     !key_changed && row.values() == original_values.as_slice();
                                 if row_unchanged {
-                                    stmt_lock_key(txn_service, stmt_ctx, ctx, table_id, &key)
-                                        .await?;
+                                    stmt_lock_key(txn_service, stmt, ctx, table_id, &key).await?;
                                 } else {
                                     if key_changed
                                         && txn_service
@@ -1990,13 +1973,12 @@ impl SimpleExecutor {
                                     }
 
                                     if key_changed {
-                                        stmt_delete(txn_service, stmt_ctx, ctx, table_id, &key)
-                                            .await?;
+                                        stmt_delete(txn_service, stmt, ctx, table_id, &key).await?;
                                     }
                                     let new_value = encode_row(&col_ids, row.values());
                                     stmt_put(
                                         txn_service,
-                                        stmt_ctx,
+                                        stmt,
                                         ctx,
                                         table_id,
                                         target_key,
@@ -2006,7 +1988,7 @@ impl SimpleExecutor {
                                 }
                                 count += 1;
                             } else {
-                                stmt_lock_key(txn_service, stmt_ctx, ctx, table_id, &key).await?;
+                                stmt_lock_key(txn_service, stmt, ctx, table_id, &key).await?;
                             }
                         }
                     }
@@ -2060,7 +2042,7 @@ impl SimpleExecutor {
                                         // for defensive consistency with explicit paths.
                                         lock_key_if_explicit(
                                             txn_service,
-                                            stmt_ctx,
+                                            stmt,
                                             ctx,
                                             table_id,
                                             &old_key,
@@ -2086,20 +2068,14 @@ impl SimpleExecutor {
                                         }
 
                                         if key_changed {
-                                            stmt_delete(
-                                                txn_service,
-                                                stmt_ctx,
-                                                ctx,
-                                                table_id,
-                                                &old_key,
-                                            )
-                                            .await?;
+                                            stmt_delete(txn_service, stmt, ctx, table_id, &old_key)
+                                                .await?;
                                         }
 
                                         let new_value = encode_row(&col_ids, row.values());
                                         stmt_put(
                                             txn_service,
-                                            stmt_ctx,
+                                            stmt,
                                             ctx,
                                             table_id,
                                             target_key,
@@ -2109,17 +2085,17 @@ impl SimpleExecutor {
                                     }
                                     count += 1;
                                 } else {
-                                    stmt_lock_key(txn_service, stmt_ctx, ctx, table_id, &old_key)
+                                    stmt_lock_key(txn_service, stmt, ctx, table_id, &old_key)
                                         .await?;
                                 }
                             }
                         } else {
-                            let mut iter = txn_service.scan_iter(ctx, table_id, range)?;
+                            let mut iter = txn_service.scan(ctx, table_id, range)?;
                             iter.advance().await?;
-                            while iter.valid() {
-                                let key_ref = iter.user_key();
+                            while let Some(entry) = iter.current() {
+                                let key_ref = entry.user_key.as_slice();
                                 let original_values =
-                                    decode_row_to_values(iter.value(), &col_ids, &data_types)?;
+                                    decode_row_to_values(&entry.value, &col_ids, &data_types)?;
                                 let mut row = Row::new(original_values.clone());
 
                                 if row_matches_filter(filter.as_ref(), &row)? {
@@ -2152,14 +2128,8 @@ impl SimpleExecutor {
                                     let row_unchanged =
                                         !key_changed && row.values() == original_values.as_slice();
                                     if row_unchanged {
-                                        stmt_lock_key(
-                                            txn_service,
-                                            stmt_ctx,
-                                            ctx,
-                                            table_id,
-                                            key_ref,
-                                        )
-                                        .await?;
+                                        stmt_lock_key(txn_service, stmt, ctx, table_id, key_ref)
+                                            .await?;
                                     } else {
                                         if key_changed
                                             && txn_service
@@ -2180,20 +2150,14 @@ impl SimpleExecutor {
                                         }
 
                                         if key_changed {
-                                            stmt_delete(
-                                                txn_service,
-                                                stmt_ctx,
-                                                ctx,
-                                                table_id,
-                                                key_ref,
-                                            )
-                                            .await?;
+                                            stmt_delete(txn_service, stmt, ctx, table_id, key_ref)
+                                                .await?;
                                         }
 
                                         let new_value = encode_row(&col_ids, row.values());
                                         stmt_put(
                                             txn_service,
-                                            stmt_ctx,
+                                            stmt,
                                             ctx,
                                             table_id,
                                             target_key,
@@ -2205,14 +2169,8 @@ impl SimpleExecutor {
                                 } else {
                                     // In implicit autocommit this is a no-op; keep the helper
                                     // for defensive consistency with explicit paths.
-                                    lock_key_if_explicit(
-                                        txn_service,
-                                        stmt_ctx,
-                                        ctx,
-                                        table_id,
-                                        key_ref,
-                                    )
-                                    .await?;
+                                    lock_key_if_explicit(txn_service, stmt, ctx, table_id, key_ref)
+                                        .await?;
                                 }
                                 iter.advance().await?;
                             }
@@ -2244,34 +2202,17 @@ mod tests {
     use crate::kernel::execution::{
         ExecutionBackend, ExecutionRow, LogicalPointKey, PointGetRequest, RowKey,
     };
-    use crate::tablet::MvccKey;
-    use crate::transaction::{CommitInfo, TxnState};
+    use crate::transaction::{CommitInfo, StatementGuard, TxnScanEntry, TxnState};
 
     struct DummyIter;
 
-    impl MvccIterator for DummyIter {
-        async fn seek(&mut self, _target: &MvccKey) -> Result<()> {
-            Ok(())
+    impl TxnScanCursor for DummyIter {
+        fn advance(&mut self) -> impl Future<Output = Result<()>> + Send + '_ {
+            async move { Ok(()) }
         }
 
-        async fn advance(&mut self) -> Result<()> {
-            Ok(())
-        }
-
-        fn valid(&self) -> bool {
-            false
-        }
-
-        fn user_key(&self) -> &[u8] {
-            panic!("dummy iterator should never be used")
-        }
-
-        fn timestamp(&self) -> Timestamp {
-            panic!("dummy iterator should never be used")
-        }
-
-        fn value(&self) -> &[u8] {
-            panic!("dummy iterator should never be used")
+        fn current(&self) -> Option<&TxnScanEntry> {
+            None
         }
     }
 
@@ -2328,7 +2269,7 @@ mod tests {
     }
 
     impl TxnService for MockPointGetTxnService {
-        type ScanIter = DummyIter;
+        type ScanCursor = DummyIter;
 
         fn begin(&self, read_only: bool) -> Result<TxnCtx> {
             Ok(TxnCtx::new(1, 1, read_only))
@@ -2340,6 +2281,10 @@ mod tests {
 
         fn get_txn_state(&self, _start_ts: Timestamp) -> Option<TxnState> {
             Some(TxnState::Running)
+        }
+
+        fn begin_statement(&self, _ctx: &mut TxnCtx) -> StatementGuard {
+            StatementGuard::default()
         }
 
         async fn get<'a>(
@@ -2356,12 +2301,12 @@ mod tests {
             Ok(self.row_value.clone())
         }
 
-        fn scan_iter(
+        fn scan(
             &self,
             _ctx: &TxnCtx,
             table_id: TableId,
             range: Range<Vec<u8>>,
-        ) -> Result<Self::ScanIter> {
+        ) -> Result<Self::ScanCursor> {
             assert_eq!(table_id, self.table_id);
             self.scan_calls.fetch_add(1, Ordering::SeqCst);
             *self.last_scan_range.lock() = Some(range);
@@ -2371,29 +2316,38 @@ mod tests {
         async fn put<'a>(
             &'a self,
             _ctx: &'a mut TxnCtx,
+            stmt: &'a mut StatementGuard,
             table_id: TableId,
-            _key: &'a [u8],
+            key: &'a [u8],
             _value: RawValue,
         ) -> Result<()> {
             assert_eq!(table_id, self.table_id);
             self.put_calls.fetch_add(1, Ordering::SeqCst);
+            if !stmt.contains_key(key) {
+                stmt.record_first_touch(key, None);
+            }
             Ok(())
         }
 
         async fn delete<'a>(
             &'a self,
             _ctx: &'a mut TxnCtx,
+            stmt: &'a mut StatementGuard,
             table_id: TableId,
-            _key: &'a [u8],
+            key: &'a [u8],
         ) -> Result<()> {
             assert_eq!(table_id, self.table_id);
             self.delete_calls.fetch_add(1, Ordering::SeqCst);
+            if !stmt.contains_key(key) {
+                stmt.record_first_touch(key, None);
+            }
             Ok(())
         }
 
         async fn lock_key<'a>(
             &'a self,
             ctx: &'a mut TxnCtx,
+            stmt: &'a mut StatementGuard,
             table_id: TableId,
             key: &'a [u8],
         ) -> Result<()> {
@@ -2406,13 +2360,16 @@ mod tests {
                     tablet_id: crate::tablet::TabletId::Table { table_id },
                 },
             );
+            if !stmt.contains_key(key) {
+                stmt.record_first_touch(key, None);
+            }
             Ok(())
         }
 
         async fn rollback_statement<'a>(
             &'a self,
             _ctx: &'a mut TxnCtx,
-            _undo: crate::transaction::StatementUndo,
+            _undo: StatementGuard,
         ) -> Result<()> {
             Ok(())
         }
@@ -2434,6 +2391,7 @@ mod tests {
         rows: Vec<(Key, RawValue)>,
         index: usize,
         started: bool,
+        current: Option<TxnScanEntry>,
     }
 
     impl MockRowsIter {
@@ -2442,40 +2400,29 @@ mod tests {
                 rows,
                 index: 0,
                 started: false,
+                current: None,
             }
         }
     }
 
-    impl MvccIterator for MockRowsIter {
-        async fn seek(&mut self, _target: &MvccKey) -> Result<()> {
-            self.started = true;
-            self.index = 0;
-            Ok(())
-        }
-
-        async fn advance(&mut self) -> Result<()> {
-            if !self.started {
-                self.started = true;
-            } else {
-                self.index += 1;
+    impl TxnScanCursor for MockRowsIter {
+        fn advance(&mut self) -> impl Future<Output = Result<()>> + Send + '_ {
+            async move {
+                if !self.started {
+                    self.started = true;
+                } else {
+                    self.index += 1;
+                }
+                self.current = self.rows.get(self.index).map(|(key, value)| TxnScanEntry {
+                    user_key: key.clone(),
+                    value: value.clone(),
+                });
+                Ok(())
             }
-            Ok(())
         }
 
-        fn valid(&self) -> bool {
-            self.started && self.index < self.rows.len()
-        }
-
-        fn user_key(&self) -> &[u8] {
-            &self.rows[self.index].0
-        }
-
-        fn timestamp(&self) -> Timestamp {
-            0
-        }
-
-        fn value(&self) -> &[u8] {
-            &self.rows[self.index].1
+        fn current(&self) -> Option<&TxnScanEntry> {
+            self.current.as_ref()
         }
     }
 
@@ -2489,7 +2436,7 @@ mod tests {
     }
 
     impl TxnService for MockScanRowsTxnService {
-        type ScanIter = MockRowsIter;
+        type ScanCursor = MockRowsIter;
 
         fn begin(&self, read_only: bool) -> Result<TxnCtx> {
             Ok(TxnCtx::new(1, 1, read_only))
@@ -2503,6 +2450,10 @@ mod tests {
             Some(TxnState::Running)
         }
 
+        fn begin_statement(&self, _ctx: &mut TxnCtx) -> StatementGuard {
+            StatementGuard::default()
+        }
+
         async fn get<'a>(
             &'a self,
             _ctx: &'a TxnCtx,
@@ -2513,12 +2464,12 @@ mod tests {
             Ok(None)
         }
 
-        fn scan_iter(
+        fn scan(
             &self,
             _ctx: &TxnCtx,
             table_id: TableId,
             _range: Range<Vec<u8>>,
-        ) -> Result<Self::ScanIter> {
+        ) -> Result<Self::ScanCursor> {
             assert_eq!(table_id, self.table_id);
             self.scan_calls.fetch_add(1, Ordering::SeqCst);
             Ok(MockRowsIter::new(self.rows.clone()))
@@ -2527,6 +2478,7 @@ mod tests {
         async fn put<'a>(
             &'a self,
             _ctx: &'a mut TxnCtx,
+            _stmt: &'a mut StatementGuard,
             table_id: TableId,
             _key: &'a [u8],
             _value: RawValue,
@@ -2539,6 +2491,7 @@ mod tests {
         async fn delete<'a>(
             &'a self,
             _ctx: &'a mut TxnCtx,
+            _stmt: &'a mut StatementGuard,
             table_id: TableId,
             _key: &'a [u8],
         ) -> Result<()> {
@@ -2550,6 +2503,7 @@ mod tests {
         async fn lock_key<'a>(
             &'a self,
             _ctx: &'a mut TxnCtx,
+            _stmt: &'a mut StatementGuard,
             table_id: TableId,
             _key: &'a [u8],
         ) -> Result<()> {
@@ -2561,7 +2515,7 @@ mod tests {
         async fn rollback_statement<'a>(
             &'a self,
             _ctx: &'a mut TxnCtx,
-            _undo: crate::transaction::StatementUndo,
+            _undo: StatementGuard,
         ) -> Result<()> {
             Ok(())
         }
@@ -2589,7 +2543,7 @@ mod tests {
     }
 
     impl TxnService for MockStatementRollbackTxnService {
-        type ScanIter = DummyIter;
+        type ScanCursor = DummyIter;
 
         fn begin(&self, read_only: bool) -> Result<TxnCtx> {
             Ok(TxnCtx::new(1, 1, read_only))
@@ -2603,6 +2557,10 @@ mod tests {
             Some(TxnState::Running)
         }
 
+        fn begin_statement(&self, _ctx: &mut TxnCtx) -> StatementGuard {
+            StatementGuard::default()
+        }
+
         async fn get<'a>(
             &'a self,
             _ctx: &'a TxnCtx,
@@ -2613,20 +2571,21 @@ mod tests {
             Ok(None)
         }
 
-        fn scan_iter(
+        fn scan(
             &self,
             _ctx: &TxnCtx,
             _table_id: TableId,
             _range: Range<Vec<u8>>,
-        ) -> Result<Self::ScanIter> {
+        ) -> Result<Self::ScanCursor> {
             Ok(DummyIter)
         }
 
         async fn put<'a>(
             &'a self,
             _ctx: &'a mut TxnCtx,
+            stmt: &'a mut StatementGuard,
             table_id: TableId,
-            _key: &'a [u8],
+            key: &'a [u8],
             _value: RawValue,
         ) -> Result<()> {
             assert_eq!(table_id, self.table_id);
@@ -2634,6 +2593,9 @@ mod tests {
             if call == self.put_fail_on_call {
                 Err(TiSqlError::LockWaitTimeout)
             } else {
+                if !stmt.contains_key(key) {
+                    stmt.record_first_touch(key, None);
+                }
                 Ok(())
             }
         }
@@ -2641,6 +2603,7 @@ mod tests {
         async fn delete<'a>(
             &'a self,
             _ctx: &'a mut TxnCtx,
+            _stmt: &'a mut StatementGuard,
             _table_id: TableId,
             _key: &'a [u8],
         ) -> Result<()> {
@@ -2650,6 +2613,7 @@ mod tests {
         async fn lock_key<'a>(
             &'a self,
             _ctx: &'a mut TxnCtx,
+            _stmt: &'a mut StatementGuard,
             _table_id: TableId,
             _key: &'a [u8],
         ) -> Result<()> {
@@ -2659,7 +2623,7 @@ mod tests {
         async fn rollback_statement<'a>(
             &'a self,
             _ctx: &'a mut TxnCtx,
-            undo: crate::transaction::StatementUndo,
+            undo: StatementGuard,
         ) -> Result<()> {
             self.rollback_statement_calls.fetch_add(1, Ordering::SeqCst);
             self.last_undo_len.store(undo.len(), Ordering::SeqCst);
@@ -2995,10 +2959,12 @@ mod tests {
         };
 
         let mut stmt_ctx = StatementCtx::new();
+        let mut stmt = service.begin_statement(&mut ctx);
         let output = SimpleExecutor::new()
             .execute_write_with_ctx(
                 plan,
                 &mut stmt_ctx,
+                &mut stmt,
                 &mut ctx,
                 &service,
                 &MemoryCatalog::new(),
@@ -3057,10 +3023,12 @@ mod tests {
         };
 
         let mut stmt_ctx = StatementCtx::new();
+        let mut stmt = service.begin_statement(&mut ctx);
         let output = SimpleExecutor::new()
             .execute_write_with_ctx(
                 plan,
                 &mut stmt_ctx,
+                &mut stmt,
                 &mut ctx,
                 &service,
                 &MemoryCatalog::new(),
@@ -3118,10 +3086,12 @@ mod tests {
         };
 
         let mut stmt_ctx = StatementCtx::new();
+        let mut stmt = service.begin_statement(&mut ctx);
         let output = SimpleExecutor::new()
             .execute_write_with_ctx(
                 plan,
                 &mut stmt_ctx,
+                &mut stmt,
                 &mut ctx,
                 &service,
                 &MemoryCatalog::new(),
@@ -3181,10 +3151,12 @@ mod tests {
         };
 
         let mut stmt_ctx = StatementCtx::new();
+        let mut stmt = service.begin_statement(&mut ctx);
         let output = SimpleExecutor::new()
             .execute_write_with_ctx(
                 plan,
                 &mut stmt_ctx,
+                &mut stmt,
                 &mut ctx,
                 &service,
                 &MemoryCatalog::new(),
@@ -3250,10 +3222,12 @@ mod tests {
         };
 
         let mut stmt_ctx = StatementCtx::new();
+        let mut stmt = service.begin_statement(&mut ctx);
         let output = SimpleExecutor::new()
             .execute_write_with_ctx(
                 plan,
                 &mut stmt_ctx,
+                &mut stmt,
                 &mut ctx,
                 &service,
                 &MemoryCatalog::new(),
@@ -3326,10 +3300,12 @@ mod tests {
         };
 
         let mut stmt_ctx = StatementCtx::new();
+        let mut stmt = service.begin_statement(&mut ctx);
         let output = SimpleExecutor::new()
             .execute_write_with_ctx(
                 plan,
                 &mut stmt_ctx,
+                &mut stmt,
                 &mut ctx,
                 &service,
                 &MemoryCatalog::new(),
@@ -3407,10 +3383,12 @@ mod tests {
         };
 
         let mut stmt_ctx = StatementCtx::new();
+        let mut stmt = service.begin_statement(&mut ctx);
         let output = SimpleExecutor::new()
             .execute_write_with_ctx(
                 plan,
                 &mut stmt_ctx,
+                &mut stmt,
                 &mut ctx,
                 &service,
                 &MemoryCatalog::new(),
@@ -3470,10 +3448,12 @@ mod tests {
 
         let mut ctx = TxnCtx::new(51, 500, false);
         let mut stmt_ctx = StatementCtx::new();
+        let mut stmt = service.begin_statement(&mut ctx);
         let output = SimpleExecutor::new()
             .execute_write_with_ctx(
                 plan,
                 &mut stmt_ctx,
+                &mut stmt,
                 &mut ctx,
                 &service,
                 &MemoryCatalog::new(),
@@ -3503,13 +3483,13 @@ mod tests {
         };
 
         let mut ctx = TxnCtx::new(61, 600, false);
-        let mut stmt_ctx = StatementCtx::new();
-        lock_key_if_explicit(&service, &mut stmt_ctx, &mut ctx, 606, b"k")
+        let mut stmt = service.begin_statement(&mut ctx);
+        lock_key_if_explicit(&service, &mut stmt, &mut ctx, 606, b"k")
             .await
             .unwrap();
 
         assert_eq!(service.lock_calls.load(Ordering::SeqCst), 0);
-        assert!(stmt_ctx.take_undo().is_empty());
+        assert!(stmt.is_empty());
     }
 
     #[tokio::test]
@@ -3527,13 +3507,13 @@ mod tests {
         };
 
         let mut ctx = TxnCtx::new_explicit(62, 601, false);
-        let mut stmt_ctx = StatementCtx::new();
-        lock_key_if_explicit(&service, &mut stmt_ctx, &mut ctx, 607, b"k")
+        let mut stmt = service.begin_statement(&mut ctx);
+        lock_key_if_explicit(&service, &mut stmt, &mut ctx, 607, b"k")
             .await
             .unwrap();
 
         assert_eq!(service.lock_calls.load(Ordering::SeqCst), 1);
-        assert_eq!(stmt_ctx.take_undo().len(), 1);
+        assert_eq!(stmt.len(), 1);
     }
 
     #[tokio::test]

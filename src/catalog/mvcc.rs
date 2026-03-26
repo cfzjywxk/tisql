@@ -246,8 +246,9 @@ impl<T: TxnService> Catalog for MvccCatalog<T> {
             Value::String(name.to_string()),
         ];
         let row_data = encode_row(col_ids, values);
+        let mut stmt = self.txn_service.begin_statement(&mut ctx);
         self.txn_service
-            .put(&mut ctx, ALL_SCHEMA_TABLE_ID, &key, row_data)
+            .put(&mut ctx, &mut stmt, ALL_SCHEMA_TABLE_ID, &key, row_data)
             .await?;
 
         let current_next = self.next_schema_id.load(Ordering::SeqCst);
@@ -301,8 +302,9 @@ impl<T: TxnService> Catalog for MvccCatalog<T> {
         let mut ctx = self.begin_internal()?;
 
         let key = encode_record_key_with_handle(ALL_SCHEMA_TABLE_ID, schema_id as i64);
+        let mut stmt = self.txn_service.begin_statement(&mut ctx);
         self.txn_service
-            .delete(&mut ctx, ALL_SCHEMA_TABLE_ID, &key)
+            .delete(&mut ctx, &mut stmt, ALL_SCHEMA_TABLE_ID, &key)
             .await?;
 
         self.write_schema_version_to_meta(&mut ctx, new_version)
@@ -454,8 +456,9 @@ impl<T: TxnService> Catalog for MvccCatalog<T> {
         let mut ctx = self.begin_internal()?;
 
         let table_key = encode_record_key_with_handle(ALL_TABLE_TABLE_ID, table_id as i64);
+        let mut stmt = self.txn_service.begin_statement(&mut ctx);
         self.txn_service
-            .delete(&mut ctx, ALL_TABLE_TABLE_ID, &table_key)
+            .delete(&mut ctx, &mut stmt, ALL_TABLE_TABLE_ID, &table_key)
             .await?;
 
         delete_column_rows(
@@ -658,8 +661,9 @@ impl<T: TxnService> Catalog for MvccCatalog<T> {
         let mut ctx = self.begin_internal()?;
 
         let key = encode_record_key_with_handle(ALL_INDEX_TABLE_ID, index_key as i64);
+        let mut stmt = self.txn_service.begin_statement(&mut ctx);
         self.txn_service
-            .delete(&mut ctx, ALL_INDEX_TABLE_ID, &key)
+            .delete(&mut ctx, &mut stmt, ALL_INDEX_TABLE_ID, &key)
             .await?;
 
         write_gc_task_row(

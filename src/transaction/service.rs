@@ -18,6 +18,7 @@
 //! state held in `TxnCtx` and passed to each operation.
 
 use std::collections::BTreeMap;
+use std::future::Future;
 use std::ops::Range;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
@@ -32,8 +33,8 @@ use crate::tso::TsoService;
 use crate::util::error::{Result, TiSqlError};
 
 use super::api::{
-    CommitInfo, MutationMeta, MutationPayload, StatementUndo, StatementUndoEntry, TxnCtx,
-    TxnService, TxnState,
+    CommitInfo, MutationMeta, MutationPayload, StatementGuard, StatementUndo, StatementUndoEntry,
+    TxnCtx, TxnScanCursor, TxnScanEntry, TxnService, TxnState,
 };
 use super::concurrency::ConcurrencyManager;
 use crate::catalog::types::{Key, RawValue, TableId, Timestamp, TxnId};
@@ -400,6 +401,55 @@ impl<S: StorageEngine, L: ClogService, T: TsoService> TransactionService<S, L, T
         self.tso.last_ts()
     }
 
+    /// Convenience single-statement put for concrete callers.
+    pub async fn put(
+        &self,
+        ctx: &mut TxnCtx,
+        table_id: TableId,
+        key: &[u8],
+        value: RawValue,
+    ) -> Result<()>
+    where
+        S: PessimisticStorage + 'static,
+        L: 'static,
+    {
+        let mut stmt = <Self as TxnService>::begin_statement(self, ctx);
+        <Self as TxnService>::put(self, ctx, &mut stmt, table_id, key, value).await
+    }
+
+    /// Convenience single-statement delete for concrete callers.
+    pub async fn delete(&self, ctx: &mut TxnCtx, table_id: TableId, key: &[u8]) -> Result<()>
+    where
+        S: PessimisticStorage + 'static,
+        L: 'static,
+    {
+        let mut stmt = <Self as TxnService>::begin_statement(self, ctx);
+        <Self as TxnService>::delete(self, ctx, &mut stmt, table_id, key).await
+    }
+
+    /// Convenience single-statement lock for concrete callers.
+    pub async fn lock_key(&self, ctx: &mut TxnCtx, table_id: TableId, key: &[u8]) -> Result<()>
+    where
+        S: PessimisticStorage + 'static,
+        L: 'static,
+    {
+        let mut stmt = <Self as TxnService>::begin_statement(self, ctx);
+        <Self as TxnService>::lock_key(self, ctx, &mut stmt, table_id, key).await
+    }
+
+    /// Crate-internal rollback shim for existing tests and callers that still build undo sets.
+    pub(crate) async fn rollback_statement(
+        &self,
+        ctx: &mut TxnCtx,
+        undo: StatementUndo,
+    ) -> Result<()>
+    where
+        S: PessimisticStorage + 'static,
+        L: 'static,
+    {
+        <Self as TxnService>::rollback_statement(self, ctx, StatementGuard::from_undo(undo)).await
+    }
+
     /// Write a pending value and retry when storage requests slowdown delay.
     ///
     /// This keeps storage trait methods synchronous while ensuring async callers
@@ -701,7 +751,7 @@ impl<S: StorageEngine, L: ClogService, T: TsoService> TransactionService<S, L, T
 impl<S: PessimisticStorage + 'static, L: ClogService + 'static, T: TsoService> TxnService
     for TransactionService<S, L, T>
 {
-    type ScanIter = MvccScanIterator<S::Iter>;
+    type ScanCursor = TxnScanCursorAdapter<S::Iter>;
 
     fn begin(&self, read_only: bool) -> Result<TxnCtx> {
         let txn_id = self.get_ts();
@@ -759,14 +809,9 @@ impl<S: PessimisticStorage + 'static, L: ClogService + 'static, T: TsoService> T
         }
     }
 
-    fn scan_iter(
-        &self,
-        ctx: &TxnCtx,
-        table_id: TableId,
-        range: Range<Key>,
-    ) -> Result<MvccScanIterator<S::Iter>> {
+    fn scan(&self, ctx: &TxnCtx, table_id: TableId, range: Range<Key>) -> Result<Self::ScanCursor> {
         if !range.start.is_empty() {
-            Self::validate_table_target_key(table_id, &range.start, "TxnService::scan_iter")?;
+            Self::validate_table_target_key(table_id, &range.start, "TxnService::scan")?;
         }
 
         // Build MVCC key range:
@@ -793,18 +838,23 @@ impl<S: PessimisticStorage + 'static, L: ClogService + 'static, T: TsoService> T
             .scan_iter_on_tablet(tablet_id, mvcc_range, owner_ts)?;
 
         let cm = Some(Arc::clone(&self.concurrency_manager));
-        Ok(MvccScanIterator::new(
+        Ok(TxnScanCursorAdapter::new(MvccScanIterator::new(
             storage_iter,
             ctx.start_ts,
             range,
             cm,
             self.conflict_wait_config,
-        ))
+        )))
+    }
+
+    fn begin_statement(&self, _ctx: &mut TxnCtx) -> StatementGuard {
+        StatementGuard::default()
     }
 
     async fn put(
         &self,
         ctx: &mut TxnCtx,
+        stmt: &mut StatementGuard,
         table_id: TableId,
         key: &[u8],
         value: RawValue,
@@ -816,6 +866,11 @@ impl<S: PessimisticStorage + 'static, L: ClogService + 'static, T: TsoService> T
             return Err(TiSqlError::ReadOnlyTransaction);
         }
         Self::validate_table_target_key(table_id, key, "TxnService::put")?;
+
+        let record_undo = ctx.is_explicit() && !stmt.contains_key(key);
+        let previous = record_undo
+            .then(|| ctx.mutations.get(key).cloned())
+            .flatten();
 
         // Register in state cache BEFORE writing pending node so concurrent readers
         // can always resolve our pending writes via TxnStateCache.
@@ -838,19 +893,28 @@ impl<S: PessimisticStorage + 'static, L: ClogService + 'static, T: TsoService> T
                 // Single insert handles both: adding a new Write entry AND
                 // upgrading Lock→Write (overwrite) if key had a prior LOCK.
                 ctx.mutations.insert(
-                    key,
+                    key.clone(),
                     MutationMeta {
                         mutation: MutationPayload::Put(value),
                         tablet_id,
                     },
                 );
+                if record_undo {
+                    stmt.record_first_touch(key.as_slice(), previous);
+                }
                 Ok(())
             }
             Err(e) => Err(e),
         }
     }
 
-    async fn delete(&self, ctx: &mut TxnCtx, table_id: TableId, key: &[u8]) -> Result<()> {
+    async fn delete(
+        &self,
+        ctx: &mut TxnCtx,
+        stmt: &mut StatementGuard,
+        table_id: TableId,
+        key: &[u8],
+    ) -> Result<()> {
         if ctx.state != TxnState::Running {
             return Err(TiSqlError::TransactionNotActive(format!("{:?}", ctx.state)));
         }
@@ -858,6 +922,11 @@ impl<S: PessimisticStorage + 'static, L: ClogService + 'static, T: TsoService> T
             return Err(TiSqlError::ReadOnlyTransaction);
         }
         Self::validate_table_target_key(table_id, key, "TxnService::delete")?;
+
+        let record_undo = ctx.is_explicit() && !stmt.contains_key(key);
+        let previous = record_undo
+            .then(|| ctx.mutations.get(key).cloned())
+            .flatten();
 
         // Register before writing pending (same reason as put()).
         if !ctx.registered {
@@ -888,12 +957,15 @@ impl<S: PessimisticStorage + 'static, L: ClogService + 'static, T: TsoService> T
                 Ok(()) => {
                     let key = key.to_vec();
                     ctx.mutations.insert(
-                        key,
+                        key.clone(),
                         MutationMeta {
                             mutation: MutationPayload::Delete,
                             tablet_id,
                         },
                     );
+                    if record_undo {
+                        stmt.record_first_touch(key.as_slice(), previous);
+                    }
                     Ok(())
                 }
                 Err(e) => Err(e),
@@ -912,10 +984,13 @@ impl<S: PessimisticStorage + 'static, L: ClogService + 'static, T: TsoService> T
                     let key = key.to_vec();
                     // or_insert preserves existing Write if key was previously put
                     // (won't downgrade Write→Lock).
-                    ctx.mutations.entry(key).or_insert(MutationMeta {
+                    ctx.mutations.entry(key.clone()).or_insert(MutationMeta {
                         mutation: MutationPayload::Lock,
                         tablet_id,
                     });
+                    if record_undo {
+                        stmt.record_first_touch(key.as_slice(), previous);
+                    }
                     Ok(())
                 }
                 Err(e) => Err(e),
@@ -923,7 +998,13 @@ impl<S: PessimisticStorage + 'static, L: ClogService + 'static, T: TsoService> T
         }
     }
 
-    async fn lock_key(&self, ctx: &mut TxnCtx, table_id: TableId, key: &[u8]) -> Result<()> {
+    async fn lock_key(
+        &self,
+        ctx: &mut TxnCtx,
+        stmt: &mut StatementGuard,
+        table_id: TableId,
+        key: &[u8],
+    ) -> Result<()> {
         if ctx.state != TxnState::Running {
             return Err(TiSqlError::TransactionNotActive(format!("{:?}", ctx.state)));
         }
@@ -931,6 +1012,9 @@ impl<S: PessimisticStorage + 'static, L: ClogService + 'static, T: TsoService> T
             return Err(TiSqlError::ReadOnlyTransaction);
         }
         Self::validate_table_target_key(table_id, key, "TxnService::lock_key")?;
+
+        let record_undo =
+            ctx.is_explicit() && !stmt.contains_key(key) && !ctx.mutations.contains_key(key);
 
         // Existing write mutation already protects this key; don't downgrade.
         if ctx
@@ -965,28 +1049,31 @@ impl<S: PessimisticStorage + 'static, L: ClogService + 'static, T: TsoService> T
         match lock_result {
             Ok(()) => {
                 let key = key.to_vec();
-                ctx.mutations.entry(key).or_insert(MutationMeta {
+                ctx.mutations.entry(key.clone()).or_insert(MutationMeta {
                     mutation: MutationPayload::Lock,
                     tablet_id,
                 });
+                if record_undo && ctx.mutations.contains_key(key.as_slice()) {
+                    stmt.record_first_touch(key.as_slice(), None);
+                }
                 Ok(())
             }
             Err(e) => Err(e),
         }
     }
 
-    async fn rollback_statement(&self, ctx: &mut TxnCtx, undo: StatementUndo) -> Result<()> {
+    async fn rollback_statement(&self, ctx: &mut TxnCtx, stmt: StatementGuard) -> Result<()> {
         if ctx.state != TxnState::Running {
             return Err(TiSqlError::TransactionNotActive(format!("{:?}", ctx.state)));
         }
 
-        if undo.is_empty() {
+        if stmt.is_empty() {
             return Ok(());
         }
 
         let mut restore_entries = Vec::new();
         let mut absent_entries = Vec::new();
-        for (key, entry) in undo.into_entries() {
+        for (key, entry) in stmt.into_entries() {
             match entry {
                 StatementUndoEntry::Restore(previous) => restore_entries.push((key, previous)),
                 StatementUndoEntry::Absent => absent_entries.push(key),
@@ -1575,6 +1662,62 @@ impl<I: MvccIterator> MvccIterator for MvccScanIterator<I> {
     }
 }
 
+/// Public logical scan cursor backed by the internal MVCC iterator.
+pub struct TxnScanCursorAdapter<I: MvccIterator> {
+    iter: MvccScanIterator<I>,
+    current: Option<TxnScanEntry>,
+}
+
+impl<I: MvccIterator> TxnScanCursorAdapter<I> {
+    fn new(iter: MvccScanIterator<I>) -> Self {
+        Self {
+            iter,
+            current: None,
+        }
+    }
+
+    pub fn valid(&self) -> bool {
+        self.current.is_some()
+    }
+
+    pub fn user_key(&self) -> &[u8] {
+        self.current
+            .as_ref()
+            .expect("user_key() called on invalid cursor")
+            .user_key
+            .as_slice()
+    }
+
+    pub fn value(&self) -> &[u8] {
+        self.current
+            .as_ref()
+            .expect("value() called on invalid cursor")
+            .value
+            .as_slice()
+    }
+}
+
+impl<I: MvccIterator> TxnScanCursor for TxnScanCursorAdapter<I> {
+    fn advance(&mut self) -> impl Future<Output = Result<()>> + Send + '_ {
+        async move {
+            self.iter.advance().await?;
+            self.current = if self.iter.valid() {
+                Some(TxnScanEntry {
+                    user_key: self.iter.user_key().to_vec(),
+                    value: self.iter.value().to_vec(),
+                })
+            } else {
+                None
+            };
+            Ok(())
+        }
+    }
+
+    fn current(&self) -> Option<&TxnScanEntry> {
+        self.current.as_ref()
+    }
+}
+
 /// Statistics from recovery
 #[derive(Default, Debug)]
 pub struct RecoveryStats {
@@ -1604,6 +1747,7 @@ mod tests {
     use crate::clog::{FileClogConfig, FileClogService};
     use crate::inner_table::core_tables::ALL_META_TABLE_ID;
     use crate::tablet::MemTableEngine;
+    use crate::transaction::{TxnScanCursor, TxnService as PublicTxnService};
     use crate::tso::LocalTso;
     use std::time::Duration;
     use tempfile::tempdir;
@@ -1647,6 +1791,117 @@ mod tests {
             },
         );
         (storage, txn_service, dir)
+    }
+
+    async fn collect_public_scan<T: PublicTxnService>(
+        txn_service: &T,
+        ctx: &TxnCtx,
+        table_id: TableId,
+        range: Range<Key>,
+    ) -> Result<Vec<(Key, RawValue)>> {
+        let mut cursor = txn_service.scan(ctx, table_id, range)?;
+        let mut rows = Vec::new();
+
+        cursor.advance().await?;
+        while let Some(entry) = cursor.current() {
+            rows.push((entry.user_key.clone(), entry.value.clone()));
+            cursor.advance().await?;
+        }
+
+        Ok(rows)
+    }
+
+    async fn public_put_and_commit<T: PublicTxnService>(
+        txn_service: &T,
+        table_id: TableId,
+        key: &[u8],
+        value: &[u8],
+    ) -> Result<()> {
+        let mut ctx = txn_service.begin(false)?;
+        let mut stmt = txn_service.begin_statement(&mut ctx);
+        PublicTxnService::put(
+            txn_service,
+            &mut ctx,
+            &mut stmt,
+            table_id,
+            key,
+            value.to_vec(),
+        )
+        .await?;
+        txn_service.commit(ctx).await?;
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_public_statement_guard_can_rollback_without_storage_types() {
+        let (_storage, txn_service, _dir) = create_test_service();
+
+        let mut ctx = txn_service.begin_explicit(false).unwrap();
+        let mut stmt = txn_service.begin_statement(&mut ctx);
+
+        PublicTxnService::put(
+            &txn_service,
+            &mut ctx,
+            &mut stmt,
+            ALL_META_TABLE_ID,
+            b"stmt_key",
+            b"value".to_vec(),
+        )
+        .await
+        .unwrap();
+
+        PublicTxnService::rollback_statement(&txn_service, &mut ctx, stmt)
+            .await
+            .unwrap();
+
+        assert_eq!(
+            txn_service
+                .get(&ctx, ALL_META_TABLE_ID, b"stmt_key")
+                .await
+                .unwrap(),
+            None
+        );
+        assert!(collect_public_scan(
+            &txn_service,
+            &ctx,
+            ALL_META_TABLE_ID,
+            b"stmt".to_vec()..b"stmu".to_vec(),
+        )
+        .await
+        .unwrap()
+        .is_empty());
+
+        txn_service.rollback(ctx).unwrap();
+    }
+
+    #[tokio::test]
+    async fn test_public_scan_cursor_returns_logical_key_values() {
+        let (_storage, txn_service, _dir) = create_test_service();
+
+        public_put_and_commit(&txn_service, ALL_META_TABLE_ID, b"alpha", b"v1")
+            .await
+            .unwrap();
+        public_put_and_commit(&txn_service, ALL_META_TABLE_ID, b"beta", b"v2")
+            .await
+            .unwrap();
+
+        let ctx = txn_service.begin(true).unwrap();
+        let rows = collect_public_scan(
+            &txn_service,
+            &ctx,
+            ALL_META_TABLE_ID,
+            b"alpha".to_vec()..b"gamma".to_vec(),
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(
+            rows,
+            vec![
+                (b"alpha".to_vec(), b"v1".to_vec()),
+                (b"beta".to_vec(), b"v2".to_vec()),
+            ]
+        );
     }
 
     // ========================================================================
