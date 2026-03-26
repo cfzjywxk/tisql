@@ -2110,6 +2110,90 @@ mod tests {
         }
     }
 
+    #[tokio::test]
+    async fn test_execute_point_get_short_matches_normal_query_result() {
+        let (db, _dir) = create_test_db();
+        db.execute_query(
+            "CREATE TABLE t_short_parity (id BIGINT NOT NULL, name VARCHAR(32), age BIGINT, PRIMARY KEY(id))",
+        )
+        .await
+        .unwrap();
+        db.execute_query("INSERT INTO t_short_parity (id, name, age) VALUES (7, 'alice', 42)")
+            .await
+            .unwrap();
+
+        let sql = "SELECT name, age FROM t_short_parity WHERE id = 7";
+        let normal = db.execute_query(sql).await.unwrap();
+        let query = try_parse_point_get_short(sql)
+            .expect("short-path parser should accept point get query");
+        let exec_ctx = ExecutionCtx::with_db("default");
+        let mut stmt_ctx = StatementCtx::new();
+
+        let short = db
+            .execute_point_get_short(&exec_ctx, &mut stmt_ctx, &query)
+            .await
+            .unwrap();
+
+        let QueryResult::Rows { columns, data } = normal else {
+            panic!("expected row result from normal point get");
+        };
+
+        match short {
+            ShortPointGetExecOutcome::Hit(output) => {
+                assert_eq!(output.columns, columns);
+                assert_eq!(
+                    output
+                        .row
+                        .map(|row| row.iter().map(value_to_string).collect::<Vec<_>>()),
+                    data.into_iter().next(),
+                );
+            }
+            ShortPointGetExecOutcome::Fallback(reason) => {
+                panic!("unexpected short-path fallback: {reason:?}");
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn test_execute_point_get_short_matches_normal_query_result_when_missing() {
+        let (db, _dir) = create_test_db();
+        db.execute_query(
+            "CREATE TABLE t_short_parity_miss (id BIGINT NOT NULL, name VARCHAR(32), age BIGINT, PRIMARY KEY(id))",
+        )
+        .await
+        .unwrap();
+        db.execute_query("INSERT INTO t_short_parity_miss (id, name, age) VALUES (7, 'alice', 42)")
+            .await
+            .unwrap();
+
+        let sql = "SELECT name, age FROM t_short_parity_miss WHERE id = 8";
+        let normal = db.execute_query(sql).await.unwrap();
+        let query = try_parse_point_get_short(sql)
+            .expect("short-path parser should accept point get query");
+        let exec_ctx = ExecutionCtx::with_db("default");
+        let mut stmt_ctx = StatementCtx::new();
+
+        let short = db
+            .execute_point_get_short(&exec_ctx, &mut stmt_ctx, &query)
+            .await
+            .unwrap();
+
+        let QueryResult::Rows { columns, data } = normal else {
+            panic!("expected row result from normal point get");
+        };
+
+        match short {
+            ShortPointGetExecOutcome::Hit(output) => {
+                assert_eq!(output.columns, columns);
+                assert!(data.is_empty());
+                assert_eq!(output.row, None);
+            }
+            ShortPointGetExecOutcome::Fallback(reason) => {
+                panic!("unexpected short-path fallback: {reason:?}");
+            }
+        }
+    }
+
     async fn prepare_phase4_two_tablet_recovery_case(
         dir: &std::path::Path,
         flush_table1: bool,
