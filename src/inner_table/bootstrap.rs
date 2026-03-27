@@ -532,13 +532,14 @@ async fn load_table_auto_increment_counters<T: TxnService>(
 mod tests {
     use super::*;
     use crate::clog::{FileClogConfig, FileClogService};
-    use crate::tablet::MemTableEngine;
+    use crate::tablet::{MemTableEngine, TabletTxnStorage};
     use crate::transaction::{ConcurrencyManager, TransactionService};
     use crate::tso::LocalTso;
     use std::sync::Arc;
     use tempfile::tempdir;
 
-    type TestTxnService = TransactionService<MemTableEngine, FileClogService, LocalTso>;
+    type TestTxnStorage = TabletTxnStorage<MemTableEngine>;
+    type TestTxnService = TransactionService<TestTxnStorage, FileClogService, LocalTso>;
 
     fn make_test_io() -> Arc<crate::io::IoService> {
         crate::io::IoService::new_for_test(32).unwrap()
@@ -559,8 +560,12 @@ mod tests {
         let clog_service = Arc::new(clog_service);
         let tso = Arc::new(LocalTso::new(1));
         let concurrency_manager = Arc::new(ConcurrencyManager::new(0));
+        let txn_storage = Arc::new(TabletTxnStorage::new(
+            Arc::clone(&storage),
+            Arc::clone(&concurrency_manager),
+        ));
         let txn_service = Arc::new(TransactionService::new(
-            storage,
+            txn_storage,
             clog_service,
             tso,
             concurrency_manager,

@@ -16,9 +16,10 @@
 // Module Structure
 // ============================================================================
 //
-// Layer separation: upper layers only access lower layers via traits (interfaces)
+// Layer separation: upper layers only access lower layers via traits and
+// inward-facing kernel contracts.
 //
-// Public modules (expose interfaces/traits):
+// Public modules (externally supported API):
 //   - util - shared utilities
 //   - catalog - metadata traits and catalog::types
 //   - catalog::types - SQL schema/value types
@@ -27,9 +28,10 @@
 //   - tablet - storage/tablet engine module
 //   - log - clog/ilog/lsn durability modules
 //
-// Internal modules (implementations hidden):
-//   - transaction - TxnService trait public, TransactionService/ConcurrencyManager internal
-//   - sql, executor - Parser and SimpleExecutor on Database
+// Internal modules (implementation seams and composition):
+//   - kernel - execution / txn-storage / manifest contracts between subsystems
+//   - transaction - TxnService trait public, implementation details internal
+//   - sql, executor - parser/planner/executor built on Database + ExecutionBackend
 
 // Public modules - common types and server infrastructure
 pub mod log;
@@ -80,8 +82,9 @@ pub use worker::QueryResponse;
 pub mod testkit {
     //! Test utilities and implementation re-exports.
     //!
-    //! This module exposes internal implementation details for integration tests.
-    //! These are NOT part of the public API and may change without notice.
+    //! This module exposes non-public seams for integration tests, including
+    //! inward-facing manifest contracts that intentionally stay out of the main
+    //! crate API. These items are NOT stable public API.
     pub use crate::clog::{
         ClogBatch, ClogEntry, ClogOp, ClogOpRef, FileClogConfig, FileClogService, TruncateStats,
     };
@@ -97,8 +100,10 @@ pub mod testkit {
         CompactionExecutor, CompactionPicker, CompactionScheduler, CompactionTask, IlogConfig,
         IlogService, IlogTruncateStats, LsmConfig, LsmConfigBuilder, LsmEngine, LsmRecovery,
         LsmStats, ManifestDelta, MemTable, RecoveryResult, SstBuilder, SstBuilderOptions,
-        SstIterator, SstMeta, SstReader, SstReaderRef, TabletManager, Version,
+        SstIterator, SstMeta, SstReader, SstReaderRef, TabletManager, TabletTxnStorage, Version,
     };
+
+    pub use crate::kernel::manifest::{ManifestCheckpoint, ManifestLog, ManifestSnapshot};
 
     // Re-export FlushScheduler for testing
     pub use crate::tablet::FlushScheduler;
@@ -118,7 +123,7 @@ pub mod testkit {
     // Test helper extension trait for TransactionService
     use crate::clog::ClogService;
     use crate::inner_table::core_tables::ALL_META_TABLE_ID;
-    use crate::tablet::PessimisticStorage;
+    use crate::kernel::txn_storage::TxnStoragePort;
     use crate::transaction::{CommitInfo, TxnService};
     use crate::tso::TsoService;
     use crate::util::error::Result;
@@ -143,7 +148,7 @@ pub mod testkit {
 
     impl<S, C, T> TxnServiceTestExt for TransactionService<S, C, T>
     where
-        S: PessimisticStorage + 'static,
+        S: TxnStoragePort + 'static,
         C: ClogService + 'static,
         T: TsoService,
     {
@@ -188,7 +193,7 @@ use tablet::{
     collect_snapshot, route_table_to_tablet, snapshot_to_metric_rows, CacheSuite, CacheSuiteConfig,
     EngineStatusMetricRow, EngineStatusReporter, EngineStatusSnapshot, GlobalLogGcBoundary,
     IlogConfig, IlogService, IlogTruncateStats, LsmConfig, LsmEngine, LsmRecovery,
-    RoutedTabletStorage, TabletId, TabletManager, DEFAULT_BLOOM_BITS_PER_KEY,
+    RoutedTabletStorage, TabletId, TabletManager, TabletTxnStorage, DEFAULT_BLOOM_BITS_PER_KEY,
     DEFAULT_BLOOM_ENABLED, DEFAULT_CACHE_TOTAL_RATIO, DEFAULT_L0_COMPACTION_TRIGGER,
     DEFAULT_L0_SLOWDOWN_TRIGGER, DEFAULT_L0_STOP_TRIGGER, DEFAULT_MAX_LEVELS,
     DEFAULT_READER_CACHE_ENABLED, DEFAULT_READER_CACHE_MAX_ENTRIES, DEFAULT_READER_CACHE_SHARDS,
@@ -612,10 +617,11 @@ mod database_config_tests {
 
 /// Internal type alias for concrete storage engine.
 type DbStorage = RoutedTabletStorage;
+type DbTxnStorage = TabletTxnStorage<DbStorage>;
 
 /// Internal type alias for concrete transaction service.
 /// Not exposed publicly - callers only see TxnService trait.
-type DbTxnService = TransactionService<DbStorage, FileClogService, LocalTso>;
+type DbTxnService = TransactionService<DbTxnStorage, FileClogService, LocalTso>;
 type DbExecutionBackend = TxnExecutionBackend<DbTxnService>;
 
 /// TiSQL Database instance.
@@ -970,8 +976,12 @@ impl Database {
 
         // Create transaction service with recovered shared clog.
         let routed_storage = Arc::new(RoutedTabletStorage::new(Arc::clone(&tablet_manager)));
-        let txn_service = Arc::new(TransactionService::new_with_conflict_wait_config(
+        let txn_storage = Arc::new(TabletTxnStorage::new(
             Arc::clone(&routed_storage),
+            Arc::clone(&concurrency_manager),
+        ));
+        let txn_service = Arc::new(TransactionService::new_with_conflict_wait_config(
+            txn_storage,
             Arc::clone(&recovery.clog),
             Arc::clone(&tso),
             Arc::clone(&concurrency_manager),
@@ -2908,6 +2918,94 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn test_phase3_range_scan_returns_expected_rows() {
+        let (db, _dir) = create_test_db();
+
+        db.execute_query("CREATE TABLE p3_scan_range (id INT PRIMARY KEY, v INT)")
+            .await
+            .unwrap();
+        db.execute_query("INSERT INTO p3_scan_range VALUES (1, 10), (2, 20), (3, 30), (4, 40)")
+            .await
+            .unwrap();
+
+        match db
+            .execute_query("SELECT id, v FROM p3_scan_range WHERE id >= 2 AND id < 4 ORDER BY id")
+            .await
+            .unwrap()
+        {
+            QueryResult::Rows { data, .. } => {
+                assert_eq!(
+                    data,
+                    vec![
+                        vec!["2".to_string(), "20".to_string()],
+                        vec!["3".to_string(), "30".to_string()],
+                    ]
+                );
+            }
+            other => panic!("expected rows for range scan, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn test_phase3_explicit_write_failure_keeps_prior_statement_only() {
+        let (db, _dir) = create_test_db();
+
+        db.execute_query("CREATE TABLE p3_stmt_atomic (id INT PRIMARY KEY, v INT)")
+            .await
+            .unwrap();
+
+        let mut session = Session::new();
+        db.execute_query_with_session("BEGIN", &mut session)
+            .await
+            .unwrap();
+        db.execute_query_with_session("INSERT INTO p3_stmt_atomic VALUES (1, 10)", &mut session)
+            .await
+            .unwrap();
+
+        let err = db
+            .execute_query_with_session(
+                "INSERT INTO p3_stmt_atomic VALUES (2, 20), (1, 30)",
+                &mut session,
+            )
+            .await
+            .unwrap_err();
+        let err_msg = err.to_string();
+        assert!(
+            err_msg.contains("Duplicate") || err_msg.contains("duplicate"),
+            "expected duplicate key error, got: {err_msg}"
+        );
+
+        match db
+            .execute_query_with_session(
+                "SELECT id, v FROM p3_stmt_atomic ORDER BY id",
+                &mut session,
+            )
+            .await
+            .unwrap()
+        {
+            QueryResult::Rows { data, .. } => {
+                assert_eq!(data, vec![vec!["1".to_string(), "10".to_string()]]);
+            }
+            other => panic!("expected rows inside explicit txn, got {other:?}"),
+        }
+
+        db.execute_query_with_session("COMMIT", &mut session)
+            .await
+            .unwrap();
+
+        match db
+            .execute_query("SELECT id, v FROM p3_stmt_atomic ORDER BY id")
+            .await
+            .unwrap()
+        {
+            QueryResult::Rows { data, .. } => {
+                assert_eq!(data, vec![vec!["1".to_string(), "10".to_string()]]);
+            }
+            other => panic!("expected committed rows after statement rollback, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
     async fn test_phase3_cross_tablet_commit_routes_to_mounted_tablets() {
         let dir = tempdir().unwrap();
         let db = Database::open(DatabaseConfig::with_data_dir(dir.path())).unwrap();
@@ -3562,18 +3660,9 @@ mod tests {
 
         // Verify mutation metadata has entries for all keys
         assert_eq!(ctx.mutations.len(), 3);
-        assert_eq!(
-            ctx.mutations.get(&key1).map(|meta| meta.tablet_id),
-            Some(TabletId::Table { table_id: table1 })
-        );
-        assert_eq!(
-            ctx.mutations.get(&key1b).map(|meta| meta.tablet_id),
-            Some(TabletId::Table { table_id: table1 })
-        );
-        assert_eq!(
-            ctx.mutations.get(&key2).map(|meta| meta.tablet_id),
-            Some(TabletId::Table { table_id: table2 })
-        );
+        assert!(ctx.mutations.contains_key(&key1));
+        assert!(ctx.mutations.contains_key(&key1b));
+        assert!(ctx.mutations.contains_key(&key2));
 
         db.txn_service.commit(ctx).await.unwrap();
     }

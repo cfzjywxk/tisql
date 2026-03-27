@@ -12,4 +12,13 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+//! Inward-facing contracts that separate TiSQL subsystems.
+//!
+//! These modules define the stable seams used by the outer layers:
+//! - `execution` hides row codecs and key encoding from SQL/executor callers
+//! - `txn_storage` hides tablet routing and MVCC details from the transaction layer
+//! - `manifest` hides tablet version internals from ilog persistence and recovery
+
 pub(crate) mod execution;
+pub(crate) mod manifest;
+pub(crate) mod txn_storage;

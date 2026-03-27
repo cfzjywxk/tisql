@@ -29,6 +29,12 @@ use tokio::time::Instant as TokioInstant;
 use fail::fail_point;
 
 use crate::clog::{ClogEntry, ClogOp, ClogOpRef, ClogService};
+use crate::kernel::txn_storage::{
+    AbortRequest, CommitReservation, FinalizeRequest, PointReadResult, RecoveredWrite,
+    TxnDeleteEffect, TxnPointRead, TxnRestoreMutation, TxnStageError, TxnStoragePort,
+    TxnStorageRecoveryPort, TxnStorageScanCursor, TxnStorageScanRequest, TxnStorageScanStep,
+    TxnStorageVisibleState,
+};
 use crate::tso::TsoService;
 use crate::util::error::{Result, TiSqlError};
 
@@ -39,11 +45,6 @@ use super::api::{
 use super::concurrency::ConcurrencyManager;
 use crate::catalog::types::{Key, RawValue, TableId, Timestamp, TxnId};
 use crate::inner_table::core_tables::USER_TABLE_ID_START;
-use crate::tablet::mvcc::{is_lock, is_tombstone, MvccIterator, MvccKey, LOCK, TOMBSTONE};
-use crate::tablet::{
-    route_table_to_tablet, PessimisticStorage, PessimisticWriteError, StorageEngine, TabletId,
-    WriteBatch,
-};
 use crate::util::codec::key::decode_table_id;
 
 /// Transaction service manages transactions with durability and MVCC.
@@ -52,11 +53,11 @@ use crate::util::codec::key::decode_table_id;
 /// OceanBase's `ObTransService` pattern. Transaction state is held in `TxnCtx`
 /// and passed to each operation.
 ///
-/// All write operations use pessimistic locking via PessimisticStorage:
+/// All write operations go through `TxnStoragePort`:
 /// 1. Write pending nodes to storage (locks acquired immediately)
 /// 2. On commit: finalize pending nodes with commit_ts
 /// 3. On rollback: abort pending nodes
-pub struct TransactionService<S: StorageEngine, L: ClogService, T: TsoService> {
+pub struct TransactionService<S: TxnStoragePort, L: ClogService, T: TsoService> {
     /// Storage engine for state
     storage: Arc<S>,
     /// Commit log service for durability
@@ -70,8 +71,6 @@ pub struct TransactionService<S: StorageEngine, L: ClogService, T: TsoService> {
     /// Aggregated write-path diagnostics exposed through SHOW ENGINE STATUS.
     write_path_diagnostics: Arc<WritePathDiagnostics>,
 }
-
-type GroupedTabletKeys = Vec<(TabletId, Vec<Key>)>;
 
 /// Lock-conflict wait policy shared by read and write paths.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -167,12 +166,6 @@ impl ConflictBackoff {
             ConflictWaitOutcome::TimedOut
         }
     }
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum PointReadConflictAction {
-    Proceed,
-    Wait,
 }
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
@@ -311,37 +304,40 @@ fn update_max_relaxed(target: &AtomicU64, observed: u64) {
 }
 
 /// Ensures commit reservations are released on every exit path.
-struct CommitReservationReleaseGuard<'a, S: PessimisticStorage + ?Sized> {
+struct CommitReservationReleaseGuard<'a, S: TxnStoragePort + ?Sized> {
     storage: &'a S,
-    txn_start_ts: Timestamp,
+    reservation: Option<CommitReservation>,
     released: bool,
 }
 
-impl<'a, S: PessimisticStorage + ?Sized> CommitReservationReleaseGuard<'a, S> {
-    fn new(storage: &'a S, txn_start_ts: Timestamp) -> Self {
+impl<'a, S: TxnStoragePort + ?Sized> CommitReservationReleaseGuard<'a, S> {
+    fn new(storage: &'a S, reservation: CommitReservation) -> Self {
         Self {
             storage,
-            txn_start_ts,
+            reservation: Some(reservation),
             released: false,
         }
     }
 
     fn release(mut self) -> Option<u64> {
-        let released = self.storage.release_commit_lsn(self.txn_start_ts);
+        let reservation = self.reservation.take()?;
+        let released = self.storage.release_commit_lsn(reservation);
         self.released = true;
-        released
+        released.then_some(reservation.lsn)
     }
 }
 
-impl<S: PessimisticStorage + ?Sized> Drop for CommitReservationReleaseGuard<'_, S> {
+impl<S: TxnStoragePort + ?Sized> Drop for CommitReservationReleaseGuard<'_, S> {
     fn drop(&mut self) {
         if !self.released {
-            let _ = self.storage.release_commit_lsn(self.txn_start_ts);
+            if let Some(reservation) = self.reservation.take() {
+                let _ = self.storage.release_commit_lsn(reservation);
+            }
         }
     }
 }
 
-impl<S: StorageEngine, L: ClogService, T: TsoService> TransactionService<S, L, T> {
+impl<S: TxnStoragePort, L: ClogService + 'static, T: TsoService> TransactionService<S, L, T> {
     /// Create a new transaction service
     pub fn new(
         storage: Arc<S>,
@@ -408,31 +404,19 @@ impl<S: StorageEngine, L: ClogService, T: TsoService> TransactionService<S, L, T
         table_id: TableId,
         key: &[u8],
         value: RawValue,
-    ) -> Result<()>
-    where
-        S: PessimisticStorage + 'static,
-        L: 'static,
-    {
+    ) -> Result<()> {
         let mut stmt = <Self as TxnService>::begin_statement(self, ctx);
         <Self as TxnService>::put(self, ctx, &mut stmt, table_id, key, value).await
     }
 
     /// Convenience single-statement delete for concrete callers.
-    pub async fn delete(&self, ctx: &mut TxnCtx, table_id: TableId, key: &[u8]) -> Result<()>
-    where
-        S: PessimisticStorage + 'static,
-        L: 'static,
-    {
+    pub async fn delete(&self, ctx: &mut TxnCtx, table_id: TableId, key: &[u8]) -> Result<()> {
         let mut stmt = <Self as TxnService>::begin_statement(self, ctx);
         <Self as TxnService>::delete(self, ctx, &mut stmt, table_id, key).await
     }
 
     /// Convenience single-statement lock for concrete callers.
-    pub async fn lock_key(&self, ctx: &mut TxnCtx, table_id: TableId, key: &[u8]) -> Result<()>
-    where
-        S: PessimisticStorage + 'static,
-        L: 'static,
-    {
+    pub async fn lock_key(&self, ctx: &mut TxnCtx, table_id: TableId, key: &[u8]) -> Result<()> {
         let mut stmt = <Self as TxnService>::begin_statement(self, ctx);
         <Self as TxnService>::lock_key(self, ctx, &mut stmt, table_id, key).await
     }
@@ -442,138 +426,131 @@ impl<S: StorageEngine, L: ClogService, T: TsoService> TransactionService<S, L, T
         &self,
         ctx: &mut TxnCtx,
         undo: StatementUndo,
-    ) -> Result<()>
-    where
-        S: PessimisticStorage + 'static,
-        L: 'static,
-    {
+    ) -> Result<()> {
         <Self as TxnService>::rollback_statement(self, ctx, StatementGuard::from_undo(undo)).await
     }
 
-    /// Write a pending value and retry when storage requests slowdown delay.
-    ///
-    /// This keeps storage trait methods synchronous while ensuring async callers
-    /// can apply `tokio::time::sleep` for backpressure hints, and uses a borrowed
-    /// value slice so retry loops do not force caller-side cloning.
-    async fn put_pending_with_retry(
+    async fn retry_stage_error(
         &self,
-        tablet_id: TabletId,
-        key: &[u8],
-        value: &[u8],
-        owner_start_ts: Timestamp,
-    ) -> Result<()>
-    where
-        S: PessimisticStorage,
-    {
-        // Keep retries bounded so explicit txn writes fail fast instead of hanging
-        // indefinitely if background compaction cannot clear slowdown pressure.
+        err: TxnStageError,
+        conflict_backoff: &mut ConflictBackoff,
+        retries: &mut usize,
+    ) -> Result<bool> {
         const MAX_SLOWDOWN_RETRIES: usize = 32;
-        let mut retries = 0;
-        let mut conflict_backoff = ConflictBackoff::new(self.conflict_wait_config);
-        loop {
-            let result = self
-                .storage
-                .put_pending_on_tablet(tablet_id, key, value, owner_start_ts);
-
-            match result {
-                Ok(()) => return Ok(()),
-                Err(PessimisticWriteError::LockConflict(_)) => {
-                    match conflict_backoff.wait_next().await {
-                        ConflictWaitOutcome::RetryNow => continue,
-                        ConflictWaitOutcome::TimedOut => {
-                            return Err(TiSqlError::LockWaitTimeout);
-                        }
-                    }
-                }
-                Err(PessimisticWriteError::WriteStall { delay: Some(delay) }) => {
-                    if retries >= MAX_SLOWDOWN_RETRIES {
-                        return Err(TiSqlError::Storage(
-                            "Write stalled: storage backpressure, retry later".to_string(),
-                        ));
-                    }
-                    retries += 1;
-                    tokio::time::sleep(delay).await;
-                }
-                Err(PessimisticWriteError::WriteStall { delay: None }) => {
+        match err {
+            TxnStageError::LockConflict { .. } => match conflict_backoff.wait_next().await {
+                ConflictWaitOutcome::RetryNow => Ok(true),
+                ConflictWaitOutcome::TimedOut => Err(TiSqlError::LockWaitTimeout),
+            },
+            TxnStageError::WriteStall { delay: Some(delay) } => {
+                if *retries >= MAX_SLOWDOWN_RETRIES {
                     return Err(TiSqlError::Storage(
                         "Write stalled: storage backpressure, retry later".to_string(),
                     ));
                 }
+                *retries += 1;
+                tokio::time::sleep(delay).await;
+                Ok(true)
+            }
+            TxnStageError::WriteStall { delay: None } => Err(TiSqlError::Storage(
+                "Write stalled: storage backpressure, retry later".to_string(),
+            )),
+        }
+    }
+
+    async fn stage_put_with_retry(
+        &self,
+        key: &[u8],
+        value: &[u8],
+        owner_start_ts: Timestamp,
+    ) -> Result<()> {
+        let mut retries = 0;
+        let mut conflict_backoff = ConflictBackoff::new(self.conflict_wait_config);
+
+        loop {
+            match self.storage.stage_put(key, value, owner_start_ts) {
+                Ok(()) => return Ok(()),
+                Err(err)
+                    if self
+                        .retry_stage_error(err, &mut conflict_backoff, &mut retries)
+                        .await? =>
+                {
+                    continue
+                }
+                Err(_) => unreachable!("retry_stage_error returns on terminal stage errors"),
+            }
+        }
+    }
+
+    async fn stage_delete_with_retry(
+        &self,
+        key: &[u8],
+        owner_start_ts: Timestamp,
+    ) -> Result<TxnDeleteEffect> {
+        let mut retries = 0;
+        let mut conflict_backoff = ConflictBackoff::new(self.conflict_wait_config);
+
+        loop {
+            match self.storage.stage_delete(key, owner_start_ts).await {
+                Ok(effect) => return Ok(effect),
+                Err(err)
+                    if self
+                        .retry_stage_error(err, &mut conflict_backoff, &mut retries)
+                        .await? =>
+                {
+                    continue
+                }
+                Err(_) => unreachable!("retry_stage_error returns on terminal stage errors"),
+            }
+        }
+    }
+
+    async fn stage_lock_with_retry(&self, key: &[u8], owner_start_ts: Timestamp) -> Result<()> {
+        let mut retries = 0;
+        let mut conflict_backoff = ConflictBackoff::new(self.conflict_wait_config);
+
+        loop {
+            match self.storage.stage_lock(key, owner_start_ts) {
+                Ok(()) => return Ok(()),
+                Err(err)
+                    if self
+                        .retry_stage_error(err, &mut conflict_backoff, &mut retries)
+                        .await? =>
+                {
+                    continue
+                }
+                Err(_) => unreachable!("retry_stage_error returns on terminal stage errors"),
             }
         }
     }
 
     async fn restore_pending_same_owner(
         &self,
-        tablet_id: TabletId,
         key: &[u8],
         previous: &MutationMeta,
         owner_start_ts: Timestamp,
-    ) -> Result<()>
-    where
-        S: PessimisticStorage,
-    {
-        const MAX_SLOWDOWN_RETRIES: usize = 32;
+    ) -> Result<()> {
         let mut retries = 0;
+        let mut conflict_backoff = ConflictBackoff::new(self.conflict_wait_config);
 
         loop {
-            let value = match &previous.mutation {
-                MutationPayload::Put(value) => value.as_slice(),
-                MutationPayload::Delete => TOMBSTONE,
-                MutationPayload::Lock => LOCK,
+            let mutation = match &previous.mutation {
+                MutationPayload::Put(value) => TxnRestoreMutation::Put(value.as_slice()),
+                MutationPayload::Delete => TxnRestoreMutation::Delete,
+                MutationPayload::Lock => TxnRestoreMutation::Lock,
             };
-            match self
-                .storage
-                .put_pending_on_tablet(tablet_id, key, value, owner_start_ts)
-            {
+
+            match self.storage.restore_pending(key, mutation, owner_start_ts) {
                 Ok(()) => return Ok(()),
-                Err(PessimisticWriteError::LockConflict(other_owner)) => {
-                    return Err(TiSqlError::Internal(format!(
-                        "statement rollback owner mismatch for key {:?}: expected owner {}, found {}",
-                        key, owner_start_ts, other_owner
-                    )));
+                Err(err)
+                    if self
+                        .retry_stage_error(err, &mut conflict_backoff, &mut retries)
+                        .await? =>
+                {
+                    continue
                 }
-                Err(PessimisticWriteError::WriteStall { delay: Some(delay) }) => {
-                    if retries >= MAX_SLOWDOWN_RETRIES {
-                        return Err(TiSqlError::Storage(
-                            "Write stalled: storage backpressure, retry later".to_string(),
-                        ));
-                    }
-                    retries += 1;
-                    tokio::time::sleep(delay).await;
-                }
-                Err(PessimisticWriteError::WriteStall { delay: None }) => {
-                    return Err(TiSqlError::Storage(
-                        "Write stalled: storage backpressure, retry later".to_string(),
-                    ));
-                }
+                Err(_) => unreachable!("retry_stage_error returns on terminal stage errors"),
             }
-        }
-    }
-
-    fn classify_point_read_conflict(
-        &self,
-        lock_owner: Option<Timestamp>,
-        reader_owner_ts: Timestamp,
-        read_ts: Timestamp,
-    ) -> PointReadConflictAction {
-        let Some(lock_owner) = lock_owner else {
-            return PointReadConflictAction::Proceed;
-        };
-        if lock_owner == reader_owner_ts {
-            return PointReadConflictAction::Proceed;
-        }
-
-        match self.concurrency_manager.get_txn_state(lock_owner) {
-            Some(TxnState::Preparing) => PointReadConflictAction::Wait,
-            Some(TxnState::Prepared { prepared_ts }) if prepared_ts <= read_ts => {
-                PointReadConflictAction::Wait
-            }
-            Some(TxnState::Running)
-            | Some(TxnState::Prepared { .. })
-            | Some(TxnState::Committed { .. })
-            | Some(TxnState::Aborted)
-            | None => PointReadConflictAction::Proceed,
         }
     }
 
@@ -583,7 +560,10 @@ impl<S: StorageEngine, L: ClogService, T: TsoService> TransactionService<S, L, T
     ///
     /// This should be called at startup to rebuild the in-memory state
     /// from the durable commit log.
-    pub fn recover(&self, entries: &[ClogEntry]) -> Result<RecoveryStats> {
+    pub(crate) fn recover(&self, entries: &[ClogEntry]) -> Result<RecoveryStats>
+    where
+        S: TxnStorageRecoveryPort,
+    {
         let mut stats = RecoveryStats::default();
         let mut max_ts: Timestamp = 0;
 
@@ -618,20 +598,19 @@ impl<S: StorageEngine, L: ClogService, T: TsoService> TransactionService<S, L, T
 
             match &entry.op {
                 ClogOp::Put { key, value } => {
-                    // Create a write batch with commit_ts and clog LSN
-                    let mut batch = WriteBatch::new();
-                    batch.put(key.clone(), value.clone());
-                    batch.set_commit_ts(commit_ts);
-                    batch.set_clog_lsn(lsn);
-                    self.storage.write_batch(batch)?;
+                    self.storage.apply_recovered_write(
+                        RecoveredWrite::Put { key, value },
+                        commit_ts,
+                        lsn,
+                    )?;
                     stats.applied_puts += 1;
                 }
                 ClogOp::Delete { key } => {
-                    let mut batch = WriteBatch::new();
-                    batch.delete(key.clone());
-                    batch.set_commit_ts(commit_ts);
-                    batch.set_clog_lsn(lsn);
-                    self.storage.write_batch(batch)?;
+                    self.storage.apply_recovered_write(
+                        RecoveredWrite::Delete { key },
+                        commit_ts,
+                        lsn,
+                    )?;
                     stats.applied_deletes += 1;
                 }
                 ClogOp::Commit { .. } | ClogOp::Rollback => {
@@ -706,52 +685,29 @@ impl<S: StorageEngine, L: ClogService, T: TsoService> TransactionService<S, L, T
         Ok(())
     }
 
-    fn group_owned_mutation_keys_by_tablet(
-        mutations: BTreeMap<Key, MutationMeta>,
-    ) -> GroupedTabletKeys {
-        let mut grouped: BTreeMap<TabletId, Vec<Key>> = BTreeMap::new();
-        for (key, mutation_meta) in mutations {
-            grouped
-                .entry(mutation_meta.tablet_id)
-                .or_default()
-                .push(key);
-        }
-        grouped.into_iter().collect()
+    fn mutation_keys(mutations: BTreeMap<Key, MutationMeta>) -> Vec<Key> {
+        mutations.into_keys().collect()
     }
 
-    fn group_owned_mutation_keys_by_tablet_and_type(
-        mutations: BTreeMap<Key, MutationMeta>,
-    ) -> (GroupedTabletKeys, GroupedTabletKeys) {
-        let mut write_grouped: BTreeMap<TabletId, Vec<Key>> = BTreeMap::new();
-        let mut lock_grouped: BTreeMap<TabletId, Vec<Key>> = BTreeMap::new();
+    fn split_mutation_keys_by_type(mutations: BTreeMap<Key, MutationMeta>) -> (Vec<Key>, Vec<Key>) {
+        let mut write_keys = Vec::new();
+        let mut lock_only_keys = Vec::new();
         for (key, mutation_meta) in mutations {
             if mutation_meta.mutation.is_write() {
-                write_grouped
-                    .entry(mutation_meta.tablet_id)
-                    .or_default()
-                    .push(key);
+                write_keys.push(key);
             } else {
-                lock_grouped
-                    .entry(mutation_meta.tablet_id)
-                    .or_default()
-                    .push(key);
+                lock_only_keys.push(key);
             }
         }
-        (
-            write_grouped.into_iter().collect(),
-            lock_grouped.into_iter().collect(),
-        )
+        (write_keys, lock_only_keys)
     }
 }
 
 /// Implement TxnService trait for TransactionService
-///
-/// Note: `S: PessimisticStorage` is required because both implicit and explicit
-/// transactions use pessimistic locking with pending nodes in storage.
-impl<S: PessimisticStorage + 'static, L: ClogService + 'static, T: TsoService> TxnService
+impl<S: TxnStoragePort + 'static, L: ClogService + 'static, T: TsoService> TxnService
     for TransactionService<S, L, T>
 {
-    type ScanCursor = TxnScanCursorAdapter<S::Iter>;
+    type ScanCursor = TxnScanCursorAdapter<S::ScanCursor>;
 
     fn begin(&self, read_only: bool) -> Result<TxnCtx> {
         let txn_id = self.get_ts();
@@ -782,7 +738,6 @@ impl<S: PessimisticStorage + 'static, L: ClogService + 'static, T: TsoService> T
 
     async fn get(&self, ctx: &TxnCtx, table_id: TableId, key: &[u8]) -> Result<Option<RawValue>> {
         Self::validate_table_target_key(table_id, key, "TxnService::get")?;
-        let tablet_id = route_table_to_tablet(table_id);
         // Keep point-get ownership semantics aligned with scan_iter:
         // - explicit txn reads can see their own pending writes
         // - implicit txn reads use owner=0 to avoid intra-statement self-visibility
@@ -790,20 +745,20 @@ impl<S: PessimisticStorage + 'static, L: ClogService + 'static, T: TsoService> T
         let mut conflict_backoff = ConflictBackoff::new(self.conflict_wait_config);
 
         loop {
-            let lock_owner = self.storage.get_lock_owner_on_tablet(tablet_id, key);
-            match self.classify_point_read_conflict(lock_owner, owner_ts, ctx.start_ts) {
-                PointReadConflictAction::Proceed => {
-                    let value = self
-                        .storage
-                        .get_with_owner_on_tablet(tablet_id, key, ctx.start_ts, owner_ts)
-                        .await;
-                    return Ok(value.filter(|v| !is_tombstone(v) && !is_lock(v)));
-                }
-                PointReadConflictAction::Wait => match conflict_backoff.wait_next().await {
+            match self
+                .storage
+                .read_point(TxnPointRead {
+                    key,
+                    read_ts: ctx.start_ts,
+                    owner_ts,
+                })
+                .await?
+            {
+                PointReadResult::Missing | PointReadResult::Deleted => return Ok(None),
+                PointReadResult::Value(value) => return Ok(Some(value)),
+                PointReadResult::Blocked { .. } => match conflict_backoff.wait_next().await {
                     ConflictWaitOutcome::RetryNow => continue,
-                    ConflictWaitOutcome::TimedOut => {
-                        return Err(TiSqlError::LockWaitTimeout);
-                    }
+                    ConflictWaitOutcome::TimedOut => return Err(TiSqlError::LockWaitTimeout),
                 },
             }
         }
@@ -814,17 +769,6 @@ impl<S: PessimisticStorage + 'static, L: ClogService + 'static, T: TsoService> T
             Self::validate_table_target_key(table_id, &range.start, "TxnService::scan")?;
         }
 
-        // Build MVCC key range:
-        // - Start: MvccKey::encode(range.start, MAX) - smallest MVCC key with this prefix
-        // - End: MvccKey::encode(range.end, 0) - largest MVCC key for range.end (exclusive)
-        let start_mvcc = MvccKey::encode(&range.start, Timestamp::MAX);
-        let end_mvcc = if range.end.is_empty() {
-            MvccKey::unbounded()
-        } else {
-            MvccKey::encode(&range.end, 0)
-        };
-        let mvcc_range = start_mvcc..end_mvcc;
-
         // Explicit transactions use owner_ts=start_ts for read-your-writes
         // (see pending writes from prior statements in the same txn).
         // Implicit transactions use owner_ts=0 because writes within a single
@@ -832,19 +776,16 @@ impl<S: PessimisticStorage + 'static, L: ClogService + 'static, T: TsoService> T
         // must not re-scan rows it just inserted). Pending resolution via
         // concurrency_manager handles other txns' pending writes for both paths.
         let owner_ts = if ctx.is_explicit() { ctx.start_ts } else { 0 };
-        let tablet_id = route_table_to_tablet(table_id);
-        let storage_iter = self
-            .storage
-            .scan_iter_on_tablet(tablet_id, mvcc_range, owner_ts)?;
-
-        let cm = Some(Arc::clone(&self.concurrency_manager));
-        Ok(TxnScanCursorAdapter::new(MvccScanIterator::new(
-            storage_iter,
-            ctx.start_ts,
+        let storage_cursor = self.storage.scan(TxnStorageScanRequest {
             range,
-            cm,
+            read_ts: ctx.start_ts,
+            owner_ts,
+        })?;
+
+        Ok(TxnScanCursorAdapter::new(
+            storage_cursor,
             self.conflict_wait_config,
-        )))
+        ))
     }
 
     fn begin_statement(&self, _ctx: &mut TxnCtx) -> StatementGuard {
@@ -879,11 +820,8 @@ impl<S: PessimisticStorage + 'static, L: ClogService + 'static, T: TsoService> T
             ctx.registered = true;
         }
 
-        let tablet_id = route_table_to_tablet(table_id);
         let put_begin = Instant::now();
-        let put_result = self
-            .put_pending_with_retry(tablet_id, key, &value, ctx.start_ts)
-            .await;
+        let put_result = self.stage_put_with_retry(key, &value, ctx.start_ts).await;
         self.write_path_diagnostics
             .put_pending
             .record_duration(put_begin.elapsed());
@@ -896,7 +834,6 @@ impl<S: PessimisticStorage + 'static, L: ClogService + 'static, T: TsoService> T
                     key.clone(),
                     MutationMeta {
                         mutation: MutationPayload::Put(value),
-                        tablet_id,
                     },
                 );
                 if record_undo {
@@ -934,66 +871,36 @@ impl<S: PessimisticStorage + 'static, L: ClogService + 'static, T: TsoService> T
             ctx.registered = true;
         }
 
-        let tablet_id = route_table_to_tablet(table_id);
-
-        // Check committed OR own pending value (owner_ts=start_ts sees own pending).
-        // This fixes put(k)+delete(k) on non-existing key: sees own pending put → TOMBSTONE.
-        let value_exists = self
-            .storage
-            .get_with_owner_on_tablet(tablet_id, key, ctx.start_ts, ctx.start_ts)
-            .await
-            .is_some();
-
-        if value_exists {
-            // Value exists (committed or own pending) → TOMBSTONE
-            let put_begin = Instant::now();
-            let put_result = self
-                .put_pending_with_retry(tablet_id, key, TOMBSTONE, ctx.start_ts)
-                .await;
-            self.write_path_diagnostics
-                .put_pending
-                .record_duration(put_begin.elapsed());
-            match put_result {
-                Ok(()) => {
-                    let key = key.to_vec();
-                    ctx.mutations.insert(
-                        key.clone(),
-                        MutationMeta {
-                            mutation: MutationPayload::Delete,
-                            tablet_id,
-                        },
-                    );
-                    if record_undo {
-                        stmt.record_first_touch(key.as_slice(), previous);
-                    }
-                    Ok(())
+        let delete_begin = Instant::now();
+        match self.stage_delete_with_retry(key, ctx.start_ts).await? {
+            TxnDeleteEffect::Delete => {
+                self.write_path_diagnostics
+                    .put_pending
+                    .record_duration(delete_begin.elapsed());
+                let key = key.to_vec();
+                ctx.mutations.insert(
+                    key.clone(),
+                    MutationMeta {
+                        mutation: MutationPayload::Delete,
+                    },
+                );
+                if record_undo {
+                    stmt.record_first_touch(key.as_slice(), previous);
                 }
-                Err(e) => Err(e),
+                Ok(())
             }
-        } else {
-            // No value exists → LOCK (pessimistic lock only, not persisted to clog)
-            let lock_begin = Instant::now();
-            let lock_result = self
-                .put_pending_with_retry(tablet_id, key, LOCK, ctx.start_ts)
-                .await;
-            self.write_path_diagnostics
-                .lock_pending
-                .record_duration(lock_begin.elapsed());
-            match lock_result {
-                Ok(()) => {
-                    let key = key.to_vec();
-                    // or_insert preserves existing Write if key was previously put
-                    // (won't downgrade Write→Lock).
-                    ctx.mutations.entry(key.clone()).or_insert(MutationMeta {
-                        mutation: MutationPayload::Lock,
-                        tablet_id,
-                    });
-                    if record_undo {
-                        stmt.record_first_touch(key.as_slice(), previous);
-                    }
-                    Ok(())
+            TxnDeleteEffect::Lock => {
+                self.write_path_diagnostics
+                    .lock_pending
+                    .record_duration(delete_begin.elapsed());
+                let key = key.to_vec();
+                ctx.mutations.entry(key.clone()).or_insert(MutationMeta {
+                    mutation: MutationPayload::Lock,
+                });
+                if record_undo {
+                    stmt.record_first_touch(key.as_slice(), previous);
                 }
-                Err(e) => Err(e),
+                Ok(())
             }
         }
     }
@@ -1038,11 +945,8 @@ impl<S: PessimisticStorage + 'static, L: ClogService + 'static, T: TsoService> T
             ctx.registered = true;
         }
 
-        let tablet_id = route_table_to_tablet(table_id);
         let lock_begin = Instant::now();
-        let lock_result = self
-            .put_pending_with_retry(tablet_id, key, LOCK, ctx.start_ts)
-            .await;
+        let lock_result = self.stage_lock_with_retry(key, ctx.start_ts).await;
         self.write_path_diagnostics
             .lock_pending
             .record_duration(lock_begin.elapsed());
@@ -1051,7 +955,6 @@ impl<S: PessimisticStorage + 'static, L: ClogService + 'static, T: TsoService> T
                 let key = key.to_vec();
                 ctx.mutations.entry(key.clone()).or_insert(MutationMeta {
                     mutation: MutationPayload::Lock,
-                    tablet_id,
                 });
                 if record_undo && ctx.mutations.contains_key(key.as_slice()) {
                     stmt.record_first_touch(key.as_slice(), None);
@@ -1081,38 +984,31 @@ impl<S: PessimisticStorage + 'static, L: ClogService + 'static, T: TsoService> T
         }
 
         for (key, previous) in restore_entries {
-            let current = ctx.mutations.get(&key).ok_or_else(|| {
+            ctx.mutations.get(&key).ok_or_else(|| {
                 TiSqlError::Internal(format!(
                     "statement rollback missing current mutation for key {:?}",
                     key
                 ))
             })?;
-            if current.tablet_id != previous.tablet_id {
-                return Err(TiSqlError::Internal(format!(
-                    "statement rollback tablet mismatch for key {:?}: current={}, previous={}",
-                    key, current.tablet_id, previous.tablet_id
-                )));
-            }
-            self.restore_pending_same_owner(current.tablet_id, &key, &previous, ctx.start_ts)
+            self.restore_pending_same_owner(&key, &previous, ctx.start_ts)
                 .await?;
             ctx.mutations.insert(key, previous);
         }
 
-        let mut absent_mutations = BTreeMap::new();
         for key in &absent_entries {
-            let current = ctx.mutations.get(key).ok_or_else(|| {
+            ctx.mutations.get(key).ok_or_else(|| {
                 TiSqlError::Internal(format!(
                     "statement rollback missing current mutation for key {:?}",
                     key
                 ))
             })?;
-            absent_mutations.insert(key.clone(), current.clone());
         }
 
-        if !absent_mutations.is_empty() {
-            let grouped_keys = Self::group_owned_mutation_keys_by_tablet(absent_mutations);
-            self.storage
-                .abort_pending_grouped(&grouped_keys, ctx.start_ts);
+        if !absent_entries.is_empty() {
+            self.storage.abort(AbortRequest {
+                owner_start_ts: ctx.start_ts,
+                keys: &absent_entries,
+            })?;
         }
 
         for key in absent_entries {
@@ -1188,11 +1084,12 @@ impl<S: PessimisticStorage + 'static, L: ClogService + 'static, T: TsoService> T
         let has_wal_ops = !ops.is_empty();
 
         // V2.6: reserve commit LSN ahead of WAL write.
-        let txn_lsn = self.storage.alloc_and_reserve_commit_lsn(start_ts);
+        let reservation = self.storage.reserve_commit_lsn(start_ts);
+        let txn_lsn = reservation.lsn;
         ctx.reserved_lsn = Some(txn_lsn);
         let mut reservation_guard = Some(CommitReservationReleaseGuard::new(
             self.storage.as_ref(),
-            start_ts,
+            reservation,
         ));
 
         #[cfg(feature = "failpoints")]
@@ -1200,10 +1097,6 @@ impl<S: PessimisticStorage + 'static, L: ClogService + 'static, T: TsoService> T
 
         // Step 5: Write to clog for durability (serializes synchronously, returns
         // future for fsync). After this call, ops are no longer needed.
-        debug_assert!(
-            self.storage.is_commit_lsn_reserved(start_ts, txn_lsn),
-            "reserved commit lsn missing before clog write: start_ts={start_ts}, lsn={txn_lsn}",
-        );
         let clog_write_begin = Instant::now();
         let clog_result = self
             .clog_service
@@ -1218,7 +1111,7 @@ impl<S: PessimisticStorage + 'static, L: ClogService + 'static, T: TsoService> T
 
         // Release borrows on mutations (ops → mutations).
         drop(ops);
-        let mut grouped_mutations = Some(mutations);
+        let mut pending_mutations = Some(mutations);
 
         match clog_result {
             Ok(fsync_future) => {
@@ -1239,28 +1132,25 @@ impl<S: PessimisticStorage + 'static, L: ClogService + 'static, T: TsoService> T
                             );
                         }
                         let commit_lsn = txn_lsn;
-                        let (write_grouped_keys, lock_grouped_keys) =
-                            Self::group_owned_mutation_keys_by_tablet_and_type(
-                                grouped_mutations
-                                    .take()
-                                    .expect("commit mutation set should be available exactly once"),
-                            );
+                        let (write_keys, lock_only_keys) = Self::split_mutation_keys_by_type(
+                            pending_mutations
+                                .take()
+                                .expect("commit mutation set should be available exactly once"),
+                        );
                         let finalize_begin = Instant::now();
 
                         // Step 6: Finalize write keys and abort lock-only keys so LOCK
                         // sentinels never become committed user-visible versions.
-                        if !write_grouped_keys.is_empty() {
-                            self.storage.finalize_pending_grouped_with_lsn(
-                                &write_grouped_keys,
-                                start_ts,
-                                commit_ts,
-                                commit_lsn,
-                            );
-                        }
-                        if !lock_grouped_keys.is_empty() {
-                            self.storage
-                                .abort_pending_grouped(&lock_grouped_keys, start_ts);
-                        }
+                        self.storage.finalize(FinalizeRequest {
+                            owner_start_ts: start_ts,
+                            commit_ts,
+                            reservation: CommitReservation {
+                                owner_start_ts: start_ts,
+                                lsn: commit_lsn,
+                            },
+                            write_keys: &write_keys,
+                            lock_only_keys: &lock_only_keys,
+                        })?;
 
                         #[cfg(feature = "failpoints")]
                         fail_point!("txn_after_finalize_before_reservation_release_v26");
@@ -1297,12 +1187,15 @@ impl<S: PessimisticStorage + 'static, L: ClogService + 'static, T: TsoService> T
                             let _ = guard.release();
                         }
                         ctx.reserved_lsn = None;
-                        let grouped_keys = Self::group_owned_mutation_keys_by_tablet(
-                            grouped_mutations
+                        let keys = Self::mutation_keys(
+                            pending_mutations
                                 .take()
                                 .expect("commit mutation set should be available exactly once"),
                         );
-                        self.storage.abort_pending_grouped(&grouped_keys, start_ts);
+                        self.storage.abort(AbortRequest {
+                            owner_start_ts: start_ts,
+                            keys: &keys,
+                        })?;
                         self.concurrency_manager.abort_txn(start_ts).ok();
                         self.concurrency_manager.remove_txn(start_ts);
                         self.write_path_diagnostics
@@ -1320,12 +1213,15 @@ impl<S: PessimisticStorage + 'static, L: ClogService + 'static, T: TsoService> T
                     let _ = guard.release();
                 }
                 ctx.reserved_lsn = None;
-                let grouped_keys = Self::group_owned_mutation_keys_by_tablet(
-                    grouped_mutations
+                let keys = Self::mutation_keys(
+                    pending_mutations
                         .take()
                         .expect("commit mutation set should be available exactly once"),
                 );
-                self.storage.abort_pending_grouped(&grouped_keys, start_ts);
+                self.storage.abort(AbortRequest {
+                    owner_start_ts: start_ts,
+                    keys: &keys,
+                })?;
                 self.concurrency_manager.abort_txn(start_ts).ok();
                 self.concurrency_manager.remove_txn(start_ts);
                 self.write_path_diagnostics
@@ -1346,13 +1242,18 @@ impl<S: PessimisticStorage + 'static, L: ClogService + 'static, T: TsoService> T
 
         // Abort all pending nodes in storage
         if !mutations.is_empty() {
-            let grouped_keys = Self::group_owned_mutation_keys_by_tablet(mutations);
-            self.storage
-                .abort_pending_grouped(&grouped_keys, ctx.start_ts);
+            let keys = Self::mutation_keys(mutations);
+            self.storage.abort(AbortRequest {
+                owner_start_ts: ctx.start_ts,
+                keys: &keys,
+            })?;
         }
 
-        if ctx.reserved_lsn.take().is_some() {
-            let _ = self.storage.release_commit_lsn(ctx.start_ts);
+        if let Some(lsn) = ctx.reserved_lsn.take() {
+            let _ = self.storage.release_commit_lsn(CommitReservation {
+                owner_start_ts: ctx.start_ts,
+                lsn,
+            });
         }
 
         // Update state cache
@@ -1367,312 +1268,21 @@ impl<S: PessimisticStorage + 'static, L: ClogService + 'static, T: TsoService> T
 }
 
 // ============================================================================
-// MvccScanIterator - Transaction layer wrapper for storage iterator
+// Public logical scan cursor backed by TxnStoragePort scan steps
 // ============================================================================
 
-/// Streaming MVCC scan iterator wrapping the storage iterator.
-///
-/// This is a thin wrapper that provides MVCC visibility filtering:
-/// - Filters entries by `read_ts` (only entries with `ts <= read_ts` are visible)
-/// - Filters out tombstone/lock sentinels
-/// - Skips older versions of the same key (returns only latest visible version)
-///
-/// ## Iterator Pattern
-///
-/// Construction does NOT position the iterator. Call `advance()` first:
-///
-/// ```ignore
-/// let mut iter = scan_iter(ctx, range)?;
-/// iter.advance()?;  // Position on first entry
-/// while iter.valid() {
-///     let key = iter.user_key();
-///     let value = iter.value();
-///     iter.advance()?;
-/// }
-/// ```
-///
-/// ## Error Handling
-///
-/// Storage errors (I/O, corruption) are propagated through `advance()`.
-/// After an error, `valid()` returns false.
-///
-/// ## Zero-Copy Design
-///
-/// Uses lazy skipping to avoid value cloning: after finding a visible entry,
-/// the storage iterator stays positioned on it. Older versions are skipped
-/// at the start of the next `advance()` call. This allows `user_key()`,
-/// `timestamp()`, and `value()` to return references directly from storage.
-pub struct MvccScanIterator<I: MvccIterator> {
-    /// Storage iterator producing MVCC key-value pairs
-    storage_iter: I,
-    /// Transaction's read timestamp for MVCC filtering
-    read_ts: Timestamp,
-    /// Key range for filtering
-    range: Range<Key>,
-    /// Key to skip on next advance (older versions of last returned key).
-    /// Also used for tombstone skipping within the same advance call.
-    last_returned_key: Option<Vec<u8>>,
-    /// Whether positioned on a valid entry (storage_iter points to it)
-    is_positioned: bool,
-    /// ConcurrencyManager for resolving pending writes from other transactions.
-    /// None for explicit transactions (they use read-your-writes directly).
-    concurrency_manager: Option<Arc<ConcurrencyManager>>,
-    /// Wait/backoff policy for pending owners that cannot be skipped.
+pub struct TxnScanCursorAdapter<C: TxnStorageScanCursor> {
+    cursor: C,
+    current: Option<TxnScanEntry>,
     conflict_wait_config: ConflictWaitConfig,
 }
 
-/// Result of resolving a pending write via TxnStateCache.
-enum PendingResolution {
-    /// Skip this pending node (writer is Running, Aborted, or committed with ts > read_ts)
-    Skip,
-    /// The pending node is now committed with ts <= read_ts; treat as visible
-    Visible,
-}
-
-impl<I: MvccIterator> MvccScanIterator<I> {
-    /// Create a new scan iterator.
-    ///
-    /// The iterator is NOT positioned after construction. Call `advance()`
-    /// to position on the first entry.
-    ///
-    /// # Arguments
-    ///
-    /// * `storage_iter` - Iterator over storage (MVCC key-value pairs)
-    /// * `read_ts` - Transaction's read timestamp for MVCC visibility
-    /// * `range` - Key range for filtering
-    pub fn new(
-        storage_iter: I,
-        read_ts: Timestamp,
-        range: Range<Key>,
-        concurrency_manager: Option<Arc<ConcurrencyManager>>,
-        conflict_wait_config: ConflictWaitConfig,
-    ) -> Self {
+impl<C: TxnStorageScanCursor> TxnScanCursorAdapter<C> {
+    fn new(cursor: C, conflict_wait_config: ConflictWaitConfig) -> Self {
         Self {
-            storage_iter,
-            read_ts,
-            range,
-            last_returned_key: None,
-            is_positioned: false,
-            concurrency_manager,
-            conflict_wait_config,
-        }
-    }
-
-    /// Resolve a pending (uncommitted) write by consulting TxnStateCache.
-    ///
-    /// This determines whether the pending node should be skipped or is visible
-    /// based on the owning transaction's current state.
-    async fn resolve_pending(
-        concurrency_manager: Option<Arc<ConcurrencyManager>>,
-        conflict_wait_config: ConflictWaitConfig,
-        read_ts: Timestamp,
-        owner_ts: Timestamp,
-    ) -> crate::util::error::Result<PendingResolution> {
-        let cm = match concurrency_manager {
-            Some(cm) => cm,
-            None => {
-                // No concurrency manager (explicit txn path) - skip pending
-                return Ok(PendingResolution::Skip);
-            }
-        };
-
-        let mut conflict_backoff = ConflictBackoff::new(conflict_wait_config);
-        loop {
-            match cm.get_txn_state(owner_ts) {
-                Some(TxnState::Running) => {
-                    // Writer is still running. Safe to skip because:
-                    // Writer will see max_ts >= reader.start_ts when it computes commit_ts,
-                    // so commit_ts > reader.start_ts is guaranteed.
-                    return Ok(PendingResolution::Skip);
-                }
-                Some(TxnState::Preparing) => {
-                    // Writer is computing commit_ts. Spin-wait until it transitions
-                    // to Prepared (where we can check the actual commit_ts).
-                    match conflict_backoff.wait_next().await {
-                        ConflictWaitOutcome::RetryNow => continue,
-                        ConflictWaitOutcome::TimedOut => {
-                            return Err(TiSqlError::LockWaitTimeout);
-                        }
-                    }
-                }
-                Some(TxnState::Prepared { prepared_ts }) => {
-                    if prepared_ts > read_ts {
-                        // commit_ts > read_ts, not visible to us
-                        return Ok(PendingResolution::Skip);
-                    }
-                    // prepared_ts <= read_ts: we can't determine visibility yet.
-                    // The writer may commit with this ts, making it visible.
-                    match conflict_backoff.wait_next().await {
-                        ConflictWaitOutcome::RetryNow => continue,
-                        ConflictWaitOutcome::TimedOut => {
-                            return Err(TiSqlError::LockWaitTimeout);
-                        }
-                    }
-                }
-                Some(TxnState::Committed { commit_ts }) => {
-                    if commit_ts > read_ts {
-                        return Ok(PendingResolution::Skip);
-                    }
-                    // Committed with commit_ts <= read_ts: visible!
-                    return Ok(PendingResolution::Visible);
-                }
-                Some(TxnState::Aborted) | None => {
-                    // Transaction aborted or already cleaned up - skip
-                    return Ok(PendingResolution::Skip);
-                }
-            }
-        }
-    }
-
-    /// Find the next visible entry from storage.
-    ///
-    /// Uses lazy skipping: older versions of the previously returned key are
-    /// skipped at the start of this call (not at the end of the previous call).
-    /// This allows `user_key()`, `timestamp()`, and `value()` to return
-    /// references directly from the storage iterator without caching.
-    ///
-    /// After finding a visible entry, the storage iterator stays positioned on it.
-    /// The key is recorded in `last_returned_key` for skipping on the next call.
-    async fn find_next_visible(&mut self) -> crate::util::error::Result<()> {
-        // Lazy skip: skip older versions of the previously returned key
-        if let Some(ref skip_key) = self.last_returned_key {
-            while self.storage_iter.valid() && self.storage_iter.user_key() == skip_key.as_slice() {
-                self.storage_iter.advance().await?;
-            }
-        }
-        self.last_returned_key = None;
-        self.is_positioned = false;
-
-        // Initialize storage iterator if needed
-        if !self.storage_iter.valid() {
-            self.storage_iter.advance().await?;
-        }
-
-        while self.storage_iter.valid() {
-            let user_key = self.storage_iter.user_key();
-            let ts = self.storage_iter.timestamp();
-
-            // Check if past end of range
-            if !self.range.end.is_empty() && user_key >= self.range.end.as_slice() {
-                return Ok(()); // is_positioned stays false
-            }
-
-            // Skip if before start of range
-            if user_key < self.range.start.as_slice() {
-                self.storage_iter.advance().await?;
-                continue;
-            }
-
-            // Resolve pending writes before visibility check
-            if self.storage_iter.is_pending() {
-                match Self::resolve_pending(
-                    self.concurrency_manager.clone(),
-                    self.conflict_wait_config,
-                    self.read_ts,
-                    self.storage_iter.pending_owner(),
-                )
-                .await?
-                {
-                    PendingResolution::Skip => {
-                        self.storage_iter.advance().await?;
-                        continue;
-                    }
-                    PendingResolution::Visible => {
-                        // Committed with commit_ts <= read_ts.
-                        // Skip tombstone/lock sentinels and all older versions.
-                        if is_tombstone(self.storage_iter.value())
-                            || is_lock(self.storage_iter.value())
-                        {
-                            let skip_key = user_key.to_vec();
-                            self.storage_iter.advance().await?;
-                            while self.storage_iter.valid()
-                                && self.storage_iter.user_key() == skip_key.as_slice()
-                            {
-                                self.storage_iter.advance().await?;
-                            }
-                            continue;
-                        }
-                        self.last_returned_key = Some(user_key.to_vec());
-                        self.is_positioned = true;
-                        return Ok(());
-                    }
-                }
-            }
-
-            // Skip if not visible at read_ts
-            if ts > self.read_ts {
-                self.storage_iter.advance().await?;
-                continue;
-            }
-
-            // Found a visible entry - skip tombstone/lock sentinels.
-            if is_tombstone(self.storage_iter.value()) || is_lock(self.storage_iter.value()) {
-                // Sentinel: skip this key and all older versions immediately
-                // (we don't return sentinels, so no lazy skip needed).
-                let skip_key = user_key.to_vec();
-                self.storage_iter.advance().await?;
-                while self.storage_iter.valid()
-                    && self.storage_iter.user_key() == skip_key.as_slice()
-                {
-                    self.storage_iter.advance().await?;
-                }
-                continue;
-            }
-
-            // Found a visible, non-tombstone entry
-            // Record key for lazy skip on next advance, keep iterator positioned here
-            self.last_returned_key = Some(user_key.to_vec());
-            self.is_positioned = true;
-            return Ok(());
-        }
-
-        Ok(()) // is_positioned stays false - exhausted
-    }
-}
-
-impl<I: MvccIterator> MvccIterator for MvccScanIterator<I> {
-    async fn seek(&mut self, _target: &MvccKey) -> crate::util::error::Result<()> {
-        // MvccScanIterator is created for a specific range.
-        // Seeking within the result is not supported - this is a forward-only iterator.
-        // The iterator should be created with the appropriate range instead.
-        Ok(())
-    }
-
-    async fn advance(&mut self) -> crate::util::error::Result<()> {
-        self.find_next_visible().await
-    }
-
-    fn valid(&self) -> bool {
-        self.is_positioned
-    }
-
-    fn user_key(&self) -> &[u8] {
-        debug_assert!(self.is_positioned, "user_key() called on invalid iterator");
-        self.storage_iter.user_key()
-    }
-
-    fn timestamp(&self) -> Timestamp {
-        debug_assert!(self.is_positioned, "timestamp() called on invalid iterator");
-        self.storage_iter.timestamp()
-    }
-
-    fn value(&self) -> &[u8] {
-        debug_assert!(self.is_positioned, "value() called on invalid iterator");
-        self.storage_iter.value()
-    }
-}
-
-/// Public logical scan cursor backed by the internal MVCC iterator.
-pub struct TxnScanCursorAdapter<I: MvccIterator> {
-    iter: MvccScanIterator<I>,
-    current: Option<TxnScanEntry>,
-}
-
-impl<I: MvccIterator> TxnScanCursorAdapter<I> {
-    fn new(iter: MvccScanIterator<I>) -> Self {
-        Self {
-            iter,
+            cursor,
             current: None,
+            conflict_wait_config,
         }
     }
 
@@ -1697,19 +1307,35 @@ impl<I: MvccIterator> TxnScanCursorAdapter<I> {
     }
 }
 
-impl<I: MvccIterator> TxnScanCursor for TxnScanCursorAdapter<I> {
+impl<C: TxnStorageScanCursor> TxnScanCursor for TxnScanCursorAdapter<C> {
     fn advance(&mut self) -> impl Future<Output = Result<()>> + Send + '_ {
         async move {
-            self.iter.advance().await?;
-            self.current = if self.iter.valid() {
-                Some(TxnScanEntry {
-                    user_key: self.iter.user_key().to_vec(),
-                    value: self.iter.value().to_vec(),
-                })
-            } else {
-                None
-            };
-            Ok(())
+            let mut conflict_backoff = ConflictBackoff::new(self.conflict_wait_config);
+            loop {
+                match self.cursor.next_step().await? {
+                    TxnStorageScanStep::Entry(entry) => match entry.state {
+                        TxnStorageVisibleState::Value(value) => {
+                            self.current = Some(TxnScanEntry {
+                                user_key: entry.user_key,
+                                value,
+                            });
+                            return Ok(());
+                        }
+                        TxnStorageVisibleState::Deleted => continue,
+                    },
+                    TxnStorageScanStep::Blocked(_) => match conflict_backoff.wait_next().await {
+                        ConflictWaitOutcome::RetryNow => continue,
+                        ConflictWaitOutcome::TimedOut => {
+                            self.current = None;
+                            return Err(TiSqlError::LockWaitTimeout);
+                        }
+                    },
+                    TxnStorageScanStep::Exhausted => {
+                        self.current = None;
+                        return Ok(());
+                    }
+                }
+            }
         }
     }
 
@@ -1746,13 +1372,26 @@ mod tests {
     use super::*;
     use crate::clog::{FileClogConfig, FileClogService};
     use crate::inner_table::core_tables::ALL_META_TABLE_ID;
-    use crate::tablet::MemTableEngine;
+    use crate::kernel::txn_storage::{
+        AbortRequest, CommitReservation, FinalizeRequest, PointReadResult, TxnDeleteEffect,
+        TxnPointRead, TxnStageError, TxnStoragePort, TxnStorageScanCursor, TxnStorageScanEntry,
+        TxnStorageScanRequest, TxnStorageScanStep, TxnStorageVisibleState,
+    };
+    use crate::lsn::new_lsn_provider;
+    use crate::tablet::routed_storage::TxnStorageScanAdapter;
+    use crate::tablet::{
+        is_lock, is_tombstone, route_table_to_tablet, IlogConfig, IlogService, LsmConfig,
+        MemTableEngine, MvccIterator, MvccKey, PessimisticStorage, StorageEngine, TabletEngine,
+        TabletTxnStorage, Version, WriteBatch, LOCK,
+    };
     use crate::transaction::{TxnScanCursor, TxnService as PublicTxnService};
     use crate::tso::LocalTso;
+    use std::collections::VecDeque;
     use std::time::Duration;
     use tempfile::tempdir;
 
     type TestStorage = MemTableEngine;
+    type TestTxnStorage = TabletTxnStorage<TestStorage>;
 
     fn make_test_io() -> Arc<crate::io::IoService> {
         crate::io::IoService::new_for_test(32).unwrap()
@@ -1760,7 +1399,7 @@ mod tests {
 
     fn create_test_service() -> (
         Arc<TestStorage>,
-        TransactionService<TestStorage, FileClogService, LocalTso>,
+        TransactionService<TestTxnStorage, FileClogService, LocalTso>,
         tempfile::TempDir,
     ) {
         let dir = tempdir().unwrap();
@@ -1778,8 +1417,9 @@ mod tests {
         );
         let tso = Arc::new(LocalTso::new(1));
         let cm = Arc::new(ConcurrencyManager::new(0));
+        let txn_storage = Arc::new(TabletTxnStorage::new(Arc::clone(&storage), Arc::clone(&cm)));
         let txn_service = TransactionService::new_with_conflict_wait_config(
-            Arc::clone(&storage),
+            txn_storage,
             clog_service,
             tso,
             cm,
@@ -1791,6 +1431,268 @@ mod tests {
             },
         );
         (storage, txn_service, dir)
+    }
+
+    fn create_lsm_test_service() -> (
+        Arc<TabletEngine>,
+        TransactionService<TabletTxnStorage<TabletEngine>, FileClogService, LocalTso>,
+        tempfile::TempDir,
+    ) {
+        let dir = tempdir().unwrap();
+        let config = FileClogConfig::with_dir(dir.path().join("clog"));
+        let io_handle = tokio::runtime::Handle::current();
+        let lsn_provider = new_lsn_provider();
+        let ilog = Arc::new(
+            IlogService::open_with_thread(
+                IlogConfig::new(dir.path().join("tablet")),
+                Arc::clone(&lsn_provider),
+            )
+            .unwrap(),
+        );
+        let storage = Arc::new(
+            TabletEngine::open_with_recovery(
+                LsmConfig::new(dir.path().join("tablet")),
+                Arc::clone(&lsn_provider),
+                ilog,
+                Version::new(),
+                make_test_io(),
+            )
+            .unwrap(),
+        );
+        let clog_service = Arc::new(
+            FileClogService::open_with_lsn_provider(
+                config,
+                lsn_provider,
+                make_test_io(),
+                &io_handle,
+            )
+            .unwrap(),
+        );
+        let tso = Arc::new(LocalTso::new(1));
+        let cm = Arc::new(ConcurrencyManager::new(0));
+        let txn_storage = Arc::new(TabletTxnStorage::new(Arc::clone(&storage), Arc::clone(&cm)));
+        let txn_service = TransactionService::new_with_conflict_wait_config(
+            txn_storage,
+            clog_service,
+            tso,
+            cm,
+            ConflictWaitConfig {
+                lock_wait_timeout: Duration::from_millis(100),
+                spin_retries: 0,
+                initial_backoff: Duration::from_millis(10),
+                max_backoff: Duration::from_millis(10),
+            },
+        );
+        (storage, txn_service, dir)
+    }
+
+    #[derive(Clone)]
+    struct MockTxnStorage {
+        scan_steps: Vec<TxnStorageScanStep>,
+    }
+
+    impl MockTxnStorage {
+        fn new(scan_steps: Vec<TxnStorageScanStep>) -> Self {
+            Self { scan_steps }
+        }
+    }
+
+    struct MockScanCursor {
+        steps: VecDeque<TxnStorageScanStep>,
+    }
+
+    impl TxnStorageScanCursor for MockScanCursor {
+        fn next_step(&mut self) -> impl Future<Output = Result<TxnStorageScanStep>> + Send + '_ {
+            std::future::ready(Ok(self
+                .steps
+                .pop_front()
+                .unwrap_or(TxnStorageScanStep::Exhausted)))
+        }
+    }
+
+    impl TxnStoragePort for MockTxnStorage {
+        type ScanCursor = MockScanCursor;
+
+        fn read_point<'a>(
+            &'a self,
+            _req: TxnPointRead<'a>,
+        ) -> impl Future<Output = Result<PointReadResult>> + Send + 'a {
+            std::future::ready(Ok(PointReadResult::Missing))
+        }
+
+        fn scan(&self, _req: TxnStorageScanRequest) -> Result<Self::ScanCursor> {
+            Ok(MockScanCursor {
+                steps: self.scan_steps.iter().cloned().collect(),
+            })
+        }
+
+        fn stage_put(
+            &self,
+            _key: &[u8],
+            _value: &[u8],
+            _owner_start_ts: Timestamp,
+        ) -> std::result::Result<(), TxnStageError> {
+            unreachable!("mock scan storage does not stage writes")
+        }
+
+        fn stage_delete<'a>(
+            &'a self,
+            _key: &'a [u8],
+            _owner_start_ts: Timestamp,
+        ) -> impl Future<Output = std::result::Result<TxnDeleteEffect, TxnStageError>> + Send + 'a
+        {
+            async move { unreachable!("mock scan storage does not stage writes") }
+        }
+
+        fn stage_lock(
+            &self,
+            _key: &[u8],
+            _owner_start_ts: Timestamp,
+        ) -> std::result::Result<(), TxnStageError> {
+            unreachable!("mock scan storage does not stage writes")
+        }
+
+        fn restore_pending(
+            &self,
+            _key: &[u8],
+            _mutation: TxnRestoreMutation<'_>,
+            _owner_start_ts: Timestamp,
+        ) -> std::result::Result<(), TxnStageError> {
+            unreachable!("mock scan storage does not stage writes")
+        }
+
+        fn reserve_commit_lsn(&self, owner_start_ts: Timestamp) -> CommitReservation {
+            CommitReservation {
+                owner_start_ts,
+                lsn: 1,
+            }
+        }
+
+        fn release_commit_lsn(&self, _reservation: CommitReservation) -> bool {
+            true
+        }
+
+        fn finalize(&self, _req: FinalizeRequest<'_>) -> Result<()> {
+            Ok(())
+        }
+
+        fn abort(&self, _req: AbortRequest<'_>) -> Result<()> {
+            Ok(())
+        }
+    }
+
+    fn create_mock_scan_service(
+        scan_steps: Vec<TxnStorageScanStep>,
+        conflict_wait_config: ConflictWaitConfig,
+    ) -> (
+        TransactionService<MockTxnStorage, FileClogService, LocalTso>,
+        tempfile::TempDir,
+    ) {
+        let dir = tempdir().unwrap();
+        let config = FileClogConfig::with_dir(dir.path());
+        let io_handle = tokio::runtime::Handle::current();
+        let clog_service = Arc::new(
+            FileClogService::open_with_lsn_provider(
+                config,
+                crate::lsn::new_lsn_provider(),
+                make_test_io(),
+                &io_handle,
+            )
+            .unwrap(),
+        );
+        let tso = Arc::new(LocalTso::new(1));
+        let cm = Arc::new(ConcurrencyManager::new(0));
+        let txn_storage = Arc::new(MockTxnStorage::new(scan_steps));
+        let txn_service = TransactionService::new_with_conflict_wait_config(
+            txn_storage,
+            clog_service,
+            tso,
+            cm,
+            conflict_wait_config,
+        );
+        (txn_service, dir)
+    }
+
+    struct MvccScanIterator<I: MvccIterator> {
+        cursor: TxnStorageScanAdapter<I>,
+        current: Option<TxnScanEntry>,
+        conflict_wait_config: ConflictWaitConfig,
+    }
+
+    impl<I: MvccIterator> MvccScanIterator<I> {
+        fn new(
+            iter: I,
+            read_ts: Timestamp,
+            range: Range<Key>,
+            concurrency_manager: Option<Arc<ConcurrencyManager>>,
+            conflict_wait_config: ConflictWaitConfig,
+        ) -> Self {
+            let cm = concurrency_manager.unwrap_or_else(|| Arc::new(ConcurrencyManager::new(0)));
+            Self {
+                cursor: TxnStorageScanAdapter::new(iter, read_ts, range, cm),
+                current: None,
+                conflict_wait_config,
+            }
+        }
+    }
+
+    impl<I: MvccIterator> MvccIterator for MvccScanIterator<I> {
+        async fn seek(&mut self, _target: &MvccKey) -> Result<()> {
+            Ok(())
+        }
+
+        async fn advance(&mut self) -> Result<()> {
+            let mut conflict_backoff = ConflictBackoff::new(self.conflict_wait_config);
+            loop {
+                match self.cursor.next_step().await? {
+                    TxnStorageScanStep::Entry(entry) => match entry.state {
+                        TxnStorageVisibleState::Value(value) => {
+                            self.current = Some(TxnScanEntry {
+                                user_key: entry.user_key,
+                                value,
+                            });
+                            return Ok(());
+                        }
+                        TxnStorageVisibleState::Deleted => continue,
+                    },
+                    TxnStorageScanStep::Blocked(_) => match conflict_backoff.wait_next().await {
+                        ConflictWaitOutcome::RetryNow => continue,
+                        ConflictWaitOutcome::TimedOut => {
+                            self.current = None;
+                            return Err(TiSqlError::LockWaitTimeout);
+                        }
+                    },
+                    TxnStorageScanStep::Exhausted => {
+                        self.current = None;
+                        return Ok(());
+                    }
+                }
+            }
+        }
+
+        fn valid(&self) -> bool {
+            self.current.is_some()
+        }
+
+        fn user_key(&self) -> &[u8] {
+            self.current
+                .as_ref()
+                .expect("user_key() called on invalid iterator")
+                .user_key
+                .as_slice()
+        }
+
+        fn timestamp(&self) -> Timestamp {
+            0
+        }
+
+        fn value(&self) -> &[u8] {
+            self.current
+                .as_ref()
+                .expect("value() called on invalid iterator")
+                .value
+                .as_slice()
+        }
     }
 
     async fn collect_public_scan<T: PublicTxnService>(
@@ -1904,6 +1806,50 @@ mod tests {
         );
     }
 
+    #[tokio::test]
+    async fn test_public_scan_retries_blocked_same_key_before_advancing() {
+        let (txn_service, _dir) = create_mock_scan_service(
+            vec![
+                TxnStorageScanStep::Blocked(crate::kernel::txn_storage::TxnStorageBlocked {
+                    user_key: b"beta".to_vec(),
+                    owner_start_ts: 42,
+                }),
+                TxnStorageScanStep::Entry(TxnStorageScanEntry {
+                    user_key: b"beta".to_vec(),
+                    state: TxnStorageVisibleState::Value(b"v2".to_vec()),
+                }),
+                TxnStorageScanStep::Entry(TxnStorageScanEntry {
+                    user_key: b"gamma".to_vec(),
+                    state: TxnStorageVisibleState::Value(b"v3".to_vec()),
+                }),
+            ],
+            ConflictWaitConfig {
+                lock_wait_timeout: Duration::from_millis(100),
+                spin_retries: 1,
+                initial_backoff: Duration::from_millis(10),
+                max_backoff: Duration::from_millis(10),
+            },
+        );
+
+        let ctx = txn_service.begin(true).unwrap();
+        let rows = collect_public_scan(
+            &txn_service,
+            &ctx,
+            ALL_META_TABLE_ID,
+            b"beta".to_vec()..b"omega".to_vec(),
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(
+            rows,
+            vec![
+                (b"beta".to_vec(), b"v2".to_vec()),
+                (b"gamma".to_vec(), b"v3".to_vec()),
+            ]
+        );
+    }
+
     // ========================================================================
     // Test Helpers Using MvccKey
     // ========================================================================
@@ -2012,7 +1958,9 @@ mod tests {
             );
             let tso = Arc::new(LocalTso::new(1));
             let cm = Arc::new(ConcurrencyManager::new(0));
-            let txn_service = TransactionService::new(storage, clog_service.clone(), tso, cm);
+            let txn_storage =
+                Arc::new(TabletTxnStorage::new(Arc::clone(&storage), Arc::clone(&cm)));
+            let txn_service = TransactionService::new(txn_storage, clog_service.clone(), tso, cm);
 
             txn_service.autocommit_put(b"k1", b"v1").await.unwrap();
             txn_service.autocommit_put(b"k2", b"v2").await.unwrap();
@@ -2033,7 +1981,8 @@ mod tests {
         let clog_service = Arc::new(clog_service);
         let tso = Arc::new(LocalTso::new(1));
         let cm = Arc::new(ConcurrencyManager::new(0));
-        let txn_service = TransactionService::new(Arc::clone(&storage), clog_service, tso, cm);
+        let txn_storage = Arc::new(TabletTxnStorage::new(Arc::clone(&storage), Arc::clone(&cm)));
+        let txn_service = TransactionService::new(txn_storage, clog_service, tso, cm);
 
         let stats = txn_service.recover(&entries).unwrap();
         assert_eq!(stats.committed_txns, 3);
@@ -2197,7 +2146,7 @@ mod tests {
         assert_eq!(value, Some(b"v1".to_vec()));
 
         // But reading via storage should see v2
-        let latest = get_for_test(txn_service.storage(), b"key").await;
+        let latest = get_for_test(txn_service.storage().inner(), b"key").await;
         assert_eq!(latest, Some(b"v2".to_vec()));
     }
 
@@ -3400,7 +3349,8 @@ mod tests {
         let clog_service = Arc::new(clog_service);
         let tso = Arc::new(LocalTso::new(1));
         let cm = Arc::new(ConcurrencyManager::new(0));
-        let txn_service = TransactionService::new(Arc::clone(&storage), clog_service, tso, cm);
+        let txn_storage = Arc::new(TabletTxnStorage::new(Arc::clone(&storage), Arc::clone(&cm)));
+        let txn_service = TransactionService::new(txn_storage, clog_service, tso, cm);
 
         let stats = txn_service.recover(&entries).unwrap();
 
@@ -3699,9 +3649,11 @@ mod tests {
             "reader should wait while prepared owner is unresolved"
         );
 
-        txn_service
-            .storage
-            .finalize_pending(&[b"prepared_key".to_vec()], writer.start_ts, read_ts);
+        txn_service.storage.inner().finalize_pending(
+            &[b"prepared_key".to_vec()],
+            writer.start_ts,
+            read_ts,
+        );
         txn_service
             .concurrency_manager
             .commit_txn(writer.start_ts, read_ts)
@@ -3777,7 +3729,9 @@ mod tests {
             );
             let tso = Arc::new(LocalTso::new(1));
             let cm = Arc::new(ConcurrencyManager::new(0));
-            let txn_service = TransactionService::new(storage, clog_service.clone(), tso, cm);
+            let txn_storage =
+                Arc::new(TabletTxnStorage::new(Arc::clone(&storage), Arc::clone(&cm)));
+            let txn_service = TransactionService::new(txn_storage, clog_service.clone(), tso, cm);
 
             // Put then delete
             txn_service
@@ -3801,7 +3755,8 @@ mod tests {
         let clog_service = Arc::new(clog_service);
         let tso = Arc::new(LocalTso::new(1));
         let cm = Arc::new(ConcurrencyManager::new(0));
-        let txn_service = TransactionService::new(Arc::clone(&storage), clog_service, tso, cm);
+        let txn_storage = Arc::new(TabletTxnStorage::new(Arc::clone(&storage), Arc::clone(&cm)));
+        let txn_service = TransactionService::new(txn_storage, clog_service, tso, cm);
 
         let stats = txn_service.recover(&entries).unwrap();
 
@@ -3830,7 +3785,8 @@ mod tests {
         );
         let tso = Arc::new(LocalTso::new(1));
         let cm = Arc::new(ConcurrencyManager::new(0));
-        let txn_service = TransactionService::new(Arc::clone(&storage), clog_service, tso, cm);
+        let txn_storage = Arc::new(TabletTxnStorage::new(Arc::clone(&storage), Arc::clone(&cm)));
+        let txn_service = TransactionService::new(txn_storage, clog_service, tso, cm);
 
         // Recover with empty entries
         let stats = txn_service.recover(&[]).unwrap();
@@ -3846,7 +3802,7 @@ mod tests {
         let (storage, txn_service, _dir) = create_test_service();
 
         // Test storage() getter returns the same storage
-        let storage_ref = txn_service.storage();
+        let storage_ref = txn_service.storage().inner();
         txn_service
             .autocommit_put(b"test_key", b"test_value")
             .await
@@ -3963,6 +3919,43 @@ mod tests {
         let entries = txn_service.clog_service().read_all().unwrap();
         let data = clog_data_entries(&entries, txn_id);
         assert_eq!(data.len(), 1, "should have 1 Delete entry");
+        assert!(
+            matches!(&data[0].op, ClogOp::Delete { key } if key == b"key1"),
+            "expected Delete entry for key1, got {:?}",
+            data[0].op
+        );
+    }
+
+    #[tokio::test]
+    async fn test_explicit_txn_repeated_delete_existing_preserves_delete_on_commit() {
+        let (storage, txn_service, _dir) = create_test_service();
+
+        txn_service
+            .autocommit_put(b"key1", b"value1")
+            .await
+            .unwrap();
+
+        let mut ctx = txn_service.begin_explicit(false).unwrap();
+        let txn_id = ctx.txn_id();
+        txn_service
+            .delete(&mut ctx, ALL_META_TABLE_ID, b"key1")
+            .await
+            .unwrap();
+        txn_service
+            .delete(&mut ctx, ALL_META_TABLE_ID, b"key1")
+            .await
+            .unwrap();
+        txn_service.commit(ctx).await.unwrap();
+
+        assert_eq!(
+            get_for_test(&*storage, b"key1").await,
+            None,
+            "repeated delete must not degrade into a lock-only commit"
+        );
+
+        let entries = txn_service.clog_service().read_all().unwrap();
+        let data = clog_data_entries(&entries, txn_id);
+        assert_eq!(data.len(), 1, "should still write one delete entry");
         assert!(
             matches!(&data[0].op, ClogOp::Delete { key } if key == b"key1"),
             "expected Delete entry for key1, got {:?}",
@@ -4241,6 +4234,106 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn test_statement_rollback_restores_prior_delete_after_repeated_delete() {
+        let (_storage, txn_service, _dir) = create_test_service();
+
+        txn_service
+            .autocommit_put(b"restore_delete_twice", b"base")
+            .await
+            .unwrap();
+
+        let mut ctx = txn_service.begin_explicit(false).unwrap();
+        txn_service
+            .delete(&mut ctx, ALL_META_TABLE_ID, b"restore_delete_twice")
+            .await
+            .unwrap();
+
+        let mut undo = StatementUndo::default();
+        undo.record_first_touch(
+            b"restore_delete_twice",
+            ctx.mutations
+                .get(b"restore_delete_twice".as_slice())
+                .cloned(),
+        );
+
+        txn_service
+            .delete(&mut ctx, ALL_META_TABLE_ID, b"restore_delete_twice")
+            .await
+            .unwrap();
+
+        txn_service
+            .rollback_statement(&mut ctx, undo)
+            .await
+            .unwrap();
+
+        assert!(matches!(
+            ctx.mutations
+                .get(b"restore_delete_twice".as_slice())
+                .map(|meta| &meta.mutation),
+            Some(MutationPayload::Delete)
+        ));
+        assert_eq!(
+            txn_service
+                .get(&ctx, ALL_META_TABLE_ID, b"restore_delete_twice")
+                .await
+                .unwrap(),
+            None
+        );
+
+        txn_service.rollback(ctx).unwrap();
+    }
+
+    #[tokio::test]
+    async fn test_statement_rollback_restores_prior_delete_after_repeated_delete_on_lsm_storage() {
+        let (_storage, txn_service, _dir) = create_lsm_test_service();
+
+        txn_service
+            .autocommit_put(b"restore_delete_twice_lsm", b"base")
+            .await
+            .unwrap();
+
+        let mut ctx = txn_service.begin_explicit(false).unwrap();
+        txn_service
+            .delete(&mut ctx, ALL_META_TABLE_ID, b"restore_delete_twice_lsm")
+            .await
+            .unwrap();
+
+        let mut undo = StatementUndo::default();
+        undo.record_first_touch(
+            b"restore_delete_twice_lsm",
+            ctx.mutations
+                .get(b"restore_delete_twice_lsm".as_slice())
+                .cloned(),
+        );
+
+        txn_service
+            .delete(&mut ctx, ALL_META_TABLE_ID, b"restore_delete_twice_lsm")
+            .await
+            .unwrap();
+
+        txn_service
+            .rollback_statement(&mut ctx, undo)
+            .await
+            .unwrap();
+
+        assert!(matches!(
+            ctx.mutations
+                .get(b"restore_delete_twice_lsm".as_slice())
+                .map(|meta| &meta.mutation),
+            Some(MutationPayload::Delete)
+        ));
+        assert_eq!(
+            txn_service
+                .get(&ctx, ALL_META_TABLE_ID, b"restore_delete_twice_lsm")
+                .await
+                .unwrap(),
+            None
+        );
+
+        txn_service.rollback(ctx).unwrap();
+    }
+
+    #[tokio::test]
     async fn test_statement_rollback_restores_prior_lock() {
         let (_storage, txn_service, _dir) = create_test_service();
 
@@ -4323,9 +4416,11 @@ mod tests {
         let tablet_id = route_table_to_tablet(ALL_META_TABLE_ID);
         txn_service
             .storage
+            .inner()
             .abort_pending(&[b"restore_conflict".to_vec()], ctx.start_ts);
         txn_service
             .storage
+            .inner()
             .put_pending_on_tablet(tablet_id, b"restore_conflict", b"foreign", 9_999)
             .unwrap();
 
@@ -4349,6 +4444,7 @@ mod tests {
 
         txn_service
             .storage
+            .inner()
             .abort_pending(&[b"restore_conflict".to_vec()], 9_999);
     }
 

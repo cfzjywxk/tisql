@@ -28,17 +28,20 @@ use std::pin::Pin;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Instant;
 
-use crate::catalog::types::{ColumnId, ColumnInfo, DataType, Key, Row, Schema, TableId, Value};
+use crate::catalog::types::{ColumnInfo, DataType, Row, Schema, Value};
+#[cfg(test)]
+use crate::catalog::types::{Key, TableId};
 use crate::catalog::{Catalog, TableDef};
 use crate::kernel::execution::{
-    ExecutionBackend, LogicalPointKey, PointGetRequest, ProjectionSpec,
+    DeleteRequest, ExecutionBackend, ExecutionRow, ExecutionRowStream, InsertRequest, InsertRow,
+    LockRequest, LogicalPointKey, LogicalScanBounds, PointGetRequest, ProjectionSpec, RowKey,
+    ScanBound, ScanRequest, UpdateRequest, UpdateRow, WriteRequest,
 };
 use crate::session::{ExecutionCtx, StatementCtx};
 use crate::sql::{AggFunc, BinaryOp, Expr, LogicalPlan, OrderByExpr, UnaryOp};
-use crate::tablet::{
-    decode_row_to_values, encode_int_key, encode_key, encode_pk, encode_row, next_key_bound,
-};
-use crate::transaction::{StatementGuard, TxnCtx, TxnScanCursor, TxnService};
+#[cfg(test)]
+use crate::transaction::StatementGuard;
+use crate::transaction::{TxnCtx, TxnService};
 use crate::util::error::{Result, TiSqlError};
 
 use super::{DdlEffect, Execution, ExecutionOutput, Executor, RowPuller};
@@ -385,14 +388,11 @@ fn compute_aggregate(func: &AggFunc, arg: &Expr, rows: &[Row]) -> Result<Value> 
 // ============================================================================
 
 /// Table scan operator — reads rows from storage via TxnScanCursor.
-struct ScanOp<I: TxnScanCursor> {
+struct ScanOp<I: ExecutionRowStream> {
     iter: I,
     schema: Schema,
-    col_ids: Vec<ColumnId>,
-    data_types: Vec<DataType>,
     filter: Option<Expr>,
     projection: Option<Vec<usize>>,
-    initialized: bool,
 }
 
 /// VALUES clause operator — yields literal rows.
@@ -407,20 +407,20 @@ struct EmptyOp {
 }
 
 /// Projection operator — evaluates expressions on each row.
-struct ProjectOp<I: TxnScanCursor> {
+struct ProjectOp<I: ExecutionRowStream> {
     child: Box<Operator<I>>,
     exprs: Vec<(Expr, String)>,
     schema: Schema,
 }
 
 /// Filter operator — keeps rows matching predicate.
-struct FilterOp<I: TxnScanCursor> {
+struct FilterOp<I: ExecutionRowStream> {
     child: Box<Operator<I>>,
     predicate: Expr,
 }
 
 /// Limit/offset operator — caps output row count.
-struct LimitOp<I: TxnScanCursor> {
+struct LimitOp<I: ExecutionRowStream> {
     child: Box<Operator<I>>,
     limit: Option<usize>,
     offset: usize,
@@ -429,14 +429,14 @@ struct LimitOp<I: TxnScanCursor> {
 }
 
 /// Sort operator — materializes all rows on first next(), then yields sorted.
-struct SortOp<I: TxnScanCursor> {
+struct SortOp<I: ExecutionRowStream> {
     child: Box<Operator<I>>,
     order_by: Vec<OrderByExpr>,
     sorted_rows: Option<std::vec::IntoIter<Row>>,
 }
 
 /// Aggregate operator — materializes all rows on first next(), computes aggregates.
-struct AggregateOp<I: TxnScanCursor> {
+struct AggregateOp<I: ExecutionRowStream> {
     child: Box<Operator<I>>,
     group_by: Vec<Expr>,
     agg_exprs: Vec<(AggFunc, Expr, String)>,
@@ -452,7 +452,7 @@ struct AggregateOp<I: TxnScanCursor> {
 ///
 /// Generic over `I: TxnScanCursor` — the storage iterator type, known at
 /// compile time via `TxnService::ScanCursor`.
-enum Operator<I: TxnScanCursor> {
+enum Operator<I: ExecutionRowStream> {
     Scan(ScanOp<I>),
     Values(ValuesOp),
     Empty(EmptyOp),
@@ -463,7 +463,7 @@ enum Operator<I: TxnScanCursor> {
     Aggregate(AggregateOp<I>),
 }
 
-impl<I: TxnScanCursor> Operator<I> {
+impl<I: ExecutionRowStream> Operator<I> {
     /// Cascade open to children. Leaf nodes are no-ops.
     /// No I/O happens here — real work is deferred to first `next()` call.
     fn open(&mut self) -> Pin<Box<dyn Future<Output = Result<()>> + Send + '_>> {
@@ -510,7 +510,7 @@ impl<I: TxnScanCursor> Operator<I> {
     }
 }
 
-impl<I: TxnScanCursor> RowPuller for Operator<I> {
+impl<I: ExecutionRowStream> RowPuller for Operator<I> {
     fn next(&mut self) -> Pin<Box<dyn Future<Output = Result<Option<Row>>> + Send + '_>> {
         Operator::next(self)
     }
@@ -520,22 +520,14 @@ impl<I: TxnScanCursor> RowPuller for Operator<I> {
 // Individual Operator Implementations
 // ============================================================================
 
-impl<I: TxnScanCursor> ScanOp<I> {
+impl<I: ExecutionRowStream> ScanOp<I> {
     async fn next(&mut self) -> Result<Option<Row>> {
-        if !self.initialized {
-            self.initialized = true;
-            self.iter.advance().await?;
-        }
-
-        while let Some(entry) = self.iter.current() {
-            let value = entry.value.as_slice();
-            let values = decode_row_to_values(value, &self.col_ids, &self.data_types)?;
-            let row = Row::new(values);
+        while let Some(execution_row) = self.iter.next_row().await? {
+            let row = execution_row.row;
 
             if let Some(ref filter_expr) = self.filter {
                 let result = eval_expr(filter_expr, &row)?;
                 if !value_to_bool(&result)? {
-                    self.iter.advance().await?;
                     continue;
                 }
             }
@@ -550,7 +542,6 @@ impl<I: TxnScanCursor> ScanOp<I> {
                 row
             };
 
-            self.iter.advance().await?;
             return Ok(Some(projected_row));
         }
 
@@ -558,7 +549,7 @@ impl<I: TxnScanCursor> ScanOp<I> {
     }
 }
 
-impl<I: TxnScanCursor> ProjectOp<I> {
+impl<I: ExecutionRowStream> ProjectOp<I> {
     async fn next(&mut self) -> Result<Option<Row>> {
         if let Some(row) = self.child.next().await? {
             let values = self
@@ -573,7 +564,7 @@ impl<I: TxnScanCursor> ProjectOp<I> {
     }
 }
 
-impl<I: TxnScanCursor> FilterOp<I> {
+impl<I: ExecutionRowStream> FilterOp<I> {
     async fn next(&mut self) -> Result<Option<Row>> {
         while let Some(row) = self.child.next().await? {
             let result = eval_expr(&self.predicate, &row)?;
@@ -585,7 +576,7 @@ impl<I: TxnScanCursor> FilterOp<I> {
     }
 }
 
-impl<I: TxnScanCursor> LimitOp<I> {
+impl<I: ExecutionRowStream> LimitOp<I> {
     async fn next(&mut self) -> Result<Option<Row>> {
         // Skip offset rows
         while self.skipped < self.offset {
@@ -610,7 +601,7 @@ impl<I: TxnScanCursor> LimitOp<I> {
     }
 }
 
-impl<I: TxnScanCursor> SortOp<I> {
+impl<I: ExecutionRowStream> SortOp<I> {
     async fn next(&mut self) -> Result<Option<Row>> {
         if self.sorted_rows.is_none() {
             // Materialize all rows from child, then sort
@@ -637,7 +628,7 @@ impl<I: TxnScanCursor> SortOp<I> {
     }
 }
 
-impl<I: TxnScanCursor> AggregateOp<I> {
+impl<I: ExecutionRowStream> AggregateOp<I> {
     async fn next(&mut self) -> Result<Option<Row>> {
         if self.result.is_none() {
             // Materialize all rows from child
@@ -670,31 +661,19 @@ impl<I: TxnScanCursor> AggregateOp<I> {
 
 /// Build an operator tree from a logical plan.
 ///
-/// `Scan` and `PointGet` touch `txn_service`; all other nodes just wrap
-/// their child operator in `Box`.
-async fn build_read_operator<T: TxnService>(
+/// Read access stays behind `ExecutionBackend`; the executor does not encode
+/// physical keys or touch transaction scan cursors directly here.
+async fn build_read_operator<B: ExecutionBackend>(
     plan: LogicalPlan,
-    txn_service: &T,
-    execution_backend: &impl ExecutionBackend,
+    execution_backend: &B,
     ctx: &TxnCtx,
-) -> Result<Operator<T::ScanCursor>> {
+) -> Result<Operator<B::Scan>> {
     match plan {
         LogicalPlan::Scan {
             table,
             filter,
             projection,
         } => {
-            let table_id = table.id();
-            let start_key = encode_key(table_id, &[]);
-            let end_key = encode_key(table_id + 1, &[]);
-
-            let col_ids: Vec<ColumnId> = table.columns().iter().map(|c| c.id()).collect();
-            let data_types: Vec<DataType> = table
-                .columns()
-                .iter()
-                .map(|c| c.data_type().clone())
-                .collect();
-
             let schema = Schema::new(
                 table
                     .columns()
@@ -705,27 +684,31 @@ async fn build_read_operator<T: TxnService>(
                     .collect(),
             );
 
-            let scan_range = match filter
+            let bounds = match filter
                 .as_ref()
-                .and_then(|predicate| extract_pk_scan_range(&table, predicate))
+                .and_then(|predicate| extract_pk_scan_bounds(&table, predicate))
             {
-                Some(PkScanRange::Empty) => {
+                Some(LogicalPkScanBounds::Empty) => {
                     return Ok(Operator::Empty(EmptyOp { schema }));
                 }
-                Some(PkScanRange::Bounded(range)) => range,
-                None => start_key..end_key,
+                Some(LogicalPkScanBounds::Bounded(bounds)) => bounds,
+                None => LogicalScanBounds::FullTable,
             };
 
-            let iter = txn_service.scan(ctx, table_id, scan_range)?;
+            let iter = execution_backend.scan(
+                ctx,
+                ScanRequest {
+                    table,
+                    bounds,
+                    projection: ProjectionSpec::All,
+                },
+            )?;
 
             Ok(Operator::Scan(ScanOp {
                 iter,
                 schema,
-                col_ids,
-                data_types,
                 filter,
                 projection,
-                initialized: false,
             }))
         }
 
@@ -782,13 +765,7 @@ async fn build_read_operator<T: TxnService>(
         LogicalPlan::Empty { schema } => Ok(Operator::Empty(EmptyOp { schema })),
 
         LogicalPlan::Project { input, exprs } => {
-            let child = Box::pin(build_read_operator(
-                *input,
-                txn_service,
-                execution_backend,
-                ctx,
-            ))
-            .await?;
+            let child = Box::pin(build_read_operator(*input, execution_backend, ctx)).await?;
             let schema = Schema::new(
                 exprs
                     .iter()
@@ -803,13 +780,7 @@ async fn build_read_operator<T: TxnService>(
         }
 
         LogicalPlan::Filter { input, predicate } => {
-            let child = Box::pin(build_read_operator(
-                *input,
-                txn_service,
-                execution_backend,
-                ctx,
-            ))
-            .await?;
+            let child = Box::pin(build_read_operator(*input, execution_backend, ctx)).await?;
             Ok(Operator::Filter(FilterOp {
                 child: Box::new(child),
                 predicate,
@@ -821,13 +792,7 @@ async fn build_read_operator<T: TxnService>(
             limit,
             offset,
         } => {
-            let child = Box::pin(build_read_operator(
-                *input,
-                txn_service,
-                execution_backend,
-                ctx,
-            ))
-            .await?;
+            let child = Box::pin(build_read_operator(*input, execution_backend, ctx)).await?;
             Ok(Operator::Limit(LimitOp {
                 child: Box::new(child),
                 limit,
@@ -838,13 +803,7 @@ async fn build_read_operator<T: TxnService>(
         }
 
         LogicalPlan::Sort { input, order_by } => {
-            let child = Box::pin(build_read_operator(
-                *input,
-                txn_service,
-                execution_backend,
-                ctx,
-            ))
-            .await?;
+            let child = Box::pin(build_read_operator(*input, execution_backend, ctx)).await?;
             Ok(Operator::Sort(SortOp {
                 child: Box::new(child),
                 order_by,
@@ -857,13 +816,7 @@ async fn build_read_operator<T: TxnService>(
             group_by,
             agg_exprs,
         } => {
-            let child = Box::pin(build_read_operator(
-                *input,
-                txn_service,
-                execution_backend,
-                ctx,
-            ))
-            .await?;
+            let child = Box::pin(build_read_operator(*input, execution_backend, ctx)).await?;
             let schema = Schema::new(
                 agg_exprs
                     .iter()
@@ -889,24 +842,19 @@ async fn build_read_operator<T: TxnService>(
 enum DmlReadPlan {
     Empty,
     PointGet {
-        key: Key,
+        key: LogicalPointKey,
         filter: Option<Expr>,
     },
     Scan {
-        range: std::ops::Range<Key>,
+        bounds: LogicalScanBounds,
         filter: Option<Expr>,
     },
 }
 
-enum PkScanRange {
+#[derive(Debug, Clone, PartialEq)]
+enum LogicalPkScanBounds {
     Empty,
-    Bounded(std::ops::Range<Key>),
-}
-
-#[derive(Clone)]
-struct PkBound {
-    encoded: Vec<u8>,
-    inclusive: bool,
+    Bounded(LogicalScanBounds),
 }
 
 enum AutoIncrementRowAction {
@@ -1004,27 +952,7 @@ fn row_matches_filter(filter: Option<&Expr>, row: &Row) -> Result<bool> {
     value_to_bool(&result)
 }
 
-async fn stmt_put<T: TxnService>(
-    txn_service: &T,
-    stmt: &mut StatementGuard,
-    ctx: &mut TxnCtx,
-    table_id: TableId,
-    key: &[u8],
-    value: Vec<u8>,
-) -> Result<()> {
-    txn_service.put(ctx, stmt, table_id, key, value).await
-}
-
-async fn stmt_delete<T: TxnService>(
-    txn_service: &T,
-    stmt: &mut StatementGuard,
-    ctx: &mut TxnCtx,
-    table_id: TableId,
-    key: &[u8],
-) -> Result<()> {
-    txn_service.delete(ctx, stmt, table_id, key).await
-}
-
+#[cfg(test)]
 async fn stmt_lock_key<T: TxnService>(
     txn_service: &T,
     stmt: &mut StatementGuard,
@@ -1035,6 +963,7 @@ async fn stmt_lock_key<T: TxnService>(
     txn_service.lock_key(ctx, stmt, table_id, key).await
 }
 
+#[cfg(test)]
 async fn lock_key_if_explicit<T: TxnService>(
     txn_service: &T,
     stmt: &mut StatementGuard,
@@ -1048,24 +977,32 @@ async fn lock_key_if_explicit<T: TxnService>(
     Ok(())
 }
 
-async fn collect_scan_rows<T: TxnService>(
-    txn_service: &T,
+async fn collect_execution_scan_rows<B: ExecutionBackend>(
+    execution_backend: &B,
     ctx: &TxnCtx,
-    table_id: TableId,
-    range: std::ops::Range<Key>,
-    col_ids: &[ColumnId],
-    data_types: &[DataType],
-) -> Result<Vec<(Key, Vec<Value>)>> {
-    let mut iter = txn_service.scan(ctx, table_id, range)?;
-    iter.advance().await?;
-
+    req: ScanRequest,
+) -> Result<Vec<ExecutionRow>> {
+    let mut scan = execution_backend.scan(ctx, req)?;
     let mut rows = Vec::new();
-    while let Some(entry) = iter.current() {
-        let values = decode_row_to_values(&entry.value, col_ids, data_types)?;
-        rows.push((entry.user_key.clone(), values));
-        iter.advance().await?;
+    while let Some(row) = scan.next_row().await? {
+        rows.push(row);
     }
     Ok(rows)
+}
+
+fn compose_write_request(
+    primary: Option<WriteRequest>,
+    lock_request: Option<LockRequest>,
+) -> Option<WriteRequest> {
+    match (primary, lock_request) {
+        (None, None) => None,
+        (Some(primary), None) => Some(primary),
+        (None, Some(lock_request)) => Some(WriteRequest::Lock(lock_request)),
+        (Some(primary), Some(lock_request)) => Some(WriteRequest::Batch(vec![
+            primary,
+            WriteRequest::Lock(lock_request),
+        ])),
+    }
 }
 
 fn collect_conjuncts<'a>(expr: &'a Expr, out: &mut Vec<&'a Expr>) {
@@ -1102,6 +1039,152 @@ fn point_get_literal_matches_pk(pk_type: &DataType, literal: &Value) -> bool {
     }
 }
 
+fn compare_scan_values(left: &[Value], right: &[Value]) -> Option<std::cmp::Ordering> {
+    left.iter()
+        .zip(right)
+        .map(|(left, right)| compare_scan_value(left, right))
+        .find(|ordering| !matches!(ordering, Some(std::cmp::Ordering::Equal)))
+        .unwrap_or(Some(left.len().cmp(&right.len())))
+}
+
+fn compare_scan_value(left: &Value, right: &Value) -> Option<std::cmp::Ordering> {
+    match (left, right) {
+        (Value::TinyInt(left), Value::TinyInt(right)) => Some(left.cmp(right)),
+        (Value::SmallInt(left), Value::SmallInt(right)) => Some(left.cmp(right)),
+        (Value::Int(left), Value::Int(right)) => Some(left.cmp(right)),
+        (Value::BigInt(left), Value::BigInt(right)) => Some(left.cmp(right)),
+        (Value::TinyInt(left), Value::BigInt(right)) => Some(i64::from(*left).cmp(right)),
+        (Value::BigInt(left), Value::TinyInt(right)) => Some(left.cmp(&i64::from(*right))),
+        (Value::Int(left), Value::BigInt(right)) => Some(i64::from(*left).cmp(right)),
+        (Value::BigInt(left), Value::Int(right)) => Some(left.cmp(&i64::from(*right))),
+        (Value::SmallInt(left), Value::BigInt(right)) => Some(i64::from(*left).cmp(right)),
+        (Value::BigInt(left), Value::SmallInt(right)) => Some(left.cmp(&i64::from(*right))),
+        (Value::String(left), Value::String(right)) => Some(left.cmp(right)),
+        (Value::Boolean(left), Value::Boolean(right)) => Some(left.cmp(right)),
+        _ => None,
+    }
+}
+
+fn combine_lower_logical(existing: Option<ScanBound>, candidate: ScanBound) -> Option<ScanBound> {
+    match existing {
+        None => Some(candidate),
+        Some(current) => match compare_scan_values(&current.values, &candidate.values)? {
+            std::cmp::Ordering::Less => Some(candidate),
+            std::cmp::Ordering::Greater => Some(current),
+            std::cmp::Ordering::Equal => Some(ScanBound {
+                values: current.values,
+                inclusive: current.inclusive && candidate.inclusive,
+            }),
+        },
+    }
+}
+
+fn combine_upper_logical(existing: Option<ScanBound>, candidate: ScanBound) -> Option<ScanBound> {
+    match existing {
+        None => Some(candidate),
+        Some(current) => match compare_scan_values(&current.values, &candidate.values)? {
+            std::cmp::Ordering::Less => Some(current),
+            std::cmp::Ordering::Greater => Some(candidate),
+            std::cmp::Ordering::Equal => Some(ScanBound {
+                values: current.values,
+                inclusive: current.inclusive && candidate.inclusive,
+            }),
+        },
+    }
+}
+
+fn extract_pk_scan_bounds(table: &TableDef, filter: &Expr) -> Option<LogicalPkScanBounds> {
+    let pk_indices = table.pk_column_indices();
+    if pk_indices.len() != 1 {
+        return None;
+    }
+    let pk_column_idx = pk_indices[0];
+    let pk_column = table.columns().get(pk_column_idx)?;
+
+    let mut lower: Option<ScanBound> = None;
+    let mut upper: Option<ScanBound> = None;
+
+    let mut conjuncts = Vec::new();
+    collect_conjuncts(filter, &mut conjuncts);
+    let mut found_pk_predicate = false;
+
+    for conjunct in conjuncts {
+        let Some((op, literal)) = normalize_pk_comparison(conjunct, pk_column_idx) else {
+            continue;
+        };
+        if !point_get_literal_matches_pk(pk_column.data_type(), literal) {
+            continue;
+        }
+
+        found_pk_predicate = true;
+        match op {
+            BinaryOp::Eq => {
+                let bound = ScanBound {
+                    values: vec![literal.clone()],
+                    inclusive: true,
+                };
+                lower = combine_lower_logical(lower, bound.clone());
+                upper = combine_upper_logical(upper, bound);
+            }
+            BinaryOp::Gt => {
+                lower = combine_lower_logical(
+                    lower,
+                    ScanBound {
+                        values: vec![literal.clone()],
+                        inclusive: false,
+                    },
+                );
+            }
+            BinaryOp::Ge => {
+                lower = combine_lower_logical(
+                    lower,
+                    ScanBound {
+                        values: vec![literal.clone()],
+                        inclusive: true,
+                    },
+                );
+            }
+            BinaryOp::Lt => {
+                upper = combine_upper_logical(
+                    upper,
+                    ScanBound {
+                        values: vec![literal.clone()],
+                        inclusive: false,
+                    },
+                );
+            }
+            BinaryOp::Le => {
+                upper = combine_upper_logical(
+                    upper,
+                    ScanBound {
+                        values: vec![literal.clone()],
+                        inclusive: true,
+                    },
+                );
+            }
+            _ => {}
+        }
+    }
+
+    if !found_pk_predicate {
+        return None;
+    }
+
+    if let (Some(lower), Some(upper)) = (&lower, &upper) {
+        match compare_scan_values(&lower.values, &upper.values)? {
+            std::cmp::Ordering::Greater => return Some(LogicalPkScanBounds::Empty),
+            std::cmp::Ordering::Equal if !lower.inclusive || !upper.inclusive => {
+                return Some(LogicalPkScanBounds::Empty);
+            }
+            _ => {}
+        }
+    }
+
+    Some(LogicalPkScanBounds::Bounded(
+        LogicalScanBounds::PrimaryKeyRange { lower, upper },
+    ))
+}
+
 fn normalize_pk_comparison(expr: &Expr, pk_column_idx: usize) -> Option<(BinaryOp, &Value)> {
     let Expr::BinaryOp { left, op, right } = expr else {
         return None;
@@ -1130,149 +1213,6 @@ fn normalize_pk_comparison(expr: &Expr, pk_column_idx: usize) -> Option<(BinaryO
     }
 }
 
-fn combine_lower(existing: Option<PkBound>, candidate: PkBound) -> Option<PkBound> {
-    match existing {
-        None => Some(candidate),
-        Some(current) => match current.encoded.cmp(&candidate.encoded) {
-            std::cmp::Ordering::Less => Some(candidate),
-            std::cmp::Ordering::Greater => Some(current),
-            std::cmp::Ordering::Equal => Some(PkBound {
-                encoded: current.encoded,
-                inclusive: current.inclusive && candidate.inclusive,
-            }),
-        },
-    }
-}
-
-fn combine_upper(existing: Option<PkBound>, candidate: PkBound) -> Option<PkBound> {
-    match existing {
-        None => Some(candidate),
-        Some(current) => match current.encoded.cmp(&candidate.encoded) {
-            std::cmp::Ordering::Less => Some(current),
-            std::cmp::Ordering::Greater => Some(candidate),
-            std::cmp::Ordering::Equal => Some(PkBound {
-                encoded: current.encoded,
-                inclusive: current.inclusive && candidate.inclusive,
-            }),
-        },
-    }
-}
-
-fn extract_pk_scan_range(table: &TableDef, filter: &Expr) -> Option<PkScanRange> {
-    let pk_indices = table.pk_column_indices();
-    if pk_indices.len() != 1 {
-        return None;
-    }
-    let pk_column_idx = pk_indices[0];
-    let pk_column = table.columns().get(pk_column_idx)?;
-
-    let mut lower: Option<PkBound> = None;
-    let mut upper: Option<PkBound> = None;
-
-    let mut conjuncts = Vec::new();
-    collect_conjuncts(filter, &mut conjuncts);
-    let mut found_pk_predicate = false;
-
-    for conjunct in conjuncts {
-        let Some((op, literal)) = normalize_pk_comparison(conjunct, pk_column_idx) else {
-            continue;
-        };
-        if !point_get_literal_matches_pk(pk_column.data_type(), literal) {
-            continue;
-        }
-
-        let encoded = encode_pk(std::slice::from_ref(literal));
-        found_pk_predicate = true;
-
-        match op {
-            BinaryOp::Eq => {
-                let bound = PkBound {
-                    encoded,
-                    inclusive: true,
-                };
-                lower = combine_lower(lower, bound.clone());
-                upper = combine_upper(upper, bound);
-            }
-            BinaryOp::Gt => {
-                lower = combine_lower(
-                    lower,
-                    PkBound {
-                        encoded,
-                        inclusive: false,
-                    },
-                );
-            }
-            BinaryOp::Ge => {
-                lower = combine_lower(
-                    lower,
-                    PkBound {
-                        encoded,
-                        inclusive: true,
-                    },
-                );
-            }
-            BinaryOp::Lt => {
-                upper = combine_upper(
-                    upper,
-                    PkBound {
-                        encoded,
-                        inclusive: false,
-                    },
-                );
-            }
-            BinaryOp::Le => {
-                upper = combine_upper(
-                    upper,
-                    PkBound {
-                        encoded,
-                        inclusive: true,
-                    },
-                );
-            }
-            _ => {}
-        }
-    }
-
-    if !found_pk_predicate {
-        return None;
-    }
-
-    if let (Some(l), Some(u)) = (&lower, &upper) {
-        match l.encoded.cmp(&u.encoded) {
-            std::cmp::Ordering::Greater => return Some(PkScanRange::Empty),
-            std::cmp::Ordering::Equal if !l.inclusive || !u.inclusive => {
-                return Some(PkScanRange::Empty);
-            }
-            _ => {}
-        }
-    }
-
-    let table_start = encode_key(table.id(), &[]);
-    let table_end = encode_key(table.id() + 1, &[]);
-
-    let mut range_start = table_start;
-    if let Some(l) = lower {
-        range_start = encode_key(table.id(), &l.encoded);
-        if !l.inclusive && !next_key_bound(&mut range_start) {
-            return Some(PkScanRange::Empty);
-        }
-    }
-
-    let mut range_end = table_end.clone();
-    if let Some(u) = upper {
-        range_end = encode_key(table.id(), &u.encoded);
-        if u.inclusive && !next_key_bound(&mut range_end) {
-            range_end = table_end;
-        }
-    }
-
-    if range_start >= range_end {
-        return Some(PkScanRange::Empty);
-    }
-
-    Some(PkScanRange::Bounded(range_start..range_end))
-}
-
 fn build_dml_read_plan(input: LogicalPlan, table: &TableDef) -> Result<DmlReadPlan> {
     let mut filter = None;
     let mut current = input;
@@ -1298,18 +1238,16 @@ fn build_dml_read_plan(input: LogicalPlan, table: &TableDef) -> Result<DmlReadPl
                     filter = conjoin_predicate(filter, scan_filter);
                 }
 
-                let table_start = encode_key(table.id(), &[]);
-                let table_end = encode_key(table.id() + 1, &[]);
-                let range = match filter
+                let bounds = match filter
                     .as_ref()
-                    .and_then(|predicate| extract_pk_scan_range(table, predicate))
+                    .and_then(|predicate| extract_pk_scan_bounds(table, predicate))
                 {
-                    Some(PkScanRange::Empty) => return Ok(DmlReadPlan::Empty),
-                    Some(PkScanRange::Bounded(range)) => range,
-                    None => table_start..table_end,
+                    Some(LogicalPkScanBounds::Empty) => return Ok(DmlReadPlan::Empty),
+                    Some(LogicalPkScanBounds::Bounded(bounds)) => bounds,
+                    None => LogicalScanBounds::FullTable,
                 };
 
-                return Ok(DmlReadPlan::Scan { range, filter });
+                return Ok(DmlReadPlan::Scan { bounds, filter });
             }
             LogicalPlan::PointGet {
                 table: point_get_table,
@@ -1320,10 +1258,7 @@ fn build_dml_read_plan(input: LogicalPlan, table: &TableDef) -> Result<DmlReadPl
                         "DML input point-get table does not match target table".into(),
                     ));
                 }
-                return Ok(DmlReadPlan::PointGet {
-                    key: encode_legacy_dml_point_get_key(point_get_table.id(), &key),
-                    filter,
-                });
+                return Ok(DmlReadPlan::PointGet { key, filter });
             }
             LogicalPlan::Empty { .. } => return Ok(DmlReadPlan::Empty),
             other => {
@@ -1333,14 +1268,6 @@ fn build_dml_read_plan(input: LogicalPlan, table: &TableDef) -> Result<DmlReadPl
                 )));
             }
         }
-    }
-}
-
-fn encode_legacy_dml_point_get_key(table_id: TableId, key: &LogicalPointKey) -> Key {
-    // Transitional bridge until slice 3 moves DML fully behind `ExecutionBackend`.
-    match key {
-        LogicalPointKey::PrimaryKey(values) => encode_key(table_id, &encode_pk(values)),
-        LogicalPointKey::HiddenRowId(handle) => encode_int_key(table_id, *handle),
     }
 }
 
@@ -1469,35 +1396,23 @@ impl Executor for SimpleExecutor {
                         );
                     }
 
-                    let mut stmt = txn_service.begin_statement(&mut ctx);
                     match self
                         .execute_write_with_ctx(
                             plan,
                             stmt_ctx,
-                            &mut stmt,
                             &mut ctx,
-                            txn_service,
+                            execution_backend,
                             catalog,
                         )
                         .await
                     {
                         Ok(result) => (Ok(result), Some(ctx)),
-                        Err(e) => {
-                            let rollback_result =
-                                txn_service.rollback_statement(&mut ctx, stmt).await;
-                            match rollback_result {
-                                Ok(()) => (Err(e), Some(ctx)),
-                                Err(stmt_rollback_err) => match txn_service.rollback(ctx) {
-                                    Ok(()) => (Err(stmt_rollback_err), None),
-                                    Err(rollback_err) => (Err(rollback_err), None),
-                                },
-                            }
-                        }
+                        Err(e) => (Err(e), Some(ctx)),
                     }
                 } else {
                     // Streaming read in explicit txn — no materialization
                     match self
-                        .execute_with_ctx(plan, &ctx, txn_service, execution_backend, catalog)
+                        .execute_with_ctx(plan, &ctx, execution_backend, catalog)
                         .await
                     {
                         Ok(output) => (Ok(output), Some(ctx)),
@@ -1508,7 +1423,7 @@ impl Executor for SimpleExecutor {
             None => {
                 if plan.is_write() {
                     match self
-                        .execute_write(plan, stmt_ctx, txn_service, catalog)
+                        .execute_write(plan, stmt_ctx, txn_service, execution_backend, catalog)
                         .await
                     {
                         Ok(result) => (Ok(result), None),
@@ -1523,13 +1438,7 @@ impl Executor for SimpleExecutor {
                             let begin_us = begin_t.elapsed().as_micros() as u64;
                             let build_t = Instant::now();
                             match self
-                                .execute_with_ctx(
-                                    plan,
-                                    &ctx,
-                                    txn_service,
-                                    execution_backend,
-                                    catalog,
-                                )
+                                .execute_with_ctx(plan, &ctx, execution_backend, catalog)
                                 .await
                             {
                                 Ok(output) => {
@@ -1579,11 +1488,12 @@ impl SimpleExecutor {
     ///
     /// Creates a transaction, executes writes (buffered), then commits.
     /// Checks schema version at commit to detect concurrent DDL changes.
-    async fn execute_write<T: TxnService, C: Catalog>(
+    async fn execute_write<T: TxnService, B: ExecutionBackend, C: Catalog>(
         &self,
         plan: LogicalPlan,
         stmt_ctx: &mut StatementCtx,
         txn_service: &T,
+        execution_backend: &B,
         catalog: &C,
     ) -> Result<ExecutionOutput> {
         // DDL operations don't need transaction (catalog operations)
@@ -1599,11 +1509,9 @@ impl SimpleExecutor {
 
         // Begin a read-write transaction (allocates txn_id and start_ts)
         let mut ctx = txn_service.begin(false)?;
-        let mut stmt = txn_service.begin_statement(&mut ctx);
-
         // Execute the write plan and get the result
         let result = match self
-            .execute_write_with_ctx(plan, stmt_ctx, &mut stmt, &mut ctx, txn_service, catalog)
+            .execute_write_with_ctx(plan, stmt_ctx, &mut ctx, execution_backend, catalog)
             .await
         {
             Ok(r) => r,
@@ -1691,15 +1599,14 @@ impl SimpleExecutor {
     ///
     /// Builds a volcano-style operator tree from the plan, opens it,
     /// and returns a live `ExecutionOutput` — zero materialization.
-    async fn execute_with_ctx<T: TxnService, B: ExecutionBackend, C: Catalog>(
+    async fn execute_with_ctx<B: ExecutionBackend, C: Catalog>(
         &self,
         plan: LogicalPlan,
         ctx: &TxnCtx,
-        txn_service: &T,
         execution_backend: &B,
         _catalog: &C,
     ) -> Result<ExecutionOutput> {
-        let mut op = build_read_operator(plan, txn_service, execution_backend, ctx).await?;
+        let mut op = build_read_operator(plan, execution_backend, ctx).await?;
         op.open().await?;
         let schema = op.schema().clone();
         Ok(ExecutionOutput::Rows {
@@ -1709,13 +1616,12 @@ impl SimpleExecutor {
     }
 
     /// Execute write operations using a transaction context.
-    async fn execute_write_with_ctx<T: TxnService, C: Catalog>(
+    async fn execute_write_with_ctx<B: ExecutionBackend, C: Catalog>(
         &self,
         plan: LogicalPlan,
         _stmt_ctx: &mut StatementCtx,
-        stmt: &mut StatementGuard,
         ctx: &mut TxnCtx,
-        txn_service: &T,
+        execution_backend: &B,
         catalog: &C,
     ) -> Result<ExecutionOutput> {
         match plan {
@@ -1726,18 +1632,16 @@ impl SimpleExecutor {
                 ignore,
             } => {
                 let pk_indices = table.pk_column_indices();
-                let mut count = 0u64;
                 let auto_inc_column = table
                     .columns()
                     .iter()
                     .enumerate()
                     .find(|(_, col)| col.auto_increment());
-
-                // Get column IDs for encoding
-                let col_ids: Vec<ColumnId> = table.columns().iter().map(|c| c.id()).collect();
+                let table_id = table.id();
+                let mut explicit_auto_inc_observations = Vec::new();
+                let mut rows = Vec::new();
 
                 for row_exprs in values {
-                    // Build row values
                     let mut row_values = vec![Value::Null; table.columns().len()];
 
                     for (col_idx, &col_id) in columns.iter().enumerate() {
@@ -1753,23 +1657,21 @@ impl SimpleExecutor {
                         row_values[table_col_idx] = value;
                     }
 
-                    // For tables without explicit PK, allocate hidden row-id
                     let row_id_for_key = if pk_indices.is_empty() {
-                        Some(catalog.next_auto_increment(table.id())?)
+                        Some(catalog.next_auto_increment(table_id)?)
                     } else {
                         None
                     };
 
                     let mut explicit_auto_inc_observe = None;
 
-                    // Handle explicit/null AUTO_INCREMENT semantics in row order.
                     if let Some((idx, col)) = auto_inc_column {
                         match classify_auto_increment_row_value(&row_values[idx], col.data_type())?
                         {
                             AutoIncrementRowAction::Generate => {
                                 let next_id = match row_id_for_key {
                                     Some(v) => v,
-                                    None => catalog.next_auto_increment(table.id())?,
+                                    None => catalog.next_auto_increment(table_id)?,
                                 };
                                 row_values[idx] =
                                     generated_auto_increment_value(next_id, col.data_type())?;
@@ -1782,403 +1684,255 @@ impl SimpleExecutor {
                     }
 
                     let key = if let Some(handle) = row_id_for_key {
-                        encode_int_key(table.id(), handle as i64)
+                        RowKey::HiddenRowId(handle as i64)
                     } else {
                         let pk_values: Vec<_> =
                             pk_indices.iter().map(|&i| row_values[i].clone()).collect();
-                        let pk_bytes = encode_pk(&pk_values);
-                        encode_key(table.id(), &pk_bytes)
+                        RowKey::PrimaryKey(pk_values)
                     };
 
-                    // Check for duplicate primary key
-                    let duplicate_check_begin = Instant::now();
-                    let duplicate_exists = txn_service.get(ctx, table.id(), &key).await?.is_some();
-                    txn_service.record_duplicate_check_duration(duplicate_check_begin.elapsed());
-                    if duplicate_exists {
-                        if ignore {
-                            stmt_lock_key(txn_service, stmt, ctx, table.id(), &key).await?;
-                            continue;
-                        }
-                        let pk_desc = if pk_indices.is_empty() {
-                            format!("row_id={}", row_id_for_key.unwrap_or(0))
-                        } else {
-                            let pk_values: Vec<_> =
-                                pk_indices.iter().map(|&i| row_values[i].clone()).collect();
-                            format!("{pk_values:?}")
-                        };
-                        return Err(TiSqlError::DuplicateKey(format!(
-                            "Duplicate entry '{}' for key '{}.PRIMARY'",
-                            pk_desc,
-                            table.name()
-                        )));
-                    }
-
-                    // Encode row using TiDB codec format
-                    let value = encode_row(&col_ids, &row_values);
-
-                    // Buffer write in transaction
-                    stmt_put(txn_service, stmt, ctx, table.id(), &key, value).await?;
                     if let Some(explicit_v) = explicit_auto_inc_observe {
-                        catalog.observe_auto_increment_explicit(table.id(), explicit_v)?;
+                        explicit_auto_inc_observations.push(explicit_v);
                     }
-                    count += 1;
+                    rows.push(InsertRow {
+                        key,
+                        row: Row::new(row_values),
+                    });
                 }
 
-                Ok(ExecutionOutput::Affected { count })
+                let outcome = execution_backend
+                    .apply_write(
+                        ctx,
+                        WriteRequest::Insert(InsertRequest {
+                            table: table.clone(),
+                            rows,
+                            ignore_duplicates: ignore,
+                        }),
+                    )
+                    .await?;
+
+                for explicit_v in explicit_auto_inc_observations {
+                    catalog.observe_auto_increment_explicit(table_id, explicit_v)?;
+                }
+
+                Ok(ExecutionOutput::Affected {
+                    count: outcome.affected_rows,
+                })
             }
 
-            LogicalPlan::Delete { table, input } => {
-                let table_id = table.id();
-                let col_ids: Vec<ColumnId> = table.columns().iter().map(|c| c.id()).collect();
-                let data_types: Vec<DataType> = table
-                    .columns()
-                    .iter()
-                    .map(|c| c.data_type().clone())
-                    .collect();
-                let mut count = 0u64;
-                match build_dml_read_plan(*input, &table)? {
-                    DmlReadPlan::Empty => {}
-                    DmlReadPlan::PointGet { key, filter } => {
-                        if let Some(value) = txn_service.get(ctx, table_id, &key).await? {
-                            let values = decode_row_to_values(&value, &col_ids, &data_types)?;
-                            let row = Row::new(values);
-                            if row_matches_filter(filter.as_ref(), &row)? {
-                                stmt_delete(txn_service, stmt, ctx, table_id, &key).await?;
-                                count += 1;
-                            } else {
-                                stmt_lock_key(txn_service, stmt, ctx, table_id, &key).await?;
-                            }
-                        }
-                    }
-                    DmlReadPlan::Scan { range, filter } => {
-                        if ctx.is_explicit() {
-                            let scanned_rows = collect_scan_rows(
-                                txn_service,
-                                &*ctx,
-                                table_id,
-                                range,
-                                &col_ids,
-                                &data_types,
-                            )
-                            .await?;
-                            for (key, values) in scanned_rows {
-                                let row = Row::new(values);
-                                if row_matches_filter(filter.as_ref(), &row)? {
-                                    stmt_delete(txn_service, stmt, ctx, table_id, &key).await?;
-                                    count += 1;
-                                } else {
-                                    stmt_lock_key(txn_service, stmt, ctx, table_id, &key).await?;
-                                }
-                            }
-                        } else {
-                            let mut iter = txn_service.scan(ctx, table_id, range)?;
-                            iter.advance().await?;
-                            while let Some(entry) = iter.current() {
-                                let key = entry.user_key.as_slice();
-                                let values =
-                                    decode_row_to_values(&entry.value, &col_ids, &data_types)?;
-                                let row = Row::new(values);
-                                if row_matches_filter(filter.as_ref(), &row)? {
-                                    stmt_delete(txn_service, stmt, ctx, table_id, key).await?;
-                                    count += 1;
-                                } else {
-                                    // In implicit autocommit this is a no-op; keep the helper
-                                    // for defensive consistency with explicit paths.
-                                    lock_key_if_explicit(txn_service, stmt, ctx, table_id, key)
-                                        .await?;
-                                }
-                                iter.advance().await?;
-                            }
-                        }
-                    }
+            LogicalPlan::Delete { table, input } => match build_dml_read_plan(*input, &table)? {
+                DmlReadPlan::Empty => Ok(ExecutionOutput::Affected { count: 0 }),
+                DmlReadPlan::PointGet { key, filter } => {
+                    let row = execution_backend
+                        .point_get(
+                            ctx,
+                            PointGetRequest {
+                                table: table.clone(),
+                                key,
+                                projection: ProjectionSpec::All,
+                            },
+                        )
+                        .await?;
+
+                    let Some(row) = row else {
+                        return Ok(ExecutionOutput::Affected { count: 0 });
+                    };
+
+                    let write_req = if row_matches_filter(filter.as_ref(), &row.row)? {
+                        Some(WriteRequest::Delete(DeleteRequest {
+                            table: table.clone(),
+                            keys: vec![row.key],
+                        }))
+                    } else {
+                        Some(WriteRequest::Lock(LockRequest {
+                            table: table.clone(),
+                            keys: vec![row.key],
+                        }))
+                    };
+
+                    let outcome = execution_backend
+                        .apply_write(ctx, write_req.unwrap())
+                        .await?;
+                    Ok(ExecutionOutput::Affected {
+                        count: outcome.affected_rows,
+                    })
                 }
-                Ok(ExecutionOutput::Affected { count })
-            }
+                DmlReadPlan::Scan { bounds, filter } => {
+                    let scanned_rows = collect_execution_scan_rows(
+                        execution_backend,
+                        &*ctx,
+                        ScanRequest {
+                            table: table.clone(),
+                            bounds,
+                            projection: ProjectionSpec::All,
+                        },
+                    )
+                    .await?;
+                    let mut delete_keys = Vec::new();
+                    let mut lock_keys = Vec::new();
+
+                    for row in scanned_rows {
+                        if row_matches_filter(filter.as_ref(), &row.row)? {
+                            delete_keys.push(row.key);
+                        } else if ctx.is_explicit() {
+                            lock_keys.push(row.key);
+                        }
+                    }
+
+                    let write_req = compose_write_request(
+                        (!delete_keys.is_empty()).then(|| {
+                            WriteRequest::Delete(DeleteRequest {
+                                table: table.clone(),
+                                keys: delete_keys,
+                            })
+                        }),
+                        (!lock_keys.is_empty()).then(|| LockRequest {
+                            table: table.clone(),
+                            keys: lock_keys,
+                        }),
+                    );
+
+                    let Some(write_req) = write_req else {
+                        return Ok(ExecutionOutput::Affected { count: 0 });
+                    };
+
+                    let outcome = execution_backend.apply_write(ctx, write_req).await?;
+                    Ok(ExecutionOutput::Affected {
+                        count: outcome.affected_rows,
+                    })
+                }
+            },
 
             LogicalPlan::Update {
                 table,
                 assignments,
                 input,
             } => {
-                let table_id = table.id();
-                let pk_indices = table.pk_column_indices();
-                let pk_column_ids: Vec<ColumnId> = pk_indices
-                    .iter()
-                    .map(|&idx| table.columns()[idx].id())
-                    .collect();
-                let pk_assigned = assignments
-                    .iter()
-                    .any(|(col_id, _)| pk_column_ids.contains(col_id));
-                let col_ids: Vec<ColumnId> = table.columns().iter().map(|c| c.id()).collect();
-                let data_types: Vec<DataType> = table
-                    .columns()
-                    .iter()
-                    .map(|c| c.data_type().clone())
-                    .collect();
-                let mut count = 0u64;
+                let assignment_slots = assignments
+                    .into_iter()
+                    .map(|(col_id, expr)| {
+                        let col_idx = table
+                            .columns()
+                            .iter()
+                            .position(|c| c.id() == col_id)
+                            .ok_or_else(|| TiSqlError::ColumnNotFound(format!("id={col_id}")))?;
+                        Ok((col_idx, expr))
+                    })
+                    .collect::<Result<Vec<_>>>()?;
 
                 match build_dml_read_plan(*input, &table)? {
-                    DmlReadPlan::Empty => {}
+                    DmlReadPlan::Empty => Ok(ExecutionOutput::Affected { count: 0 }),
                     DmlReadPlan::PointGet { key, filter } => {
-                        if let Some(value) = txn_service.get(ctx, table_id, &key).await? {
-                            let original_values =
-                                decode_row_to_values(&value, &col_ids, &data_types)?;
-                            let mut row = Row::new(original_values.clone());
-                            if row_matches_filter(filter.as_ref(), &row)? {
-                                for (col_id, expr) in &assignments {
-                                    let col_idx = table
-                                        .columns()
-                                        .iter()
-                                        .position(|c| c.id() == *col_id)
-                                        .ok_or_else(|| {
-                                            TiSqlError::ColumnNotFound(format!("id={col_id}"))
-                                        })?;
-                                    let new_value = eval_expr(expr, &row)?;
-                                    row.set(col_idx, new_value);
-                                }
-
-                                let maybe_new_key = if pk_indices.is_empty() || !pk_assigned {
-                                    None
-                                } else {
-                                    let pk_values: Vec<_> = pk_indices
-                                        .iter()
-                                        .map(|&i| row.get(i).cloned().unwrap_or(Value::Null))
-                                        .collect();
-                                    Some(encode_key(table_id, &encode_pk(&pk_values)))
-                                };
-                                let target_key = maybe_new_key.as_deref().unwrap_or(&key);
-                                let key_changed = maybe_new_key
-                                    .as_ref()
-                                    .is_some_and(|new_key| new_key.as_slice() != key.as_slice());
-
-                                let row_unchanged =
-                                    !key_changed && row.values() == original_values.as_slice();
-                                if row_unchanged {
-                                    stmt_lock_key(txn_service, stmt, ctx, table_id, &key).await?;
-                                } else {
-                                    if key_changed
-                                        && txn_service
-                                            .get(ctx, table_id, target_key)
-                                            .await?
-                                            .is_some()
-                                    {
-                                        let pk_values: Vec<_> = pk_indices
-                                            .iter()
-                                            .map(|&i| row.get(i).cloned().unwrap_or(Value::Null))
-                                            .collect();
-                                        return Err(TiSqlError::DuplicateKey(format!(
-                                            "Duplicate entry '{pk_values:?}' for key '{}.PRIMARY'",
-                                            table.name()
-                                        )));
-                                    }
-
-                                    if key_changed {
-                                        stmt_delete(txn_service, stmt, ctx, table_id, &key).await?;
-                                    }
-                                    let new_value = encode_row(&col_ids, row.values());
-                                    stmt_put(
-                                        txn_service,
-                                        stmt,
-                                        ctx,
-                                        table_id,
-                                        target_key,
-                                        new_value,
-                                    )
-                                    .await?;
-                                }
-                                count += 1;
-                            } else {
-                                stmt_lock_key(txn_service, stmt, ctx, table_id, &key).await?;
-                            }
-                        }
-                    }
-                    DmlReadPlan::Scan { range, filter } => {
-                        if ctx.is_explicit() {
-                            let scanned_rows = collect_scan_rows(
-                                txn_service,
-                                &*ctx,
-                                table_id,
-                                range,
-                                &col_ids,
-                                &data_types,
+                        let row = execution_backend
+                            .point_get(
+                                ctx,
+                                PointGetRequest {
+                                    table: table.clone(),
+                                    key,
+                                    projection: ProjectionSpec::All,
+                                },
                             )
                             .await?;
-                            for (old_key, original_values) in scanned_rows {
-                                let mut row = Row::new(original_values.clone());
 
-                                if row_matches_filter(filter.as_ref(), &row)? {
-                                    for (col_id, expr) in &assignments {
-                                        let col_idx = table
-                                            .columns()
-                                            .iter()
-                                            .position(|c| c.id() == *col_id)
-                                            .ok_or_else(|| {
-                                                TiSqlError::ColumnNotFound(format!("id={col_id}"))
-                                            })?;
-                                        let new_value = eval_expr(expr, &row)?;
-                                        row.set(col_idx, new_value);
-                                    }
+                        let Some(row) = row else {
+                            return Ok(ExecutionOutput::Affected { count: 0 });
+                        };
 
-                                    let maybe_new_key = if pk_indices.is_empty() || !pk_assigned {
-                                        None
-                                    } else {
-                                        let pk_values: Vec<_> = pk_indices
-                                            .iter()
-                                            .map(|&i| row.get(i).cloned().unwrap_or(Value::Null))
-                                            .collect();
-                                        Some(encode_key(table_id, &encode_pk(&pk_values)))
-                                    };
-                                    let target_key =
-                                        maybe_new_key.as_deref().unwrap_or(old_key.as_slice());
-                                    let key_changed =
-                                        maybe_new_key.as_ref().is_some_and(|new_key| {
-                                            new_key.as_slice() != old_key.as_slice()
-                                        });
+                        let mut update_rows = Vec::new();
+                        let mut lock_keys = Vec::new();
 
-                                    let row_unchanged =
-                                        !key_changed && row.values() == original_values.as_slice();
-                                    if row_unchanged {
-                                        // In implicit autocommit this is a no-op; keep the helper
-                                        // for defensive consistency with explicit paths.
-                                        lock_key_if_explicit(
-                                            txn_service,
-                                            stmt,
-                                            ctx,
-                                            table_id,
-                                            &old_key,
-                                        )
-                                        .await?;
-                                    } else {
-                                        if key_changed
-                                            && txn_service
-                                                .get(ctx, table_id, target_key)
-                                                .await?
-                                                .is_some()
-                                        {
-                                            let pk_values: Vec<_> = pk_indices
-                                                .iter()
-                                                .map(|&i| {
-                                                    row.get(i).cloned().unwrap_or(Value::Null)
-                                                })
-                                                .collect();
-                                            return Err(TiSqlError::DuplicateKey(format!(
-                                                "Duplicate entry '{pk_values:?}' for key '{}.PRIMARY'",
-                                                table.name()
-                                            )));
-                                        }
-
-                                        if key_changed {
-                                            stmt_delete(txn_service, stmt, ctx, table_id, &old_key)
-                                                .await?;
-                                        }
-
-                                        let new_value = encode_row(&col_ids, row.values());
-                                        stmt_put(
-                                            txn_service,
-                                            stmt,
-                                            ctx,
-                                            table_id,
-                                            target_key,
-                                            new_value,
-                                        )
-                                        .await?;
-                                    }
-                                    count += 1;
-                                } else {
-                                    stmt_lock_key(txn_service, stmt, ctx, table_id, &old_key)
-                                        .await?;
-                                }
+                        if row_matches_filter(filter.as_ref(), &row.row)? {
+                            let mut new_row = row.row.clone();
+                            for (col_idx, expr) in &assignment_slots {
+                                let new_value = eval_expr(expr, &new_row)?;
+                                new_row.set(*col_idx, new_value);
                             }
+                            update_rows.push(UpdateRow {
+                                current_key: row.key,
+                                current_row: row.row,
+                                new_row,
+                            });
                         } else {
-                            let mut iter = txn_service.scan(ctx, table_id, range)?;
-                            iter.advance().await?;
-                            while let Some(entry) = iter.current() {
-                                let key_ref = entry.user_key.as_slice();
-                                let original_values =
-                                    decode_row_to_values(&entry.value, &col_ids, &data_types)?;
-                                let mut row = Row::new(original_values.clone());
+                            lock_keys.push(row.key);
+                        }
 
-                                if row_matches_filter(filter.as_ref(), &row)? {
-                                    for (col_id, expr) in &assignments {
-                                        let col_idx = table
-                                            .columns()
-                                            .iter()
-                                            .position(|c| c.id() == *col_id)
-                                            .ok_or_else(|| {
-                                                TiSqlError::ColumnNotFound(format!("id={col_id}"))
-                                            })?;
-                                        let new_value = eval_expr(expr, &row)?;
-                                        row.set(col_idx, new_value);
-                                    }
+                        let write_req = compose_write_request(
+                            (!update_rows.is_empty()).then(|| {
+                                WriteRequest::Update(UpdateRequest {
+                                    table: table.clone(),
+                                    rows: update_rows,
+                                })
+                            }),
+                            (!lock_keys.is_empty()).then(|| LockRequest {
+                                table: table.clone(),
+                                keys: lock_keys,
+                            }),
+                        );
 
-                                    let maybe_new_key = if pk_indices.is_empty() || !pk_assigned {
-                                        None
-                                    } else {
-                                        let pk_values: Vec<_> = pk_indices
-                                            .iter()
-                                            .map(|&i| row.get(i).cloned().unwrap_or(Value::Null))
-                                            .collect();
-                                        Some(encode_key(table_id, &encode_pk(&pk_values)))
-                                    };
-                                    let target_key = maybe_new_key.as_deref().unwrap_or(key_ref);
-                                    let key_changed = maybe_new_key
-                                        .as_ref()
-                                        .is_some_and(|new_key| new_key.as_slice() != key_ref);
+                        let Some(write_req) = write_req else {
+                            return Ok(ExecutionOutput::Affected { count: 0 });
+                        };
 
-                                    let row_unchanged =
-                                        !key_changed && row.values() == original_values.as_slice();
-                                    if row_unchanged {
-                                        stmt_lock_key(txn_service, stmt, ctx, table_id, key_ref)
-                                            .await?;
-                                    } else {
-                                        if key_changed
-                                            && txn_service
-                                                .get(ctx, table_id, target_key)
-                                                .await?
-                                                .is_some()
-                                        {
-                                            let pk_values: Vec<_> = pk_indices
-                                                .iter()
-                                                .map(|&i| {
-                                                    row.get(i).cloned().unwrap_or(Value::Null)
-                                                })
-                                                .collect();
-                                            return Err(TiSqlError::DuplicateKey(format!(
-                                                "Duplicate entry '{pk_values:?}' for key '{}.PRIMARY'",
-                                                table.name()
-                                            )));
-                                        }
+                        let outcome = execution_backend.apply_write(ctx, write_req).await?;
+                        Ok(ExecutionOutput::Affected {
+                            count: outcome.affected_rows,
+                        })
+                    }
+                    DmlReadPlan::Scan { bounds, filter } => {
+                        let scanned_rows = collect_execution_scan_rows(
+                            execution_backend,
+                            &*ctx,
+                            ScanRequest {
+                                table: table.clone(),
+                                bounds,
+                                projection: ProjectionSpec::All,
+                            },
+                        )
+                        .await?;
 
-                                        if key_changed {
-                                            stmt_delete(txn_service, stmt, ctx, table_id, key_ref)
-                                                .await?;
-                                        }
+                        let mut update_rows = Vec::new();
+                        let mut lock_keys = Vec::new();
 
-                                        let new_value = encode_row(&col_ids, row.values());
-                                        stmt_put(
-                                            txn_service,
-                                            stmt,
-                                            ctx,
-                                            table_id,
-                                            target_key,
-                                            new_value,
-                                        )
-                                        .await?;
-                                    }
-                                    count += 1;
-                                } else {
-                                    // In implicit autocommit this is a no-op; keep the helper
-                                    // for defensive consistency with explicit paths.
-                                    lock_key_if_explicit(txn_service, stmt, ctx, table_id, key_ref)
-                                        .await?;
+                        for row in scanned_rows {
+                            if row_matches_filter(filter.as_ref(), &row.row)? {
+                                let mut new_row = row.row.clone();
+                                for (col_idx, expr) in &assignment_slots {
+                                    let new_value = eval_expr(expr, &new_row)?;
+                                    new_row.set(*col_idx, new_value);
                                 }
-                                iter.advance().await?;
+                                update_rows.push(UpdateRow {
+                                    current_key: row.key,
+                                    current_row: row.row,
+                                    new_row,
+                                });
+                            } else if ctx.is_explicit() {
+                                lock_keys.push(row.key);
                             }
                         }
+
+                        let write_req = compose_write_request(
+                            (!update_rows.is_empty()).then(|| {
+                                WriteRequest::Update(UpdateRequest {
+                                    table: table.clone(),
+                                    rows: update_rows,
+                                })
+                            }),
+                            (!lock_keys.is_empty()).then(|| LockRequest {
+                                table: table.clone(),
+                                keys: lock_keys,
+                            }),
+                        );
+
+                        let Some(write_req) = write_req else {
+                            return Ok(ExecutionOutput::Affected { count: 0 });
+                        };
+
+                        let outcome = execution_backend.apply_write(ctx, write_req).await?;
+                        Ok(ExecutionOutput::Affected {
+                            count: outcome.affected_rows,
+                        })
                     }
                 }
-
-                Ok(ExecutionOutput::Affected { count })
             }
 
             _ => Err(TiSqlError::Execution(format!(
@@ -2200,11 +1954,38 @@ mod tests {
     use crate::catalog::types::{Lsn, RawValue, TableId, Timestamp, TxnId};
     use crate::catalog::{ColumnDef, MemoryCatalog, TableDef};
     use crate::kernel::execution::{
-        ExecutionBackend, ExecutionRow, LogicalPointKey, PointGetRequest, RowKey,
+        ExecutionBackend, ExecutionRow, ExecutionRowStream, LogicalPointKey, LogicalScanBounds,
+        PointGetRequest, RowKey, ScanRequest,
     };
-    use crate::transaction::{CommitInfo, StatementGuard, TxnScanEntry, TxnState};
+    use crate::transaction::{CommitInfo, StatementGuard, TxnScanCursor, TxnScanEntry, TxnState};
 
     struct DummyIter;
+
+    struct DummyExecutionScan {
+        rows: Vec<Row>,
+        index: usize,
+    }
+
+    impl DummyExecutionScan {
+        fn from_rows(rows: Vec<Row>) -> Self {
+            Self { rows, index: 0 }
+        }
+    }
+
+    impl ExecutionRowStream for DummyExecutionScan {
+        fn next_row(&mut self) -> impl Future<Output = Result<Option<ExecutionRow>>> + Send + '_ {
+            async move {
+                let Some(row) = self.rows.get(self.index).cloned() else {
+                    return Ok(None);
+                };
+                self.index += 1;
+                Ok(Some(ExecutionRow {
+                    key: RowKey::HiddenRowId(self.index as i64),
+                    row,
+                }))
+            }
+        }
+    }
 
     impl TxnScanCursor for DummyIter {
         fn advance(&mut self) -> impl Future<Output = Result<()>> + Send + '_ {
@@ -2228,18 +2009,6 @@ mod tests {
         last_scan_range: Mutex<Option<Range<Vec<u8>>>>,
     }
 
-    struct UnusedExecutionBackend;
-
-    impl ExecutionBackend for UnusedExecutionBackend {
-        fn point_get<'a>(
-            &'a self,
-            _ctx: &'a TxnCtx,
-            _req: PointGetRequest,
-        ) -> impl Future<Output = Result<Option<ExecutionRow>>> + Send + 'a {
-            async move { panic!("unused execution backend should not be called") }
-        }
-    }
-
     struct MockPointGetExecutionBackend {
         expected_table_id: TableId,
         expected_key: LogicalPointKey,
@@ -2248,6 +2017,8 @@ mod tests {
     }
 
     impl ExecutionBackend for MockPointGetExecutionBackend {
+        type Scan = DummyExecutionScan;
+
         fn point_get<'a>(
             &'a self,
             _ctx: &'a TxnCtx,
@@ -2264,6 +2035,168 @@ mod tests {
                     },
                     row,
                 }))
+            }
+        }
+
+        fn scan(&self, _ctx: &TxnCtx, _req: ScanRequest) -> Result<Self::Scan> {
+            panic!("point-get backend should not be used for scans")
+        }
+
+        fn apply_write<'a>(
+            &'a self,
+            _ctx: &'a mut TxnCtx,
+            _req: WriteRequest,
+        ) -> impl Future<Output = Result<crate::kernel::execution::WriteOutcome>> + Send + 'a
+        {
+            async move { panic!("point-get backend should not be used for writes") }
+        }
+    }
+
+    struct MockScanExecutionBackend {
+        expected_table_id: TableId,
+        expected_bounds: LogicalScanBounds,
+        rows: Vec<Row>,
+        scan_calls: AtomicUsize,
+    }
+
+    impl ExecutionBackend for MockScanExecutionBackend {
+        type Scan = DummyExecutionScan;
+
+        fn point_get<'a>(
+            &'a self,
+            _ctx: &'a TxnCtx,
+            _req: PointGetRequest,
+        ) -> impl Future<Output = Result<Option<ExecutionRow>>> + Send + 'a {
+            async move { panic!("scan backend should not be used for point gets") }
+        }
+
+        fn scan(&self, _ctx: &TxnCtx, req: ScanRequest) -> Result<Self::Scan> {
+            self.scan_calls.fetch_add(1, Ordering::SeqCst);
+            assert_eq!(req.table.id(), self.expected_table_id);
+            assert_eq!(req.bounds, self.expected_bounds);
+            Ok(DummyExecutionScan::from_rows(self.rows.clone()))
+        }
+
+        fn apply_write<'a>(
+            &'a self,
+            _ctx: &'a mut TxnCtx,
+            _req: WriteRequest,
+        ) -> impl Future<Output = Result<crate::kernel::execution::WriteOutcome>> + Send + 'a
+        {
+            async move { panic!("scan backend should not be used for writes") }
+        }
+    }
+
+    struct MockExecutionRows {
+        rows: Vec<ExecutionRow>,
+        index: usize,
+    }
+
+    impl MockExecutionRows {
+        fn new(rows: Vec<ExecutionRow>) -> Self {
+            Self { rows, index: 0 }
+        }
+    }
+
+    impl ExecutionRowStream for MockExecutionRows {
+        fn next_row(&mut self) -> impl Future<Output = Result<Option<ExecutionRow>>> + Send + '_ {
+            async move {
+                let row = self.rows.get(self.index).cloned();
+                self.index += usize::from(row.is_some());
+                Ok(row)
+            }
+        }
+    }
+
+    struct MockWriteExecutionBackend {
+        expected_table_id: TableId,
+        point_get_row: Option<ExecutionRow>,
+        scan_rows: Vec<ExecutionRow>,
+        expected_scan_bounds: Option<LogicalScanBounds>,
+        point_get_calls: AtomicUsize,
+        scan_calls: AtomicUsize,
+        apply_write_calls: AtomicUsize,
+        last_write_request: Mutex<Option<WriteRequest>>,
+        fail_apply_write: bool,
+    }
+
+    fn write_outcome_for(req: &WriteRequest) -> crate::kernel::execution::WriteOutcome {
+        match req {
+            WriteRequest::Insert(req) => crate::kernel::execution::WriteOutcome {
+                matched_rows: req.rows.len() as u64,
+                affected_rows: req.rows.len() as u64,
+                locked_rows: 0,
+                last_insert_id: None,
+            },
+            WriteRequest::Update(req) => crate::kernel::execution::WriteOutcome {
+                matched_rows: req.rows.len() as u64,
+                affected_rows: req.rows.len() as u64,
+                locked_rows: 0,
+                last_insert_id: None,
+            },
+            WriteRequest::Delete(req) => crate::kernel::execution::WriteOutcome {
+                matched_rows: req.keys.len() as u64,
+                affected_rows: req.keys.len() as u64,
+                locked_rows: 0,
+                last_insert_id: None,
+            },
+            WriteRequest::Lock(req) => crate::kernel::execution::WriteOutcome {
+                matched_rows: 0,
+                affected_rows: 0,
+                locked_rows: req.keys.len() as u64,
+                last_insert_id: None,
+            },
+            WriteRequest::Batch(reqs) => reqs.iter().fold(
+                crate::kernel::execution::WriteOutcome::default(),
+                |mut acc, req| {
+                    let next = write_outcome_for(req);
+                    acc.matched_rows += next.matched_rows;
+                    acc.affected_rows += next.affected_rows;
+                    acc.locked_rows += next.locked_rows;
+                    acc
+                },
+            ),
+        }
+    }
+
+    impl ExecutionBackend for MockWriteExecutionBackend {
+        type Scan = MockExecutionRows;
+
+        fn point_get<'a>(
+            &'a self,
+            _ctx: &'a TxnCtx,
+            req: PointGetRequest,
+        ) -> impl Future<Output = Result<Option<ExecutionRow>>> + Send + 'a {
+            async move {
+                self.point_get_calls.fetch_add(1, Ordering::SeqCst);
+                assert_eq!(req.table.id(), self.expected_table_id);
+                Ok(self.point_get_row.clone())
+            }
+        }
+
+        fn scan(&self, _ctx: &TxnCtx, req: ScanRequest) -> Result<Self::Scan> {
+            self.scan_calls.fetch_add(1, Ordering::SeqCst);
+            assert_eq!(req.table.id(), self.expected_table_id);
+            if let Some(expected_bounds) = &self.expected_scan_bounds {
+                assert_eq!(&req.bounds, expected_bounds);
+            }
+            Ok(MockExecutionRows::new(self.scan_rows.clone()))
+        }
+
+        fn apply_write<'a>(
+            &'a self,
+            _ctx: &'a mut TxnCtx,
+            req: WriteRequest,
+        ) -> impl Future<Output = Result<crate::kernel::execution::WriteOutcome>> + Send + 'a
+        {
+            async move {
+                self.apply_write_calls.fetch_add(1, Ordering::SeqCst);
+                *self.last_write_request.lock() = Some(req.clone());
+                if self.fail_apply_write {
+                    Err(TiSqlError::LockWaitTimeout)
+                } else {
+                    Ok(write_outcome_for(&req))
+                }
             }
         }
     }
@@ -2357,7 +2290,6 @@ mod tests {
                 key.to_vec(),
                 crate::transaction::MutationMeta {
                     mutation: crate::transaction::MutationPayload::Lock,
-                    tablet_id: crate::tablet::TabletId::Table { table_id },
                 },
             );
             if !stmt.contains_key(key) {
@@ -2683,7 +2615,6 @@ mod tests {
                 table,
                 key: LogicalPointKey::PrimaryKey(vec![Value::BigInt(7)]),
             },
-            &service,
             &backend,
             &ctx,
         )
@@ -2740,7 +2671,6 @@ mod tests {
                 table,
                 key: LogicalPointKey::PrimaryKey(vec![Value::BigInt(8)]),
             },
-            &service,
             &backend,
             &ctx,
         )
@@ -2754,8 +2684,67 @@ mod tests {
         assert_eq!(service.scan_calls.load(Ordering::SeqCst), 0);
     }
 
+    #[tokio::test]
+    async fn test_scan_plan_uses_execution_backend_instead_of_txn_scan() {
+        let table = TableDef::new(
+            102,
+            "t".to_string(),
+            "default".to_string(),
+            vec![
+                ColumnDef::new(1, "id".into(), DataType::BigInt, false, None, false),
+                ColumnDef::new(2, "name".into(), DataType::Varchar(32), true, None, false),
+            ],
+            vec![1],
+        );
+        let service = MockPointGetTxnService {
+            table_id: table.id(),
+            expected_key: None,
+            row_value: None,
+            get_calls: AtomicUsize::new(0),
+            scan_calls: AtomicUsize::new(0),
+            put_calls: AtomicUsize::new(0),
+            delete_calls: AtomicUsize::new(0),
+            lock_calls: AtomicUsize::new(0),
+            last_scan_range: Mutex::new(None),
+        };
+        let backend = MockScanExecutionBackend {
+            expected_table_id: table.id(),
+            expected_bounds: LogicalScanBounds::FullTable,
+            rows: vec![Row::new(vec![
+                Value::BigInt(7),
+                Value::String("alice".into()),
+            ])],
+            scan_calls: AtomicUsize::new(0),
+        };
+        let ctx = TxnCtx::new(13, 102, true);
+
+        let mut op = build_read_operator(
+            LogicalPlan::Scan {
+                table,
+                projection: None,
+                filter: None,
+            },
+            &backend,
+            &ctx,
+        )
+        .await
+        .unwrap();
+
+        op.open().await.unwrap();
+        let first = op
+            .next()
+            .await
+            .unwrap()
+            .expect("scan should return one row");
+        assert_eq!(first.get(0), Some(&Value::BigInt(7)));
+        assert_eq!(first.get(1), Some(&Value::String("alice".into())));
+        assert!(op.next().await.unwrap().is_none());
+        assert_eq!(backend.scan_calls.load(Ordering::SeqCst), 1);
+        assert_eq!(service.scan_calls.load(Ordering::SeqCst), 0);
+    }
+
     #[test]
-    fn test_extract_pk_scan_range_for_closed_interval() {
+    fn test_extract_pk_scan_bounds_for_closed_interval() {
         let table = TableDef::new(
             202,
             "t".to_string(),
@@ -2787,20 +2776,25 @@ mod tests {
             }),
         };
 
-        match extract_pk_scan_range(&table, &predicate) {
-            Some(PkScanRange::Bounded(range)) => {
-                let expected_start = encode_key(table.id(), &encode_pk(&[Value::BigInt(1)]));
-                let mut expected_end = encode_key(table.id(), &encode_pk(&[Value::BigInt(5)]));
-                assert!(next_key_bound(&mut expected_end));
-                assert_eq!(range.start, expected_start);
-                assert_eq!(range.end, expected_end);
-            }
-            _ => panic!("expected bounded pk range"),
-        }
+        assert_eq!(
+            extract_pk_scan_bounds(&table, &predicate),
+            Some(LogicalPkScanBounds::Bounded(
+                LogicalScanBounds::PrimaryKeyRange {
+                    lower: Some(ScanBound {
+                        values: vec![Value::BigInt(1)],
+                        inclusive: true,
+                    }),
+                    upper: Some(ScanBound {
+                        values: vec![Value::BigInt(5)],
+                        inclusive: true,
+                    }),
+                }
+            ))
+        );
     }
 
     #[test]
-    fn test_extract_pk_scan_range_accepts_integer_literal_type_mismatch() {
+    fn test_extract_pk_scan_bounds_accepts_integer_literal_type_mismatch() {
         let table = TableDef::new(
             203,
             "t".to_string(),
@@ -2823,16 +2817,21 @@ mod tests {
             right: Box::new(Expr::Literal(Value::BigInt(7))),
         };
 
-        match extract_pk_scan_range(&table, &predicate) {
-            Some(PkScanRange::Bounded(range)) => {
-                let expected_start = encode_key(table.id(), &encode_pk(&[Value::BigInt(7)]));
-                let mut expected_end = encode_key(table.id(), &encode_pk(&[Value::BigInt(7)]));
-                assert!(next_key_bound(&mut expected_end));
-                assert_eq!(range.start, expected_start);
-                assert_eq!(range.end, expected_end);
-            }
-            _ => panic!("expected bounded pk range"),
-        }
+        assert_eq!(
+            extract_pk_scan_bounds(&table, &predicate),
+            Some(LogicalPkScanBounds::Bounded(
+                LogicalScanBounds::PrimaryKeyRange {
+                    lower: Some(ScanBound {
+                        values: vec![Value::BigInt(7)],
+                        inclusive: true,
+                    }),
+                    upper: Some(ScanBound {
+                        values: vec![Value::BigInt(7)],
+                        inclusive: true,
+                    }),
+                }
+            ))
+        );
     }
 
     #[tokio::test]
@@ -2879,6 +2878,21 @@ mod tests {
             lock_calls: AtomicUsize::new(0),
             last_scan_range: Mutex::new(None),
         };
+        let backend = MockScanExecutionBackend {
+            expected_table_id: table.id(),
+            expected_bounds: LogicalScanBounds::PrimaryKeyRange {
+                lower: Some(crate::kernel::execution::ScanBound {
+                    values: vec![Value::BigInt(1)],
+                    inclusive: true,
+                }),
+                upper: Some(crate::kernel::execution::ScanBound {
+                    values: vec![Value::BigInt(5)],
+                    inclusive: true,
+                }),
+            },
+            rows: Vec::new(),
+            scan_calls: AtomicUsize::new(0),
+        };
         let ctx = TxnCtx::new(15, 150, true);
 
         let mut op = build_read_operator(
@@ -2887,8 +2901,7 @@ mod tests {
                 projection: None,
                 filter: Some(filter),
             },
-            &service,
-            &UnusedExecutionBackend,
+            &backend,
             &ctx,
         )
         .await
@@ -2896,18 +2909,8 @@ mod tests {
 
         op.open().await.unwrap();
         assert!(op.next().await.unwrap().is_none());
-        assert_eq!(service.scan_calls.load(Ordering::SeqCst), 1);
-
-        let observed = service
-            .last_scan_range
-            .lock()
-            .clone()
-            .expect("scan range should be captured");
-        let expected_start = encode_key(table.id(), &encode_pk(&[Value::BigInt(1)]));
-        let mut expected_end = encode_key(table.id(), &encode_pk(&[Value::BigInt(5)]));
-        assert!(next_key_bound(&mut expected_end));
-        assert_eq!(observed.start, expected_start);
-        assert_eq!(observed.end, expected_end);
+        assert_eq!(backend.scan_calls.load(Ordering::SeqCst), 1);
+        assert_eq!(service.scan_calls.load(Ordering::SeqCst), 0);
     }
 
     #[tokio::test]
@@ -2922,19 +2925,30 @@ mod tests {
             ],
             vec![1],
         );
-        let key = encode_key(table.id(), &encode_pk(&[Value::BigInt(7)]));
-        let row = encode_row(&[1, 2], &[Value::BigInt(7), Value::String("alice".into())]);
-
         let service = MockPointGetTxnService {
             table_id: table.id(),
-            expected_key: Some(key.clone()),
-            row_value: Some(row),
+            expected_key: None,
+            row_value: None,
             get_calls: AtomicUsize::new(0),
             scan_calls: AtomicUsize::new(0),
             put_calls: AtomicUsize::new(0),
             delete_calls: AtomicUsize::new(0),
             lock_calls: AtomicUsize::new(0),
             last_scan_range: Mutex::new(None),
+        };
+        let backend = MockWriteExecutionBackend {
+            expected_table_id: table.id(),
+            point_get_row: Some(ExecutionRow {
+                key: RowKey::PrimaryKey(vec![Value::BigInt(7)]),
+                row: Row::new(vec![Value::BigInt(7), Value::String("alice".into())]),
+            }),
+            scan_rows: Vec::new(),
+            expected_scan_bounds: None,
+            point_get_calls: AtomicUsize::new(0),
+            scan_calls: AtomicUsize::new(0),
+            apply_write_calls: AtomicUsize::new(0),
+            last_write_request: Mutex::new(None),
+            fail_apply_write: false,
         };
 
         let mut ctx = TxnCtx::new(16, 160, false);
@@ -2959,24 +2973,26 @@ mod tests {
         };
 
         let mut stmt_ctx = StatementCtx::new();
-        let mut stmt = service.begin_statement(&mut ctx);
         let output = SimpleExecutor::new()
             .execute_write_with_ctx(
                 plan,
                 &mut stmt_ctx,
-                &mut stmt,
                 &mut ctx,
-                &service,
+                &backend,
                 &MemoryCatalog::new(),
             )
             .await
             .unwrap();
 
         assert!(matches!(output, ExecutionOutput::Affected { count } if count == 0));
-        assert_eq!(service.get_calls.load(Ordering::SeqCst), 1);
-        assert_eq!(service.lock_calls.load(Ordering::SeqCst), 1);
-        assert_eq!(service.delete_calls.load(Ordering::SeqCst), 0);
+        assert_eq!(backend.point_get_calls.load(Ordering::SeqCst), 1);
+        assert_eq!(backend.apply_write_calls.load(Ordering::SeqCst), 1);
+        assert_eq!(service.get_calls.load(Ordering::SeqCst), 0);
         assert_eq!(service.scan_calls.load(Ordering::SeqCst), 0);
+        assert!(matches!(
+            backend.last_write_request.lock().clone(),
+            Some(WriteRequest::Lock(LockRequest { keys, .. })) if keys == vec![RowKey::PrimaryKey(vec![Value::BigInt(7)])]
+        ));
     }
 
     #[tokio::test]
@@ -2991,16 +3007,30 @@ mod tests {
             ],
             vec![1],
         );
-        let key = encode_key(table.id(), &encode_pk(&[Value::BigInt(7)]));
-        let row = encode_row(&[1, 2], &[Value::BigInt(7), Value::String("alice".into())]);
-
-        let service = MockScanRowsTxnService {
+        let service = MockPointGetTxnService {
             table_id: table.id(),
-            rows: vec![(key, row)],
+            expected_key: None,
+            row_value: None,
+            get_calls: AtomicUsize::new(0),
             scan_calls: AtomicUsize::new(0),
             put_calls: AtomicUsize::new(0),
             delete_calls: AtomicUsize::new(0),
             lock_calls: AtomicUsize::new(0),
+            last_scan_range: Mutex::new(None),
+        };
+        let backend = MockWriteExecutionBackend {
+            expected_table_id: table.id(),
+            point_get_row: None,
+            scan_rows: vec![ExecutionRow {
+                key: RowKey::PrimaryKey(vec![Value::BigInt(7)]),
+                row: Row::new(vec![Value::BigInt(7), Value::String("alice".into())]),
+            }],
+            expected_scan_bounds: Some(LogicalScanBounds::FullTable),
+            point_get_calls: AtomicUsize::new(0),
+            scan_calls: AtomicUsize::new(0),
+            apply_write_calls: AtomicUsize::new(0),
+            last_write_request: Mutex::new(None),
+            fail_apply_write: false,
         };
 
         let mut ctx = TxnCtx::new(17, 161, false);
@@ -3023,23 +3053,21 @@ mod tests {
         };
 
         let mut stmt_ctx = StatementCtx::new();
-        let mut stmt = service.begin_statement(&mut ctx);
         let output = SimpleExecutor::new()
             .execute_write_with_ctx(
                 plan,
                 &mut stmt_ctx,
-                &mut stmt,
                 &mut ctx,
-                &service,
+                &backend,
                 &MemoryCatalog::new(),
             )
             .await
             .unwrap();
 
         assert!(matches!(output, ExecutionOutput::Affected { count } if count == 0));
-        assert_eq!(service.scan_calls.load(Ordering::SeqCst), 1);
-        assert_eq!(service.delete_calls.load(Ordering::SeqCst), 0);
-        assert_eq!(service.lock_calls.load(Ordering::SeqCst), 0);
+        assert_eq!(backend.scan_calls.load(Ordering::SeqCst), 1);
+        assert_eq!(backend.apply_write_calls.load(Ordering::SeqCst), 0);
+        assert_eq!(service.scan_calls.load(Ordering::SeqCst), 0);
     }
 
     #[tokio::test]
@@ -3054,16 +3082,30 @@ mod tests {
             ],
             vec![1],
         );
-        let key = encode_key(table.id(), &encode_pk(&[Value::BigInt(8)]));
-        let row = encode_row(&[1, 2], &[Value::BigInt(8), Value::String("alice".into())]);
-
-        let service = MockScanRowsTxnService {
+        let service = MockPointGetTxnService {
             table_id: table.id(),
-            rows: vec![(key, row)],
+            expected_key: None,
+            row_value: None,
+            get_calls: AtomicUsize::new(0),
             scan_calls: AtomicUsize::new(0),
             put_calls: AtomicUsize::new(0),
             delete_calls: AtomicUsize::new(0),
             lock_calls: AtomicUsize::new(0),
+            last_scan_range: Mutex::new(None),
+        };
+        let backend = MockWriteExecutionBackend {
+            expected_table_id: table.id(),
+            point_get_row: None,
+            scan_rows: vec![ExecutionRow {
+                key: RowKey::PrimaryKey(vec![Value::BigInt(8)]),
+                row: Row::new(vec![Value::BigInt(8), Value::String("alice".into())]),
+            }],
+            expected_scan_bounds: Some(LogicalScanBounds::FullTable),
+            point_get_calls: AtomicUsize::new(0),
+            scan_calls: AtomicUsize::new(0),
+            apply_write_calls: AtomicUsize::new(0),
+            last_write_request: Mutex::new(None),
+            fail_apply_write: false,
         };
 
         let mut ctx = TxnCtx::new_explicit(18, 162, false);
@@ -3086,27 +3128,29 @@ mod tests {
         };
 
         let mut stmt_ctx = StatementCtx::new();
-        let mut stmt = service.begin_statement(&mut ctx);
         let output = SimpleExecutor::new()
             .execute_write_with_ctx(
                 plan,
                 &mut stmt_ctx,
-                &mut stmt,
                 &mut ctx,
-                &service,
+                &backend,
                 &MemoryCatalog::new(),
             )
             .await
             .unwrap();
 
         assert!(matches!(output, ExecutionOutput::Affected { count } if count == 0));
-        assert_eq!(service.scan_calls.load(Ordering::SeqCst), 1);
-        assert_eq!(service.delete_calls.load(Ordering::SeqCst), 0);
-        assert_eq!(service.lock_calls.load(Ordering::SeqCst), 1);
+        assert_eq!(backend.scan_calls.load(Ordering::SeqCst), 1);
+        assert_eq!(backend.apply_write_calls.load(Ordering::SeqCst), 1);
+        assert!(matches!(
+            backend.last_write_request.lock().clone(),
+            Some(WriteRequest::Lock(LockRequest { keys, .. })) if keys == vec![RowKey::PrimaryKey(vec![Value::BigInt(8)])]
+        ));
+        assert_eq!(service.scan_calls.load(Ordering::SeqCst), 0);
     }
 
     #[tokio::test]
-    async fn test_update_noop_uses_lock_key_with_point_get_input() {
+    async fn test_update_noop_is_forwarded_as_logical_update_request() {
         let table = TableDef::new(
             303,
             "t".to_string(),
@@ -3117,19 +3161,30 @@ mod tests {
             ],
             vec![1],
         );
-        let key = encode_key(table.id(), &encode_pk(&[Value::BigInt(7)]));
-        let row = encode_row(&[1, 2], &[Value::BigInt(7), Value::String("alice".into())]);
-
         let service = MockPointGetTxnService {
             table_id: table.id(),
-            expected_key: Some(key.clone()),
-            row_value: Some(row),
+            expected_key: None,
+            row_value: None,
             get_calls: AtomicUsize::new(0),
             scan_calls: AtomicUsize::new(0),
             put_calls: AtomicUsize::new(0),
             delete_calls: AtomicUsize::new(0),
             lock_calls: AtomicUsize::new(0),
             last_scan_range: Mutex::new(None),
+        };
+        let backend = MockWriteExecutionBackend {
+            expected_table_id: table.id(),
+            point_get_row: Some(ExecutionRow {
+                key: RowKey::PrimaryKey(vec![Value::BigInt(7)]),
+                row: Row::new(vec![Value::BigInt(7), Value::String("alice".into())]),
+            }),
+            scan_rows: Vec::new(),
+            expected_scan_bounds: None,
+            point_get_calls: AtomicUsize::new(0),
+            scan_calls: AtomicUsize::new(0),
+            apply_write_calls: AtomicUsize::new(0),
+            last_write_request: Mutex::new(None),
+            fail_apply_write: false,
         };
 
         let mut ctx = TxnCtx::new(31, 300, false);
@@ -3151,25 +3206,29 @@ mod tests {
         };
 
         let mut stmt_ctx = StatementCtx::new();
-        let mut stmt = service.begin_statement(&mut ctx);
         let output = SimpleExecutor::new()
             .execute_write_with_ctx(
                 plan,
                 &mut stmt_ctx,
-                &mut stmt,
                 &mut ctx,
-                &service,
+                &backend,
                 &MemoryCatalog::new(),
             )
             .await
             .unwrap();
 
         assert!(matches!(output, ExecutionOutput::Affected { count } if count == 1));
-        assert_eq!(service.get_calls.load(Ordering::SeqCst), 1);
-        assert_eq!(service.lock_calls.load(Ordering::SeqCst), 1);
-        assert_eq!(service.put_calls.load(Ordering::SeqCst), 0);
-        assert_eq!(service.delete_calls.load(Ordering::SeqCst), 0);
-        assert_eq!(service.scan_calls.load(Ordering::SeqCst), 0);
+        assert_eq!(backend.point_get_calls.load(Ordering::SeqCst), 1);
+        assert_eq!(backend.apply_write_calls.load(Ordering::SeqCst), 1);
+        assert_eq!(service.get_calls.load(Ordering::SeqCst), 0);
+        assert!(matches!(
+            backend.last_write_request.lock().clone(),
+            Some(WriteRequest::Update(UpdateRequest { rows, .. }))
+                if rows.len() == 1
+                    && rows[0].current_key == RowKey::PrimaryKey(vec![Value::BigInt(7)])
+                    && rows[0].current_row.values() == [Value::BigInt(7), Value::String("alice".into())]
+                    && rows[0].new_row.values() == [Value::BigInt(7), Value::String("alice".into())]
+        ));
     }
 
     #[tokio::test]
@@ -3184,19 +3243,30 @@ mod tests {
             ],
             vec![1],
         );
-        let key = encode_key(table.id(), &encode_pk(&[Value::BigInt(7)]));
-        let row = encode_row(&[1, 2], &[Value::BigInt(7), Value::String("alice".into())]);
-
         let service = MockPointGetTxnService {
             table_id: table.id(),
-            expected_key: Some(key.clone()),
-            row_value: Some(row),
+            expected_key: None,
+            row_value: None,
             get_calls: AtomicUsize::new(0),
             scan_calls: AtomicUsize::new(0),
             put_calls: AtomicUsize::new(0),
             delete_calls: AtomicUsize::new(0),
             lock_calls: AtomicUsize::new(0),
             last_scan_range: Mutex::new(None),
+        };
+        let backend = MockWriteExecutionBackend {
+            expected_table_id: table.id(),
+            point_get_row: Some(ExecutionRow {
+                key: RowKey::PrimaryKey(vec![Value::BigInt(7)]),
+                row: Row::new(vec![Value::BigInt(7), Value::String("alice".into())]),
+            }),
+            scan_rows: Vec::new(),
+            expected_scan_bounds: None,
+            point_get_calls: AtomicUsize::new(0),
+            scan_calls: AtomicUsize::new(0),
+            apply_write_calls: AtomicUsize::new(0),
+            last_write_request: Mutex::new(None),
+            fail_apply_write: false,
         };
 
         let mut ctx = TxnCtx::new(32, 301, false);
@@ -3222,25 +3292,25 @@ mod tests {
         };
 
         let mut stmt_ctx = StatementCtx::new();
-        let mut stmt = service.begin_statement(&mut ctx);
         let output = SimpleExecutor::new()
             .execute_write_with_ctx(
                 plan,
                 &mut stmt_ctx,
-                &mut stmt,
                 &mut ctx,
-                &service,
+                &backend,
                 &MemoryCatalog::new(),
             )
             .await
             .unwrap();
 
         assert!(matches!(output, ExecutionOutput::Affected { count } if count == 0));
-        assert_eq!(service.get_calls.load(Ordering::SeqCst), 1);
-        assert_eq!(service.lock_calls.load(Ordering::SeqCst), 1);
-        assert_eq!(service.put_calls.load(Ordering::SeqCst), 0);
-        assert_eq!(service.delete_calls.load(Ordering::SeqCst), 0);
-        assert_eq!(service.scan_calls.load(Ordering::SeqCst), 0);
+        assert_eq!(backend.point_get_calls.load(Ordering::SeqCst), 1);
+        assert_eq!(backend.apply_write_calls.load(Ordering::SeqCst), 1);
+        assert_eq!(service.get_calls.load(Ordering::SeqCst), 0);
+        assert!(matches!(
+            backend.last_write_request.lock().clone(),
+            Some(WriteRequest::Lock(LockRequest { keys, .. })) if keys == vec![RowKey::PrimaryKey(vec![Value::BigInt(7)])]
+        ));
     }
 
     #[tokio::test]
@@ -3287,6 +3357,26 @@ mod tests {
             lock_calls: AtomicUsize::new(0),
             last_scan_range: Mutex::new(None),
         };
+        let backend = MockWriteExecutionBackend {
+            expected_table_id: table.id(),
+            point_get_row: None,
+            scan_rows: Vec::new(),
+            expected_scan_bounds: Some(LogicalScanBounds::PrimaryKeyRange {
+                lower: Some(ScanBound {
+                    values: vec![Value::BigInt(1)],
+                    inclusive: true,
+                }),
+                upper: Some(ScanBound {
+                    values: vec![Value::BigInt(5)],
+                    inclusive: true,
+                }),
+            }),
+            point_get_calls: AtomicUsize::new(0),
+            scan_calls: AtomicUsize::new(0),
+            apply_write_calls: AtomicUsize::new(0),
+            last_write_request: Mutex::new(None),
+            fail_apply_write: false,
+        };
 
         let mut ctx = TxnCtx::new(41, 400, false);
         let plan = LogicalPlan::Update {
@@ -3300,31 +3390,21 @@ mod tests {
         };
 
         let mut stmt_ctx = StatementCtx::new();
-        let mut stmt = service.begin_statement(&mut ctx);
         let output = SimpleExecutor::new()
             .execute_write_with_ctx(
                 plan,
                 &mut stmt_ctx,
-                &mut stmt,
                 &mut ctx,
-                &service,
+                &backend,
                 &MemoryCatalog::new(),
             )
             .await
             .unwrap();
 
         assert!(matches!(output, ExecutionOutput::Affected { count } if count == 0));
-        assert_eq!(service.scan_calls.load(Ordering::SeqCst), 1);
-        let observed = service
-            .last_scan_range
-            .lock()
-            .clone()
-            .expect("scan range should be captured");
-        let expected_start = encode_key(table.id(), &encode_pk(&[Value::BigInt(1)]));
-        let mut expected_end = encode_key(table.id(), &encode_pk(&[Value::BigInt(5)]));
-        assert!(next_key_bound(&mut expected_end));
-        assert_eq!(observed.start, expected_start);
-        assert_eq!(observed.end, expected_end);
+        assert_eq!(backend.scan_calls.load(Ordering::SeqCst), 1);
+        assert_eq!(backend.apply_write_calls.load(Ordering::SeqCst), 0);
+        assert_eq!(service.scan_calls.load(Ordering::SeqCst), 0);
     }
 
     #[tokio::test]
@@ -3371,6 +3451,26 @@ mod tests {
             lock_calls: AtomicUsize::new(0),
             last_scan_range: Mutex::new(None),
         };
+        let backend = MockWriteExecutionBackend {
+            expected_table_id: table.id(),
+            point_get_row: None,
+            scan_rows: Vec::new(),
+            expected_scan_bounds: Some(LogicalScanBounds::PrimaryKeyRange {
+                lower: Some(ScanBound {
+                    values: vec![Value::BigInt(1)],
+                    inclusive: true,
+                }),
+                upper: Some(ScanBound {
+                    values: vec![Value::BigInt(5)],
+                    inclusive: true,
+                }),
+            }),
+            point_get_calls: AtomicUsize::new(0),
+            scan_calls: AtomicUsize::new(0),
+            apply_write_calls: AtomicUsize::new(0),
+            last_write_request: Mutex::new(None),
+            fail_apply_write: false,
+        };
 
         let mut ctx = TxnCtx::new(42, 401, false);
         let plan = LogicalPlan::Delete {
@@ -3383,35 +3483,25 @@ mod tests {
         };
 
         let mut stmt_ctx = StatementCtx::new();
-        let mut stmt = service.begin_statement(&mut ctx);
         let output = SimpleExecutor::new()
             .execute_write_with_ctx(
                 plan,
                 &mut stmt_ctx,
-                &mut stmt,
                 &mut ctx,
-                &service,
+                &backend,
                 &MemoryCatalog::new(),
             )
             .await
             .unwrap();
 
         assert!(matches!(output, ExecutionOutput::Affected { count } if count == 0));
-        assert_eq!(service.scan_calls.load(Ordering::SeqCst), 1);
-        let observed = service
-            .last_scan_range
-            .lock()
-            .clone()
-            .expect("scan range should be captured");
-        let expected_start = encode_key(table.id(), &encode_pk(&[Value::BigInt(1)]));
-        let mut expected_end = encode_key(table.id(), &encode_pk(&[Value::BigInt(5)]));
-        assert!(next_key_bound(&mut expected_end));
-        assert_eq!(observed.start, expected_start);
-        assert_eq!(observed.end, expected_end);
+        assert_eq!(backend.scan_calls.load(Ordering::SeqCst), 1);
+        assert_eq!(backend.apply_write_calls.load(Ordering::SeqCst), 0);
+        assert_eq!(service.scan_calls.load(Ordering::SeqCst), 0);
     }
 
     #[tokio::test]
-    async fn test_insert_ignore_duplicate_locks_existing_key() {
+    async fn test_insert_ignore_is_forwarded_to_execution_backend() {
         let table = TableDef::new(
             505,
             "t".to_string(),
@@ -3422,18 +3512,27 @@ mod tests {
             ],
             vec![1],
         );
-        let key = encode_key(table.id(), &encode_pk(&[Value::BigInt(7)]));
-
         let service = MockPointGetTxnService {
             table_id: table.id(),
-            expected_key: Some(key),
-            row_value: Some(b"existing".to_vec()),
+            expected_key: None,
+            row_value: None,
             get_calls: AtomicUsize::new(0),
             scan_calls: AtomicUsize::new(0),
             put_calls: AtomicUsize::new(0),
             delete_calls: AtomicUsize::new(0),
             lock_calls: AtomicUsize::new(0),
             last_scan_range: Mutex::new(None),
+        };
+        let backend = MockWriteExecutionBackend {
+            expected_table_id: table.id(),
+            point_get_row: None,
+            scan_rows: Vec::new(),
+            expected_scan_bounds: None,
+            point_get_calls: AtomicUsize::new(0),
+            scan_calls: AtomicUsize::new(0),
+            apply_write_calls: AtomicUsize::new(0),
+            last_write_request: Mutex::new(None),
+            fail_apply_write: false,
         };
 
         let plan = LogicalPlan::Insert {
@@ -3448,24 +3547,27 @@ mod tests {
 
         let mut ctx = TxnCtx::new(51, 500, false);
         let mut stmt_ctx = StatementCtx::new();
-        let mut stmt = service.begin_statement(&mut ctx);
         let output = SimpleExecutor::new()
             .execute_write_with_ctx(
                 plan,
                 &mut stmt_ctx,
-                &mut stmt,
                 &mut ctx,
-                &service,
+                &backend,
                 &MemoryCatalog::new(),
             )
             .await
             .unwrap();
 
-        assert!(matches!(output, ExecutionOutput::Affected { count } if count == 0));
-        assert_eq!(service.get_calls.load(Ordering::SeqCst), 1);
-        assert_eq!(service.lock_calls.load(Ordering::SeqCst), 1);
-        assert_eq!(service.put_calls.load(Ordering::SeqCst), 0);
-        assert_eq!(service.scan_calls.load(Ordering::SeqCst), 0);
+        assert!(matches!(output, ExecutionOutput::Affected { count } if count == 1));
+        assert_eq!(backend.apply_write_calls.load(Ordering::SeqCst), 1);
+        assert_eq!(service.get_calls.load(Ordering::SeqCst), 0);
+        assert!(matches!(
+            backend.last_write_request.lock().clone(),
+            Some(WriteRequest::Insert(InsertRequest { ignore_duplicates: true, rows, .. }))
+                if rows.len() == 1
+                    && rows[0].key == RowKey::PrimaryKey(vec![Value::BigInt(7)])
+                    && rows[0].row.values() == [Value::BigInt(7), Value::String("alice".into())]
+        ));
     }
 
     #[tokio::test]
@@ -3540,6 +3642,17 @@ mod tests {
             rollback_calls: AtomicUsize::new(0),
             last_undo_len: AtomicUsize::new(0),
         };
+        let backend = MockWriteExecutionBackend {
+            expected_table_id: table.id(),
+            point_get_row: None,
+            scan_rows: Vec::new(),
+            expected_scan_bounds: None,
+            point_get_calls: AtomicUsize::new(0),
+            scan_calls: AtomicUsize::new(0),
+            apply_write_calls: AtomicUsize::new(0),
+            last_write_request: Mutex::new(None),
+            fail_apply_write: true,
+        };
         let plan = LogicalPlan::Insert {
             table,
             columns: vec![1],
@@ -3560,7 +3673,7 @@ mod tests {
                 &exec_ctx,
                 &mut stmt_ctx,
                 &service,
-                &UnusedExecutionBackend,
+                &backend,
                 &MemoryCatalog::new(),
                 txn_ctx,
             )
@@ -3571,8 +3684,8 @@ mod tests {
             returned_ctx.is_some(),
             "explicit txn should survive statement error"
         );
-        assert_eq!(service.rollback_statement_calls.load(Ordering::SeqCst), 1);
-        assert_eq!(service.last_undo_len.load(Ordering::SeqCst), 1);
+        assert_eq!(backend.apply_write_calls.load(Ordering::SeqCst), 1);
+        assert_eq!(service.rollback_statement_calls.load(Ordering::SeqCst), 0);
         assert_eq!(service.rollback_calls.load(Ordering::SeqCst), 0);
     }
 }

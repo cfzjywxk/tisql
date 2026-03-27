@@ -23,6 +23,8 @@
 //! 1. **Unified interface**: All transaction operations in one trait (`TxnService`)
 //! 2. **Context-based**: Transaction state is held in `TxnCtx`, passed to operations
 //! 3. **No read-only distinction**: Even "reads" may write in distributed txn (lock resolution)
+//! 4. **Storage details stay hidden**: callers interact with logical scan rows
+//!    and opaque `StatementGuard`s, not MVCC iterators or rollback metadata
 //!
 //! ## Usage
 //!
@@ -31,13 +33,14 @@
 //! let mut ctx = txn_service.begin(false)?;  // read_only = false
 //!
 //! // Read operations
-//! let value = txn_service.get(&ctx, table_id, key)?;
+//! let value = txn_service.get(&ctx, table_id, key).await?;
 //!
-//! // Write operations
-//! txn_service.put(&mut ctx, table_id, key, value)?;
+//! // Write operations for direct transaction callers
+//! let mut stmt = txn_service.begin_statement(&mut ctx);
+//! txn_service.put(&mut ctx, &mut stmt, table_id, key, value).await?;
 //!
 //! // Commit
-//! let info = txn_service.commit(ctx)?;
+//! let info = txn_service.commit(ctx).await?;
 //! ```
 
 use std::collections::BTreeMap;
@@ -46,7 +49,6 @@ use std::ops::Range;
 use std::time::Duration;
 
 use crate::catalog::types::{Key, Lsn, RawValue, TableId, Timestamp, TxnId};
-use crate::tablet::TabletId;
 use crate::util::error::Result;
 
 /// Final per-key mutation payload tracked in a transaction context.
@@ -79,8 +81,6 @@ impl MutationPayload {
 pub(crate) struct MutationMeta {
     /// Final mutation payload for commit/rollback handling.
     pub(crate) mutation: MutationPayload,
-    /// Tablet routing captured when the mutation was recorded.
-    pub(crate) tablet_id: TabletId,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -247,8 +247,8 @@ pub struct TxnCtx {
     pub(crate) explicit: bool,
     /// Keys mutated by this transaction with final per-key mutation payload.
     ///
-    /// Each entry tracks the final operation (`Put`, `Delete`, or `Lock`) plus
-    /// tablet routing. Commit serializes durable clog ops directly from this map.
+    /// Each entry tracks the final operation (`Put`, `Delete`, or `Lock`).
+    /// Commit serializes durable clog ops directly from this map.
     pub(crate) mutations: BTreeMap<Key, MutationMeta>,
     /// Whether this transaction has been registered in the state cache.
     /// Registration happens on first write (put/delete) for implicit txns,

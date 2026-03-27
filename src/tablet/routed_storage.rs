@@ -25,15 +25,340 @@ use std::sync::Arc;
 use fail::fail_point;
 
 use crate::catalog::types::{Key, RawValue, Timestamp};
+use crate::kernel::txn_storage::{
+    AbortRequest, CommitReservation as TxnCommitReservation, FinalizeRequest, PointReadResult,
+    RecoveredWrite, TxnDeleteEffect, TxnPointRead, TxnRestoreMutation, TxnStageError,
+    TxnStorageBlocked, TxnStoragePort, TxnStorageRecoveryPort, TxnStorageScanCursor,
+    TxnStorageScanEntry, TxnStorageScanRequest, TxnStorageScanStep, TxnStorageVisibleState,
+};
+use crate::transaction::{ConcurrencyManager, TxnState};
 use crate::util::codec::key::{decode_index_key, decode_table_id, is_index_key, is_record_key};
 use crate::util::error::Result;
 
 use super::mvcc::MvccKey;
 use super::router::{is_system_table_id, route_index_to_tablet, route_table_to_tablet, TabletId};
 use super::{
-    PessimisticStorage, PessimisticWriteError, StorageEngine, TabletEngine, TabletManager,
-    TieredMergeIterator, WriteBatch, WriteOp,
+    is_lock, is_tombstone, MvccIterator, PessimisticStorage, PessimisticWriteError, StorageEngine,
+    TabletEngine, TabletManager, TieredMergeIterator, WriteBatch, WriteOp, LOCK, TOMBSTONE,
 };
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum PendingPointReadAction {
+    Proceed,
+    Blocked(Timestamp),
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum PendingScanAction {
+    Skip,
+    Visible,
+    Blocked(Timestamp),
+}
+
+fn classify_point_read_conflict(
+    concurrency_manager: &ConcurrencyManager,
+    lock_owner: Option<Timestamp>,
+    reader_owner_ts: Timestamp,
+    read_ts: Timestamp,
+) -> PendingPointReadAction {
+    let Some(lock_owner) = lock_owner else {
+        return PendingPointReadAction::Proceed;
+    };
+    if lock_owner == reader_owner_ts {
+        return PendingPointReadAction::Proceed;
+    }
+
+    match concurrency_manager.get_txn_state(lock_owner) {
+        Some(TxnState::Preparing) => PendingPointReadAction::Blocked(lock_owner),
+        Some(TxnState::Prepared { prepared_ts }) if prepared_ts <= read_ts => {
+            PendingPointReadAction::Blocked(lock_owner)
+        }
+        Some(TxnState::Running)
+        | Some(TxnState::Prepared { .. })
+        | Some(TxnState::Committed { .. })
+        | Some(TxnState::Aborted)
+        | None => PendingPointReadAction::Proceed,
+    }
+}
+
+fn classify_scan_pending(
+    concurrency_manager: &ConcurrencyManager,
+    read_ts: Timestamp,
+    owner_start_ts: Timestamp,
+) -> PendingScanAction {
+    match concurrency_manager.get_txn_state(owner_start_ts) {
+        Some(TxnState::Running) => PendingScanAction::Skip,
+        Some(TxnState::Preparing) => PendingScanAction::Blocked(owner_start_ts),
+        Some(TxnState::Prepared { prepared_ts }) => {
+            if prepared_ts > read_ts {
+                PendingScanAction::Skip
+            } else {
+                PendingScanAction::Blocked(owner_start_ts)
+            }
+        }
+        Some(TxnState::Committed { commit_ts }) => {
+            if commit_ts > read_ts {
+                PendingScanAction::Skip
+            } else {
+                PendingScanAction::Visible
+            }
+        }
+        Some(TxnState::Aborted) | None => PendingScanAction::Skip,
+    }
+}
+
+fn map_stage_error(err: PessimisticWriteError) -> TxnStageError {
+    match err {
+        PessimisticWriteError::LockConflict(owner_start_ts) => {
+            TxnStageError::LockConflict { owner_start_ts }
+        }
+        PessimisticWriteError::WriteStall { delay } => TxnStageError::WriteStall { delay },
+    }
+}
+
+async fn resolve_point_read<S>(
+    storage: &S,
+    concurrency_manager: &ConcurrencyManager,
+    req: TxnPointRead<'_>,
+) -> Result<PointReadResult>
+where
+    S: PessimisticStorage + StorageEngine,
+{
+    let tablet_id = infer_logical_tablet_from_encoded_key(req.key);
+    let start_mvcc = MvccKey::encode(req.key, Timestamp::MAX);
+    let end_mvcc = MvccKey::encode(req.key, 0)
+        .next_key()
+        .unwrap_or_else(MvccKey::unbounded);
+    let mut storage_iter =
+        storage.scan_iter_on_tablet(tablet_id, start_mvcc..end_mvcc, req.owner_ts)?;
+
+    storage_iter.advance().await?;
+    while storage_iter.valid() && storage_iter.user_key() == req.key {
+        if storage_iter.is_pending() {
+            let owner_start_ts = storage_iter.pending_owner();
+            if owner_start_ts == req.owner_ts {
+                if is_lock(storage_iter.value()) {
+                    storage_iter.advance().await?;
+                    continue;
+                }
+                return Ok(if is_tombstone(storage_iter.value()) {
+                    PointReadResult::Deleted
+                } else {
+                    PointReadResult::Value(storage_iter.value().to_vec())
+                });
+            }
+
+            match classify_point_read_conflict(
+                concurrency_manager,
+                Some(owner_start_ts),
+                req.owner_ts,
+                req.read_ts,
+            ) {
+                PendingPointReadAction::Proceed => {
+                    storage_iter.advance().await?;
+                    continue;
+                }
+                PendingPointReadAction::Blocked(owner_start_ts) => {
+                    return Ok(PointReadResult::Blocked { owner_start_ts });
+                }
+            }
+        }
+
+        if storage_iter.timestamp() > req.read_ts {
+            storage_iter.advance().await?;
+            continue;
+        }
+
+        if is_lock(storage_iter.value()) {
+            storage_iter.advance().await?;
+            continue;
+        }
+
+        return Ok(if is_tombstone(storage_iter.value()) {
+            PointReadResult::Deleted
+        } else {
+            PointReadResult::Value(storage_iter.value().to_vec())
+        });
+    }
+
+    Ok(PointReadResult::Missing)
+}
+
+async fn classify_same_owner_delete_effect<S>(
+    storage: &S,
+    concurrency_manager: &ConcurrencyManager,
+    key: &[u8],
+    owner_start_ts: Timestamp,
+) -> Result<TxnDeleteEffect>
+where
+    S: PessimisticStorage + StorageEngine,
+{
+    // Owner-visible raw reads on LsmEngine collapse tombstones to None. When we
+    // already own the head pending node, re-use the logical point-read path so a
+    // repeated delete preserves delete semantics instead of degrading to LOCK.
+    let point_read = resolve_point_read(
+        storage,
+        concurrency_manager,
+        TxnPointRead {
+            key,
+            read_ts: owner_start_ts,
+            owner_ts: owner_start_ts,
+        },
+    )
+    .await?;
+
+    Ok(match point_read {
+        PointReadResult::Value(_) | PointReadResult::Deleted => TxnDeleteEffect::Delete,
+        PointReadResult::Missing => TxnDeleteEffect::Lock,
+        PointReadResult::Blocked {
+            owner_start_ts: blocked_owner,
+        } => {
+            debug_assert_eq!(
+                blocked_owner, owner_start_ts,
+                "same-owner point read should not block on a different owner"
+            );
+            TxnDeleteEffect::Lock
+        }
+    })
+}
+
+pub struct TabletTxnStorage<S> {
+    storage: Arc<S>,
+    concurrency_manager: Arc<ConcurrencyManager>,
+}
+
+impl<S> TabletTxnStorage<S> {
+    pub fn new(storage: Arc<S>, concurrency_manager: Arc<ConcurrencyManager>) -> Self {
+        Self {
+            storage,
+            concurrency_manager,
+        }
+    }
+
+    pub fn inner(&self) -> &S {
+        self.storage.as_ref()
+    }
+}
+
+pub struct TxnStorageScanAdapter<I: MvccIterator> {
+    storage_iter: I,
+    read_ts: Timestamp,
+    range: Range<Key>,
+    concurrency_manager: Arc<ConcurrencyManager>,
+}
+
+impl<I: MvccIterator> TxnStorageScanAdapter<I> {
+    pub(crate) fn new(
+        storage_iter: I,
+        read_ts: Timestamp,
+        range: Range<Key>,
+        concurrency_manager: Arc<ConcurrencyManager>,
+    ) -> Self {
+        Self {
+            storage_iter,
+            read_ts,
+            range,
+            concurrency_manager,
+        }
+    }
+
+    async fn skip_current_key(&mut self, skip_key: &[u8]) -> Result<()> {
+        self.storage_iter.advance().await?;
+        while self.storage_iter.valid() && self.storage_iter.user_key() == skip_key {
+            self.storage_iter.advance().await?;
+        }
+        Ok(())
+    }
+}
+
+impl<I: MvccIterator> TxnStorageScanCursor for TxnStorageScanAdapter<I> {
+    fn next_step(
+        &mut self,
+    ) -> impl std::future::Future<Output = Result<TxnStorageScanStep>> + Send + '_ {
+        async move {
+            if !self.storage_iter.valid() {
+                self.storage_iter.advance().await?;
+            }
+
+            while self.storage_iter.valid() {
+                let user_key = self.storage_iter.user_key();
+
+                if !self.range.end.is_empty() && user_key >= self.range.end.as_slice() {
+                    return Ok(TxnStorageScanStep::Exhausted);
+                }
+
+                if user_key < self.range.start.as_slice() {
+                    self.storage_iter.advance().await?;
+                    continue;
+                }
+
+                if self.storage_iter.is_pending() {
+                    let owner_start_ts = self.storage_iter.pending_owner();
+                    match classify_scan_pending(
+                        self.concurrency_manager.as_ref(),
+                        self.read_ts,
+                        owner_start_ts,
+                    ) {
+                        PendingScanAction::Skip => {
+                            self.storage_iter.advance().await?;
+                            continue;
+                        }
+                        PendingScanAction::Visible => {
+                            if is_lock(self.storage_iter.value()) {
+                                let skip_key = user_key.to_vec();
+                                self.skip_current_key(skip_key.as_slice()).await?;
+                                continue;
+                            }
+
+                            let user_key = user_key.to_vec();
+                            let state = if is_tombstone(self.storage_iter.value()) {
+                                TxnStorageVisibleState::Deleted
+                            } else {
+                                TxnStorageVisibleState::Value(self.storage_iter.value().to_vec())
+                            };
+                            self.skip_current_key(user_key.as_slice()).await?;
+                            return Ok(TxnStorageScanStep::Entry(TxnStorageScanEntry {
+                                user_key,
+                                state,
+                            }));
+                        }
+                        PendingScanAction::Blocked(owner_start_ts) => {
+                            return Ok(TxnStorageScanStep::Blocked(TxnStorageBlocked {
+                                user_key: user_key.to_vec(),
+                                owner_start_ts,
+                            }));
+                        }
+                    }
+                }
+
+                if self.storage_iter.timestamp() > self.read_ts {
+                    self.storage_iter.advance().await?;
+                    continue;
+                }
+
+                if is_lock(self.storage_iter.value()) {
+                    let skip_key = user_key.to_vec();
+                    self.skip_current_key(skip_key.as_slice()).await?;
+                    continue;
+                }
+
+                let user_key = user_key.to_vec();
+                let state = if is_tombstone(self.storage_iter.value()) {
+                    TxnStorageVisibleState::Deleted
+                } else {
+                    TxnStorageVisibleState::Value(self.storage_iter.value().to_vec())
+                };
+                self.skip_current_key(user_key.as_slice()).await?;
+                return Ok(TxnStorageScanStep::Entry(TxnStorageScanEntry {
+                    user_key,
+                    state,
+                }));
+            }
+
+            Ok(TxnStorageScanStep::Exhausted)
+        }
+    }
+}
 
 /// Storage facade that routes all operations through `TabletManager`.
 ///
@@ -129,6 +454,181 @@ impl RoutedTabletStorage {
                 .push(key.clone());
         }
         grouped
+    }
+}
+
+impl<S> TxnStoragePort for TabletTxnStorage<S>
+where
+    S: PessimisticStorage + StorageEngine,
+{
+    type ScanCursor = TxnStorageScanAdapter<S::Iter>;
+
+    fn read_point<'a>(
+        &'a self,
+        req: TxnPointRead<'a>,
+    ) -> impl std::future::Future<Output = Result<PointReadResult>> + Send + 'a {
+        resolve_point_read(
+            self.storage.as_ref(),
+            self.concurrency_manager.as_ref(),
+            req,
+        )
+    }
+
+    fn scan(&self, req: TxnStorageScanRequest) -> Result<Self::ScanCursor> {
+        let start_mvcc = MvccKey::encode(&req.range.start, Timestamp::MAX);
+        let end_mvcc = if req.range.end.is_empty() {
+            MvccKey::unbounded()
+        } else {
+            MvccKey::encode(&req.range.end, 0)
+        };
+        let storage_iter = self.storage.scan_iter(start_mvcc..end_mvcc, req.owner_ts)?;
+        Ok(TxnStorageScanAdapter::new(
+            storage_iter,
+            req.read_ts,
+            req.range,
+            Arc::clone(&self.concurrency_manager),
+        ))
+    }
+
+    fn stage_put(
+        &self,
+        key: &[u8],
+        value: &[u8],
+        owner_start_ts: Timestamp,
+    ) -> std::result::Result<(), TxnStageError> {
+        let tablet_id = infer_logical_tablet_from_encoded_key(key);
+        self.storage
+            .put_pending_on_tablet(tablet_id, key, value, owner_start_ts)
+            .map_err(map_stage_error)
+    }
+
+    fn stage_delete<'a>(
+        &'a self,
+        key: &'a [u8],
+        owner_start_ts: Timestamp,
+    ) -> impl std::future::Future<Output = std::result::Result<TxnDeleteEffect, TxnStageError>> + Send + 'a
+    {
+        async move {
+            let tablet_id = infer_logical_tablet_from_encoded_key(key);
+            let delete_effect =
+                if self.storage.get_lock_owner_on_tablet(tablet_id, key) == Some(owner_start_ts) {
+                    classify_same_owner_delete_effect(
+                        self.storage.as_ref(),
+                        self.concurrency_manager.as_ref(),
+                        key,
+                        owner_start_ts,
+                    )
+                    .await
+                    .expect("same-owner delete effect resolution should succeed")
+                } else if self
+                    .storage
+                    .get_with_owner_on_tablet(tablet_id, key, owner_start_ts, owner_start_ts)
+                    .await
+                    .is_some()
+                {
+                    TxnDeleteEffect::Delete
+                } else {
+                    TxnDeleteEffect::Lock
+                };
+
+            if delete_effect == TxnDeleteEffect::Delete {
+                self.storage
+                    .put_pending_on_tablet(tablet_id, key, TOMBSTONE, owner_start_ts)
+                    .map_err(map_stage_error)?;
+                Ok(TxnDeleteEffect::Delete)
+            } else {
+                self.storage
+                    .put_pending_on_tablet(tablet_id, key, LOCK, owner_start_ts)
+                    .map_err(map_stage_error)?;
+                Ok(TxnDeleteEffect::Lock)
+            }
+        }
+    }
+
+    fn stage_lock(
+        &self,
+        key: &[u8],
+        owner_start_ts: Timestamp,
+    ) -> std::result::Result<(), TxnStageError> {
+        let tablet_id = infer_logical_tablet_from_encoded_key(key);
+        if self.storage.get_lock_owner_on_tablet(tablet_id, key) == Some(owner_start_ts) {
+            return Ok(());
+        }
+        self.storage
+            .put_pending_on_tablet(tablet_id, key, LOCK, owner_start_ts)
+            .map_err(map_stage_error)
+    }
+
+    fn restore_pending(
+        &self,
+        key: &[u8],
+        mutation: TxnRestoreMutation<'_>,
+        owner_start_ts: Timestamp,
+    ) -> std::result::Result<(), TxnStageError> {
+        let tablet_id = infer_logical_tablet_from_encoded_key(key);
+        let value = match mutation {
+            TxnRestoreMutation::Put(value) => value,
+            TxnRestoreMutation::Delete => TOMBSTONE,
+            TxnRestoreMutation::Lock => LOCK,
+        };
+        self.storage
+            .put_pending_on_tablet(tablet_id, key, value, owner_start_ts)
+            .map_err(map_stage_error)
+    }
+
+    fn reserve_commit_lsn(&self, owner_start_ts: Timestamp) -> TxnCommitReservation {
+        TxnCommitReservation {
+            owner_start_ts,
+            lsn: self.storage.alloc_and_reserve_commit_lsn(owner_start_ts),
+        }
+    }
+
+    fn release_commit_lsn(&self, reservation: TxnCommitReservation) -> bool {
+        self.storage.release_commit_lsn(reservation.owner_start_ts) == Some(reservation.lsn)
+    }
+
+    fn finalize(&self, req: FinalizeRequest<'_>) -> Result<()> {
+        if !req.write_keys.is_empty() {
+            self.storage.finalize_pending_with_lsn(
+                req.write_keys,
+                req.owner_start_ts,
+                req.commit_ts,
+                req.reservation.lsn,
+            );
+        }
+        if !req.lock_only_keys.is_empty() {
+            self.storage
+                .abort_pending(req.lock_only_keys, req.owner_start_ts);
+        }
+        Ok(())
+    }
+
+    fn abort(&self, req: AbortRequest<'_>) -> Result<()> {
+        if !req.keys.is_empty() {
+            self.storage.abort_pending(req.keys, req.owner_start_ts);
+        }
+        Ok(())
+    }
+}
+
+impl<S> TxnStorageRecoveryPort for TabletTxnStorage<S>
+where
+    S: PessimisticStorage + StorageEngine,
+{
+    fn apply_recovered_write(
+        &self,
+        write: RecoveredWrite<'_>,
+        commit_ts: Timestamp,
+        lsn: u64,
+    ) -> Result<()> {
+        let mut batch = WriteBatch::new();
+        match write {
+            RecoveredWrite::Put { key, value } => batch.put(key.to_vec(), value.to_vec()),
+            RecoveredWrite::Delete { key } => batch.delete(key.to_vec()),
+        }
+        batch.set_commit_ts(commit_ts);
+        batch.set_clog_lsn(lsn);
+        self.storage.write_batch(batch)
     }
 }
 
@@ -334,7 +834,7 @@ mod tests {
     use crate::inner_table::core_tables::{ALL_TABLE_TABLE_ID, USER_TABLE_ID_START};
     use crate::lsn::new_lsn_provider;
     use crate::tablet::MvccIterator;
-    use crate::tablet::{encode_key, LsmConfig};
+    use crate::tablet::{encode_key, LsmConfig, MemTableEngine};
     use crate::util::codec::key::{encode_index_seek_key, encode_record_key_with_handle};
     use tempfile::TempDir;
 
@@ -367,6 +867,18 @@ mod tests {
     ) -> std::result::Result<bool, PessimisticWriteError> {
         let (tablet_id, _) = storage.resolve_key_tablet(key);
         storage.delete_pending_on_tablet(tablet_id, key, owner_start_ts)
+    }
+
+    fn make_mem_txn_storage() -> (
+        Arc<MemTableEngine>,
+        Arc<ConcurrencyManager>,
+        TabletTxnStorage<MemTableEngine>,
+    ) {
+        let storage = Arc::new(MemTableEngine::new());
+        let concurrency_manager = Arc::new(ConcurrencyManager::new(0));
+        let txn_storage =
+            TabletTxnStorage::new(Arc::clone(&storage), Arc::clone(&concurrency_manager));
+        (storage, concurrency_manager, txn_storage)
     }
 
     #[test]
@@ -1014,6 +1526,272 @@ mod tests {
 
         // Cleanup
         tablet.abort_pending(&[key], owner_ts);
+    }
+
+    #[test]
+    fn test_phase4_txn_storage_point_read_distinguishes_states() {
+        let (storage, concurrency_manager, txn_storage) = make_mem_txn_storage();
+
+        let visible_key = encode_record_key_with_handle(USER_TABLE_ID_START, 1);
+        let deleted_key = encode_record_key_with_handle(USER_TABLE_ID_START, 2);
+        let blocked_key = encode_record_key_with_handle(USER_TABLE_ID_START, 3);
+        let missing_key = encode_record_key_with_handle(USER_TABLE_ID_START, 4);
+
+        let mut batch = WriteBatch::new();
+        batch.put(visible_key.clone(), b"visible".to_vec());
+        batch.set_commit_ts(10);
+        storage.write_batch(batch).unwrap();
+
+        let mut batch = WriteBatch::new();
+        batch.put(deleted_key.clone(), b"old".to_vec());
+        batch.set_commit_ts(10);
+        storage.write_batch(batch).unwrap();
+
+        let mut batch = WriteBatch::new();
+        batch.delete(deleted_key.clone());
+        batch.set_commit_ts(20);
+        storage.write_batch(batch).unwrap();
+
+        storage
+            .put_pending_on_tablet(
+                route_table_to_tablet(USER_TABLE_ID_START),
+                &blocked_key,
+                b"pending",
+                42,
+            )
+            .unwrap();
+        concurrency_manager.register_txn(42);
+        concurrency_manager.set_preparing_txn(42).unwrap();
+
+        crate::io::block_on_sync(async {
+            assert_eq!(
+                txn_storage
+                    .read_point(TxnPointRead {
+                        key: &visible_key,
+                        read_ts: 100,
+                        owner_ts: 0,
+                    })
+                    .await
+                    .unwrap(),
+                PointReadResult::Value(b"visible".to_vec())
+            );
+            assert_eq!(
+                txn_storage
+                    .read_point(TxnPointRead {
+                        key: &deleted_key,
+                        read_ts: 100,
+                        owner_ts: 0,
+                    })
+                    .await
+                    .unwrap(),
+                PointReadResult::Deleted
+            );
+            assert_eq!(
+                txn_storage
+                    .read_point(TxnPointRead {
+                        key: &missing_key,
+                        read_ts: 100,
+                        owner_ts: 0,
+                    })
+                    .await
+                    .unwrap(),
+                PointReadResult::Missing
+            );
+            assert_eq!(
+                txn_storage
+                    .read_point(TxnPointRead {
+                        key: &blocked_key,
+                        read_ts: 100,
+                        owner_ts: 0,
+                    })
+                    .await
+                    .unwrap(),
+                PointReadResult::Blocked { owner_start_ts: 42 }
+            );
+        });
+    }
+
+    #[tokio::test]
+    async fn test_phase4_txn_storage_stage_delete_and_lock_preserve_effects() {
+        let (storage, _concurrency_manager, txn_storage) = make_mem_txn_storage();
+
+        let existing_key = encode_record_key_with_handle(USER_TABLE_ID_START, 10);
+        let missing_key = encode_record_key_with_handle(USER_TABLE_ID_START, 11);
+        let pending_key = encode_record_key_with_handle(USER_TABLE_ID_START, 12);
+
+        let mut batch = WriteBatch::new();
+        batch.put(existing_key.clone(), b"base".to_vec());
+        batch.set_commit_ts(10);
+        storage.write_batch(batch).unwrap();
+
+        assert_eq!(
+            txn_storage.stage_delete(&existing_key, 100).await,
+            Ok(TxnDeleteEffect::Delete)
+        );
+        assert_eq!(
+            txn_storage.stage_delete(&missing_key, 100).await,
+            Ok(TxnDeleteEffect::Lock)
+        );
+
+        txn_storage
+            .stage_put(&pending_key, b"pending", 200)
+            .unwrap();
+        txn_storage.stage_lock(&pending_key, 200).unwrap();
+
+        assert_eq!(
+            txn_storage
+                .read_point(TxnPointRead {
+                    key: &pending_key,
+                    read_ts: 200,
+                    owner_ts: 200,
+                })
+                .await
+                .unwrap(),
+            PointReadResult::Value(b"pending".to_vec()),
+            "stage_lock must not downgrade a same-owner pending write"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_phase4_txn_storage_repeated_delete_preserves_same_owner_tombstone() {
+        let tmp = TempDir::new().unwrap();
+        let storage = Arc::new(TabletEngine::open(LsmConfig::new(tmp.path())).unwrap());
+        let concurrency_manager = Arc::new(ConcurrencyManager::new(0));
+        let txn_storage =
+            TabletTxnStorage::new(Arc::clone(&storage), Arc::clone(&concurrency_manager));
+
+        let existing_key = encode_record_key_with_handle(USER_TABLE_ID_START, 13);
+
+        let mut batch = WriteBatch::new();
+        batch.put(existing_key.clone(), b"base".to_vec());
+        batch.set_commit_ts(10);
+        storage.write_batch(batch).unwrap();
+
+        assert_eq!(
+            txn_storage.stage_delete(&existing_key, 100).await,
+            Ok(TxnDeleteEffect::Delete)
+        );
+        assert_eq!(
+            txn_storage.stage_delete(&existing_key, 100).await,
+            Ok(TxnDeleteEffect::Delete),
+            "repeated delete must not degrade a same-owner tombstone into lock-only semantics"
+        );
+
+        assert_eq!(
+            txn_storage
+                .read_point(TxnPointRead {
+                    key: &existing_key,
+                    read_ts: 100,
+                    owner_ts: 100,
+                })
+                .await
+                .unwrap(),
+            PointReadResult::Deleted,
+            "owner should still observe a delete after repeating the delete"
+        );
+    }
+
+    #[test]
+    fn test_phase4_txn_storage_scan_retries_blocked_same_key() {
+        let (storage, concurrency_manager, txn_storage) = make_mem_txn_storage();
+
+        let blocked_key = encode_record_key_with_handle(USER_TABLE_ID_START, 20);
+        let later_key = encode_record_key_with_handle(USER_TABLE_ID_START, 21);
+        let range_start = encode_key(USER_TABLE_ID_START, &[]);
+        let range_end = encode_key(USER_TABLE_ID_START + 1, &[]);
+
+        let mut batch = WriteBatch::new();
+        batch.put(later_key.clone(), b"later".to_vec());
+        batch.set_commit_ts(10);
+        storage.write_batch(batch).unwrap();
+
+        storage
+            .put_pending_on_tablet(
+                route_table_to_tablet(USER_TABLE_ID_START),
+                &blocked_key,
+                b"blocked",
+                55,
+            )
+            .unwrap();
+        concurrency_manager.register_txn(55);
+        concurrency_manager.set_preparing_txn(55).unwrap();
+
+        let mut cursor = txn_storage
+            .scan(TxnStorageScanRequest {
+                range: range_start..range_end,
+                read_ts: 100,
+                owner_ts: 0,
+            })
+            .unwrap();
+
+        crate::io::block_on_sync(async {
+            assert_eq!(
+                cursor.next_step().await.unwrap(),
+                TxnStorageScanStep::Blocked(TxnStorageBlocked {
+                    user_key: blocked_key.clone(),
+                    owner_start_ts: 55,
+                })
+            );
+        });
+
+        concurrency_manager.prepare_txn(55, 60).unwrap();
+        storage.finalize_pending(&[blocked_key.clone()], 55, 60);
+        concurrency_manager.commit_txn(55, 60).unwrap();
+
+        crate::io::block_on_sync(async {
+            assert_eq!(
+                cursor.next_step().await.unwrap(),
+                TxnStorageScanStep::Entry(TxnStorageScanEntry {
+                    user_key: blocked_key.clone(),
+                    state: TxnStorageVisibleState::Value(b"blocked".to_vec()),
+                })
+            );
+            assert_eq!(
+                cursor.next_step().await.unwrap(),
+                TxnStorageScanStep::Entry(TxnStorageScanEntry {
+                    user_key: later_key.clone(),
+                    state: TxnStorageVisibleState::Value(b"later".to_vec()),
+                })
+            );
+            assert_eq!(
+                cursor.next_step().await.unwrap(),
+                TxnStorageScanStep::Exhausted
+            );
+        });
+    }
+
+    #[test]
+    fn test_phase4_txn_storage_stage_put_maps_write_stall() {
+        let tmp = TempDir::new().unwrap();
+        let config = LsmConfig::builder(tmp.path())
+            .memtable_size(64)
+            .max_frozen_memtables(1)
+            .build()
+            .unwrap();
+        let storage = Arc::new(TabletEngine::open(config).unwrap());
+        let concurrency_manager = Arc::new(ConcurrencyManager::new(0));
+        let txn_storage =
+            TabletTxnStorage::new(Arc::clone(&storage), Arc::clone(&concurrency_manager));
+
+        let mut batch = WriteBatch::new();
+        batch.set_commit_ts(1);
+        batch.put(b"k1".to_vec(), vec![b'x'; 60]);
+        storage.write_batch(batch).unwrap();
+
+        let mut batch = WriteBatch::new();
+        batch.set_commit_ts(2);
+        batch.put(b"k2".to_vec(), vec![b'x'; 60]);
+        storage.write_batch(batch).unwrap();
+
+        let mut batch = WriteBatch::new();
+        batch.set_commit_ts(3);
+        batch.put(b"k3".to_vec(), vec![b'x'; 60]);
+        let _ = storage.write_batch(batch);
+
+        assert_eq!(
+            txn_storage.stage_put(b"pending_stalled", b"value", 100),
+            Err(TxnStageError::WriteStall { delay: None })
+        );
     }
 
     /// T3.6a: Reservation is global (one per txn, not per tablet).

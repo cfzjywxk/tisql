@@ -12,10 +12,12 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-//! Storage layer - provides key-value storage abstraction.
+//! Storage layer and tablet-local persistence primitives.
 //!
-//! This module defines the core storage interface (`StorageEngine`) and related types.
-//! All storage implementations must implement this trait.
+//! `tablet` owns MVCC encoding, routing, memtables, SSTs, recovery, and the
+//! low-level storage traits used to implement those pieces. Higher layers
+//! should normally cross this boundary through `TxnService` or the
+//! `kernel::execution` adapters instead of depending on tablet internals.
 //!
 //! ## IMPORTANT: Use TxnService for All Reads
 //!
@@ -69,11 +71,6 @@ pub mod status_reporter;
 pub mod version;
 pub mod version_set;
 
-// Backward-compatible module path: crate::tablet::ilog::{...}
-pub mod ilog {
-    pub use crate::log::ilog::*;
-}
-
 // ============================================================================
 // Storage Implementation
 // ============================================================================
@@ -125,7 +122,7 @@ pub use manager::{
     derive_tablet_inventory, GlobalLogGcBoundary, TabletCheckpointCapture,
     TabletIlogTruncateCapture, TabletManager, TabletWorkerStatus,
 };
-pub use routed_storage::RoutedTabletStorage;
+pub use routed_storage::{RoutedTabletStorage, TabletTxnStorage};
 pub use router::{is_system_table_id, route_index_to_tablet, route_table_to_tablet, TabletId};
 
 // Re-export flush scheduler
@@ -138,7 +135,7 @@ pub use compaction_scheduler::{CompactionScheduler, CompactionSchedulerStatus};
 pub use compaction::{CompactionExecutor, CompactionPicker, CompactionTask, MergeIterator};
 
 // Re-export ilog types
-pub use ilog::{IlogConfig, IlogRecord, IlogService, IlogTruncateStats, VersionSnapshot};
+pub use crate::log::ilog::{IlogConfig, IlogRecord, IlogService, IlogTruncateStats};
 
 // Re-export recovery types
 pub use recovery::{LsmRecovery, RecoveryResult, RecoveryStats};

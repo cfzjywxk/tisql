@@ -18,7 +18,7 @@
 //! Concurrency control is handled by:
 //! - `TsoService` (separate module) - timestamp allocation
 //! - `ConcurrencyManager` - max_ts tracking and transaction state management
-//! - `PessimisticStorage` - lock management via pending nodes in storage
+//! - `TxnStoragePort` implementations - pending-node reads, writes, and finalize/abort
 //!
 //! ## Design Pattern
 //!
@@ -40,7 +40,8 @@
 //! 2. **Context-based**: Transaction state is in `TxnCtx`, passed to operations
 //! 3. **No read-only distinction at API level**: Even "reads" may write in
 //!    distributed transactions (lock resolution, min_commit_ts push)
-//! 4. **Separated concerns**: TSO allocates timestamps, storage handles locks
+//! 4. **Separated concerns**: TSO allocates timestamps, the transaction layer
+//!    owns wait policy, and tablet/log details stay behind inward-facing ports
 //!
 //! ## Example
 //!
@@ -49,13 +50,14 @@
 //! let mut ctx = txn_service.begin(false)?;  // read_only = false
 //!
 //! // Read operations
-//! let value = txn_service.get(&ctx, table_id, key)?;
+//! let value = txn_service.get(&ctx, table_id, key).await?;
 //!
 //! // Write operations
-//! txn_service.put(&mut ctx, table_id, key, value)?;
+//! let mut stmt = txn_service.begin_statement(&mut ctx);
+//! txn_service.put(&mut ctx, &mut stmt, table_id, key, value).await?;
 //!
 //! // Commit
-//! let info = txn_service.commit(ctx)?;
+//! let info = txn_service.commit(ctx).await?;
 //! ```
 
 mod api;
@@ -69,6 +71,7 @@ pub use api::{
     TxnScanEntry, TxnService, TxnState,
 };
 
+#[cfg(test)]
 pub(crate) use api::MutationMeta;
 
 // Implementation types - not re-exported from lib.rs main API
