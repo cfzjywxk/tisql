@@ -30,8 +30,9 @@ use tisql::tablet::mvcc::{is_tombstone, MvccIterator, MvccKey};
 use tisql::tablet::WriteBatch;
 use tisql::testkit::{
     CompactionExecutor, CompactionPicker, CompactionScheduler, CompactionTask, FlushScheduler,
-    IlogConfig, IlogService, IoService, LsmConfigBuilder, LsmEngine, ManifestDelta, SstBuilder,
-    SstBuilderOptions, SstMeta, SstReaderRef, Version,
+    IlogConfig, IlogService, IoService, LsmConfigBuilder, LsmEngine, ManifestCheckpoint,
+    ManifestDelta, ManifestLog, ManifestSnapshot, SstBuilder, SstBuilderOptions, SstMeta,
+    SstReaderRef, Version,
 };
 use tisql::StorageEngine;
 
@@ -1148,7 +1149,13 @@ async fn test_do_compaction_with_ilog_recovery() {
 
         // Write checkpoint to persist state
         let version = engine.current_version();
-        ilog.write_checkpoint(&version).unwrap();
+        let checkpoint = ManifestCheckpoint {
+            snapshot: ManifestSnapshot::from(version.as_ref()),
+            pending_intents: Vec::new(),
+        };
+        ManifestLog::write_checkpoint(ilog.as_ref(), &checkpoint)
+            .await
+            .unwrap();
 
         // Engine and ilog dropped here
     }

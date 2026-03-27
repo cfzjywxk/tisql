@@ -29,12 +29,13 @@ use std::sync::Arc;
 
 use tisql::catalog::types::{RawValue, Timestamp};
 use tisql::tablet::mvcc::{is_tombstone, MvccIterator, MvccKey};
+use tisql::tablet::TabletTxnStorage;
 use tisql::testkit::{
     ConcurrencyManager, ConflictWaitConfig, FileClogConfig, FileClogService, LocalTso,
     MemTableEngine, TransactionService, TxnServiceTestExt,
 };
 use tisql::util::error::TiSqlError;
-use tisql::StorageEngine;
+use tisql::{StorageEngine, TxnScanCursor};
 
 const SYS_TABLE_ID: u64 = 1;
 
@@ -77,8 +78,11 @@ async fn get_for_test(storage: &MemTableEngine, key: &[u8]) -> Option<RawValue> 
 /// Type alias for the test storage engine
 type TestStorage = MemTableEngine;
 
+/// Type alias for the transaction-facing storage adapter
+type TestTxnStorage = TabletTxnStorage<TestStorage>;
+
 /// Type alias for the test transaction service
-type TestTxnService = TransactionService<TestStorage, FileClogService, LocalTso>;
+type TestTxnService = TransactionService<TestTxnStorage, FileClogService, LocalTso>;
 
 /// Type alias for the create_test_service return type
 type TestServiceTuple = (
@@ -105,8 +109,9 @@ fn create_test_service() -> TestServiceTuple {
     );
     let tso = Arc::new(LocalTso::new(1));
     let cm = Arc::new(ConcurrencyManager::new(0));
+    let txn_storage = Arc::new(TabletTxnStorage::new(Arc::clone(&storage), Arc::clone(&cm)));
     let txn_service = Arc::new(TransactionService::new_with_conflict_wait_config(
-        Arc::clone(&storage),
+        txn_storage,
         clog_service,
         Arc::clone(&tso),
         Arc::clone(&cm),
@@ -1258,7 +1263,7 @@ async fn test_concurrent_scan_while_writers_run() {
 /// keys must be in ascending lexicographic order.
 #[tokio::test]
 async fn test_mvcc_iterator_ordering_invariant() {
-    let (_storage, txn_service, _tso, _cm, _dir) = create_test_service();
+    let (storage, txn_service, _tso, _cm, _dir) = create_test_service();
 
     // Create multiple versions of multiple keys
     // The ordering should be:
@@ -1313,7 +1318,6 @@ async fn test_mvcc_iterator_ordering_invariant() {
     let start = MvccKey::encode(b"key_a", Timestamp::MAX);
     let end = MvccKey::encode(b"key_d", 0);
 
-    let storage = txn_service.storage();
     let mut iter = storage.scan_iter(start..end, 0).unwrap();
     iter.advance().await.unwrap();
 

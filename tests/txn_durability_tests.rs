@@ -23,6 +23,7 @@ use std::sync::Arc;
 use tempfile::tempdir;
 
 use tisql::new_lsn_provider;
+use tisql::tablet::TabletTxnStorage;
 use tisql::testkit::{
     ConcurrencyManager, FileClogConfig, FileClogService, IlogConfig, IlogService, LocalTso,
     LsmConfig, LsmEngine, LsmRecovery, TransactionService, TxnServiceTestExt, Version,
@@ -70,7 +71,7 @@ fn create_txn_env(
     dir: &Path,
 ) -> (
     Arc<LsmEngine>,
-    TransactionService<LsmEngine, FileClogService, LocalTso>,
+    TransactionService<TabletTxnStorage<LsmEngine>, FileClogService, LocalTso>,
     Arc<FileClogService>,
 ) {
     let handle = tokio::runtime::Handle::current();
@@ -104,7 +105,8 @@ fn create_txn_env(
     );
     let tso = Arc::new(LocalTso::new(1));
     let cm = Arc::new(ConcurrencyManager::new(0));
-    let txn_service = TransactionService::new(Arc::clone(&engine), Arc::clone(&clog), tso, cm);
+    let txn_storage = Arc::new(TabletTxnStorage::new(Arc::clone(&engine), Arc::clone(&cm)));
+    let txn_service = TransactionService::new(txn_storage, Arc::clone(&clog), tso, cm);
     (engine, txn_service, clog)
 }
 
@@ -113,7 +115,7 @@ fn recover_txn_env(
     dir: &Path,
 ) -> (
     Arc<LsmEngine>,
-    TransactionService<LsmEngine, FileClogService, LocalTso>,
+    TransactionService<TabletTxnStorage<LsmEngine>, FileClogService, LocalTso>,
 ) {
     let handle = tokio::runtime::Handle::current();
     let recovery = LsmRecovery::new(dir);
@@ -122,8 +124,8 @@ fn recover_txn_env(
     let engine = Arc::new(result.engine);
     let tso = Arc::new(LocalTso::new(result.stats.max_commit_ts + 1));
     let cm = Arc::new(ConcurrencyManager::new(result.stats.max_commit_ts));
-    let txn_service =
-        TransactionService::new(Arc::clone(&engine), Arc::clone(&result.clog), tso, cm);
+    let txn_storage = Arc::new(TabletTxnStorage::new(Arc::clone(&engine), Arc::clone(&cm)));
+    let txn_service = TransactionService::new(txn_storage, Arc::clone(&result.clog), tso, cm);
 
     (engine, txn_service)
 }

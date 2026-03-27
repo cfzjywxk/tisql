@@ -42,6 +42,9 @@
 
 use std::sync::Arc;
 
+use crate::kernel::manifest::{
+    ManifestCommitRequest, ManifestSnapshot, RecordedManifestCommit, SstDesc, TrivialMoveEdit,
+};
 use crate::tablet::SstMeta;
 
 /// Maximum number of levels in the LSM-tree.
@@ -364,6 +367,79 @@ impl Default for VersionBuilder {
     }
 }
 
+impl From<&SstMeta> for SstDesc {
+    fn from(value: &SstMeta) -> Self {
+        Self {
+            id: value.id,
+            level: value.level,
+            smallest_key: value.smallest_key.clone(),
+            largest_key: value.largest_key.clone(),
+            file_size: value.file_size,
+            entry_count: value.entry_count,
+            block_count: value.block_count,
+            min_ts: value.min_ts,
+            max_ts: value.max_ts,
+            created_at: value.created_at,
+        }
+    }
+}
+
+impl From<&SstDesc> for SstMeta {
+    fn from(value: &SstDesc) -> Self {
+        Self {
+            id: value.id,
+            level: value.level,
+            smallest_key: value.smallest_key.clone(),
+            largest_key: value.largest_key.clone(),
+            file_size: value.file_size,
+            entry_count: value.entry_count,
+            block_count: value.block_count,
+            min_ts: value.min_ts,
+            max_ts: value.max_ts,
+            created_at: value.created_at,
+        }
+    }
+}
+
+impl From<&Version> for ManifestSnapshot {
+    fn from(value: &Version) -> Self {
+        let mut levels = Vec::with_capacity(MAX_LEVELS);
+        for level in 0..MAX_LEVELS {
+            levels.push(
+                value
+                    .ssts_at_level(level as u32)
+                    .iter()
+                    .map(|sst| SstDesc::from(sst.as_ref()))
+                    .collect(),
+            );
+        }
+
+        Self {
+            levels,
+            next_sst_id: value.next_sst_id(),
+            version_num: value.version_num(),
+            flushed_lsn: value.flushed_lsn(),
+        }
+    }
+}
+
+impl From<&ManifestSnapshot> for Version {
+    fn from(value: &ManifestSnapshot) -> Self {
+        let mut builder = VersionBuilder::new()
+            .next_sst_id(value.next_sst_id)
+            .version_num(value.version_num)
+            .flushed_lsn(value.flushed_lsn);
+
+        for (level, ssts) in value.levels.iter().enumerate() {
+            for sst in ssts {
+                builder = builder.add_sst_at_level(level as u32, Arc::new(SstMeta::from(sst)));
+            }
+        }
+
+        builder.build()
+    }
+}
+
 /// ManifestDelta represents an incremental change to the version.
 ///
 /// Deltas are persisted to the manifest (via clog) for recovery.
@@ -430,11 +506,69 @@ impl ManifestDelta {
     pub fn is_empty(&self) -> bool {
         self.new_ssts.is_empty() && self.deleted_ssts.is_empty() && self.flushed_lsn.is_none()
     }
+
+    pub fn from_commit(commit: &RecordedManifestCommit) -> Self {
+        match commit {
+            RecordedManifestCommit::Flush {
+                sst, flushed_lsn, ..
+            } => Self::flush(SstMeta::from(sst), *flushed_lsn),
+            RecordedManifestCommit::Compact {
+                deleted_ssts,
+                new_ssts,
+                ..
+            } => Self::compaction(
+                new_ssts.iter().map(SstMeta::from).collect(),
+                deleted_ssts.clone(),
+            ),
+        }
+    }
+
+    pub fn from_commit_request(commit: &ManifestCommitRequest) -> Self {
+        match commit {
+            ManifestCommitRequest::Flush { sst, flushed_lsn } => {
+                Self::flush(SstMeta::from(sst), *flushed_lsn)
+            }
+            ManifestCommitRequest::Compact {
+                deleted_ssts,
+                new_ssts,
+            } => Self::compaction(
+                new_ssts.iter().map(SstMeta::from).collect(),
+                deleted_ssts.clone(),
+            ),
+        }
+    }
+
+    pub fn from_trivial_move(edit: &TrivialMoveEdit) -> Self {
+        Self::compaction(
+            edit.new_ssts.iter().map(SstMeta::from).collect(),
+            edit.deleted_ssts.clone(),
+        )
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn assert_versions_match(expected: &Version, actual: &Version) {
+        assert_eq!(actual.next_sst_id(), expected.next_sst_id());
+        assert_eq!(actual.version_num(), expected.version_num());
+        assert_eq!(actual.flushed_lsn(), expected.flushed_lsn());
+
+        for level in 0..MAX_LEVELS {
+            let expected_ssts: Vec<_> = expected
+                .level(level)
+                .iter()
+                .map(|sst| sst.as_ref().clone())
+                .collect();
+            let actual_ssts: Vec<_> = actual
+                .level(level)
+                .iter()
+                .map(|sst| sst.as_ref().clone())
+                .collect();
+            assert_eq!(actual_ssts, expected_ssts, "level {level} mismatch");
+        }
+    }
 
     fn make_sst(id: u64, level: u32, smallest: &[u8], largest: &[u8]) -> SstMeta {
         SstMeta {
@@ -481,6 +615,85 @@ mod tests {
         assert_eq!(v.level_size(0), 2);
         assert_eq!(v.level_size(1), 1);
         assert_eq!(v.total_sst_count(), 3);
+    }
+
+    #[test]
+    fn test_manifest_snapshot_from_version() {
+        let sst1 = make_sst(1, 0, b"a", b"m");
+        let sst2 = make_sst(2, 0, b"n", b"z");
+        let sst3 = make_sst(3, 1, b"aa", b"zz");
+
+        let version = VersionBuilder::new()
+            .add_sst_at_level(0, Arc::new(sst1))
+            .add_sst_at_level(0, Arc::new(sst2))
+            .add_sst_at_level(1, Arc::new(sst3))
+            .next_sst_id(4)
+            .version_num(5)
+            .flushed_lsn(100)
+            .build();
+
+        let snapshot = ManifestSnapshot::from(&version);
+
+        assert_eq!(snapshot.next_sst_id, 4);
+        assert_eq!(snapshot.version_num, 5);
+        assert_eq!(snapshot.flushed_lsn, 100);
+        assert_eq!(snapshot.levels[0].len(), 2);
+        assert_eq!(snapshot.levels[1].len(), 1);
+    }
+
+    #[test]
+    fn test_manifest_snapshot_round_trip_preserves_recovery_fields() {
+        let sst1 = SstMeta {
+            id: 11,
+            level: 0,
+            smallest_key: b"a:0001".to_vec(),
+            largest_key: b"c:9999".to_vec(),
+            file_size: 111,
+            entry_count: 11,
+            block_count: 2,
+            min_ts: 7,
+            max_ts: 17,
+            created_at: 70,
+        };
+        let sst2 = SstMeta {
+            id: 22,
+            level: 0,
+            smallest_key: b"d:0002".to_vec(),
+            largest_key: b"f:9998".to_vec(),
+            file_size: 222,
+            entry_count: 22,
+            block_count: 3,
+            min_ts: 8,
+            max_ts: 18,
+            created_at: 80,
+        };
+        let sst3 = SstMeta {
+            id: 33,
+            level: 2,
+            smallest_key: b"m:0003".to_vec(),
+            largest_key: b"z:9997".to_vec(),
+            file_size: 333,
+            entry_count: 33,
+            block_count: 4,
+            min_ts: 9,
+            max_ts: 19,
+            created_at: 90,
+        };
+
+        let version = VersionBuilder::new()
+            .add_sst_at_level(0, Arc::new(sst1))
+            .add_sst_at_level(0, Arc::new(sst2))
+            .add_sst_at_level(2, Arc::new(sst3))
+            .next_sst_id(44)
+            .version_num(55)
+            .flushed_lsn(66)
+            .build();
+
+        let snapshot = ManifestSnapshot::from(&version);
+        let round_tripped = Version::from(&snapshot);
+
+        assert_versions_match(&version, &round_tripped);
+        assert_eq!(ManifestSnapshot::from(&round_tripped), snapshot);
     }
 
     #[test]

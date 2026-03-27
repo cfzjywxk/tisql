@@ -57,6 +57,11 @@ use tokio::task::JoinSet;
 use fail::fail_point;
 
 use crate::catalog::types::{Key, Lsn, RawValue, Timestamp};
+use crate::kernel::manifest::{
+    CheckpointCapture, ManifestCheckpoint, ManifestCommitRequest, ManifestCoordinator,
+    ManifestIntentRequest, ManifestLog, ManifestSnapshot, PreparedManifestOp,
+    RecordedManifestIntent, TrivialMoveEdit,
+};
 use crate::lsn::SharedLsnProvider;
 use crate::tablet::mvcc::{
     extract_key, extract_timestamp, is_tombstone, MvccIterator, MvccKey, SharedMvccRange,
@@ -409,28 +414,22 @@ impl LsmState {
     }
 }
 
-#[derive(Debug, Clone)]
-enum ManifestEdit {
-    Flush {
-        sst_meta: SstMeta,
-        flushed_lsn: Lsn,
-    },
-    Compact {
-        deleted_ssts: Vec<(u32, u64)>,
-        new_ssts: Vec<SstMeta>,
-    },
-    TrivialMove {
-        delta: ManifestDelta,
-    },
-}
-
 enum ManifestRequest {
-    Apply {
-        edit: ManifestEdit,
+    RegisterIntent {
+        req: ManifestIntentRequest,
+        reply: oneshot::Sender<Result<PreparedManifestOp>>,
+    },
+    CommitPrepared {
+        op: PreparedManifestOp,
+        commit: ManifestCommitRequest,
+        reply: oneshot::Sender<Result<()>>,
+    },
+    ApplyTrivialMove {
+        edit: TrivialMoveEdit,
         reply: oneshot::Sender<Result<()>>,
     },
     CheckpointAndCapture {
-        reply: oneshot::Sender<Result<(Arc<Version>, Lsn)>>,
+        reply: oneshot::Sender<Result<CheckpointCapture>>,
     },
 }
 
@@ -454,11 +453,46 @@ impl ManifestWriterHandle {
         Ok(())
     }
 
-    async fn submit(&self, edit: ManifestEdit) -> Result<()> {
+    async fn register_intent(&self, req: ManifestIntentRequest) -> Result<PreparedManifestOp> {
         self.fast_fail()?;
         let (reply_tx, reply_rx) = oneshot::channel();
         self.tx
-            .send(ManifestRequest::Apply {
+            .send(ManifestRequest::RegisterIntent {
+                req,
+                reply: reply_tx,
+            })
+            .await
+            .map_err(|_| TiSqlError::Internal("Manifest writer is shut down".into()))?;
+        reply_rx
+            .await
+            .map_err(|_| TiSqlError::Internal("Manifest writer dropped reply".into()))?
+    }
+
+    async fn commit_prepared(
+        &self,
+        op: PreparedManifestOp,
+        commit: ManifestCommitRequest,
+    ) -> Result<()> {
+        self.fast_fail()?;
+        let (reply_tx, reply_rx) = oneshot::channel();
+        self.tx
+            .send(ManifestRequest::CommitPrepared {
+                op,
+                commit,
+                reply: reply_tx,
+            })
+            .await
+            .map_err(|_| TiSqlError::Internal("Manifest writer is shut down".into()))?;
+        reply_rx
+            .await
+            .map_err(|_| TiSqlError::Internal("Manifest writer dropped reply".into()))?
+    }
+
+    async fn apply_trivial_move(&self, edit: TrivialMoveEdit) -> Result<()> {
+        self.fast_fail()?;
+        let (reply_tx, reply_rx) = oneshot::channel();
+        self.tx
+            .send(ManifestRequest::ApplyTrivialMove {
                 edit,
                 reply: reply_tx,
             })
@@ -469,7 +503,7 @@ impl ManifestWriterHandle {
             .map_err(|_| TiSqlError::Internal("Manifest writer dropped reply".into()))?
     }
 
-    async fn checkpoint_and_capture(&self) -> Result<(Arc<Version>, Lsn)> {
+    async fn checkpoint_and_capture(&self) -> Result<CheckpointCapture> {
         self.fast_fail()?;
         let (reply_tx, reply_rx) = oneshot::channel();
         self.tx
@@ -482,63 +516,74 @@ impl ManifestWriterHandle {
     }
 }
 
-fn manifest_delta_from_edit(edit: &ManifestEdit) -> ManifestDelta {
-    match edit {
-        ManifestEdit::Flush {
-            sst_meta,
-            flushed_lsn,
-        } => ManifestDelta::flush(sst_meta.clone(), *flushed_lsn),
-        ManifestEdit::Compact {
-            deleted_ssts,
-            new_ssts,
-        } => {
-            let mut delta = ManifestDelta::new();
-            for (level, sst_id) in deleted_ssts {
-                delta.delete_sst(*level, *sst_id);
-            }
-            for sst in new_ssts {
-                delta.add_sst(sst.clone());
-            }
-            delta
-        }
-        ManifestEdit::TrivialMove { delta } => delta.clone(),
+impl ManifestCoordinator for ManifestWriterHandle {
+    fn register_intent(
+        &self,
+        req: ManifestIntentRequest,
+    ) -> impl std::future::Future<Output = Result<PreparedManifestOp>> + Send + '_ {
+        async move { self.register_intent(req).await }
+    }
+
+    fn commit_prepared(
+        &self,
+        op: PreparedManifestOp,
+        commit: ManifestCommitRequest,
+    ) -> impl std::future::Future<Output = Result<()>> + Send + '_ {
+        async move { self.commit_prepared(op, commit).await }
+    }
+
+    fn apply_trivial_move(
+        &self,
+        edit: TrivialMoveEdit,
+    ) -> impl std::future::Future<Output = Result<()>> + Send + '_ {
+        async move { self.apply_trivial_move(edit).await }
+    }
+
+    fn checkpoint_and_capture(
+        &self,
+    ) -> impl std::future::Future<Output = Result<CheckpointCapture>> + Send + '_ {
+        async move { self.checkpoint_and_capture().await }
     }
 }
 
-async fn write_manifest_ilog_record(ilog: &IlogService, edit: &ManifestEdit) -> Result<()> {
-    match edit {
-        ManifestEdit::Flush {
-            sst_meta,
-            flushed_lsn,
-        } => ilog
-            .write_flush_commit_async(sst_meta.clone(), *flushed_lsn)
-            .await
-            .map(|_| ()),
-        ManifestEdit::Compact {
-            deleted_ssts,
-            new_ssts,
-        } => ilog
-            .write_compact_commit_async(deleted_ssts.clone(), new_ssts.clone())
-            .await
-            .map(|_| ()),
-        // TODO: Trivial move currently has no dedicated ilog record. Durability
-        // still relies on periodic/forced checkpoints, same as pre-queue behavior.
-        ManifestEdit::TrivialMove { .. } => Ok(()),
+fn manifest_checkpoint_from_state(
+    version_set: &VersionSet,
+    pending_intents: &std::collections::BTreeMap<Lsn, RecordedManifestIntent>,
+) -> ManifestCheckpoint {
+    ManifestCheckpoint {
+        snapshot: ManifestSnapshot::from(version_set.current().as_ref()),
+        pending_intents: pending_intents.values().cloned().collect(),
     }
 }
 
-fn reply_manifest_batch_error(batch: &mut Vec<ManifestRequest>, msg: &str) {
-    for req in batch.drain(..) {
-        let err = TiSqlError::Internal(msg.to_string());
-        match req {
-            ManifestRequest::Apply { reply, .. } => {
-                let _ = reply.send(Err(err));
-            }
-            ManifestRequest::CheckpointAndCapture { reply } => {
-                let _ = reply.send(Err(err));
-            }
-        }
-    }
+async fn checkpoint_manifest_state(
+    ilog: &IlogService,
+    version_set: &VersionSet,
+    pending_intents: &std::collections::BTreeMap<Lsn, RecordedManifestIntent>,
+) -> Result<CheckpointCapture> {
+    let checkpoint = manifest_checkpoint_from_state(version_set, pending_intents);
+    let checkpoint_lsn = ManifestLog::write_checkpoint(ilog, &checkpoint).await?;
+    Ok(CheckpointCapture {
+        snapshot: checkpoint.snapshot,
+        pending_intents: checkpoint.pending_intents,
+        checkpoint_lsn,
+    })
+}
+
+fn manifest_commit_matches_intent(
+    intent: &RecordedManifestIntent,
+    commit: &ManifestCommitRequest,
+) -> bool {
+    matches!(
+        (intent, commit),
+        (
+            RecordedManifestIntent::Flush { .. },
+            ManifestCommitRequest::Flush { .. }
+        ) | (
+            RecordedManifestIntent::Compact { .. },
+            ManifestCommitRequest::Compact { .. }
+        )
+    )
 }
 
 async fn manifest_writer_loop(
@@ -562,80 +607,137 @@ async fn manifest_writer_loop(
     let _running_guard = RunningGuard {
         flag: Arc::clone(&running_flag),
     };
-    let mut batch: Vec<ManifestRequest> = Vec::with_capacity(8);
+    let mut pending_intents = std::collections::BTreeMap::<Lsn, RecordedManifestIntent>::new();
 
-    while let Some(first_req) = rx.recv().await {
-        batch.push(first_req);
-        while let Ok(req) = rx.try_recv() {
-            batch.push(req);
-        }
-
-        // Phase 1: persist ilog records for all edits in this batch.
-        for req in &batch {
-            let edit = match req {
-                ManifestRequest::Apply { edit, .. } => edit,
-                ManifestRequest::CheckpointAndCapture { .. } => continue,
-            };
-            if let Err(e) = write_manifest_ilog_record(ilog.as_ref(), edit).await {
-                // Some prefix edits in this batch may already be durable in ilog.
-                // We still fail-stop the whole writer task on any ilog error:
-                // callers treat this as fatal, and recovery replays any durable
-                // prefix on next restart.
-                let msg = format!("Manifest writer ilog apply failed: {e}");
-                error_flag.store(true, AtomicOrdering::SeqCst);
-                reply_manifest_batch_error(&mut batch, &msg);
-                log_error!("{msg}");
-                return;
-            }
-        }
-
-        // Phase 2: apply in-memory deltas in FIFO order.
-        for req in &batch {
-            if let ManifestRequest::Apply { edit, .. } = req {
-                let delta = manifest_delta_from_edit(edit);
-                version_set.apply_delta(&delta);
-            }
-        }
-
-        // Phase 3: write at most one checkpoint for the whole batch.
-        let has_capture_request = batch
-            .iter()
-            .any(|req| matches!(req, ManifestRequest::CheckpointAndCapture { .. }));
-        let mut captured: Option<(Arc<Version>, Lsn)> = None;
-        if has_capture_request || ilog.needs_checkpoint() {
-            let version = version_set.current();
-            match ilog.write_checkpoint_async(version.as_ref()).await {
-                Ok(lsn) => {
-                    captured = Some((version, lsn));
+    while let Some(req) = rx.recv().await {
+        match req {
+            ManifestRequest::RegisterIntent { req, reply } => {
+                let result: Result<PreparedManifestOp> = async {
+                    let recorded = ManifestLog::append_intent(ilog.as_ref(), &req).await?;
+                    let op_id = recorded.op_id();
+                    pending_intents.insert(op_id, recorded);
+                    if ManifestLog::needs_checkpoint(ilog.as_ref()) {
+                        checkpoint_manifest_state(
+                            ilog.as_ref(),
+                            version_set.as_ref(),
+                            &pending_intents,
+                        )
+                        .await?;
+                    }
+                    Ok(PreparedManifestOp { op_id })
                 }
-                Err(e) => {
-                    let msg = format!("Manifest writer checkpoint failed: {e}");
-                    error_flag.store(true, AtomicOrdering::SeqCst);
-                    reply_manifest_batch_error(&mut batch, &msg);
-                    log_error!("{msg}");
-                    return;
+                .await;
+
+                match result {
+                    Ok(op) => {
+                        let _ = reply.send(Ok(op));
+                    }
+                    Err(e) => {
+                        error_flag.store(true, AtomicOrdering::SeqCst);
+                        let msg = format!("Manifest writer register_intent failed: {e}");
+                        let _ = reply.send(Err(TiSqlError::Internal(msg.clone())));
+                        log_error!("{msg}");
+                        return;
+                    }
                 }
             }
-        }
-
-        // Phase 4: reply to all waiters.
-        for req in batch.drain(..) {
-            match req {
-                ManifestRequest::Apply { reply, .. } => {
-                    let _ = reply.send(Ok(()));
+            ManifestRequest::CommitPrepared { op, commit, reply } => {
+                let Some(intent) = pending_intents.get(&op.op_id).cloned() else {
+                    let _ = reply.send(Err(TiSqlError::Internal(format!(
+                        "Unknown prepared manifest op {}",
+                        op.op_id
+                    ))));
+                    continue;
+                };
+                if !manifest_commit_matches_intent(&intent, &commit) {
+                    let _ = reply.send(Err(TiSqlError::Internal(format!(
+                        "Manifest commit kind does not match prepared op {}",
+                        op.op_id
+                    ))));
+                    continue;
                 }
-                ManifestRequest::CheckpointAndCapture { reply } => {
-                    let capture = match &captured {
-                        Some((version, lsn)) => (Arc::clone(version), *lsn),
-                        None => {
-                            let msg = "Manifest writer missing checkpoint capture".to_string();
-                            error_flag.store(true, AtomicOrdering::SeqCst);
-                            let _ = reply.send(Err(TiSqlError::Internal(msg.clone())));
-                            log_error!("{msg}");
-                            return;
-                        }
-                    };
-                    let _ = reply.send(Ok(capture));
+
+                let result: Result<()> = async {
+                    let recorded = crate::kernel::manifest::RecordedManifestCommit::from_request(
+                        op.op_id, commit,
+                    );
+                    ManifestLog::append_commit(ilog.as_ref(), &recorded).await?;
+                    let delta = ManifestDelta::from_commit(&recorded);
+                    version_set.apply_delta(&delta);
+                    pending_intents.remove(&op.op_id);
+                    if ManifestLog::needs_checkpoint(ilog.as_ref()) {
+                        checkpoint_manifest_state(
+                            ilog.as_ref(),
+                            version_set.as_ref(),
+                            &pending_intents,
+                        )
+                        .await?;
+                    }
+                    Ok(())
+                }
+                .await;
+
+                match result {
+                    Ok(()) => {
+                        let _ = reply.send(Ok(()));
+                    }
+                    Err(e) => {
+                        error_flag.store(true, AtomicOrdering::SeqCst);
+                        let msg = format!("Manifest writer commit_prepared failed: {e}");
+                        let _ = reply.send(Err(TiSqlError::Internal(msg.clone())));
+                        log_error!("{msg}");
+                        return;
+                    }
+                }
+            }
+            ManifestRequest::ApplyTrivialMove { edit, reply } => {
+                let result: Result<()> = async {
+                    ManifestLog::append_trivial_move(ilog.as_ref(), &edit).await?;
+                    let delta = ManifestDelta::from_trivial_move(&edit);
+                    version_set.apply_delta(&delta);
+                    if ManifestLog::needs_checkpoint(ilog.as_ref()) {
+                        checkpoint_manifest_state(
+                            ilog.as_ref(),
+                            version_set.as_ref(),
+                            &pending_intents,
+                        )
+                        .await?;
+                    }
+                    Ok(())
+                }
+                .await;
+
+                match result {
+                    Ok(()) => {
+                        let _ = reply.send(Ok(()));
+                    }
+                    Err(e) => {
+                        error_flag.store(true, AtomicOrdering::SeqCst);
+                        let msg = format!("Manifest writer apply_trivial_move failed: {e}");
+                        let _ = reply.send(Err(TiSqlError::Internal(msg.clone())));
+                        log_error!("{msg}");
+                        return;
+                    }
+                }
+            }
+            ManifestRequest::CheckpointAndCapture { reply } => {
+                match checkpoint_manifest_state(
+                    ilog.as_ref(),
+                    version_set.as_ref(),
+                    &pending_intents,
+                )
+                .await
+                {
+                    Ok(capture) => {
+                        let _ = reply.send(Ok(capture));
+                    }
+                    Err(e) => {
+                        error_flag.store(true, AtomicOrdering::SeqCst);
+                        let msg = format!("Manifest writer checkpoint failed: {e}");
+                        let _ = reply.send(Err(TiSqlError::Internal(msg.clone())));
+                        log_error!("{msg}");
+                        return;
+                    }
                 }
             }
         }
@@ -1223,7 +1325,11 @@ impl LsmEngine {
             ));
         }
         let manifest = self.manifest_writer_handle()?;
-        manifest.checkpoint_and_capture().await
+        let capture = ManifestCoordinator::checkpoint_and_capture(&manifest).await?;
+        Ok((
+            Arc::new(Version::from(&capture.snapshot)),
+            capture.checkpoint_lsn,
+        ))
     }
 
     /// Close this tablet's ilog writer, flushing pending records.
@@ -1578,20 +1684,34 @@ impl LsmEngine {
         // Allocate SST ID atomically to prevent races during concurrent flushes
         let sst_id = self.alloc_sst_id();
 
-        // Phase 1: Write flush intent (if durable)
-        if let Some(ref ilog) = self.ilog {
-            if let Err(e) = ilog.write_flush_intent_async(sst_id, memtable.id()).await {
-                Self::rollback_flushing_state(memtable);
-                log_warn!(
-                    "[engine-event] op=flush phase=abort tablet_ns={} memtable_id={} reason=\"{}\" elapsed_ms={}",
-                    self.tablet_cache_ns,
-                    memtable.id(),
-                    e,
-                    flush_start.elapsed().as_millis()
-                );
-                return Err(e);
+        // Phase 1: Register flush intent (if durable)
+        let prepared_flush = if self.ilog.is_some() {
+            let manifest = self.manifest_writer_handle()?;
+            match ManifestCoordinator::register_intent(
+                &manifest,
+                ManifestIntentRequest::Flush {
+                    sst_id,
+                    memtable_id: memtable.id(),
+                },
+            )
+            .await
+            {
+                Ok(op) => Some(op),
+                Err(e) => {
+                    Self::rollback_flushing_state(memtable);
+                    log_warn!(
+                        "[engine-event] op=flush phase=abort tablet_ns={} memtable_id={} reason=\"{}\" elapsed_ms={}",
+                        self.tablet_cache_ns,
+                        memtable.id(),
+                        e,
+                        flush_start.elapsed().as_millis()
+                    );
+                    return Err(e);
+                }
             }
-        }
+        } else {
+            None
+        };
 
         // Phase 2: Build SST file
         // Failpoint: crash before SST build
@@ -1667,14 +1787,17 @@ impl LsmEngine {
         #[cfg(feature = "failpoints")]
         fail_point!("lsm_flush_after_boundary_before_manifest_commit_v26");
 
-        let commit_result = if self.ilog.is_some() {
+        let commit_result = if let Some(op) = prepared_flush {
             let manifest = self.manifest_writer_handle()?;
-            manifest
-                .submit(ManifestEdit::Flush {
-                    sst_meta: meta.clone(),
+            ManifestCoordinator::commit_prepared(
+                &manifest,
+                op,
+                ManifestCommitRequest::Flush {
+                    sst: (&meta).into(),
                     flushed_lsn: safe_flushed_lsn,
-                })
-                .await
+                },
+            )
+            .await
         } else {
             let delta = ManifestDelta::flush(meta.clone(), safe_flushed_lsn);
             self.version_set.apply_delta(&delta);
@@ -2787,7 +2910,19 @@ impl LsmEngine {
 
             if self.ilog.is_some() {
                 let manifest = self.manifest_writer_handle()?;
-                if let Err(e) = manifest.submit(ManifestEdit::TrivialMove { delta }).await {
+                if let Err(e) = ManifestCoordinator::apply_trivial_move(
+                    &manifest,
+                    TrivialMoveEdit {
+                        deleted_ssts: delta.deleted_ssts.clone(),
+                        new_ssts: delta
+                            .new_ssts
+                            .iter()
+                            .map(|sst| sst.as_ref().into())
+                            .collect(),
+                    },
+                )
+                .await
+                {
                     log_warn!(
                         "[engine-event] op=compact phase=abort tablet_ns={} reason=\"{}\" elapsed_ms={}",
                         self.tablet_cache_ns,
@@ -2824,16 +2959,24 @@ impl LsmEngine {
         let pre_allocated_ids: Vec<u64> =
             (0..estimated_count).map(|_| self.alloc_sst_id()).collect();
 
-        // Phase 2: Write CompactIntent (if durable)
+        // Phase 2: Register CompactIntent (if durable)
         let input_sst_ids: Vec<u64> = task.inputs.iter().map(|(_, id)| *id).collect();
-        if let Some(ref ilog) = self.ilog {
-            ilog.write_compact_intent_async(
-                input_sst_ids,
-                pre_allocated_ids.clone(),
-                task.output_level,
+        let prepared_compaction = if self.ilog.is_some() {
+            let manifest = self.manifest_writer_handle()?;
+            Some(
+                ManifestCoordinator::register_intent(
+                    &manifest,
+                    ManifestIntentRequest::Compact {
+                        input_sst_ids,
+                        output_sst_ids: pre_allocated_ids.clone(),
+                        target_level: task.output_level,
+                    },
+                )
+                .await?,
             )
-            .await?;
-        }
+        } else {
+            None
+        };
 
         // Phase 3: Execute compaction
         let executor = CompactionExecutor::new(Arc::clone(&self.config));
@@ -2861,15 +3004,21 @@ impl LsmEngine {
             }
         };
 
-        if self.ilog.is_some() {
+        if let Some(op) = prepared_compaction {
             let manifest = self.manifest_writer_handle()?;
-            let new_ssts: Vec<SstMeta> = delta.new_ssts.iter().map(|m| (**m).clone()).collect();
-            if let Err(e) = manifest
-                .submit(ManifestEdit::Compact {
+            if let Err(e) = ManifestCoordinator::commit_prepared(
+                &manifest,
+                op,
+                ManifestCommitRequest::Compact {
                     deleted_ssts: delta.deleted_ssts.clone(),
-                    new_ssts,
-                })
-                .await
+                    new_ssts: delta
+                        .new_ssts
+                        .iter()
+                        .map(|sst| sst.as_ref().into())
+                        .collect(),
+                },
+            )
+            .await
             {
                 log_warn!(
                     "[engine-event] op=compact phase=abort tablet_ns={} reason=\"{}\" elapsed_ms={}",

@@ -23,6 +23,7 @@
 
 #![cfg(feature = "failpoints")]
 
+use std::panic;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
@@ -31,11 +32,12 @@ use tempfile::TempDir;
 use fail::fail_point;
 use tisql::new_lsn_provider;
 use tisql::tablet::WriteBatch;
-use tisql::tablet::{RoutedTabletStorage, TabletId};
+use tisql::tablet::{RoutedTabletStorage, TabletId, TabletTxnStorage};
 use tisql::testkit::{
-    ClogBatch, ConcurrencyManager, FileClogConfig, FileClogService, IlogConfig, IlogService,
-    IlogTruncateStats, LocalTso, LsmConfigBuilder, LsmEngine, LsmRecovery, RecoveryResult,
-    TabletManager, TransactionService, TruncateStats, Version,
+    ClogBatch, ClogEntry, ClogOp, ConcurrencyManager, FileClogConfig, FileClogService, IlogConfig,
+    IlogService, IlogTruncateStats, LocalTso, LsmConfigBuilder, LsmEngine, LsmRecovery,
+    ManifestCheckpoint, ManifestLog, ManifestSnapshot, RecoveryResult, TabletManager,
+    TransactionService, TruncateStats, Version,
 };
 use tisql::{
     ClogService, Database, DatabaseConfig, PessimisticStorage, QueryResult, StorageEngine,
@@ -142,13 +144,14 @@ async fn create_test_txn_service_with_unified_logs(
     Arc<LsmEngine>,
     Arc<IlogService>,
     Arc<FileClogService>,
-    Arc<TransactionService<LsmEngine, FileClogService, LocalTso>>,
+    Arc<TransactionService<TabletTxnStorage<LsmEngine>, FileClogService, LocalTso>>,
 ) {
     let (engine, ilog, clog) = create_test_lsm_engine_with_unified_logs(dir).await;
     let tso = Arc::new(LocalTso::new(1));
     let cm = Arc::new(ConcurrencyManager::new(0));
+    let txn_storage = Arc::new(TabletTxnStorage::new(Arc::clone(&engine), Arc::clone(&cm)));
     let txn_service = Arc::new(TransactionService::new(
-        Arc::clone(&engine),
+        txn_storage,
         Arc::clone(&clog),
         tso,
         cm,
@@ -160,7 +163,7 @@ async fn create_multi_tablet_routed_txn_service(
     dir: &TempDir,
 ) -> (
     Arc<TabletManager>,
-    Arc<TransactionService<RoutedTabletStorage, FileClogService, LocalTso>>,
+    Arc<TransactionService<TabletTxnStorage<RoutedTabletStorage>, FileClogService, LocalTso>>,
     u64,
     u64,
 ) {
@@ -224,7 +227,8 @@ async fn create_multi_tablet_routed_txn_service(
     );
     let tso = Arc::new(LocalTso::new(1));
     let cm = Arc::new(ConcurrencyManager::new(0));
-    let txn_service = Arc::new(TransactionService::new(routed, clog, tso, cm));
+    let txn_storage = Arc::new(TabletTxnStorage::new(routed, Arc::clone(&cm)));
+    let txn_service = Arc::new(TransactionService::new(txn_storage, clog, tso, cm));
     (manager, txn_service, table1, table2)
 }
 
@@ -718,8 +722,6 @@ async fn test_crash_before_freeze() {
 /// the failpoint was triggered.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn test_crash_after_freeze_before_insert() {
-    use std::panic;
-
     let scenario = fail::FailScenario::setup();
     let dir = tempfile::tempdir().unwrap();
 
@@ -769,8 +771,6 @@ async fn test_crash_after_freeze_before_insert() {
 /// action to verify the failpoint fires during flush_memtable().
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn test_crash_before_sst_build() {
-    use std::panic;
-
     let scenario = fail::FailScenario::setup();
     let dir = tempfile::tempdir().unwrap();
 
@@ -813,8 +813,6 @@ async fn run_flush_crash_after_sst_before_manifest_test(
     failpoint_name: &str,
     mode: Option<V26BoundaryMode>,
 ) {
-    use std::panic;
-
     let scenario = fail::FailScenario::setup();
     let dir = tempfile::tempdir().unwrap();
 
@@ -1088,8 +1086,6 @@ async fn test_crash_after_flush_intent() {
 /// Test crash during checkpoint write.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn test_crash_during_checkpoint() {
-    use std::panic;
-
     let scenario = fail::FailScenario::setup();
     let dir = tempfile::tempdir().unwrap();
 
@@ -1105,17 +1101,24 @@ async fn test_crash_during_checkpoint() {
         )
         .unwrap();
 
-        let version = Version::new();
+        let checkpoint = ManifestCheckpoint {
+            snapshot: ManifestSnapshot::from(&Version::new()),
+            pending_intents: Vec::new(),
+        };
 
         // Configure failpoint to panic (simulating crash)
         fail::cfg("ilog_checkpoint_mid_write", "panic").unwrap();
 
         // Write checkpoint - should panic
-        let result =
-            panic::catch_unwind(panic::AssertUnwindSafe(|| ilog.write_checkpoint(&version)));
+        let join = tokio::spawn(async move {
+            ManifestLog::write_checkpoint(&ilog, &checkpoint)
+                .await
+                .unwrap();
+        })
+        .await;
 
         // Verify the failpoint triggered
-        assert!(result.is_err(), "Should have panicked at failpoint");
+        assert!(join.is_err(), "Should have panicked at failpoint");
 
         // Remove failpoint
         fail::cfg("ilog_checkpoint_mid_write", "off").unwrap();
@@ -1641,6 +1644,12 @@ async fn test_log_gc_once_reclaims_and_recovers() {
         expected.push((key, value));
     }
 
+    let baseline_safe_lsn = engine.compute_log_gc_boundary_with_caps(3).safe_lsn;
+    assert_eq!(
+        baseline_safe_lsn, 3,
+        "setup must make clog entries truncatable"
+    );
+
     let clog_size_before = clog.file_size().unwrap();
     let ilog_size_before = ilog.file_size().unwrap();
 
@@ -1661,6 +1670,90 @@ async fn test_log_gc_once_reclaims_and_recovers() {
         let got = recovered.engine.get(&key).await.unwrap();
         assert_eq!(got, Some(value), "key {:?} should survive log GC", key);
     }
+
+    scenario.teardown();
+}
+
+/// Checkpoint capture failure must abort GC before any truncation proceeds.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn test_phase5_log_gc_aborts_truncation_when_checkpoint_capture_fails() {
+    let scenario = fail::FailScenario::setup();
+    let dir = tempfile::tempdir().unwrap();
+
+    let lsn_provider = new_lsn_provider();
+    let ilog = Arc::new(
+        IlogService::open(
+            IlogConfig::new(dir.path()),
+            Arc::clone(&lsn_provider),
+            make_test_io(),
+            &tokio::runtime::Handle::current(),
+        )
+        .unwrap(),
+    );
+    let clog = Arc::new(
+        FileClogService::open_with_lsn_provider(
+            FileClogConfig::with_dir(dir.path()),
+            Arc::clone(&lsn_provider),
+            make_test_io(),
+            &tokio::runtime::Handle::current(),
+        )
+        .unwrap(),
+    );
+    let engine = Arc::new(
+        LsmEngine::open_with_recovery(
+            LsmConfigBuilder::new(dir.path())
+                .memtable_size(256)
+                .max_frozen_memtables(16)
+                .build_unchecked(),
+            Arc::clone(&lsn_provider),
+            Arc::clone(&ilog),
+            Version::builder().flushed_lsn(3).version_num(1).build(),
+            make_test_io(),
+        )
+        .unwrap(),
+    );
+
+    for i in 0..3 {
+        let mut batch = ClogBatch::new();
+        batch.add(ClogEntry {
+            lsn: 0,
+            txn_id: i + 1,
+            op: ClogOp::Put {
+                key: format!("log_gc_gate_key_{i}").into_bytes(),
+                value: format!("log_gc_gate_value_{i}").into_bytes(),
+            },
+        });
+        let lsn = clog.write(&mut batch, true).unwrap().await.unwrap();
+        assert_eq!(lsn, i + 1);
+    }
+
+    let clog_size_before = clog.file_size().unwrap();
+    let ilog_size_before = ilog.file_size().unwrap();
+
+    let fail_guard = fail::FailGuard::new("ilog_checkpoint_write_error", "return").unwrap();
+    let err = run_log_gc_cycle(&engine, &ilog, &clog).await.unwrap_err();
+    drop(fail_guard);
+
+    assert!(
+        err.to_string()
+            .contains("injected ilog checkpoint write error"),
+        "unexpected error: {err}"
+    );
+    assert_eq!(
+        clog.file_size().unwrap(),
+        clog_size_before,
+        "clog must not be truncated when checkpoint capture fails"
+    );
+    assert_eq!(
+        clog.oldest_lsn().unwrap(),
+        1,
+        "checkpoint failure must leave clog head untouched"
+    );
+    assert_eq!(
+        ilog.file_size().unwrap(),
+        ilog_size_before,
+        "ilog must not be truncated when checkpoint capture fails"
+    );
 
     scenario.teardown();
 }

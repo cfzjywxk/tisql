@@ -40,7 +40,7 @@
 //! Reuses the clog engine implementation but stores files in `data/ilog/`.
 //! Each record has: type (4 bytes) + length (4 bytes) + checksum (4 bytes) + data.
 
-use std::collections::HashSet;
+use std::collections::{BTreeMap, HashSet};
 use std::fs::{self, File, OpenOptions};
 use std::io::{BufReader, BufWriter, Read, Write};
 use std::path::PathBuf;
@@ -52,6 +52,11 @@ use fail::fail_point;
 use serde::{Deserialize, Serialize};
 
 use crate::catalog::types::Lsn;
+use crate::kernel::manifest::{
+    ManifestCheckpoint, ManifestCommitRequest, ManifestIntentRequest, ManifestLog,
+    ManifestSnapshot, RecordedManifestCommit, RecordedManifestIntent, RecoveredManifest,
+    TrivialMoveEdit,
+};
 use crate::lsn::SharedLsnProvider;
 use crate::util::error::{Result, TiSqlError};
 use crate::util::fs::{create_dir_durable, rename_durable, sync_dir};
@@ -78,68 +83,18 @@ const MAX_RECORD_SIZE: usize = 256 * 1024 * 1024;
 /// Index log record types.
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
 pub enum IlogRecord {
-    /// Intent to flush a memtable to SST.
-    ///
-    /// Written before starting the flush operation.
-    /// Contains expected SST metadata.
-    FlushIntent {
-        /// LSN of this record
+    Intent(RecordedManifestIntent),
+    Commit {
         lsn: Lsn,
-        /// Expected SST ID
-        sst_id: u64,
-        /// Memtable ID being flushed
-        memtable_id: u64,
+        commit: RecordedManifestCommit,
     },
-
-    /// Commit of a successful flush.
-    ///
-    /// Written after SST file is created and fsync'd.
-    FlushCommit {
-        /// LSN of this record
+    TrivialMove {
         lsn: Lsn,
-        /// The created SST metadata
-        sst_meta: SstMeta,
-        /// Flushed LSN (up to which clog data is now in SST)
-        flushed_lsn: Lsn,
+        edit: TrivialMoveEdit,
     },
-
-    /// Intent to start compaction.
-    ///
-    /// Written before starting compaction.
-    /// Lists input SSTs and expected output SST IDs.
-    CompactIntent {
-        /// LSN of this record
-        lsn: Lsn,
-        /// Input SST IDs (will be deleted after commit)
-        input_sst_ids: Vec<u64>,
-        /// Expected output SST IDs (will be created)
-        output_sst_ids: Vec<u64>,
-        /// Target level for output
-        target_level: u32,
-    },
-
-    /// Commit of a successful compaction.
-    ///
-    /// Written after all output SSTs are created and fsync'd.
-    CompactCommit {
-        /// LSN of this record
-        lsn: Lsn,
-        /// Input SSTs that were removed
-        deleted_ssts: Vec<(u32, u64)>, // (level, sst_id)
-        /// Output SSTs that were created
-        new_ssts: Vec<SstMeta>,
-    },
-
-    /// Full Version checkpoint.
-    ///
-    /// Periodically written to enable faster recovery.
-    /// Contains complete SST metadata for all levels.
     Checkpoint {
-        /// LSN of this record
         lsn: Lsn,
-        /// Full Version state
-        version: VersionSnapshot,
-        /// Checkpoint sequence number (for log truncation)
+        checkpoint: ManifestCheckpoint,
         checkpoint_seq: u64,
     },
 }
@@ -148,47 +103,15 @@ impl IlogRecord {
     /// Get the LSN of this record.
     pub fn lsn(&self) -> Lsn {
         match self {
-            IlogRecord::FlushIntent { lsn, .. } => *lsn,
-            IlogRecord::FlushCommit { lsn, .. } => *lsn,
-            IlogRecord::CompactIntent { lsn, .. } => *lsn,
-            IlogRecord::CompactCommit { lsn, .. } => *lsn,
+            IlogRecord::Intent(intent) => intent.op_id(),
+            IlogRecord::Commit { lsn, .. } => *lsn,
+            IlogRecord::TrivialMove { lsn, .. } => *lsn,
             IlogRecord::Checkpoint { lsn, .. } => *lsn,
         }
     }
 }
 
-/// Serializable Version snapshot for checkpoints.
-#[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
-pub struct VersionSnapshot {
-    /// SST files at each level (level 0 to MAX_LEVELS-1)
-    pub levels: Vec<Vec<SstMeta>>,
-    /// Next SST ID to allocate
-    pub next_sst_id: u64,
-    /// Version number
-    pub version_num: u64,
-    /// Highest LSN that has been flushed to SST
-    pub flushed_lsn: Lsn,
-}
-
-impl From<&Version> for VersionSnapshot {
-    fn from(v: &Version) -> Self {
-        let mut levels = Vec::new();
-        for level in 0..super::version::MAX_LEVELS {
-            let ssts: Vec<SstMeta> = v
-                .ssts_at_level(level as u32)
-                .iter()
-                .map(|m| (**m).clone())
-                .collect();
-            levels.push(ssts);
-        }
-        Self {
-            levels,
-            next_sst_id: v.next_sst_id(),
-            version_num: v.version_num(),
-            flushed_lsn: v.flushed_lsn(),
-        }
-    }
-}
+pub type VersionSnapshot = ManifestSnapshot;
 
 /// Configuration for ilog service.
 #[derive(Clone, Debug)]
@@ -224,10 +147,7 @@ impl IlogConfig {
 /// Pending operation tracker for intent/commit matching.
 #[derive(Default)]
 struct PendingOps {
-    /// Pending flush intents: sst_id
-    flush_intents: HashSet<u64>,
-    /// Pending compact intents: output_sst_ids
-    compact_intents: Vec<Vec<u64>>,
+    intents: BTreeMap<Lsn, RecordedManifestIntent>,
 }
 
 /// Index log service for SST metadata persistence.
@@ -384,13 +304,13 @@ impl IlogService {
         );
 
         // Rebuild Version from records
-        let (version, orphan_ssts, max_lsn, last_checkpoint_seq) = Self::replay_records(&records)?;
+        let recovered = Self::replay_records(&records)?;
 
         // Update LSN provider
-        if max_lsn > 0 {
+        if recovered.max_lsn > 0 {
             let current = lsn_provider.current_lsn();
-            if max_lsn >= current {
-                lsn_provider.set_lsn(max_lsn + 1);
+            if recovered.max_lsn >= current {
+                lsn_provider.set_lsn(recovered.max_lsn + 1);
             }
         }
 
@@ -398,27 +318,138 @@ impl IlogService {
         let service = Self::open(config, Arc::clone(&lsn_provider), io, io_handle)?;
         service
             .last_checkpoint_seq
-            .store(last_checkpoint_seq, Ordering::SeqCst);
+            .store(recovered.last_checkpoint_seq, Ordering::SeqCst);
 
-        Ok((service, version, orphan_ssts))
+        Ok((
+            service,
+            Version::from(&recovered.snapshot),
+            recovered.orphan_sst_ids.into_iter().collect(),
+        ))
+    }
+
+    async fn append_intent_record(
+        &self,
+        req: &ManifestIntentRequest,
+    ) -> Result<RecordedManifestIntent> {
+        let op_id = self.lsn_provider.alloc_lsn();
+        let record = RecordedManifestIntent::from_request(op_id, req);
+        self.write_record_async(&IlogRecord::Intent(record.clone()))
+            .await?;
+        Ok(record)
+    }
+
+    async fn append_commit_record(&self, commit: &RecordedManifestCommit) -> Result<Lsn> {
+        let lsn = self.lsn_provider.alloc_lsn();
+        self.write_record_async(&IlogRecord::Commit {
+            lsn,
+            commit: commit.clone(),
+        })
+        .await?;
+        Ok(lsn)
+    }
+
+    async fn append_trivial_move_record(&self, edit: &TrivialMoveEdit) -> Result<Lsn> {
+        let lsn = self.lsn_provider.alloc_lsn();
+        self.write_record_async(&IlogRecord::TrivialMove {
+            lsn,
+            edit: edit.clone(),
+        })
+        .await?;
+        Ok(lsn)
+    }
+
+    async fn write_manifest_checkpoint_async(
+        &self,
+        checkpoint: &ManifestCheckpoint,
+    ) -> Result<Lsn> {
+        #[cfg(feature = "failpoints")]
+        fail_point!("ilog_checkpoint_write_error", |_| {
+            Err(TiSqlError::Storage(
+                "injected ilog checkpoint write error".into(),
+            ))
+        });
+
+        let lsn = self.lsn_provider.alloc_lsn();
+        let checkpoint_seq = self.last_checkpoint_seq.fetch_add(1, Ordering::SeqCst) + 1;
+        let record = IlogRecord::Checkpoint {
+            lsn,
+            checkpoint: checkpoint.clone(),
+            checkpoint_seq,
+        };
+
+        #[cfg(feature = "failpoints")]
+        fail_point!("ilog_checkpoint_mid_write");
+
+        self.write_record_async(&record).await?;
+        self.records_since_checkpoint.store(0, Ordering::SeqCst);
+        log_info!("Wrote Checkpoint: lsn={}, seq={}", lsn, checkpoint_seq);
+        Ok(lsn)
+    }
+
+    fn recover_manifest(&self) -> Result<RecoveredManifest> {
+        let records = self.read_all_records()?;
+        Self::replay_records(&records)
+    }
+
+    #[deprecated(
+        note = "Legacy helper replays the entire ilog from disk. Use ManifestCoordinator exact op_id tracking instead."
+    )]
+    fn find_pending_flush_op_id(&self, sst_id: u64) -> Result<Lsn> {
+        self.recover_manifest()?
+            .pending_intents
+            .into_iter()
+            .find_map(|intent| match intent {
+                RecordedManifestIntent::Flush {
+                    op_id,
+                    sst_id: pending_sst_id,
+                    ..
+                } if pending_sst_id == sst_id => Some(op_id),
+                _ => None,
+            })
+            .ok_or_else(|| {
+                TiSqlError::Internal(format!("No pending flush intent found for SST {}", sst_id))
+            })
+    }
+
+    #[deprecated(
+        note = "Legacy helper replays the entire ilog from disk. Use ManifestCoordinator exact op_id tracking instead."
+    )]
+    fn find_pending_compact_op_id(&self, output_sst_ids: &[u64]) -> Result<Lsn> {
+        self.recover_manifest()?
+            .pending_intents
+            .into_iter()
+            .find_map(|intent| match intent {
+                RecordedManifestIntent::Compact {
+                    op_id,
+                    output_sst_ids: pending_output_sst_ids,
+                    ..
+                } if pending_output_sst_ids == output_sst_ids => Some(op_id),
+                _ => None,
+            })
+            .ok_or_else(|| {
+                TiSqlError::Internal(format!(
+                    "No pending compaction intent found for output SSTs {:?}",
+                    output_sst_ids
+                ))
+            })
     }
 
     /// Write a flush intent record asynchronously.
     pub async fn write_flush_intent_async(&self, sst_id: u64, memtable_id: u64) -> Result<Lsn> {
-        let lsn = self.lsn_provider.alloc_lsn();
-        let record = IlogRecord::FlushIntent {
-            lsn,
-            sst_id,
-            memtable_id,
-        };
-        self.write_record_async(&record).await?;
+        let intent = self
+            .append_intent_record(&ManifestIntentRequest::Flush {
+                sst_id,
+                memtable_id,
+            })
+            .await?;
 
         // Failpoint: crash after flush intent write
         #[cfg(feature = "failpoints")]
         fail_point!("ilog_after_flush_intent");
 
-        log_trace!("Wrote FlushIntent: lsn={}, sst_id={}", lsn, sst_id);
-        Ok(lsn)
+        let op_id = intent.op_id();
+        log_trace!("Wrote FlushIntent: lsn={}, sst_id={}", op_id, sst_id);
+        Ok(op_id)
     }
 
     /// Write a flush intent record.
@@ -429,18 +460,23 @@ impl IlogService {
     }
 
     /// Write a flush commit record asynchronously.
+    #[deprecated(
+        note = "Legacy commit wrapper replays the ilog to rediscover op_id. Use ManifestCoordinator::commit_prepared instead."
+    )]
     pub async fn write_flush_commit_async(
         &self,
         sst_meta: SstMeta,
         flushed_lsn: Lsn,
     ) -> Result<Lsn> {
-        let lsn = self.lsn_provider.alloc_lsn();
-        let record = IlogRecord::FlushCommit {
-            lsn,
-            sst_meta,
-            flushed_lsn,
-        };
-        self.write_record_async(&record).await?;
+        let op_id = self.find_pending_flush_op_id(sst_meta.id)?;
+        let commit = RecordedManifestCommit::from_request(
+            op_id,
+            ManifestCommitRequest::Flush {
+                sst: (&sst_meta).into(),
+                flushed_lsn,
+            },
+        );
+        let lsn = self.append_commit_record(&commit).await?;
         log_trace!(
             "Wrote FlushCommit: lsn={}, flushed_lsn={}",
             lsn,
@@ -452,6 +488,9 @@ impl IlogService {
     /// Write a flush commit record.
     ///
     /// Transitional sync wrapper used by existing sync call sites.
+    #[deprecated(
+        note = "Legacy commit wrapper replays the ilog to rediscover op_id. Use ManifestCoordinator::commit_prepared instead."
+    )]
     pub fn write_flush_commit(&self, sst_meta: SstMeta, flushed_lsn: Lsn) -> Result<Lsn> {
         crate::io::block_on_sync(self.write_flush_commit_async(sst_meta, flushed_lsn))
     }
@@ -463,16 +502,16 @@ impl IlogService {
         output_sst_ids: Vec<u64>,
         target_level: u32,
     ) -> Result<Lsn> {
-        let lsn = self.lsn_provider.alloc_lsn();
-        let record = IlogRecord::CompactIntent {
-            lsn,
-            input_sst_ids,
-            output_sst_ids,
-            target_level,
-        };
-        self.write_record_async(&record).await?;
-        log_trace!("Wrote CompactIntent: lsn={}", lsn);
-        Ok(lsn)
+        let intent = self
+            .append_intent_record(&ManifestIntentRequest::Compact {
+                input_sst_ids,
+                output_sst_ids,
+                target_level,
+            })
+            .await?;
+        let op_id = intent.op_id();
+        log_trace!("Wrote CompactIntent: lsn={}", op_id);
+        Ok(op_id)
     }
 
     /// Write a compact intent record.
@@ -492,18 +531,24 @@ impl IlogService {
     }
 
     /// Write a compact commit record asynchronously.
+    #[deprecated(
+        note = "Legacy commit wrapper replays the ilog to rediscover op_id. Use ManifestCoordinator::commit_prepared instead."
+    )]
     pub async fn write_compact_commit_async(
         &self,
         deleted_ssts: Vec<(u32, u64)>,
         new_ssts: Vec<SstMeta>,
     ) -> Result<Lsn> {
-        let lsn = self.lsn_provider.alloc_lsn();
-        let record = IlogRecord::CompactCommit {
-            lsn,
-            deleted_ssts,
-            new_ssts,
-        };
-        self.write_record_async(&record).await?;
+        let output_sst_ids: Vec<u64> = new_ssts.iter().map(|sst| sst.id).collect();
+        let op_id = self.find_pending_compact_op_id(&output_sst_ids)?;
+        let commit = RecordedManifestCommit::from_request(
+            op_id,
+            ManifestCommitRequest::Compact {
+                deleted_ssts,
+                new_ssts: new_ssts.iter().map(|sst| sst.into()).collect(),
+            },
+        );
+        let lsn = self.append_commit_record(&commit).await?;
         log_trace!("Wrote CompactCommit: lsn={}", lsn);
         Ok(lsn)
     }
@@ -511,6 +556,9 @@ impl IlogService {
     /// Write a compact commit record.
     ///
     /// Transitional sync wrapper used by existing sync call sites.
+    #[deprecated(
+        note = "Legacy commit wrapper replays the ilog to rediscover op_id. Use ManifestCoordinator::commit_prepared instead."
+    )]
     pub fn write_compact_commit(
         &self,
         deleted_ssts: Vec<(u32, u64)>,
@@ -520,36 +568,23 @@ impl IlogService {
     }
 
     /// Write a checkpoint record asynchronously.
-    pub async fn write_checkpoint_async(&self, version: &Version) -> Result<Lsn> {
-        let lsn = self.lsn_provider.alloc_lsn();
-        let checkpoint_seq = self.last_checkpoint_seq.fetch_add(1, Ordering::SeqCst) + 1;
-        let record = IlogRecord::Checkpoint {
-            lsn,
-            version: VersionSnapshot::from(version),
-            checkpoint_seq,
-        };
-
-        // Failpoint: crash mid checkpoint write (before actual write)
-        #[cfg(feature = "failpoints")]
-        fail_point!("ilog_checkpoint_mid_write");
-
-        self.write_record_async(&record).await?;
-        self.records_since_checkpoint.store(0, Ordering::SeqCst);
-        log_info!("Wrote Checkpoint: lsn={}, seq={}", lsn, checkpoint_seq);
-        Ok(lsn)
+    #[deprecated(
+        note = "Legacy checkpoint API cannot capture pending intents. Use ManifestLog::write_checkpoint with a ManifestCheckpoint built from coordinator state."
+    )]
+    pub async fn write_checkpoint_async(&self, _version: &Version) -> Result<Lsn> {
+        Err(TiSqlError::Internal(
+            "Legacy write_checkpoint_async no longer captures pending intents; use ManifestLog::write_checkpoint with a ManifestCheckpoint".into(),
+        ))
     }
 
     /// Write a checkpoint record.
     ///
     /// Transitional sync wrapper used by existing sync call sites.
+    #[deprecated(
+        note = "Legacy checkpoint API cannot capture pending intents. Use ManifestLog::write_checkpoint with a ManifestCheckpoint built from coordinator state."
+    )]
     pub fn write_checkpoint(&self, version: &Version) -> Result<Lsn> {
         crate::io::block_on_sync(self.write_checkpoint_async(version))
-    }
-
-    /// Check if a checkpoint is needed based on record count.
-    pub fn needs_checkpoint(&self) -> bool {
-        self.records_since_checkpoint.load(Ordering::SeqCst) as usize
-            >= self.config.checkpoint_interval
     }
 
     /// Sync the log to disk asynchronously.
@@ -848,21 +883,31 @@ impl IlogService {
             ilog_path
         );
 
-        let (version, orphan_ssts, max_lsn, last_checkpoint_seq) = Self::replay_records(&records)?;
+        let recovered = Self::replay_records(&records)?;
 
-        if max_lsn > 0 {
+        if recovered.max_lsn > 0 {
             let current = lsn_provider.current_lsn();
-            if max_lsn >= current {
-                lsn_provider.set_lsn(max_lsn + 1);
+            if recovered.max_lsn >= current {
+                lsn_provider.set_lsn(recovered.max_lsn + 1);
             }
         }
 
         let service = Self::open_with_thread(config, Arc::clone(&lsn_provider))?;
         service
             .last_checkpoint_seq
-            .store(last_checkpoint_seq, Ordering::SeqCst);
+            .store(recovered.last_checkpoint_seq, Ordering::SeqCst);
 
-        Ok((service, version, orphan_ssts))
+        Ok((
+            service,
+            Version::from(&recovered.snapshot),
+            recovered.orphan_sst_ids.into_iter().collect(),
+        ))
+    }
+
+    /// Check if a checkpoint is needed based on record count.
+    pub fn needs_checkpoint(&self) -> bool {
+        self.records_since_checkpoint.load(Ordering::SeqCst) as usize
+            >= self.config.checkpoint_interval
     }
 
     // ========== Private methods ==========
@@ -1027,13 +1072,10 @@ impl IlogService {
         Ok(Some((record, record_size)))
     }
 
-    /// Replay records to rebuild Version.
-    ///
-    /// Returns (version, orphan_sst_ids, max_lsn, last_checkpoint_seq)
-    fn replay_records(records: &[IlogRecord]) -> Result<(Version, HashSet<u64>, Lsn, u64)> {
-        let mut version = Version::new();
+    /// Replay records to rebuild manifest state.
+    fn replay_records(records: &[IlogRecord]) -> Result<RecoveredManifest> {
+        let mut snapshot = ManifestSnapshot::from(&Version::new());
         let mut pending = PendingOps::default();
-        let mut orphan_ssts = HashSet::new();
         let mut max_lsn: Lsn = 0;
         let mut last_checkpoint_seq: u64 = 0;
 
@@ -1048,87 +1090,92 @@ impl IlogService {
 
             match record {
                 IlogRecord::Checkpoint {
-                    version: snapshot,
+                    checkpoint,
                     checkpoint_seq,
                     ..
                 } => {
-                    // Reset version to checkpoint state
-                    version = Self::version_from_snapshot(snapshot);
-                    pending = PendingOps::default();
+                    snapshot = checkpoint.snapshot.clone();
+                    pending.intents = checkpoint
+                        .pending_intents
+                        .iter()
+                        .cloned()
+                        .map(|intent| (intent.op_id(), intent))
+                        .collect();
                     last_checkpoint_seq = *checkpoint_seq;
                 }
 
-                IlogRecord::FlushIntent { sst_id, .. } => {
-                    pending.flush_intents.insert(*sst_id);
+                IlogRecord::Intent(intent) => {
+                    pending.intents.insert(intent.op_id(), intent.clone());
                 }
 
-                IlogRecord::FlushCommit {
-                    sst_meta,
-                    flushed_lsn,
-                    ..
-                } => {
-                    // Apply to version
-                    let delta =
-                        super::version::ManifestDelta::flush(sst_meta.clone(), *flushed_lsn);
-                    version = version.apply(&delta);
-                    pending.flush_intents.remove(&sst_meta.id);
+                IlogRecord::Commit { commit, .. } => {
+                    let version = Version::from(&snapshot);
+                    let delta = super::version::ManifestDelta::from_commit(commit);
+                    snapshot = ManifestSnapshot::from(&version.apply(&delta));
+                    pending.intents.remove(&commit.op_id());
                 }
 
-                IlogRecord::CompactIntent { output_sst_ids, .. } => {
-                    pending.compact_intents.push(output_sst_ids.clone());
-                }
-
-                IlogRecord::CompactCommit {
-                    deleted_ssts,
-                    new_ssts,
-                    ..
-                } => {
-                    // Apply to version
-                    let delta = super::version::ManifestDelta {
-                        new_ssts: new_ssts.iter().map(|m| Arc::new(m.clone())).collect(),
-                        deleted_ssts: deleted_ssts.clone(),
-                        flushed_lsn: None,
-                        sequence: 0,
-                    };
-                    version = version.apply(&delta);
-
-                    // Remove matched intent
-                    if !pending.compact_intents.is_empty() {
-                        pending.compact_intents.remove(0);
-                    }
+                IlogRecord::TrivialMove { edit, .. } => {
+                    let version = Version::from(&snapshot);
+                    let delta = super::version::ManifestDelta::from_trivial_move(edit);
+                    snapshot = ManifestSnapshot::from(&version.apply(&delta));
                 }
             }
         }
 
-        // Any remaining intents are orphans
-        for sst_id in pending.flush_intents {
-            orphan_ssts.insert(sst_id);
+        let pending_intents: Vec<_> = pending.intents.into_values().collect();
+        let mut orphan_sst_ids = Vec::new();
+        for intent in &pending_intents {
+            orphan_sst_ids.extend(intent.output_sst_ids());
         }
-        for output_ids in pending.compact_intents {
-            for sst_id in output_ids {
-                orphan_ssts.insert(sst_id);
-            }
-        }
+        orphan_sst_ids.sort_unstable();
+        orphan_sst_ids.dedup();
 
-        Ok((version, orphan_ssts, max_lsn, last_checkpoint_seq))
+        Ok(RecoveredManifest {
+            snapshot,
+            pending_intents,
+            orphan_sst_ids,
+            max_lsn,
+            last_checkpoint_seq,
+        })
+    }
+}
+
+impl ManifestLog for IlogService {
+    fn append_intent<'a>(
+        &'a self,
+        req: &'a ManifestIntentRequest,
+    ) -> impl std::future::Future<Output = Result<RecordedManifestIntent>> + Send + 'a {
+        async move { self.append_intent_record(req).await }
     }
 
-    fn version_from_snapshot(snapshot: &VersionSnapshot) -> Version {
-        use super::version::VersionBuilder;
+    fn append_commit<'a>(
+        &'a self,
+        commit: &'a RecordedManifestCommit,
+    ) -> impl std::future::Future<Output = Result<Lsn>> + Send + 'a {
+        async move { self.append_commit_record(commit).await }
+    }
 
-        let mut builder = VersionBuilder::new();
-        builder = builder
-            .next_sst_id(snapshot.next_sst_id)
-            .version_num(snapshot.version_num)
-            .flushed_lsn(snapshot.flushed_lsn);
+    fn append_trivial_move<'a>(
+        &'a self,
+        edit: &'a TrivialMoveEdit,
+    ) -> impl std::future::Future<Output = Result<Lsn>> + Send + 'a {
+        async move { self.append_trivial_move_record(edit).await }
+    }
 
-        for (level, ssts) in snapshot.levels.iter().enumerate() {
-            for sst in ssts {
-                builder = builder.add_sst_at_level(level as u32, Arc::new(sst.clone()));
-            }
-        }
+    fn write_checkpoint<'a>(
+        &'a self,
+        checkpoint: &'a ManifestCheckpoint,
+    ) -> impl std::future::Future<Output = Result<Lsn>> + Send + 'a {
+        async move { self.write_manifest_checkpoint_async(checkpoint).await }
+    }
 
-        builder.build()
+    fn needs_checkpoint(&self) -> bool {
+        IlogService::needs_checkpoint(self)
+    }
+
+    fn recover(&self) -> Result<RecoveredManifest> {
+        self.recover_manifest()
     }
 }
 
@@ -1151,6 +1198,10 @@ fn crc32(data: &[u8]) -> u32 {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::kernel::manifest::{
+        ManifestCheckpoint, ManifestCommitRequest, ManifestIntentRequest, ManifestLog,
+        ManifestSnapshot, RecordedManifestCommit, RecordedManifestIntent,
+    };
     use crate::lsn::new_lsn_provider;
     use std::path::Path;
     use tempfile::TempDir;
@@ -1178,6 +1229,13 @@ mod tests {
         }
     }
 
+    fn manifest_checkpoint(version: &Version) -> ManifestCheckpoint {
+        ManifestCheckpoint {
+            snapshot: ManifestSnapshot::from(version),
+            pending_intents: Vec::new(),
+        }
+    }
+
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn test_ilog_open() {
         let tmp = TempDir::new().unwrap();
@@ -1192,6 +1250,272 @@ mod tests {
         )
         .unwrap();
         service.sync().unwrap();
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn test_phase5_checkpoint_recovers_pending_intent_from_checkpoint() {
+        let tmp = TempDir::new().unwrap();
+        let config = test_config(tmp.path());
+        std::fs::create_dir_all(&config.ilog_dir).unwrap();
+        let file = File::create(config.ilog_path()).unwrap();
+        let mut writer = BufWriter::new(file);
+        IlogService::write_header(&mut writer).unwrap();
+
+        let intent = RecordedManifestIntent::from_request(
+            1,
+            &ManifestIntentRequest::Flush {
+                sst_id: 1,
+                memtable_id: 100,
+            },
+        );
+        writer
+            .write_all(&IlogService::encode_record(&IlogRecord::Intent(intent.clone())).unwrap())
+            .unwrap();
+
+        let checkpoint = ManifestCheckpoint {
+            snapshot: ManifestSnapshot::from(&Version::new()),
+            pending_intents: vec![intent.clone()],
+        };
+        writer
+            .write_all(
+                &IlogService::encode_record(&IlogRecord::Checkpoint {
+                    lsn: 2,
+                    checkpoint: checkpoint.clone(),
+                    checkpoint_seq: 1,
+                })
+                .unwrap(),
+            )
+            .unwrap();
+        writer.flush().unwrap();
+
+        let (service, version, orphans) =
+            IlogService::recover_with_thread(config, new_lsn_provider()).unwrap();
+        let recovered = ManifestLog::recover(&service).unwrap();
+        assert_eq!(version.total_sst_count(), 0);
+        assert!(orphans.contains(&1));
+        assert_eq!(recovered.snapshot, checkpoint.snapshot);
+        assert_eq!(recovered.pending_intents, vec![intent]);
+        assert_eq!(recovered.orphan_sst_ids, vec![1]);
+        assert_eq!(recovered.max_lsn, 2);
+        assert_eq!(recovered.last_checkpoint_seq, 1);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn test_phase5_recover_matches_commit_by_exact_op_id() {
+        let tmp = TempDir::new().unwrap();
+        let config = test_config(tmp.path());
+        std::fs::create_dir_all(&config.ilog_dir).unwrap();
+        let file = File::create(config.ilog_path()).unwrap();
+        let mut writer = BufWriter::new(file);
+        IlogService::write_header(&mut writer).unwrap();
+
+        let intent1 = RecordedManifestIntent::from_request(
+            1,
+            &ManifestIntentRequest::Flush {
+                sst_id: 1,
+                memtable_id: 101,
+            },
+        );
+        let intent2 = RecordedManifestIntent::from_request(
+            2,
+            &ManifestIntentRequest::Flush {
+                sst_id: 2,
+                memtable_id: 102,
+            },
+        );
+        let commit2 = RecordedManifestCommit::Flush {
+            op_id: 2,
+            sst: (&test_sst_meta(2, 0)).into(),
+            flushed_lsn: 50,
+        };
+
+        for record in [
+            IlogRecord::Intent(intent1.clone()),
+            IlogRecord::Intent(intent2),
+            IlogRecord::Commit {
+                lsn: 3,
+                commit: commit2,
+            },
+        ] {
+            writer
+                .write_all(&IlogService::encode_record(&record).unwrap())
+                .unwrap();
+        }
+        writer.flush().unwrap();
+
+        let (service, version, orphans) =
+            IlogService::recover_with_thread(config, new_lsn_provider()).unwrap();
+        let recovered = ManifestLog::recover(&service).unwrap();
+
+        assert_eq!(version.level_size(0), 1);
+        assert!(version.has_sst(2));
+        assert!(!orphans.contains(&2));
+        assert!(orphans.contains(&1));
+        assert_eq!(recovered.pending_intents, vec![intent1]);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn test_phase5_recover_matches_interleaved_concurrent_commits_by_exact_op_id() {
+        let tmp = TempDir::new().unwrap();
+        let config = test_config(tmp.path());
+        std::fs::create_dir_all(&config.ilog_dir).unwrap();
+        let file = File::create(config.ilog_path()).unwrap();
+        let mut writer = BufWriter::new(file);
+        IlogService::write_header(&mut writer).unwrap();
+
+        let flush1 = RecordedManifestIntent::from_request(
+            1,
+            &ManifestIntentRequest::Flush {
+                sst_id: 1,
+                memtable_id: 101,
+            },
+        );
+        let compact2 = RecordedManifestIntent::from_request(
+            2,
+            &ManifestIntentRequest::Compact {
+                input_sst_ids: vec![90],
+                output_sst_ids: vec![10],
+                target_level: 1,
+            },
+        );
+        let flush3 = RecordedManifestIntent::from_request(
+            3,
+            &ManifestIntentRequest::Flush {
+                sst_id: 2,
+                memtable_id: 102,
+            },
+        );
+        let compact4 = RecordedManifestIntent::from_request(
+            4,
+            &ManifestIntentRequest::Compact {
+                input_sst_ids: vec![91],
+                output_sst_ids: vec![11],
+                target_level: 1,
+            },
+        );
+
+        let commit2 = RecordedManifestCommit::from_request(
+            2,
+            ManifestCommitRequest::Compact {
+                deleted_ssts: vec![],
+                new_ssts: vec![(&test_sst_meta(10, 1)).into()],
+            },
+        );
+        let commit1 = RecordedManifestCommit::from_request(
+            1,
+            ManifestCommitRequest::Flush {
+                sst: (&test_sst_meta(1, 0)).into(),
+                flushed_lsn: 50,
+            },
+        );
+        let commit4 = RecordedManifestCommit::from_request(
+            4,
+            ManifestCommitRequest::Compact {
+                deleted_ssts: vec![],
+                new_ssts: vec![(&test_sst_meta(11, 1)).into()],
+            },
+        );
+        let commit3 = RecordedManifestCommit::from_request(
+            3,
+            ManifestCommitRequest::Flush {
+                sst: (&test_sst_meta(2, 0)).into(),
+                flushed_lsn: 60,
+            },
+        );
+
+        for record in [
+            IlogRecord::Intent(flush1),
+            IlogRecord::Intent(compact2),
+            IlogRecord::Intent(flush3),
+            IlogRecord::Commit {
+                lsn: 5,
+                commit: commit2,
+            },
+            IlogRecord::Intent(compact4),
+            IlogRecord::Commit {
+                lsn: 6,
+                commit: commit1,
+            },
+            IlogRecord::Commit {
+                lsn: 7,
+                commit: commit4,
+            },
+            IlogRecord::Commit {
+                lsn: 8,
+                commit: commit3,
+            },
+        ] {
+            writer
+                .write_all(&IlogService::encode_record(&record).unwrap())
+                .unwrap();
+        }
+        writer.flush().unwrap();
+
+        let (service, version, orphans) =
+            IlogService::recover_with_thread(config, new_lsn_provider()).unwrap();
+        let recovered = ManifestLog::recover(&service).unwrap();
+
+        assert!(orphans.is_empty());
+        assert!(recovered.pending_intents.is_empty());
+        assert!(version.has_sst(1));
+        assert!(version.has_sst(2));
+        assert!(version.has_sst(10));
+        assert!(version.has_sst(11));
+        assert_eq!(version.total_sst_count(), 4);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn test_phase5_recovery_parity_when_commit_follows_checkpointed_intent() {
+        let tmp = TempDir::new().unwrap();
+        let config = test_config(tmp.path());
+        std::fs::create_dir_all(&config.ilog_dir).unwrap();
+        let file = File::create(config.ilog_path()).unwrap();
+        let mut writer = BufWriter::new(file);
+        IlogService::write_header(&mut writer).unwrap();
+
+        let intent = RecordedManifestIntent::from_request(
+            1,
+            &ManifestIntentRequest::Flush {
+                sst_id: 1,
+                memtable_id: 100,
+            },
+        );
+        let checkpoint = ManifestCheckpoint {
+            snapshot: ManifestSnapshot::from(&Version::new()),
+            pending_intents: vec![intent.clone()],
+        };
+        let commit = RecordedManifestCommit::Flush {
+            op_id: 1,
+            sst: (&test_sst_meta(1, 0)).into(),
+            flushed_lsn: 50,
+        };
+
+        for record in [
+            IlogRecord::Intent(intent),
+            IlogRecord::Checkpoint {
+                lsn: 2,
+                checkpoint,
+                checkpoint_seq: 1,
+            },
+            IlogRecord::Commit { lsn: 3, commit },
+        ] {
+            writer
+                .write_all(&IlogService::encode_record(&record).unwrap())
+                .unwrap();
+        }
+        writer.flush().unwrap();
+
+        let (service, version, orphans) =
+            IlogService::recover_with_thread(config, new_lsn_provider()).unwrap();
+        let recovered = ManifestLog::recover(&service).unwrap();
+
+        assert_eq!(version.level_size(0), 1);
+        assert!(version.has_sst(1));
+        assert!(orphans.is_empty());
+        assert!(recovered.pending_intents.is_empty());
+        assert_eq!(recovered.orphan_sst_ids, Vec::<u64>::new());
+        assert_eq!(recovered.max_lsn, 3);
+        assert_eq!(recovered.last_checkpoint_seq, 1);
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -1370,7 +1694,9 @@ mod tests {
         let lsn_provider3 = new_lsn_provider();
         let service2 =
             IlogService::open(config.clone(), lsn_provider3, make_test_io(), &io_handle).unwrap();
-        service2.write_checkpoint(&version).unwrap();
+        ManifestLog::write_checkpoint(&service2, &manifest_checkpoint(&version))
+            .await
+            .unwrap();
         service2.sync().unwrap();
 
         // Recover from checkpoint
@@ -1381,6 +1707,22 @@ mod tests {
         assert!(orphans.is_empty());
         assert_eq!(recovered_version.level_size(0), 10);
         assert_eq!(recovered_version.flushed_lsn(), 100);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn test_legacy_checkpoint_api_requires_manifest_checkpoint() {
+        let tmp = TempDir::new().unwrap();
+        let config = test_config(tmp.path());
+        let lsn_provider = new_lsn_provider();
+        let io_handle = tokio::runtime::Handle::current();
+
+        let service = IlogService::open(config, lsn_provider, make_test_io(), &io_handle).unwrap();
+
+        let err = service.write_checkpoint(&Version::new()).unwrap_err();
+        assert!(
+            err.to_string().contains("ManifestCheckpoint"),
+            "unexpected error: {err}"
+        );
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -1629,73 +1971,55 @@ mod tests {
     #[test]
     fn test_ilog_record_lsn_all_variants() {
         // Test IlogRecord::lsn() for all record types
-        let flush_intent = IlogRecord::FlushIntent {
-            lsn: 100,
+        let flush_intent = IlogRecord::Intent(RecordedManifestIntent::Flush {
+            op_id: 100,
             sst_id: 1,
             memtable_id: 1,
-        };
+        });
         assert_eq!(flush_intent.lsn(), 100);
 
-        let flush_commit = IlogRecord::FlushCommit {
+        let flush_commit = IlogRecord::Commit {
             lsn: 200,
-            sst_meta: test_sst_meta(1, 0),
-            flushed_lsn: 50,
+            commit: RecordedManifestCommit::Flush {
+                op_id: 100,
+                sst: (&test_sst_meta(1, 0)).into(),
+                flushed_lsn: 50,
+            },
         };
         assert_eq!(flush_commit.lsn(), 200);
 
-        let compact_intent = IlogRecord::CompactIntent {
-            lsn: 300,
+        let compact_intent = IlogRecord::Intent(RecordedManifestIntent::Compact {
+            op_id: 300,
             input_sst_ids: vec![1, 2],
             output_sst_ids: vec![3],
             target_level: 1,
-        };
+        });
         assert_eq!(compact_intent.lsn(), 300);
 
-        let compact_commit = IlogRecord::CompactCommit {
+        let compact_commit = IlogRecord::Commit {
             lsn: 400,
-            deleted_ssts: vec![(0, 1), (0, 2)],
-            new_ssts: vec![test_sst_meta(3, 1)],
+            commit: RecordedManifestCommit::Compact {
+                op_id: 300,
+                deleted_ssts: vec![(0, 1), (0, 2)],
+                new_ssts: vec![(&test_sst_meta(3, 1)).into()],
+            },
         };
         assert_eq!(compact_commit.lsn(), 400);
 
         let checkpoint = IlogRecord::Checkpoint {
             lsn: 500,
-            version: VersionSnapshot {
-                levels: vec![],
-                next_sst_id: 1,
-                version_num: 1,
-                flushed_lsn: 50,
+            checkpoint: ManifestCheckpoint {
+                snapshot: VersionSnapshot {
+                    levels: vec![],
+                    next_sst_id: 1,
+                    version_num: 1,
+                    flushed_lsn: 50,
+                },
+                pending_intents: Vec::new(),
             },
             checkpoint_seq: 1,
         };
         assert_eq!(checkpoint.lsn(), 500);
-    }
-
-    #[test]
-    fn test_version_snapshot_from_version() {
-        use super::super::version::VersionBuilder;
-
-        // Create a version with some SSTs
-        let meta1 = Arc::new(test_sst_meta(1, 0));
-        let meta2 = Arc::new(test_sst_meta(2, 0));
-        let meta3 = Arc::new(test_sst_meta(3, 1));
-
-        let version = VersionBuilder::new()
-            .add_sst_at_level(0, meta1)
-            .add_sst_at_level(0, meta2)
-            .add_sst_at_level(1, meta3)
-            .next_sst_id(4)
-            .version_num(5)
-            .flushed_lsn(100)
-            .build();
-
-        let snapshot = VersionSnapshot::from(&version);
-
-        assert_eq!(snapshot.next_sst_id, 4);
-        assert_eq!(snapshot.version_num, 5);
-        assert_eq!(snapshot.flushed_lsn, 100);
-        assert_eq!(snapshot.levels[0].len(), 2);
-        assert_eq!(snapshot.levels[1].len(), 1);
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -1869,7 +2193,9 @@ mod tests {
         let lsn_provider3 = new_lsn_provider();
         let service2 =
             IlogService::open(config.clone(), lsn_provider3, make_test_io(), &io_handle).unwrap();
-        service2.write_checkpoint(&version1).unwrap();
+        ManifestLog::write_checkpoint(&service2, &manifest_checkpoint(&version1))
+            .await
+            .unwrap();
         drop(service2);
 
         // Second batch of flushes
@@ -1890,7 +2216,9 @@ mod tests {
         let lsn_provider6 = new_lsn_provider();
         let service4 =
             IlogService::open(config.clone(), lsn_provider6, make_test_io(), &io_handle).unwrap();
-        service4.write_checkpoint(&version2).unwrap();
+        ManifestLog::write_checkpoint(&service4, &manifest_checkpoint(&version2))
+            .await
+            .unwrap();
         drop(service4);
 
         // Final recovery should have all 6 SSTs
@@ -2060,14 +2388,14 @@ mod tests {
     #[test]
     fn test_ilog_version_snapshot_equality() {
         let snapshot1 = VersionSnapshot {
-            levels: vec![vec![test_sst_meta(1, 0)]],
+            levels: vec![vec![(&test_sst_meta(1, 0)).into()]],
             next_sst_id: 2,
             version_num: 1,
             flushed_lsn: 100,
         };
 
         let snapshot2 = VersionSnapshot {
-            levels: vec![vec![test_sst_meta(1, 0)]],
+            levels: vec![vec![(&test_sst_meta(1, 0)).into()]],
             next_sst_id: 2,
             version_num: 1,
             flushed_lsn: 100,
