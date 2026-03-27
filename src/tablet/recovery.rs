@@ -48,13 +48,13 @@ use std::sync::Arc;
 
 use crate::catalog::types::{Lsn, Timestamp, TxnId};
 use crate::clog::{ClogEntry, ClogOp, FileClogConfig, FileClogService};
+use crate::log::ilog::{IlogConfig, IlogService};
 use crate::lsn::{new_lsn_provider, SharedLsnProvider};
 use crate::tablet::{LsmConfig, LsmEngine, StorageEngine, TabletId, TabletManager, WriteBatch};
 use crate::util::codec::key::{decode_index_key, decode_table_id, is_index_key, is_record_key};
 use crate::util::error::Result;
 use crate::{log_info, log_warn};
 
-use super::ilog::{IlogConfig, IlogService};
 use super::router::{is_system_table_id, route_index_to_tablet, route_table_to_tablet};
 
 const STORAGE_IO_RING_SIZE: u32 = 256;
@@ -645,7 +645,7 @@ mod tests {
     use super::*;
     use crate::catalog::types::RawValue;
     use crate::clog::{ClogBatch, ClogEntry, ClogOp, ClogService};
-    use crate::tablet::ilog::IlogService;
+    use crate::log::ilog::IlogService;
     use crate::tablet::mvcc::{is_tombstone, MvccIterator, MvccKey};
     use crate::tablet::version::Version;
     use crate::tablet::StorageEngine;

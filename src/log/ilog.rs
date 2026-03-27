@@ -58,12 +58,11 @@ use crate::kernel::manifest::{
     TrivialMoveEdit,
 };
 use crate::lsn::SharedLsnProvider;
+use crate::tablet::sstable::SstMeta;
+use crate::tablet::version::{ManifestDelta, Version};
 use crate::util::error::{Result, TiSqlError};
 use crate::util::fs::{create_dir_durable, rename_durable, sync_dir};
 use crate::{log_info, log_trace, log_warn};
-
-use super::sstable::SstMeta;
-use super::version::Version;
 
 /// File header magic bytes: "ILOG"
 const FILE_MAGIC: &[u8; 4] = b"ILOG";
@@ -110,8 +109,6 @@ impl IlogRecord {
         }
     }
 }
-
-pub type VersionSnapshot = ManifestSnapshot;
 
 /// Configuration for ilog service.
 #[derive(Clone, Debug)]
@@ -1110,14 +1107,14 @@ impl IlogService {
 
                 IlogRecord::Commit { commit, .. } => {
                     let version = Version::from(&snapshot);
-                    let delta = super::version::ManifestDelta::from_commit(commit);
+                    let delta = ManifestDelta::from_commit(commit);
                     snapshot = ManifestSnapshot::from(&version.apply(&delta));
                     pending.intents.remove(&commit.op_id());
                 }
 
                 IlogRecord::TrivialMove { edit, .. } => {
                     let version = Version::from(&snapshot);
-                    let delta = super::version::ManifestDelta::from_trivial_move(edit);
+                    let delta = ManifestDelta::from_trivial_move(edit);
                     snapshot = ManifestSnapshot::from(&version.apply(&delta));
                 }
             }
@@ -2009,7 +2006,7 @@ mod tests {
         let checkpoint = IlogRecord::Checkpoint {
             lsn: 500,
             checkpoint: ManifestCheckpoint {
-                snapshot: VersionSnapshot {
+                snapshot: ManifestSnapshot {
                     levels: vec![],
                     next_sst_id: 1,
                     version_num: 1,
@@ -2386,15 +2383,15 @@ mod tests {
     }
 
     #[test]
-    fn test_ilog_version_snapshot_equality() {
-        let snapshot1 = VersionSnapshot {
+    fn test_manifest_snapshot_equality() {
+        let snapshot1 = ManifestSnapshot {
             levels: vec![vec![(&test_sst_meta(1, 0)).into()]],
             next_sst_id: 2,
             version_num: 1,
             flushed_lsn: 100,
         };
 
-        let snapshot2 = VersionSnapshot {
+        let snapshot2 = ManifestSnapshot {
             levels: vec![vec![(&test_sst_meta(1, 0)).into()]],
             next_sst_id: 2,
             version_num: 1,

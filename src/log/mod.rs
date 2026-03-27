@@ -15,14 +15,10 @@
 //! Log subsystem modules.
 //!
 //! `clog` is the transaction commit log (WAL), `ilog` is the LSM metadata
-//! log (manifest/flush/compaction metadata), and `lsn` provides shared sequence
-//! allocation for both logs.
+//! log (manifest/flush/compaction metadata) behind the neutral
+//! `kernel::manifest::ManifestLog` boundary, and `lsn` provides shared
+//! sequence allocation for both logs.
 
 pub mod clog;
 pub mod ilog;
 pub mod lsn;
-
-// Keep ilog implementation decoupled from tablet internals while allowing
-// compatibility with existing relative paths inside ilog.rs tests/helpers.
-pub(crate) use crate::tablet::sstable;
-pub(crate) use crate::tablet::version;

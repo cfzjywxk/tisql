@@ -62,6 +62,7 @@ use crate::kernel::manifest::{
     ManifestIntentRequest, ManifestLog, ManifestSnapshot, PreparedManifestOp,
     RecordedManifestIntent, TrivialMoveEdit,
 };
+use crate::log::ilog::{IlogService, IlogTruncateStats};
 use crate::lsn::SharedLsnProvider;
 use crate::tablet::mvcc::{
     extract_key, extract_timestamp, is_tombstone, MvccIterator, MvccKey, SharedMvccRange,
@@ -76,7 +77,6 @@ use super::cache::key::{tablet_namespace_from_dir, ReaderCacheKey, RowCacheKey};
 use super::cache::CacheSuite;
 use super::commit_reservations::{CommitLsnReservations, CommitReservationStats};
 use super::config::{LsmConfig, V26BoundaryMode};
-use super::ilog::{IlogService, IlogTruncateStats};
 use super::memtable::{FlushState, MemTable};
 use super::sstable::{
     AsyncSstBuilder, SstBuilderOptions, SstIterator, SstMeta, SstMvccIterator, SstReadOptions,
@@ -5613,8 +5613,8 @@ mod tests {
 
     // ==================== Durable Engine Tests ====================
 
+    use crate::log::ilog::{IlogConfig, IlogService};
     use crate::lsn::new_lsn_provider;
-    use crate::tablet::ilog::{IlogConfig, IlogService};
 
     #[tokio::test]
     async fn test_tablet_engine_smoke_open_write_read() {

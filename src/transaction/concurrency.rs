@@ -23,13 +23,13 @@
 //! ## Design
 //!
 //! The ConcurrencyManager uses OceanBase-style pessimistic locking where:
-//! - Locks are stored in the storage layer as pending nodes (via PessimisticStorage)
+//! - Locks are stored in the storage layer as pending nodes behind `TxnStoragePort`
 //! - Transaction state is tracked in a centralized TxnStateCache
 //! - Readers skip pending/aborted nodes for correct MVCC visibility
 //!
 //! ```text
 //! Pessimistic Write Flow:
-//!   1. put_pending_on_tablet(tablet_id, key, value, start_ts) -> write pending node
+//!   1. TransactionService stages a pending node through its storage port
 //!   2. If locked by another txn -> return KeyIsLocked error
 //!   3. On commit: finalize_pending() sets commit_ts, makes writes visible
 //!   4. On rollback: abort_pending() marks nodes as aborted
@@ -58,7 +58,8 @@ use super::txn_state_cache::TxnStateCache;
 /// 2. **TxnStateCache** - Centralized transaction state for pessimistic locking
 ///
 /// Note: Timestamp allocation is handled by the separate `TsoService`.
-/// Lock management is handled by the storage layer via `PessimisticStorage`.
+/// Lock management is handled by the storage layer through
+/// `kernel::txn_storage::TxnStoragePort` implementations.
 ///
 /// ## Thread Safety
 ///

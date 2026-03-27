@@ -12,6 +12,12 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+//! Neutral manifest contracts shared between tablet coordination and ilog.
+//!
+//! The types in this module intentionally describe committed snapshot state,
+//! pending intents, and exact intent/commit matching without exposing
+//! `tablet::Version`, `tablet::SstMeta`, or ilog record-layout details.
+
 use std::future::Future;
 
 use serde::{Deserialize, Serialize};
