@@ -203,15 +203,15 @@ fn normalize_integral_point_key(value: &Value, target: &DataType) -> Result<Valu
     };
 
     match target {
-        DataType::TinyInt => i8::try_from(signed)
-            .map(Value::TinyInt)
-            .map_err(|_| TiSqlError::Execution(format!("Primary key {signed} is out of TINYINT range"))),
+        DataType::TinyInt => i8::try_from(signed).map(Value::TinyInt).map_err(|_| {
+            TiSqlError::Execution(format!("Primary key {signed} is out of TINYINT range"))
+        }),
         DataType::SmallInt => i16::try_from(signed).map(Value::SmallInt).map_err(|_| {
             TiSqlError::Execution(format!("Primary key {signed} is out of SMALLINT range"))
         }),
-        DataType::Int => i32::try_from(signed)
-            .map(Value::Int)
-            .map_err(|_| TiSqlError::Execution(format!("Primary key {signed} is out of INT range"))),
+        DataType::Int => i32::try_from(signed).map(Value::Int).map_err(|_| {
+            TiSqlError::Execution(format!("Primary key {signed} is out of INT range"))
+        }),
         DataType::BigInt => Ok(Value::BigInt(signed)),
         _ => Err(TiSqlError::Execution(format!(
             "Primary key literal {value:?} does not match {target:?}"
