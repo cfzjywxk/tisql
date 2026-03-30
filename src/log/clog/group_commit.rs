@@ -744,6 +744,29 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn test_group_commit_async_runtime_round_trip() {
+        let (file, io, tmp) = make_writer();
+        let gc = GroupCommitWriter::new_with_trace(
+            file,
+            io,
+            &tokio::runtime::Handle::current(),
+            IoTraceTag::default(),
+        );
+
+        let rx = gc.submit(b"async_runtime".to_vec(), true).unwrap();
+        rx.await.unwrap().unwrap();
+
+        gc.stop_and_drain().await.unwrap();
+        gc.shutdown();
+
+        let submit_err = gc.submit(b"after_shutdown".to_vec(), true).unwrap_err();
+        assert_eq!(submit_err, "shutdown");
+
+        let content = std::fs::read(tmp.path()).unwrap();
+        assert_eq!(&content, b"async_runtime");
+    }
+
+    #[tokio::test]
     async fn test_group_commit_mixed_async() {
         let (file, io, tmp) = make_writer();
         let gc = Arc::new(GroupCommitWriter::new_with_thread_with_trace(
@@ -853,4 +876,64 @@ mod tests {
             .expect("stop_and_drain should interrupt delay window")
             .unwrap();
     }
+
+    #[tokio::test]
+    async fn test_group_commit_async_restart_accepts_new_writes() {
+        let (file, io, tmp) = make_writer();
+        let gc = GroupCommitWriter::new_with_trace(
+            file,
+            Arc::clone(&io),
+            &tokio::runtime::Handle::current(),
+            IoTraceTag::default(),
+        );
+
+        let rx = gc.submit(b"before".to_vec(), true).unwrap();
+        rx.await.unwrap().unwrap();
+        gc.stop_and_drain().await.unwrap();
+
+        let reopened = DmaFile::open_append_buffered(tmp.path()).unwrap();
+        gc.restart(
+            reopened,
+            Arc::clone(&io),
+            Some(&tokio::runtime::Handle::current()),
+        );
+
+        let rx = gc.submit(b"_after".to_vec(), true).unwrap();
+        rx.await.unwrap().unwrap();
+        gc.stop_and_drain().await.unwrap();
+
+        let content = std::fs::read(tmp.path()).unwrap();
+        assert_eq!(&content, b"before_after");
+    }
+
+    #[tokio::test]
+    async fn test_group_commit_async_delay_collects_follow_up_request() {
+        let (file, io, tmp) = make_writer();
+        let gc = GroupCommitWriter::new_with_config_with_trace(
+            file,
+            io,
+            &tokio::runtime::Handle::current(),
+            IoTraceTag::default(),
+            GroupCommitTuning {
+                delay: Duration::from_millis(200),
+                no_delay_count: 2,
+            },
+        );
+
+        let rx1 = gc.submit(b"first".to_vec(), true).unwrap();
+        let rx2 = gc.submit(b"second".to_vec(), true).unwrap();
+
+        tokio::time::timeout(Duration::from_secs(1), async {
+            rx1.await.unwrap().unwrap();
+            rx2.await.unwrap().unwrap();
+        })
+        .await
+        .expect("delay window should admit the second request");
+
+        gc.stop_and_drain().await.unwrap();
+
+        let content = std::fs::read(tmp.path()).unwrap();
+        assert_eq!(&content, b"firstsecond");
+    }
+
 }
