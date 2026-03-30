@@ -189,10 +189,126 @@ impl<T> TxnExecutionBackend<T> {
     }
 }
 
-fn encode_logical_point_key(table_id: TableId, key: &LogicalPointKey) -> Key {
+fn normalize_integral_point_key(value: &Value, target: &DataType) -> Result<Value> {
+    let signed = match value {
+        Value::TinyInt(v) => i64::from(*v),
+        Value::SmallInt(v) => i64::from(*v),
+        Value::Int(v) => i64::from(*v),
+        Value::BigInt(v) => *v,
+        _ => {
+            return Err(TiSqlError::Execution(format!(
+                "Primary key literal {value:?} does not match {target:?}"
+            )));
+        }
+    };
+
+    match target {
+        DataType::TinyInt => i8::try_from(signed)
+            .map(Value::TinyInt)
+            .map_err(|_| TiSqlError::Execution(format!("Primary key {signed} is out of TINYINT range"))),
+        DataType::SmallInt => i16::try_from(signed).map(Value::SmallInt).map_err(|_| {
+            TiSqlError::Execution(format!("Primary key {signed} is out of SMALLINT range"))
+        }),
+        DataType::Int => i32::try_from(signed)
+            .map(Value::Int)
+            .map_err(|_| TiSqlError::Execution(format!("Primary key {signed} is out of INT range"))),
+        DataType::BigInt => Ok(Value::BigInt(signed)),
+        _ => Err(TiSqlError::Execution(format!(
+            "Primary key literal {value:?} does not match {target:?}"
+        ))),
+    }
+}
+
+fn normalize_point_key_value(value: &Value, target: &DataType) -> Result<Value> {
+    match target {
+        DataType::TinyInt | DataType::SmallInt | DataType::Int | DataType::BigInt => {
+            normalize_integral_point_key(value, target)
+        }
+        DataType::Boolean => match value {
+            Value::Boolean(v) => Ok(Value::Boolean(*v)),
+            _ => Err(TiSqlError::Execution(format!(
+                "Primary key literal {value:?} does not match BOOLEAN"
+            ))),
+        },
+        DataType::Float => match value {
+            Value::Float(v) => Ok(Value::Float(*v)),
+            _ => Err(TiSqlError::Execution(format!(
+                "Primary key literal {value:?} does not match FLOAT"
+            ))),
+        },
+        DataType::Double => match value {
+            Value::Double(v) => Ok(Value::Double(*v)),
+            _ => Err(TiSqlError::Execution(format!(
+                "Primary key literal {value:?} does not match DOUBLE"
+            ))),
+        },
+        DataType::Decimal { .. } => match value {
+            Value::Decimal(v) => Ok(Value::Decimal(v.clone())),
+            _ => Err(TiSqlError::Execution(format!(
+                "Primary key literal {value:?} does not match DECIMAL"
+            ))),
+        },
+        DataType::Char(_) | DataType::Varchar(_) | DataType::Text => match value {
+            Value::String(v) => Ok(Value::String(v.clone())),
+            _ => Err(TiSqlError::Execution(format!(
+                "Primary key literal {value:?} does not match string primary key"
+            ))),
+        },
+        DataType::Blob => match value {
+            Value::Bytes(v) => Ok(Value::Bytes(v.clone())),
+            _ => Err(TiSqlError::Execution(format!(
+                "Primary key literal {value:?} does not match BLOB"
+            ))),
+        },
+        DataType::Date => match value {
+            Value::Date(v) => Ok(Value::Date(*v)),
+            _ => Err(TiSqlError::Execution(format!(
+                "Primary key literal {value:?} does not match DATE"
+            ))),
+        },
+        DataType::Time => match value {
+            Value::Time(v) => Ok(Value::Time(*v)),
+            _ => Err(TiSqlError::Execution(format!(
+                "Primary key literal {value:?} does not match TIME"
+            ))),
+        },
+        DataType::DateTime => match value {
+            Value::DateTime(v) => Ok(Value::DateTime(*v)),
+            _ => Err(TiSqlError::Execution(format!(
+                "Primary key literal {value:?} does not match DATETIME"
+            ))),
+        },
+        DataType::Timestamp => match value {
+            Value::Timestamp(v) => Ok(Value::Timestamp(*v)),
+            _ => Err(TiSqlError::Execution(format!(
+                "Primary key literal {value:?} does not match TIMESTAMP"
+            ))),
+        },
+    }
+}
+
+fn normalize_logical_point_key(table: &TableDef, key: &LogicalPointKey) -> Result<RowKey> {
     match key {
-        LogicalPointKey::PrimaryKey(values) => encode_key(table_id, &encode_pk(values)),
-        LogicalPointKey::HiddenRowId(handle) => encode_int_key(table_id, *handle),
+        LogicalPointKey::HiddenRowId(handle) => Ok(RowKey::HiddenRowId(*handle)),
+        LogicalPointKey::PrimaryKey(values) => {
+            let pk_indices = table.pk_column_indices();
+            if pk_indices.len() != values.len() {
+                return Err(TiSqlError::Execution(format!(
+                    "Expected {} primary-key values, got {}",
+                    pk_indices.len(),
+                    values.len()
+                )));
+            }
+
+            let normalized = pk_indices
+                .into_iter()
+                .zip(values.iter())
+                .map(|(col_idx, value)| {
+                    normalize_point_key_value(value, table.columns()[col_idx].data_type())
+                })
+                .collect::<Result<Vec<_>>>()?;
+            Ok(RowKey::PrimaryKey(normalized))
+        }
     }
 }
 
@@ -213,13 +329,6 @@ fn project_columns(
             col_ids,
             data_types,
         } => (col_ids.clone(), data_types.clone()),
-    }
-}
-
-fn row_key_for(key: &LogicalPointKey) -> RowKey {
-    match key {
-        LogicalPointKey::PrimaryKey(values) => RowKey::PrimaryKey(values.clone()),
-        LogicalPointKey::HiddenRowId(handle) => RowKey::HiddenRowId(*handle),
     }
 }
 
@@ -420,7 +529,8 @@ impl<T: TxnService> ExecutionBackend for TxnExecutionBackend<T> {
         req: PointGetRequest,
     ) -> impl Future<Output = Result<Option<ExecutionRow>>> + Send + 'a {
         async move {
-            let encoded_key = encode_logical_point_key(req.table.id(), &req.key);
+            let normalized_key = normalize_logical_point_key(&req.table, &req.key)?;
+            let encoded_key = encode_row_key(req.table.id(), &normalized_key);
             let Some(raw_row) = self
                 .txn_service
                 .get(ctx, req.table.id(), &encoded_key)
@@ -432,7 +542,7 @@ impl<T: TxnService> ExecutionBackend for TxnExecutionBackend<T> {
             let (col_ids, data_types) = project_columns(&req.table, &req.projection);
             let values = decode_row_to_values(&raw_row, &col_ids, &data_types)?;
             Ok(Some(ExecutionRow {
-                key: row_key_for(&req.key),
+                key: normalized_key,
                 row: Row::new(values),
             }))
         }
