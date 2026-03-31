@@ -577,6 +577,7 @@ mod tests {
     }
 
     #[tokio::test]
+    #[allow(clippy::await_holding_lock)]
     async fn test_writer_micro_batch_delay_coalesces_following_slot() {
         let _hook_lock = hook_test_lock().lock().unwrap();
         let dir = tempfile::tempdir().unwrap();
@@ -808,6 +809,7 @@ mod tests {
     }
 
     #[tokio::test]
+    #[allow(clippy::await_holding_lock)]
     async fn test_writer_drop_fails_pending_write() {
         let _hook_lock = hook_test_lock().lock().unwrap();
         let dir = tempfile::tempdir().unwrap();
@@ -851,5 +853,4 @@ mod tests {
         let err = rx.await.unwrap().unwrap_err();
         assert_eq!(err, "clog writer dropped");
     }
-
 }

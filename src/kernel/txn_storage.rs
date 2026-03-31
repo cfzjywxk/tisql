@@ -200,11 +200,13 @@ pub trait TxnStoragePort: Send + Sync + 'static {
     fn abort(&self, req: AbortRequest<'_>) -> Result<()>;
 }
 
+#[cfg_attr(not(test), allow(dead_code))]
 pub(crate) enum RecoveredWrite<'a> {
     Put { key: &'a [u8], value: &'a [u8] },
     Delete { key: &'a [u8] },
 }
 
+#[cfg_attr(not(test), allow(dead_code))]
 pub(crate) trait TxnStorageRecoveryPort: TxnStoragePort {
     fn apply_recovered_write(
         &self,

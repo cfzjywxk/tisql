@@ -15,9 +15,11 @@ AFFECTED 1
 BEGIN
 UPDATE lock_release_test SET val = 's2_attempt1' WHERE id = 1
 ERROR 1205: LockWaitTimeout
+ROLLBACK
 BEGIN
 UPDATE lock_release_test SET val = 's2_attempt2' WHERE id = 2
 ERROR 1205: LockWaitTimeout
+ROLLBACK
 SELECT 1
 ?column?
 1

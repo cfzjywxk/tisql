@@ -788,7 +788,10 @@ mod tests {
             infer_logical_tablet_from_encoded_key(&system_key),
             TabletId::System
         );
-        assert_eq!(infer_logical_tablet_from_encoded_key(b"not-a-key"), TabletId::System);
+        assert_eq!(
+            infer_logical_tablet_from_encoded_key(b"not-a-key"),
+            TabletId::System
+        );
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -856,7 +859,10 @@ mod tests {
             &io_handle,
         )
         .unwrap();
-        assert_eq!(get_for_test(&recovered_default.engine, &key).await, Some(b"tablet-value".to_vec()));
+        assert_eq!(
+            get_for_test(&recovered_default.engine, &key).await,
+            Some(b"tablet-value".to_vec())
+        );
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

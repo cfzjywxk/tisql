@@ -497,55 +497,51 @@ impl<I> TxnExecutionScan<I> {
 }
 
 impl<I: crate::transaction::TxnScanCursor> ExecutionRowStream for TxnExecutionScan<I> {
-    fn next_row(&mut self) -> impl Future<Output = Result<Option<ExecutionRow>>> + Send + '_ {
-        async move {
-            if !self.initialized {
-                self.initialized = true;
-                self.iter.advance().await?;
-            }
-
-            let Some(entry) = self.iter.current() else {
-                return Ok(None);
-            };
-
-            let full_values =
-                decode_row_to_values(&entry.value, &self.full_col_ids, &self.full_data_types)?;
-            let full_row = Row::new(full_values);
-            let row = project_row(&self.table, &self.projection, &full_row)?;
-            let key = decode_scan_row_key(&self.table, &entry.user_key, &full_row)?;
-
+    async fn next_row(&mut self) -> Result<Option<ExecutionRow>> {
+        if !self.initialized {
+            self.initialized = true;
             self.iter.advance().await?;
-            Ok(Some(ExecutionRow { key, row }))
         }
+
+        let Some(entry) = self.iter.current() else {
+            return Ok(None);
+        };
+
+        let full_values =
+            decode_row_to_values(&entry.value, &self.full_col_ids, &self.full_data_types)?;
+        let full_row = Row::new(full_values);
+        let row = project_row(&self.table, &self.projection, &full_row)?;
+        let key = decode_scan_row_key(&self.table, &entry.user_key, &full_row)?;
+
+        self.iter.advance().await?;
+        Ok(Some(ExecutionRow { key, row }))
     }
 }
 
 impl<T: TxnService> ExecutionBackend for TxnExecutionBackend<T> {
     type Scan = TxnExecutionScan<T::ScanCursor>;
 
-    fn point_get<'a>(
+    async fn point_get<'a>(
         &'a self,
         ctx: &'a TxnCtx,
         req: PointGetRequest,
-    ) -> impl Future<Output = Result<Option<ExecutionRow>>> + Send + 'a {
-        async move {
-            let normalized_key = normalize_logical_point_key(&req.table, &req.key)?;
-            let encoded_key = encode_row_key(req.table.id(), &normalized_key);
-            let Some(raw_row) = self
-                .txn_service
-                .get(ctx, req.table.id(), &encoded_key)
-                .await?
-            else {
-                return Ok(None);
-            };
+    ) -> Result<Option<ExecutionRow>> {
+        let normalized_key = normalize_logical_point_key(&req.table, &req.key)?;
+        let encoded_key = encode_row_key(req.table.id(), &normalized_key);
+        let Some(raw_row) = self
+            .txn_service
+            .get(ctx, req.table.id(), &encoded_key)
+            .await?
+        else {
+            return Ok(None);
+        };
 
-            let (col_ids, data_types) = project_columns(&req.table, &req.projection);
-            let values = decode_row_to_values(&raw_row, &col_ids, &data_types)?;
-            Ok(Some(ExecutionRow {
-                key: normalized_key,
-                row: Row::new(values),
-            }))
-        }
+        let (col_ids, data_types) = project_columns(&req.table, &req.projection);
+        let values = decode_row_to_values(&raw_row, &col_ids, &data_types)?;
+        Ok(Some(ExecutionRow {
+            key: normalized_key,
+            row: Row::new(values),
+        }))
     }
 
     fn scan(&self, ctx: &TxnCtx, req: ScanRequest) -> Result<Self::Scan> {
@@ -554,23 +550,21 @@ impl<T: TxnService> ExecutionBackend for TxnExecutionBackend<T> {
         Ok(TxnExecutionScan::new(iter, req.table, req.projection))
     }
 
-    fn apply_write<'a>(
+    async fn apply_write<'a>(
         &'a self,
         ctx: &'a mut TxnCtx,
         req: WriteRequest,
-    ) -> impl Future<Output = Result<WriteOutcome>> + Send + 'a {
-        async move {
-            let mut stmt = self.txn_service.begin_statement(ctx);
-            let result = self.apply_write_inner(ctx, &mut stmt, req).await;
-            match result {
-                Ok(outcome) => Ok(outcome),
-                Err(err) => {
-                    if stmt.is_empty() {
-                        Err(err)
-                    } else {
-                        self.txn_service.rollback_statement(ctx, stmt).await?;
-                        Err(err)
-                    }
+    ) -> Result<WriteOutcome> {
+        let mut stmt = self.txn_service.begin_statement(ctx);
+        let result = self.apply_write_inner(ctx, &mut stmt, req).await;
+        match result {
+            Ok(outcome) => Ok(outcome),
+            Err(err) => {
+                if stmt.is_empty() {
+                    Err(err)
+                } else {
+                    self.txn_service.rollback_statement(ctx, stmt).await?;
+                    Err(err)
                 }
             }
         }
@@ -765,8 +759,8 @@ mod tests {
     struct DummyCursor;
 
     impl TxnScanCursor for DummyCursor {
-        fn advance(&mut self) -> impl Future<Output = Result<()>> + Send + '_ {
-            async move { Ok(()) }
+        async fn advance(&mut self) -> Result<()> {
+            Ok(())
         }
 
         fn current(&self) -> Option<&TxnScanEntry> {
@@ -791,14 +785,12 @@ mod tests {
     }
 
     impl TxnScanCursor for VecScanCursor {
-        fn advance(&mut self) -> impl Future<Output = Result<()>> + Send + '_ {
-            async move {
-                self.current = self.entries.get(self.index).cloned();
-                if self.current.is_some() {
-                    self.index += 1;
-                }
-                Ok(())
+        async fn advance(&mut self) -> Result<()> {
+            self.current = self.entries.get(self.index).cloned();
+            if self.current.is_some() {
+                self.index += 1;
             }
+            Ok(())
         }
 
         fn current(&self) -> Option<&TxnScanEntry> {

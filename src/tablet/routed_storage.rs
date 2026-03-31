@@ -272,91 +272,87 @@ impl<I: MvccIterator> TxnStorageScanAdapter<I> {
 }
 
 impl<I: MvccIterator> TxnStorageScanCursor for TxnStorageScanAdapter<I> {
-    fn next_step(
-        &mut self,
-    ) -> impl std::future::Future<Output = Result<TxnStorageScanStep>> + Send + '_ {
-        async move {
-            if !self.storage_iter.valid() {
-                self.storage_iter.advance().await?;
+    async fn next_step(&mut self) -> Result<TxnStorageScanStep> {
+        if !self.storage_iter.valid() {
+            self.storage_iter.advance().await?;
+        }
+
+        while self.storage_iter.valid() {
+            let user_key = self.storage_iter.user_key();
+
+            if !self.range.end.is_empty() && user_key >= self.range.end.as_slice() {
+                return Ok(TxnStorageScanStep::Exhausted);
             }
 
-            while self.storage_iter.valid() {
-                let user_key = self.storage_iter.user_key();
+            if user_key < self.range.start.as_slice() {
+                self.storage_iter.advance().await?;
+                continue;
+            }
 
-                if !self.range.end.is_empty() && user_key >= self.range.end.as_slice() {
-                    return Ok(TxnStorageScanStep::Exhausted);
-                }
-
-                if user_key < self.range.start.as_slice() {
-                    self.storage_iter.advance().await?;
-                    continue;
-                }
-
-                if self.storage_iter.is_pending() {
-                    let owner_start_ts = self.storage_iter.pending_owner();
-                    match classify_scan_pending(
-                        self.concurrency_manager.as_ref(),
-                        self.read_ts,
-                        owner_start_ts,
-                    ) {
-                        PendingScanAction::Skip => {
-                            self.storage_iter.advance().await?;
+            if self.storage_iter.is_pending() {
+                let owner_start_ts = self.storage_iter.pending_owner();
+                match classify_scan_pending(
+                    self.concurrency_manager.as_ref(),
+                    self.read_ts,
+                    owner_start_ts,
+                ) {
+                    PendingScanAction::Skip => {
+                        self.storage_iter.advance().await?;
+                        continue;
+                    }
+                    PendingScanAction::Visible => {
+                        if is_lock(self.storage_iter.value()) {
+                            let skip_key = user_key.to_vec();
+                            self.skip_current_key(skip_key.as_slice()).await?;
                             continue;
                         }
-                        PendingScanAction::Visible => {
-                            if is_lock(self.storage_iter.value()) {
-                                let skip_key = user_key.to_vec();
-                                self.skip_current_key(skip_key.as_slice()).await?;
-                                continue;
-                            }
 
-                            let user_key = user_key.to_vec();
-                            let state = if is_tombstone(self.storage_iter.value()) {
-                                TxnStorageVisibleState::Deleted
-                            } else {
-                                TxnStorageVisibleState::Value(self.storage_iter.value().to_vec())
-                            };
-                            self.skip_current_key(user_key.as_slice()).await?;
-                            return Ok(TxnStorageScanStep::Entry(TxnStorageScanEntry {
-                                user_key,
-                                state,
-                            }));
-                        }
-                        PendingScanAction::Blocked(owner_start_ts) => {
-                            return Ok(TxnStorageScanStep::Blocked(TxnStorageBlocked {
-                                user_key: user_key.to_vec(),
-                                owner_start_ts,
-                            }));
-                        }
+                        let user_key = user_key.to_vec();
+                        let state = if is_tombstone(self.storage_iter.value()) {
+                            TxnStorageVisibleState::Deleted
+                        } else {
+                            TxnStorageVisibleState::Value(self.storage_iter.value().to_vec())
+                        };
+                        self.skip_current_key(user_key.as_slice()).await?;
+                        return Ok(TxnStorageScanStep::Entry(TxnStorageScanEntry {
+                            user_key,
+                            state,
+                        }));
+                    }
+                    PendingScanAction::Blocked(owner_start_ts) => {
+                        return Ok(TxnStorageScanStep::Blocked(TxnStorageBlocked {
+                            user_key: user_key.to_vec(),
+                            owner_start_ts,
+                        }));
                     }
                 }
-
-                if self.storage_iter.timestamp() > self.read_ts {
-                    self.storage_iter.advance().await?;
-                    continue;
-                }
-
-                if is_lock(self.storage_iter.value()) {
-                    let skip_key = user_key.to_vec();
-                    self.skip_current_key(skip_key.as_slice()).await?;
-                    continue;
-                }
-
-                let user_key = user_key.to_vec();
-                let state = if is_tombstone(self.storage_iter.value()) {
-                    TxnStorageVisibleState::Deleted
-                } else {
-                    TxnStorageVisibleState::Value(self.storage_iter.value().to_vec())
-                };
-                self.skip_current_key(user_key.as_slice()).await?;
-                return Ok(TxnStorageScanStep::Entry(TxnStorageScanEntry {
-                    user_key,
-                    state,
-                }));
             }
 
-            Ok(TxnStorageScanStep::Exhausted)
+            if self.storage_iter.timestamp() > self.read_ts {
+                self.storage_iter.advance().await?;
+                continue;
+            }
+
+            if is_lock(self.storage_iter.value()) {
+                let skip_key = user_key.to_vec();
+                self.skip_current_key(skip_key.as_slice()).await?;
+                continue;
+            }
+
+            let user_key = user_key.to_vec();
+            let state = if is_tombstone(self.storage_iter.value()) {
+                TxnStorageVisibleState::Deleted
+            } else {
+                TxnStorageVisibleState::Value(self.storage_iter.value().to_vec())
+            };
+            self.skip_current_key(user_key.as_slice()).await?;
+            return Ok(TxnStorageScanStep::Entry(TxnStorageScanEntry {
+                user_key,
+                state,
+            }));
         }
+
+        Ok(TxnStorageScanStep::Exhausted)
     }
 }
 
@@ -502,46 +498,43 @@ where
             .map_err(map_stage_error)
     }
 
-    fn stage_delete<'a>(
+    async fn stage_delete<'a>(
         &'a self,
         key: &'a [u8],
         owner_start_ts: Timestamp,
-    ) -> impl std::future::Future<Output = std::result::Result<TxnDeleteEffect, TxnStageError>> + Send + 'a
-    {
-        async move {
-            let tablet_id = infer_logical_tablet_from_encoded_key(key);
-            let delete_effect =
-                if self.storage.get_lock_owner_on_tablet(tablet_id, key) == Some(owner_start_ts) {
-                    classify_same_owner_delete_effect(
-                        self.storage.as_ref(),
-                        self.concurrency_manager.as_ref(),
-                        key,
-                        owner_start_ts,
-                    )
-                    .await
-                    .expect("same-owner delete effect resolution should succeed")
-                } else if self
+    ) -> std::result::Result<TxnDeleteEffect, TxnStageError> {
+        let tablet_id = infer_logical_tablet_from_encoded_key(key);
+        let delete_effect =
+            if self.storage.get_lock_owner_on_tablet(tablet_id, key) == Some(owner_start_ts) {
+                classify_same_owner_delete_effect(
+                    self.storage.as_ref(),
+                    self.concurrency_manager.as_ref(),
+                    key,
+                    owner_start_ts,
+                )
+                .await
+                .expect("same-owner delete effect resolution should succeed")
+            } else {
+                match self
                     .storage
                     .get_with_owner_on_tablet(tablet_id, key, owner_start_ts, owner_start_ts)
                     .await
-                    .is_some()
                 {
-                    TxnDeleteEffect::Delete
-                } else {
-                    TxnDeleteEffect::Lock
-                };
+                    Some(_) => TxnDeleteEffect::Delete,
+                    None => TxnDeleteEffect::Lock,
+                }
+            };
 
-            if delete_effect == TxnDeleteEffect::Delete {
-                self.storage
-                    .put_pending_on_tablet(tablet_id, key, TOMBSTONE, owner_start_ts)
-                    .map_err(map_stage_error)?;
-                Ok(TxnDeleteEffect::Delete)
-            } else {
-                self.storage
-                    .put_pending_on_tablet(tablet_id, key, LOCK, owner_start_ts)
-                    .map_err(map_stage_error)?;
-                Ok(TxnDeleteEffect::Lock)
-            }
+        if delete_effect == TxnDeleteEffect::Delete {
+            self.storage
+                .put_pending_on_tablet(tablet_id, key, TOMBSTONE, owner_start_ts)
+                .map_err(map_stage_error)?;
+            Ok(TxnDeleteEffect::Delete)
+        } else {
+            self.storage
+                .put_pending_on_tablet(tablet_id, key, LOCK, owner_start_ts)
+                .map_err(map_stage_error)?;
+            Ok(TxnDeleteEffect::Lock)
         }
     }
 
@@ -1935,9 +1928,9 @@ mod tests {
         storage.write_batch(empty_batch).unwrap();
 
         let index_key = encode_index_seek_key(USER_TABLE_ID_START, 2007, b"idx");
-        let (tablet_id, resolved) = storage.resolve_scan_tablet(&(
-            MvccKey::encode(&index_key, Timestamp::MAX)..MvccKey::unbounded()
-        ));
+        let (tablet_id, resolved) = storage.resolve_scan_tablet(
+            &(MvccKey::encode(&index_key, Timestamp::MAX)..MvccKey::unbounded()),
+        );
         assert_eq!(tablet_id, index_tablet_id);
         assert!(Arc::ptr_eq(&resolved, &index_tablet));
         assert_eq!(
@@ -1945,11 +1938,15 @@ mod tests {
             index_tablet_id
         );
 
-        let (fallback_id, fallback_tablet) = storage
-            .resolve_scan_tablet(&(MvccKey::encode(b"broken", Timestamp::MAX)..MvccKey::unbounded()));
+        let (fallback_id, fallback_tablet) = storage.resolve_scan_tablet(
+            &(MvccKey::encode(b"broken", Timestamp::MAX)..MvccKey::unbounded()),
+        );
         assert_eq!(fallback_id, TabletId::System);
         assert!(Arc::ptr_eq(&fallback_tablet, &system));
-        assert_eq!(infer_logical_tablet_from_encoded_key(b"broken"), TabletId::System);
+        assert_eq!(
+            infer_logical_tablet_from_encoded_key(b"broken"),
+            TabletId::System
+        );
 
         let (_mem, _cm, txn_storage) = make_mem_txn_storage();
         let reservation = TxnCommitReservation {
@@ -1984,7 +1981,9 @@ mod tests {
             table_id: USER_TABLE_ID_START,
         };
         let user = open_tablet(&manager.tablet_dir(user_tablet_id));
-        manager.insert_tablet(user_tablet_id, Arc::clone(&user)).unwrap();
+        manager
+            .insert_tablet(user_tablet_id, Arc::clone(&user))
+            .unwrap();
 
         let storage = RoutedTabletStorage::new(Arc::clone(&manager));
         let system_key = encode_record_key_with_handle(ALL_TABLE_TABLE_ID, 41);
@@ -2095,7 +2094,10 @@ mod tests {
                     state: TxnStorageVisibleState::Value(b"visible".to_vec()),
                 })
             );
-            assert_eq!(cursor.next_step().await.unwrap(), TxnStorageScanStep::Exhausted);
+            assert_eq!(
+                cursor.next_step().await.unwrap(),
+                TxnStorageScanStep::Exhausted
+            );
         });
     }
 

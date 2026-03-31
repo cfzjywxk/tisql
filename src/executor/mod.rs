@@ -142,6 +142,7 @@ pub trait Executor: Send + Sync {
     ///   - `Err(error)` on statement failure
     ///   - `Option<TxnCtx>` always carries the post-statement transaction context
     ///     (for explicit transactions, statement errors should keep the txn open)
+    #[allow(clippy::too_many_arguments)]
     fn execute_unified<T: TxnService, B: ExecutionBackend, C: Catalog>(
         &self,
         plan: LogicalPlan,

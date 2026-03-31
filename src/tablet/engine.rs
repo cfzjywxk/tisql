@@ -517,32 +517,24 @@ impl ManifestWriterHandle {
 }
 
 impl ManifestCoordinator for ManifestWriterHandle {
-    fn register_intent(
-        &self,
-        req: ManifestIntentRequest,
-    ) -> impl std::future::Future<Output = Result<PreparedManifestOp>> + Send + '_ {
-        async move { self.register_intent(req).await }
+    async fn register_intent(&self, req: ManifestIntentRequest) -> Result<PreparedManifestOp> {
+        ManifestWriterHandle::register_intent(self, req).await
     }
 
-    fn commit_prepared(
+    async fn commit_prepared(
         &self,
         op: PreparedManifestOp,
         commit: ManifestCommitRequest,
-    ) -> impl std::future::Future<Output = Result<()>> + Send + '_ {
-        async move { self.commit_prepared(op, commit).await }
+    ) -> Result<()> {
+        ManifestWriterHandle::commit_prepared(self, op, commit).await
     }
 
-    fn apply_trivial_move(
-        &self,
-        edit: TrivialMoveEdit,
-    ) -> impl std::future::Future<Output = Result<()>> + Send + '_ {
-        async move { self.apply_trivial_move(edit).await }
+    async fn apply_trivial_move(&self, edit: TrivialMoveEdit) -> Result<()> {
+        ManifestWriterHandle::apply_trivial_move(self, edit).await
     }
 
-    fn checkpoint_and_capture(
-        &self,
-    ) -> impl std::future::Future<Output = Result<CheckpointCapture>> + Send + '_ {
-        async move { self.checkpoint_and_capture().await }
+    async fn checkpoint_and_capture(&self) -> Result<CheckpointCapture> {
+        ManifestWriterHandle::checkpoint_and_capture(self).await
     }
 }
 
@@ -5372,13 +5364,14 @@ mod tests {
         assert_eq!(capture.pending_intents.len(), 1);
         assert!(capture.checkpoint_lsn > 0);
 
-        let flush_sst: crate::kernel::manifest::SstDesc = make_test_sst_meta(11, 0, b"a", b"z")
-            .as_ref()
-            .into();
+        let flush_sst: crate::kernel::manifest::SstDesc =
+            make_test_sst_meta(11, 0, b"a", b"z").as_ref().into();
 
         let (unknown_reply_tx, unknown_reply_rx) = tokio::sync::oneshot::channel();
         tx.send(ManifestRequest::CommitPrepared {
-            op: PreparedManifestOp { op_id: prepared.op_id + 99 },
+            op: PreparedManifestOp {
+                op_id: prepared.op_id + 99,
+            },
             commit: ManifestCommitRequest::Flush {
                 sst: flush_sst.clone(),
                 flushed_lsn: 33,
@@ -5423,9 +5416,8 @@ mod tests {
             .unwrap();
         assert_eq!(version_set.current().ssts_at_level(0).len(), 1);
 
-        let moved_sst: crate::kernel::manifest::SstDesc = make_test_sst_meta(12, 1, b"a", b"z")
-            .as_ref()
-            .into();
+        let moved_sst: crate::kernel::manifest::SstDesc =
+            make_test_sst_meta(12, 1, b"a", b"z").as_ref().into();
         handle
             .apply_trivial_move(TrivialMoveEdit {
                 deleted_ssts: vec![(0, 11)],
@@ -5687,7 +5679,7 @@ mod tests {
         }
 
         let version = engine.current_version();
-        let mut metas: Vec<Arc<SstMeta>> = version.ssts_at_level(0).iter().cloned().collect();
+        let mut metas: Vec<Arc<SstMeta>> = version.ssts_at_level(0).to_vec();
         metas.sort_by(|left, right| left.smallest_key.cmp(&right.smallest_key));
 
         let mut l0_real = L0SstIterator::new(

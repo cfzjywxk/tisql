@@ -935,5 +935,4 @@ mod tests {
         let content = std::fs::read(tmp.path()).unwrap();
         assert_eq!(&content, b"firstsecond");
     }
-
 }

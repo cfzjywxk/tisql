@@ -551,6 +551,7 @@ impl Default for SimpleExecutor {
 }
 
 impl Executor for SimpleExecutor {
+    #[allow(clippy::too_many_arguments)]
     async fn execute_unified<T: TxnService, B: ExecutionBackend, C: Catalog>(
         &self,
         plan: LogicalPlan,

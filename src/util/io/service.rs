@@ -189,7 +189,7 @@ impl IoService {
         };
 
         #[cfg(target_os = "linux")]
-        {
+        return {
             let (init_tx, init_rx) = std::sync::mpsc::sync_channel(1);
             std::thread::Builder::new()
                 .name(thread_name.clone())
@@ -209,26 +209,24 @@ impl IoService {
                 .map_err(|e| format!("Failed to spawn IoService thread: {e}"))?;
 
             match init_rx.recv() {
-                Ok(Ok(())) => {
-                    return Ok(Arc::new(Self {
-                        tx,
-                        shutdown_tx: parking_lot::Mutex::new(Some(shutdown_tx)),
-                    }));
-                }
+                Ok(Ok(())) => Ok(Arc::new(Self {
+                    tx,
+                    shutdown_tx: parking_lot::Mutex::new(Some(shutdown_tx)),
+                })),
                 Ok(Err(e)) => {
                     tracing::warn!(
                         "IoService io_uring backend unavailable, falling back to sync backend: {e}"
                     );
-                    return Self::spawn_sync_backend(thread_name);
+                    Self::spawn_sync_backend(thread_name)
                 }
                 Err(e) => {
                     tracing::warn!(
                         "IoService io_uring backend did not report startup, falling back to sync backend: {e}"
                     );
-                    return Self::spawn_sync_backend(thread_name);
+                    Self::spawn_sync_backend(thread_name)
                 }
             }
-        }
+        };
 
         #[cfg(not(target_os = "linux"))]
         std::thread::Builder::new()
@@ -240,10 +238,13 @@ impl IoService {
             })
             .map_err(|e| format!("Failed to spawn IoService thread: {e}"))?;
 
-        Ok(Arc::new(Self {
-            tx,
-            shutdown_tx: parking_lot::Mutex::new(Some(shutdown_tx)),
-        }))
+        #[cfg(not(target_os = "linux"))]
+        {
+            Ok(Arc::new(Self {
+                tx,
+                shutdown_tx: parking_lot::Mutex::new(Some(shutdown_tx)),
+            }))
+        }
     }
 
     /// Create a new IoService that always uses the synchronous backend.
@@ -400,15 +401,6 @@ impl IoService {
 // ============================================================================
 // IO Thread Main Loop
 // ============================================================================
-
-/// Main loop for the Linux io_uring backend.
-#[cfg(target_os = "linux")]
-fn io_thread_main(rx: crossbeam_channel::Receiver<IoOp>, ring_size: u32) -> Result<(), String> {
-    let mut ring = io_uring::IoUring::new(ring_size)
-        .map_err(|e| format!("Failed to create io_uring with ring_size={ring_size}: {e}"))?;
-
-    io_thread_main_with_ring(rx, ring)
-}
 
 #[cfg(target_os = "linux")]
 fn io_thread_main_with_ring(

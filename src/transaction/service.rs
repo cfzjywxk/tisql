@@ -18,7 +18,6 @@
 //! state held in `TxnCtx` and passed to each operation.
 
 use std::collections::BTreeMap;
-use std::future::Future;
 use std::ops::Range;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
@@ -536,8 +535,7 @@ impl<S: TxnStoragePort, L: ClogService + 'static, T: TsoService> TransactionServ
                     owner_start_ts: actual_owner,
                 }) => {
                     return Err(TiSqlError::Internal(format!(
-                        "statement rollback restore owner mismatch for key {:?}: expected owner {}, found {}",
-                        key, owner_start_ts, actual_owner
+                        "statement rollback restore owner mismatch for key {key:?}: expected owner {owner_start_ts}, found {actual_owner}"
                     )));
                 }
                 Err(err)
@@ -558,6 +556,7 @@ impl<S: TxnStoragePort, L: ClogService + 'static, T: TsoService> TransactionServ
     ///
     /// This should be called at startup to rebuild the in-memory state
     /// from the durable commit log.
+    #[cfg_attr(not(test), allow(dead_code))]
     pub(crate) fn recover(&self, entries: &[ClogEntry]) -> Result<RecoveryStats>
     where
         S: TxnStorageRecoveryPort,
@@ -984,8 +983,7 @@ impl<S: TxnStoragePort + 'static, L: ClogService + 'static, T: TsoService> TxnSe
         for (key, previous) in restore_entries {
             ctx.mutations.get(&key).ok_or_else(|| {
                 TiSqlError::Internal(format!(
-                    "statement rollback missing current mutation for key {:?}",
-                    key
+                    "statement rollback missing current mutation for key {key:?}"
                 ))
             })?;
             self.restore_pending_same_owner(&key, &previous, ctx.start_ts)
@@ -996,8 +994,7 @@ impl<S: TxnStoragePort + 'static, L: ClogService + 'static, T: TsoService> TxnSe
         for key in &absent_entries {
             ctx.mutations.get(key).ok_or_else(|| {
                 TiSqlError::Internal(format!(
-                    "statement rollback missing current mutation for key {:?}",
-                    key
+                    "statement rollback missing current mutation for key {key:?}"
                 ))
             })?;
         }
@@ -1306,32 +1303,30 @@ impl<C: TxnStorageScanCursor> TxnScanCursorAdapter<C> {
 }
 
 impl<C: TxnStorageScanCursor> TxnScanCursor for TxnScanCursorAdapter<C> {
-    fn advance(&mut self) -> impl Future<Output = Result<()>> + Send + '_ {
-        async move {
-            let mut conflict_backoff = ConflictBackoff::new(self.conflict_wait_config);
-            loop {
-                match self.cursor.next_step().await? {
-                    TxnStorageScanStep::Entry(entry) => match entry.state {
-                        TxnStorageVisibleState::Value(value) => {
-                            self.current = Some(TxnScanEntry {
-                                user_key: entry.user_key,
-                                value,
-                            });
-                            return Ok(());
-                        }
-                        TxnStorageVisibleState::Deleted => continue,
-                    },
-                    TxnStorageScanStep::Blocked(_) => match conflict_backoff.wait_next().await {
-                        ConflictWaitOutcome::RetryNow => continue,
-                        ConflictWaitOutcome::TimedOut => {
-                            self.current = None;
-                            return Err(TiSqlError::LockWaitTimeout);
-                        }
-                    },
-                    TxnStorageScanStep::Exhausted => {
-                        self.current = None;
+    async fn advance(&mut self) -> Result<()> {
+        let mut conflict_backoff = ConflictBackoff::new(self.conflict_wait_config);
+        loop {
+            match self.cursor.next_step().await? {
+                TxnStorageScanStep::Entry(entry) => match entry.state {
+                    TxnStorageVisibleState::Value(value) => {
+                        self.current = Some(TxnScanEntry {
+                            user_key: entry.user_key,
+                            value,
+                        });
                         return Ok(());
                     }
+                    TxnStorageVisibleState::Deleted => continue,
+                },
+                TxnStorageScanStep::Blocked(_) => match conflict_backoff.wait_next().await {
+                    ConflictWaitOutcome::RetryNow => continue,
+                    ConflictWaitOutcome::TimedOut => {
+                        self.current = None;
+                        return Err(TiSqlError::LockWaitTimeout);
+                    }
+                },
+                TxnStorageScanStep::Exhausted => {
+                    self.current = None;
+                    return Ok(());
                 }
             }
         }
@@ -1343,6 +1338,7 @@ impl<C: TxnStorageScanCursor> TxnScanCursor for TxnScanCursorAdapter<C> {
 }
 
 /// Statistics from recovery
+#[cfg_attr(not(test), allow(dead_code))]
 #[derive(Default, Debug)]
 pub struct RecoveryStats {
     /// Number of committed transactions
@@ -1355,9 +1351,11 @@ pub struct RecoveryStats {
     pub rolled_back_entries: u64,
     /// Reserved for future recovery-shape validation diagnostics.
     /// Under per-transaction LSN, this is currently expected to stay 0.
+    #[allow(dead_code)]
     pub post_commit_ops: u64,
 }
 
+#[cfg_attr(not(test), allow(dead_code))]
 impl RecoveryStats {
     /// Total operations applied
     pub fn total_applied(&self) -> u64 {
@@ -1386,6 +1384,7 @@ mod tests {
     use crate::transaction::{TxnScanCursor, TxnService as PublicTxnService};
     use crate::tso::LocalTso;
     use std::collections::VecDeque;
+    use std::future::Future;
     use std::sync::atomic::Ordering as AtomicOrdering;
     use std::time::Duration;
     use tempfile::tempdir;
@@ -1516,11 +1515,11 @@ mod tests {
     }
 
     impl TxnStorageScanCursor for MockScanCursor {
-        fn next_step(&mut self) -> impl Future<Output = Result<TxnStorageScanStep>> + Send + '_ {
-            std::future::ready(Ok(self
+        async fn next_step(&mut self) -> Result<TxnStorageScanStep> {
+            Ok(self
                 .steps
                 .pop_front()
-                .unwrap_or(TxnStorageScanStep::Exhausted)))
+                .unwrap_or(TxnStorageScanStep::Exhausted))
         }
     }
 
@@ -1549,13 +1548,12 @@ mod tests {
             unreachable!("mock scan storage does not stage writes")
         }
 
-        fn stage_delete<'a>(
+        async fn stage_delete<'a>(
             &'a self,
             _key: &'a [u8],
             _owner_start_ts: Timestamp,
-        ) -> impl Future<Output = std::result::Result<TxnDeleteEffect, TxnStageError>> + Send + 'a
-        {
-            async move { unreachable!("mock scan storage does not stage writes") }
+        ) -> std::result::Result<TxnDeleteEffect, TxnStageError> {
+            unreachable!("mock scan storage does not stage writes")
         }
 
         fn stage_lock(

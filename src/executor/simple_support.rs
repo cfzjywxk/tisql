@@ -1288,8 +1288,8 @@ mod tests {
             combine_lower_logical(Some(lower_a.clone()), lower_b.clone()).unwrap(),
             lower_b
         );
-        assert_eq!(
-            combine_upper_logical(
+        assert!(
+            !combine_upper_logical(
                 Some(ScanBound {
                     values: vec![Value::Int(5)],
                     inclusive: true,
@@ -1300,8 +1300,7 @@ mod tests {
                 },
             )
             .unwrap()
-            .inclusive,
-            false
+            .inclusive
         );
 
         let table = int_pk_table();

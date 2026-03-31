@@ -2159,7 +2159,7 @@ mod tests {
                     output.row,
                     Some(vec![Value::String("alice".into()), Value::BigInt(42)])
                 );
-                assert!(output.profile.backend_us <= u64::MAX);
+                let _ = output.profile.backend_us;
             }
             ShortPointGetExecOutcome::Fallback(reason) => {
                 panic!("unexpected short-path fallback: {reason:?}");

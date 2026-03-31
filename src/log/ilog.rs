@@ -383,15 +383,7 @@ impl IlogService {
         Ok(lsn)
     }
 
-    fn recover_manifest(&self) -> Result<RecoveredManifest> {
-        let records = self.read_all_records()?;
-        Self::replay_records(&records)
-    }
-
-    #[deprecated(
-        note = "Legacy helper replays the entire ilog from disk. Use ManifestCoordinator exact op_id tracking instead."
-    )]
-    fn find_pending_flush_op_id(&self, sst_id: u64) -> Result<Lsn> {
+    fn replay_pending_flush_op_id(&self, sst_id: u64) -> Result<Lsn> {
         self.recover_manifest()?
             .pending_intents
             .into_iter()
@@ -404,14 +396,11 @@ impl IlogService {
                 _ => None,
             })
             .ok_or_else(|| {
-                TiSqlError::Internal(format!("No pending flush intent found for SST {}", sst_id))
+                TiSqlError::Internal(format!("No pending flush intent found for SST {sst_id}"))
             })
     }
 
-    #[deprecated(
-        note = "Legacy helper replays the entire ilog from disk. Use ManifestCoordinator exact op_id tracking instead."
-    )]
-    fn find_pending_compact_op_id(&self, output_sst_ids: &[u64]) -> Result<Lsn> {
+    fn replay_pending_compact_op_id(&self, output_sst_ids: &[u64]) -> Result<Lsn> {
         self.recover_manifest()?
             .pending_intents
             .into_iter()
@@ -425,10 +414,77 @@ impl IlogService {
             })
             .ok_or_else(|| {
                 TiSqlError::Internal(format!(
-                    "No pending compaction intent found for output SSTs {:?}",
-                    output_sst_ids
+                    "No pending compaction intent found for output SSTs {output_sst_ids:?}"
                 ))
             })
+    }
+
+    async fn legacy_write_flush_commit_async(
+        &self,
+        sst_meta: SstMeta,
+        flushed_lsn: Lsn,
+    ) -> Result<Lsn> {
+        let op_id = self.replay_pending_flush_op_id(sst_meta.id)?;
+        let commit = RecordedManifestCommit::from_request(
+            op_id,
+            ManifestCommitRequest::Flush {
+                sst: (&sst_meta).into(),
+                flushed_lsn,
+            },
+        );
+        let lsn = self.append_commit_record(&commit).await?;
+        log_trace!(
+            "Wrote FlushCommit: lsn={}, flushed_lsn={}",
+            lsn,
+            flushed_lsn
+        );
+        Ok(lsn)
+    }
+
+    async fn legacy_write_compact_commit_async(
+        &self,
+        deleted_ssts: Vec<(u32, u64)>,
+        new_ssts: Vec<SstMeta>,
+    ) -> Result<Lsn> {
+        let output_sst_ids: Vec<u64> = new_ssts.iter().map(|sst| sst.id).collect();
+        let op_id = self.replay_pending_compact_op_id(&output_sst_ids)?;
+        let commit = RecordedManifestCommit::from_request(
+            op_id,
+            ManifestCommitRequest::Compact {
+                deleted_ssts,
+                new_ssts: new_ssts.iter().map(|sst| sst.into()).collect(),
+            },
+        );
+        let lsn = self.append_commit_record(&commit).await?;
+        log_trace!("Wrote CompactCommit: lsn={}", lsn);
+        Ok(lsn)
+    }
+
+    fn legacy_write_checkpoint_result(&self, _version: &Version) -> Result<Lsn> {
+        Err(TiSqlError::Internal(
+            "Legacy write_checkpoint_async no longer captures pending intents; use ManifestLog::write_checkpoint with a ManifestCheckpoint".into(),
+        ))
+    }
+
+    fn recover_manifest(&self) -> Result<RecoveredManifest> {
+        let records = self.read_all_records()?;
+        Self::replay_records(&records)
+    }
+
+    #[deprecated(
+        note = "Legacy helper replays the entire ilog from disk. Use ManifestCoordinator exact op_id tracking instead."
+    )]
+    #[allow(dead_code)]
+    fn find_pending_flush_op_id(&self, sst_id: u64) -> Result<Lsn> {
+        self.replay_pending_flush_op_id(sst_id)
+    }
+
+    #[deprecated(
+        note = "Legacy helper replays the entire ilog from disk. Use ManifestCoordinator exact op_id tracking instead."
+    )]
+    #[allow(dead_code)]
+    fn find_pending_compact_op_id(&self, output_sst_ids: &[u64]) -> Result<Lsn> {
+        self.replay_pending_compact_op_id(output_sst_ids)
     }
 
     /// Write a flush intent record asynchronously.
@@ -465,21 +521,8 @@ impl IlogService {
         sst_meta: SstMeta,
         flushed_lsn: Lsn,
     ) -> Result<Lsn> {
-        let op_id = self.find_pending_flush_op_id(sst_meta.id)?;
-        let commit = RecordedManifestCommit::from_request(
-            op_id,
-            ManifestCommitRequest::Flush {
-                sst: (&sst_meta).into(),
-                flushed_lsn,
-            },
-        );
-        let lsn = self.append_commit_record(&commit).await?;
-        log_trace!(
-            "Wrote FlushCommit: lsn={}, flushed_lsn={}",
-            lsn,
-            flushed_lsn
-        );
-        Ok(lsn)
+        self.legacy_write_flush_commit_async(sst_meta, flushed_lsn)
+            .await
     }
 
     /// Write a flush commit record.
@@ -489,7 +532,7 @@ impl IlogService {
         note = "Legacy commit wrapper replays the ilog to rediscover op_id. Use ManifestCoordinator::commit_prepared instead."
     )]
     pub fn write_flush_commit(&self, sst_meta: SstMeta, flushed_lsn: Lsn) -> Result<Lsn> {
-        crate::io::block_on_sync(self.write_flush_commit_async(sst_meta, flushed_lsn))
+        crate::io::block_on_sync(self.legacy_write_flush_commit_async(sst_meta, flushed_lsn))
     }
 
     /// Write a compact intent record asynchronously.
@@ -536,18 +579,8 @@ impl IlogService {
         deleted_ssts: Vec<(u32, u64)>,
         new_ssts: Vec<SstMeta>,
     ) -> Result<Lsn> {
-        let output_sst_ids: Vec<u64> = new_ssts.iter().map(|sst| sst.id).collect();
-        let op_id = self.find_pending_compact_op_id(&output_sst_ids)?;
-        let commit = RecordedManifestCommit::from_request(
-            op_id,
-            ManifestCommitRequest::Compact {
-                deleted_ssts,
-                new_ssts: new_ssts.iter().map(|sst| sst.into()).collect(),
-            },
-        );
-        let lsn = self.append_commit_record(&commit).await?;
-        log_trace!("Wrote CompactCommit: lsn={}", lsn);
-        Ok(lsn)
+        self.legacy_write_compact_commit_async(deleted_ssts, new_ssts)
+            .await
     }
 
     /// Write a compact commit record.
@@ -561,17 +594,15 @@ impl IlogService {
         deleted_ssts: Vec<(u32, u64)>,
         new_ssts: Vec<SstMeta>,
     ) -> Result<Lsn> {
-        crate::io::block_on_sync(self.write_compact_commit_async(deleted_ssts, new_ssts))
+        crate::io::block_on_sync(self.legacy_write_compact_commit_async(deleted_ssts, new_ssts))
     }
 
     /// Write a checkpoint record asynchronously.
     #[deprecated(
         note = "Legacy checkpoint API cannot capture pending intents. Use ManifestLog::write_checkpoint with a ManifestCheckpoint built from coordinator state."
     )]
-    pub async fn write_checkpoint_async(&self, _version: &Version) -> Result<Lsn> {
-        Err(TiSqlError::Internal(
-            "Legacy write_checkpoint_async no longer captures pending intents; use ManifestLog::write_checkpoint with a ManifestCheckpoint".into(),
-        ))
+    pub async fn write_checkpoint_async(&self, version: &Version) -> Result<Lsn> {
+        self.legacy_write_checkpoint_result(version)
     }
 
     /// Write a checkpoint record.
@@ -581,7 +612,7 @@ impl IlogService {
         note = "Legacy checkpoint API cannot capture pending intents. Use ManifestLog::write_checkpoint with a ManifestCheckpoint built from coordinator state."
     )]
     pub fn write_checkpoint(&self, version: &Version) -> Result<Lsn> {
-        crate::io::block_on_sync(self.write_checkpoint_async(version))
+        self.legacy_write_checkpoint_result(version)
     }
 
     /// Sync the log to disk asynchronously.
@@ -1140,32 +1171,23 @@ impl IlogService {
 }
 
 impl ManifestLog for IlogService {
-    fn append_intent<'a>(
+    async fn append_intent<'a>(
         &'a self,
         req: &'a ManifestIntentRequest,
-    ) -> impl std::future::Future<Output = Result<RecordedManifestIntent>> + Send + 'a {
-        async move { self.append_intent_record(req).await }
+    ) -> Result<RecordedManifestIntent> {
+        self.append_intent_record(req).await
     }
 
-    fn append_commit<'a>(
-        &'a self,
-        commit: &'a RecordedManifestCommit,
-    ) -> impl std::future::Future<Output = Result<Lsn>> + Send + 'a {
-        async move { self.append_commit_record(commit).await }
+    async fn append_commit<'a>(&'a self, commit: &'a RecordedManifestCommit) -> Result<Lsn> {
+        self.append_commit_record(commit).await
     }
 
-    fn append_trivial_move<'a>(
-        &'a self,
-        edit: &'a TrivialMoveEdit,
-    ) -> impl std::future::Future<Output = Result<Lsn>> + Send + 'a {
-        async move { self.append_trivial_move_record(edit).await }
+    async fn append_trivial_move<'a>(&'a self, edit: &'a TrivialMoveEdit) -> Result<Lsn> {
+        self.append_trivial_move_record(edit).await
     }
 
-    fn write_checkpoint<'a>(
-        &'a self,
-        checkpoint: &'a ManifestCheckpoint,
-    ) -> impl std::future::Future<Output = Result<Lsn>> + Send + 'a {
-        async move { self.write_manifest_checkpoint_async(checkpoint).await }
+    async fn write_checkpoint<'a>(&'a self, checkpoint: &'a ManifestCheckpoint) -> Result<Lsn> {
+        self.write_manifest_checkpoint_async(checkpoint).await
     }
 
     fn needs_checkpoint(&self) -> bool {
@@ -1194,6 +1216,7 @@ fn crc32(data: &[u8]) -> u32 {
 }
 
 #[cfg(test)]
+#[allow(deprecated)]
 mod tests {
     use super::*;
     use crate::kernel::manifest::{

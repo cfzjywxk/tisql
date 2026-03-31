@@ -35,6 +35,10 @@ const SYS_TABLE_ID: u64 = 1;
 use tisql::catalog::types::Timestamp;
 use tisql::tablet::{is_tombstone, MvccIterator, MvccKey};
 
+type TestTxnService = TransactionService<TabletTxnStorage<LsmEngine>, FileClogService, LocalTso>;
+type TestTxnEnv = (Arc<LsmEngine>, TestTxnService, Arc<FileClogService>);
+type RecoveredTxnEnv = (Arc<LsmEngine>, TestTxnService);
+
 /// Helper: get value at read_ts from LsmEngine (for verification after recovery).
 async fn get_value(engine: &LsmEngine, key: &[u8], read_ts: Timestamp) -> Option<Vec<u8>> {
     let seek_key = MvccKey::encode(key, read_ts);
@@ -67,13 +71,7 @@ fn make_test_io() -> std::sync::Arc<tisql::io::IoService> {
 
 /// Create a fresh LsmEngine + TransactionService environment.
 /// Uses `Handle::current()` for the clog GroupCommitWriter (spawn_blocking).
-fn create_txn_env(
-    dir: &Path,
-) -> (
-    Arc<LsmEngine>,
-    TransactionService<TabletTxnStorage<LsmEngine>, FileClogService, LocalTso>,
-    Arc<FileClogService>,
-) {
+fn create_txn_env(dir: &Path) -> TestTxnEnv {
     let handle = tokio::runtime::Handle::current();
     let lsn_provider = new_lsn_provider();
     let lsm_config = LsmConfig::builder(dir)
@@ -111,12 +109,7 @@ fn create_txn_env(
 }
 
 /// Recover from a data directory, returning a fresh LsmEngine + TransactionService.
-fn recover_txn_env(
-    dir: &Path,
-) -> (
-    Arc<LsmEngine>,
-    TransactionService<TabletTxnStorage<LsmEngine>, FileClogService, LocalTso>,
-) {
+fn recover_txn_env(dir: &Path) -> RecoveredTxnEnv {
     let handle = tokio::runtime::Handle::current();
     let recovery = LsmRecovery::new(dir);
     let result = recovery.recover(&handle).unwrap();

@@ -21,10 +21,12 @@ BEGIN;
 --error 1205
 --error_kind LockWaitTimeout
 UPDATE lock_release_test SET val = 's2_attempt1' WHERE id = 1;
+ROLLBACK;
 BEGIN;
 --error 1205
 --error_kind LockWaitTimeout
 UPDATE lock_release_test SET val = 's2_attempt2' WHERE id = 2;
+ROLLBACK;
 
 # Session s2: Session remains usable after timeout cleanup
 SELECT 1;
