@@ -174,18 +174,30 @@ impl LsmRecovery {
         self,
         io_handle: &tokio::runtime::Handle,
     ) -> Result<RecoveryBootstrap> {
+        self.recover_bootstrap_with_storage_io(io_handle, false)
+    }
+
+    pub fn recover_bootstrap_with_storage_io(
+        self,
+        io_handle: &tokio::runtime::Handle,
+        use_sync_storage_io: bool,
+    ) -> Result<RecoveryBootstrap> {
         let mut stats = RecoveryStats::default();
 
         // Create shared LSN provider
         let lsn_provider = new_lsn_provider();
 
         // Shared IoService for storage-side io_uring users (ilog + LSM reads/writes).
-        let storage_io_service =
-            crate::io::IoService::new_with_role(STORAGE_IO_RING_SIZE, "storage").map_err(|e| {
-                crate::util::error::TiSqlError::Storage(format!(
-                    "Failed to create storage IoService: {e}"
-                ))
-            })?;
+        let storage_io_service = if use_sync_storage_io {
+            crate::io::IoService::new_sync_with_role(STORAGE_IO_RING_SIZE, "storage-test")
+        } else {
+            crate::io::IoService::new_with_role(STORAGE_IO_RING_SIZE, "storage")
+        }
+        .map_err(|e| {
+            crate::util::error::TiSqlError::Storage(format!(
+                "Failed to create storage IoService: {e}"
+            ))
+        })?;
 
         // Step 1: Recover ilog to rebuild Version
         log_info!(
@@ -645,10 +657,13 @@ mod tests {
     use super::*;
     use crate::catalog::types::RawValue;
     use crate::clog::{ClogBatch, ClogEntry, ClogOp, ClogService};
+    use crate::inner_table::core_tables::USER_TABLE_ID_START;
     use crate::log::ilog::IlogService;
     use crate::tablet::mvcc::{is_tombstone, MvccIterator, MvccKey};
     use crate::tablet::version::Version;
     use crate::tablet::StorageEngine;
+    use crate::tablet::{route_index_to_tablet, route_table_to_tablet};
+    use crate::util::codec::key::{encode_index_seek_key, encode_record_key_with_handle};
     use tempfile::TempDir;
 
     fn make_test_io() -> Arc<crate::io::IoService> {
@@ -752,6 +767,96 @@ mod tests {
             Some(value),
             "Data should survive flush after empty recovery"
         );
+    }
+
+    #[test]
+    fn test_recovery_infer_logical_tablet_from_encoded_key_routes_record_index_and_fallback() {
+        let record_key = encode_record_key_with_handle(USER_TABLE_ID_START, 7);
+        assert_eq!(
+            infer_logical_tablet_from_encoded_key(&record_key),
+            route_table_to_tablet(USER_TABLE_ID_START)
+        );
+
+        let index_key = encode_index_seek_key(USER_TABLE_ID_START, 21, b"idx");
+        assert_eq!(
+            infer_logical_tablet_from_encoded_key(&index_key),
+            route_index_to_tablet(USER_TABLE_ID_START, 21)
+        );
+
+        let system_key = encode_record_key_with_handle(1, 9);
+        assert_eq!(
+            infer_logical_tablet_from_encoded_key(&system_key),
+            TabletId::System
+        );
+        assert_eq!(infer_logical_tablet_from_encoded_key(b"not-a-key"), TabletId::System);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn test_recover_tablet_with_template_uses_tablet_dir_state() {
+        let tmp = TempDir::new().unwrap();
+        let tablet_dir = tmp.path().join("tablets").join("t_recover");
+        std::fs::create_dir_all(&tablet_dir).unwrap();
+        let io_handle = tokio::runtime::Handle::current();
+
+        let lsn_provider = new_lsn_provider();
+        let io = make_test_io();
+        let ilog = Arc::new(
+            IlogService::open(
+                IlogConfig::new(&tablet_dir),
+                Arc::clone(&lsn_provider),
+                Arc::clone(&io),
+                &io_handle,
+            )
+            .unwrap(),
+        );
+        let engine = LsmEngine::open_with_recovery(
+            LsmConfig::new(&tablet_dir),
+            Arc::clone(&lsn_provider),
+            Arc::clone(&ilog),
+            Version::new(),
+            Arc::clone(&io),
+        )
+        .unwrap();
+
+        let key = encode_record_key_with_handle(USER_TABLE_ID_START, 77);
+        let value = b"tablet-value".to_vec();
+        let mut batch = WriteBatch::new();
+        batch.put(key.clone(), value.clone());
+        batch.set_commit_ts(55);
+        batch.set_clog_lsn(9);
+        engine.write_batch(batch).unwrap();
+        engine.flush_all_with_active().unwrap();
+        drop(engine);
+        drop(ilog);
+
+        let wrong_dir = tmp.path().join("wrong-template-root");
+        let template = LsmConfig::builder(&wrong_dir)
+            .memtable_size(64)
+            .max_frozen_memtables(2)
+            .build()
+            .unwrap();
+
+        let recovered = LsmRecovery::recover_tablet_with_template(
+            &tablet_dir,
+            lsn_provider,
+            io,
+            &io_handle,
+            &template,
+        )
+        .unwrap();
+
+        assert_eq!(get_for_test(&recovered.engine, &key).await, Some(value));
+        assert_eq!(recovered.max_ts_from_ssts, 55);
+        assert_eq!(recovered.orphan_ssts_cleaned, 0);
+
+        let recovered_default = LsmRecovery::recover_tablet(
+            &tablet_dir,
+            new_lsn_provider(),
+            make_test_io(),
+            &io_handle,
+        )
+        .unwrap();
+        assert_eq!(get_for_test(&recovered_default.engine, &key).await, Some(b"tablet-value".to_vec()));
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

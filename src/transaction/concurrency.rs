@@ -268,4 +268,14 @@ mod tests {
         cm.remove_txn(start_ts);
         assert_eq!(cm.get_txn_state(start_ts), None);
     }
+
+    #[test]
+    fn test_default_and_set_preparing() {
+        let cm = ConcurrencyManager::default();
+        assert_eq!(cm.max_ts(), 0);
+
+        cm.register_txn(300);
+        cm.set_preparing_txn(300).unwrap();
+        assert_eq!(cm.get_txn_state(300), Some(TxnState::Preparing));
+    }
 }

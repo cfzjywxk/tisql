@@ -124,6 +124,85 @@ mod crud {
             .await
             .check(rows![["1"], ["2"]]);
     }
+
+    #[tokio::test]
+    async fn test_explicit_scan_update_and_delete_partial_matches() {
+        let tk = TestKit::new();
+
+        tk.must_exec("CREATE TABLE t (id INT PRIMARY KEY, v INT, txt VARCHAR(16))")
+            .await;
+        tk.must_exec("INSERT INTO t VALUES (1, 5, 'a'), (2, 15, 'b'), (3, 25, 'c')")
+            .await;
+
+        let db = tk.db();
+        let mut session = tisql::Session::new();
+        db.execute_query_with_session("BEGIN", &mut session)
+            .await
+            .unwrap();
+        db.execute_query_with_session(
+            "UPDATE t SET txt = 'hot', v = v + 1 WHERE v >= 15",
+            &mut session,
+        )
+        .await
+        .unwrap();
+        db.execute_query_with_session("DELETE FROM t WHERE v >= 26", &mut session)
+            .await
+            .unwrap();
+        db.execute_query_with_session("COMMIT", &mut session)
+            .await
+            .unwrap();
+
+        tk.must_query("SELECT id, v, txt FROM t ORDER BY id")
+            .await
+            .check(rows![["1", "5", "a"], ["2", "16", "hot"]]);
+    }
+
+    #[tokio::test]
+    async fn test_explicit_point_update_and_delete_non_matching_filters_are_noops() {
+        let tk = TestKit::new();
+
+        tk.must_exec("CREATE TABLE t (id INT PRIMARY KEY, v INT, txt VARCHAR(16))")
+            .await;
+        tk.must_exec("INSERT INTO t VALUES (1, 5, 'a')").await;
+
+        let db = tk.db();
+        let mut session = tisql::Session::new();
+        db.execute_query_with_session("BEGIN", &mut session)
+            .await
+            .unwrap();
+
+        match db
+            .execute_query_with_session(
+                "DELETE FROM t WHERE id = 1 AND txt = 'missing'",
+                &mut session,
+            )
+            .await
+            .unwrap()
+        {
+            tisql::QueryResult::Affected(rows) => assert_eq!(rows, 0),
+            other => panic!("expected affected rows for DELETE, got {other:?}"),
+        }
+
+        match db
+            .execute_query_with_session(
+                "UPDATE t SET v = 99 WHERE id = 1 AND txt = 'missing'",
+                &mut session,
+            )
+            .await
+            .unwrap()
+        {
+            tisql::QueryResult::Affected(rows) => assert_eq!(rows, 0),
+            other => panic!("expected affected rows for UPDATE, got {other:?}"),
+        }
+
+        db.execute_query_with_session("COMMIT", &mut session)
+            .await
+            .unwrap();
+
+        tk.must_query("SELECT id, v, txt FROM t")
+            .await
+            .check(rows![["1", "5", "a"]]);
+    }
 }
 
 /// SELECT operation tests
@@ -184,6 +263,28 @@ mod select {
         tk.must_query("SELECT c, b, a FROM t")
             .await
             .check(rows![["3", "2", "1"]]);
+    }
+
+    #[tokio::test]
+    async fn test_projection_scan_empty_pk_range_and_point_miss() {
+        let tk = TestKit::new();
+
+        tk.must_exec("CREATE TABLE t (id INT PRIMARY KEY, v INT, txt VARCHAR(16))")
+            .await;
+        tk.must_exec("INSERT INTO t VALUES (1, 5, 'a'), (2, 15, 'b'), (3, 25, 'c')")
+            .await;
+
+        tk.must_query("SELECT txt FROM t WHERE v >= 15 ORDER BY id")
+            .await
+            .check(rows![["b"], ["c"]]);
+
+        tk.must_query("SELECT txt FROM t WHERE id > 10 AND id < 5 ORDER BY id")
+            .await
+            .check(rows![]);
+
+        tk.must_query("SELECT txt FROM t WHERE id = 99")
+            .await
+            .check(rows![]);
     }
 
     #[tokio::test]
@@ -332,6 +433,17 @@ mod ddl {
         tk.must_exec("DROP TABLE IF EXISTS t").await.check_ok();
         tk.must_exec("DROP TABLE IF EXISTS t").await.check_ok();
     }
+
+    #[tokio::test]
+    async fn test_create_table_requires_primary_key() {
+        let tk = TestKit::new();
+
+        let err = tk.must_exec_err("CREATE TABLE no_pk (v INT)").await;
+        assert!(
+            err.contains("PRIMARY KEY") || err.contains("primary key"),
+            "Error: {err}"
+        );
+    }
 }
 
 /// Data type tests
@@ -366,6 +478,27 @@ mod data_types {
         tk.must_query("SELECT c, vc, txt FROM t")
             .await
             .check(rows![["hello", "world", "long text content"]]);
+    }
+
+    #[tokio::test]
+    async fn test_insert_and_update_casts_follow_column_types() {
+        let tk = TestKit::new();
+
+        tk.must_exec("CREATE TABLE t (id INT PRIMARY KEY, txt VARCHAR(16), n SMALLINT)")
+            .await;
+        tk.must_exec("INSERT INTO t VALUES (1, 10, 20), (2, 30, 40)")
+            .await;
+
+        tk.must_query("SELECT id, txt, n FROM t ORDER BY id")
+            .await
+            .check(rows![["1", "10", "20"], ["2", "30", "40"]]);
+
+        tk.must_exec("UPDATE t SET txt = 99, n = '7' WHERE id = 1")
+            .await
+            .check_affected(1);
+        tk.must_query("SELECT txt, n FROM t WHERE id = 1")
+            .await
+            .check(rows![["99", "7"]]);
     }
 
     #[tokio::test]
@@ -418,11 +551,103 @@ mod expressions {
     }
 
     #[tokio::test]
+    async fn test_aggregate_functions_and_empty_input() {
+        let tk = TestKit::new();
+
+        tk.must_exec("CREATE TABLE t (id INT PRIMARY KEY, v INT)")
+            .await;
+        tk.must_exec("INSERT INTO t VALUES (1, 10), (2, NULL), (3, 20)")
+            .await;
+
+        tk.must_query("SELECT COUNT(v), SUM(v), AVG(v), MIN(v), MAX(v) FROM t")
+            .await
+            .check(rows![["2", "30", "15", "10", "20"]]);
+        tk.must_query("SELECT COUNT(v), SUM(v), AVG(v), MIN(v), MAX(v) FROM t WHERE id > 100")
+            .await
+            .check(rows![["0", "NULL", "NULL", "NULL", "NULL"]]);
+    }
+
+    #[tokio::test]
+    async fn test_reversed_numeric_and_string_pk_range_predicates() {
+        let tk = TestKit::new();
+
+        tk.must_exec("CREATE TABLE t_num (id INT PRIMARY KEY, v INT)")
+            .await;
+        tk.must_exec("INSERT INTO t_num VALUES (1, 10), (2, 20), (3, 30), (4, 40)")
+            .await;
+        tk.must_query("SELECT id FROM t_num WHERE 2 <= id AND 4 > id ORDER BY id")
+            .await
+            .check(rows![["2"], ["3"]]);
+        tk.must_query("SELECT id FROM t_num WHERE 3 > id ORDER BY id")
+            .await
+            .check(rows![["1"], ["2"]]);
+
+        tk.must_exec("CREATE TABLE t_str (id VARCHAR(10) PRIMARY KEY, v INT)")
+            .await;
+        tk.must_exec("INSERT INTO t_str VALUES ('a', 1), ('b', 2), ('c', 3), ('d', 4)")
+            .await;
+        tk.must_query("SELECT id FROM t_str WHERE id >= 'b' AND 'd' > id ORDER BY id")
+            .await
+            .check(rows![["b"], ["c"]]);
+    }
+
+    #[tokio::test]
     async fn test_negative_numbers() {
         let tk = TestKit::new();
 
         tk.must_query("SELECT -5").await.check(rows![["-5"]]);
         tk.must_query("SELECT 0 - 10").await.check(rows![["-10"]]);
+    }
+}
+
+mod auto_increment {
+    use super::*;
+
+    #[tokio::test]
+    async fn test_auto_increment_validation_and_overflow_errors() {
+        let tk = TestKit::new();
+
+        tk.must_exec("CREATE TABLE ai_big (id BIGINT NOT NULL AUTO_INCREMENT PRIMARY KEY, v INT)")
+            .await;
+        tk.must_exec("INSERT INTO ai_big (id, v) VALUES (9223372036854775807, 1)")
+            .await;
+        let overflow_err = tk.must_exec_err("INSERT INTO ai_big (v) VALUES (2)").await;
+        assert!(
+            overflow_err.contains("overflow"),
+            "unexpected bigint overflow error: {overflow_err}"
+        );
+
+        let type_err = tk
+            .must_exec_err(
+                "CREATE TABLE ai_tiny (id TINYINT NOT NULL AUTO_INCREMENT PRIMARY KEY, v INT)",
+            )
+            .await;
+        assert!(
+            type_err.contains("INT/BIGINT")
+                || type_err.contains("INT or BIGINT")
+                || type_err.contains("supported"),
+            "unexpected auto_increment type error: {type_err}"
+        );
+
+        tk.must_exec("CREATE TABLE ai_int (id INT NOT NULL AUTO_INCREMENT PRIMARY KEY, v INT)")
+            .await;
+        let explicit_type_err = tk
+            .must_exec_err("INSERT INTO ai_int (id, v) VALUES ('oops', 1)")
+            .await;
+        assert!(
+            explicit_type_err.contains("INT/BIGINT")
+                || explicit_type_err.contains("Type mismatch")
+                || explicit_type_err.contains("Cannot"),
+            "unexpected explicit auto_increment type error: {explicit_type_err}"
+        );
+
+        let range_err = tk
+            .must_exec_err("INSERT INTO ai_int (id, v) VALUES (2147483648, 1)")
+            .await;
+        assert!(
+            range_err.contains("INT range") || range_err.contains("out of INT range"),
+            "unexpected explicit auto_increment range error: {range_err}"
+        );
     }
 }
 
@@ -453,24 +678,31 @@ mod errors {
         );
     }
 }
-
-// NOTE: The following tests document known limitations in the current implementation:
-// 1. Aggregate functions (COUNT, SUM, AVG, MIN, MAX) do not properly collapse rows
-// 2. UPDATE with expression (val = val + 1) has issues with row key generation
-// These behaviors are captured by E2E tests in tests/integrationtest/ for regression detection.
-
 /// Persistence tests - verify data and catalog survive restart
 mod persistence {
     use tempfile::tempdir;
     use tisql::{Database, DatabaseConfig, QueryResult, RuntimeThreadOverrides};
 
     fn persistence_config(path: &std::path::Path) -> DatabaseConfig {
-        DatabaseConfig::with_data_dir(path).with_runtime_threads(RuntimeThreadOverrides {
-            protocol: Some(1),
-            worker: Some(1),
-            background: Some(1),
-            io: Some(1),
-        })
+        DatabaseConfig::with_data_dir(path)
+            .with_storage_sync_io(true)
+            .with_runtime_threads(RuntimeThreadOverrides {
+                protocol: Some(1),
+                worker: Some(1),
+                background: Some(1),
+                io: Some(1),
+            })
+    }
+
+    fn crash_persistence_config(path: &std::path::Path) -> DatabaseConfig {
+        persistence_config(path).with_flush_on_drop(false)
+    }
+
+    fn persistence_runtime() -> tokio::runtime::Runtime {
+        tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap()
     }
 
     #[tokio::test]
@@ -653,28 +885,73 @@ mod persistence {
         }
     }
 
-    /// Test crash recovery without graceful shutdown (simulates kill -9).
-    /// This test does NOT call db.close() to simulate an abrupt crash.
-    #[tokio::test]
-    async fn test_crash_recovery_no_close() {
+    #[test]
+    fn test_drop_flushes_by_default() {
         let dir = tempdir().unwrap();
         let config = persistence_config(dir.path());
+        let runtime = persistence_runtime();
+
+        {
+            let db = Database::open(config.clone()).unwrap();
+            runtime.block_on(async {
+                db.execute_query("CREATE TABLE drop_flush (id INT PRIMARY KEY, v INT)")
+                    .await
+                    .unwrap();
+                db.execute_query("INSERT INTO drop_flush VALUES (1, 10), (2, 20)")
+                    .await
+                    .unwrap();
+            });
+            // Intentionally rely on Drop instead of close().
+        }
+
+        {
+            let db = Database::open(config.clone()).unwrap();
+            let result = runtime
+                .block_on(db.execute_query("SELECT id, v FROM drop_flush ORDER BY id"))
+                .unwrap();
+
+            match result {
+                QueryResult::Rows { data, .. } => {
+                    assert_eq!(
+                        data,
+                        vec![
+                            vec!["1".to_string(), "10".to_string()],
+                            vec!["2".to_string(), "20".to_string()],
+                        ]
+                    );
+                }
+                other => panic!("Expected rows after drop flush, got: {other:?}"),
+            }
+
+            runtime.block_on(db.close()).unwrap();
+        }
+    }
+
+    /// Test crash recovery without graceful shutdown (simulates kill -9).
+    /// This test does NOT call db.close() to simulate an abrupt crash.
+    #[test]
+    fn test_crash_recovery_no_close() {
+        let dir = tempdir().unwrap();
+        let config = crash_persistence_config(dir.path());
+        let runtime = persistence_runtime();
 
         // First session: write data and "crash" (no close)
         {
             let db = Database::open(config.clone()).unwrap();
-            db.execute_query("CREATE TABLE crash_test (id INT PRIMARY KEY, data VARCHAR(100))")
-                .await
-                .unwrap();
-            db.execute_query("INSERT INTO crash_test VALUES (1, 'first')")
-                .await
-                .unwrap();
-            db.execute_query("INSERT INTO crash_test VALUES (2, 'second')")
-                .await
-                .unwrap();
-            db.execute_query("INSERT INTO crash_test VALUES (3, 'third')")
-                .await
-                .unwrap();
+            runtime.block_on(async {
+                db.execute_query("CREATE TABLE crash_test (id INT PRIMARY KEY, data VARCHAR(100))")
+                    .await
+                    .unwrap();
+                db.execute_query("INSERT INTO crash_test VALUES (1, 'first')")
+                    .await
+                    .unwrap();
+                db.execute_query("INSERT INTO crash_test VALUES (2, 'second')")
+                    .await
+                    .unwrap();
+                db.execute_query("INSERT INTO crash_test VALUES (3, 'third')")
+                    .await
+                    .unwrap();
+            });
             // NO close() - simulate kill -9
             // Database is dropped here, but close() is not called
         }
@@ -683,9 +960,8 @@ mod persistence {
         {
             let db = Database::open(config.clone()).unwrap();
 
-            let result = db
-                .execute_query("SELECT id, data FROM crash_test ORDER BY id")
-                .await
+            let result = runtime
+                .block_on(db.execute_query("SELECT id, data FROM crash_test ORDER BY id"))
                 .unwrap();
             match result {
                 QueryResult::Rows { data, columns } => {
@@ -700,41 +976,40 @@ mod persistence {
                 }
                 other => panic!("Expected rows, got: {other:?}"),
             }
-            db.close().await.unwrap();
+            runtime.block_on(db.close()).unwrap();
         }
     }
 
     /// Test crash recovery with updates and deletes.
-    #[tokio::test]
-    async fn test_crash_recovery_with_updates_deletes() {
+    #[test]
+    fn test_crash_recovery_with_updates_deletes() {
         let dir = tempdir().unwrap();
-        let config = persistence_config(dir.path());
+        let config = crash_persistence_config(dir.path());
+        let runtime = persistence_runtime();
 
         // First session: create, insert, update, delete, then crash
         {
             let db = Database::open(config.clone()).unwrap();
-            db.execute_query("CREATE TABLE modify_test (id INT PRIMARY KEY, value INT)")
-                .await
-                .unwrap();
-            db.execute_query("INSERT INTO modify_test VALUES (1, 100)")
-                .await
-                .unwrap();
-            db.execute_query("INSERT INTO modify_test VALUES (2, 200)")
-                .await
-                .unwrap();
-            db.execute_query("INSERT INTO modify_test VALUES (3, 300)")
-                .await
-                .unwrap();
-
-            // Update id=2
-            db.execute_query("UPDATE modify_test SET value = 999 WHERE id = 2")
-                .await
-                .unwrap();
-
-            // Delete id=1
-            db.execute_query("DELETE FROM modify_test WHERE id = 1")
-                .await
-                .unwrap();
+            runtime.block_on(async {
+                db.execute_query("CREATE TABLE modify_test (id INT PRIMARY KEY, value INT)")
+                    .await
+                    .unwrap();
+                db.execute_query("INSERT INTO modify_test VALUES (1, 100)")
+                    .await
+                    .unwrap();
+                db.execute_query("INSERT INTO modify_test VALUES (2, 200)")
+                    .await
+                    .unwrap();
+                db.execute_query("INSERT INTO modify_test VALUES (3, 300)")
+                    .await
+                    .unwrap();
+                db.execute_query("UPDATE modify_test SET value = 999 WHERE id = 2")
+                    .await
+                    .unwrap();
+                db.execute_query("DELETE FROM modify_test WHERE id = 1")
+                    .await
+                    .unwrap();
+            });
 
             // NO close() - crash
         }
@@ -743,9 +1018,8 @@ mod persistence {
         {
             let db = Database::open(config.clone()).unwrap();
 
-            let result = db
-                .execute_query("SELECT id, value FROM modify_test ORDER BY id")
-                .await
+            let result = runtime
+                .block_on(db.execute_query("SELECT id, value FROM modify_test ORDER BY id"))
                 .unwrap();
             match result {
                 QueryResult::Rows { data, .. } => {
@@ -759,25 +1033,28 @@ mod persistence {
                 }
                 other => panic!("Expected rows, got: {other:?}"),
             }
-            db.close().await.unwrap();
+            runtime.block_on(db.close()).unwrap();
         }
     }
 
     /// Test crash recovery with multiple crash/recover cycles.
-    #[tokio::test]
-    async fn test_multiple_crash_recovery_cycles() {
+    #[test]
+    fn test_multiple_crash_recovery_cycles() {
         let dir = tempdir().unwrap();
-        let config = persistence_config(dir.path());
+        let config = crash_persistence_config(dir.path());
+        let runtime = persistence_runtime();
 
         // Cycle 1: create and insert
         {
             let db = Database::open(config.clone()).unwrap();
-            db.execute_query("CREATE TABLE cycle_test (id INT PRIMARY KEY)")
-                .await
-                .unwrap();
-            db.execute_query("INSERT INTO cycle_test VALUES (1)")
-                .await
-                .unwrap();
+            runtime.block_on(async {
+                db.execute_query("CREATE TABLE cycle_test (id INT PRIMARY KEY)")
+                    .await
+                    .unwrap();
+                db.execute_query("INSERT INTO cycle_test VALUES (1)")
+                    .await
+                    .unwrap();
+            });
             // crash - no close()
         }
 
@@ -786,9 +1063,8 @@ mod persistence {
             let db = Database::open(config.clone()).unwrap();
 
             // Verify cycle 1 data
-            let result = db
-                .execute_query("SELECT id FROM cycle_test ORDER BY id")
-                .await
+            let result = runtime
+                .block_on(db.execute_query("SELECT id FROM cycle_test ORDER BY id"))
                 .unwrap();
             match &result {
                 QueryResult::Rows { data, .. } => {
@@ -798,12 +1074,14 @@ mod persistence {
                 _ => panic!("Expected rows"),
             }
 
-            db.execute_query("INSERT INTO cycle_test VALUES (2)")
-                .await
-                .unwrap();
-            db.execute_query("INSERT INTO cycle_test VALUES (3)")
-                .await
-                .unwrap();
+            runtime.block_on(async {
+                db.execute_query("INSERT INTO cycle_test VALUES (2)")
+                    .await
+                    .unwrap();
+                db.execute_query("INSERT INTO cycle_test VALUES (3)")
+                    .await
+                    .unwrap();
+            });
             // crash - no close()
         }
 
@@ -812,9 +1090,8 @@ mod persistence {
             let db = Database::open(config.clone()).unwrap();
 
             // Verify cycle 1+2 data
-            let result = db
-                .execute_query("SELECT id FROM cycle_test ORDER BY id")
-                .await
+            let result = runtime
+                .block_on(db.execute_query("SELECT id FROM cycle_test ORDER BY id"))
                 .unwrap();
             match &result {
                 QueryResult::Rows { data, .. } => {
@@ -826,9 +1103,11 @@ mod persistence {
                 _ => panic!("Expected rows"),
             }
 
-            db.execute_query("INSERT INTO cycle_test VALUES (4)")
-                .await
-                .unwrap();
+            runtime.block_on(async {
+                db.execute_query("INSERT INTO cycle_test VALUES (4)")
+                    .await
+                    .unwrap();
+            });
             // crash - no close()
         }
 
@@ -836,9 +1115,8 @@ mod persistence {
         {
             let db = Database::open(config.clone()).unwrap();
 
-            let result = db
-                .execute_query("SELECT id FROM cycle_test ORDER BY id")
-                .await
+            let result = runtime
+                .block_on(db.execute_query("SELECT id FROM cycle_test ORDER BY id"))
                 .unwrap();
             match result {
                 QueryResult::Rows { data, .. } => {
@@ -850,38 +1128,43 @@ mod persistence {
                 }
                 other => panic!("Expected rows, got: {other:?}"),
             }
-            db.close().await.unwrap();
+            runtime.block_on(db.close()).unwrap();
         }
     }
 
     /// Test crash during DDL (DROP TABLE) - verify atomicity.
-    #[tokio::test]
-    async fn test_crash_recovery_ddl_drop_table() {
+    #[test]
+    fn test_crash_recovery_ddl_drop_table() {
         let dir = tempdir().unwrap();
-        let config = persistence_config(dir.path());
+        let config = crash_persistence_config(dir.path());
+        let runtime = persistence_runtime();
 
         // Create two tables
         {
             let db = Database::open(config.clone()).unwrap();
-            db.execute_query("CREATE TABLE keep_me (x INT PRIMARY KEY)")
-                .await
-                .unwrap();
-            db.execute_query("INSERT INTO keep_me VALUES (42)")
-                .await
-                .unwrap();
-            db.execute_query("CREATE TABLE drop_me (y INT PRIMARY KEY)")
-                .await
-                .unwrap();
-            db.execute_query("INSERT INTO drop_me VALUES (99)")
-                .await
-                .unwrap();
-            db.close().await.unwrap();
+            runtime.block_on(async {
+                db.execute_query("CREATE TABLE keep_me (x INT PRIMARY KEY)")
+                    .await
+                    .unwrap();
+                db.execute_query("INSERT INTO keep_me VALUES (42)")
+                    .await
+                    .unwrap();
+                db.execute_query("CREATE TABLE drop_me (y INT PRIMARY KEY)")
+                    .await
+                    .unwrap();
+                db.execute_query("INSERT INTO drop_me VALUES (99)")
+                    .await
+                    .unwrap();
+                db.close().await.unwrap();
+            });
         }
 
         // Drop one table and crash
         {
             let db = Database::open(config.clone()).unwrap();
-            db.execute_query("DROP TABLE drop_me").await.unwrap();
+            runtime
+                .block_on(db.execute_query("DROP TABLE drop_me"))
+                .unwrap();
             // crash
         }
 
@@ -890,7 +1173,9 @@ mod persistence {
             let db = Database::open(config.clone()).unwrap();
 
             // keep_me should exist
-            let result = db.execute_query("SELECT x FROM keep_me").await.unwrap();
+            let result = runtime
+                .block_on(db.execute_query("SELECT x FROM keep_me"))
+                .unwrap();
             match result {
                 QueryResult::Rows { data, .. } => {
                     assert_eq!(data[0][0], "42");
@@ -899,13 +1184,13 @@ mod persistence {
             }
 
             // drop_me should not exist
-            let result = db.execute_query("SELECT * FROM drop_me").await;
+            let result = runtime.block_on(db.execute_query("SELECT * FROM drop_me"));
             assert!(
                 result.is_err(),
                 "drop_me should not exist after crash recovery"
             );
 
-            db.close().await.unwrap();
+            runtime.block_on(db.close()).unwrap();
         }
     }
 }

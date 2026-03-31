@@ -277,6 +277,57 @@ mod tests {
     }
 
     #[test]
+    fn test_set_preparing_missing_and_wrong_state_errors() {
+        let cache = TxnStateCache::new();
+
+        let missing = cache.set_preparing(999).unwrap_err();
+        assert!(matches!(
+            missing,
+            TiSqlError::Internal(message) if message.contains("not found")
+        ));
+
+        cache.register(100);
+        cache.prepare(100, 150).unwrap();
+        let wrong_state = cache.set_preparing(100).unwrap_err();
+        assert!(matches!(
+            wrong_state,
+            TiSqlError::Internal(message) if message.contains("expected Running")
+        ));
+    }
+
+    #[test]
+    fn test_prepare_missing_and_wrong_state_errors() {
+        let cache = TxnStateCache::new();
+
+        let missing = cache.prepare(999, 1).unwrap_err();
+        assert!(matches!(
+            missing,
+            TiSqlError::Internal(message) if message.contains("not found")
+        ));
+
+        cache.register(100);
+        cache.prepare(100, 150).unwrap();
+        cache.commit(100, 160).unwrap();
+        let wrong_state = cache.prepare(100, 170).unwrap_err();
+        assert!(matches!(
+            wrong_state,
+            TiSqlError::Internal(message)
+                if message.contains("expected Running or Preparing")
+        ));
+    }
+
+    #[test]
+    fn test_commit_missing_error() {
+        let cache = TxnStateCache::new();
+
+        let err = cache.commit(999, 1).unwrap_err();
+        assert!(matches!(
+            err,
+            TiSqlError::Internal(message) if message.contains("not found")
+        ));
+    }
+
+    #[test]
     fn test_abort_from_running() {
         let cache = TxnStateCache::new();
 
@@ -318,6 +369,17 @@ mod tests {
         cache.abort(100).unwrap(); // Should not fail
 
         assert_eq!(cache.get(100), Some(TxnState::Aborted));
+    }
+
+    #[test]
+    fn test_abort_missing_error() {
+        let cache = TxnStateCache::new();
+
+        let err = cache.abort(999).unwrap_err();
+        assert!(matches!(
+            err,
+            TiSqlError::Internal(message) if message.contains("not found")
+        ));
     }
 
     #[test]
@@ -441,5 +503,12 @@ mod tests {
         cache.abort(100).unwrap();
 
         assert_eq!(cache.get(100), Some(TxnState::Aborted));
+    }
+
+    #[test]
+    fn test_default_cache_is_empty() {
+        let cache = TxnStateCache::default();
+        assert_eq!(cache.len(), 0);
+        assert_eq!(cache.get(1), None);
     }
 }

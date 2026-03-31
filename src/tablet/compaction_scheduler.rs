@@ -464,4 +464,118 @@ mod tests {
 
         scheduler.stop();
     }
+
+    #[test]
+    fn test_wait_for_compaction_count_timeout_and_status_timestamp() {
+        let tmp = TempDir::new().unwrap();
+        let config = test_config(tmp.path());
+        let engine = Arc::new(LsmEngine::open(config).unwrap());
+        let scheduler = CompactionScheduler::new(engine);
+
+        assert!(!scheduler.wait_for_compaction_count(1, Duration::from_millis(1)));
+
+        assert!(CompactionSchedulerInner::now_ms() > 0);
+        scheduler
+            .inner
+            .last_error_ts_ms
+            .store(CompactionSchedulerInner::now_ms(), Ordering::Relaxed);
+        let status = scheduler.status();
+        assert_eq!(status.failed, 0);
+        assert!(status.last_error_ts_ms.is_some());
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn test_compaction_worker_loop_direct_success_and_error_paths() {
+        let success_dir = TempDir::new().unwrap();
+        let success_config = LsmConfig::builder(success_dir.path())
+            .memtable_size(100)
+            .max_frozen_memtables(16)
+            .l0_compaction_trigger(2)
+            .l0_slowdown_trigger(100)
+            .l0_stop_trigger(200)
+            .target_file_size(256)
+            .l1_max_size(4096)
+            .build()
+            .unwrap();
+        let success_engine = Arc::new(LsmEngine::open(success_config).unwrap());
+        for (ts, key) in [(1_u64, b"a".as_slice()), (2_u64, b"b"), (3_u64, b"c")] {
+            let mut batch = WriteBatch::new();
+            batch.set_commit_ts(ts);
+            batch.put(key.to_vec(), vec![b'x'; 48]);
+            success_engine.write_batch(batch).unwrap();
+            success_engine.flush_all_with_active().unwrap();
+        }
+
+        let success_scheduler = CompactionScheduler::new(Arc::clone(&success_engine));
+        let success_inner = Arc::clone(&success_scheduler.inner);
+        let success_task = tokio::spawn(async move {
+            success_inner.compaction_worker_loop().await;
+        });
+        tokio::time::timeout(Duration::from_secs(10), async {
+            while success_scheduler.compaction_count() < 1 {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("compaction worker should complete one compaction");
+        success_scheduler
+            .inner
+            .shutdown
+            .store(true, Ordering::SeqCst);
+        success_scheduler.inner.notify.notify_one();
+        success_task.await.unwrap();
+
+        let success_status = success_scheduler.status();
+        assert!(success_status.completed >= 1);
+        assert_eq!(success_status.failed, 0);
+        assert_eq!(success_status.in_progress, 0);
+
+        let error_dir = TempDir::new().unwrap();
+        let error_config = LsmConfig::builder(error_dir.path())
+            .memtable_size(100)
+            .max_frozen_memtables(16)
+            .l0_compaction_trigger(2)
+            .l0_slowdown_trigger(100)
+            .l0_stop_trigger(200)
+            .target_file_size(256)
+            .l1_max_size(4096)
+            .build()
+            .unwrap();
+        let error_engine = Arc::new(LsmEngine::open(error_config).unwrap());
+        for (ts, key) in [(11_u64, b"d".as_slice()), (12_u64, b"e"), (13_u64, b"f")] {
+            let mut batch = WriteBatch::new();
+            batch.set_commit_ts(ts);
+            batch.put(key.to_vec(), vec![b'y'; 48]);
+            error_engine.write_batch(batch).unwrap();
+            error_engine.flush_all_with_active().unwrap();
+        }
+
+        let victim = error_engine.current_version().ssts_at_level(0)[0].id;
+        let victim_path = error_engine
+            .config()
+            .sst_dir()
+            .join(format!("{victim:08}.sst"));
+        std::fs::remove_file(victim_path).unwrap();
+
+        let error_scheduler = CompactionScheduler::new(Arc::clone(&error_engine));
+        let error_inner = Arc::clone(&error_scheduler.inner);
+        let error_task = tokio::spawn(async move {
+            error_inner.compaction_worker_loop().await;
+        });
+        tokio::time::timeout(Duration::from_secs(10), async {
+            while error_scheduler.status().failed < 1 {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("compaction worker should record a compaction failure");
+        error_scheduler.inner.shutdown.store(true, Ordering::SeqCst);
+        error_scheduler.inner.notify.notify_one();
+        error_task.await.unwrap();
+
+        let error_status = error_scheduler.status();
+        assert!(error_status.failed >= 1);
+        assert!(error_status.last_error_ts_ms.is_some());
+        assert_eq!(error_status.in_progress, 0);
+    }
 }

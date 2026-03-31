@@ -22,11 +22,19 @@ use tempfile::tempdir;
 use tisql::catalog::types::Value;
 use tisql::tablet::TabletId;
 use tisql::testkit::ExecutionResult;
-use tisql::{Database, DatabaseConfig, QueryResult};
+use tisql::{Database, DatabaseConfig, QueryResult, RuntimeThreadOverrides};
 
 fn create_test_db() -> (Arc<Database>, tempfile::TempDir) {
     let dir = tempdir().unwrap();
-    let db = Arc::new(Database::open(DatabaseConfig::with_data_dir(dir.path())).unwrap());
+    let config = DatabaseConfig::with_data_dir(dir.path())
+        .with_storage_sync_io(true)
+        .with_runtime_threads(RuntimeThreadOverrides {
+            protocol: Some(1),
+            worker: Some(1),
+            background: Some(1),
+            io: Some(1),
+        });
+    let db = Arc::new(Database::open(config).unwrap());
     (db, dir)
 }
 
@@ -35,19 +43,27 @@ async fn exec(db: &Database, sql: &str) {
 }
 
 async fn table_id_by_name(db: &Arc<Database>, table_name: &str) -> u64 {
-    let sess = db.new_inner_session("__tisql_inner");
+    let deadline = Instant::now() + Duration::from_secs(5);
     let sql = format!(
         "SELECT table_id FROM __all_table WHERE table_name = '{table_name}' ORDER BY table_id LIMIT 1"
     );
-    let result = sess.execute_inner_sql(&sql).await.unwrap();
-    let rows = match result {
-        ExecutionResult::Rows { rows, .. } => rows,
-        _ => panic!("expected rows for table id query"),
-    };
-    match rows.first().and_then(|row| row.get(0)) {
-        Some(Value::BigInt(id)) => *id as u64,
-        other => panic!("unexpected table_id row: {other:?}"),
+
+    while Instant::now() < deadline {
+        let sess = db.new_inner_session("__tisql_inner");
+        let result = sess.execute_inner_sql(&sql).await.unwrap();
+        let rows = match result {
+            ExecutionResult::Rows { rows, .. } => rows,
+            _ => panic!("expected rows for table id query"),
+        };
+
+        if let Some(Value::BigInt(id)) = rows.first().and_then(|row| row.get(0)) {
+            return *id as u64;
+        }
+
+        tokio::time::sleep(Duration::from_millis(20)).await;
     }
+
+    panic!("table {table_name} did not appear in __all_table before timeout");
 }
 
 async fn gc_task_statuses_for_table(db: &Arc<Database>, table_id: u64) -> Vec<String> {

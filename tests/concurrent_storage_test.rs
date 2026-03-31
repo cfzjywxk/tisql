@@ -43,7 +43,7 @@ use tisql::testkit::{
 use tisql::StorageEngine;
 
 fn make_test_io() -> std::sync::Arc<tisql::io::IoService> {
-    tisql::io::IoService::new(32).unwrap()
+    tisql::io::IoService::new_for_test(32).unwrap()
 }
 
 // ==================== Test Helpers Using MvccKey ====================

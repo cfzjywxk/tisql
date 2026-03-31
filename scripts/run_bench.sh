@@ -14,28 +14,33 @@ if [[ ! "$timeout_secs" =~ ^[1-9][0-9]*$ ]]; then
     exit 2
 fi
 
-bench_cases=(
-    "tablet::engine::tests::test_point_get_from_sst_reads_few_blocks"
-    "tablet::engine::tests::test_point_get_from_sst_bloom_path_hits_block_cache"
-    "tablet::engine::tests::test_point_get_from_sst_scale_regression_guard"
-    "tablet::engine::tests::test_default_flow_control_has_tablet_headroom"
+bench_targets=(
+    "sql_executor"
+    "transaction_service"
+    "clog_service"
+    "tablet_engine"
 )
 
-selected_cases=()
-for case_name in "${bench_cases[@]}"; do
-    if [[ -n "$name_filter" && "$case_name" != *"$name_filter"* ]]; then
-        continue
-    fi
-    selected_cases+=("$case_name")
-done
-
-if [[ ${#selected_cases[@]} -eq 0 ]]; then
-    echo "no bench cases matched filter: $name_filter" >&2
-    exit 1
+selected_targets=()
+if [[ -n "$name_filter" ]]; then
+    for target in "${bench_targets[@]}"; do
+        if [[ "$target" == *"$name_filter"* ]]; then
+            selected_targets+=("$target")
+        fi
+    done
 fi
 
-for case_name in "${selected_cases[@]}"; do
-    echo "Running bench case: $case_name"
-    ./scripts/run_with_timeout.sh "$timeout_secs" \
-        cargo test --lib "$case_name" -- --exact --test-threads=1
+if [[ ${#selected_targets[@]} -eq 0 ]]; then
+    selected_targets=("${bench_targets[@]}")
+fi
+
+bench_log_level="${TISQL_LOG:-${RUST_LOG:-warn}}"
+
+for target in "${selected_targets[@]}"; do
+    echo "Running bench target: $target"
+    cmd=(env "TISQL_LOG=$bench_log_level" "RUST_LOG=${RUST_LOG:-$bench_log_level}" cargo bench --bench "$target" -- --noplot)
+    if [[ -n "$name_filter" ]]; then
+        cmd+=("$name_filter")
+    fi
+    ./scripts/run_with_timeout.sh "$timeout_secs" "${cmd[@]}"
 done

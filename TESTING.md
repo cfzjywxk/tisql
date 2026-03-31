@@ -249,3 +249,37 @@ See `.github/workflows/ci.yml` for details.
 ## License
 
 This project is licensed under the Apache License, Version 2.0. See [LICENSE](LICENSE) for details.
+
+
+## Coverage Gates
+
+Use the shared coverage script to generate reports and enforce per-module minimums for `executor`, `transaction`, `log/clog`, and `tablet`/`engine` paths.
+
+```bash
+# HTML report + per-module 90% gate
+make coverage
+
+# JSON export only
+./scripts/coverage.sh --json
+
+# Summary-only gate with a different threshold
+./scripts/coverage.sh --summary-only --min 92
+```
+
+## Criterion Benches
+
+Criterion microbenchmarks live under `benches/` and cover the main hot paths for SQL execution, transaction service, clog service, and tablet/engine reads/writes.
+
+```bash
+# Run all benchmark targets with timeout guards
+make bench
+
+# Run only one target
+./scripts/run_bench.sh 45 sql_executor
+./scripts/run_bench.sh 45 transaction_service
+
+# Run one named benchmark across targets
+./scripts/run_bench.sh 45 point_select
+```
+
+Generated Criterion reports are written under `target/criterion/`.

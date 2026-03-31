@@ -655,3 +655,207 @@ pub trait PessimisticStorage: StorageEngine {
         owner_start_ts: Timestamp,
     ) -> impl std::future::Future<Output = Option<RawValue>> + Send + 'a;
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use parking_lot::Mutex;
+    use std::ops::Range;
+
+    struct DummyIter;
+
+    impl MvccIterator for DummyIter {
+        fn seek(
+            &mut self,
+            _target: &MvccKey,
+        ) -> impl std::future::Future<Output = Result<()>> + Send {
+            std::future::ready(Ok(()))
+        }
+
+        fn advance(&mut self) -> impl std::future::Future<Output = Result<()>> + Send {
+            std::future::ready(Ok(()))
+        }
+
+        fn valid(&self) -> bool {
+            false
+        }
+
+        fn user_key(&self) -> &[u8] {
+            &[]
+        }
+
+        fn timestamp(&self) -> Timestamp {
+            0
+        }
+
+        fn value(&self) -> &[u8] {
+            &[]
+        }
+    }
+
+    #[derive(Default)]
+    struct DummyPessimisticStorage {
+        finalized: Mutex<Vec<(Vec<Key>, Timestamp, Timestamp)>>,
+        aborted: Mutex<Vec<(Vec<Key>, Timestamp)>>,
+    }
+
+    impl StorageEngine for DummyPessimisticStorage {
+        type Iter = DummyIter;
+
+        fn scan_iter(&self, _range: Range<MvccKey>, _owner_ts: Timestamp) -> Result<Self::Iter> {
+            Ok(DummyIter)
+        }
+
+        fn write_batch(&self, _batch: WriteBatch) -> Result<()> {
+            Ok(())
+        }
+    }
+
+    impl PessimisticStorage for DummyPessimisticStorage {
+        fn put_pending_on_tablet(
+            &self,
+            _tablet_id: router::TabletId,
+            _key: &[u8],
+            _value: &[u8],
+            _owner_start_ts: Timestamp,
+        ) -> std::result::Result<(), PessimisticWriteError> {
+            Ok(())
+        }
+
+        fn get_lock_owner_on_tablet(
+            &self,
+            _tablet_id: router::TabletId,
+            _key: &[u8],
+        ) -> Option<Timestamp> {
+            None
+        }
+
+        fn alloc_and_reserve_commit_lsn(&self, _owner_start_ts: Timestamp) -> u64 {
+            7
+        }
+
+        fn release_commit_lsn(&self, _owner_start_ts: Timestamp) -> Option<u64> {
+            Some(7)
+        }
+
+        fn is_commit_lsn_reserved(&self, _owner_start_ts: Timestamp, lsn: u64) -> bool {
+            lsn == 7
+        }
+
+        fn finalize_pending(&self, keys: &[Key], owner_start_ts: Timestamp, commit_ts: Timestamp) {
+            self.finalized
+                .lock()
+                .push((keys.to_vec(), owner_start_ts, commit_ts));
+        }
+
+        fn abort_pending(&self, keys: &[Key], owner_start_ts: Timestamp) {
+            self.aborted.lock().push((keys.to_vec(), owner_start_ts));
+        }
+
+        fn delete_pending_on_tablet(
+            &self,
+            _tablet_id: router::TabletId,
+            _key: &[u8],
+            _owner_start_ts: Timestamp,
+        ) -> std::result::Result<bool, PessimisticWriteError> {
+            Ok(false)
+        }
+
+        fn get_with_owner_on_tablet<'a>(
+            &'a self,
+            _tablet_id: router::TabletId,
+            _key: &'a [u8],
+            _read_ts: Timestamp,
+            _owner_start_ts: Timestamp,
+        ) -> impl std::future::Future<Output = Option<RawValue>> + Send + 'a {
+            std::future::ready(None)
+        }
+    }
+
+    #[test]
+    fn test_write_batch_clear_preserves_metadata() {
+        let mut batch = WriteBatch::new();
+        batch.put(b"a", b"v1");
+        batch.delete(b"b");
+        batch.set_commit_ts(11);
+        batch.set_clog_lsn(22);
+
+        batch.clear();
+
+        assert!(batch.is_empty());
+        assert_eq!(batch.len(), 0);
+        assert_eq!(batch.commit_ts(), Some(11));
+        assert_eq!(batch.clog_lsn(), Some(22));
+    }
+
+    #[test]
+    fn test_grouped_finalize_and_abort_flatten_keys() {
+        let storage = DummyPessimisticStorage::default();
+        let groups = vec![
+            (router::TabletId::System, vec![b"a".to_vec()]),
+            (
+                router::TabletId::Table { table_id: 42 },
+                vec![b"b".to_vec(), b"c".to_vec()],
+            ),
+        ];
+
+        storage.finalize_pending_grouped_with_lsn(&groups, 5, 9, 123);
+        storage.abort_pending_grouped(&groups, 5);
+
+        let finalized = storage.finalized.lock();
+        assert_eq!(finalized.len(), 1);
+        assert_eq!(
+            finalized[0].0,
+            vec![b"a".to_vec(), b"b".to_vec(), b"c".to_vec()]
+        );
+        assert_eq!(finalized[0].1, 5);
+        assert_eq!(finalized[0].2, 9);
+        drop(finalized);
+
+        let aborted = storage.aborted.lock();
+        assert_eq!(aborted.len(), 1);
+        assert_eq!(
+            aborted[0].0,
+            vec![b"a".to_vec(), b"b".to_vec(), b"c".to_vec()]
+        );
+        assert_eq!(aborted[0].1, 5);
+    }
+
+    #[tokio::test]
+    async fn test_dummy_storage_and_iterator_trait_methods() {
+        let storage = DummyPessimisticStorage::default();
+        let tablet_id = router::TabletId::Table { table_id: 7 };
+
+        let mut iter = storage
+            .scan_iter(MvccKey::unbounded()..MvccKey::unbounded(), 0)
+            .unwrap();
+        iter.seek(&MvccKey::unbounded()).await.unwrap();
+        iter.advance().await.unwrap();
+        assert!(!iter.valid());
+        assert_eq!(iter.user_key(), b"");
+        assert_eq!(iter.timestamp(), 0);
+        assert_eq!(iter.value(), b"");
+
+        let mut batch = WriteBatch::new();
+        batch.put(b"dummy", b"value");
+        storage.write_batch(batch).unwrap();
+
+        storage
+            .put_pending_on_tablet(tablet_id, b"key", b"value", 11)
+            .unwrap();
+        assert_eq!(storage.get_lock_owner_on_tablet(tablet_id, b"key"), None);
+        assert_eq!(storage.alloc_and_reserve_commit_lsn(11), 7);
+        assert_eq!(storage.release_commit_lsn(11), Some(7));
+        assert!(storage.is_commit_lsn_reserved(11, 7));
+        assert!(!storage.is_commit_lsn_reserved(11, 8));
+        assert!(!storage
+            .delete_pending_on_tablet(tablet_id, b"key", 11)
+            .unwrap());
+        assert_eq!(
+            storage
+                .get_with_owner_on_tablet(tablet_id, b"key", 22, 11)
+                .await,
+            None
+        );
+    }
+}

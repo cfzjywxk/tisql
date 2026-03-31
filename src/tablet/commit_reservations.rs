@@ -29,6 +29,9 @@ use parking_lot::Mutex;
 use crate::catalog::types::{Lsn, Timestamp};
 use crate::lsn::LsnProvider;
 
+#[cfg(all(test, feature = "failpoints"))]
+pub(crate) static FAILPOINT_TEST_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
 /// One reservation owned by a transaction.
 #[derive(Debug, Clone)]
 pub struct CommitReservation {
@@ -282,9 +285,6 @@ mod tests {
 
     use crate::lsn::AtomicLsnProvider;
 
-    #[cfg(feature = "failpoints")]
-    static TEST_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
-
     #[test]
     fn test_alloc_release_and_min() {
         let reservations = CommitLsnReservations::new();
@@ -306,6 +306,13 @@ mod tests {
 
     #[test]
     fn test_double_release_stats() {
+        #[cfg(feature = "failpoints")]
+        let _guard = FAILPOINT_TEST_LOCK.lock().unwrap();
+        #[cfg(feature = "failpoints")]
+        let _scenario = fail::FailScenario::setup();
+        #[cfg(feature = "failpoints")]
+        fail::cfg("reservation_double_release_v26", "off").unwrap();
+
         let reservations = CommitLsnReservations::new();
         let provider = AtomicLsnProvider::with_start(1);
 
@@ -352,7 +359,7 @@ mod tests {
     #[cfg(feature = "failpoints")]
     #[test]
     fn test_release_drop_failpoint_then_force_release() {
-        let _guard = TEST_LOCK.lock().unwrap();
+        let _guard = FAILPOINT_TEST_LOCK.lock().unwrap();
         let _scenario = fail::FailScenario::setup();
         let reservations = CommitLsnReservations::new();
         reservations.reserve_with_lsn_for_test(900, 900);
@@ -369,7 +376,7 @@ mod tests {
     #[cfg(feature = "failpoints")]
     #[test]
     fn test_double_release_failpoint() {
-        let _guard = TEST_LOCK.lock().unwrap();
+        let _guard = FAILPOINT_TEST_LOCK.lock().unwrap();
         let _scenario = fail::FailScenario::setup();
         let reservations = CommitLsnReservations::new();
 
@@ -385,7 +392,7 @@ mod tests {
     #[cfg(feature = "failpoints")]
     #[test]
     fn test_sweep_force_release_failpoint() {
-        let _guard = TEST_LOCK.lock().unwrap();
+        let _guard = FAILPOINT_TEST_LOCK.lock().unwrap();
         let _scenario = fail::FailScenario::setup();
         let reservations = CommitLsnReservations::new();
         reservations.reserve_with_lsn_for_test(77, 700);
@@ -403,7 +410,7 @@ mod tests {
         use std::sync::mpsc;
         use std::time::Duration;
 
-        let _guard = TEST_LOCK.lock().unwrap();
+        let _guard = FAILPOINT_TEST_LOCK.lock().unwrap();
         let _scenario = fail::FailScenario::setup();
         let reservations = Arc::new(CommitLsnReservations::new());
         let provider = Arc::new(AtomicLsnProvider::with_start(100));

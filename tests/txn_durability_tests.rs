@@ -62,7 +62,7 @@ async fn get_value(engine: &LsmEngine, key: &[u8], read_ts: Timestamp) -> Option
 }
 
 fn make_test_io() -> std::sync::Arc<tisql::io::IoService> {
-    tisql::io::IoService::new(32).unwrap()
+    tisql::io::IoService::new_for_test(32).unwrap()
 }
 
 /// Create a fresh LsmEngine + TransactionService environment.

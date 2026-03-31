@@ -1691,6 +1691,104 @@ mod tests {
         );
     }
 
+    #[tokio::test]
+    async fn test_phase4_restore_pending_and_apply_recovered_write_round_trip() {
+        let (_storage, _concurrency_manager, txn_storage) = make_mem_txn_storage();
+
+        let put_key = encode_record_key_with_handle(USER_TABLE_ID_START, 30);
+        let delete_key = encode_record_key_with_handle(USER_TABLE_ID_START, 31);
+        let lock_key = encode_record_key_with_handle(USER_TABLE_ID_START, 32);
+        let recovered_put_key = encode_record_key_with_handle(USER_TABLE_ID_START, 33);
+        let recovered_delete_key = encode_record_key_with_handle(USER_TABLE_ID_START, 34);
+
+        txn_storage
+            .restore_pending(&put_key, TxnRestoreMutation::Put(b"restored"), 70)
+            .unwrap();
+        txn_storage
+            .restore_pending(&delete_key, TxnRestoreMutation::Delete, 70)
+            .unwrap();
+        txn_storage
+            .restore_pending(&lock_key, TxnRestoreMutation::Lock, 70)
+            .unwrap();
+
+        assert_eq!(
+            txn_storage
+                .read_point(TxnPointRead {
+                    key: &put_key,
+                    read_ts: 70,
+                    owner_ts: 70,
+                })
+                .await
+                .unwrap(),
+            PointReadResult::Value(b"restored".to_vec())
+        );
+        assert_eq!(
+            txn_storage
+                .read_point(TxnPointRead {
+                    key: &delete_key,
+                    read_ts: 70,
+                    owner_ts: 70,
+                })
+                .await
+                .unwrap(),
+            PointReadResult::Deleted
+        );
+        assert_eq!(
+            txn_storage
+                .read_point(TxnPointRead {
+                    key: &lock_key,
+                    read_ts: 70,
+                    owner_ts: 70,
+                })
+                .await
+                .unwrap(),
+            PointReadResult::Missing
+        );
+
+        txn_storage
+            .apply_recovered_write(
+                RecoveredWrite::Put {
+                    key: &recovered_put_key,
+                    value: b"durable",
+                },
+                90,
+                9,
+            )
+            .unwrap();
+        txn_storage
+            .apply_recovered_write(
+                RecoveredWrite::Delete {
+                    key: &recovered_delete_key,
+                },
+                91,
+                10,
+            )
+            .unwrap();
+
+        assert_eq!(
+            txn_storage
+                .read_point(TxnPointRead {
+                    key: &recovered_put_key,
+                    read_ts: 100,
+                    owner_ts: 0,
+                })
+                .await
+                .unwrap(),
+            PointReadResult::Value(b"durable".to_vec())
+        );
+        assert_eq!(
+            txn_storage
+                .read_point(TxnPointRead {
+                    key: &recovered_delete_key,
+                    read_ts: 100,
+                    owner_ts: 0,
+                })
+                .await
+                .unwrap(),
+            PointReadResult::Deleted
+        );
+    }
+
     #[test]
     fn test_phase4_txn_storage_scan_retries_blocked_same_key() {
         let (storage, concurrency_manager, txn_storage) = make_mem_txn_storage();
@@ -1757,6 +1855,247 @@ mod tests {
                 cursor.next_step().await.unwrap(),
                 TxnStorageScanStep::Exhausted
             );
+        });
+    }
+
+    #[test]
+    fn test_phase4_txn_storage_scan_hides_older_committed_versions() {
+        let tmp = TempDir::new().unwrap();
+        let storage = Arc::new(TabletEngine::open(LsmConfig::new(tmp.path())).unwrap());
+        let concurrency_manager = Arc::new(ConcurrencyManager::new(0));
+        let txn_storage =
+            TabletTxnStorage::new(Arc::clone(&storage), Arc::clone(&concurrency_manager));
+
+        let key1 = encode_record_key_with_handle(USER_TABLE_ID_START, 1);
+        let key2 = encode_record_key_with_handle(USER_TABLE_ID_START, 2);
+        let range_start = encode_key(USER_TABLE_ID_START, &[]);
+        let range_end = encode_key(USER_TABLE_ID_START + 1, &[]);
+
+        let mut batch = WriteBatch::new();
+        batch.put(key1.clone(), b"11".to_vec());
+        batch.put(key2.clone(), b"22".to_vec());
+        batch.set_commit_ts(10);
+        storage.write_batch(batch).unwrap();
+
+        let mut batch = WriteBatch::new();
+        batch.put(key1.clone(), b"12".to_vec());
+        batch.put(key2.clone(), b"23".to_vec());
+        batch.set_commit_ts(20);
+        storage.write_batch(batch).unwrap();
+
+        let mut cursor = txn_storage
+            .scan(TxnStorageScanRequest {
+                range: range_start..range_end,
+                read_ts: 100,
+                owner_ts: 0,
+            })
+            .unwrap();
+
+        crate::io::block_on_sync(async {
+            assert_eq!(
+                cursor.next_step().await.unwrap(),
+                TxnStorageScanStep::Entry(TxnStorageScanEntry {
+                    user_key: key1.clone(),
+                    state: TxnStorageVisibleState::Value(b"12".to_vec()),
+                })
+            );
+            assert_eq!(
+                cursor.next_step().await.unwrap(),
+                TxnStorageScanStep::Entry(TxnStorageScanEntry {
+                    user_key: key2.clone(),
+                    state: TxnStorageVisibleState::Value(b"23".to_vec()),
+                })
+            );
+            assert_eq!(
+                cursor.next_step().await.unwrap(),
+                TxnStorageScanStep::Exhausted
+            );
+        });
+    }
+
+    #[test]
+    fn test_phase4_routed_storage_resolve_scan_and_noop_paths() {
+        let dir = TempDir::new().unwrap();
+        let system = open_tablet(&dir.path().join("system_engine"));
+        let manager = Arc::new(
+            TabletManager::new(dir.path(), new_lsn_provider(), Arc::clone(&system)).unwrap(),
+        );
+        let index_tablet_id = TabletId::LocalIndex {
+            table_id: USER_TABLE_ID_START,
+            index_id: 2007,
+        };
+        let index_tablet = open_tablet(&manager.tablet_dir(index_tablet_id));
+        manager
+            .insert_tablet(index_tablet_id, Arc::clone(&index_tablet))
+            .unwrap();
+
+        let storage = RoutedTabletStorage::new(Arc::clone(&manager));
+        let mut empty_batch = WriteBatch::new();
+        empty_batch.set_commit_ts(1);
+        storage.write_batch(empty_batch).unwrap();
+
+        let index_key = encode_index_seek_key(USER_TABLE_ID_START, 2007, b"idx");
+        let (tablet_id, resolved) = storage.resolve_scan_tablet(&(
+            MvccKey::encode(&index_key, Timestamp::MAX)..MvccKey::unbounded()
+        ));
+        assert_eq!(tablet_id, index_tablet_id);
+        assert!(Arc::ptr_eq(&resolved, &index_tablet));
+        assert_eq!(
+            infer_logical_tablet_from_encoded_key(&index_key),
+            index_tablet_id
+        );
+
+        let (fallback_id, fallback_tablet) = storage
+            .resolve_scan_tablet(&(MvccKey::encode(b"broken", Timestamp::MAX)..MvccKey::unbounded()));
+        assert_eq!(fallback_id, TabletId::System);
+        assert!(Arc::ptr_eq(&fallback_tablet, &system));
+        assert_eq!(infer_logical_tablet_from_encoded_key(b"broken"), TabletId::System);
+
+        let (_mem, _cm, txn_storage) = make_mem_txn_storage();
+        let reservation = TxnCommitReservation {
+            owner_start_ts: 77,
+            lsn: 88,
+        };
+        txn_storage
+            .finalize(FinalizeRequest {
+                owner_start_ts: 77,
+                commit_ts: 99,
+                reservation,
+                write_keys: &[],
+                lock_only_keys: &[],
+            })
+            .unwrap();
+        txn_storage
+            .abort(AbortRequest {
+                owner_start_ts: 77,
+                keys: &[],
+            })
+            .unwrap();
+    }
+
+    #[test]
+    fn test_phase4_routed_storage_finalize_and_abort_grouped_wrappers() {
+        let dir = TempDir::new().unwrap();
+        let system = open_tablet(&dir.path().join("system_engine"));
+        let manager = Arc::new(
+            TabletManager::new(dir.path(), new_lsn_provider(), Arc::clone(&system)).unwrap(),
+        );
+        let user_tablet_id = TabletId::Table {
+            table_id: USER_TABLE_ID_START,
+        };
+        let user = open_tablet(&manager.tablet_dir(user_tablet_id));
+        manager.insert_tablet(user_tablet_id, Arc::clone(&user)).unwrap();
+
+        let storage = RoutedTabletStorage::new(Arc::clone(&manager));
+        let system_key = encode_record_key_with_handle(ALL_TABLE_TABLE_ID, 41);
+        let user_key = encode_record_key_with_handle(USER_TABLE_ID_START, 42);
+
+        put_pending_by_key(&storage, &system_key, b"sys", 80).unwrap();
+        put_pending_by_key(&storage, &user_key, b"user", 80).unwrap();
+        storage.finalize_pending(&[system_key.clone(), user_key.clone()], 80, 90);
+        assert_eq!(read_value(&system, &system_key, 100), Some(b"sys".to_vec()));
+        assert_eq!(read_value(&user, &user_key, 100), Some(b"user".to_vec()));
+
+        let system_abort = encode_record_key_with_handle(ALL_TABLE_TABLE_ID, 43);
+        let user_abort = encode_record_key_with_handle(USER_TABLE_ID_START, 44);
+        put_pending_by_key(&storage, &system_abort, b"drop", 81).unwrap();
+        put_pending_by_key(&storage, &user_abort, b"drop", 81).unwrap();
+        storage.abort_pending_grouped(
+            &[
+                (TabletId::System, vec![system_abort.clone()]),
+                (user_tablet_id, vec![user_abort.clone()]),
+            ],
+            81,
+        );
+        assert_eq!(lock_owner(&system, &system_abort), None);
+        assert_eq!(lock_owner(&user, &user_abort), None);
+        assert_eq!(read_value(&system, &system_abort, 100), None);
+        assert_eq!(read_value(&user, &user_abort, 100), None);
+    }
+
+    #[test]
+    fn test_phase4_txn_storage_scan_skips_non_visible_pending_and_lock_heads() {
+        let tmp = TempDir::new().unwrap();
+        let storage = Arc::new(TabletEngine::open(LsmConfig::new(tmp.path())).unwrap());
+        let concurrency_manager = Arc::new(ConcurrencyManager::new(0));
+        let txn_storage =
+            TabletTxnStorage::new(Arc::clone(&storage), Arc::clone(&concurrency_manager));
+
+        let before_range = encode_record_key_with_handle(USER_TABLE_ID_START, 1);
+        let pending_lock = encode_record_key_with_handle(USER_TABLE_ID_START, 2);
+        let pending_tombstone = encode_record_key_with_handle(USER_TABLE_ID_START, 3);
+        let too_new = encode_record_key_with_handle(USER_TABLE_ID_START, 4);
+        let committed_lock = encode_record_key_with_handle(USER_TABLE_ID_START, 5);
+        let visible = encode_record_key_with_handle(USER_TABLE_ID_START, 6);
+        let range_end = encode_record_key_with_handle(USER_TABLE_ID_START, 7);
+
+        for (key, value, ts) in [
+            (&before_range, b"before".as_slice(), 10),
+            (&too_new, b"old".as_slice(), 40),
+            (&too_new, b"new".as_slice(), 80),
+            (&visible, b"visible".as_slice(), 25),
+        ] {
+            let mut batch = WriteBatch::new();
+            batch.put(key.clone(), value.to_vec());
+            batch.set_commit_ts(ts);
+            storage.write_batch(batch).unwrap();
+        }
+
+        let mut lock_old = WriteBatch::new();
+        lock_old.put(committed_lock.clone(), b"after-lock".to_vec());
+        lock_old.set_commit_ts(20);
+        storage.write_batch(lock_old).unwrap();
+
+        let mut lock_batch = WriteBatch::new();
+        lock_batch.put(committed_lock.clone(), LOCK.to_vec());
+        lock_batch.set_commit_ts(30);
+        storage.write_batch(lock_batch).unwrap();
+
+        storage
+            .put_pending_on_tablet(TabletId::System, &pending_lock, LOCK, 200)
+            .unwrap();
+        concurrency_manager.register_txn(200);
+        concurrency_manager.prepare_txn(200, 15).unwrap();
+        concurrency_manager.commit_txn(200, 15).unwrap();
+
+        storage
+            .put_pending_on_tablet(TabletId::System, &pending_tombstone, TOMBSTONE, 201)
+            .unwrap();
+        concurrency_manager.register_txn(201);
+        concurrency_manager.prepare_txn(201, 16).unwrap();
+        concurrency_manager.commit_txn(201, 16).unwrap();
+
+        let mut cursor = txn_storage
+            .scan(TxnStorageScanRequest {
+                range: pending_lock.clone()..range_end.clone(),
+                read_ts: 50,
+                owner_ts: 0,
+            })
+            .unwrap();
+
+        crate::io::block_on_sync(async {
+            assert_eq!(
+                cursor.next_step().await.unwrap(),
+                TxnStorageScanStep::Entry(TxnStorageScanEntry {
+                    user_key: pending_tombstone.clone(),
+                    state: TxnStorageVisibleState::Deleted,
+                })
+            );
+            assert_eq!(
+                cursor.next_step().await.unwrap(),
+                TxnStorageScanStep::Entry(TxnStorageScanEntry {
+                    user_key: too_new.clone(),
+                    state: TxnStorageVisibleState::Value(b"old".to_vec()),
+                })
+            );
+            assert_eq!(
+                cursor.next_step().await.unwrap(),
+                TxnStorageScanStep::Entry(TxnStorageScanEntry {
+                    user_key: visible.clone(),
+                    state: TxnStorageVisibleState::Value(b"visible".to_vec()),
+                })
+            );
+            assert_eq!(cursor.next_step().await.unwrap(), TxnStorageScanStep::Exhausted);
         });
     }
 
@@ -1863,5 +2202,87 @@ mod tests {
             None,
             "min_reserved should be None after all released"
         );
+    }
+
+    #[test]
+    fn test_pending_conflict_classifiers_cover_state_matrix() {
+        let cm = ConcurrencyManager::new(0);
+        cm.register_txn(10);
+        cm.register_txn(20);
+        cm.set_preparing_txn(10).unwrap();
+        cm.prepare_txn(20, 30).unwrap();
+        cm.register_txn(40);
+        cm.prepare_txn(40, 35).unwrap();
+        cm.commit_txn(40, 45).unwrap();
+        cm.register_txn(50);
+        cm.abort_txn(50).unwrap();
+
+        assert_eq!(
+            classify_point_read_conflict(&cm, None, 1, 100),
+            PendingPointReadAction::Proceed
+        );
+        assert_eq!(
+            classify_point_read_conflict(&cm, Some(1), 1, 100),
+            PendingPointReadAction::Proceed
+        );
+        assert_eq!(
+            classify_point_read_conflict(&cm, Some(10), 1, 100),
+            PendingPointReadAction::Blocked(10)
+        );
+        assert_eq!(
+            classify_point_read_conflict(&cm, Some(20), 1, 30),
+            PendingPointReadAction::Blocked(20)
+        );
+        assert_eq!(
+            classify_point_read_conflict(&cm, Some(20), 1, 29),
+            PendingPointReadAction::Proceed
+        );
+
+        assert_eq!(
+            classify_scan_pending(&cm, 25, 10),
+            PendingScanAction::Blocked(10)
+        );
+        assert_eq!(classify_scan_pending(&cm, 25, 20), PendingScanAction::Skip);
+        assert_eq!(
+            classify_scan_pending(&cm, 35, 20),
+            PendingScanAction::Blocked(20)
+        );
+        assert_eq!(classify_scan_pending(&cm, 44, 40), PendingScanAction::Skip);
+        assert_eq!(
+            classify_scan_pending(&cm, 45, 40),
+            PendingScanAction::Visible
+        );
+        assert_eq!(classify_scan_pending(&cm, 25, 50), PendingScanAction::Skip);
+        assert_eq!(classify_scan_pending(&cm, 25, 999), PendingScanAction::Skip);
+
+        assert_eq!(
+            map_stage_error(PessimisticWriteError::LockConflict(88)),
+            TxnStageError::LockConflict { owner_start_ts: 88 }
+        );
+        assert_eq!(
+            map_stage_error(PessimisticWriteError::WriteStall {
+                delay: Some(std::time::Duration::from_millis(1))
+            }),
+            TxnStageError::WriteStall {
+                delay: Some(std::time::Duration::from_millis(1))
+            }
+        );
+    }
+
+    #[test]
+    fn test_tablet_manager_getter_and_unbounded_scan_fallback() {
+        let dir = TempDir::new().unwrap();
+        let system = open_tablet(&dir.path().join("system_engine"));
+        let manager = Arc::new(
+            TabletManager::new(dir.path(), new_lsn_provider(), Arc::clone(&system)).unwrap(),
+        );
+        let storage = RoutedTabletStorage::new(Arc::clone(&manager));
+
+        assert!(Arc::ptr_eq(storage.tablet_manager(), &manager));
+
+        let (tablet_id, tablet) =
+            storage.resolve_scan_tablet(&(MvccKey::unbounded()..MvccKey::unbounded()));
+        assert_eq!(tablet_id, TabletId::System);
+        assert!(Arc::ptr_eq(&tablet, &system));
     }
 }

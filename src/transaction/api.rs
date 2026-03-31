@@ -101,11 +101,6 @@ impl StatementUndo {
     }
 
     #[inline]
-    fn len(&self) -> usize {
-        self.entries.len()
-    }
-
-    #[inline]
     fn into_entries(self) -> BTreeMap<Key, StatementUndoEntry> {
         self.entries
     }
@@ -134,18 +129,8 @@ pub struct StatementGuard {
 
 impl StatementGuard {
     #[inline]
-    pub(crate) fn from_undo(undo: StatementUndo) -> Self {
-        Self { _private: (), undo }
-    }
-
-    #[inline]
     pub(crate) fn is_empty(&self) -> bool {
         self.undo.is_empty()
-    }
-
-    #[inline]
-    pub(crate) fn len(&self) -> usize {
-        self.undo.len()
     }
 
     #[inline]
@@ -592,6 +577,122 @@ pub enum IsolationLevel {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::future;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    struct DummyCursor {
+        current: Option<TxnScanEntry>,
+    }
+
+    impl TxnScanCursor for DummyCursor {
+        fn advance(&mut self) -> impl Future<Output = Result<()>> + Send + '_ {
+            future::ready(Ok(()))
+        }
+
+        fn current(&self) -> Option<&TxnScanEntry> {
+            self.current.as_ref()
+        }
+    }
+
+    #[derive(Default)]
+    struct DummyTxnService {
+        scan_calls: AtomicUsize,
+    }
+
+    impl TxnService for DummyTxnService {
+        type ScanCursor = DummyCursor;
+
+        fn begin(&self, read_only: bool) -> Result<TxnCtx> {
+            Ok(TxnCtx::new(1, 10, read_only))
+        }
+
+        fn begin_explicit(&self, read_only: bool) -> Result<TxnCtx> {
+            Ok(TxnCtx::new_explicit(2, 20, read_only))
+        }
+
+        fn get_txn_state(&self, _start_ts: Timestamp) -> Option<TxnState> {
+            None
+        }
+
+        fn get<'a>(
+            &'a self,
+            _ctx: &'a TxnCtx,
+            _table_id: TableId,
+            _key: &'a [u8],
+        ) -> impl Future<Output = Result<Option<RawValue>>> + Send + 'a {
+            future::ready(Ok(Some(b"value".to_vec())))
+        }
+
+        fn scan(
+            &self,
+            _ctx: &TxnCtx,
+            _table_id: TableId,
+            _range: Range<Key>,
+        ) -> Result<Self::ScanCursor> {
+            self.scan_calls.fetch_add(1, Ordering::SeqCst);
+            Ok(DummyCursor {
+                current: Some(TxnScanEntry {
+                    user_key: b"k".to_vec(),
+                    value: b"v".to_vec(),
+                }),
+            })
+        }
+
+        fn begin_statement(&self, _ctx: &mut TxnCtx) -> StatementGuard {
+            StatementGuard::default()
+        }
+
+        fn put<'a>(
+            &'a self,
+            _ctx: &'a mut TxnCtx,
+            _stmt: &'a mut StatementGuard,
+            _table_id: TableId,
+            _key: &'a [u8],
+            _value: RawValue,
+        ) -> impl Future<Output = Result<()>> + Send + 'a {
+            future::ready(Ok(()))
+        }
+
+        fn delete<'a>(
+            &'a self,
+            _ctx: &'a mut TxnCtx,
+            _stmt: &'a mut StatementGuard,
+            _table_id: TableId,
+            _key: &'a [u8],
+        ) -> impl Future<Output = Result<()>> + Send + 'a {
+            future::ready(Ok(()))
+        }
+
+        fn lock_key<'a>(
+            &'a self,
+            _ctx: &'a mut TxnCtx,
+            _stmt: &'a mut StatementGuard,
+            _table_id: TableId,
+            _key: &'a [u8],
+        ) -> impl Future<Output = Result<()>> + Send + 'a {
+            future::ready(Ok(()))
+        }
+
+        fn rollback_statement<'a>(
+            &'a self,
+            _ctx: &'a mut TxnCtx,
+            _stmt: StatementGuard,
+        ) -> impl Future<Output = Result<()>> + Send + 'a {
+            future::ready(Ok(()))
+        }
+
+        fn commit(&self, ctx: TxnCtx) -> impl Future<Output = Result<CommitInfo>> + Send + '_ {
+            future::ready(Ok(CommitInfo {
+                txn_id: ctx.txn_id(),
+                commit_ts: ctx.start_ts(),
+                lsn: 0,
+            }))
+        }
+
+        fn rollback(&self, _ctx: TxnCtx) -> Result<()> {
+            Ok(())
+        }
+    }
 
     #[test]
     fn test_isolation_level_default() {
@@ -613,5 +714,80 @@ mod tests {
         let ctx = TxnCtx::new(2, 200, true);
         assert!(ctx.is_read_only());
         assert!(ctx.is_valid());
+    }
+
+    #[test]
+    fn test_txn_ctx_validity_for_intermediate_states() {
+        let mut ctx = TxnCtx::new(3, 300, false);
+        ctx.state = TxnState::Preparing;
+        assert!(ctx.is_valid());
+
+        ctx.state = TxnState::Prepared { prepared_ts: 301 };
+        assert!(ctx.is_valid());
+
+        ctx.state = TxnState::Committed { commit_ts: 302 };
+        assert!(!ctx.is_valid());
+
+        ctx.state = TxnState::Aborted;
+        assert!(!ctx.is_valid());
+    }
+
+    #[test]
+    fn test_statement_guard_tracks_entries() {
+        let previous = MutationMeta {
+            mutation: MutationPayload::Delete,
+        };
+        let mut guard = StatementGuard::default();
+        assert!(guard.is_empty());
+
+        guard.record_first_touch(b"k1", None);
+        guard.record_first_touch(b"k1", Some(previous.clone()));
+        guard.record_first_touch(b"k2", Some(previous.clone()));
+
+        assert!(!guard.is_empty());
+        assert!(guard.contains_key(b"k1"));
+        assert!(guard.contains_key(b"k2"));
+
+        let entries = guard.into_entries();
+        assert_eq!(entries.len(), 2);
+        assert_eq!(
+            entries.get(b"k1".as_slice()),
+            Some(&StatementUndoEntry::Absent)
+        );
+        assert_eq!(
+            entries.get(b"k2".as_slice()),
+            Some(&StatementUndoEntry::Restore(previous))
+        );
+
+        assert!(MutationPayload::Put(b"v".to_vec()).is_write());
+        assert!(MutationPayload::Delete.is_write());
+        assert!(MutationPayload::Lock.is_lock());
+        assert!(!MutationPayload::Lock.is_write());
+    }
+
+    #[test]
+    fn test_txn_ctx_new_for_test_tracks_explicit_and_schema_version() {
+        let mut ctx = TxnCtx::new_explicit(7, 70, true);
+        assert!(ctx.is_explicit());
+        assert!(ctx.is_read_only());
+        assert_eq!(ctx.schema_version(), None);
+
+        ctx.set_schema_version(42);
+        assert_eq!(ctx.schema_version(), Some(42));
+    }
+
+    #[tokio::test]
+    async fn test_txn_service_default_helpers_delegate_to_scan() {
+        let service = DummyTxnService::default();
+        let ctx = service.begin(true).unwrap();
+
+        service.record_duplicate_check_duration(Duration::from_micros(5));
+        let mut cursor = service
+            .scan_iter(&ctx, 9, b"a".to_vec()..b"z".to_vec())
+            .unwrap();
+
+        assert_eq!(service.scan_calls.load(Ordering::SeqCst), 1);
+        assert_eq!(cursor.current().unwrap().user_key, b"k".to_vec());
+        cursor.advance().await.unwrap();
     }
 }

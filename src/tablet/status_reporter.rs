@@ -1018,3 +1018,301 @@ fn now_ms() -> u64 {
         .map(|d| d.as_millis() as u64)
         .unwrap_or(0)
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::io::{reset_io_accounting, IoCounterSnapshot};
+    use crate::lsn::new_lsn_provider;
+    use crate::tablet::{CacheSuiteConfig, LsmConfig, TabletEngine};
+    use std::path::Path;
+    use tempfile::TempDir;
+    use tokio::time::timeout;
+
+    fn open_test_system_tablet(dir: &Path) -> Arc<TabletEngine> {
+        Arc::new(TabletEngine::open(LsmConfig::new(dir)).unwrap())
+    }
+
+    fn metric_value(
+        rows: &[EngineStatusMetricRow],
+        scope: &str,
+        tablet: &str,
+        metric: &str,
+    ) -> Option<String> {
+        rows.iter()
+            .find(|row| row.scope == scope && row.tablet == tablet && row.metric == metric)
+            .map(|row| row.value.clone())
+    }
+
+    #[test]
+    fn test_snapshot_to_metric_rows_and_log_snapshot_cover_metric_surface() {
+        let dir = TempDir::new().unwrap();
+        let engine = open_test_system_tablet(dir.path());
+        let mut lsm = engine.stats();
+        lsm.active_memtable_size = 11;
+        lsm.frozen_memtable_count = 2;
+        lsm.frozen_waiters = 4;
+        lsm.flush_workers_active = 5;
+        lsm.flush_workers_limit = 6;
+        lsm.l0_sst_count = 7;
+        lsm.total_sst_bytes = 99;
+
+        let tablet_id = TabletId::Table { table_id: 42 };
+        let tablet_name = tablet_id.dir_name();
+        let snapshot = EngineStatusSnapshot {
+            ts_unix_ms: 123,
+            collection_duration_us: 600_001,
+            global: GlobalStatus {
+                tablet_count: 1,
+                reported_tablets: 1,
+                total_sst_bytes: 999,
+                cache_delta: CacheDeltaStatus {
+                    block: Some(BlockCacheStats {
+                        hits: 1,
+                        misses: 2,
+                        inserts: 3,
+                        evictions: 4,
+                        invalidations: 5,
+                        insert_rejects: 6,
+                    }),
+                    row: Some(RowCacheStats {
+                        hits: 7,
+                        misses: 8,
+                        inserts: 9,
+                        evictions: 10,
+                        invalidations: 11,
+                        insert_rejects: 12,
+                    }),
+                    reader: Some(ReaderCacheStats {
+                        hits: 13,
+                        misses: 14,
+                        inserts: 15,
+                        evictions: 16,
+                        invalidations: 17,
+                    }),
+                },
+                io: IoStatus {
+                    by_source: vec![
+                        IoSourceStatus {
+                            source: IoSource::ForegroundPointRead,
+                            read_ops: 18,
+                            read_bytes: 19,
+                            write_ops: 20,
+                            write_bytes: 21,
+                            fsync_ops: 22,
+                        },
+                        IoSourceStatus {
+                            source: IoSource::Flush,
+                            read_ops: 23,
+                            read_bytes: 24,
+                            write_ops: 25,
+                            write_bytes: 26,
+                            fsync_ops: 27,
+                        },
+                    ],
+                    foreground_ops: 38,
+                    foreground_bytes: 40,
+                    background_ops: 48,
+                    background_bytes: 50,
+                },
+                ..GlobalStatus::default()
+            },
+            tablets: vec![TabletStatus {
+                tablet_id,
+                tablet_ns: 456,
+                cache: CacheStatus {
+                    block: Some(BlockCacheStatus {
+                        data_usage_bytes: 30,
+                        data_entries: 1,
+                        index_usage_bytes: 31,
+                        index_entries: 2,
+                        bloom_usage_bytes: 32,
+                        bloom_entries: 3,
+                    }),
+                    row: Some(RowCacheStatus {
+                        usage_bytes: 33,
+                        entries: 4,
+                    }),
+                },
+                io: IoStatus::default(),
+                lsm,
+                jobs: JobStatus {
+                    flush: JobCounters {
+                        in_progress: 34,
+                        ..JobCounters::default()
+                    },
+                    compaction: JobCounters {
+                        in_progress: 35,
+                        ..JobCounters::default()
+                    },
+                },
+                backpressure: BackpressureStatus {
+                    state: BackpressureState::Slowdown,
+                    slowdown_events: 36,
+                    stall_events: 37,
+                    frozen_slowdown_events: 38,
+                    frozen_cap_stall_events: 39,
+                    l0_stop_stall_events: 40,
+                    mem_pressure_soft_events: 41,
+                    mem_pressure_hard_events: 42,
+                    mem_pressure_soft_residency_ms: 43,
+                    mem_pressure_hard_residency_ms: 44,
+                    writer_wait_events: 45,
+                    writer_wake_events: 46,
+                    writer_wait_timeout_events: 47,
+                },
+            }],
+        };
+
+        log_snapshot(&snapshot);
+        let rows = snapshot_to_metric_rows(&snapshot);
+
+        assert_eq!(
+            metric_value(&rows, "global", "", "ts_unix_ms"),
+            Some("123".to_string())
+        );
+        assert_eq!(
+            metric_value(&rows, "global", "", "cache.block.delta.insert_rejects"),
+            Some("6".to_string())
+        );
+        assert_eq!(
+            metric_value(&rows, "global", "", "cache.reader.delta.invalidations"),
+            Some("17".to_string())
+        );
+        assert_eq!(
+            metric_value(&rows, "global", "", "cache.row.delta.insert_rejects"),
+            Some("12".to_string())
+        );
+        assert_eq!(
+            metric_value(&rows, "global", "", "io.ForegroundPointRead.read_ops"),
+            Some("18".to_string())
+        );
+        assert_eq!(
+            metric_value(&rows, "global", "", "io.Flush.write_bytes"),
+            Some("26".to_string())
+        );
+        assert_eq!(
+            metric_value(&rows, "tablet", &tablet_name, "tablet_ns"),
+            Some("456".to_string())
+        );
+        assert_eq!(
+            metric_value(&rows, "tablet", &tablet_name, "lsm.total_sst_bytes"),
+            Some("99".to_string())
+        );
+        assert_eq!(
+            metric_value(&rows, "tablet", &tablet_name, "backpressure.state"),
+            Some("Slowdown".to_string())
+        );
+        assert_eq!(
+            metric_value(
+                &rows,
+                "tablet",
+                &tablet_name,
+                "backpressure.writer_wait_timeout_events"
+            ),
+            Some("47".to_string())
+        );
+        assert_eq!(
+            metric_value(&rows, "tablet", &tablet_name, "jobs.flush.in_progress"),
+            Some("34".to_string())
+        );
+        assert_eq!(
+            metric_value(&rows, "tablet", &tablet_name, "jobs.compaction.in_progress"),
+            Some("35".to_string())
+        );
+        assert_eq!(
+            metric_value(
+                &rows,
+                "tablet",
+                &tablet_name,
+                "cache.block.total_usage_bytes"
+            ),
+            Some("93".to_string())
+        );
+        assert_eq!(
+            metric_value(&rows, "tablet", &tablet_name, "cache.row.usage_bytes"),
+            Some("33".to_string())
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn test_reporter_lifecycle_collect_methods_publish_snapshot() {
+        reset_io_accounting();
+
+        let dir = TempDir::new().unwrap();
+        let manager = Arc::new(
+            TabletManager::new(
+                dir.path(),
+                new_lsn_provider(),
+                open_test_system_tablet(dir.path()),
+            )
+            .unwrap(),
+        );
+        let cache_suite = Arc::new(CacheSuite::new(CacheSuiteConfig::default()));
+        manager.bind_cache_suite(Arc::clone(&cache_suite));
+
+        let reporter =
+            EngineStatusReporter::new(Arc::clone(&manager), Arc::clone(&cache_suite), 1, 1);
+        assert_eq!(reporter.interval(), Duration::from_secs(1));
+        assert!(reporter.latest_snapshot().is_none());
+
+        reporter.start(&tokio::runtime::Handle::current());
+        reporter.start(&tokio::runtime::Handle::current());
+
+        timeout(Duration::from_secs(5), async {
+            while reporter.latest_snapshot().is_none() {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("reporter should publish an initial snapshot");
+
+        let loud = reporter.collect_once();
+        let quiet = reporter.collect_once_quiet();
+        let latest = reporter
+            .latest_snapshot()
+            .expect("latest snapshot should exist");
+        assert!(loud.global.tablet_count >= 1);
+        assert!(quiet.global.reported_tablets >= 1);
+        assert_eq!(
+            latest.global.reported_tablets,
+            quiet.global.reported_tablets
+        );
+
+        let delta = reporter.inner.snapshot_io_delta();
+        assert!(delta.iter().all(
+            |entry| io_counters_is_zero(entry.counters) || !io_counters_is_zero(entry.counters)
+        ));
+
+        let current = IoCounterSnapshot {
+            read_ops: 9,
+            read_bytes: 8,
+            write_ops: 7,
+            write_bytes: 6,
+            fsync_ops: 5,
+        };
+        let previous = IoCounterSnapshot {
+            read_ops: 4,
+            read_bytes: 3,
+            write_ops: 2,
+            write_bytes: 1,
+            fsync_ops: 1,
+        };
+        let diff = diff_io_counters(current, previous);
+        assert_eq!(
+            diff,
+            IoCounterSnapshot {
+                read_ops: 5,
+                read_bytes: 5,
+                write_ops: 5,
+                write_bytes: 5,
+                fsync_ops: 4,
+            }
+        );
+        assert!(io_counters_is_zero(IoCounterSnapshot::default()));
+        assert!(!io_counters_is_zero(diff));
+        assert!(now_ms() > 0);
+
+        reporter.stop();
+    }
+}

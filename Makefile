@@ -1,6 +1,6 @@
 # TiSQL Makefile
 
-.PHONY: all build test unit-test store-test storage-test failpoint-test e2e-test bench fmt clippy clean run help prepare quick-prepare
+.PHONY: all build test unit-test store-test storage-test failpoint-test e2e-test bench fmt clippy clean run help prepare quick-prepare coverage
 
 CPU_CORES ?= $(shell getconf _NPROCESSORS_ONLN 2>/dev/null || nproc 2>/dev/null || echo 4)
 # Process-level test parallelism tuned by machine size. Keep integration/e2e
@@ -140,6 +140,10 @@ bench:
 		$(BENCH_TIMEOUT_SECS) \
 		"$(BENCH_FILTER)"
 
+# Run coverage with per-module gates
+coverage:
+	./scripts/coverage.sh
+
 # Record E2E test results (use when adding new tests)
 e2e-record:
 	./scripts/run_with_timeout.sh $(E2E_TEST_TIMEOUT_SECS) \
@@ -216,6 +220,7 @@ help:
 	@echo "  e2e-test     Run E2E tests only"
 	@echo "  e2e-record   Record E2E test results"
 	@echo "  bench        Run deterministic performance-regression bench cases"
+	@echo "  coverage     Generate coverage report with per-module 90% gates"
 	@echo "  fmt          Format code"
 	@echo "  fmt-check    Check code formatting"
 	@echo "  clippy       Run clippy linter"

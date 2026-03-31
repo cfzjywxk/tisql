@@ -836,8 +836,9 @@ impl IlogService {
 
         log_info!("Opened ilog file: {:?}", ilog_path);
 
-        // Create IoService internally for test/thread paths
-        let io = crate::io::IoService::new(32)
+        // Thread-backed manifest writers are used by tests and sync helpers
+        // that must remain deterministic on hosts without io_uring support.
+        let io = crate::io::IoService::new_for_test(32)
             .map_err(|e| TiSqlError::Internal(format!("Failed to create IoService: {e}")))?;
         let group_writer = crate::clog::GroupCommitWriter::new_with_thread_with_trace(
             dma_file,

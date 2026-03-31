@@ -898,4 +898,54 @@ mod tests {
         let matches = v.find_overlapping_at_level(0, b"c", b"h");
         assert_eq!(matches.len(), 0);
     }
+
+    #[test]
+    fn test_version_defaults_and_builder_ignore_out_of_range_levels() {
+        let version = Version::default();
+        assert_eq!(version.version_num(), 0);
+        assert_eq!(version.next_sst_id(), 1);
+
+        let built = VersionBuilder::default()
+            .add_sst(make_sst(9, MAX_LEVELS as u32, b"x", b"z"))
+            .build();
+        assert_eq!(built.total_sst_count(), 0);
+    }
+
+    #[test]
+    fn test_manifest_delta_helper_methods_and_conversions() {
+        let sst1 = make_sst(11, 0, b"a", b"m");
+        let sst2 = make_sst(12, 1, b"n", b"z");
+
+        let mut delta = ManifestDelta::default();
+        delta.add_sst(sst1.clone());
+        delta.delete_sst(1, 77);
+        delta.set_flushed_lsn(88);
+        assert_eq!(delta.new_ssts.len(), 1);
+        assert_eq!(delta.deleted_ssts, vec![(1, 77)]);
+        assert_eq!(delta.flushed_lsn, Some(88));
+
+        let flush_request = ManifestCommitRequest::Flush {
+            sst: SstDesc::from(&sst1),
+            flushed_lsn: 99,
+        };
+        let flush_delta = ManifestDelta::from_commit_request(&flush_request);
+        assert_eq!(flush_delta.new_ssts.len(), 1);
+        assert_eq!(flush_delta.flushed_lsn, Some(99));
+
+        let compact_request = ManifestCommitRequest::Compact {
+            deleted_ssts: vec![(0, 11)],
+            new_ssts: vec![SstDesc::from(&sst2)],
+        };
+        let compact_delta = ManifestDelta::from_commit_request(&compact_request);
+        assert_eq!(compact_delta.deleted_ssts, vec![(0, 11)]);
+        assert_eq!(compact_delta.new_ssts.len(), 1);
+
+        let move_edit = TrivialMoveEdit {
+            deleted_ssts: vec![(1, 22)],
+            new_ssts: vec![SstDesc::from(&sst2)],
+        };
+        let move_delta = ManifestDelta::from_trivial_move(&move_edit);
+        assert_eq!(move_delta.deleted_ssts, vec![(1, 22)]);
+        assert_eq!(move_delta.new_ssts.len(), 1);
+    }
 }

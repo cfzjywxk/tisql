@@ -1199,12 +1199,45 @@ fn crc32(data: &[u8]) -> u32 {
 mod tests {
     use super::*;
     use crate::clog::{ClogOp, ClogOpRef};
+    use crate::log::clog::group_buffer::{ClogGroupBuffer, GroupBufferError};
+    use crate::log::clog::writer::{ClogWriter, ClogWriterTuning};
     use std::io::{BufReader, Seek, SeekFrom};
     use std::path::Path;
+    use std::time::Duration;
     use tempfile::tempdir;
 
     fn make_test_io() -> Arc<crate::io::IoService> {
         crate::io::IoService::new_for_test(32).unwrap()
+    }
+
+    struct HeaderIoErrorReader;
+
+    impl Read for HeaderIoErrorReader {
+        fn read(&mut self, _buf: &mut [u8]) -> std::io::Result<usize> {
+            Err(std::io::Error::other("boom"))
+        }
+    }
+
+    fn make_small_service(dir: &Path, buffer_size: usize, max_slots: usize) -> FileClogService {
+        let config = FileClogConfig::with_dir(dir);
+        std::fs::create_dir_all(&config.clog_dir).unwrap();
+        let group_buffer = ClogGroupBuffer::new(buffer_size, max_slots);
+        let writer = ClogWriter::new(
+            config.clog_path(),
+            Arc::clone(&group_buffer),
+            &tokio::runtime::Handle::current(),
+            0,
+            buffer_size.max(DMA_ALIGNMENT),
+            ClogWriterTuning::default(),
+            Arc::new(|_| {}),
+        )
+        .unwrap();
+        FileClogService {
+            config,
+            lsn_provider: LsnProviderKind::Local(AtomicLsnProvider::with_start(1)),
+            group_buffer,
+            writer,
+        }
     }
 
     #[test]
@@ -1379,6 +1412,118 @@ mod tests {
                 );
             }
         }
+    }
+
+    #[test]
+    fn test_read_record_with_size_propagates_header_io_error() {
+        let err = FileClogService::read_record_with_size(&mut HeaderIoErrorReader, 0).unwrap_err();
+        assert!(matches!(
+            err,
+            TiSqlError::Io(io_err) if io_err.to_string().contains("boom")
+        ));
+    }
+
+    #[test]
+    fn test_serialize_ops_with_commit_into_rejects_too_small_buffer() {
+        let err = FileClogService::serialize_ops_with_commit_into(&mut [0u8; 4], 1, 1, &[], 1)
+            .unwrap_err();
+        assert!(matches!(
+            err,
+            TiSqlError::Internal(message) if message.contains("record buffer too small")
+        ));
+    }
+
+    #[test]
+    fn test_map_group_buffer_error_variants() {
+        assert!(matches!(
+            FileClogService::map_group_buffer_error(GroupBufferError::RecordTooLarge {
+                size: 9,
+                max: 7,
+            }),
+            TiSqlError::Internal(message) if message.contains("too large")
+        ));
+        assert!(matches!(
+            FileClogService::map_group_buffer_error(GroupBufferError::BufferFull),
+            TiSqlError::Internal(message) if message.contains("buffer full")
+        ));
+        assert!(matches!(
+            FileClogService::map_group_buffer_error(GroupBufferError::SlotsFull),
+            TiSqlError::Internal(message) if message.contains("buffer full")
+        ));
+        assert!(matches!(
+            FileClogService::map_group_buffer_error(GroupBufferError::StreamFailed),
+            TiSqlError::Internal(message) if message.contains("stream failed")
+        ));
+    }
+
+    #[tokio::test]
+    async fn test_submit_ops_async_maps_stream_failed_and_record_too_large() {
+        let dir = tempdir().unwrap();
+        let service = make_small_service(dir.path(), 64, 1);
+
+        service.group_buffer.set_shutdown();
+        let err = service.submit_ops_async(8, 1, 1, &[], 1).await.unwrap_err();
+        assert!(matches!(
+            err,
+            TiSqlError::Internal(message) if message.contains("stream failed")
+        ));
+        service
+            .writer
+            .stop_and_drain("shutdown test")
+            .await
+            .unwrap();
+
+        let dir = tempdir().unwrap();
+        let service = make_small_service(dir.path(), 8, 1);
+        let err = service
+            .submit_ops_async(16, 1, 1, &[], 1)
+            .await
+            .unwrap_err();
+        assert!(matches!(
+            err,
+            TiSqlError::Internal(message) if message.contains("too large")
+        ));
+        service
+            .writer
+            .stop_and_drain("record too large")
+            .await
+            .unwrap();
+    }
+
+    #[tokio::test]
+    async fn test_submit_ops_async_waits_for_space_then_commits() {
+        let dir = tempdir().unwrap();
+        let service = make_small_service(dir.path(), 128, 1);
+        let reserved_record_len = RECORD_HEADER_SIZE
+            + FileClogService::serialized_ops_payload_size(7, 11, &[], 13).unwrap();
+
+        let held = service.group_buffer.alloc(reserved_record_len).unwrap();
+        let submit_future = service.submit_ops_async(reserved_record_len, 7, 11, &[], 13);
+        tokio::pin!(submit_future);
+        assert!(
+            tokio::time::timeout(Duration::from_millis(10), &mut submit_future)
+                .await
+                .is_err()
+        );
+
+        drop(held);
+        assert!(service
+            .group_buffer
+            .drain_cancelled_head("test reclaim")
+            .then_some(())
+            .is_some());
+
+        let rx = submit_future
+            .await
+            .expect("submit_ops_async should succeed after space is reclaimed");
+        rx.await
+            .expect("writer completion sender dropped")
+            .expect("writer should flush reclaimed reservation");
+        service
+            .writer
+            .stop_and_drain("buffer wait test")
+            .await
+            .unwrap();
     }
 
     /// Locate the byte offset of the nth logical record (0-based), skipping

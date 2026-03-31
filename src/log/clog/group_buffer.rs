@@ -669,6 +669,9 @@ impl ClogGroupBuffer {
     }
 
     fn bump_space_epoch(&self) {
+        // Serialize epoch publication with the waiter mutex to avoid
+        // notify-before-wait lost-wakeup races in alloc_sync_wait/reclaim/shutdown paths.
+        let _guard = self.space_wait_mu.lock();
         let next = self.space_epoch.fetch_add(1, Ordering::AcqRel) + 1;
         self.space_watch_tx.send_replace(next);
         self.space_wait_cv.notify_all();
@@ -864,6 +867,83 @@ mod tests {
             .alloc(40)
             .expect("wrapped reservation should fit after full reclaim");
         drop(r2);
+    }
+
+    #[test]
+    fn test_alloc_sync_wait_wakes_on_reclaim_and_shutdown() {
+        let gb = ClogGroupBuffer::new(32, 1);
+        let reservation = gb.alloc(16).unwrap();
+
+        let waiter_gb = Arc::clone(&gb);
+        let (ready_tx, ready_rx) = mpsc::channel();
+        let (done_tx, done_rx) = mpsc::channel();
+        let handle = std::thread::spawn(move || {
+            ready_tx.send(()).unwrap();
+            let result = waiter_gb.alloc_sync_wait(8).map(|resv| resv.slot_idx);
+            done_tx.send(result).unwrap();
+        });
+
+        ready_rx.recv().unwrap();
+        drop(reservation);
+        assert!(gb.drain_cancelled_head("cancelled"));
+
+        let slot_idx = done_rx
+            .recv_timeout(Duration::from_secs(1))
+            .expect("alloc_sync_wait should wake after reclaim")
+            .expect("allocation should succeed after reclaim");
+        assert_eq!(slot_idx, 1);
+        handle.join().unwrap();
+
+        let gb = ClogGroupBuffer::new(32, 1);
+        let reservation = gb.alloc(16).unwrap();
+
+        let waiter_gb = Arc::clone(&gb);
+        let (ready_tx, ready_rx) = mpsc::channel();
+        let (done_tx, done_rx) = mpsc::channel();
+        let handle = std::thread::spawn(move || {
+            ready_tx.send(()).unwrap();
+            let result = waiter_gb.alloc_sync_wait(8);
+            done_tx.send(result).unwrap();
+        });
+
+        ready_rx.recv().unwrap();
+        gb.set_shutdown();
+        drop(reservation);
+
+        let err = match done_rx
+            .recv_timeout(Duration::from_secs(1))
+            .expect("alloc_sync_wait should wake on shutdown")
+        {
+            Ok(_) => panic!("allocation should fail once shutdown is observed"),
+            Err(err) => err,
+        };
+        assert_eq!(err, GroupBufferError::StreamFailed);
+        handle.join().unwrap();
+    }
+
+    #[test]
+    fn test_commit_with_size_invalid_and_state_mismatch_fail_pending_waiters() {
+        let gb = ClogGroupBuffer::new(32, 2);
+        let reservation = gb.alloc(4).unwrap();
+        let rx = reservation.commit_with_size(8);
+        let err = rx
+            .blocking_recv()
+            .expect("invalid size waiter should resolve")
+            .unwrap_err();
+        assert!(err.contains("commit size invalid"));
+        assert!(gb.is_shutdown());
+
+        gb.reset_for_restart();
+
+        let reservation = gb.alloc(4).unwrap();
+        gb.slot(0).state.store(SLOT_FREE, Ordering::Release);
+        let rx = reservation.commit();
+        let err = rx
+            .blocking_recv()
+            .expect("state mismatch waiter should resolve")
+            .unwrap_err();
+        assert!(err.contains("commit state mismatch"));
+        assert!(gb.is_shutdown());
     }
 
     #[test]

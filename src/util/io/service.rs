@@ -146,6 +146,25 @@ impl std::fmt::Debug for IoService {
 }
 
 impl IoService {
+    fn spawn_sync_backend(thread_name: String) -> Result<Arc<Self>, String> {
+        let (tx, rx) = crossbeam_channel::unbounded::<IoOp>();
+        let shutdown_tx = tx.clone();
+
+        std::thread::Builder::new()
+            .name(thread_name)
+            .spawn(move || {
+                if let Err(e) = io_thread_main_sync(rx) {
+                    tracing::error!("IoService sync thread failed: {e}");
+                }
+            })
+            .map_err(|e| format!("Failed to spawn IoService sync thread: {e}"))?;
+
+        Ok(Arc::new(Self {
+            tx,
+            shutdown_tx: parking_lot::Mutex::new(Some(shutdown_tx)),
+        }))
+    }
+
     /// Create a new IoService with the given ring size hint and thread-role label.
     ///
     /// `thread_role` is used only for the dedicated OS thread name to make
@@ -169,6 +188,49 @@ impl IoService {
             format!("{thread_base}-{thread_role}")
         };
 
+        #[cfg(target_os = "linux")]
+        {
+            let (init_tx, init_rx) = std::sync::mpsc::sync_channel(1);
+            std::thread::Builder::new()
+                .name(thread_name.clone())
+                .spawn(move || match io_uring::IoUring::new(ring_size) {
+                    Ok(ring) => {
+                        let _ = init_tx.send(Ok(()));
+                        if let Err(e) = io_thread_main_with_ring(rx, ring) {
+                            tracing::error!("IoService thread failed: {e}");
+                        }
+                    }
+                    Err(e) => {
+                        let _ = init_tx.send(Err(format!(
+                            "Failed to create io_uring with ring_size={ring_size}: {e}"
+                        )));
+                    }
+                })
+                .map_err(|e| format!("Failed to spawn IoService thread: {e}"))?;
+
+            match init_rx.recv() {
+                Ok(Ok(())) => {
+                    return Ok(Arc::new(Self {
+                        tx,
+                        shutdown_tx: parking_lot::Mutex::new(Some(shutdown_tx)),
+                    }));
+                }
+                Ok(Err(e)) => {
+                    tracing::warn!(
+                        "IoService io_uring backend unavailable, falling back to sync backend: {e}"
+                    );
+                    return Self::spawn_sync_backend(thread_name);
+                }
+                Err(e) => {
+                    tracing::warn!(
+                        "IoService io_uring backend did not report startup, falling back to sync backend: {e}"
+                    );
+                    return Self::spawn_sync_backend(thread_name);
+                }
+            }
+        }
+
+        #[cfg(not(target_os = "linux"))]
         std::thread::Builder::new()
             .name(thread_name)
             .spawn(move || {
@@ -184,6 +246,16 @@ impl IoService {
         }))
     }
 
+    /// Create a new IoService that always uses the synchronous backend.
+    pub fn new_sync_with_role(_ring_size: u32, thread_role: &str) -> Result<Arc<Self>, String> {
+        let thread_name = if thread_role.is_empty() {
+            "tisql-io-sync".to_string()
+        } else {
+            format!("tisql-io-sync-{thread_role}")
+        };
+        Self::spawn_sync_backend(thread_name)
+    }
+
     /// Create a new IoService with the given ring size hint.
     ///
     /// On Linux, `ring_size` determines the io_uring submission queue depth.
@@ -195,10 +267,12 @@ impl IoService {
         Self::new_with_role(ring_size, "")
     }
 
-    /// Create an IoService for tests (alias for `new()`).
-    #[cfg(test)]
-    pub fn new_for_test(ring_size: u32) -> Result<Arc<Self>, String> {
-        Self::new(ring_size)
+    /// Create an IoService for tests using the synchronous backend explicitly.
+    ///
+    /// This keeps test environments deterministic on hosts where `io_uring`
+    /// is unavailable, without changing the production semantics of `new()`.
+    pub fn new_for_test(_ring_size: u32) -> Result<Arc<Self>, String> {
+        Self::new_sync_with_role(0, "test")
     }
 
     /// Shutdown the I/O thread by closing the channel early.
@@ -331,8 +405,16 @@ impl IoService {
 #[cfg(target_os = "linux")]
 fn io_thread_main(rx: crossbeam_channel::Receiver<IoOp>, ring_size: u32) -> Result<(), String> {
     let mut ring = io_uring::IoUring::new(ring_size)
-        .map_err(|e| format!("io_uring::IoUring::new failed: {e}"))?;
+        .map_err(|e| format!("Failed to create io_uring with ring_size={ring_size}: {e}"))?;
 
+    io_thread_main_with_ring(rx, ring)
+}
+
+#[cfg(target_os = "linux")]
+fn io_thread_main_with_ring(
+    rx: crossbeam_channel::Receiver<IoOp>,
+    mut ring: io_uring::IoUring,
+) -> Result<(), String> {
     // Pending operations: maps user_data -> completion handler
     let mut pending: Vec<Option<PendingOp>> = Vec::new();
     let mut next_id: u64 = 0;
@@ -579,6 +661,10 @@ enum PendingOp {
 /// the public async/sync IoService API unchanged for macOS development.
 #[cfg(not(target_os = "linux"))]
 fn io_thread_main(rx: crossbeam_channel::Receiver<IoOp>, _ring_size: u32) -> Result<(), String> {
+    io_thread_main_sync(rx)
+}
+
+fn io_thread_main_sync(rx: crossbeam_channel::Receiver<IoOp>) -> Result<(), String> {
     while let Ok(op) = rx.recv() {
         match op {
             IoOp::ReadAt {
@@ -626,17 +712,31 @@ fn io_thread_main(rx: crossbeam_channel::Receiver<IoOp>, _ring_size: u32) -> Res
     Ok(())
 }
 
-#[cfg(not(target_os = "linux"))]
 fn read_at_sync(fd: RawFd, offset: u64, len: usize) -> IoResult<AlignedBuf> {
     if len == 0 {
         return Ok(AlignedBuf::zeroed(0, DMA_ALIGNMENT));
     }
 
-    let mut buf = AlignedBuf::zeroed(len, DMA_ALIGNMENT);
+    #[cfg(target_os = "linux")]
+    let (read_offset, read_len, skip, requested_len) = {
+        let aligned_offset = align_down(offset, DMA_ALIGNMENT as u64);
+        let aligned_end = align_up(offset + len as u64, DMA_ALIGNMENT as u64);
+        (
+            aligned_offset,
+            (aligned_end - aligned_offset) as usize,
+            (offset - aligned_offset) as usize,
+            len,
+        )
+    };
+
+    #[cfg(not(target_os = "linux"))]
+    let (read_offset, read_len, skip, requested_len) = (offset, len, 0usize, len);
+
+    let mut buf = AlignedBuf::zeroed(read_len, DMA_ALIGNMENT);
     let mut total_read = 0usize;
 
-    while total_read < len {
-        let current_offset = offset
+    while total_read < read_len {
+        let current_offset = read_offset
             .checked_add(total_read as u64)
             .ok_or_else(|| "read offset overflow".to_string())?;
         let off = offset_to_off_t(current_offset)?;
@@ -647,7 +747,7 @@ fn read_at_sync(fd: RawFd, offset: u64, len: usize) -> IoResult<AlignedBuf> {
             libc::pread(
                 fd,
                 buf[total_read..].as_mut_ptr() as *mut libc::c_void,
-                len - total_read,
+                read_len - total_read,
                 off,
             )
         };
@@ -660,14 +760,18 @@ fn read_at_sync(fd: RawFd, offset: u64, len: usize) -> IoResult<AlignedBuf> {
         total_read += n as usize;
     }
 
-    if total_read == len {
-        Ok(buf)
-    } else {
-        Ok(AlignedBuf::from_slice(&buf[..total_read], DMA_ALIGNMENT))
+    if total_read <= skip {
+        return Ok(AlignedBuf::zeroed(0, DMA_ALIGNMENT));
     }
+
+    let available = total_read - skip;
+    let actual_len = requested_len.min(available);
+    Ok(AlignedBuf::from_slice(
+        &buf[skip..skip + actual_len],
+        DMA_ALIGNMENT,
+    ))
 }
 
-#[cfg(not(target_os = "linux"))]
 fn write_at_sync(fd: RawFd, offset: u64, buf: &AlignedBuf) -> IoResult<usize> {
     let mut total_written = 0usize;
     while total_written < buf.len() {
@@ -725,7 +829,7 @@ fn sync_sync(fd: RawFd, mode: IoSyncMode) -> IoResult<()> {
     Ok(())
 }
 
-#[cfg(all(not(target_os = "linux"), not(target_os = "macos")))]
+#[cfg(not(target_os = "macos"))]
 fn sync_sync(fd: RawFd, mode: IoSyncMode) -> IoResult<()> {
     // SAFETY: `fd` belongs to an open file descriptor owned by DmaFile.
     let rc = unsafe {
@@ -747,7 +851,6 @@ fn sync_sync(fd: RawFd, mode: IoSyncMode) -> IoResult<()> {
     Ok(())
 }
 
-#[cfg(not(target_os = "linux"))]
 fn offset_to_off_t(offset: u64) -> IoResult<libc::off_t> {
     if offset > libc::off_t::MAX as u64 {
         return Err(format!("offset {offset} exceeds off_t::MAX"));

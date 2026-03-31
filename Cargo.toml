@@ -98,6 +98,22 @@ path = "tests/concurrency_test.rs"
 name = "mysql_protocol_test"
 path = "tests/mysql_protocol_test.rs"
 
+[[bench]]
+name = "sql_executor"
+harness = false
+
+[[bench]]
+name = "transaction_service"
+harness = false
+
+[[bench]]
+name = "clog_service"
+harness = false
+
+[[bench]]
+name = "tablet_engine"
+harness = false
+
 # ============================================================================
 # Profile settings
 # ============================================================================

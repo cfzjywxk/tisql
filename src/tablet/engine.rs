@@ -4141,6 +4141,8 @@ struct MockMvccIterator {
     pos: i32,
     /// Tracks whether seek() has been called (shared for external inspection)
     seek_called: Arc<AtomicBool>,
+    /// Inject a one-shot advance failure after the current item is emitted.
+    fail_on_advance: Option<TiSqlError>,
 }
 
 #[cfg(test)]
@@ -4151,6 +4153,7 @@ impl MockMvccIterator {
             data,
             pos: -1, // Not initialized
             seek_called: Arc::clone(&seek_called),
+            fail_on_advance: None,
         };
         (iter, seek_called)
     }
@@ -4164,7 +4167,23 @@ impl MockMvccIterator {
             data,
             pos: -1,
             seek_called,
+            fail_on_advance: None,
         }
+    }
+
+    fn new_fail_on_advance(
+        _name: &str,
+        data: Vec<(MvccKey, Vec<u8>)>,
+        err: TiSqlError,
+    ) -> (Self, Arc<AtomicBool>) {
+        let seek_called = Arc::new(AtomicBool::new(false));
+        let iter = Self {
+            data,
+            pos: -1,
+            seek_called: Arc::clone(&seek_called),
+            fail_on_advance: Some(err),
+        };
+        (iter, seek_called)
     }
 }
 
@@ -4184,6 +4203,9 @@ impl MvccIterator for MockMvccIterator {
     }
 
     async fn advance(&mut self) -> Result<()> {
+        if let Some(err) = self.fail_on_advance.take() {
+            return Err(err);
+        }
         if self.pos >= 0 {
             self.pos += 1;
         }
@@ -4415,13 +4437,10 @@ impl Drop for LsmEngine {
     fn drop(&mut self) {
         self.shutdown_manifest_writer();
 
-        // Shutdown spawn_blocking tasks before the runtime drops.
-        //
-        // IoService and GroupCommitWriter (in IlogService) each run a
-        // spawn_blocking task that blocks on rx.recv(). Closing their
-        // sender channels causes those tasks to exit. Without this,
-        // runtime shutdown blocks forever waiting for them.
-        self.io.shutdown();
+        // Shutdown per-engine manifest writers here. The shared IoService is
+        // owned by the enclosing database/test harness and must not be shut
+        // down by individual tablet engines while other engines are still
+        // flushing or recovering.
         if let Some(ilog) = &self.ilog {
             ilog.shutdown();
         }
@@ -5073,6 +5092,724 @@ mod tests {
         let mut batch = WriteBatch::new();
         batch.set_commit_ts(commit_ts);
         batch
+    }
+
+    fn make_test_sst_meta(id: u64, level: u32, smallest: &[u8], largest: &[u8]) -> Arc<SstMeta> {
+        Arc::new(SstMeta {
+            id,
+            level,
+            smallest_key: MvccKey::encode(smallest, Timestamp::MAX).into_bytes(),
+            largest_key: MvccKey::encode(largest, 0).into_bytes(),
+            file_size: 1,
+            entry_count: 1,
+            block_count: 1,
+            min_ts: 0,
+            max_ts: Timestamp::MAX,
+            created_at: 0,
+        })
+    }
+
+    fn reset_storage_profile_counters() {
+        STORAGE_PROFILE_COUNT.store(0, AtomicOrdering::Relaxed);
+        STORAGE_PROFILE_MEMTABLE_US_TOTAL.store(0, AtomicOrdering::Relaxed);
+        STORAGE_PROFILE_ROW_CACHE_US_TOTAL.store(0, AtomicOrdering::Relaxed);
+        STORAGE_PROFILE_SST_US_TOTAL.store(0, AtomicOrdering::Relaxed);
+        STORAGE_PROFILE_MEMTABLE_HITS.store(0, AtomicOrdering::Relaxed);
+        STORAGE_PROFILE_ROW_CACHE_HITS.store(0, AtomicOrdering::Relaxed);
+        STORAGE_PROFILE_SST_HITS.store(0, AtomicOrdering::Relaxed);
+    }
+
+    fn reset_sst_profile_counters() {
+        SST_PROFILE_COUNT.store(0, AtomicOrdering::Relaxed);
+        SST_PROFILE_VERSION_US_TOTAL.store(0, AtomicOrdering::Relaxed);
+        SST_PROFILE_READER_US_TOTAL.store(0, AtomicOrdering::Relaxed);
+        SST_PROFILE_BLOOM_US_TOTAL.store(0, AtomicOrdering::Relaxed);
+        SST_PROFILE_SEEK_US_TOTAL.store(0, AtomicOrdering::Relaxed);
+        SST_PROFILE_COMPARE_US_TOTAL.store(0, AtomicOrdering::Relaxed);
+        SST_PROFILE_SSTS_VISITED.store(0, AtomicOrdering::Relaxed);
+        SST_PROFILE_BLOOM_REJECTIONS.store(0, AtomicOrdering::Relaxed);
+    }
+
+    #[test]
+    fn test_profile_helpers_cover_all_hit_paths() {
+        reset_storage_profile_counters();
+        STORAGE_PROFILE_COUNT.store(STORAGE_PROFILE_LOG_EVERY - 4, AtomicOrdering::Relaxed);
+        record_storage_profile(1, 2, 3, "mem");
+        record_storage_profile(4, 5, 6, "rc");
+        record_storage_profile(7, 8, 9, "sst");
+        record_storage_profile(10, 11, 12, "other");
+        assert_eq!(
+            STORAGE_PROFILE_COUNT.load(AtomicOrdering::Relaxed),
+            STORAGE_PROFILE_LOG_EVERY
+        );
+        assert_eq!(
+            STORAGE_PROFILE_MEMTABLE_HITS.load(AtomicOrdering::Relaxed),
+            1
+        );
+        assert_eq!(
+            STORAGE_PROFILE_ROW_CACHE_HITS.load(AtomicOrdering::Relaxed),
+            1
+        );
+        assert_eq!(STORAGE_PROFILE_SST_HITS.load(AtomicOrdering::Relaxed), 1);
+
+        reset_sst_profile_counters();
+        SST_PROFILE_COUNT.store(SST_PROFILE_LOG_EVERY - 1, AtomicOrdering::Relaxed);
+        record_sst_profile(
+            13,
+            &SstProfileAccum {
+                reader_us: 14,
+                bloom_us: 15,
+                seek_us: 16,
+                compare_us: 17,
+                ssts_visited: 3,
+                bloom_rejections: 2,
+            },
+        );
+        assert_eq!(
+            SST_PROFILE_COUNT.load(AtomicOrdering::Relaxed),
+            SST_PROFILE_LOG_EVERY
+        );
+        assert_eq!(
+            SST_PROFILE_VERSION_US_TOTAL.load(AtomicOrdering::Relaxed),
+            13
+        );
+        assert_eq!(
+            SST_PROFILE_BLOOM_REJECTIONS.load(AtomicOrdering::Relaxed),
+            2
+        );
+    }
+
+    #[tokio::test]
+    async fn test_manifest_writer_handle_fast_fail_and_apply_trivial_move_errors() {
+        let (tx, rx) = tokio::sync::mpsc::channel(1);
+        drop(rx);
+        let handle = ManifestWriterHandle::new(tx, Arc::new(AtomicBool::new(false)));
+        let err = handle
+            .apply_trivial_move(TrivialMoveEdit {
+                deleted_ssts: vec![],
+                new_ssts: vec![],
+            })
+            .await
+            .unwrap_err();
+        assert!(matches!(
+            err,
+            TiSqlError::Internal(message) if message.contains("shut down")
+        ));
+
+        let (tx, mut rx) = tokio::sync::mpsc::channel(1);
+        let handle = ManifestWriterHandle::new(tx, Arc::new(AtomicBool::new(false)));
+        let receiver_task = tokio::spawn(async move {
+            if let Some(ManifestRequest::ApplyTrivialMove { reply, .. }) = rx.recv().await {
+                drop(reply);
+            }
+        });
+        let err = handle
+            .apply_trivial_move(TrivialMoveEdit {
+                deleted_ssts: vec![],
+                new_ssts: vec![],
+            })
+            .await
+            .unwrap_err();
+        assert!(matches!(
+            err,
+            TiSqlError::Internal(message) if message.contains("dropped reply")
+        ));
+        receiver_task.await.unwrap();
+
+        let (tx, mut rx) = tokio::sync::mpsc::channel(1);
+        let handle = ManifestWriterHandle::new(tx, Arc::new(AtomicBool::new(false)));
+        let receiver_task = tokio::spawn(async move {
+            if let Some(ManifestRequest::ApplyTrivialMove { reply, .. }) = rx.recv().await {
+                let _ = reply.send(Ok(()));
+            }
+        });
+        ManifestCoordinator::apply_trivial_move(
+            &handle,
+            TrivialMoveEdit {
+                deleted_ssts: vec![],
+                new_ssts: vec![],
+            },
+        )
+        .await
+        .unwrap();
+        receiver_task.await.unwrap();
+
+        let failed = ManifestWriterHandle::new(
+            tokio::sync::mpsc::channel(1).0,
+            Arc::new(AtomicBool::new(true)),
+        );
+        let err = failed.fast_fail().unwrap_err();
+        assert!(matches!(
+            err,
+            TiSqlError::Internal(message) if message.contains("failed state")
+        ));
+    }
+
+    #[tokio::test]
+    async fn test_manifest_writer_engine_lifecycle_and_checkpoint_paths() {
+        let tmp = TempDir::new().unwrap();
+        let config = test_config(tmp.path());
+        let mut ilog_config = IlogConfig::new(tmp.path());
+        ilog_config.checkpoint_interval = 1;
+        let lsn_provider = new_lsn_provider();
+        let io = make_test_io();
+        let ilog = Arc::new(
+            IlogService::open(
+                ilog_config,
+                Arc::clone(&lsn_provider),
+                Arc::clone(&io),
+                &tokio::runtime::Handle::current(),
+            )
+            .unwrap(),
+        );
+        let engine = LsmEngine::open_with_recovery(
+            config,
+            Arc::clone(&lsn_provider),
+            Arc::clone(&ilog),
+            Version::new(),
+            io,
+        )
+        .unwrap();
+
+        engine
+            .start_manifest_writer(&tokio::runtime::Handle::current())
+            .unwrap();
+        engine
+            .start_manifest_writer(&tokio::runtime::Handle::current())
+            .unwrap();
+        assert!(engine.manifest_writer.lock().is_some());
+
+        let (snapshot, checkpoint_lsn) = engine.checkpoint_and_capture_manifest().await.unwrap();
+        assert_eq!(snapshot.flushed_lsn(), 0);
+        assert!(checkpoint_lsn > 0);
+
+        engine.shutdown_manifest_writer();
+        assert!(engine.manifest_writer.lock().is_none());
+
+        engine.ensure_manifest_writer().unwrap();
+        assert!(engine.manifest_runtime.lock().is_some());
+
+        engine.shutdown_manifest_writer();
+        engine.ensure_manifest_writer().unwrap();
+        assert!(engine.manifest_writer.lock().is_some());
+
+        engine.manifest_error.store(true, AtomicOrdering::SeqCst);
+        engine.shutdown_manifest_writer();
+
+        let err = engine.ensure_manifest_writer().unwrap_err();
+        assert!(matches!(
+            err,
+            TiSqlError::Internal(message) if message.contains("failed state")
+        ));
+        let err = engine
+            .start_manifest_writer_inner(&tokio::runtime::Handle::current())
+            .unwrap_err();
+        assert!(matches!(
+            err,
+            TiSqlError::Internal(message) if message.contains("failed state")
+        ));
+
+        let memory_dir = tmp.path().join("memory");
+        let non_durable = LsmEngine::open(test_config(&memory_dir)).unwrap();
+        non_durable
+            .start_manifest_writer(&tokio::runtime::Handle::current())
+            .unwrap();
+        let err = match non_durable.manifest_writer_handle() {
+            Ok(_) => panic!("non-durable engine should not have a manifest writer handle"),
+            Err(err) => err,
+        };
+        assert!(matches!(
+            err,
+            TiSqlError::Internal(message) if message.contains("not available")
+        ));
+        let err = non_durable
+            .checkpoint_and_capture_manifest()
+            .await
+            .unwrap_err();
+        assert!(matches!(
+            err,
+            TiSqlError::Internal(message) if message.contains("durable ilog")
+        ));
+    }
+
+    #[tokio::test]
+    async fn test_manifest_writer_loop_request_matrix() {
+        let tmp = TempDir::new().unwrap();
+        let mut ilog_config = IlogConfig::new(tmp.path());
+        ilog_config.checkpoint_interval = 1;
+        let lsn_provider = new_lsn_provider();
+        let io = make_test_io();
+        let ilog = Arc::new(
+            IlogService::open(
+                ilog_config,
+                Arc::clone(&lsn_provider),
+                Arc::clone(&io),
+                &tokio::runtime::Handle::current(),
+            )
+            .unwrap(),
+        );
+        let version_set = Arc::new(VersionSet::new(Version::new()));
+        let error_flag = Arc::new(AtomicBool::new(false));
+        let running_flag = Arc::new(AtomicBool::new(false));
+        let (tx, rx) = tokio::sync::mpsc::channel(8);
+        let writer_task = tokio::spawn(manifest_writer_loop(
+            Arc::clone(&ilog),
+            Arc::clone(&version_set),
+            rx,
+            Arc::clone(&error_flag),
+            Arc::clone(&running_flag),
+        ));
+        let handle = ManifestWriterHandle::new(tx.clone(), Arc::clone(&error_flag));
+
+        let prepared = handle
+            .register_intent(ManifestIntentRequest::Flush {
+                sst_id: 11,
+                memtable_id: 7,
+            })
+            .await
+            .unwrap();
+        let capture = handle.checkpoint_and_capture().await.unwrap();
+        assert_eq!(capture.pending_intents.len(), 1);
+        assert!(capture.checkpoint_lsn > 0);
+
+        let flush_sst: crate::kernel::manifest::SstDesc = make_test_sst_meta(11, 0, b"a", b"z")
+            .as_ref()
+            .into();
+
+        let (unknown_reply_tx, unknown_reply_rx) = tokio::sync::oneshot::channel();
+        tx.send(ManifestRequest::CommitPrepared {
+            op: PreparedManifestOp { op_id: prepared.op_id + 99 },
+            commit: ManifestCommitRequest::Flush {
+                sst: flush_sst.clone(),
+                flushed_lsn: 33,
+            },
+            reply: unknown_reply_tx,
+        })
+        .await
+        .unwrap();
+        let unknown_err = unknown_reply_rx.await.unwrap().unwrap_err();
+        assert!(matches!(
+            unknown_err,
+            TiSqlError::Internal(message) if message.contains("Unknown prepared manifest op")
+        ));
+
+        let (mismatch_reply_tx, mismatch_reply_rx) = tokio::sync::oneshot::channel();
+        tx.send(ManifestRequest::CommitPrepared {
+            op: prepared,
+            commit: ManifestCommitRequest::Compact {
+                deleted_ssts: vec![],
+                new_ssts: vec![],
+            },
+            reply: mismatch_reply_tx,
+        })
+        .await
+        .unwrap();
+        let mismatch_err = mismatch_reply_rx.await.unwrap().unwrap_err();
+        assert!(matches!(
+            mismatch_err,
+            TiSqlError::Internal(message)
+                if message.contains("Manifest commit kind does not match prepared op")
+        ));
+
+        handle
+            .commit_prepared(
+                prepared,
+                ManifestCommitRequest::Flush {
+                    sst: flush_sst.clone(),
+                    flushed_lsn: 44,
+                },
+            )
+            .await
+            .unwrap();
+        assert_eq!(version_set.current().ssts_at_level(0).len(), 1);
+
+        let moved_sst: crate::kernel::manifest::SstDesc = make_test_sst_meta(12, 1, b"a", b"z")
+            .as_ref()
+            .into();
+        handle
+            .apply_trivial_move(TrivialMoveEdit {
+                deleted_ssts: vec![(0, 11)],
+                new_ssts: vec![moved_sst],
+            })
+            .await
+            .unwrap();
+        let version = version_set.current();
+        assert!(version.ssts_at_level(0).is_empty());
+        assert_eq!(version.ssts_at_level(1).len(), 1);
+
+        drop(handle);
+        drop(tx);
+        writer_task.await.unwrap();
+        assert!(!running_flag.load(AtomicOrdering::SeqCst));
+        assert!(!error_flag.load(AtomicOrdering::SeqCst));
+    }
+
+    #[test]
+    fn test_gc_safe_point_and_backpressure_getters_do_not_regress() {
+        let tmp = TempDir::new().unwrap();
+        let engine = LsmEngine::open(test_config(tmp.path())).unwrap();
+
+        assert_eq!(engine.gc_safe_point(), 0);
+        engine.set_gc_safe_point(50);
+        engine.set_gc_safe_point(40);
+        assert_eq!(engine.gc_safe_point(), 50);
+
+        assert_eq!(engine.backpressure_state(), BackpressureState::Normal);
+        assert_eq!(engine.backpressure_events(), (0, 0));
+        assert_eq!(engine.frozen_waiter_count(), 0);
+    }
+
+    #[tokio::test]
+    async fn test_flush_memtable_async_rolls_back_when_manifest_register_intent_fails() {
+        let tmp = TempDir::new().unwrap();
+        let config = test_config(tmp.path());
+        let lsn_provider = new_lsn_provider();
+        let io = make_test_io();
+        let ilog = Arc::new(
+            IlogService::open(
+                IlogConfig::new(tmp.path()),
+                Arc::clone(&lsn_provider),
+                Arc::clone(&io),
+                &tokio::runtime::Handle::current(),
+            )
+            .unwrap(),
+        );
+        let engine =
+            LsmEngine::open_with_recovery(config, lsn_provider, ilog, Version::new(), io).unwrap();
+
+        let mut batch = new_batch(1);
+        batch.put(b"flush-me".to_vec(), b"value".to_vec());
+        batch.set_clog_lsn(11);
+        engine.write_batch(batch).unwrap();
+        engine.freeze_active();
+        let frozen = {
+            let state = engine.state.read();
+            state.frozen.front().cloned().expect("frozen memtable")
+        };
+
+        let (tx, rx) = tokio::sync::mpsc::channel(1);
+        drop(rx);
+        *engine.manifest_writer.lock() = Some(ManifestWriterHandle::new(
+            tx,
+            Arc::new(AtomicBool::new(false)),
+        ));
+
+        let err = engine.flush_memtable_async(&frozen).await.unwrap_err();
+        assert!(matches!(
+            err,
+            TiSqlError::Internal(message) if message.contains("Manifest writer is shut down")
+        ));
+        assert_eq!(frozen.flush_state(), FlushState::NeedsFlush);
+    }
+
+    #[tokio::test]
+    async fn test_engine_pressure_and_iterator_helper_paths() {
+        let tmp = TempDir::new().unwrap();
+        let config = LsmConfig::builder(tmp.path())
+            .memtable_size(1024)
+            .max_frozen_memtables(4)
+            .frozen_slowdown_enter_percent(100)
+            .frozen_slowdown_exit_percent(99)
+            .frozen_slowdown_delay_ms(3, 9)
+            .mem_pressure_limits_bytes(10, 20)
+            .mem_pressure_delay_ms(2, 8)
+            .build()
+            .unwrap();
+        let engine = LsmEngine::open(config).unwrap();
+        bind_test_cache_suite(&engine, engine.config());
+        assert_eq!(engine.compute_log_gc_boundary_with_caps(42).safe_lsn, 42);
+
+        let mut batch = new_batch(7);
+        batch.put(b"pressure".to_vec(), b"value".to_vec());
+        engine.write_batch(batch).unwrap();
+        assert!(engine.active_memtable_size() > 0);
+        assert!(engine.cache_suite().is_some());
+        assert_eq!(
+            engine.compute_log_gc_boundary_with_caps(42).safe_lsn,
+            0,
+            "unflushed active data should clamp the log-gc boundary"
+        );
+
+        assert_eq!(
+            engine.compute_frozen_write_delay(4),
+            Duration::from_millis(3)
+        );
+        assert_eq!(
+            engine.compute_mem_pressure_delay(20),
+            Duration::from_millis(8)
+        );
+
+        let invalid_pressure_engine = LsmEngine::open(
+            LsmConfig::builder(tmp.path().join("pressure-invalid"))
+                .memtable_size(1024)
+                .max_frozen_memtables(4)
+                .mem_pressure_limits_bytes(0, 0)
+                .mem_pressure_delay_ms(5, 9)
+                .build()
+                .unwrap(),
+        )
+        .unwrap();
+        assert_eq!(
+            invalid_pressure_engine.compute_mem_pressure_delay(100),
+            Duration::from_millis(5)
+        );
+
+        engine.record_mem_pressure_state(10);
+        engine.record_mem_pressure_state(20);
+        {
+            let mut tracker = engine.mem_pressure_tracker.lock();
+            tracker.soft_enter_at = Some(
+                Instant::now()
+                    .checked_sub(Duration::from_millis(1))
+                    .expect("soft tracker underflow"),
+            );
+            tracker.hard_enter_at = Some(
+                Instant::now()
+                    .checked_sub(Duration::from_millis(1))
+                    .expect("hard tracker underflow"),
+            );
+        }
+        engine.record_mem_pressure_state(20);
+        engine.record_mem_pressure_state(0);
+        let stats = engine.stats();
+        assert!(stats.mem_pressure_soft_events >= 1);
+        assert!(stats.mem_pressure_hard_events >= 1);
+        assert!(stats.mem_pressure_soft_residency_ms >= 1);
+        assert!(stats.mem_pressure_hard_residency_ms >= 1);
+
+        assert_eq!(
+            LsmEngine::decision_to_backpressure_state(WritePressureDecision::Normal),
+            BackpressureState::Normal
+        );
+        assert_eq!(
+            LsmEngine::decision_to_backpressure_state(WritePressureDecision::Slowdown(
+                Duration::from_millis(1)
+            )),
+            BackpressureState::Slowdown
+        );
+        assert_eq!(
+            LsmEngine::decision_to_backpressure_state(WritePressureDecision::Stall(
+                WriteStallReason::FrozenCap
+            )),
+            BackpressureState::Stall
+        );
+
+        let notify_seen = Arc::new(AtomicBool::new(false));
+        let notify_seen_clone = Arc::clone(&notify_seen);
+        engine.set_compaction_notify(Arc::new(move || {
+            notify_seen_clone.store(true, AtomicOrdering::Relaxed);
+        }));
+        engine.trigger_compaction();
+        assert!(notify_seen.load(AtomicOrdering::Relaxed));
+
+        engine.set_gc_safe_point_updater(Arc::new(|| 77));
+        engine.update_gc_safe_point();
+        assert_eq!(engine.gc_safe_point(), 77);
+
+        engine.frozen_waiters.store(1, AtomicOrdering::Relaxed);
+        let notified = engine.frozen_wait_notify.notified();
+        engine.notify_frozen_waiters();
+        tokio::time::timeout(Duration::from_secs(1), notified)
+            .await
+            .expect("notify_frozen_waiters should wake a waiter");
+
+        let dirty = Arc::new(MemTable::new(20));
+        dirty.freeze();
+        dirty.set_flush_state(FlushState::Flushing);
+        dirty.set_flush_state(FlushState::FlushedDirty);
+        assert!(LsmEngine::try_mark_flushing(dirty.as_ref()));
+        assert_eq!(dirty.flush_state(), FlushState::Flushing);
+
+        let frozen = Arc::new(MemTable::new(21));
+        frozen.freeze();
+        frozen.set_flush_state(FlushState::Flushing);
+        {
+            let mut state = engine.state.write();
+            state.active.set_flush_state(FlushState::Flushing);
+            state.frozen.push_back(Arc::clone(&frozen));
+        }
+        engine.reset_aborted_flush_states();
+        let state = engine.state.read();
+        assert_eq!(state.active.flush_state(), FlushState::NeedsFlush);
+        assert_eq!(frozen.flush_state(), FlushState::NeedsFlush);
+    }
+
+    #[tokio::test]
+    async fn test_direct_sst_iterator_and_merge_iterator_paths() {
+        let tmp = TempDir::new().unwrap();
+        let sst_dir = tmp.path().join("sst");
+        let config = LsmConfig::builder(tmp.path())
+            .memtable_size(64)
+            .max_frozen_memtables(4)
+            .build()
+            .unwrap();
+        let engine = LsmEngine::open(config).unwrap();
+
+        let range = Arc::new(MvccKey::unbounded()..MvccKey::unbounded());
+        let missing_meta = make_test_sst_meta(999, 0, b"a", b"b");
+
+        let mut l0_pending = L0SstIterator::new(
+            Arc::clone(&missing_meta),
+            sst_dir.clone(),
+            Arc::clone(&range),
+            make_test_io(),
+            SstReadOptions::default(),
+        );
+        l0_pending.pending_error = Some(TiSqlError::Storage("pending l0 seek".into()));
+        assert!(matches!(
+            l0_pending.seek(&MvccKey::unbounded()).await.unwrap_err(),
+            TiSqlError::Storage(message) if message.contains("pending l0 seek")
+        ));
+        l0_pending.pending_error = Some(TiSqlError::Storage("pending l0 advance".into()));
+        assert!(matches!(
+            l0_pending.advance().await.unwrap_err(),
+            TiSqlError::Storage(message) if message.contains("pending l0 advance")
+        ));
+
+        let mut l0_missing = L0SstIterator::new(
+            Arc::clone(&missing_meta),
+            sst_dir.clone(),
+            Arc::clone(&range),
+            make_test_io(),
+            SstReadOptions::default(),
+        );
+        let err = l0_missing.seek(&MvccKey::unbounded()).await.unwrap_err();
+        assert!(matches!(
+            err,
+            TiSqlError::Storage(message) if message.contains("SST file missing")
+        ));
+
+        for (ts, key, value) in [(10, b"a".as_slice(), b"one".as_slice()), (20, b"z", b"two")] {
+            let mut batch = new_batch(ts);
+            batch.put(key.to_vec(), value.to_vec());
+            engine.write_batch(batch).unwrap();
+            engine.flush_all_with_active().unwrap();
+        }
+
+        let version = engine.current_version();
+        let mut metas: Vec<Arc<SstMeta>> = version.ssts_at_level(0).iter().cloned().collect();
+        metas.sort_by(|left, right| left.smallest_key.cmp(&right.smallest_key));
+
+        let mut l0_real = L0SstIterator::new(
+            Arc::clone(&metas[0]),
+            engine.config.sst_dir(),
+            Arc::clone(&range),
+            make_test_io(),
+            SstReadOptions::default(),
+        );
+        l0_real.seek(&MvccKey::unbounded()).await.unwrap();
+        assert!(l0_real.valid());
+        assert_eq!(l0_real.user_key(), b"a");
+        assert_eq!(l0_real.timestamp(), 10);
+        assert_eq!(l0_real.value(), b"one");
+        l0_real.advance().await.unwrap();
+        assert!(!l0_real.valid());
+
+        let mut empty_level = LevelIterator::new(
+            vec![],
+            engine.config.sst_dir(),
+            Arc::clone(&range),
+            make_test_io(),
+            SstReadOptions::default(),
+        );
+        empty_level.seek(&MvccKey::unbounded()).await.unwrap();
+        empty_level.open_file(0).await.unwrap();
+        empty_level.pending_error = Some(TiSqlError::Storage("pending level seek".into()));
+        assert!(matches!(
+            empty_level.seek(&MvccKey::unbounded()).await.unwrap_err(),
+            TiSqlError::Storage(message) if message.contains("pending level seek")
+        ));
+        empty_level.pending_error = Some(TiSqlError::Storage("pending level advance".into()));
+        assert!(matches!(
+            empty_level.advance().await.unwrap_err(),
+            TiSqlError::Storage(message) if message.contains("pending level advance")
+        ));
+
+        let mut missing_level = LevelIterator::new(
+            vec![Arc::clone(&missing_meta)],
+            sst_dir.clone(),
+            Arc::clone(&range),
+            make_test_io(),
+            SstReadOptions::default(),
+        );
+        let err = missing_level.open_file(0).await.unwrap_err();
+        assert!(matches!(
+            err,
+            TiSqlError::Storage(message) if message.contains("SST file missing")
+        ));
+
+        let mut beyond_range = LevelIterator::new(
+            vec![make_test_sst_meta(1001, 1, b"a", b"b")],
+            sst_dir.clone(),
+            Arc::clone(&range),
+            make_test_io(),
+            SstReadOptions::default(),
+        );
+        beyond_range
+            .seek(&MvccKey::encode(b"zz", Timestamp::MAX))
+            .await
+            .unwrap();
+        beyond_range.advance().await.unwrap();
+        assert!(!beyond_range.valid());
+
+        let mut level = LevelIterator::new(
+            metas,
+            engine.config.sst_dir(),
+            Arc::clone(&range),
+            make_test_io(),
+            SstReadOptions::default(),
+        );
+        level.seek(&MvccKey::unbounded()).await.unwrap();
+        assert!(level.valid());
+        assert_eq!(level.user_key(), b"a");
+        assert_eq!(level.value(), b"one");
+        level.advance().await.unwrap();
+        assert!(level.valid());
+        assert_eq!(level.user_key(), b"z");
+        level
+            .seek(&MvccKey::encode(b"z", Timestamp::MAX))
+            .await
+            .unwrap();
+        assert!(level.valid());
+        assert_eq!(level.user_key(), b"z");
+        level.advance().await.unwrap();
+        assert!(!level.valid());
+
+        let (mock, seek_called) =
+            MockMvccIterator::new("active", vec![(MvccKey::encode(b"k", 5), b"v".to_vec())]);
+        let mut merge = TieredMergeIterator::default();
+        merge.add_mock_active(mock);
+        merge = merge.build();
+        merge.advance().await.unwrap();
+        assert!(seek_called.load(AtomicOrdering::Relaxed));
+        assert!(merge.valid());
+        assert_eq!(merge.user_key(), b"k");
+        assert_eq!(merge.timestamp(), 5);
+        assert_eq!(merge.value(), b"v");
+
+        merge.pending_error = Some(TiSqlError::Storage("advance pending".into()));
+        assert!(matches!(
+            merge.advance().await.unwrap_err(),
+            TiSqlError::Storage(message) if message.contains("advance pending")
+        ));
+        merge.pending_error = Some(TiSqlError::Storage("seek pending".into()));
+        merge.seek(&MvccKey::unbounded()).await.unwrap();
+        assert!(merge.valid());
+
+        let (failing, _tracker) = MockMvccIterator::new_fail_on_advance(
+            "failing",
+            vec![(MvccKey::encode(b"x", 1), b"y".to_vec())],
+            TiSqlError::Storage("boom".into()),
+        );
+        let mut merge = TieredMergeIterator::new();
+        merge.add_mock_active(failing);
+        merge.advance().await.unwrap();
+        assert!(merge.valid());
+        let err = merge.advance().await.unwrap_err();
+        assert!(matches!(
+            err,
+            TiSqlError::Storage(message) if message.contains("boom")
+        ));
     }
 
     // ==================== Test Helpers Using MvccKey ====================
@@ -9997,6 +10734,50 @@ mod tests {
         assert!(get_for_test(&engine, b"key1").await.is_none());
     }
 
+    #[test]
+    fn test_finalize_pending_with_lsn_marks_active_and_frozen_memtables_dirty() {
+        let tmp = TempDir::new().unwrap();
+        let config = test_config(tmp.path());
+        let engine = LsmEngine::open(config).unwrap();
+        let owner_ts: Timestamp = 100;
+
+        engine
+            .put_pending(b"frozen_key", b"frozen_value", owner_ts)
+            .unwrap();
+        engine.freeze_active();
+        engine
+            .put_pending(b"active_key", b"active_value", owner_ts)
+            .unwrap();
+
+        {
+            let state = engine.state.write();
+            state.active.set_flush_state(FlushState::Flushing);
+            state.active.set_flush_state(FlushState::FlushedClean);
+            state
+                .frozen
+                .front()
+                .expect("frozen memtable")
+                .set_flush_state(FlushState::Flushing);
+        }
+
+        engine.finalize_pending_with_lsn(
+            &[b"frozen_key".to_vec(), b"active_key".to_vec()],
+            owner_ts,
+            200,
+            55,
+        );
+
+        let state = engine.state.read();
+        assert_eq!(state.active.flush_state(), FlushState::FlushedDirty);
+        assert_eq!(
+            state.frozen.front().expect("frozen memtable").flush_state(),
+            FlushState::FlushedDirty
+        );
+        drop(state);
+
+        assert_eq!(engine.min_unflushed_lsn(), Some(55));
+    }
+
     // ========================================================================
     // Tombstone Preservation: Flush and Compaction
     // ========================================================================
@@ -11068,6 +11849,37 @@ mod tests {
         assert_eq!(engine.min_unflushed_lsn(), Some(5));
     }
 
+    #[test]
+    fn test_min_unflushed_lsn_branches_with_missing_lsn_and_skipped_frozen_memtables() {
+        let dir = TempDir::new().unwrap();
+        let config = test_config(dir.path());
+        let engine = LsmEngine::open(config).unwrap();
+        let owner_ts: Timestamp = 100;
+
+        engine
+            .put_pending(b"frozen-no-lsn", b"v1", owner_ts)
+            .unwrap();
+        engine.finalize_pending(&[b"frozen-no-lsn".to_vec()], owner_ts, 10);
+        engine.freeze_active();
+
+        let empty_frozen = Arc::new(MemTable::new(999));
+        empty_frozen.freeze();
+        {
+            let mut state = engine.state.write();
+            state.frozen.push_back(Arc::clone(&empty_frozen));
+        }
+
+        assert_eq!(engine.min_unflushed_lsn(), None);
+
+        let mut active_batch = new_batch(2);
+        active_batch.put(b"active-with-lsn".to_vec(), b"v2".to_vec());
+        active_batch.set_clog_lsn(10);
+        engine.write_batch(active_batch).unwrap();
+
+        assert_eq!(engine.min_unflushed_lsn(), Some(10));
+        assert_eq!(engine.min_lsn_excluding(0), Some(10));
+    }
+
     /// Simulates the race condition where a lower LSN lands in a newer memtable.
     ///
     /// This directly reproduces the bug scenario:
@@ -11149,6 +11961,33 @@ mod tests {
         // No in-memory data left — safe_lsn == flushed_lsn.
         assert_eq!(engine.min_unflushed_lsn(), None);
         assert_eq!(engine.safe_log_gc_lsn(), flushed_lsn);
+    }
+
+    #[test]
+    fn test_stats_counts_flushed_dirty_and_clean_frozen_memtables() {
+        let dir = TempDir::new().unwrap();
+        let config = test_config(dir.path());
+        let engine = LsmEngine::open(config).unwrap();
+
+        let dirty = Arc::new(MemTable::new(200));
+        dirty.freeze();
+        dirty.set_flush_state(FlushState::Flushing);
+        dirty.set_flush_state(FlushState::FlushedDirty);
+
+        let clean = Arc::new(MemTable::new(201));
+        clean.freeze();
+        clean.set_flush_state(FlushState::Flushing);
+        clean.set_flush_state(FlushState::FlushedClean);
+
+        {
+            let mut state = engine.state.write();
+            state.frozen.push_back(dirty);
+            state.frozen.push_back(clean);
+        }
+
+        let stats = engine.stats();
+        assert_eq!(stats.frozen_memtable_state_counts.flushed_dirty, 1);
+        assert_eq!(stats.frozen_memtable_state_counts.flushed_clean, 1);
     }
 
     #[tokio::test]
@@ -11333,6 +12172,29 @@ mod tests {
             Some(b"v_straggler".to_vec())
         );
         assert_eq!(engine.get(b"k3").await.unwrap(), Some(b"v3".to_vec()));
+    }
+
+    #[tokio::test]
+    async fn test_flush_memtable_with_pending_entries_remains_flushed_dirty() {
+        let dir = TempDir::new().unwrap();
+        let config = test_config(dir.path());
+        let engine = LsmEngine::open(config).unwrap();
+
+        let mut committed = new_batch(1);
+        committed.put(b"committed".to_vec(), b"value".to_vec());
+        committed.set_clog_lsn(11);
+        engine.write_batch(committed).unwrap();
+        engine.put_pending(b"pending", b"value", 100).unwrap();
+        engine.freeze_active();
+
+        let frozen = {
+            let state = engine.state.read();
+            state.frozen.front().cloned().expect("frozen memtable")
+        };
+        engine.flush_memtable_async(&frozen).await.unwrap();
+
+        assert_eq!(frozen.flush_state(), FlushState::FlushedDirty);
+        assert_eq!(engine.current_version().level_size(0), 1);
     }
 
     /// Verify flushed_lsn never regresses (monotonicity) even when later flushes

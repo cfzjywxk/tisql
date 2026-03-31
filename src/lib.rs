@@ -205,6 +205,7 @@ use tso::LocalTso;
 use util::error::{Result, TiSqlError};
 
 use std::path::PathBuf;
+use std::sync::atomic::{AtomicBool, Ordering as AtomicOrdering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
@@ -269,6 +270,10 @@ pub struct DatabaseConfig {
     pub clog_spin_before_park_iters: u32,
     /// Total wait budget for transactional lock conflicts.
     pub lock_wait_timeout: Duration,
+    /// Whether `Drop` performs a final durable flush.
+    pub flush_on_drop: bool,
+    /// Whether storage I/O uses the synchronous backend instead of io_uring.
+    pub storage_sync_io: bool,
 }
 
 impl Default for DatabaseConfig {
@@ -299,6 +304,8 @@ impl Default for DatabaseConfig {
             group_commit_no_delay_count: 16,
             clog_spin_before_park_iters: 0,
             lock_wait_timeout: Duration::from_secs(10),
+            flush_on_drop: true,
+            storage_sync_io: false,
         }
     }
 }
@@ -338,6 +345,18 @@ impl DatabaseConfig {
     /// Set the lock-wait timeout used by transaction conflict handling.
     pub fn with_lock_wait_timeout(mut self, timeout: Duration) -> Self {
         self.lock_wait_timeout = timeout;
+        self
+    }
+
+    /// Enable/disable the final durable flush in `Drop`.
+    pub fn with_flush_on_drop(mut self, enabled: bool) -> Self {
+        self.flush_on_drop = enabled;
+        self
+    }
+
+    /// Force storage I/O to use the synchronous backend.
+    pub fn with_storage_sync_io(mut self, enabled: bool) -> Self {
+        self.storage_sync_io = enabled;
         self
     }
 
@@ -502,6 +521,7 @@ mod database_config_tests {
         assert_eq!(config.l0_stop_trigger, DEFAULT_L0_STOP_TRIGGER);
         assert_eq!(config.max_levels, DEFAULT_MAX_LEVELS);
         assert_eq!(config.clog_spin_before_park_iters, 0);
+        assert!(!config.storage_sync_io);
     }
 
     #[test]
@@ -521,7 +541,8 @@ mod database_config_tests {
             .with_l0_compaction_trigger(10)
             .with_l0_slowdown_trigger(20)
             .with_l0_stop_trigger(30)
-            .with_max_levels(4);
+            .with_max_levels(4)
+            .with_storage_sync_io(true);
         assert!(config.enable_point_get_short_path);
         assert!(config.bloom_enabled);
         assert_eq!(config.bloom_bits_per_key, 16);
@@ -537,6 +558,7 @@ mod database_config_tests {
         assert_eq!(config.l0_slowdown_trigger, 20);
         assert_eq!(config.l0_stop_trigger, 30);
         assert_eq!(config.max_levels, 4);
+        assert!(config.storage_sync_io);
     }
 
     #[test]
@@ -682,6 +704,10 @@ pub struct Database {
     enable_encoded_result_batch: bool,
     /// Protocol fast lane toggle for autocommit point-get queries.
     enable_point_get_short_path: bool,
+    /// Whether `Drop` should perform a final durable flush.
+    flush_on_drop: bool,
+    /// Whether `close()` has already completed the durable shutdown path.
+    closed: AtomicBool,
 }
 
 fn drop_runtime_safely(runtime: tokio::runtime::Runtime) {
@@ -909,7 +935,7 @@ impl Database {
             clog_config,
             IlogConfig::new(&config.data_dir),
         )
-        .recover_bootstrap(io_runtime.handle())?;
+        .recover_bootstrap_with_storage_io(io_runtime.handle(), config.storage_sync_io)?;
 
         // Wrap recovered system tablet in manager first.
         let storage = Arc::new(recovery.engine);
@@ -1189,6 +1215,8 @@ impl Database {
             session_registry,
             enable_encoded_result_batch: config.enable_encoded_result_batch,
             enable_point_get_short_path: config.enable_point_get_short_path,
+            flush_on_drop: config.flush_on_drop,
+            closed: AtomicBool::new(false),
         })
     }
 
@@ -1666,17 +1694,24 @@ impl Database {
 
     /// Close the database (flush memtables and sync logs).
     pub async fn close(&self) -> Result<()> {
+        if self.closed.load(AtomicOrdering::SeqCst) {
+            return Ok(());
+        }
+
         if let Some(reporter) = &self.engine_status_reporter {
             reporter.stop();
         }
-        // Stop background workers first so no new manifest edits are submitted.
+        // Stop GC first so no new tablet-retire work starts while we drain writes.
         self.gc_worker.stop();
-        self.tablet_manager.stop_background_workers();
 
         // Flush any pending memtable data to SSTs
         if let Err(e) = self.tablet_manager.flush_all_with_active() {
             log_warn!("Error flushing memtables on close: {}", e);
         }
+
+        // Abort tablet workers only after the final flush. Stopping them first
+        // can interrupt an in-flight flush and poison the follow-up durable drain.
+        self.tablet_manager.stop_background_workers();
 
         // Drain/stop manifest writer before closing ilog.
         self.tablet_manager.shutdown_manifest_writers();
@@ -1689,6 +1724,7 @@ impl Database {
         self.tablet_manager.close_non_system_tablet_ilogs()?;
         self.ilog.close()?;
 
+        self.closed.store(true, AtomicOrdering::SeqCst);
         log_info!("Database closed");
         Ok(())
     }
@@ -1699,22 +1735,31 @@ impl Drop for Database {
         if let Some(reporter) = &self.engine_status_reporter {
             reporter.stop();
         }
-        // 1. Stop background schedulers and GC worker
+        // 1. Stop GC first so no new tablet-retire work starts while Drop drains writes.
         self.gc_worker.stop();
-        self.tablet_manager.stop_background_workers();
 
-        // 2. Final flush (needs I/O runtime — ilog writes go through group commit)
-        let _ = self.tablet_manager.flush_all_with_active();
+        if !self.closed.load(AtomicOrdering::SeqCst) {
+            if self.flush_on_drop {
+                // 2. Final flush (needs I/O runtime — ilog writes go through group commit)
+                let _ = self.tablet_manager.flush_all_with_active();
+            }
 
-        // 3. Drain/stop manifest writer before ilog close.
-        self.tablet_manager.shutdown_manifest_writers();
+            // 3. Abort background workers only after the final flush. Stopping them
+            // before the flush can interrupt an in-flight flush and break Drop durability.
+            self.tablet_manager.stop_background_workers();
 
-        // 4. Best-effort asynchronous shutdown for WAL/manifest writers.
-        // Drop must not block indefinitely on durability paths; callers that
-        // need a graceful durable shutdown should call `Database::close()`.
-        self.txn_service.clog_service().shutdown();
+            // 4. Drain/stop manifest writer before ilog close.
+            self.tablet_manager.shutdown_manifest_writers();
 
-        // 5. Shutdown storage-side writer channels BEFORE dropping io_runtime.
+            // 5. Best-effort asynchronous shutdown for WAL/manifest writers.
+            // Drop must not block indefinitely on durability paths; callers that
+            // need a graceful durable shutdown should call `Database::close()`.
+            self.txn_service.clog_service().shutdown();
+        } else {
+            self.tablet_manager.stop_background_workers();
+        }
+
+        // 6. Shutdown storage-side writer channels BEFORE dropping io_runtime.
         //
         // GroupCommitWriter (ilog) runs on io_runtime and blocks on rx.recv().
         // Closing sender channels causes recv() to return Err and exit. Without
@@ -1723,7 +1768,7 @@ impl Drop for Database {
         self.ilog.shutdown();
         self.storage.io_service().shutdown();
 
-        // 6. Shut down runtimes.
+        // 7. Shut down runtimes.
         //
         // Tokio runtimes cannot be dropped from within an async context (panics).
         // If we are inside a tokio runtime (tests, or nested drop), move the
@@ -1981,7 +2026,9 @@ mod tests {
 
     fn create_test_db() -> (Database, tempfile::TempDir) {
         let dir = tempdir().unwrap();
-        let config = DatabaseConfig::with_data_dir(dir.path());
+        let config = DatabaseConfig::with_data_dir(dir.path())
+            .with_storage_sync_io(true)
+            .with_flush_on_drop(false);
         let db = Database::open(config).unwrap();
         (db, dir)
     }
@@ -2383,6 +2430,63 @@ mod tests {
                 assert_eq!(data[0][1], "Alice");
             }
             _ => panic!("Expected rows"),
+        }
+    }
+
+    #[tokio::test]
+    async fn test_point_get_casts_numeric_literal_to_int_primary_key() {
+        let (db, _dir) = create_test_db();
+
+        db.execute_query("CREATE TABLE t_point_get (id INT PRIMARY KEY, v INT)")
+            .await
+            .unwrap();
+        db.execute_query("INSERT INTO t_point_get VALUES (1, 42)")
+            .await
+            .unwrap();
+
+        let result = db
+            .execute_query("SELECT v FROM t_point_get WHERE id = 1")
+            .await
+            .unwrap();
+        match result {
+            QueryResult::Rows { data, .. } => {
+                assert_eq!(data, vec![vec![String::from("42")]]);
+            }
+            other => panic!("unexpected result: {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn test_point_get_with_residual_filter_uses_executor_filter() {
+        let (db, _dir) = create_test_db();
+
+        db.execute_query("CREATE TABLE t_point_filter (id INT PRIMARY KEY, v INT)")
+            .await
+            .unwrap();
+        db.execute_query("INSERT INTO t_point_filter VALUES (1, 42)")
+            .await
+            .unwrap();
+
+        let hit = db
+            .execute_query("SELECT v FROM t_point_filter WHERE id = 1 AND v = 42")
+            .await
+            .unwrap();
+        match hit {
+            QueryResult::Rows { data, .. } => {
+                assert_eq!(data, vec![vec![String::from("42")]]);
+            }
+            other => panic!("unexpected result: {other:?}"),
+        }
+
+        let miss = db
+            .execute_query("SELECT v FROM t_point_filter WHERE id = 1 AND v = 99")
+            .await
+            .unwrap();
+        match miss {
+            QueryResult::Rows { data, .. } => {
+                assert!(data.is_empty(), "residual filter should reject the row");
+            }
+            other => panic!("unexpected result: {other:?}"),
         }
     }
 
@@ -3003,6 +3107,54 @@ mod tests {
             }
             other => panic!("expected committed rows after statement rollback, got {other:?}"),
         }
+    }
+
+    #[tokio::test]
+    async fn test_phase3_explicit_txn_control_rejects_nested_begin_and_ddl() {
+        let (db, _dir) = create_test_db();
+
+        db.execute_query("CREATE TABLE p3_txn_guard (id INT PRIMARY KEY, v INT)")
+            .await
+            .unwrap();
+
+        let mut session = Session::new();
+        db.execute_query_with_session("BEGIN", &mut session)
+            .await
+            .unwrap();
+
+        let nested_err = db
+            .execute_query_with_session("BEGIN", &mut session)
+            .await
+            .unwrap_err();
+        assert!(
+            nested_err.to_string().contains("Nested transactions"),
+            "unexpected nested BEGIN error: {nested_err}"
+        );
+
+        let ddl_err = db
+            .execute_query_with_session(
+                "CREATE TABLE p3_txn_guard_inner (id INT PRIMARY KEY)",
+                &mut session,
+            )
+            .await
+            .unwrap_err();
+        assert!(
+            ddl_err
+                .to_string()
+                .contains("DDL statements are not allowed within explicit transactions"),
+            "unexpected DDL-in-transaction error: {ddl_err}"
+        );
+
+        db.execute_query_with_session("ROLLBACK", &mut session)
+            .await
+            .unwrap();
+
+        db.execute_query_with_session("COMMIT", &mut session)
+            .await
+            .unwrap();
+        db.execute_query_with_session("ROLLBACK", &mut session)
+            .await
+            .unwrap();
     }
 
     #[tokio::test]
@@ -3808,12 +3960,17 @@ mod tests {
         assert!(!tablet_has_table_entries(&system, table2));
     }
 
-    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    async fn test_phase4_recovery_repeated_reopen_idempotent() {
+    #[test]
+    fn test_phase4_recovery_repeated_reopen_idempotent() {
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
         let dir = tempdir().unwrap();
         let config = DatabaseConfig::with_data_dir(dir.path());
-        let (table1, table2, key1, val1, key2, val2, _) =
-            prepare_phase4_two_tablet_recovery_case(dir.path(), false, false).await;
+        let (table1, table2, key1, val1, key2, val2, _) = runtime.block_on(
+            prepare_phase4_two_tablet_recovery_case(dir.path(), false, false),
+        );
 
         let db1 = Database::open(config.clone()).unwrap();
         let t1 = db1
@@ -3826,7 +3983,7 @@ mod tests {
             .unwrap();
         assert_eq!(tablet_get_value(&t1, &key1), Some(val1.clone()));
         assert_eq!(tablet_get_value(&t2, &key2), Some(val2.clone()));
-        drop(db1);
+        runtime.block_on(db1.close()).unwrap();
 
         let db2 = Database::open(config).unwrap();
         let t1 = db2
@@ -3839,6 +3996,7 @@ mod tests {
             .unwrap();
         assert_eq!(tablet_get_value(&t1, &key1), Some(val1));
         assert_eq!(tablet_get_value(&t2, &key2), Some(val2));
+        runtime.block_on(db2.close()).unwrap();
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -4041,7 +4199,6 @@ mod tests {
         );
 
         db.close().await.unwrap();
-        drop(db);
 
         let db2 = Database::open(config).unwrap();
         assert_eq!(db2.storage.get(&key1).await.unwrap(), Some(value1));
@@ -4101,7 +4258,6 @@ mod tests {
         );
 
         db.close().await.unwrap();
-        drop(db);
 
         let db2 = Database::open(config).unwrap();
         match db2
@@ -4433,6 +4589,27 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn test_unsupported_scalar_function_returns_executor_error() {
+        let (db, _dir) = create_test_db();
+
+        db.execute_query("CREATE TABLE t_exec_err (id INT PRIMARY KEY, grp INT)")
+            .await
+            .unwrap();
+        db.execute_query("INSERT INTO t_exec_err VALUES (1, 10)")
+            .await
+            .unwrap();
+
+        let err = db
+            .execute_query("SELECT ABS(grp) FROM t_exec_err")
+            .await
+            .unwrap_err();
+        assert!(
+            err.to_string().contains("Unsupported expression"),
+            "unexpected executor error: {err}"
+        );
+    }
+
+    #[tokio::test]
     async fn test_update() {
         let (db, _dir) = create_test_db();
 
@@ -4456,6 +4633,37 @@ mod tests {
                 assert_eq!(data[0][1], "999");
             }
             _ => panic!("Expected rows"),
+        }
+    }
+
+    #[tokio::test]
+    async fn test_update_with_expression_hides_older_versions_in_scan_results() {
+        let (db, _dir) = create_test_db();
+
+        db.execute_query("CREATE TABLE t (a INT PRIMARY KEY, b INT)")
+            .await
+            .unwrap();
+        db.execute_query("INSERT INTO t VALUES (1, 11), (2, 22)")
+            .await
+            .unwrap();
+
+        db.execute_query("UPDATE t SET b = b + 1").await.unwrap();
+
+        let result = db
+            .execute_query("SELECT a, b FROM t ORDER BY a")
+            .await
+            .unwrap();
+        match result {
+            QueryResult::Rows { data, .. } => {
+                assert_eq!(
+                    data,
+                    vec![
+                        vec![String::from("1"), String::from("12")],
+                        vec![String::from("2"), String::from("23")],
+                    ]
+                );
+            }
+            other => panic!("Expected rows, got: {other:?}"),
         }
     }
 

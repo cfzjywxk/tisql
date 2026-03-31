@@ -720,11 +720,23 @@ mod tests {
     use crate::inner_table::core_tables::{ALL_TABLE_TABLE_ID, USER_TABLE_ID_START};
     use crate::io::{record_io, snapshot_io, IoOpKind, IoSource, IoTraceTag};
     use crate::lsn::new_lsn_provider;
+    #[cfg(feature = "failpoints")]
+    use crate::tablet::commit_reservations::FAILPOINT_TEST_LOCK;
     use crate::tablet::memtable::FlushState;
     use crate::tablet::{IlogConfig, IlogService, LsmConfig, StorageEngine, Version, WriteBatch};
     use std::collections::HashMap;
     use tempfile::TempDir;
     use tokio::time::{timeout, Duration};
+
+    #[cfg(feature = "failpoints")]
+    fn reset_reservation_failpoints() -> fail::FailScenario<'static> {
+        let scenario = fail::FailScenario::setup();
+        fail::cfg("reservation_release_drop_v26", "off").unwrap();
+        fail::cfg("reservation_double_release_v26", "off").unwrap();
+        fail::cfg("reservation_sweep_force_release_v26", "off").unwrap();
+        fail::cfg("txn_after_lsn_alloc_before_reserve_v26", "off").unwrap();
+        scenario
+    }
 
     fn open_test_system_tablet(dir: &Path) -> Arc<TabletEngine> {
         Arc::new(TabletEngine::open(LsmConfig::new(dir)).unwrap())
@@ -810,6 +822,11 @@ mod tests {
 
     #[test]
     fn test_manager_commit_reservations_global() {
+        #[cfg(feature = "failpoints")]
+        let _lock = FAILPOINT_TEST_LOCK.lock().unwrap();
+        #[cfg(feature = "failpoints")]
+        let _scenario = reset_reservation_failpoints();
+
         let dir = TempDir::new().unwrap();
         let manager = TabletManager::new(
             dir.path(),
@@ -904,6 +921,11 @@ mod tests {
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn test_phase5_gc_boundary_reservation_cap_global() {
+        #[cfg(feature = "failpoints")]
+        let _lock = FAILPOINT_TEST_LOCK.lock().unwrap();
+        #[cfg(feature = "failpoints")]
+        let _scenario = reset_reservation_failpoints();
+
         let dir = TempDir::new().unwrap();
         let lsn_provider = new_lsn_provider();
 
@@ -930,6 +952,11 @@ mod tests {
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn test_phase5_gc_boundary_all_caps_combined() {
+        #[cfg(feature = "failpoints")]
+        let _lock = FAILPOINT_TEST_LOCK.lock().unwrap();
+        #[cfg(feature = "failpoints")]
+        let _scenario = reset_reservation_failpoints();
+
         let dir = TempDir::new().unwrap();
         let lsn_provider = new_lsn_provider();
 
@@ -1336,6 +1363,11 @@ mod tests {
     /// T2.5: commit_reservation_stats reflects alloc/release counters.
     #[test]
     fn test_commit_reservation_stats_counters() {
+        #[cfg(feature = "failpoints")]
+        let _lock = FAILPOINT_TEST_LOCK.lock().unwrap();
+        #[cfg(feature = "failpoints")]
+        let _scenario = reset_reservation_failpoints();
+
         let dir = TempDir::new().unwrap();
         let manager = TabletManager::new(
             dir.path(),
@@ -1349,30 +1381,40 @@ mod tests {
         assert_eq!(stats_before.total_allocated, 0);
         assert_eq!(stats_before.total_released, 0);
 
-        let _lsn1 = manager.alloc_and_reserve_commit_lsn(200);
-        let _lsn2 = manager.alloc_and_reserve_commit_lsn(201);
+        let lsn1 = manager.alloc_and_reserve_commit_lsn(200);
+        let lsn2 = manager.alloc_and_reserve_commit_lsn(201);
 
         let stats_mid = manager.commit_reservation_stats();
-        assert_eq!(stats_mid.active, 2);
-        assert_eq!(stats_mid.total_allocated, 2);
+        assert_eq!(stats_mid.total_allocated - stats_before.total_allocated, 2);
+        assert!(manager.is_commit_lsn_reserved(200, lsn1));
+        assert!(manager.is_commit_lsn_reserved(201, lsn2));
 
         manager.release_commit_lsn(200);
 
         let stats_after = manager.commit_reservation_stats();
-        assert_eq!(stats_after.active, 1);
-        assert_eq!(stats_after.total_released, 1);
+        assert_eq!(stats_after.total_released - stats_before.total_released, 1);
+        assert!(!manager.is_commit_lsn_reserved(200, lsn1));
+        assert!(manager.is_commit_lsn_reserved(201, lsn2));
 
         manager.release_commit_lsn(201);
 
         let stats_final = manager.commit_reservation_stats();
-        assert_eq!(stats_final.active, 0);
-        assert_eq!(stats_final.total_allocated, 2);
-        assert_eq!(stats_final.total_released, 2);
+        assert_eq!(
+            stats_final.total_allocated - stats_before.total_allocated,
+            2
+        );
+        assert_eq!(stats_final.total_released - stats_before.total_released, 2);
+        assert!(!manager.is_commit_lsn_reserved(201, lsn2));
     }
 
     /// T2.5: multiple reservations — min_reserved_lsn returns the smallest.
     #[test]
     fn test_multiple_reservations_min_ordering() {
+        #[cfg(feature = "failpoints")]
+        let _lock = FAILPOINT_TEST_LOCK.lock().unwrap();
+        #[cfg(feature = "failpoints")]
+        let _scenario = reset_reservation_failpoints();
+
         let dir = TempDir::new().unwrap();
         let manager = TabletManager::new(
             dir.path(),

@@ -40,7 +40,7 @@ use tisql::{StorageEngine, TxnScanCursor};
 const SYS_TABLE_ID: u64 = 1;
 
 fn make_test_io() -> Arc<tisql::io::IoService> {
-    tisql::io::IoService::new(32).unwrap()
+    tisql::io::IoService::new_for_test(32).unwrap()
 }
 
 // ==================== Test Helpers Using MvccKey ====================

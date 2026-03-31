@@ -119,7 +119,7 @@ async fn scan_at_for_test(
 // ============================================================================
 
 fn make_test_io() -> std::sync::Arc<tisql::io::IoService> {
-    tisql::io::IoService::new(32).unwrap()
+    tisql::io::IoService::new_for_test(32).unwrap()
 }
 
 fn create_engine(dir: &TempDir) -> LsmEngine {
@@ -801,7 +801,7 @@ async fn test_sst_iterator_key_patterns() {
     builder.finish(1, 0).unwrap();
 
     // Read and verify
-    let reader = SstReaderRef::open(&sst_path, IoService::new(32).unwrap())
+    let reader = SstReaderRef::open(&sst_path, IoService::new_for_test(32).unwrap())
         .await
         .unwrap();
     let mut iter = SstIterator::new(reader).unwrap();
@@ -847,7 +847,7 @@ async fn test_sst_many_entries() {
     assert_eq!(meta.entry_count, num_entries as u64);
 
     // Read and count
-    let reader = SstReaderRef::open(&sst_path, IoService::new(32).unwrap())
+    let reader = SstReaderRef::open(&sst_path, IoService::new_for_test(32).unwrap())
         .await
         .unwrap();
     let mut iter = SstIterator::new(reader).unwrap();
@@ -906,7 +906,7 @@ async fn test_sst_mvcc_keys() {
     builder.finish(1, 0).unwrap();
 
     // Read and verify order
-    let reader = SstReaderRef::open(&sst_path, IoService::new(32).unwrap())
+    let reader = SstReaderRef::open(&sst_path, IoService::new_for_test(32).unwrap())
         .await
         .unwrap();
     let mut iter = SstIterator::new(reader).unwrap();

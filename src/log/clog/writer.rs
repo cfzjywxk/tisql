@@ -502,6 +502,11 @@ mod tests {
         HOOK_STATE.get_or_init(|| StdMutex::new(WriterTestHookState::default()))
     }
 
+    fn hook_test_lock() -> &'static StdMutex<()> {
+        static HOOK_TEST_LOCK: OnceLock<StdMutex<()>> = OnceLock::new();
+        HOOK_TEST_LOCK.get_or_init(|| StdMutex::new(()))
+    }
+
     fn install_test_hooks(
         delay_wait_start_tx: mpsc::Sender<()>,
         batch_collected_tx: mpsc::Sender<usize>,
@@ -573,6 +578,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_writer_micro_batch_delay_coalesces_following_slot() {
+        let _hook_lock = hook_test_lock().lock().unwrap();
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("test_delay.clog");
         let gb = ClogGroupBuffer::new(4096 * 4, 64);
@@ -633,4 +639,217 @@ mod tests {
 
         assert_eq!(std::fs::metadata(path).unwrap().len(), 4096);
     }
+
+    #[tokio::test]
+    async fn test_writer_restart_and_stop_state_transitions() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("test_states.clog");
+        let gb = ClogGroupBuffer::new(4096 * 4, 64);
+        let runtime = tokio::runtime::Handle::current();
+
+        let writer = ClogWriter::new(
+            path,
+            gb,
+            &runtime,
+            0,
+            4096 * 4,
+            ClogWriterTuning::default(),
+            Arc::new(|_| {}),
+        )
+        .unwrap();
+
+        let restart_err = writer.restart(0).unwrap_err();
+        assert!(restart_err.contains("already active"));
+
+        writer.stop_and_drain("first stop").await.unwrap();
+        writer.stop_and_drain("second stop").await.unwrap();
+
+        *writer.state.lock() = WriterState::Failed("boom".to_string());
+        let failed = writer.stop_and_drain("ignored").await.unwrap_err();
+        assert_eq!(failed, "boom");
+    }
+
+    #[tokio::test]
+    async fn test_writer_stop_and_drain_join_error_marks_failed() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("test_join_error.clog");
+        let gb = ClogGroupBuffer::new(4096 * 4, 64);
+        let runtime = tokio::runtime::Handle::current();
+
+        let writer = ClogWriter::new(
+            path,
+            gb,
+            &runtime,
+            0,
+            4096 * 4,
+            ClogWriterTuning::default(),
+            Arc::new(|_| {}),
+        )
+        .unwrap();
+        writer.stop_and_drain("initial stop").await.unwrap();
+
+        let panic_handle = runtime.spawn_blocking(|| panic!("writer test panic"));
+        *writer.state.lock() = WriterState::Active(panic_handle);
+
+        let err = writer.stop_and_drain("join error").await.unwrap_err();
+        assert!(err.contains("join error"));
+        assert!(
+            matches!(&*writer.state.lock(), WriterState::Failed(message) if message.contains("join error"))
+        );
+    }
+
+    #[tokio::test]
+    async fn test_writer_empty_collect_paths_with_and_without_spin() {
+        for spin_before_park_iters in [0, 2] {
+            let dir = tempfile::tempdir().unwrap();
+            let path = dir
+                .path()
+                .join(format!("test_empty_{spin_before_park_iters}.clog"));
+            let gb = ClogGroupBuffer::new(4096 * 4, 64);
+            let runtime = tokio::runtime::Handle::current();
+
+            let writer = ClogWriter::new(
+                path,
+                gb,
+                &runtime,
+                0,
+                4096 * 4,
+                ClogWriterTuning {
+                    spin_before_park_iters,
+                    ..Default::default()
+                },
+                Arc::new(|_| {}),
+            )
+            .unwrap();
+
+            for _ in 0..8 {
+                tokio::task::yield_now().await;
+            }
+
+            writer.stop_and_drain("empty stop").await.unwrap();
+        }
+    }
+
+    #[test]
+    fn test_writer_perf_stats_maybe_log_and_reset_paths() {
+        let now = Instant::now() - Duration::from_secs(2);
+        let mut stats = WriterPerfStats::new(now);
+
+        stats.maybe_log_and_reset(Duration::ZERO);
+        assert_eq!(stats.last_log_at, now);
+
+        stats.window_batches = 1;
+        stats.maybe_log_and_reset(Duration::from_millis(1));
+        assert_eq!(stats.window_batches, 0);
+        assert_eq!(stats.window_slots, 0);
+        let logged_at = stats.last_log_at;
+        assert!(logged_at >= now);
+
+        stats.window_batches = 2;
+        stats.window_slots = 4;
+        stats.window_data_bytes = 8;
+        stats.window_padded_bytes = 16;
+        stats.park_count = 2;
+        stats.park_wait_ns = 2_000;
+        stats.spin_count = 2;
+        stats.spin_hits = 1;
+        stats.spin_wait_ns = 3_000;
+        stats.delay_count = 2;
+        stats.delay_wait_ns = 4_000;
+        stats.delay_slots_gained = 6;
+        stats.collect_ns = 5_000;
+        stats.copy_ns = 6_000;
+        stats.pwrite_ns = 7_000;
+        stats.complete_ns = 8_000;
+        stats.last_log_at = Instant::now() - Duration::from_secs(2);
+        stats.maybe_log_and_reset(Duration::from_millis(1));
+        assert_eq!(stats.window_batches, 0);
+        assert_eq!(stats.window_data_bytes, 0);
+
+        stats.window_batches = 3;
+        let after_reset = stats.last_log_at;
+        stats.maybe_log_and_reset(Duration::from_secs(60));
+        assert_eq!(stats.window_batches, 3);
+        assert_eq!(stats.last_log_at, after_reset);
+    }
+
+    #[test]
+    fn test_pwrite_all_fails_on_read_only_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("readonly.clog");
+        std::fs::write(&path, b"seed").unwrap();
+        let file = OpenOptions::new().read(true).open(&path).unwrap();
+
+        let err = pwrite_all(&file, b"x", 0).unwrap_err();
+        assert!(err.raw_os_error().is_some());
+    }
+
+    #[tokio::test]
+    async fn test_writer_shutdown_then_stop() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("test_shutdown.clog");
+        let gb = ClogGroupBuffer::new(4096 * 4, 64);
+        let runtime = tokio::runtime::Handle::current();
+
+        let writer = ClogWriter::new(
+            path,
+            Arc::clone(&gb),
+            &runtime,
+            0,
+            4096 * 4,
+            ClogWriterTuning::default(),
+            Arc::new(|_| {}),
+        )
+        .unwrap();
+
+        writer.shutdown();
+        assert!(gb.is_shutdown());
+        writer.stop_and_drain("shutdown stop").await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn test_writer_drop_fails_pending_write() {
+        let _hook_lock = hook_test_lock().lock().unwrap();
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("test_drop_pending.clog");
+        let gb = ClogGroupBuffer::new(4096 * 4, 64);
+        let runtime = tokio::runtime::Handle::current();
+        let (delay_tx, delay_rx) = mpsc::channel();
+        let (batch_tx, _batch_rx) = mpsc::channel();
+        install_test_hooks(delay_tx, batch_tx);
+        let _hook_guard = TestHookGuard;
+
+        let writer = ClogWriter::new(
+            path,
+            Arc::clone(&gb),
+            &runtime,
+            0,
+            4096 * 4,
+            ClogWriterTuning {
+                micro_batch_delay: Duration::from_secs(10),
+                micro_batch_no_delay_count: 2,
+                stats_log_interval: Duration::ZERO,
+                hook_delay_wait_start: Some(test_hook_delay_wait_start),
+                hook_batch_collected: Some(test_hook_batch_collected),
+                ..Default::default()
+            },
+            Arc::new(|_| {}),
+        )
+        .unwrap();
+
+        let mut reservation = gb.alloc(8).unwrap();
+        reservation.as_mut_slice().copy_from_slice(b"12345678");
+        let rx = reservation.commit();
+
+        delay_rx
+            .recv_timeout(Duration::from_secs(1))
+            .expect("writer should enter the delay window before drop");
+
+        writer.shutdown();
+        drop(writer);
+
+        let err = rx.await.unwrap().unwrap_err();
+        assert_eq!(err, "clog writer dropped");
+    }
+
 }

@@ -149,7 +149,7 @@ async fn scan_at_for_test(
 // ============================================================================
 
 fn make_test_io() -> std::sync::Arc<tisql::io::IoService> {
-    tisql::io::IoService::new(32).unwrap()
+    tisql::io::IoService::new_for_test(32).unwrap()
 }
 
 #[allow(dead_code)]
@@ -421,7 +421,7 @@ async fn test_executor_merge_keys() {
             &version,
             &sst_dir,
             &pre_allocated_ids,
-            IoService::new(32).unwrap(),
+            IoService::new_for_test(32).unwrap(),
             0, // gc_safe_point = 0 → no GC
             false,
         )
@@ -435,7 +435,7 @@ async fn test_executor_merge_keys() {
     // Read output SST and verify keys are merged in order
     let output_sst = &delta.new_ssts[0];
     let output_path = sst_dir.join(format!("{:08}.sst", output_sst.id));
-    let reader = SstReaderRef::open(&output_path, IoService::new(32).unwrap())
+    let reader = SstReaderRef::open(&output_path, IoService::new_for_test(32).unwrap())
         .await
         .unwrap();
     let mut iter = tisql::testkit::SstIterator::new(reader).unwrap();
@@ -515,7 +515,7 @@ async fn test_executor_mvcc_ordering() {
             &version,
             &sst_dir,
             &pre_allocated_ids,
-            IoService::new(32).unwrap(),
+            IoService::new_for_test(32).unwrap(),
             0, // gc_safe_point = 0 → no GC
             false,
         )
@@ -524,7 +524,7 @@ async fn test_executor_mvcc_ordering() {
 
     // Read and verify all versions are preserved in correct order
     let output_path = sst_dir.join(format!("{:08}.sst", delta.new_ssts[0].id));
-    let reader = SstReaderRef::open(&output_path, IoService::new(32).unwrap())
+    let reader = SstReaderRef::open(&output_path, IoService::new_for_test(32).unwrap())
         .await
         .unwrap();
     let mut iter = tisql::testkit::SstIterator::new(reader).unwrap();
@@ -588,7 +588,7 @@ async fn test_executor_tombstones() {
             &version,
             &sst_dir,
             &pre_allocated_ids,
-            IoService::new(32).unwrap(),
+            IoService::new_for_test(32).unwrap(),
             0, // gc_safe_point = 0 → no GC
             false,
         )
@@ -597,7 +597,7 @@ async fn test_executor_tombstones() {
 
     // Both versions should be in output (MVCC preserves all)
     let output_path = sst_dir.join(format!("{:08}.sst", delta.new_ssts[0].id));
-    let reader = SstReaderRef::open(&output_path, IoService::new(32).unwrap())
+    let reader = SstReaderRef::open(&output_path, IoService::new_for_test(32).unwrap())
         .await
         .unwrap();
     let mut iter = tisql::testkit::SstIterator::new(reader).unwrap();
@@ -1662,7 +1662,7 @@ async fn test_gc_safe_point_zero_no_gc() {
             &version,
             &sst_dir,
             &pre_allocated_ids,
-            IoService::new(32).unwrap(),
+            IoService::new_for_test(32).unwrap(),
             0, // gc_safe_point = 0 → no GC
             true,
         )
@@ -1671,7 +1671,7 @@ async fn test_gc_safe_point_zero_no_gc() {
 
     // Read output and count entries — all 3 should be preserved
     let output_path = sst_dir.join(format!("{:08}.sst", delta.new_ssts[0].id));
-    let reader = SstReaderRef::open(&output_path, IoService::new(32).unwrap())
+    let reader = SstReaderRef::open(&output_path, IoService::new_for_test(32).unwrap())
         .await
         .unwrap();
     let mut iter = tisql::testkit::SstIterator::new(reader).unwrap();
@@ -1722,7 +1722,7 @@ async fn test_gc_drops_old_versions() {
             &version,
             &sst_dir,
             &pre_allocated_ids,
-            IoService::new(32).unwrap(),
+            IoService::new_for_test(32).unwrap(),
             25, // gc_safe_point = 25
             true,
         )
@@ -1731,7 +1731,7 @@ async fn test_gc_drops_old_versions() {
 
     // Read output
     let output_path = sst_dir.join(format!("{:08}.sst", delta.new_ssts[0].id));
-    let reader = SstReaderRef::open(&output_path, IoService::new(32).unwrap())
+    let reader = SstReaderRef::open(&output_path, IoService::new_for_test(32).unwrap())
         .await
         .unwrap();
     let mut iter = tisql::testkit::SstIterator::new(reader).unwrap();
@@ -1787,7 +1787,7 @@ async fn test_gc_tombstone_at_bottommost() {
             &version,
             &sst_dir,
             &pre_allocated_ids,
-            IoService::new(32).unwrap(),
+            IoService::new_for_test(32).unwrap(),
             25,
             true, // is_bottommost
         )
@@ -1795,7 +1795,7 @@ async fn test_gc_tombstone_at_bottommost() {
         .unwrap();
 
     let output_path = sst_dir.join(format!("{:08}.sst", delta.new_ssts[0].id));
-    let reader = SstReaderRef::open(&output_path, IoService::new(32).unwrap())
+    let reader = SstReaderRef::open(&output_path, IoService::new_for_test(32).unwrap())
         .await
         .unwrap();
     let mut iter = tisql::testkit::SstIterator::new(reader).unwrap();
@@ -1853,7 +1853,7 @@ async fn test_gc_tombstone_not_bottommost() {
             &version,
             &sst_dir,
             &pre_allocated_ids,
-            IoService::new(32).unwrap(),
+            IoService::new_for_test(32).unwrap(),
             25,
             false, // NOT bottommost
         )
@@ -1861,7 +1861,7 @@ async fn test_gc_tombstone_not_bottommost() {
         .unwrap();
 
     let output_path = sst_dir.join(format!("{:08}.sst", delta.new_ssts[0].id));
-    let reader = SstReaderRef::open(&output_path, IoService::new(32).unwrap())
+    let reader = SstReaderRef::open(&output_path, IoService::new_for_test(32).unwrap())
         .await
         .unwrap();
     let mut iter = tisql::testkit::SstIterator::new(reader).unwrap();
@@ -1930,7 +1930,7 @@ async fn test_gc_mixed_keys() {
             &version,
             &sst_dir,
             &pre_allocated_ids,
-            IoService::new(32).unwrap(),
+            IoService::new_for_test(32).unwrap(),
             25,
             true, // bottommost
         )
@@ -1938,7 +1938,7 @@ async fn test_gc_mixed_keys() {
         .unwrap();
 
     let output_path = sst_dir.join(format!("{:08}.sst", delta.new_ssts[0].id));
-    let reader = SstReaderRef::open(&output_path, IoService::new(32).unwrap())
+    let reader = SstReaderRef::open(&output_path, IoService::new_for_test(32).unwrap())
         .await
         .unwrap();
     let mut iter = tisql::testkit::SstIterator::new(reader).unwrap();
@@ -2443,7 +2443,7 @@ async fn test_gc_barrier_kept_per_user_key_across_tables() {
             &version,
             &sst_dir,
             &pre_allocated_ids,
-            IoService::new(32).unwrap(),
+            IoService::new_for_test(32).unwrap(),
             20, // gc_safe_point = 20
             true,
         )
@@ -2452,7 +2452,7 @@ async fn test_gc_barrier_kept_per_user_key_across_tables() {
 
     // Read output SST
     let output_path = sst_dir.join(format!("{:08}.sst", delta.new_ssts[0].id));
-    let reader = SstReaderRef::open(&output_path, IoService::new(32).unwrap())
+    let reader = SstReaderRef::open(&output_path, IoService::new_for_test(32).unwrap())
         .await
         .unwrap();
     let mut iter = tisql::testkit::SstIterator::new(reader).unwrap();
@@ -2515,7 +2515,7 @@ async fn test_gc_barrier_kept_with_safe_point_enabled() {
             &version,
             &sst_dir,
             &pre_allocated_ids,
-            IoService::new(32).unwrap(),
+            IoService::new_for_test(32).unwrap(),
             20, // gc_safe_point = 20
             true,
         )
@@ -2524,7 +2524,7 @@ async fn test_gc_barrier_kept_with_safe_point_enabled() {
 
     // Read output
     let output_path = sst_dir.join(format!("{:08}.sst", delta.new_ssts[0].id));
-    let reader = SstReaderRef::open(&output_path, IoService::new(32).unwrap())
+    let reader = SstReaderRef::open(&output_path, IoService::new_for_test(32).unwrap())
         .await
         .unwrap();
     let mut iter = tisql::testkit::SstIterator::new(reader).unwrap();
@@ -2580,7 +2580,7 @@ async fn test_gc_disabled_when_safe_point_zero() {
             &version,
             &sst_dir,
             &pre_allocated_ids,
-            IoService::new(32).unwrap(),
+            IoService::new_for_test(32).unwrap(),
             0, // gc_safe_point = 0 (no GC)
             true,
         )
@@ -2589,7 +2589,7 @@ async fn test_gc_disabled_when_safe_point_zero() {
 
     // Read output
     let output_path = sst_dir.join(format!("{:08}.sst", delta.new_ssts[0].id));
-    let reader = SstReaderRef::open(&output_path, IoService::new(32).unwrap())
+    let reader = SstReaderRef::open(&output_path, IoService::new_for_test(32).unwrap())
         .await
         .unwrap();
     let mut iter = tisql::testkit::SstIterator::new(reader).unwrap();

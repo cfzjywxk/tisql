@@ -184,9 +184,11 @@ impl QueryChecker {
         assert_eq!(
             self.data.len(),
             expected.len(),
-            "Row count mismatch: expected {}, got {}",
+            "Row count mismatch: expected {}, got {}\nactual rows: {:?}\nexpected rows: {:?}",
             expected.len(),
-            self.data.len()
+            self.data.len(),
+            self.data,
+            expected,
         );
 
         for (i, (actual_row, expected_row)) in self.data.iter().zip(expected.iter()).enumerate() {
