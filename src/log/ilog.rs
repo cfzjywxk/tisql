@@ -62,7 +62,7 @@ use crate::tablet::sstable::SstMeta;
 use crate::tablet::version::{ManifestDelta, Version};
 use crate::util::error::{Result, TiSqlError};
 use crate::util::fs::{create_dir_durable, rename_durable, sync_dir};
-use crate::{log_info, log_trace, log_warn};
+use crate::{log_error, log_info, log_trace, log_warn};
 
 /// File header magic bytes: "ILOG"
 const FILE_MAGIC: &[u8; 4] = b"ILOG";
@@ -147,6 +147,15 @@ struct PendingOps {
     intents: BTreeMap<Lsn, RecordedManifestIntent>,
 }
 
+type IlogFatalAction = Arc<dyn Fn(String) + Send + Sync + 'static>;
+
+fn default_ilog_fatal_action() -> IlogFatalAction {
+    Arc::new(|err| {
+        log_error!("fatal ilog append error: {err}");
+        std::process::abort();
+    })
+}
+
 /// Index log service for SST metadata persistence.
 pub struct IlogService {
     config: IlogConfig,
@@ -162,6 +171,14 @@ pub struct IlogService {
     /// Runtime handle for spawning new GroupCommitWriter tasks (e.g. on ilog rewrite).
     /// None for test paths that use std::thread.
     io_handle: Option<tokio::runtime::Handle>,
+    /// Process-level fail-stop hook for append ambiguity.
+    ///
+    /// Ilog recovery stops at the first corrupt record. If the process observes
+    /// an ilog append submission/write/sync failure and continues, later valid
+    /// records could be appended after a corrupt record and then be hidden on
+    /// recovery. The production action aborts the process; tests may override
+    /// it to assert the fail-stop path without killing the runner.
+    fatal_action: IlogFatalAction,
     /// Number of records since last checkpoint
     records_since_checkpoint: AtomicU64,
     /// Last checkpoint sequence
@@ -264,6 +281,7 @@ impl IlogService {
             group_writer,
             io_service: io,
             io_handle: Some(io_handle.clone()),
+            fatal_action: default_ilog_fatal_action(),
             records_since_checkpoint: AtomicU64::new(0),
             last_checkpoint_seq: AtomicU64::new(0),
         })
@@ -729,8 +747,10 @@ impl IlogService {
         .await;
 
         if let Err(e) = &result {
-            // stop_and_drain() moved writer to Draining; any error before restart
-            // must transition to Failed so submitters return error instead of waiting.
+            // stop_and_drain() moved the writer to Draining. Rewrite/reopen
+            // failures are not append ambiguities because in-flight appends
+            // have already drained, so poison the writer here and let any
+            // future append attempt enter the append fail-stop path.
             self.group_writer.set_failed(format!("{e}"));
         }
 
@@ -883,6 +903,7 @@ impl IlogService {
             group_writer,
             io_service: io,
             io_handle: None,
+            fatal_action: default_ilog_fatal_action(),
             records_since_checkpoint: AtomicU64::new(0),
             last_checkpoint_seq: AtomicU64::new(0),
         })
@@ -953,13 +974,19 @@ impl IlogService {
         let buf = Self::encode_record(record)?;
 
         // Submit to group commit writer (batches fsync with concurrent writers)
-        let rx = self
-            .group_writer
-            .submit(buf, true)
-            .map_err(|e| TiSqlError::Internal(format!("Ilog group commit failed: {e}")))?;
-        rx.await
-            .map_err(|_| TiSqlError::Internal("Ilog writer dropped".into()))?
-            .map_err(|e| TiSqlError::Internal(format!("Ilog group commit failed: {e}")))?;
+        let rx = match self.group_writer.submit(buf, true) {
+            Ok(rx) => rx,
+            Err(e) => {
+                return Err(self.fail_stop_append_error(format!("Ilog append submit failed: {e}")));
+            }
+        };
+        let write_result = rx
+            .await
+            .map_err(|_| "Ilog writer dropped".to_string())
+            .and_then(|result| result.map_err(|e| format!("Ilog group commit failed: {e}")));
+        if let Err(e) = write_result {
+            return Err(self.fail_stop_append_error(e));
+        }
 
         // Failpoint: crash after fsync
         #[cfg(feature = "failpoints")]
@@ -968,6 +995,15 @@ impl IlogService {
         self.records_since_checkpoint.fetch_add(1, Ordering::SeqCst);
 
         Ok(())
+    }
+
+    fn fail_stop_append_error(&self, cause: String) -> TiSqlError {
+        let msg = format!(
+            "{cause}; ilog append durability is ambiguous and the process must stop before appending subsequent manifest records"
+        );
+        self.group_writer.set_failed(msg.clone());
+        (self.fatal_action)(msg.clone());
+        TiSqlError::Internal(msg)
     }
 
     fn encode_record(record: &IlogRecord) -> Result<Vec<u8>> {
@@ -1271,6 +1307,65 @@ mod tests {
         )
         .unwrap();
         service.sync().unwrap();
+    }
+
+    #[test]
+    fn test_ilog_append_failure_invokes_fatal_action_and_poison_writer() {
+        let tmp = TempDir::new().unwrap();
+        let config = test_config(tmp.path());
+        let lsn_provider = new_lsn_provider();
+        let mut service = IlogService::open_with_thread(config, lsn_provider).unwrap();
+
+        let fatal_messages = Arc::new(parking_lot::Mutex::new(Vec::new()));
+        let fatal_messages_for_hook = Arc::clone(&fatal_messages);
+        service.fatal_action = Arc::new(move |msg| {
+            fatal_messages_for_hook.lock().push(msg);
+        });
+
+        service.shutdown();
+        let err = service.write_flush_intent(1, 100).unwrap_err();
+
+        {
+            let messages = fatal_messages.lock();
+            assert_eq!(
+                messages.len(),
+                1,
+                "ilog append failure must invoke the fail-stop hook once"
+            );
+            assert!(
+                messages[0].contains("Ilog append submit failed"),
+                "fatal message should include append failure cause: {}",
+                messages[0]
+            );
+            assert!(
+                messages[0].contains("must stop before appending subsequent manifest records"),
+                "fatal message must explain the recovery invariant: {}",
+                messages[0]
+            );
+        }
+        assert!(
+            err.to_string().contains("durability is ambiguous"),
+            "caller should still receive the fatal append error when test hook returns: {err}"
+        );
+
+        let err2 = service.write_flush_intent(2, 200).unwrap_err();
+
+        let messages = fatal_messages.lock();
+        assert_eq!(
+            messages.len(),
+            2,
+            "subsequent submits must still take the fail-stop path"
+        );
+        assert!(
+            err2.to_string().contains("durability is ambiguous"),
+            "poisoned writer should preserve the append ambiguity message: {err2}"
+        );
+        assert!(
+            messages[1].contains("Ilog append submit failed")
+                && messages[1].contains("durability is ambiguous"),
+            "second fatal message should report the poisoned submit: {}",
+            messages[1]
+        );
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
